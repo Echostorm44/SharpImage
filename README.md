@@ -99,13 +99,13 @@ Benchmarks on .NET 10.0.3 with AVX-512, ShortRun (BenchmarkDotNet):
 ### Install via NuGet
 
 ```bash
-dotnet add package SharpImage
+dotnet add package Echostorm.SharpImage
 ```
 
 Or via the Package Manager Console:
 
 ```powershell
-Install-Package SharpImage
+Install-Package Echostorm.SharpImage
 ```
 
 ### Build from Source

@@ -12,7 +12,7 @@
 
   <!-- NuGet Package Metadata -->
   <PropertyGroup>
-    <PackageId>SharpImage</PackageId>
+    <PackageId>Echostorm.SharpImage</PackageId>
     <Authors>Echostorm</Authors>
     <Description>A pure C# .NET 10 port of ImageMagick. Zero native dependencies, full AOT compatibility. 33 image formats, 40+ colorspaces, 23 resize methods, 29 composite blend modes, and 170+ effects — all in managed code competing at native speed.</Description>
     <PackageTags>image;imagemagick;png;jpeg;tiff;webp;resize;blur;sharpen;effects;simd;aot;image-processing</PackageTags>
@@ -26,11 +26,7 @@
 
     <!-- Version is set by CI via /p:Version= from git tags; fallback for local builds -->
     <Version>0.1.0</Version>
-    <ApplicationIcon>icon.ico</ApplicationIcon>
   </PropertyGroup>
-  <ItemGroup>
-    <Content Include="icon.ico" />
-  </ItemGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />

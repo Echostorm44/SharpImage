@@ -1,0 +1,204 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# release.yml — Build AOT CLI binaries + managed DLL, create GitHub Release
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggered when a version tag (v*) is pushed.
+# Produces:
+#   • SharpImage-Cli-win-x64.zip       (native AOT executable)
+#   • SharpImage-Cli-linux-x64.tar.gz  (native AOT executable)
+#   • SharpImage-Cli-osx-x64.tar.gz    (native AOT executable)
+#   • SharpImage-Cli-osx-arm64.tar.gz  (native AOT executable)
+#   • SharpImage-Library.zip            (managed DLL for direct reference)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  CONFIGURATION: Release
+  CLI_PROJECT: src/SharpImage.Cli/SharpImage.Cli.csproj
+  LIB_PROJECT: src/SharpImage/SharpImage.csproj
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1: Build native AOT CLI binaries (one per platform)
+  # ───────────────────────────────────────────────────────────────────────────
+  build-cli:
+    name: CLI · ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            os: windows-latest
+            archive: zip
+          - rid: linux-x64
+            os: ubuntu-latest
+            archive: tar
+          - rid: osx-x64
+            os: macos-13         # Intel runner
+            archive: tar
+          - rid: osx-arm64
+            os: macos-latest     # Apple Silicon runner
+            archive: tar
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Derive version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "VERSION=$TAG" >> "$GITHUB_OUTPUT"
+          echo "📦 Version: $TAG"
+
+      - name: Publish AOT
+        run: >
+          dotnet publish ${{ env.CLI_PROJECT }}
+          -c ${{ env.CONFIGURATION }}
+          -r ${{ matrix.rid }}
+          /p:Version=${{ steps.version.outputs.VERSION }}
+          -o ./publish
+
+      - name: Package (zip) — Windows
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path ./publish/* -DestinationPath SharpImage-Cli-${{ matrix.rid }}.zip
+
+      - name: Package (tar.gz) — Linux/macOS
+        if: matrix.archive == 'tar'
+        run: tar -czf SharpImage-Cli-${{ matrix.rid }}.tar.gz -C ./publish .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.rid }}
+          path: SharpImage-Cli-${{ matrix.rid }}.*
+          retention-days: 5
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2: Build the managed DLL (framework-dependent, cross-platform)
+  # ───────────────────────────────────────────────────────────────────────────
+  build-dll:
+    name: Library DLL
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "VERSION=$TAG" >> "$GITHUB_OUTPUT"
+          echo "📦 Version: $TAG"
+
+      - name: Build library
+        run: >
+          dotnet build ${{ env.LIB_PROJECT }}
+          -c ${{ env.CONFIGURATION }}
+          /p:Version=${{ steps.version.outputs.VERSION }}
+          -o ./lib-output
+
+      - name: Package DLL
+        run: |
+          mkdir -p ./lib-package
+          cp ./lib-output/SharpImage.dll ./lib-package/
+          cp ./lib-output/SharpImage.xml ./lib-package/ 2>/dev/null || true
+          cp ./lib-output/SharpImage.deps.json ./lib-package/ 2>/dev/null || true
+          cp LICENSE ./lib-package/ 2>/dev/null || true
+          cp README.md ./lib-package/ 2>/dev/null || true
+          cd ./lib-package && zip -r ../SharpImage-Library.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: library-dll
+          path: SharpImage-Library.zip
+          retention-days: 5
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 3: Create GitHub Release with all artifacts
+  # ───────────────────────────────────────────────────────────────────────────
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-cli, build-dll]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "VERSION=$TAG" >> "$GITHUB_OUTPUT"
+          echo "📦 Version: $TAG"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lhR ./release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: SharpImage v${{ steps.version.outputs.VERSION }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
+          generate_release_notes: true
+          files: |
+            ./release-assets/SharpImage-Cli-win-x64.zip
+            ./release-assets/SharpImage-Cli-linux-x64.tar.gz
+            ./release-assets/SharpImage-Cli-osx-x64.tar.gz
+            ./release-assets/SharpImage-Cli-osx-arm64.tar.gz
+            ./release-assets/SharpImage-Library.zip
+          body: |
+            ## Downloads
+
+            | Platform | File | Description |
+            |----------|------|-------------|
+            | 🪟 Windows x64 | `SharpImage-Cli-win-x64.zip` | Native AOT CLI executable |
+            | 🐧 Linux x64 | `SharpImage-Cli-linux-x64.tar.gz` | Native AOT CLI executable |
+            | 🍎 macOS x64 (Intel) | `SharpImage-Cli-osx-x64.tar.gz` | Native AOT CLI executable |
+            | 🍎 macOS ARM64 (Apple Silicon) | `SharpImage-Cli-osx-arm64.tar.gz` | Native AOT CLI executable |
+            | 📦 Library DLL | `SharpImage-Library.zip` | Managed DLL — add as a direct reference |
+
+            > **Prefer NuGet?** `dotnet add package Echostorm.SharpImage --version ${{ steps.version.outputs.VERSION }}`
+
+            ---
