@@ -1,13 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # release.yml — Build AOT CLI binaries + managed DLL, create GitHub Release
 # ─────────────────────────────────────────────────────────────────────────────
-# Triggered when a version tag (v*) is pushed.
+# Triggered automatically on v* tags, or manually via workflow_dispatch.
 # Produces:
 #   • SharpImage-Cli-win-x64.zip       (native AOT executable)
 #   • SharpImage-Cli-linux-x64.tar.gz  (native AOT executable)
-#   • SharpImage-Cli-osx-x64.tar.gz    (native AOT executable)
+#   • SharpImage-Cli-osx-x64.tar.gz    (native AOT executable — cross-compiled)
 #   • SharpImage-Cli-osx-arm64.tar.gz  (native AOT executable)
 #   • SharpImage-Library.zip            (managed DLL for direct reference)
+#
+# Both macOS targets build on macos-latest (Apple Silicon). The Xcode universal
+# toolchain allows cross-compiling osx-x64 from an ARM64 runner via clang.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Release
@@ -16,10 +19,17 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 1.0.1 — without the v prefix)'
+        required: true
+        type: string
 
 env:
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CONFIGURATION: Release
   CLI_PROJECT: src/SharpImage.Cli/SharpImage.Cli.csproj
   LIB_PROJECT: src/SharpImage/SharpImage.csproj
@@ -27,10 +37,13 @@ env:
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # Job 1: Build native AOT CLI binaries (one per platform)
+  # continue-on-error: true so a single platform failure doesn't block the
+  # GitHub Release from being created with the other successful artifacts.
   # ───────────────────────────────────────────────────────────────────────────
   build-cli:
     name: CLI · ${{ matrix.rid }}
     runs-on: ${{ matrix.os }}
+    continue-on-error: true
 
     strategy:
       fail-fast: false
@@ -43,10 +56,10 @@ jobs:
             os: ubuntu-latest
             archive: tar
           - rid: osx-x64
-            os: macos-13         # Intel runner
+            os: macos-latest   # ARM64 runner; Xcode toolchain cross-compiles to x64
             archive: tar
           - rid: osx-arm64
-            os: macos-latest     # Apple Silicon runner
+            os: macos-latest
             archive: tar
 
     permissions:
@@ -61,11 +74,15 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Derive version from tag
+      - name: Derive version
         id: version
         shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/v}"
+          fi
           echo "VERSION=$TAG" >> "$GITHUB_OUTPUT"
           echo "📦 Version: $TAG"
 
@@ -112,10 +129,15 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Derive version from tag
+      - name: Derive version
         id: version
+        shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/v}"
+          fi
           echo "VERSION=$TAG" >> "$GITHUB_OUTPUT"
           echo "📦 Version: $TAG"
 
@@ -144,12 +166,15 @@ jobs:
           retention-days: 5
 
   # ───────────────────────────────────────────────────────────────────────────
-  # Job 3: Create GitHub Release with all artifacts
+  # Job 3: Create GitHub Release with all artifacts.
+  # Runs as long as the workflow was not cancelled — tolerates partial build
+  # failures (e.g. a single platform miss) via continue-on-error above.
   # ───────────────────────────────────────────────────────────────────────────
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
     needs: [build-cli, build-dll]
+    if: ${{ !cancelled() }}
 
     permissions:
       contents: write
@@ -158,11 +183,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Derive version from tag
+      - name: Derive version
         id: version
+        shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/v}"
+          fi
           echo "VERSION=$TAG" >> "$GITHUB_OUTPUT"
+          echo "TAG=v$TAG" >> "$GITHUB_OUTPUT"
           echo "📦 Version: $TAG"
 
       - name: Download all artifacts
@@ -177,17 +208,13 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ steps.version.outputs.TAG }}
           name: SharpImage v${{ steps.version.outputs.VERSION }}
           draft: false
           prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
           generate_release_notes: true
-          files: |
-            ./release-assets/SharpImage-Cli-win-x64.zip
-            ./release-assets/SharpImage-Cli-linux-x64.tar.gz
-            ./release-assets/SharpImage-Cli-osx-x64.tar.gz
-            ./release-assets/SharpImage-Cli-osx-arm64.tar.gz
-            ./release-assets/SharpImage-Library.zip
+          fail_on_unmatched_files: false
+          files: ./release-assets/**
           body: |
             ## Downloads
 
