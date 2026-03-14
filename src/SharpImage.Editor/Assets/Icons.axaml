@@ -1,0 +1,111 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!-- Lucide icon SVG path data (24×24 viewbox, stroke-based, round caps/joins) -->
+
+  <!-- ═══════ File Operations ═══════ -->
+  <x:String x:Key="IconFilePlus">M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z M14 2v5h5 M12 18v-6 M9 15h6</x:String>
+  <x:String x:Key="IconFolderOpen">M5 19a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v1 M5 19h14a2 2 0 0 0 2-2l-2.5-7H3.5L1 17a2 2 0 0 0 2 2z</x:String>
+  <x:String x:Key="IconSave">M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z M17 21v-8H7v8 M7 3v5h8</x:String>
+  <x:String x:Key="IconDownload">M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4 M7 10l5 5 5-5 M12 15V3</x:String>
+  <x:String x:Key="IconUpload">M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4 M17 8l-5-5-5 5 M12 3v12</x:String>
+
+  <!-- ═══════ Edit Operations ═══════ -->
+  <x:String x:Key="IconUndo">M3 7v6h6 M3 13a9 9 0 0 1 3-7.7A9 9 0 0 1 21 12a9 9 0 0 1-9 9 9 9 0 0 1-6.7-3</x:String>
+  <x:String x:Key="IconRedo">M21 7v6h-6 M21 13a9 9 0 0 0-3-7.7A9 9 0 0 0 3 12a9 9 0 0 0 9 9 9 9 0 0 0 6.7-3</x:String>
+  <x:String x:Key="IconScissors">M6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M6 15a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M20 4L8.12 15.88 M14.47 14.48L20 20 M8.12 8.12L12 12</x:String>
+  <x:String x:Key="IconCopy">M20 9h-9a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2z M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1</x:String>
+  <x:String x:Key="IconClipboard">M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2 M15 2H9a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1z</x:String>
+  <x:String x:Key="IconTrash">M3 6h18 M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6 M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2</x:String>
+
+  <!-- ═══════ View / Navigation ═══════ -->
+  <x:String x:Key="IconZoomIn">M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.35-4.35 M11 8v6 M8 11h6</x:String>
+  <x:String x:Key="IconZoomOut">M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.35-4.35 M8 11h6</x:String>
+  <x:String x:Key="IconMaximize">M8 3H5a2 2 0 0 0-2 2v3 M21 8V5a2 2 0 0 0-2-2h-3 M3 16v3a2 2 0 0 0 2 2h3 M16 21h3a2 2 0 0 0 2-2v-3</x:String>
+  <x:String x:Key="IconMinimize">M8 3v3a2 2 0 0 1-2 2H3 M21 8h-3a2 2 0 0 1-2-2V3 M3 16h3a2 2 0 0 1 2 2v3 M16 21v-3a2 2 0 0 1 2-2h3</x:String>
+  <x:String x:Key="IconHand">M18 11V6a2 2 0 0 0-2-2 2 2 0 0 0-2 2 M14 10V4a2 2 0 0 0-2-2 2 2 0 0 0-2 2v2 M10 10.5V6a2 2 0 0 0-2-2 2 2 0 0 0-2 2v8 M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15</x:String>
+  <x:String x:Key="IconMove">M5 9l-3 3 3 3 M9 5l3-3 3 3 M15 19l-3 3-3-3 M19 9l3 3-3 3 M2 12h20 M12 2v20</x:String>
+  <x:String x:Key="IconGrid">M3 3h18v18H3z M3 9h18 M3 15h18 M9 3v18 M15 3v18</x:String>
+  <x:String x:Key="IconRuler">M21.73 18l-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z</x:String>
+  <x:String x:Key="IconEye">M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0 M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z</x:String>
+  <x:String x:Key="IconEyeOff">M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94 M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19 M1 1l22 22 M10.59 10.59a2 2 0 0 0 2.83 2.83</x:String>
+  <x:String x:Key="IconInfo">M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z M12 16v-4 M12 8h.01</x:String>
+
+  <!-- ═══════ Selection Tools ═══════ -->
+  <x:String x:Key="IconMousePointer">M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z M13 13l6 6</x:String>
+  <x:String x:Key="IconSquareDashed">M5 3a2 2 0 0 0-2 2 M19 3a2 2 0 0 1 2 2 M21 19a2 2 0 0 1-2 2 M3 19a2 2 0 0 0 2 2 M9 3h1 M9 21h1 M14 3h1 M14 21h1 M3 9v1 M21 9v1 M3 14v1 M21 14v1</x:String>
+  <x:String x:Key="IconCircleDashed">M10.1 2.18a9.93 9.93 0 0 1 3.8 0 M17.6 6.4a9.93 9.93 0 0 1 1.86 3.42 M21.82 13.9a9.93 9.93 0 0 1-1.86 3.42 M17.6 17.6a9.93 9.93 0 0 1-3.42 1.86 M13.9 21.82a9.93 9.93 0 0 1-3.8 0 M6.4 17.6a9.93 9.93 0 0 1-1.86-3.42 M2.18 10.1a9.93 9.93 0 0 1 1.86-3.42 M6.4 6.4a9.93 9.93 0 0 1 3.42-1.86</x:String>
+  <x:String x:Key="IconLasso">M7 22a5 5 0 0 1-2-4 M3.3 14A6.8 6.8 0 0 1 2 10c0-4.4 4.5-8 10-8s10 3.6 10 8-4.5 8-10 8a12 12 0 0 1-3.7-.6</x:String>
+  <x:String x:Key="IconWand">M15 4V2 M15 16v-2 M8 9h2 M20 9h2 M17.8 11.8l1.4 1.4 M15 6.2V4 M17.8 6.2l1.4-1.4 M12.2 6.2L10.8 4.8 M3 21l9-9</x:String>
+
+  <!-- ═══════ Crop & Measure ═══════ -->
+  <x:String x:Key="IconCrop">M6 2v14a2 2 0 0 0 2 2h14 M6 6H2 M18 22v-4</x:String>
+  <x:String x:Key="IconRulerMeasure">M3 5v14 M3 12h18 M21 5v14 M12 3v3 M12 18v3</x:String>
+
+  <!-- ═══════ Painting Tools ═══════ -->
+  <x:String x:Key="IconPaintbrush">M18.37 2.63a2.12 2.12 0 0 1 3 3L14 13l-4 1 1-4z M20 7l-1.5-1.5</x:String>
+  <x:String x:Key="IconEraser">M7 21h10 M19.07 4.93a2 2 0 0 1 0 2.83L8.83 18H5a1 1 0 0 1-1-1v-3.83z M11 13l5-5</x:String>
+  <x:String x:Key="IconPaintBucket">M19 11h-6l-1 1 M15 2H9a1 1 0 0 0-1 1v3a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1z M12 7v4 M2 18a2 2 0 1 0 4 0c0-1-2-3-2-3s-2 2-2 3z</x:String>
+  <x:String x:Key="IconGradient">M16 16V8h2a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2z M2 8h12v8H2z</x:String>
+  <x:String x:Key="IconStamp">M5 22h14 M12 17V9 M5 9h14 M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v0a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z</x:String>
+  <x:String x:Key="IconBandAid">M18 2l-6.5 6.5 M22 6l-6.5 6.5 M8 18l-2 2 M2 8l2-2 M7.5 10.5l6 6 M10.5 7.5l6 6</x:String>
+
+  <!-- ═══════ Retouch Tools ═══════ -->
+  <x:String x:Key="IconSun">M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10z M12 1v2 M12 21v2 M4.22 4.22l1.42 1.42 M18.36 18.36l1.42 1.42 M1 12h2 M21 12h2 M4.22 19.78l1.42-1.42 M18.36 5.64l1.42-1.42</x:String>
+  <x:String x:Key="IconMoon">M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z</x:String>
+  <x:String x:Key="IconDroplets">M7 16.3c2.2 0 4-1.83 4-4.05 0-1.16-.57-2.26-1.71-3.19S7.29 6.75 7 5.3c-.29 1.45-1.14 2.84-2.29 3.76S3 11.1 3 12.25c0 2.22 1.8 4.05 4 4.05z M12.56 14.87c1.46 0 2.64-1.22 2.64-2.7 0-.78-.38-1.51-1.13-2.13-.74-.62-1.26-1.33-1.51-2.24-.25.91-.77 1.62-1.51 2.24-.75.62-1.13 1.35-1.13 2.13 0 1.48 1.18 2.7 2.64 2.7z</x:String>
+
+  <!-- ═══════ Color Tools ═══════ -->
+  <x:String x:Key="IconPipette">M2 22l1-1h3l9-9 M3 21v-3l9-9 M14.5 5.5a2.12 2.12 0 0 1 3 3L12 14l-4 1 1-4z</x:String>
+  <x:String x:Key="IconPalette">M12 22C6.5 22 2 17.5 2 12S6.5 2 12 2s10 4.5 10 10c0 1.5-.5 2.5-1.5 3.5S18.5 17 17 17h-1.5c-.5 0-1 .5-1 1 0 .3.1.5.3.7.2.2.3.5.3.8 0 .5-.5 1-1 1z</x:String>
+  <x:String x:Key="IconSwatchBook">M11 17a4 4 0 0 1-8 0V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2z M16.7 13H19a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H7 M7 17h.01 M16.7 13l-3.4-3.4a2 2 0 0 1 0-2.83l3.36-3.36a2 2 0 0 1 2.83 0l3.36 3.36a2 2 0 0 1 0 2.83z</x:String>
+
+  <!-- ═══════ Text & Vector ═══════ -->
+  <x:String x:Key="IconType">M4 7V4h16v3 M9 20h6 M12 4v16</x:String>
+  <x:String x:Key="IconPenTool">M12 19l7-7 3 3-7 7-3-3z M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z M2 2l7.586 7.586 M11 11a2 2 0 1 1-4 0 2 2 0 0 1 4 0z</x:String>
+  <x:String x:Key="IconSquare">M3 3h18v18H3z</x:String>
+  <x:String x:Key="IconCircle">M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z</x:String>
+
+  <!-- ═══════ Transform ═══════ -->
+  <x:String x:Key="IconRotateCw">M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8 M21 3v5h-5</x:String>
+  <x:String x:Key="IconRotateCcw">M3 12a9 9 0 1 0 9-9c-2.52 0-4.93 1-6.74 2.74L3 8 M3 3v5h5</x:String>
+  <x:String x:Key="IconFlipHorizontal">M8 3H5a2 2 0 0 0-2 2v14c0 1.1.9 2 2 2h3 M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3 M12 20V4</x:String>
+  <x:String x:Key="IconFlipVertical">M3 8V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3 M3 16v3a2 2 0 0 1 2 2h14a2 2 0 0 1 2-2v-3 M4 12h16</x:String>
+  <x:String x:Key="IconScaling">M21 3 9 15 M12 3H3v18h18v-9 M16 3h5v5</x:String>
+
+  <!-- ═══════ Panel Icons ═══════ -->
+  <x:String x:Key="IconLayers">M12 2L2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5</x:String>
+  <x:String x:Key="IconHistory">M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z M12 6v6l4 2</x:String>
+  <x:String x:Key="IconSliders">M21 4h-6 M9 4H3 M21 12h-10 M7 12H3 M21 20h-2 M15 20H3 M9 2v4 M7 10v4 M15 18v4</x:String>
+  <x:String x:Key="IconNavigation">M3 11l19-9-9 19-2-8-8-2z</x:String>
+  <x:String x:Key="IconImage">M3 3h18v18H3z M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z M21 15l-5-5L5 21</x:String>
+  <x:String x:Key="IconSparkles">M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z M20 3v4 M22 5h-4</x:String>
+
+  <!-- ═══════ Actions ═══════ -->
+  <x:String x:Key="IconPlus">M12 5v14 M5 12h14</x:String>
+  <x:String x:Key="IconMinus">M5 12h14</x:String>
+  <x:String x:Key="IconX">M18 6L6 18 M6 6l12 12</x:String>
+  <x:String x:Key="IconCheck">M20 6L9 17l-5-5</x:String>
+  <x:String x:Key="IconChevronDown">M6 9l6 6 6-6</x:String>
+  <x:String x:Key="IconChevronUp">M18 15l-6-6-6 6</x:String>
+  <x:String x:Key="IconChevronRight">M9 18l6-6-6-6</x:String>
+  <x:String x:Key="IconChevronLeft">M15 18l-6-6 6-6</x:String>
+  <x:String x:Key="IconLock">M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z M7 11V7a5 5 0 0 1 10 0v4</x:String>
+  <x:String x:Key="IconUnlock">M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z M7 11V7a5 5 0 0 1 9.9-1</x:String>
+  <x:String x:Key="IconLink">M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71 M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71</x:String>
+  <x:String x:Key="IconUnlink">M18.84 12.25l1.72-1.71a5 5 0 0 0-7.07-7.07l-1.72 1.71 M5.17 11.75l-1.71 1.71a5 5 0 0 0 7.07 7.07l1.71-1.71 M8 2v3 M2 8h3 M16 22v-3 M22 16h-3</x:String>
+  <x:String x:Key="IconSettings">M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z</x:String>
+  <x:String x:Key="IconSearch">M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.35-4.35</x:String>
+  <x:String x:Key="IconFolder">M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z</x:String>
+  <x:String x:Key="IconSidebar">M3 3h18v18H3z M9 3v18</x:String>
+  <x:String x:Key="IconPanelRight">M3 3h18v18H3z M15 3v18</x:String>
+  <x:String x:Key="IconRefresh">M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8 M21 3v5h-5 M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16 M3 21v-5h5</x:String>
+
+  <!-- ═══════ Blur / Filter ═══════ -->
+  <x:String x:Key="IconBlur">M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z</x:String>
+  <x:String x:Key="IconSharpen">M12 2l10 20H2z</x:String>
+
+  <!-- ═══════ Smudge ═══════ -->
+  <x:String x:Key="IconFingerprint">M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4 M5 19.5C5.5 18 6 15 6 12c0-2.5.5-4.5 1.5-5.5 M12 22a10 10 0 0 0 8-8c0-2-1-4-3-6 M14 13c0-2.5-1-5-3-7 M18 12c0-4-2-7-5-9</x:String>
+
+</ResourceDictionary>

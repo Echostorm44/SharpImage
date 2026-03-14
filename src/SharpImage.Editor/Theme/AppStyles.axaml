@@ -1,0 +1,241 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!-- Global font override to Inter -->
+  <Style Selector="TextBlock">
+    <Setter Property="FontFamily" Value="Inter" />
+    <Setter Property="FontSize" Value="13" />
+    <Setter Property="Foreground" Value="{DynamicResource LabelPrimaryBrush}" />
+  </Style>
+
+  <Style Selector="Button">
+    <Setter Property="FontFamily" Value="Inter" />
+    <Setter Property="FontSize" Value="{DynamicResource FontSizeBody}" />
+    <Setter Property="CornerRadius" Value="{DynamicResource RadiusSm}" />
+    <Setter Property="Height" Value="{DynamicResource ButtonHeight}" />
+    <Setter Property="Padding" Value="12,4" />
+  </Style>
+
+  <!-- Toolbar buttons: transparent, icon-only, theme-aware foreground -->
+  <Style Selector="Button.toolbar">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="Foreground" Value="{DynamicResource LabelPrimaryBrush}" />
+    <Setter Property="Padding" Value="6" />
+    <Setter Property="MinWidth" Value="32" />
+    <Setter Property="MinHeight" Value="32" />
+    <Setter Property="Width" Value="34" />
+    <Setter Property="Height" Value="32" />
+    <Setter Property="CornerRadius" Value="{DynamicResource RadiusSm}" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+  </Style>
+  <Style Selector="Button.toolbar:pointerover">
+    <Setter Property="Background" Value="{DynamicResource HoverBgBrush}" />
+  </Style>
+  <Style Selector="Button.toolbar:pressed">
+    <Setter Property="Background" Value="{DynamicResource FillPrimaryBrush}" />
+  </Style>
+  <Style Selector="Button.toolbar:disabled">
+    <Setter Property="Foreground" Value="{DynamicResource LabelQuaternaryBrush}" />
+    <Setter Property="Opacity" Value="0.5" />
+  </Style>
+
+  <Style Selector="TextBox">
+    <Setter Property="FontFamily" Value="Inter" />
+    <Setter Property="FontSize" Value="{DynamicResource FontSizeBody}" />
+    <Setter Property="CornerRadius" Value="{DynamicResource RadiusSm}" />
+    <Setter Property="MinHeight" Value="{DynamicResource TextFieldHeight}" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+    <Setter Property="Padding" Value="8,0" />
+  </Style>
+  <Style Selector="TextBox /template/ TextBlock#PART_Watermark">
+    <Setter Property="Foreground" Value="{DynamicResource LabelTertiaryBrush}" />
+  </Style>
+
+  <Style Selector="ComboBox">
+    <Setter Property="FontFamily" Value="Inter" />
+    <Setter Property="FontSize" Value="{DynamicResource FontSizeBody}" />
+    <Setter Property="CornerRadius" Value="{DynamicResource RadiusSm}" />
+  </Style>
+  <Style Selector="ComboBoxItem">
+    <Setter Property="FontFamily" Value="Inter" />
+  </Style>
+
+  <Style Selector="Slider:horizontal">
+    <Setter Property="MinHeight" Value="22" />
+    <Setter Property="Foreground" Value="{DynamicResource AccentBlueBrush}" />
+    <Setter Property="Background" Value="{DynamicResource FillTertiaryBrush}" />
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Border BorderThickness="{TemplateBinding BorderThickness}"
+                BorderBrush="{TemplateBinding BorderBrush}">
+          <Grid VerticalAlignment="Center">
+            <!-- Track background -->
+            <Border Height="4" CornerRadius="2"
+                    Background="{TemplateBinding Background}"
+                    VerticalAlignment="Center" />
+            <Track Name="PART_Track"
+                   Minimum="{TemplateBinding Minimum}"
+                   Maximum="{TemplateBinding Maximum}"
+                   Value="{TemplateBinding Value}"
+                   Orientation="Horizontal"
+                   IsDirectionReversed="{TemplateBinding IsDirectionReversed}">
+              <Track.DecreaseButton>
+                <RepeatButton Name="PART_DecreaseButton" Focusable="False"
+                              MinWidth="0">
+                  <RepeatButton.Template>
+                    <ControlTemplate>
+                      <Border Height="4" CornerRadius="2"
+                              Background="{DynamicResource AccentBlueBrush}" />
+                    </ControlTemplate>
+                  </RepeatButton.Template>
+                </RepeatButton>
+              </Track.DecreaseButton>
+              <Track.IncreaseButton>
+                <RepeatButton Name="PART_IncreaseButton" Focusable="False"
+                              MinWidth="0">
+                  <RepeatButton.Template>
+                    <ControlTemplate>
+                      <Border Height="4" Background="Transparent" />
+                    </ControlTemplate>
+                  </RepeatButton.Template>
+                </RepeatButton>
+              </Track.IncreaseButton>
+              <Track.Thumb>
+                <Thumb Width="20" Height="14" Cursor="Hand">
+                  <Thumb.Template>
+                    <ControlTemplate>
+                      <Border Width="20" Height="14" CornerRadius="7"
+                              Background="White"
+                              BoxShadow="0 1 4 0 #66000000, 0 0 1 0 #33000000" />
+                    </ControlTemplate>
+                  </Thumb.Template>
+                </Thumb>
+              </Track.Thumb>
+            </Track>
+          </Grid>
+        </Border>
+      </ControlTemplate>
+    </Setter>
+  </Style>
+
+  <!-- NumericUpDown styling -->
+  <Style Selector="NumericUpDown">
+    <Setter Property="FontFamily" Value="Inter" />
+    <Setter Property="FontSize" Value="{DynamicResource FontSizeBody}" />
+  </Style>
+
+  <!-- CheckBox / ToggleSwitch foreground -->
+  <Style Selector="CheckBox">
+    <Setter Property="Foreground" Value="{DynamicResource LabelPrimaryBrush}" />
+  </Style>
+  <Style Selector="ToggleSwitch">
+    <Setter Property="Foreground" Value="{DynamicResource LabelPrimaryBrush}" />
+  </Style>
+  <Style Selector="RadioButton">
+    <Setter Property="Foreground" Value="{DynamicResource LabelPrimaryBrush}" />
+  </Style>
+
+  <Style Selector="Label">
+    <Setter Property="FontFamily" Value="Inter" />
+  </Style>
+
+  <Style Selector="MenuItem">
+    <Setter Property="FontFamily" Value="Inter" />
+    <Setter Property="FontSize" Value="{DynamicResource FontSizeBody}" />
+  </Style>
+
+  <Style Selector="Menu">
+    <Setter Property="FontFamily" Value="Inter" />
+  </Style>
+
+  <!-- Tool palette button: selected state with accent bg -->
+  <Style Selector="Button.toolbar.selected">
+    <Setter Property="Background" Value="{DynamicResource SelectedBgBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource SelectedTextBrush}" />
+  </Style>
+
+  <!-- Panel header (section title: small, uppercase, semibold, secondary) -->
+  <Style Selector="TextBlock.panelHeader">
+    <Setter Property="FontFamily" Value="Inter" />
+    <Setter Property="FontSize" Value="11" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+    <Setter Property="Foreground" Value="{DynamicResource LabelSecondaryBrush}" />
+    <Setter Property="Margin" Value="8,8,8,4" />
+  </Style>
+
+  <!-- Panel container -->
+  <Style Selector="Border.panel">
+    <Setter Property="Background" Value="{DynamicResource BgSecondaryBrush}" />
+    <Setter Property="CornerRadius" Value="0" />
+    <Setter Property="BorderBrush" Value="{DynamicResource SeparatorOpaqueBrush}" />
+    <Setter Property="BorderThickness" Value="0,0,0,1" />
+    <Setter Property="Padding" Value="0,4" />
+  </Style>
+
+  <!-- Dialog overlay style -->
+  <Style Selector="Border.dialogOverlay">
+    <Setter Property="Background" Value="#80000000" />
+  </Style>
+
+  <!-- Dialog card -->
+  <Style Selector="Border.dialogCard">
+    <Setter Property="Background" Value="{DynamicResource BgPrimaryBrush}" />
+    <Setter Property="CornerRadius" Value="{DynamicResource RadiusLg}" />
+    <Setter Property="Padding" Value="24" />
+    <Setter Property="BoxShadow" Value="0 8 32 0 #40000000" />
+  </Style>
+
+  <!-- Thumbnail style for layers panel -->
+  <Style Selector="Border.layerThumb">
+    <Setter Property="Width" Value="48" />
+    <Setter Property="Height" Value="48" />
+    <Setter Property="CornerRadius" Value="{DynamicResource RadiusXs}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource SeparatorOpaqueBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="ClipToBounds" Value="True" />
+  </Style>
+
+  <!-- Accent / primary action button -->
+  <Style Selector="Button.accent">
+    <Setter Property="Background" Value="{DynamicResource AccentBlueBrush}" />
+    <Setter Property="Foreground" Value="White" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+    <Setter Property="CornerRadius" Value="{DynamicResource RadiusSm}" />
+    <Setter Property="Height" Value="28" />
+    <Setter Property="Padding" Value="16,0" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="BorderThickness" Value="0" />
+  </Style>
+
+  <!-- Lucide icon path global style (stroked, not filled) -->
+  <Style Selector="Path.lucide">
+    <Setter Property="StrokeThickness" Value="2" />
+    <Setter Property="StrokeLineCap" Value="Round" />
+    <Setter Property="StrokeJoin" Value="Round" />
+    <Setter Property="Stroke" Value="{DynamicResource LabelPrimaryBrush}" />
+  </Style>
+
+  <!-- Effects panel buttons: Apple-style secondary buttons -->
+  <Style Selector="Button.effect">
+    <Setter Property="Background" Value="{DynamicResource FillTertiaryBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource LabelPrimaryBrush}" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="CornerRadius" Value="{DynamicResource RadiusSm}" />
+    <Setter Property="Height" Value="32" />
+    <Setter Property="Padding" Value="12,0" />
+    <Setter Property="HorizontalAlignment" Value="Stretch" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+    <Setter Property="FontFamily" Value="Inter" />
+    <Setter Property="FontSize" Value="13" />
+  </Style>
+  <Style Selector="Button.effect:pointerover">
+    <Setter Property="Background" Value="{DynamicResource FillSecondaryBrush}" />
+  </Style>
+  <Style Selector="Button.effect:pressed">
+    <Setter Property="Background" Value="{DynamicResource FillPrimaryBrush}" />
+  </Style>
+
+</Styles>

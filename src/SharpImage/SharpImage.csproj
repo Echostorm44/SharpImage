@@ -1,0 +1,40 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <RootNamespace>SharpImage</RootNamespace>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <!-- NuGet Package Metadata -->
+  <PropertyGroup>
+    <PackageId>SharpImage</PackageId>
+    <Authors>Echostorm</Authors>
+    <Description>A pure C# .NET 10 port of ImageMagick. Zero native dependencies, full AOT compatibility. 33 image formats, 40+ colorspaces, 23 resize methods, 29 composite blend modes, and 170+ effects — all in managed code competing at native speed.</Description>
+    <PackageTags>image;imagemagick;png;jpeg;tiff;webp;resize;blur;sharpen;effects;simd;aot;image-processing</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Echostorm44/SharpImage</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Echostorm44/SharpImage.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <Copyright>Copyright © Echostorm</Copyright>
+
+    <!-- Version is set by CI via /p:Version= from git tags; fallback for local builds -->
+    <Version>0.1.0</Version>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="icon.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="\" Condition="Exists('..\..\icon.png')" />
+  </ItemGroup>
+
+</Project>

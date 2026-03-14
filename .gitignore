@@ -1,0 +1,95 @@
+# =============================================================================
+# SharpImage .gitignore
+# =============================================================================
+
+# ---- .NET Build Output ----
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+publish/
+artifacts/
+
+# ---- Test & Benchmark Results (regenerated on demand) ----
+BigTest/
+TestResults/
+BenchmarkDotNet.Artifacts/
+
+# ---- Reference Source Code & External Tools (not our code) ----
+ImageMagickSourceCodeAAA/
+ImageMagickSourceCode/
+tools/
+
+# ---- Visual Studio ----
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.rsuser
+*.userprefs
+copilot-instructions.md
+# ---- NuGet ----
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+project.lock.json
+project.fragment.lock.json
+*.nuget.props
+*.nuget.targets
+
+# ---- Build Artifacts ----
+*.pdb
+*.ilk
+*.obj
+*.iobj
+*.pch
+*.ipdb
+*.pgc
+*.pgd
+*.log
+*.binlog
+*.tmp
+*.tmp_proj
+*_wpftmp.csproj
+
+# ---- Coverage & Test Reports ----
+coverage*.json
+coverage*.xml
+coverage*.info
+*.coverage
+*.coveragexml
+TestResult.xml
+nunit-*.xml
+*.VisualState.xml
+
+# ---- IDE Plugins ----
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+*.dotCover
+_NCrunch_*
+.*crunch*.local.xml
+nCrunchTemp_*
+.cr/personal
+*.GhostDoc.xml
+
+# ---- OS & Editor Junk ----
+~$*
+*~
+*.swp
+Thumbs.db
+.DS_Store
+
+# ---- Misc ----
+BigTest.md
+SharpEditorPlan.md
+AgentDebugAvalonia.md
+__pycache__/
+*.pyc
+mono_crash.*
+.localhistory/
+.ionide/
+.mfractor/
+node_modules/
+Old/

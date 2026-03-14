@@ -1,0 +1,42 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="SharpImage.Editor.App"
+             RequestedThemeVariant="Dark">
+
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceInclude Source="avares://SharpImage.Editor/Theme/Typography.axaml" />
+                <ResourceInclude Source="avares://SharpImage.Editor/Assets/Icons.axaml" />
+            </ResourceDictionary.MergedDictionaries>
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Dark">
+                    <ResourceDictionary.MergedDictionaries>
+                        <ResourceInclude Source="avares://SharpImage.Editor/Theme/AppleDarkColors.axaml" />
+                    </ResourceDictionary.MergedDictionaries>
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Light">
+                    <ResourceDictionary.MergedDictionaries>
+                        <ResourceInclude Source="avares://SharpImage.Editor/Theme/AppleLightColors.axaml" />
+                    </ResourceDictionary.MergedDictionaries>
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+        </ResourceDictionary>
+    </Application.Resources>
+
+    <Application.Styles>
+        <FluentTheme>
+            <FluentTheme.Palettes>
+                <ColorPaletteResources x:Key="Light"
+                    Accent="#007AFF"
+                    AltHigh="White" AltLow="White" AltMedium="White"
+                    AltMediumHigh="White" AltMediumLow="White" />
+                <ColorPaletteResources x:Key="Dark"
+                    Accent="#0A84FF"
+                    AltHigh="White" AltLow="White" AltMedium="White"
+                    AltMediumHigh="White" AltMediumLow="White" />
+            </FluentTheme.Palettes>
+        </FluentTheme>
+        <StyleInclude Source="avares://SharpImage.Editor/Theme/AppStyles.axaml" />
+    </Application.Styles>
+</Application>

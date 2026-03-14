@@ -1,0 +1,361 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="SharpImage.Editor.Windows.MainWindow"
+        Title="SharpImage Editor"
+        Width="1400" Height="900"
+        MinWidth="800" MinHeight="600"
+        Background="{DynamicResource BgPrimaryBrush}"
+        Foreground="{DynamicResource LabelPrimaryBrush}"
+        WindowStartupLocation="CenterScreen">
+
+  <DockPanel>
+    <!-- ═══════ Menu Bar ═══════ -->
+    <Menu DockPanel.Dock="Top"
+          Name="MainMenu"
+          Background="{DynamicResource BgToolbarBrush}"
+          Foreground="{DynamicResource LabelPrimaryBrush}"
+          FontFamily="Inter" FontSize="13"
+          Height="28">
+      <MenuItem Header="_File" Name="MenuFile">
+        <MenuItem Header="_New..." Name="MenuNew" InputGesture="Ctrl+N" />
+        <MenuItem Header="_Open..." Name="MenuOpen" InputGesture="Ctrl+O" />
+        <MenuItem Header="Open _Recent" Name="MenuOpenRecent" />
+        <Separator />
+        <MenuItem Header="_Close" Name="MenuClose" InputGesture="Ctrl+W" />
+        <MenuItem Header="_Save" Name="MenuSave" InputGesture="Ctrl+S" />
+        <MenuItem Header="Save _As..." Name="MenuSaveAs" InputGesture="Ctrl+Shift+S" />
+        <MenuItem Header="_Export As..." Name="MenuExport" InputGesture="Ctrl+Shift+E" />
+        <Separator />
+        <MenuItem Header="Re_vert" Name="MenuRevert" />
+        <MenuItem Header="_Batch Process..." Name="MenuBatch" InputGesture="Ctrl+Shift+B" />
+        <Separator />
+        <MenuItem Header="P_references..." Name="MenuPreferences" InputGesture="Ctrl+OemComma" />
+        <MenuItem Header="E_xit" Name="MenuExit" InputGesture="Alt+F4" />
+      </MenuItem>
+
+      <MenuItem Header="_Edit" Name="MenuEdit">
+        <MenuItem Header="_Undo" Name="MenuUndo" InputGesture="Ctrl+Z" />
+        <MenuItem Header="_Redo" Name="MenuRedo" InputGesture="Ctrl+Y" />
+        <Separator />
+        <MenuItem Header="Cu_t" Name="MenuCut" InputGesture="Ctrl+X" />
+        <MenuItem Header="_Copy" Name="MenuCopy" InputGesture="Ctrl+C" />
+        <MenuItem Header="_Paste" Name="MenuPaste" InputGesture="Ctrl+V" />
+        <MenuItem Header="Paste as New Image" Name="MenuPasteAsNew" InputGesture="Ctrl+Shift+V" />
+        <MenuItem Header="_Delete" Name="MenuDelete" InputGesture="Delete" />
+        <Separator />
+        <MenuItem Header="_Fill..." Name="MenuFill" InputGesture="Shift+F5" />
+        <MenuItem Header="Stro_ke..." Name="MenuStroke" />
+        <Separator />
+        <MenuItem Header="Select _All" Name="MenuSelectAll" InputGesture="Ctrl+A" />
+        <MenuItem Header="_Deselect" Name="MenuDeselect" InputGesture="Ctrl+D" />
+        <MenuItem Header="Re_select" Name="MenuReselect" InputGesture="Ctrl+Shift+D" />
+        <MenuItem Header="_Invert Selection" Name="MenuInvertSelection" InputGesture="Ctrl+Shift+I" />
+        <Separator />
+        <MenuItem Header="_Transform" Name="MenuTransform">
+          <MenuItem Header="Free Transform" Name="MenuFreeTransform" InputGesture="Ctrl+T" />
+          <Separator />
+          <MenuItem Header="Rotate 90° CW" Name="MenuTransformRotateCW" />
+          <MenuItem Header="Rotate 90° CCW" Name="MenuTransformRotateCCW" />
+          <MenuItem Header="Rotate 180°" Name="MenuTransformRotate180" />
+          <Separator />
+          <MenuItem Header="Flip Horizontal" Name="MenuTransformFlipH" />
+          <MenuItem Header="Flip Vertical" Name="MenuTransformFlipV" />
+        </MenuItem>
+      </MenuItem>
+
+      <MenuItem Header="_Image" Name="MenuImage">
+        <MenuItem Header="Image _Size..." Name="MenuImageSize" InputGesture="Ctrl+Alt+I" />
+        <MenuItem Header="_Canvas Size..." Name="MenuCanvasSize" InputGesture="Ctrl+Alt+C" />
+        <Separator />
+        <MenuItem Header="_Rotate Canvas" Name="MenuRotateCanvas">
+          <MenuItem Header="90° CW" Name="MenuRotateCanvasCW" />
+          <MenuItem Header="90° CCW" Name="MenuRotateCanvasCCW" />
+          <MenuItem Header="180°" Name="MenuRotateCanvas180" />
+          <MenuItem Header="Arbitrary..." Name="MenuRotateCanvasArbitrary" />
+        </MenuItem>
+        <MenuItem Header="_Flip Canvas" Name="MenuFlipCanvas">
+          <MenuItem Header="Horizontal" Name="MenuFlipCanvasH" />
+          <MenuItem Header="Vertical" Name="MenuFlipCanvasV" />
+        </MenuItem>
+        <Separator />
+        <MenuItem Header="Crop to _Selection" Name="MenuCropToSelection" />
+        <MenuItem Header="_Trim" Name="MenuTrim" />
+        <MenuItem Header="_Auto Crop" Name="MenuAutoCrop" />
+        <Separator />
+        <MenuItem Header="_Flatten Image" Name="MenuFlatten" />
+        <Separator />
+        <MenuItem Header="_Mode" Name="MenuMode">
+          <MenuItem Header="RGB" Name="MenuModeRGB" />
+          <MenuItem Header="Grayscale" Name="MenuModeGrayscale" />
+        </MenuItem>
+      </MenuItem>
+
+      <MenuItem Header="_Layer" Name="MenuLayer">
+        <MenuItem Header="_New Layer" Name="MenuNewLayer" InputGesture="Ctrl+Shift+N" />
+        <MenuItem Header="_Duplicate Layer" Name="MenuDuplicateLayer" InputGesture="Ctrl+J" />
+        <MenuItem Header="De_lete Layer" Name="MenuDeleteLayer" />
+        <Separator />
+        <MenuItem Header="_Merge Down" Name="MenuMergeDown" InputGesture="Ctrl+E" />
+        <MenuItem Header="Merge _Visible" Name="MenuMergeVisible" InputGesture="Ctrl+Shift+E" />
+        <MenuItem Header="_Flatten Image" Name="MenuFlattenLayer" />
+        <Separator />
+        <MenuItem Header="Layer _Properties..." Name="MenuLayerProperties" />
+        <Separator />
+        <MenuItem Header="_Group Layers" Name="MenuGroupLayers" />
+        <MenuItem Header="_Ungroup" Name="MenuUngroupLayers" />
+      </MenuItem>
+
+      <MenuItem Header="_Select" Name="MenuSelect">
+        <MenuItem Header="_All" Name="MenuSelAll" InputGesture="Ctrl+A" />
+        <MenuItem Header="_Deselect" Name="MenuSelDeselect" InputGesture="Ctrl+D" />
+        <MenuItem Header="Re_select" Name="MenuSelReselect" InputGesture="Ctrl+Shift+D" />
+        <MenuItem Header="_Inverse" Name="MenuSelInverse" InputGesture="Ctrl+Shift+I" />
+        <Separator />
+        <MenuItem Header="_Color Range..." Name="MenuColorRange" />
+        <Separator />
+        <MenuItem Header="_Modify" Name="MenuSelModify">
+          <MenuItem Header="Border..." Name="MenuSelBorder" />
+          <MenuItem Header="Smooth..." Name="MenuSelSmooth" />
+          <MenuItem Header="Expand..." Name="MenuSelExpand" />
+          <MenuItem Header="Contract..." Name="MenuSelContract" />
+          <MenuItem Header="Feather..." Name="MenuSelFeather" InputGesture="Shift+F6" />
+        </MenuItem>
+        <MenuItem Header="_Grow" Name="MenuSelGrow" />
+        <MenuItem Header="S_imilar" Name="MenuSelSimilar" />
+      </MenuItem>
+
+      <MenuItem Header="Fil_ter" Name="MenuFilter">
+        <MenuItem Header="_Blur" Name="MenuBlur">
+          <MenuItem Header="Gaussian Blur..." Name="MenuGaussianBlur" />
+          <MenuItem Header="Box Blur..." Name="MenuBoxBlur" />
+          <MenuItem Header="Motion Blur..." Name="MenuMotionBlur" />
+          <MenuItem Header="Radial Blur..." Name="MenuRadialBlur" />
+          <MenuItem Header="Surface Blur..." Name="MenuSurfaceBlur" />
+          <MenuItem Header="Lens Blur..." Name="MenuLensBlur" />
+          <MenuItem Header="Selective Blur..." Name="MenuSelectiveBlur" />
+          <MenuItem Header="Bilateral Blur..." Name="MenuBilateralBlur" />
+          <MenuItem Header="Tilt-Shift..." Name="MenuTiltShift" />
+        </MenuItem>
+        <MenuItem Header="_Sharpen" Name="MenuSharpen">
+          <MenuItem Header="Sharpen" Name="MenuSharpenBasic" />
+          <MenuItem Header="Sharpen More" Name="MenuSharpenMore" />
+          <MenuItem Header="Unsharp Mask..." Name="MenuUnsharpMask" />
+          <MenuItem Header="Smart Sharpen..." Name="MenuSmartSharpen" />
+          <MenuItem Header="High Pass..." Name="MenuHighPass" />
+        </MenuItem>
+        <MenuItem Header="_Noise" Name="MenuNoise">
+          <MenuItem Header="Add Noise..." Name="MenuAddNoise" />
+          <MenuItem Header="Despeckle" Name="MenuDespeckle" />
+          <MenuItem Header="Reduce Noise..." Name="MenuReduceNoise" />
+          <MenuItem Header="Median..." Name="MenuMedian" />
+        </MenuItem>
+        <MenuItem Header="_Distort" Name="MenuDistort">
+          <MenuItem Header="Spherize..." Name="MenuSpherize" />
+          <MenuItem Header="Swirl..." Name="MenuSwirl" />
+          <MenuItem Header="Wave..." Name="MenuWave" />
+          <MenuItem Header="Ripple..." Name="MenuRipple" />
+          <MenuItem Header="Polar Coordinates..." Name="MenuPolarCoordinates" />
+          <MenuItem Header="Barrel Distortion..." Name="MenuBarrelDistortion" />
+          <MenuItem Header="Displacement Map..." Name="MenuDisplacementMap" />
+          <MenuItem Header="Liquify..." Name="MenuLiquify" />
+        </MenuItem>
+        <MenuItem Header="St_ylize" Name="MenuStylize">
+          <MenuItem Header="Emboss" Name="MenuEmboss" />
+          <MenuItem Header="Find Edges" Name="MenuFindEdges" />
+          <MenuItem Header="Oil Paint..." Name="MenuOilPaint" />
+          <MenuItem Header="Solarize" Name="MenuSolarize" />
+        </MenuItem>
+        <MenuItem Header="_Artistic" Name="MenuArtistic">
+          <MenuItem Header="Charcoal..." Name="MenuCharcoal" />
+          <MenuItem Header="Sketch..." Name="MenuSketch" />
+          <MenuItem Header="Posterize..." Name="MenuPosterize" />
+          <MenuItem Header="Halftone..." Name="MenuHalftone" />
+          <MenuItem Header="Pixelate..." Name="MenuPixelate" />
+          <MenuItem Header="Crystallize..." Name="MenuCrystallize" />
+          <MenuItem Header="Pointillize..." Name="MenuPointillize" />
+          <MenuItem Header="Vignette..." Name="MenuVignette" />
+        </MenuItem>
+        <MenuItem Header="_Color" Name="MenuColorFilters">
+          <MenuItem Header="Brightness/Contrast..." Name="MenuBrightnessContrast" />
+          <MenuItem Header="Levels..." Name="MenuLevels" InputGesture="Ctrl+L" />
+          <MenuItem Header="Curves..." Name="MenuCurves" InputGesture="Ctrl+M" />
+          <MenuItem Header="Hue/Saturation..." Name="MenuHueSaturation" InputGesture="Ctrl+U" />
+          <MenuItem Header="Color Balance..." Name="MenuColorBalance" InputGesture="Ctrl+B" />
+          <MenuItem Header="Vibrance..." Name="MenuVibrance" />
+          <MenuItem Header="Exposure..." Name="MenuExposure" />
+          <Separator />
+          <MenuItem Header="Desaturate" Name="MenuDesaturate" />
+          <MenuItem Header="Invert" Name="MenuInvert" InputGesture="Ctrl+I" />
+          <MenuItem Header="Posterize..." Name="MenuColorPosterize" />
+          <MenuItem Header="Threshold..." Name="MenuThreshold" />
+          <MenuItem Header="Gradient Map..." Name="MenuGradientMap" />
+          <MenuItem Header="Channel Mixer..." Name="MenuChannelMixer" />
+          <MenuItem Header="Color LUT..." Name="MenuColorLUT" />
+          <Separator />
+          <MenuItem Header="Auto Levels" Name="MenuAutoLevels" />
+          <MenuItem Header="Auto Contrast" Name="MenuAutoContrast" />
+          <MenuItem Header="Auto Color" Name="MenuAutoColor" />
+          <MenuItem Header="Equalize" Name="MenuEqualize" />
+          <Separator />
+          <MenuItem Header="Shadow/Highlight..." Name="MenuShadowHighlight" />
+          <MenuItem Header="HDR Toning..." Name="MenuHDRToning" />
+        </MenuItem>
+        <MenuItem Header="_Generate" Name="MenuGenerate">
+          <MenuItem Header="Clouds" Name="MenuClouds" />
+          <MenuItem Header="Plasma..." Name="MenuPlasma" />
+          <MenuItem Header="Gradient..." Name="MenuGradientGen" />
+          <MenuItem Header="Pattern..." Name="MenuPattern" />
+          <MenuItem Header="Noise Generator..." Name="MenuNoiseGenerator" />
+          <MenuItem Header="Checkerboard..." Name="MenuCheckerboard" />
+        </MenuItem>
+        <Separator />
+        <MenuItem Header="_Other" Name="MenuOther">
+          <MenuItem Header="Custom Convolution..." Name="MenuCustomConvolution" />
+          <MenuItem Header="Minimum/Maximum..." Name="MenuMinMax" />
+          <MenuItem Header="FFT" Name="MenuFFT" />
+          <MenuItem Header="Inverse FFT" Name="MenuInverseFFT" />
+        </MenuItem>
+      </MenuItem>
+
+      <MenuItem Header="_View" Name="MenuView">
+        <MenuItem Header="Zoom _In" Name="MenuZoomIn" InputGesture="Ctrl+OemPlus" />
+        <MenuItem Header="Zoom _Out" Name="MenuZoomOut" InputGesture="Ctrl+OemMinus" />
+        <MenuItem Header="_Fit in Window" Name="MenuFitWindow" InputGesture="Ctrl+D0" />
+        <MenuItem Header="_Actual Pixels" Name="MenuActualPixels" InputGesture="Ctrl+D1" />
+        <Separator />
+        <MenuItem Header="_Pixel Grid" Name="MenuPixelGrid" />
+        <MenuItem Header="_Rulers" Name="MenuRulers" InputGesture="Ctrl+R" />
+        <MenuItem Header="G_rid" Name="MenuGrid" />
+        <MenuItem Header="_Guides" Name="MenuGuides" />
+        <Separator />
+        <MenuItem Header="_Show" Name="MenuShow">
+          <MenuItem Header="Selection Edges" Name="MenuShowSelectionEdges" />
+          <MenuItem Header="Layer Edges" Name="MenuShowLayerEdges" />
+          <MenuItem Header="Guides" Name="MenuShowGuides" />
+          <MenuItem Header="Grid" Name="MenuShowGrid" />
+          <MenuItem Header="Pixel Grid" Name="MenuShowPixelGrid" />
+        </MenuItem>
+      </MenuItem>
+
+      <MenuItem Header="_Window" Name="MenuWindow">
+        <MenuItem Header="_Navigator" Name="MenuToggleNavigator" />
+        <MenuItem Header="_Color" Name="MenuToggleColor" />
+        <MenuItem Header="_Layers" Name="MenuToggleLayers" />
+        <MenuItem Header="_History" Name="MenuToggleHistory" />
+        <MenuItem Header="_Properties" Name="MenuToggleProperties" />
+        <MenuItem Header="C_hannels" Name="MenuToggleChannels" />
+        <MenuItem Header="_Brushes" Name="MenuToggleBrushes" />
+        <MenuItem Header="_Adjustments" Name="MenuToggleAdjustments" />
+        <Separator />
+        <MenuItem Header="_Reset Workspace" Name="MenuResetWorkspace" />
+      </MenuItem>
+
+      <MenuItem Header="_Help" Name="MenuHelp">
+        <MenuItem Header="_Keyboard Shortcuts" Name="MenuKeyboardShortcuts" InputGesture="F1" />
+        <MenuItem Header="_About SharpImage Editor" Name="MenuAbout" />
+      </MenuItem>
+    </Menu>
+
+    <!-- ═══════ Options Bar (context-sensitive per tool) ═══════ -->
+    <Border DockPanel.Dock="Top"
+            Background="{DynamicResource BgToolbarBrush}"
+            BorderBrush="{DynamicResource SeparatorOpaqueBrush}"
+            BorderThickness="0,0,0,1"
+            MinHeight="40"
+            Padding="8,4">
+      <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+      <StackPanel Name="OptionsBarContent"
+                  Orientation="Horizontal"
+                  VerticalAlignment="Center"
+                  Spacing="8">
+        <TextBlock Name="ActiveToolLabel"
+                   Text="Move Tool"
+                   Foreground="{DynamicResource LabelSecondaryBrush}"
+                   FontSize="12" FontWeight="SemiBold"
+                   VerticalAlignment="Center" />
+      </StackPanel>
+      </ScrollViewer>
+    </Border>
+
+    <!-- ═══════ Status Bar ═══════ -->
+    <Border DockPanel.Dock="Bottom"
+            Background="{DynamicResource BgStatusBarBrush}"
+            BorderBrush="{DynamicResource SeparatorOpaqueBrush}"
+            BorderThickness="0,1,0,0"
+            Height="24"
+            Padding="8,0">
+      <Grid ColumnDefinitions="Auto,*,Auto">
+        <!-- Left: document info -->
+        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+          <TextBlock Name="StatusFileName"
+                     Text="No document"
+                     FontSize="11"
+                     Foreground="{DynamicResource LabelSecondaryBrush}" />
+        </StackPanel>
+
+        <!-- Center: progress -->
+        <StackPanel Grid.Column="1"
+                    Orientation="Horizontal" Spacing="8"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Name="ProgressSection" IsVisible="False">
+          <TextBlock Name="ProgressLabel" Text="" FontSize="11"
+                     Foreground="{DynamicResource LabelSecondaryBrush}" />
+          <ProgressBar Name="ProgressBar" Width="200" Height="4"
+                       Minimum="0" Maximum="100" Value="0" />
+        </StackPanel>
+
+        <!-- Right: dimensions, zoom, cursor -->
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="16" VerticalAlignment="Center">
+          <TextBlock Name="StatusDimensions" Text=""
+                     FontSize="11" Foreground="{DynamicResource LabelTertiaryBrush}" />
+          <TextBlock Name="StatusZoom" Text="100%"
+                     FontSize="11" Foreground="{DynamicResource LabelSecondaryBrush}" />
+          <TextBlock Name="StatusCursorPos" Text="0, 0"
+                     FontSize="11" Foreground="{DynamicResource LabelTertiaryBrush}" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- ═══════ Main Content Area ═══════ -->
+    <DockPanel>
+      <!-- Left: Tool Palette -->
+      <Border DockPanel.Dock="Left"
+              Width="48"
+              Background="{DynamicResource BgSidebarBrush}"
+              BorderBrush="{DynamicResource SeparatorOpaqueBrush}"
+              BorderThickness="0,0,1,0">
+        <ScrollViewer VerticalScrollBarVisibility="Hidden"
+                      HorizontalScrollBarVisibility="Disabled">
+          <StackPanel Name="ToolPalettePanel"
+                      Spacing="2" Margin="6,4" />
+        </ScrollViewer>
+      </Border>
+
+      <!-- Right: Panel Dock -->
+      <Border DockPanel.Dock="Right"
+              Width="240"
+              Background="{DynamicResource BgSecondaryBrush}"
+              BorderBrush="{DynamicResource SeparatorOpaqueBrush}"
+              BorderThickness="1,0,0,0"
+              Name="PanelDock">
+        <Grid Name="PanelGrid">
+          <!-- Panels will be populated in code-behind with dynamic row definitions -->
+        </Grid>
+      </Border>
+
+      <!-- Center: Canvas Area (fills remaining space) -->
+      <Border Background="{DynamicResource BgCanvasBrush}"
+              ClipToBounds="True">
+        <Panel Name="CanvasHost">
+          <!-- ImageCanvas control will be added here in code-behind -->
+          <TextBlock Text="Open or create a document to begin"
+                     Name="EmptyCanvasMessage"
+                     HorizontalAlignment="Center"
+                     VerticalAlignment="Center"
+                     FontSize="15"
+                     Foreground="{DynamicResource LabelTertiaryBrush}" />
+        </Panel>
+      </Border>
+    </DockPanel>
+  </DockPanel>
+</Window>

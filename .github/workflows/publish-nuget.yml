@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# publish-nuget.yml — NuGet Trusted Publishing via GitHub Actions OIDC
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggered when a version tag (v*) is pushed.
+#
+# NuGet Trusted Publishing policy on nuget.org must be configured:
+#   Repository Owner : Echostorm44
+#   Repository       : SharpImage
+#   Workflow File    : publish-nuget.yml
+#   Environment      : nuget-publish
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Publish to NuGet
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  CONFIGURATION: Release
+  PACKAGE_PROJECT: src/SharpImage/SharpImage.csproj
+
+jobs:
+  publish:
+    name: Pack & Publish
+    runs-on: ubuntu-latest
+
+    environment: nuget-publish
+
+    permissions:
+      id-token: write   # Required for OIDC token issuance
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "VERSION=$TAG" >> "$GITHUB_OUTPUT"
+          echo "📦 Version: $TAG"
+
+      - name: Restore
+        run: dotnet restore ${{ env.PACKAGE_PROJECT }}
+
+      - name: Build
+        run: dotnet build ${{ env.PACKAGE_PROJECT }} -c ${{ env.CONFIGURATION }} --no-restore /p:Version=${{ steps.version.outputs.VERSION }}
+
+      - name: Pack
+        run: dotnet pack ${{ env.PACKAGE_PROJECT }} -c ${{ env.CONFIGURATION }} --no-build /p:Version=${{ steps.version.outputs.VERSION }} -o ./artifacts
+
+      - name: NuGet login (OIDC Trusted Publishing)
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: Echostorm
+
+      - name: Push to NuGet.org
+        run: dotnet nuget push ./artifacts/*.nupkg --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-package
+          path: ./artifacts/*.nupkg
+          retention-days: 30

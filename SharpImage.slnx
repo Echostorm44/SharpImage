@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SharpImage.Cli/SharpImage.Cli.csproj" />
+    <Project Path="src/SharpImage.Editor/SharpImage.Editor.csproj" />
+    <Project Path="src/SharpImage/SharpImage.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SharpImage.Tests/SharpImage.Tests.csproj" />
+    <Project Path="tests/SharpImage.BigTest/SharpImage.BigTest.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/SharpImage.Benchmarks/SharpImage.Benchmarks.csproj" />
+  </Folder>
+</Solution>

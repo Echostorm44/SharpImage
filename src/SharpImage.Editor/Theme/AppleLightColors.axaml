@@ -1,0 +1,150 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!-- Apple HIG Light Mode — all semantic colors and Fluent overrides -->
+
+  <!-- Accent -->
+  <Color x:Key="AccentBlue">#007AFF</Color>
+  <Color x:Key="AccentBlueHover">#006AE0</Color>
+  <Color x:Key="AccentBlueActive">#005BBF</Color>
+  <Color x:Key="AccentRed">#FF3B30</Color>
+  <Color x:Key="AccentGreen">#34C759</Color>
+  <Color x:Key="AccentOrange">#FF9500</Color>
+  <Color x:Key="AccentYellow">#FFCC00</Color>
+
+  <!-- Backgrounds -->
+  <Color x:Key="BgPrimary">#FFFFFF</Color>
+  <Color x:Key="BgSecondary">#F2F2F7</Color>
+  <Color x:Key="BgTertiary">#FFFFFF</Color>
+  <Color x:Key="BgGrouped">#F2F2F7</Color>
+  <Color x:Key="BgGroupedSecondary">#FFFFFF</Color>
+  <Color x:Key="BgToolbar">#F6F6F6</Color>
+  <Color x:Key="BgSidebar">#F2F2F7</Color>
+  <Color x:Key="BgCanvas">#E8E8E8</Color>
+  <Color x:Key="BgStatusBar">#F2F2F7</Color>
+
+  <!-- Foreground / Labels -->
+  <Color x:Key="LabelPrimary">#000000</Color>
+  <Color x:Key="LabelSecondary">#993C3C43</Color>
+  <Color x:Key="LabelTertiary">#4D3C3C43</Color>
+  <Color x:Key="LabelQuaternary">#2E3C3C43</Color>
+
+  <!-- Separators -->
+  <Color x:Key="Separator">#4A3C3C43</Color>
+  <Color x:Key="SeparatorOpaque">#C6C6C8</Color>
+
+  <!-- Gray Scale -->
+  <Color x:Key="SystemGray">#8E8E93</Color>
+  <Color x:Key="SystemGray2">#AEAEB2</Color>
+  <Color x:Key="SystemGray3">#C7C7CC</Color>
+  <Color x:Key="SystemGray4">#D1D1D6</Color>
+  <Color x:Key="SystemGray5">#E5E5EA</Color>
+  <Color x:Key="SystemGray6">#F2F2F7</Color>
+
+  <!-- Fills -->
+  <Color x:Key="FillPrimary">#33787880</Color>
+  <Color x:Key="FillSecondary">#29787880</Color>
+  <Color x:Key="FillTertiary">#1F767680</Color>
+  <Color x:Key="FillQuaternary">#14747480</Color>
+
+  <!-- Interactive States -->
+  <Color x:Key="HoverBg">#0A000000</Color>
+  <Color x:Key="SelectedBg">#007AFF</Color>
+  <Color x:Key="SelectedText">#FFFFFF</Color>
+
+  <!-- Shadows -->
+  <Color x:Key="ShadowSmall">#1A000000</Color>
+  <Color x:Key="ShadowMedium">#1F000000</Color>
+
+  <!-- ═══ Fluent Theme Overrides ═══ -->
+
+  <!-- TextBox / TextControl -->
+  <SolidColorBrush x:Key="TextControlBackground" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="TextControlForeground" Color="#000000" />
+  <SolidColorBrush x:Key="TextControlForegroundPointerOver" Color="#000000" />
+  <SolidColorBrush x:Key="TextControlForegroundFocused" Color="#000000" />
+  <SolidColorBrush x:Key="TextControlBorderBrush" Color="#C6C6C8" />
+  <SolidColorBrush x:Key="TextControlBorderBrushPointerOver" Color="#8E8E93" />
+  <SolidColorBrush x:Key="TextControlBorderBrushFocused" Color="#007AFF" />
+  <SolidColorBrush x:Key="TextControlPlaceholderForeground" Color="#4D3C3C43" />
+  <SolidColorBrush x:Key="TextControlPlaceholderForegroundPointerOver" Color="#4D3C3C43" />
+  <SolidColorBrush x:Key="TextControlPlaceholderForegroundFocused" Color="#4D3C3C43" />
+  <SolidColorBrush x:Key="TextControlSelectionHighlightColor" Color="#007AFF" />
+
+  <!-- ComboBox -->
+  <SolidColorBrush x:Key="ComboBoxBackground" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="ComboBoxBackgroundPointerOver" Color="#F2F2F7" />
+  <SolidColorBrush x:Key="ComboBoxBackgroundPressed" Color="#E5E5EA" />
+  <SolidColorBrush x:Key="ComboBoxForeground" Color="#000000" />
+  <SolidColorBrush x:Key="ComboBoxBorderBrush" Color="#C6C6C8" />
+  <SolidColorBrush x:Key="ComboBoxBorderBrushPointerOver" Color="#8E8E93" />
+  <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="ComboBoxDropDownForeground" Color="#000000" />
+  <SolidColorBrush x:Key="ComboBoxBackgroundDisabled" Color="#E5E5EA" />
+  <SolidColorBrush x:Key="ComboBoxForegroundDisabled" Color="#4D3C3C43" />
+
+  <!-- Slider -->
+  <SolidColorBrush x:Key="SliderTrackFill" Color="#E5E5EA" />
+  <SolidColorBrush x:Key="SliderTrackFillPointerOver" Color="#D1D1D6" />
+  <SolidColorBrush x:Key="SliderTrackFillPressed" Color="#C7C7CC" />
+  <SolidColorBrush x:Key="SliderTrackFillDisabled" Color="#E5E5EA" />
+  <SolidColorBrush x:Key="SliderTrackValueFill" Color="#007AFF" />
+  <SolidColorBrush x:Key="SliderTrackValueFillPointerOver" Color="#006AE0" />
+  <SolidColorBrush x:Key="SliderTrackValueFillPressed" Color="#005BBF" />
+  <SolidColorBrush x:Key="SliderTrackValueFillDisabled" Color="#C7C7CC" />
+  <SolidColorBrush x:Key="SliderThumbBackground" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="SliderThumbBackgroundPointerOver" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="SliderThumbBackgroundPressed" Color="#F2F2F7" />
+  <SolidColorBrush x:Key="SliderThumbBackgroundDisabled" Color="#D1D1D6" />
+  <SolidColorBrush x:Key="SliderContainerBackground" Color="Transparent" />
+  <SolidColorBrush x:Key="SliderContainerBackgroundPointerOver" Color="Transparent" />
+  <SolidColorBrush x:Key="SliderContainerBackgroundPressed" Color="Transparent" />
+  <SolidColorBrush x:Key="SliderContainerBackgroundDisabled" Color="Transparent" />
+
+  <x:Double x:Key="SliderTrackThemeHeight">3</x:Double>
+  <x:Double x:Key="SliderHorizontalThumbWidth">16</x:Double>
+  <x:Double x:Key="SliderHorizontalThumbHeight">16</x:Double>
+  <x:Double x:Key="SliderVerticalThumbWidth">16</x:Double>
+  <x:Double x:Key="SliderVerticalThumbHeight">16</x:Double>
+  <CornerRadius x:Key="SliderThumbCornerRadius">8</CornerRadius>
+  <x:Double x:Key="SliderHorizontalHeight">20</x:Double>
+
+  <!-- Menu -->
+  <SolidColorBrush x:Key="MenuFlyoutPresenterBackground" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="MenuFlyoutPresenterBorderBrush" Color="#C6C6C8" />
+
+  <!-- Global text foreground -->
+  <SolidColorBrush x:Key="TextFillColorPrimaryBrush" Color="#000000" />
+  <SolidColorBrush x:Key="TextFillColorSecondaryBrush" Color="#993C3C43" />
+  <SolidColorBrush x:Key="TextFillColorTertiaryBrush" Color="#4D3C3C43" />
+  <SolidColorBrush x:Key="TextFillColorDisabledBrush" Color="#2E3C3C43" />
+
+  <!-- Semantic brushes -->
+  <SolidColorBrush x:Key="AccentBlueBrush" Color="#007AFF" />
+  <SolidColorBrush x:Key="AccentRedBrush" Color="#FF3B30" />
+  <SolidColorBrush x:Key="AccentGreenBrush" Color="#34C759" />
+  <SolidColorBrush x:Key="BgPrimaryBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="BgSecondaryBrush" Color="#F2F2F7" />
+  <SolidColorBrush x:Key="BgTertiaryBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="BgToolbarBrush" Color="#F6F6F6" />
+  <SolidColorBrush x:Key="BgSidebarBrush" Color="#F2F2F7" />
+  <SolidColorBrush x:Key="BgCanvasBrush" Color="#E8E8E8" />
+  <SolidColorBrush x:Key="BgStatusBarBrush" Color="#F2F2F7" />
+  <SolidColorBrush x:Key="LabelPrimaryBrush" Color="#000000" />
+  <SolidColorBrush x:Key="LabelSecondaryBrush" Color="#993C3C43" />
+  <SolidColorBrush x:Key="LabelTertiaryBrush" Color="#4D3C3C43" />
+  <SolidColorBrush x:Key="LabelQuaternaryBrush" Color="#2E3C3C43" />
+  <SolidColorBrush x:Key="SeparatorBrush" Color="#4A3C3C43" />
+  <SolidColorBrush x:Key="SeparatorOpaqueBrush" Color="#C6C6C8" />
+  <SolidColorBrush x:Key="SystemGrayBrush" Color="#8E8E93" />
+  <SolidColorBrush x:Key="FillPrimaryBrush" Color="#33787880" />
+  <SolidColorBrush x:Key="FillSecondaryBrush" Color="#29787880" />
+  <SolidColorBrush x:Key="FillTertiaryBrush" Color="#1F767680" />
+  <SolidColorBrush x:Key="FillQuaternaryBrush" Color="#14747480" />
+  <SolidColorBrush x:Key="HoverBgBrush" Color="#0A000000" />
+  <SolidColorBrush x:Key="SelectedBgBrush" Color="#007AFF" />
+  <SolidColorBrush x:Key="SelectedTextBrush" Color="#FFFFFF" />
+
+</ResourceDictionary>
