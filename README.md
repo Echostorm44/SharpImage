@@ -4,7 +4,7 @@ A pure C# .NET 10 port of ImageMagick. Zero native dependencies. Full AOT compat
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![.NET](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
-![NuGet Version](https://img.shields.io/nuget/v/Echostorm.SharpImage)
+[![NuGet Version](https://img.shields.io/nuget/v/Echostorm.SharpImage)](https://www.nuget.org/packages/Echostorm.SharpImage/)
 
 ## Why SharpImage?
 
