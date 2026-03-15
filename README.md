@@ -4,12 +4,13 @@ A pure C# .NET 10 port of ImageMagick. Zero native dependencies. Full AOT compat
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![.NET](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
+![NuGet Version](https://img.shields.io/nuget/v/Echostorm.SharpImage)
 
 ## Why SharpImage?
 
 ImageMagick is the gold standard for image processing, but it's written in C — a language that has allowed memory corruption, buffer overflows, and CVEs to accumulate for decades. .NET 10 has matured to the point where C# can compete with C and C++ in raw performance when used with care: `Span<T>`, hardware intrinsics (SSE2/SSE4.1/AVX2/AVX-512), `stackalloc`, `ArrayPool<T>`, and aggressive JIT inlining.
 
-SharpImage reimplements ImageMagick's image processing pipeline entirely in safe, managed C# — producing a library DLL, a CLI tool, and eventually a GUI editor.
+SharpImage reimplements ImageMagick's image processing pipeline entirely in safe, managed C# and with better performance — producing a library DLL, a CLI tool, and a GUI Photoshop style example project.
 
 ## Features
 
