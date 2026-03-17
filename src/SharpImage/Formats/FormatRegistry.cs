@@ -44,7 +44,8 @@ public enum ImageFileFormat
     Sgi,
     Pix,
     Sun,
-    Pdf
+    Pdf,
+    CameraRaw
 }
 
 /// <summary>
@@ -82,6 +83,12 @@ public static class FormatRegistry
         if (WebpCoder.CanDecode(data))
         {
             return ImageFileFormat.WebP;
+        }
+
+        // Camera raw formats MUST be checked before TIFF — many raw formats are TIFF-based
+        if (CameraRawCoder.CanDecode(data))
+        {
+            return ImageFileFormat.CameraRaw;
         }
 
         if (TiffCoder.CanDecode(data))
@@ -253,6 +260,29 @@ public static class FormatRegistry
             ".pix" or ".alias" => ImageFileFormat.Pix,
             ".sun" or ".ras" => ImageFileFormat.Sun,
             ".pdf" => ImageFileFormat.Pdf,
+            // Camera raw extensions
+            ".cr2" or ".cr3" or ".crw" => ImageFileFormat.CameraRaw,
+            ".nef" or ".nrw" => ImageFileFormat.CameraRaw,
+            ".arw" or ".sr2" or ".srf" => ImageFileFormat.CameraRaw,
+            ".dng" => ImageFileFormat.CameraRaw,
+            ".orf" => ImageFileFormat.CameraRaw,
+            ".rw2" => ImageFileFormat.CameraRaw,
+            ".raf" => ImageFileFormat.CameraRaw,
+            ".pef" => ImageFileFormat.CameraRaw,
+            ".srw" => ImageFileFormat.CameraRaw,
+            ".3fr" => ImageFileFormat.CameraRaw,
+            ".iiq" => ImageFileFormat.CameraRaw,
+            ".x3f" => ImageFileFormat.CameraRaw,
+            ".dcr" or ".k25" or ".kdc" => ImageFileFormat.CameraRaw,
+            ".mdc" => ImageFileFormat.CameraRaw,
+            ".mef" => ImageFileFormat.CameraRaw,
+            ".mos" => ImageFileFormat.CameraRaw,
+            ".mrw" => ImageFileFormat.CameraRaw,
+            ".rmf" => ImageFileFormat.CameraRaw,
+            ".rwl" => ImageFileFormat.CameraRaw,
+            ".erf" => ImageFileFormat.CameraRaw,
+            ".fff" => ImageFileFormat.CameraRaw,
+            ".sti" => ImageFileFormat.CameraRaw,
             _ => ImageFileFormat.Unknown
         };
     }
@@ -331,6 +361,7 @@ public static class FormatRegistry
             ImageFileFormat.Sgi => SgiCoder.Decode(data),
             ImageFileFormat.Pix => PixCoder.Decode(data),
             ImageFileFormat.Sun => SunCoder.Decode(data),
+            ImageFileFormat.CameraRaw => CameraRawCoder.Decode(data),
             _ => throw new NotSupportedException($"Unsupported image format: {format}")
         };
     }
@@ -374,6 +405,7 @@ public static class FormatRegistry
             ImageFileFormat.Pix => PixCoder.Encode(image),
             ImageFileFormat.Sun => SunCoder.Encode(image),
             ImageFileFormat.Pdf => PdfCoder.Encode(image),
+            ImageFileFormat.CameraRaw => CameraRawCoder.Encode(image),
             _ => throw new NotSupportedException($"Unsupported image format: {format}")
         };
     }

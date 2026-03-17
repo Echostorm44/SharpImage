@@ -14,7 +14,7 @@ SharpImage reimplements ImageMagick's image processing pipeline entirely in safe
 
 ## Features
 
-### 33 Image Formats
+### 34 Image Formats (Including 31 Camera Raw)
 
 | Category | Formats |
 |----------|---------|
@@ -24,6 +24,9 @@ SharpImage reimplements ImageMagick's image processing pipeline entirely in safe
 | **Compact** | QOI, Farbfeld, WBMP, PNM (PBM/PGM/PPM), PCX |
 | **Legacy/Niche** | XBM, XPM, DDS, SGI, PIX, SUN |
 | **Vector/Document** | SVG (rasterized), PDF |
+| **Camera Raw** | CR2, CR3, CRW, NEF, NRW, ARW, SR2, SRF, DNG, ORF, RW2, RAF, PEF, SRW, 3FR, IIQ, X3F, DCR, K25, KDC, MDC, MEF, MOS, MRW, RMF, RWL, ERF, FFF, STI |
+
+Camera raw support is **decode-only** for proprietary formats (Canon, Nikon, Sony, etc.) and **decode+encode** for DNG. Three demosaicing algorithms are available: Bilinear (fast), VNG (quality), and AHD (highest quality). Fujifilm X-Trans 6×6 CFA is also supported.
 
 ### 40+ Colorspaces
 
@@ -82,6 +85,7 @@ Benchmarks on .NET 10.0.3 with AVX-512, ShortRun (BenchmarkDotNet):
 | Composite Over | 512+256 | 238 µs | 1,536 KB |
 | CannyEdge | 256×256 | 1,204 µs | 1,880 KB |
 | SeamCarving | 256→200 | 10.2 ms | 440 KB |
+| **Raw Demosaic Bilinear** | **1024×1024** | **5,152 µs** | **644 B** |
 
 ### Design Principles
 
@@ -119,7 +123,7 @@ dotnet build -c Release
 
 ### Run TUnit Tests
 
-The test suite uses [TUnit](https://github.com/thomhurst/TUnit) with 1,400+ tests covering formats, colorspaces, transforms, effects, compositing, and edge cases.
+The test suite uses [TUnit](https://github.com/thomhurst/TUnit) with 1,600+ tests covering formats, colorspaces, transforms, effects, compositing, and edge cases.
 
 ```bash
 # Run the full test suite
@@ -164,6 +168,13 @@ dotnet run --project benchmarks/SharpImage.Benchmarks -c Release -- --list flat
 # Convert between formats
 dotnet run --project src/SharpImage.Cli -- convert photo.jpg photo.png
 
+# Convert camera raw to PNG (with demosaic algorithm selection)
+dotnet run --project src/SharpImage.Cli -- convert photo.cr2 photo.png
+dotnet run --project src/SharpImage.Cli -- convert photo.nef output.tiff --demosaic ahd
+
+# Display camera raw metadata
+dotnet run --project src/SharpImage.Cli -- rawinfo photo.cr2
+
 # Resize an image
 dotnet run --project src/SharpImage.Cli -- resize photo.jpg -w 800 -h 600 resized.png
 
@@ -189,6 +200,8 @@ Or publish AOT and use directly:
 dotnet publish src/SharpImage.Cli -c Release
 # Then use the native binary:
 sharpimage convert photo.jpg photo.png
+sharpimage convert photo.cr2 developed.tiff --demosaic ahd
+sharpimage rawinfo photo.nef
 ```
 
 ### Use as a Library
@@ -212,6 +225,25 @@ using var output = File.Create("resized.png");
 PngCoder.Write(resized, output);
 ```
 
+#### Camera Raw Decode
+
+```csharp
+using SharpImage.Formats;
+
+// Decode a camera raw file with specific options
+byte[] rawData = File.ReadAllBytes("photo.cr2");
+var options = new CameraRawDecodeOptions { Algorithm = DemosaicAlgorithm.AHD };
+var frame = CameraRawCoder.Decode(rawData, options);
+
+// Inspect raw metadata without decoding
+var metadata = CameraRawCoder.GetMetadata(rawData);
+Console.WriteLine($"{metadata.Make} {metadata.Model} — {metadata.SensorWidth}×{metadata.SensorHeight}");
+
+// Save as DNG (the only raw format that supports encode)
+byte[] dngData = CameraRawCoder.Encode(frame);
+File.WriteAllBytes("output.dng", dngData);
+```
+
 ## Architecture
 
 ```
@@ -221,7 +253,11 @@ SharpImage/
 │   │   ├── Core/                   # Quantum, PixelTypes, Geometry, MemoryPool
 │   │   ├── Image/                  # ImageFrame, PixelCache, CacheView, ImageList
 │   │   ├── Colorspaces/            # 40+ colorspace converters
-│   │   ├── Formats/                # 33 format coders (read/write)
+│   │   ├── Formats/                # 34 format families (incl. 31 camera raw)
+│   │   │   ├── CameraRawCoder.cs   # Camera raw decode/encode (CR2, NEF, ARW, DNG, ...)
+│   │   │   ├── CameraRawFormats.cs  # Per-format parsers (11 dedicated + generic)
+│   │   │   ├── BayerDemosaic.cs     # Bilinear/VNG/AHD + X-Trans demosaic
+│   │   │   └── ...                  # 30+ other format coders
 │   │   ├── Transform/              # Resize, Crop, Rotate, Distort, SeamCarving
 │   │   ├── Effects/                # 19 effect categories, 170+ operations
 │   │   ├── Enhance/                # Equalize, Normalize, CLAHE, Curves, etc.
@@ -233,7 +269,7 @@ SharpImage/
 │   │   └── Channel/                # Channel operations, separation, combining
 │   └── SharpImage.Cli/             # Command-line interface (228 commands)
 ├── tests/
-│   └── SharpImage.Tests/           # 1,400+ tests (TUnit framework)
+│   └── SharpImage.Tests/           # 1,600+ tests (TUnit framework)
 └── benchmarks/
     └── SharpImage.Benchmarks/      # BenchmarkDotNet performance suite
 ```
@@ -258,7 +294,8 @@ SharpImage/
 
 The test suite uses [TUnit](https://github.com/thomhurst/TUnit) and covers:
 
-- **Format round-trips** — encode→decode→compare for all 33 formats
+- **Format round-trips** — encode→decode→compare for all 34 format families
+- **Camera raw decode** — real-file tests for CR2, DNG, NEF, ORF, PEF, RAF, RW2 with metadata and pixel verification
 - **Colorspace accuracy** — forward→inverse conversion for all 40+ colorspaces
 - **Transform correctness** — pixel-perfect verification of flip, flop, rotate, crop, resize (all 23 methods)
 - **Edge cases** — 1×1 images, 16384×1 strips, all-black/white, fully transparent, extreme resize ratios, odd/prime dimensions, 16-bit quantum extremes

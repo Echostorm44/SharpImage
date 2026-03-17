@@ -13,7 +13,7 @@ public static class CliOutput
     public static void PrintBanner()
     {
         AnsiConsole.Write(new FigletText("SharpImage").Color(Color.Cyan1));
-        AnsiConsole.MarkupLine("[grey]Pure C# .NET 10 Image Processing — 33 formats, zero native dependencies[/]");
+        AnsiConsole.MarkupLine("[grey]Pure C# .NET 10 Image Processing — 34 formats (incl. 31 camera raw), zero native dependencies[/]");
         AnsiConsole.WriteLine();
     }
 

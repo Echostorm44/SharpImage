@@ -440,3 +440,80 @@ public class TransformNewBenchmarks
     [Benchmark(Description = "SmartCrop 256→128x128")]
     public ImageFrame SmartCrop_Small() => SmartCrop.Apply(small, 128, 128);
 }
+
+[MemoryDiagnoser]
+[ShortRunJob]
+public class CameraRawDecodeBenchmarks
+{
+    private ushort[] syntheticSensor = null!;
+    private RawSensorData rawData;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        // Create a 1024×1024 synthetic Bayer sensor (RGGB)
+        int w = 1024, h = 1024;
+        syntheticSensor = new ushort[w * h];
+        var rng = new Random(42);
+        for (int i = 0; i < syntheticSensor.Length; i++)
+            syntheticSensor[i] = (ushort)rng.Next(0, 65536);
+
+        rawData = new RawSensorData
+        {
+            RawPixels = syntheticSensor,
+            Width = w,
+            Height = h,
+            Metadata = new CameraRawMetadata
+            {
+                BayerPattern = BayerPattern.RGGB,
+                CfaType = CfaType.Bayer,
+                BitsPerSample = 16,
+                WhiteLevel = 65535,
+                BlackLevel = 0
+            }
+        };
+    }
+
+    [Benchmark(Description = "Demosaic Bilinear 1024x1024")]
+    public ImageFrame Demosaic_Bilinear() =>
+        BayerDemosaic.Demosaic(in rawData, DemosaicAlgorithm.Bilinear);
+
+    [Benchmark(Description = "Demosaic VNG 1024x1024")]
+    public ImageFrame Demosaic_VNG() =>
+        BayerDemosaic.Demosaic(in rawData, DemosaicAlgorithm.VNG);
+
+    [Benchmark(Description = "Demosaic AHD 1024x1024")]
+    public ImageFrame Demosaic_AHD() =>
+        BayerDemosaic.Demosaic(in rawData, DemosaicAlgorithm.AHD);
+
+    [Benchmark(Description = "ScaleToFullRange 1Mpx")]
+    public void ScaleToFullRange()
+    {
+        // Clone to avoid modifying benchmark data
+        var clone = new RawSensorData
+        {
+            RawPixels = (ushort[])syntheticSensor.Clone(),
+            Width = rawData.Width,
+            Height = rawData.Height,
+            Metadata = rawData.Metadata
+        };
+        CameraRawProcessor.ScaleToFullRange(ref clone);
+    }
+
+    [Benchmark(Description = "Full Pipeline Bilinear 1024x1024")]
+    public ImageFrame FullPipeline_Bilinear()
+    {
+        var clone = new RawSensorData
+        {
+            RawPixels = (ushort[])syntheticSensor.Clone(),
+            Width = rawData.Width,
+            Height = rawData.Height,
+            Metadata = rawData.Metadata
+        };
+        CameraRawProcessor.ScaleToFullRange(ref clone);
+        var frame = BayerDemosaic.Demosaic(in clone, DemosaicAlgorithm.Bilinear);
+        var opts = CameraRawDecodeOptions.Default;
+        CameraRawProcessor.Process(frame, in clone.Metadata, in opts);
+        return frame;
+    }
+}

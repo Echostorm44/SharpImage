@@ -667,7 +667,7 @@ public static class TiffCoder
             }
 
             int[] values = ReadTagValues(data, (int)valueOffset, type, (int)count, bigEndian);
-            tags[tagId] = new TiffTag(tagId, type, (int)count, values);
+            tags[tagId] = new TiffTag(tagId, type, (int)count, values, valueOffset);
         }
 
         // Next IFD offset
@@ -1556,9 +1556,10 @@ public enum TiffCompression
 }
 
 /// <summary>
-/// Internal TIFF tag representation.
+/// Internal TIFF tag representation. Stores parsed values and the absolute file offset
+/// of the tag data for use by format-specific decoders (e.g., MakerNote sub-parsing).
 /// </summary>
-internal readonly record struct TiffTag(ushort Id, ushort Type, int Count, int[] Values);
+internal readonly record struct TiffTag(ushort Id, ushort Type, int Count, int[] Values, long ValueOffset);
 
 /// <summary>
 /// Internal TIFF tag entry for writing.

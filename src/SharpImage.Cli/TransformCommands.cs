@@ -16,16 +16,22 @@ public static class TransformCommands
         var outputArg = new Argument<string>("output") { Description = "Output image file path (format determined by extension)" };
         var qualityOption = new Option<int>("--quality") { Description = "Encoding quality 1-100 for lossy formats like JXL (default: 100 = lossless)", DefaultValueFactory = _ => 100 };
         var bc7Option = new Option<bool>("--bc7") { Description = "Use BC7 compression for DDS output (default: uncompressed BGRA32)" };
+        var demosaicOption = new Option<string>("--demosaic") { Description = "Demosaic algorithm for camera raw input: bilinear, vng, ahd (default: bilinear)" };
         var cmd = new Command("convert", """
             Convert an image from one format to another.
             The output format is automatically determined from the file extension.
-            Supports 33 formats: PNG, JPEG, GIF, BMP, TGA, PNM, TIFF, WebP, QOI, ICO,
-            HDR, PSD, DDS, SVG, Farbfeld, WBMP, PCX, XBM, XPM, DPX, FITS, CIN,
-            DICOM, JPEG 2000, JPEG XL, AVIF, HEIC, OpenEXR, SGI, PIX, Sun, PDF.
+            Supports 34 formats including 31 camera raw variants (CR2, NEF, ARW, DNG, RAF, etc.).
+
+            For camera raw input, use --demosaic to select the demosaicing algorithm:
+              bilinear  — fast, suitable for previews (default)
+              vng       — Variable Number of Gradients, good quality
+              ahd       — Adaptive Homogeneity-Directed, highest quality
 
             Examples:
               sharpimage convert photo.jpg photo.png
               sharpimage convert scan.tiff output.webp
+              sharpimage convert photo.cr2 photo.png
+              sharpimage convert photo.nef output.tiff --demosaic ahd
               sharpimage convert image.bmp image.jxl --quality 75
               sharpimage convert image.png texture.dds --bc7
             """);
@@ -33,18 +39,40 @@ public static class TransformCommands
         cmd.Add(outputArg);
         cmd.Options.Add(qualityOption);
         cmd.Options.Add(bc7Option);
+        cmd.Options.Add(demosaicOption);
         cmd.SetAction((parseResult) =>
         {
             string input = parseResult.GetValue(inputArg)!;
             string output = parseResult.GetValue(outputArg)!;
             int quality = parseResult.GetValue(qualityOption);
             bool useBc7 = parseResult.GetValue(bc7Option);
+            string? demosaic = parseResult.GetValue(demosaicOption);
             if (!CliOutput.ValidateInputExists(input))
             {
                 return;
             }
 
-            if (useBc7 && output.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
+            // Camera raw with demosaic option: use CameraRawCoder directly
+            if (demosaic is not null)
+            {
+                var algo = demosaic.ToLowerInvariant() switch
+                {
+                    "vng" => DemosaicAlgorithm.VNG,
+                    "ahd" => DemosaicAlgorithm.AHD,
+                    _ => DemosaicAlgorithm.Bilinear
+                };
+                var rawOpts = new CameraRawDecodeOptions { Algorithm = algo };
+
+                CliOutput.RunPipelineCustomWrite(input, output, $"Converting (demosaic: {algo})",
+                    img => img,
+                    _ =>
+                    {
+                        byte[] rawData = File.ReadAllBytes(input);
+                        var decoded = CameraRawCoder.Decode(rawData, rawOpts);
+                        return FormatRegistry.Encode(decoded, FormatRegistry.DetectFromExtension(output));
+                    });
+            }
+            else if (useBc7 && output.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
             {
                 CliOutput.RunPipelineCustomWrite(input, output, "Converting", img => img,
                     img => DdsCoder.EncodeBc7(img));

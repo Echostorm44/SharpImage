@@ -80,6 +80,9 @@ public static class Program
                 var convTask = ctx.AddTask("[cyan]Format Conversions[/]", maxValue: 11);
                 await RunFormatConversions(convTask);
 
+                var rawTask = ctx.AddTask("[indianred1]Camera Raw Decode[/]", maxValue: 7);
+                await RunCameraRawDecodes(rawTask);
+
                 var transTask = ctx.AddTask("[green]Transform Operations[/]", maxValue: 40);
                 await RunTransformOperations(transTask);
 
@@ -203,6 +206,68 @@ public static class Program
                     Notes = !imSupported || !imSrcSupported ? "IM: format not natively supported" : ""
                 });
             }
+            task.Increment(1);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 1b. CAMERA RAW DECODE
+    // ─────────────────────────────────────────────────────────────
+
+    static readonly (string file, string label)[] CameraRawFiles =
+    [
+        ("sample1.cr2", "CR2 (Canon)"),
+        ("sample1.dng", "DNG (Adobe)"),
+        ("sample1.nef", "NEF (Nikon)"),
+        ("sample1.orf", "ORF (Olympus)"),
+        ("sample1.pef", "PEF (Pentax)"),
+        ("sample1.raf", "RAF (Fuji)"),
+        ("sample1.rw2", "RW2 (Panasonic)")
+    ];
+
+    static async Task RunCameraRawDecodes(ProgressTask task)
+    {
+        string outDir = Path.Combine(BigTestDir, "CameraRaw");
+        Directory.CreateDirectory(outDir);
+
+        foreach (var (file, label) in CameraRawFiles)
+        {
+            string srcPath = Path.Combine(ImagesDir, file);
+            bool siOk = false;
+            bool imOk = false;
+            string notes = "";
+
+            string ext = Path.GetExtension(file).TrimStart('.');
+            string siOut = Path.Combine(outDir, $"si_{ext}_{Path.GetFileNameWithoutExtension(file)}.png");
+            string imOut = Path.Combine(outDir, $"im_{ext}_{Path.GetFileNameWithoutExtension(file)}.png");
+
+            if (!File.Exists(srcPath))
+            {
+                notes = "Source file not found";
+            }
+            else
+            {
+                // SharpImage: convert raw → PNG via CLI
+                var siResult = await RunSharpImage($"convert \"{srcPath}\" \"{siOut}\"");
+                siOk = siResult.ExitCode == 0 && File.Exists(siOut) && new FileInfo(siOut).Length > 0;
+                if (!siOk && siResult.ExitCode != 0)
+                    notes = $"SI exit={siResult.ExitCode}";
+
+                // ImageMagick: convert raw → PNG
+                var imResult = await RunMagick($"\"{srcPath}\" \"{imOut}\"");
+                imOk = imResult.ExitCode == 0 && File.Exists(imOut) && new FileInfo(imOut).Length > 0;
+            }
+
+            results.Add(new TestResult
+            {
+                Category = "CameraRaw",
+                Name = $"Decode {label}",
+                SharpImagePassed = siOk,
+                ImageMagickPassed = imOk,
+                SharpImageFile = siOut,
+                ImageMagickFile = imOut,
+                Notes = notes
+            });
             task.Increment(1);
         }
     }

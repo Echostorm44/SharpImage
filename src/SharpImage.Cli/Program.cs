@@ -8,7 +8,7 @@ using System.CommandLine.Parsing;
 var rootCommand = new RootCommand("""
     SharpImage — Pure C# .NET 10 Image Processing CLI
     
-    Supports 33 image formats with zero native dependencies.
+    Supports 34 image formats (including 31 camera raw) with zero native dependencies.
     Full AOT-compatible. No C/C++ libraries required.
     
     Format Support:
@@ -18,6 +18,9 @@ var rootCommand = new RootCommand("""
       Modern:  AVIF, HEIC, JPEG 2000, JPEG XL
       HDR/VFX: OpenEXR
       Vector:  SVG (rasterized)
+      Camera Raw: CR2, CR3, CRW, NEF, NRW, ARW, SR2, SRF, DNG, ORF, RW2, RAF,
+                  PEF, SRW, 3FR, IIQ, X3F, DCR, K25, KDC, MDC, MEF, MOS, MRW,
+                  RMF, RWL, ERF, FFF, STI (decode; DNG also supports encode)
     
     Operations:
       Transform: convert, progressive, resize, crop, rotate, flip, flop, distort, trim,
@@ -55,10 +58,12 @@ var rootCommand = new RootCommand("""
       Colorspace: colorspace, colorspace-roundtrip, colorspaces
       Novel:     seamcarve, energymap, hashsuite, histmatch, histogram, smartcrop, interestmap, pipeline, tensor, palette, diff, animwebp, moderndither
       Pixel:     sortpixels, uniquecolors, clamp, cycle, strip, colorthreshold, randomthreshold, levelcolors, modefilter
-      Info:      info, formats, psdlayers
+      Info:      info, formats, psdlayers, rawinfo
     
     Examples:
       sharpimage convert photo.jpg photo.png
+      sharpimage convert photo.cr2 photo.png --demosaic ahd
+      sharpimage rawinfo photo.nef
       sharpimage resize photo.jpg -w 800 -h 600 resized.png
       sharpimage blur photo.jpg --sigma 3.0 blurred.png
       sharpimage compare original.png modified.png --diff difference.png
@@ -300,6 +305,7 @@ rootCommand.Add(ArtisticCommands.CreateImplodeCommand());
 rootCommand.Add(InfoCommands.CreateInfoCommand());
 rootCommand.Add(InfoCommands.CreateFormatsCommand());
 rootCommand.Add(InfoCommands.CreatePsdLayersCommand());
+rootCommand.Add(InfoCommands.CreateRawInfoCommand());
 
 // Analysis & detection commands
 rootCommand.Add(AnalysisCommands.CreatePhashCommand());

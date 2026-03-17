@@ -194,9 +194,38 @@ public static class InfoCommands
             AddFormatRow(table, "AVIF", ".avif", true, true, "AVIF — AV1 still image");
             AddFormatRow(table, "HEIC", ".heic .heif", true, true, "HEIC — HEVC still image");
             AddFormatRow(table, "EXR", ".exr", true, true, "OpenEXR — HDR, VFX/film industry");
+            AddFormatRow(table, "SGI", ".sgi .rgb .bw", true, true, "SGI — Silicon Graphics image");
+            AddFormatRow(table, "PIX", ".pix", true, true, "PIX — Alias/WaveFront image");
+            AddFormatRow(table, "Sun", ".sun .ras", true, true, "Sun Raster — Sun Microsystems");
+            AddFormatRow(table, "PDF", ".pdf", false, true, "PDF — rasterized page export");
+
+            // Camera Raw formats
+            table.AddEmptyRow();
+            table.AddRow("[bold yellow]Camera Raw[/]", "", "", "", "[dim]31 manufacturer-specific raw formats[/]");
+            AddFormatRow(table, "DNG", ".dng", true, true, "Adobe Digital Negative — open raw standard");
+            AddFormatRow(table, "CR2", ".cr2", true, false, "Canon RAW 2 — Canon EOS DSLR");
+            AddFormatRow(table, "CR3", ".cr3", true, false, "Canon RAW 3 — Canon EOS R mirrorless");
+            AddFormatRow(table, "CRW", ".crw", true, false, "Canon RAW (CIFF) — older Canon");
+            AddFormatRow(table, "NEF", ".nef .nrw", true, false, "Nikon Electronic Format — Nikon DSLR/Z");
+            AddFormatRow(table, "ARW", ".arw .sr2 .srf", true, false, "Sony Alpha RAW — Sony mirrorless/DSLR");
+            AddFormatRow(table, "ORF", ".orf", true, false, "Olympus RAW Format — Olympus/OM System");
+            AddFormatRow(table, "RW2", ".rw2", true, false, "Panasonic RAW — Lumix cameras");
+            AddFormatRow(table, "RAF", ".raf", true, false, "Fuji RAW — Fujifilm X-Trans/Bayer");
+            AddFormatRow(table, "PEF", ".pef", true, false, "Pentax Electronic Format — Pentax DSLR");
+            AddFormatRow(table, "SRW", ".srw", true, false, "Samsung RAW — Samsung NX cameras");
+            AddFormatRow(table, "3FR", ".3fr", true, false, "Hasselblad 3F RAW — Hasselblad medium format");
+            AddFormatRow(table, "IIQ", ".iiq", true, false, "Phase One — medium format digital back");
+            AddFormatRow(table, "X3F", ".x3f", true, false, "Sigma/Foveon — Foveon X3 sensor");
+            AddFormatRow(table, "DCR/KDC", ".dcr .k25 .kdc", true, false, "Kodak RAW — Kodak DSLRs");
+            AddFormatRow(table, "MRW", ".mrw", true, false, "Minolta RAW — Konica Minolta");
+            AddFormatRow(table, "MEF", ".mef", true, false, "Mamiya Electronic Format — Mamiya/Phase One");
+            AddFormatRow(table, "MOS", ".mos", true, false, "Leaf MOS — Leaf digital backs");
+            AddFormatRow(table, "ERF", ".erf", true, false, "Epson RAW — Epson R-D1");
+            AddFormatRow(table, "FFF", ".fff", true, false, "Hasselblad Flexible File Format");
+            AddFormatRow(table, "Others", ".mdc .rmf .rwl .sti", true, false, "Minolta MDC, Ricoh, Sinar raw formats");
 
             AnsiConsole.Write(table);
-            AnsiConsole.MarkupLine($"\n[bold]Total: [cyan]28[/] formats supported[/]");
+            AnsiConsole.MarkupLine($"\n[bold]Total: [cyan]34[/] format families ([cyan]31[/] camera raw variants) supported[/]");
         });
         return cmd;
     }
@@ -288,4 +317,128 @@ public static class InfoCommands
         });
         return cmd;
     }
+
+    public static Command CreateRawInfoCommand()
+    {
+        var inputArg = new Argument<string>("input") { Description = "Camera raw file path (CR2, NEF, ARW, DNG, RAF, etc.)" };
+        var cmd = new Command("rawinfo", """
+            Display detailed camera raw metadata without fully decoding the image.
+            Shows manufacturer, camera model, sensor dimensions, Bayer pattern,
+            bit depth, compression, exposure settings, and white balance data.
+
+            Examples:
+              sharpimage rawinfo photo.cr2
+              sharpimage rawinfo photo.nef
+              sharpimage rawinfo photo.dng
+            """);
+        cmd.Add(inputArg);
+        cmd.SetAction((parseResult) =>
+        {
+            string input = parseResult.GetValue(inputArg)!;
+            if (!CliOutput.ValidateInputExists(input))
+                return;
+
+            byte[] data = File.ReadAllBytes(input);
+            if (!CameraRawCoder.CanDecode(data))
+            {
+                var extFormat = FormatRegistry.DetectFromExtension(input);
+                if (extFormat != ImageFileFormat.CameraRaw)
+                {
+                    CliOutput.PrintError("Not a recognized camera raw format.");
+                    return;
+                }
+            }
+
+            CameraRawMetadata meta;
+            try
+            {
+                meta = CameraRawCoder.GetMetadata(data);
+            }
+            catch (Exception ex)
+            {
+                CliOutput.PrintError($"Failed to parse raw metadata: {ex.Message}");
+                return;
+            }
+
+            var fileInfo = new FileInfo(input);
+            var table = new Table()
+                .Border(TableBorder.Rounded)
+                .AddColumn("[bold]Property[/]")
+                .AddColumn("[bold]Value[/]")
+                .Title($"[cyan]Camera Raw Info: {Markup.Escape(Path.GetFileName(input))}[/]");
+
+            table.AddRow("File", Markup.Escape(input));
+            table.AddRow("File Size", FormatFileSize(fileInfo.Length));
+            table.AddRow("Format", $"[green]{meta.Format}[/]");
+
+            table.AddRow("[bold]Camera[/]", "");
+            table.AddRow("  Make", string.IsNullOrEmpty(meta.Make) ? "[dim]unknown[/]" : Markup.Escape(meta.Make));
+            table.AddRow("  Model", string.IsNullOrEmpty(meta.Model) ? "[dim]unknown[/]" : Markup.Escape(meta.Model));
+
+            table.AddRow("[bold]Sensor[/]", "");
+            table.AddRow("  Sensor Size", $"{meta.SensorWidth} × {meta.SensorHeight} pixels");
+            table.AddRow("  Active Area", $"{meta.ActiveAreaWidth} × {meta.ActiveAreaHeight} pixels");
+            if (meta.ActiveAreaLeft != 0 || meta.ActiveAreaTop != 0)
+                table.AddRow("  Active Offset", $"({meta.ActiveAreaLeft}, {meta.ActiveAreaTop})");
+            table.AddRow("  Megapixels", $"{(double)meta.ActiveAreaWidth * meta.ActiveAreaHeight / 1_000_000:F1} MP");
+            table.AddRow("  CFA Type", $"{meta.CfaType}");
+            if (meta.CfaType == CfaType.Bayer)
+                table.AddRow("  Bayer Pattern", $"{meta.BayerPattern}");
+            table.AddRow("  Bits Per Sample", $"{meta.BitsPerSample}");
+            table.AddRow("  Compression", $"{meta.Compression}");
+
+            table.AddRow("[bold]Levels[/]", "");
+            table.AddRow("  Black Level", meta.BlackLevelPerChannel is not null
+                ? string.Join(", ", meta.BlackLevelPerChannel)
+                : $"{meta.BlackLevel}");
+            table.AddRow("  White Level", $"{meta.WhiteLevel}");
+
+            if (meta.IsoSpeed > 0 || meta.ExposureTime > 0 || meta.FNumber > 0)
+            {
+                table.AddRow("[bold]Exposure[/]", "");
+                if (meta.IsoSpeed > 0) table.AddRow("  ISO", $"{meta.IsoSpeed}");
+                if (meta.ExposureTime > 0)
+                {
+                    string shutterStr = meta.ExposureTime >= 1
+                        ? $"{meta.ExposureTime:F1}s"
+                        : $"1/{1.0 / meta.ExposureTime:F0}s";
+                    table.AddRow("  Shutter Speed", shutterStr);
+                }
+                if (meta.FNumber > 0) table.AddRow("  Aperture", $"f/{meta.FNumber:F1}");
+                if (meta.FocalLength > 0) table.AddRow("  Focal Length", $"{meta.FocalLength:F1} mm");
+            }
+
+            if (meta.AsShotWhiteBalance is not null)
+            {
+                table.AddRow("[bold]White Balance[/]", "");
+                table.AddRow("  As-Shot WB", string.Join(", ", meta.AsShotWhiteBalance.Select(v => v.ToString("F4"))));
+                if (meta.DaylightWhiteBalance is not null)
+                    table.AddRow("  Daylight WB", string.Join(", ", meta.DaylightWhiteBalance.Select(v => v.ToString("F4"))));
+            }
+
+            table.AddRow("[bold]Raw Data[/]", "");
+            table.AddRow("  Data Offset", $"{meta.RawDataOffset:N0} bytes");
+            table.AddRow("  Data Length", $"{meta.RawDataLength:N0} bytes ({FormatFileSize(meta.RawDataLength)})");
+            if (meta.ThumbnailLength > 0)
+                table.AddRow("  Thumbnail", $"offset {meta.ThumbnailOffset:N0}, {FormatFileSize(meta.ThumbnailLength)}");
+            table.AddRow("  Orientation", $"{meta.Orientation} ({OrientationDescription(meta.Orientation)})");
+
+            AnsiConsole.Write(table);
+        });
+        return cmd;
+    }
+
+    private static string OrientationDescription(int orientation) => orientation switch
+    {
+        1 => "Normal",
+        2 => "Mirrored horizontal",
+        3 => "Rotated 180°",
+        4 => "Mirrored vertical",
+        5 => "Mirrored horizontal + rotated 270°",
+        6 => "Rotated 90° CW",
+        7 => "Mirrored horizontal + rotated 90°",
+        8 => "Rotated 270° CW",
+        _ => "Unknown"
+    };
+
 }
