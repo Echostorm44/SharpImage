@@ -1,0 +1,795 @@
+# SharpImage — AI Agent Usage Guide
+
+A pure C# .NET 10 port of ImageMagick. Zero native dependencies, AOT-compatible.
+This document is for AI coding agents using SharpImage as a NuGet package.
+
+- **Package**: `Echostorm.SharpImage`
+- **Target**: .NET 10.0
+- **Install**: `dotnet add package Echostorm.SharpImage`
+- **Repo**: https://github.com/Echostorm44/SharpImage
+
+---
+
+## 30-Second Quickstart
+
+If you only read this section, you can write working code:
+
+```csharp
+using SharpImage;
+
+// Fluent pipeline — recommended path. Auto-disposes intermediates.
+ImagePipeline.Load("input.jpg")
+    .Resize(800, 600)
+    .Sharpen(sigma: 0.5, amount: 1.5)
+    .Save("output.png")
+    .Dispose();
+```
+
+That's it. The fluent `ImagePipeline` API is the recommended way to use SharpImage
+for most tasks because it eliminates the manual disposal management that the
+underlying static-method API requires. Read the rest of this doc only if you need
+operations the pipeline doesn't expose, or if you're working with frames directly.
+
+---
+
+## Two API Layers
+
+SharpImage has **two layers** that work on the same underlying types:
+
+1. **`ImagePipeline`** (recommended) — fluent, auto-disposes intermediates.
+   Top-level namespace `SharpImage`.
+2. **Static classes** (advanced) — `Resize.Apply(...)`, `Geometry.Crop(...)`,
+   `EnhanceOps.Modulate(...)`, etc. Each call returns a new `ImageFrame` that
+   the caller is responsible for disposing.
+
+Use the pipeline for chains. Use static classes when you need an op the
+pipeline doesn't expose, when you're integrating into existing code that
+manages `ImageFrame` instances, or when you need to fan one frame out to
+several outputs.
+
+---
+
+## Namespace Map
+
+```csharp
+using SharpImage;                  // ImagePipeline (fluent API)
+using SharpImage.Image;            // ImageFrame, ImageSequence, PixelCache
+using SharpImage.Core;             // Quantum, ColorspaceType, CompositeOperator,
+                                   //   PixelChannel, FilterType, GravityType, enums
+using SharpImage.Formats;          // FormatRegistry, JpegCoder, PngCoder, ...
+                                   //   CameraRawCoder, TiffCompression,
+                                   //   DemosaicAlgorithm, ImageFileFormat
+using SharpImage.Transform;        // Resize, Geometry, Composite,
+                                   //   InterpolationMethod, RotationAngle,
+                                   //   CompositeMode, SeamCarving, SmartCrop
+using SharpImage.Effects;          // ConvolutionFilters, BlurNoiseOps,
+                                   //   ColorAdjust, ArtisticOps, NoiseType, ...
+using SharpImage.Enhance;          // EnhanceOps
+using SharpImage.Colorspaces;      // ColorspaceOps, ColorspaceConverter
+using SharpImage.Channel;          // ChannelOps, AlphaOps
+```
+
+> **Note**: `ColorspaceType` lives in `SharpImage.Core`, NOT `SharpImage.Colorspaces`.
+
+---
+
+## Core Type: `ImageFrame`
+
+The container for pixel data. `IDisposable` — always dispose (or use the pipeline).
+
+Key properties (all on `ImageFrame`):
+
+| Property | Type | Notes |
+|---|---|---|
+| `Columns` | `long` | Width in pixels. **NOT `Width`.** |
+| `Rows` | `long` | Height in pixels. **NOT `Height`.** |
+| `NumberOfChannels` | `int` | 3 for RGB, 4 for RGBA, 1 for Gray |
+| `HasAlpha` | `bool` | |
+| `Colorspace` | `ColorspaceType` | Default `SRGB` |
+| `Depth` | `int` | Default 16 (16-bit quantum) |
+| `Quality` | `int` | Format-specific quality hint |
+| `Metadata` | `ImageMetadata` | EXIF / XMP / ICC |
+
+**Pixel values are 16-bit** (`ushort`, range 0–65535), not 0–255. Use
+`Quantum.MaxValue` (= 65535) and `Quantum.Scale` (= 1/65535) when normalizing.
+
+### Creating an `ImageFrame` from scratch
+
+```csharp
+using SharpImage.Core;
+using SharpImage.Image;
+
+var frame = new ImageFrame();
+frame.Initialize(columns: 256, rows: 256,
+                 colorspace: ColorspaceType.SRGB, hasAlpha: false);
+
+// Write a row of red pixels
+for (long y = 0; y < frame.Rows; y++)
+{
+    Span<ushort> row = frame.GetPixelRowForWrite(y);
+    int channels = frame.NumberOfChannels;
+    for (int x = 0; x < frame.Columns; x++)
+    {
+        int off = x * channels;
+        row[off]     = Quantum.MaxValue;  // R
+        row[off + 1] = 0;                 // G
+        row[off + 2] = 0;                 // B
+    }
+}
+```
+
+### Pixel access
+
+```csharp
+// Read-only row
+ReadOnlySpan<ushort> row = frame.GetPixelRow(y);
+
+// Writable row
+Span<ushort> writeRow = frame.GetPixelRowForWrite(y);
+
+// Row length is Columns * NumberOfChannels, channel order is R, G, B[, A]
+
+// Single-pixel access (slower than rows for bulk work)
+ushort r = frame.GetPixelChannel(x, y, 0);
+frame.SetPixelChannel(x, y, 0, (ushort)32768);
+PixelInfo px = frame.GetPixel(x, y);
+frame.SetPixel(x, y, in px);
+```
+
+### Cloning and disposing
+
+```csharp
+ImageFrame copy = frame.Clone();   // Independent copy
+frame.Dispose();                   // Releases backing memory
+```
+
+---
+
+## Loading and Saving
+
+### Recommended: `FormatRegistry` (auto-detects format)
+
+```csharp
+using SharpImage.Formats;
+
+// From file path — format detected from header bytes
+ImageFrame img = FormatRegistry.Read("photo.jpg");
+
+// From byte array
+byte[] data = File.ReadAllBytes("photo.jpg");
+ImageFrame img2 = FormatRegistry.Read(data);
+
+// Write — format inferred from extension; quality applies to lossy formats
+FormatRegistry.Write(img, "out.png");                   // PNG
+FormatRegistry.Write(img, "out.jpg", quality: 90);      // JPEG
+FormatRegistry.Write(img, "out.webp", quality: 80);     // WebP
+
+// Round-trip through bytes
+byte[] encoded = FormatRegistry.Encode(img, ImageFileFormat.Png);
+ImageFrame decoded = FormatRegistry.Decode(encoded, ImageFileFormat.Png);
+```
+
+### Format-specific coders
+
+Use these when you need format-specific options. Note that **not every coder
+has a `string path` overload** — some are stream-only (e.g., `WebpCoder.Write`,
+`BmpCoder.Write`).
+
+```csharp
+// JPEG — quality, subsampling, optional Huffman optimization
+JpegCoder.Read("photo.jpg");                 // path or Stream
+JpegCoder.Write(img, "out.jpg", quality: 85);
+JpegCoder.WriteProgressive(img, "out.jpg", quality: 85);
+
+// PNG — no quality knob; lossless
+PngCoder.Read("photo.png");
+PngCoder.Write(img, "out.png");
+
+// PNG sequence (APNG) — returns a tuple
+(ImageFrame[] Frames, int LoopCount, int[] DelaysMs) apng =
+    PngCoder.ReadSequence("anim.apng");
+PngCoder.WriteSequence(apng.Frames, "out.apng", apng.DelaysMs, loopCount: 0);
+
+// GIF — animation returns ImageSequence (not a tuple)
+ImageSequence gifAnim = GifCoder.ReadSequence("anim.gif");
+GifCoder.WriteSequence(gifAnim, "out.gif");
+
+// TIFF — compression options, multi-page
+TiffCoder.Write(img, "out.tiff", TiffCompression.Deflate);  // None|Lzw|Deflate|PackBits
+List<ImageFrame> pages = TiffCoder.ReadMultiPage("doc.tiff");
+TiffCoder.WriteMultiPage(pages, "out.tiff", TiffCompression.Lzw);
+
+// WebP — STREAM ONLY, no string-path overload
+using (var fs = File.Create("out.webp"))
+    WebpCoder.Write(img, fs, quality: 90);
+
+// BMP — has both path and stream; bool for alpha channel
+BmpCoder.Write(img, "out.bmp", includeAlpha: true);
+```
+
+### Available coders
+
+| Class | Read | Write | Notes |
+|---|---|---|---|
+| `FormatRegistry` | ✅ | ✅ | Auto-detect; quality param on `Write` |
+| `JpegCoder` | ✅ | ✅ | Quality, subsampling, progressive |
+| `PngCoder` | ✅ | ✅ | Read/Write APNG sequences |
+| `GifCoder` | ✅ | ✅ | Animation via `ImageSequence` |
+| `TiffCoder` | ✅ | ✅ | Multi-page, tiled, compression options |
+| `WebpCoder` | ✅ | ✅ | **Stream-only API** |
+| `BmpCoder` | ✅ | ✅ | Optional alpha for 32-bit |
+| `IcoCoder` | ✅ | ✅ | |
+| `TgaCoder` | ✅ | ✅ | |
+| `HeifCoder` | ✅ | ✅ | HEIC / AVIF |
+| `JxlCoder` | ✅ | ✅ | JPEG XL |
+| `Jpeg2000Coder` | ✅ | ✅ | |
+| `ExrCoder` | ✅ | ✅ | OpenEXR |
+| `HdrCoder` | ✅ | ✅ | Radiance HDR |
+| `DpxCoder` / `CinCoder` | ✅ | ✅ | Film/cinema |
+| `PsdCoder` | ✅ | ✅ | Photoshop |
+| `DicomCoder` | ✅ | ✅ | Medical imaging |
+| `FitsCoder` | ✅ | ✅ | Astronomy |
+| `QoiCoder` | ✅ | ✅ | |
+| `FarbfeldCoder`, `PnmCoder`, `WbmpCoder`, `XbmCoder`, `XpmCoder`, `SgiCoder`, `SunCoder`, `PixCoder`, `PcxCoder`, `DdsCoder` | ✅ | varies | Niche/legacy |
+| `SvgCoder` | ✅ | rasterizes only | |
+| `PdfCoder` | ✅ | rasterizes only | |
+| `CameraRawCoder` | ✅ | DNG only | 31 raw formats |
+
+---
+
+## Common Recipes (Pipeline Style — Recommended)
+
+### Resize and save
+
+```csharp
+using SharpImage;
+using SharpImage.Transform;
+
+using var p = ImagePipeline.Load("photo.jpg")
+    .Resize(800, 600, InterpolationMethod.Lanczos3)
+    .Save("resized.png");
+```
+
+### Thumbnail batch
+
+```csharp
+foreach (string path in Directory.GetFiles("photos", "*.jpg"))
+{
+    using var p = ImagePipeline.Load(path)
+        .Resize(200, 200)            // for true aspect-fit thumbnail use Resize.Thumbnail
+        .Sharpen(sigma: 0.5, amount: 1.0)
+        .Save(Path.Combine("thumbs", Path.GetFileName(path)));
+}
+```
+
+> For aspect-preserving thumbnails, use the static `Resize.Thumbnail(frame, maxW, maxH)`
+> — the pipeline's `Resize` is a hard resize to exact dimensions.
+
+### Crop, rotate, save as JPEG
+
+```csharp
+using var p = ImagePipeline.Load("portrait.png")
+    .Crop(x: 100, y: 50, width: 800, height: 1200)
+    .Rotate(RotationAngle.Rotate90)         // or .Rotate(45.0) for arbitrary angle
+    .Save("portrait_cropped.jpg");
+```
+
+### Color-correct workflow
+
+```csharp
+using var p = ImagePipeline.Load("flat.jpg")
+    .WhiteBalance()
+    .AutoLevel()
+    .Modulate(brightness: 105, saturation: 115, hue: 100)
+    .Sharpen(sigma: 0.5, amount: 1.2)
+    .Save("graded.jpg");
+```
+
+### Artistic
+
+```csharp
+using var p = ImagePipeline.Load("photo.jpg")
+    .OilPaint(radius: 4)
+    .Vignette(sigma: 30)
+    .Save("painted.jpg");
+```
+
+### Apply an op the pipeline doesn't expose
+
+```csharp
+using SharpImage.Effects;
+
+using var p = ImagePipeline.Load("photo.jpg")
+    .Apply(frame => CreativeFilters.TiltShift(frame, /*params*/))
+    .Save("tiltshift.jpg");
+```
+
+The `.Apply(Func<ImageFrame, ImageFrame>)` escape hatch lets you plug any
+static op into a pipeline. The pipeline disposes the input frame and adopts
+the returned one.
+
+### Inspect mid-pipeline (read-only)
+
+```csharp
+using var p = ImagePipeline.Load("photo.jpg")
+    .Resize(800, 600)
+    .Inspect(f => Console.WriteLine($"After resize: {f.Columns}x{f.Rows}"))
+    .GaussianBlur(2.0)
+    .Save("out.png");
+```
+
+### Hand off the final frame instead of saving
+
+```csharp
+ImageFrame finalFrame = ImagePipeline.Load("in.jpg")
+    .Resize(512, 512)
+    .Grayscale()
+    .ToFrame();         // pipeline releases ownership; you must dispose
+// ... use finalFrame ...
+finalFrame.Dispose();
+```
+
+### Encode to a byte array
+
+```csharp
+using var p = ImagePipeline.Load("in.jpg").Resize(256, 256);
+byte[] pngBytes = p.Encode(ImageFileFormat.Png);
+```
+
+---
+
+## Recipes (Static API)
+
+Use these patterns when you're not in a pipeline — typically when you have
+an existing `ImageFrame` you didn't load yourself.
+
+### Resize
+
+```csharp
+using SharpImage.Transform;
+
+using var src = FormatRegistry.Read("in.jpg");
+
+// Hard resize to exact dimensions
+using var resized = Resize.Apply(src, 800, 600, InterpolationMethod.Lanczos3);
+
+// Aspect-preserving thumbnail (fits within bounds)
+using var thumb = Resize.Thumbnail(src, maxWidth: 200, maxHeight: 200);
+
+// Adaptive area-averaging downscale
+using var adaptive = Resize.AdaptiveResize(src, 400, 300);
+
+// Non-interpolated point sampling (pixel art / palette images)
+using var sampled = Resize.Sample(src, 400, 300);
+```
+
+### Geometry
+
+```csharp
+using SharpImage.Transform;
+
+using var cropped   = Geometry.Crop(src, x: 10, y: 10, width: 100, height: 100);
+using var flipped   = Geometry.Flip(src);              // vertical
+using var flopped   = Geometry.Flop(src);              // horizontal
+using var rotated   = Geometry.Rotate(src, RotationAngle.Rotate90);   // 90/180/270
+using var spun      = Geometry.RotateArbitrary(src, 37.5);            // any angle
+using var trimmed   = Geometry.Trim(src, fuzz: 0.0);   // crop solid borders
+using var transposed= Geometry.Transpose(src);         // diagonal flip
+using var deskewed  = Geometry.Deskew(src, threshold: 0.4);
+using var oriented  = Geometry.AutoOrient(src);        // honors EXIF orientation
+
+// Resize the canvas without resizing the image
+using var extended = Geometry.Extent(src, newWidth: 1000, newHeight: 800,
+                                     xOffset: 50, yOffset: 50);
+
+// Cut out an interior region
+using var chopped = Geometry.Chop(src, chopX: 100, chopY: 100,
+                                   chopWidth: 50, chopHeight: 50);
+```
+
+### Composite (overlay one image on another)
+
+> **Important:** `Composite.Apply` returns `void` and **mutates `baseImage`
+> in place**. This is the *only* mutating op in the public surface. Clone
+> first if you need to keep the original.
+
+```csharp
+using SharpImage.Transform;
+
+using var background = FormatRegistry.Read("bg.jpg");
+using var logo       = FormatRegistry.Read("logo.png");
+
+int x = (int)(background.Columns - logo.Columns) / 2;
+int y = (int)(background.Rows - logo.Rows) / 2;
+
+Composite.Apply(background, logo, offsetX: x, offsetY: y, mode: CompositeMode.Over);
+//      ^^^^^^^^^^^^^^^^^^ no return value — background is modified in place
+
+FormatRegistry.Write(background, "result.jpg", quality: 95);
+```
+
+### Blur and sharpen
+
+```csharp
+using SharpImage.Effects;
+
+using var blurred = ConvolutionFilters.GaussianBlur(src, sigma: 2.0);
+using var sharp   = ConvolutionFilters.Sharpen(src, sigma: 1.0, amount: 2.0);
+using var unsharp = ConvolutionFilters.UnsharpMask(src,
+                        sigma: 1.0, amount: 1.5, threshold: 0.0);
+using var edges   = ConvolutionFilters.EdgeDetect(src, radius: 1.0);
+using var emboss  = ConvolutionFilters.Emboss(src);
+
+// Motion blur lives on BlurNoiseOps, not ConvolutionFilters
+using var motion  = BlurNoiseOps.MotionBlur(src,
+                        radius: 5, sigma: 2.0, angle: 45.0);
+using var radial  = BlurNoiseOps.RadialBlur(src, angle: 5.0);
+using var noisy   = BlurNoiseOps.AddNoise(src, NoiseType.Gaussian, attenuate: 1.0);
+using var denoised= BlurNoiseOps.WaveletDenoise(src, threshold: 0.05);
+```
+
+### Color adjustment
+
+```csharp
+using SharpImage.Effects;
+
+using var brighter  = ColorAdjust.Brightness(src, factor: 1.2);  // >1 brighter
+using var darker    = ColorAdjust.Brightness(src, factor: 0.8);  // <1 darker
+using var contrast  = ColorAdjust.Contrast(src, factor: 1.3);
+using var gamma     = ColorAdjust.Gamma(src, gamma: 0.8);
+using var gray      = ColorAdjust.Grayscale(src);
+using var inverted  = ColorAdjust.Invert(src);
+using var posterize = ColorAdjust.Posterize(src, levels: 4);
+using var saturated = ColorAdjust.Saturate(src, factor: 1.4);
+using var thresholded = ColorAdjust.Threshold(src, threshold: 0.5);
+using var levels    = ColorAdjust.Levels(src, /* see signature */);
+using var exposed   = ColorAdjust.Exposure(src, evStops: 1.5);
+using var vibrant   = ColorAdjust.Vibrance(src, amount: 0.4);
+using var dehazed   = ColorAdjust.Dehaze(src, strength: 0.5, patchRadius: 7);
+```
+
+### Enhancement (auto-correction)
+
+```csharp
+using SharpImage.Enhance;
+
+using var equalized = EnhanceOps.Equalize(src);                         // histogram eq
+using var normalized= EnhanceOps.Normalize(src);                        // contrast stretch
+using var leveled   = EnhanceOps.AutoLevel(src);
+using var autoGamma = EnhanceOps.AutoGamma(src);
+using var balanced  = EnhanceOps.WhiteBalance(src);
+
+// Note: parameter is `contrast` (positional, no default), not `contrastLevel`
+using var sigmoid   = EnhanceOps.SigmoidalContrast(src,
+                          contrast: 5.0, midpoint: 0.5, sharpen: true);
+
+// Note: separate tilesX, tilesY — not a single tileSize
+using var clahe     = EnhanceOps.CLAHE(src,
+                          tilesX: 8, tilesY: 8, clipLimit: 2.0);
+
+using var modulated = EnhanceOps.Modulate(src,
+                          brightness: 100, saturation: 100, hue: 100);
+                      // values in % — 100 = no change
+
+using var sepia     = EnhanceOps.SepiaTone(src, threshold: 0.8);
+using var solar     = EnhanceOps.Solarize(src, threshold: 0.5);
+using var tinted    = EnhanceOps.Colorize(src,
+                          tintR: 200, tintG: 100, tintB: 50, amount: 0.5);
+```
+
+### Channel operations
+
+```csharp
+using SharpImage.Channel;
+
+ImageFrame[] channels = ChannelOps.Separate(src);   // RGB → 3 grayscale frames
+using var single = ChannelOps.SeparateChannel(src, channelIndex: 0);  // R only
+using var combined = ChannelOps.Combine(channels);
+
+// In-place channel swap (R↔B)
+ChannelOps.SwapChannels(src, channel1: 0, channel2: 2);
+```
+
+### Alpha operations
+
+```csharp
+using SharpImage.Channel;
+using SharpImage.Core;
+
+using var alphaImg   = AlphaOps.Extract(rgbaSrc);              // alpha as gray image
+using var noAlpha    = AlphaOps.Remove(rgbaSrc,                // composite onto bg
+                          bgR: Quantum.MaxValue,
+                          bgG: Quantum.MaxValue,
+                          bgB: Quantum.MaxValue);
+using var withAlpha  = AlphaOps.SetAlpha(rgbSrc, alphaValue: Quantum.MaxValue);
+using var opaque     = AlphaOps.MakeOpaque(rgbaSrc);
+using var keyed      = AlphaOps.MakeTransparent(src,
+                          targetR: 0, targetG: Quantum.MaxValue, targetB: 0,
+                          fuzz: 0.05);
+```
+
+### Colorspace conversion
+
+> **Important:** `ColorspaceOps` takes lowercase **strings**, not the
+> `ColorspaceType` enum. The set of strings is a *subset* of the enum values.
+> See `ColorspaceOps.SupportedColorspaces` for the authoritative list.
+
+Supported strings: `"hsl"`, `"hsv"`, `"hsi"`, `"hwb"`, `"hcl"`, `"hclp"`,
+`"xyz"`, `"lab"`, `"lchab"`, `"luv"`, `"lchuv"`, `"lms"`, `"ypbpr"`,
+`"ycbcr"`, `"yiq"`, `"yuv"`, `"ydbdr"`, `"oklab"`, `"oklch"`, `"jzazbz"`,
+`"jzczhz"`, `"displayp3"`, `"prophoto"`.
+
+```csharp
+using SharpImage.Colorspaces;
+
+using var inLab     = ColorspaceOps.ConvertToColorspace(src, "lab");
+using var backToRgb = ColorspaceOps.ConvertFromColorspace(inLab, "lab");
+using var roundTrip = ColorspaceOps.RoundTrip(src, "oklab");
+
+IReadOnlyList<string> all = ColorspaceOps.SupportedColorspaces;
+
+// Per-pixel direct conversion (inputs are quantum-scale doubles, 0..65535)
+ColorspaceConverter.RgbToHsl(red: 65535.0, green: 32768.0, blue: 16384.0,
+                             out double h, out double s, out double l);
+ColorspaceConverter.RgbToLab(65535.0, 32768.0, 16384.0,
+                             out double L, out double a, out double b);
+```
+
+> **Pixel-input range gotcha:** the per-pixel `ColorspaceConverter.RgbTo*`
+> methods take *quantum-scale* doubles (0–65535), not 0–255. Multiply byte
+> inputs by 257 (or use `Quantum.ScaleFromByte`) before passing them in.
+
+### Camera Raw
+
+```csharp
+using SharpImage.Formats;
+
+byte[] rawBytes = File.ReadAllBytes("DSC_0001.nef");
+
+// Metadata-only — fast, no decode
+CameraRawMetadata meta = CameraRawCoder.GetMetadata(rawBytes);
+Console.WriteLine($"{meta.Make} {meta.Model}");
+Console.WriteLine($"Sensor: {meta.SensorWidth}x{meta.SensorHeight}, " +
+                  $"image area: {meta.ActiveAreaWidth}x{meta.ActiveAreaHeight}");
+Console.WriteLine($"ISO {meta.IsoSpeed}, f/{meta.FNumber}, {meta.ExposureTime}s, " +
+                  $"{meta.FocalLength}mm");
+//                ^^^ NOTE: IsoSpeed (not Iso), FNumber (not Aperture),
+//                          ExposureTime (not ShutterSpeed)
+
+// Full decode — defaults to AHD demosaicing, 16-bit, gamma applied
+var opts = new CameraRawDecodeOptions
+{
+    Algorithm = DemosaicAlgorithm.AHD,        // Bilinear | VNG | AHD
+    WhiteBalance = WhiteBalanceMode.AsShot,
+    OutputBitDepth = 16,
+    ApplyColorMatrix = true,
+    ApplyGamma = true,
+    HighlightRecovery = 0,
+};
+using var raw = CameraRawCoder.Decode(rawBytes, opts);
+
+// Or use Default
+using var rawDefault = CameraRawCoder.Decode(rawBytes, CameraRawDecodeOptions.Default);
+
+// DNG is the only raw format that supports encoding
+byte[] dng = CameraRawCoder.Encode(raw);
+```
+
+Supported raw formats: CR2, CR3, CRW, NEF, NRW, ARW, SR2, SRF, DNG, ORF, RW2,
+RAF, PEF, SRW, 3FR, IIQ, X3F, DCR, K25, KDC, MDC, MEF, MOS, MRW, RMF, RWL,
+ERF, FFF, STI.
+
+---
+
+## Enums Reference
+
+### `InterpolationMethod` (in `SharpImage.Transform`)
+
+```
+NearestNeighbor, Bilinear, Bicubic, Lanczos3 (default), Triangle, Hermite,
+Mitchell, Catrom, Gaussian, Sinc, Hann, Hamming, Blackman, Kaiser,
+Lanczos2, Lanczos4, Lanczos5, Spline, Parzen, Bohman, Bartlett, Welch, Lagrange
+```
+
+Recommendation: `Lanczos3` for general-purpose resizing (the default).
+`NearestNeighbor` for pixel art. `Bilinear` for fastest non-degenerate.
+
+### `CompositeMode` (in `SharpImage.Transform`)
+
+```
+Over (default), Multiply, Screen, Overlay, Add, Subtract, Replace,
+Darken, Lighten, ColorDodge, ColorBurn, HardLight, SoftLight,
+Difference, Exclusion, Dissolve, Atop, In, Out, Xor, Plus, Minus,
+ModulusAdd, ModulusSubtract, Bumpmap, HardMix, LinearLight,
+VividLight, PinLight
+```
+
+### `RotationAngle` (in `SharpImage.Transform`)
+
+```
+Rotate90 = 90, Rotate180 = 180, Rotate270 = 270
+```
+
+For other angles use `Geometry.RotateArbitrary(src, double angleDegrees)`.
+
+### `ColorspaceType` (in `SharpImage.Core`)
+
+Note these are PascalCase, including `SRGB` (not `sRGB`), `Adobe98`, `Oklab`,
+`Oklch`, `XyY`. This enum is used on `ImageFrame.Colorspace`. It does NOT
+overlap exactly with the strings accepted by `ColorspaceOps`.
+
+```
+Undefined, CMY, CMYK, Gray, HCL, HCLp, HSB, HSI, HSL, HSV, HWB, Lab, LCH,
+LCHab, LCHuv, Log, LMS, Luv, OHTA, Rec601YCbCr, Rec709YCbCr, RGB, ScRGB,
+SRGB, Transparent, XyY, XYZ, YCbCr, YCC, YDbDr, YIQ, YPbPr, YUV,
+LinearGray, Jzazbz, DisplayP3, Adobe98, ProPhoto, Oklab, Oklch, CAT02LMS
+```
+
+### `TiffCompression` (in `SharpImage.Formats`)
+
+```
+None = 1, Lzw = 5, Deflate = 8, PackBits = 32773
+```
+
+Note PascalCase: `Lzw`, not `LZW`.
+
+### `DemosaicAlgorithm` (in `SharpImage.Formats`)
+
+```
+Bilinear, VNG, AHD (default)
+```
+
+### `NoiseType` (in `SharpImage.Effects`)
+
+Used by `BlurNoiseOps.AddNoise`. Common values: `Gaussian`, `Uniform`,
+`Impulse`, `Laplacian`, `Poisson`, `Random`, `Multiplicative`. (Verify the
+exact set in `BlurNoiseOps.cs` before relying on rare ones.)
+
+---
+
+## Threading and Async
+
+- **Internal parallelism is automatic.** Most heavy ops (`Resize`, `Composite`,
+  `ConvolutionFilters.*`, `BlurNoiseOps.*`, `ColorspaceOps.*`) use
+  `Parallel.For` internally over scanlines. You do not need to thread
+  these yourself.
+
+- **A single `ImageFrame` is NOT safe for concurrent writes.** Treat it as
+  you would a mutable collection: one writer at a time, or one writer + no
+  readers. Read-only concurrent access (multiple `GetPixelRow` calls from
+  different threads) is fine as long as nothing is calling
+  `GetPixelRowForWrite` concurrently.
+
+- **Static op classes are stateless and thread-safe.** You can call
+  `Resize.Apply(srcA, …)` and `Resize.Apply(srcB, …)` from different threads
+  on different sources at the same time.
+
+- **Batch processing pattern** — fan out across files with `Parallel.ForEach`,
+  one frame per task:
+
+  ```csharp
+  Parallel.ForEach(Directory.GetFiles("photos", "*.jpg"), path =>
+  {
+      using var p = ImagePipeline.Load(path)
+          .Resize(1920, 1080)
+          .Save(Path.Combine("out", Path.GetFileName(path)));
+  });
+  ```
+
+- **No async APIs.** All I/O is synchronous. If you need async, wrap the
+  whole pipeline in `Task.Run`:
+
+  ```csharp
+  byte[] result = await Task.Run(() =>
+  {
+      using var p = ImagePipeline.Load("in.jpg").Resize(800, 600);
+      return p.Encode(ImageFileFormat.Png);
+  });
+  ```
+
+---
+
+## Exceptions
+
+What you can expect to be thrown:
+
+- **`ArgumentOutOfRangeException`** — invalid dimensions (zero/negative width
+  or height), out-of-bounds pixel access.
+- **`ArgumentException`** — unsupported colorspace string, malformed
+  arguments, missing required content (e.g., empty frame list).
+- **`InvalidDataException`** — corrupt or malformed image data (bad PNG
+  chunks, missing JPEG markers, truncated files, unknown variants within
+  a known format).
+- **`EndOfStreamException`** — file ended before the format expected.
+- **`NotSupportedException`** — operation valid but not implemented for the
+  given format (e.g., multi-frame write to a format that doesn't support it).
+- **`ObjectDisposedException`** — using an `ImagePipeline` or `ImageFrame`
+  after `Dispose`.
+- **`InvalidOperationException`** — pipeline misuse (e.g., reusing a
+  pipeline whose frame was extracted via `ToFrame()`).
+
+There is no SharpImage-specific exception type. Catch the BCL exceptions above
+or `Exception` for a top-level guard around format I/O.
+
+---
+
+## Anti-patterns (Don'ts)
+
+These prevent specific common mistakes:
+
+1. **Don't write `frame.Width` or `frame.Height`.** They are `Columns` and
+   `Rows`, both `long`. Use `(int)frame.Columns` if you need an `int`.
+
+2. **Don't compare pixel values to 255.** Pixel storage is 16-bit (0–65535).
+   `row[off] > 128` does NOT mean "above mid-gray." Use `Quantum.MaxValue / 2`
+   or `row[off] * Quantum.Scale > 0.5`.
+
+3. **Don't assume `Composite.Apply` returns a new frame.** It mutates the
+   base in place and returns `void`. Clone the base first if you need to
+   keep the original.
+
+4. **Don't pass `ColorspaceType` to `ColorspaceOps`.** It takes a lowercase
+   string. `ColorspaceOps.ConvertToColorspace(frame, ColorspaceType.Lab)`
+   is a compile error.
+
+5. **Don't dispose a frame you've passed to `ImagePipeline.Wrap`.** `Wrap`
+   takes ownership; the pipeline disposes it. Use `From` if you want to
+   keep your own copy (it clones).
+
+6. **Don't dispose the frame returned by `pipeline.ToFrame()` and then
+   continue using the pipeline.** `ToFrame` releases ownership; the pipeline
+   becomes unusable afterward.
+
+7. **Don't write manual pixel loops to do work an op already does.** A
+   for-loop over `GetPixelRowForWrite` to scale brightness will be 5–50×
+   slower than `ColorAdjust.Brightness` (which is SIMD-accelerated and
+   parallelized).
+
+8. **Don't call `Dispose()` twice on the same frame.** Idempotent in
+   current builds but not contractually guaranteed.
+
+9. **Don't try to re-use an `ImageFrame` after it has been the input to a
+   pipeline `.Wrap()` or `.From(...).Save().Dispose()`.** Once the pipeline
+   disposes it, the backing memory is gone.
+
+10. **Don't pass byte values (0–255) to `ColorspaceConverter.RgbTo*`** — they
+    take quantum-scale doubles (0–65535). Use `Quantum.ScaleFromByte(b)` to
+    convert first, or pass `byteVal * 257.0`.
+
+---
+
+## Performance Notes
+
+- **All heavy ops are SIMD + parallelized internally.** No need to add
+  `Parallel.For` around them.
+- **Pixel storage is 16-bit per channel** — both quality (matches ImageMagick)
+  and SIMD-friendly. Don't try to "optimize" by truncating to 8-bit yourself.
+- **Operations return new frames.** The only mutating op in the public
+  surface is `Composite.Apply`. If you need to chain many ops on a hot path,
+  prefer `ImagePipeline` so intermediate disposals happen automatically and
+  cheaply via `ArrayPool<T>`.
+- **`Resize.Apply` complexity scales with output size and kernel radius.**
+  Lanczos3 is ~3× the work of Bilinear at the same resolution but produces
+  visibly better results for downscale.
+- **Large images** (above available memory) are automatically backed by
+  disk via `PixelCache` — you don't need to do anything special, but
+  expect operations to be IO-bound.
+
+---
+
+## Summary for Agents
+
+When generating SharpImage code:
+
+1. **Reach for `ImagePipeline.Load(...).…Save(...)` first.** It's terser
+   and disposal-safe. Drop to static classes only when you need an op the
+   pipeline doesn't expose.
+2. **Always `using` or `Dispose()` everything that came out of `Read`,
+   `Apply`, `Crop`, `Resize`, etc.** These are all `IDisposable`.
+3. **Use `Columns` and `Rows`** (`long`), not `Width`/`Height`.
+4. **Pixels are `ushort` 0–65535.** Use `Quantum.MaxValue` and `Quantum.Scale`.
+5. **`Composite.Apply` mutates the base.** No assignment, returns `void`.
+6. **`ColorspaceOps` takes strings.** `ColorspaceType` enum is for the
+   `ImageFrame.Colorspace` property, not for `ColorspaceOps` calls.
+7. **No async APIs.** Wrap in `Task.Run` if needed.
+8. **No SharpImage-specific exceptions.** Catch BCL types or `Exception`.
