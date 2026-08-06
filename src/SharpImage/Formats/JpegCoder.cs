@@ -412,7 +412,7 @@ public static class JpegCoder
                 {
                     if (restartInterval > 0 && mcuCount > 0 && mcuCount % restartInterval == 0)
                     {
-                        bitReader.Reset();
+                        bitReader.ConsumeRestartMarker();
                         Array.Clear(dcPredictors);
                     }
 
@@ -468,7 +468,7 @@ public static class JpegCoder
                 {
                     if (restartInterval > 0 && mcuCount > 0 && mcuCount % restartInterval == 0)
                     {
-                        bitReader.Reset();
+                        bitReader.ConsumeRestartMarker();
                         eobRun = 0;
                     }
 
@@ -687,10 +687,9 @@ public static class JpegCoder
                 // Handle restart interval
                 if (restartInterval > 0 && mcuCount > 0 && mcuCount % restartInterval == 0)
                 {
-                    bitReader.Reset();
-                    Array.Clear(dcPredictors);
+                    bitReader.ConsumeRestartMarker();     // byte-align + consume the RSTn marker
+                    Array.Clear(dcPredictors);            // DC prediction resets across each interval
                     restartCounter++;
-                    // Skip restart marker bytes (already consumed by bit reader or need to find them)
                 }
 
                 // Decode each component's blocks in this MCU

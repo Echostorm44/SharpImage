@@ -211,6 +211,10 @@ public sealed class JpegBitReader
     private int bitsRemaining;
 
     private bool endOfData;
+    // Set when FillBuffer stops AT an RSTn restart marker (rather than silently swallowing it,
+    // which would let a block read across a restart boundary and desync the whole scan). While
+    // set, reads supply 1-fill bits (JPEG F.2.2.5) until ConsumeRestartMarker() clears it.
+    private bool atRestart;
 
     public JpegBitReader(Stream stream)
     {
@@ -225,41 +229,19 @@ public sealed class JpegBitReader
     /// <summary>
     /// Reads a single bit (MSB first).
     /// </summary>
-    public int ReadBit()
-    {
-        if (bitsRemaining == 0)
-        {
-            FillBuffer();
-        }
-
-        if (endOfData)
-        {
-            return 0;
-        }
-
-        bitsRemaining--;
-        return (bitBuffer >> bitsRemaining) & 1;
-    }
+    public int ReadBit() => ReadBits(1);
 
     /// <summary>
     /// Reads n bits (MSB first) and returns as an integer.
     /// </summary>
     public int ReadBits(int count)
     {
-        if (endOfData)
+        if (count == 0)
         {
             return 0;
         }
 
-        while (bitsRemaining < count)
-        {
-            FillBuffer();
-            if (endOfData)
-            {
-                return 0;
-            }
-        }
-
+        EnsureBits(count);
         bitsRemaining -= count;
         return (bitBuffer >> bitsRemaining) & ((1 << count) - 1);
     }
@@ -269,20 +251,12 @@ public sealed class JpegBitReader
     /// </summary>
     public int PeekBits(int count)
     {
-        if (endOfData)
+        if (count == 0)
         {
             return 0;
         }
 
-        while (bitsRemaining < count)
-        {
-            FillBuffer();
-            if (endOfData)
-            {
-                return 0;
-            }
-        }
-
+        EnsureBits(count);
         return (bitBuffer >> (bitsRemaining - count)) & ((1 << count) - 1);
     }
 
@@ -291,20 +265,31 @@ public sealed class JpegBitReader
     /// </summary>
     public void SkipBits(int count)
     {
-        if (endOfData)
-        {
-            return;
-        }
+        EnsureBits(count);
+        bitsRemaining -= count;
+    }
 
+    /// <summary>
+    /// Ensures at least <paramref name="count"/> bits are buffered. When the compressed data runs
+    /// out — at end-of-stream, or at a marker (RSTn / EOI) — the shortfall is padded: with 1-bits
+    /// when stopped at a restart marker (the JPEG fill-bit convention, F.2.2.5) so the final block
+    /// of a restart interval decodes correctly, otherwise with 0-bits.
+    /// </summary>
+    private void EnsureBits(int count)
+    {
         while (bitsRemaining < count)
         {
+            int before = bitsRemaining;
             FillBuffer();
-            if (endOfData)
+            if (bitsRemaining == before) // FillBuffer added nothing: EOF or stopped at a marker
             {
+                int need = count - bitsRemaining;
+                int fill = atRestart ? ((1 << need) - 1) : 0;
+                bitBuffer = (bitBuffer << need) | fill;
+                bitsRemaining = count;
                 return;
             }
         }
-        bitsRemaining -= count;
     }
 
     /// <summary>
@@ -340,6 +325,11 @@ public sealed class JpegBitReader
 
     private void FillBuffer()
     {
+        if (endOfData || atRestart)
+        {
+            return; // no more real bits until EOF is acknowledged / the restart marker is consumed
+        }
+
         int b = stream.ReadByte();
         if (b < 0)
         {
@@ -357,20 +347,23 @@ public sealed class JpegBitReader
             }
             if (marker != 0)
             {
-                if (marker >= 0xD0 && marker <= 0xD7)
-                {
-                    // Restart marker: reset state
-                    bitBuffer = 0;
-                    bitsRemaining = 0;
-                    return;
-                }
-                // EOI or other marker: end of entropy data
-                LastMarker = marker;
-                endOfData = true;
-                // Seek back so the main parser can re-read this marker
+                // A marker terminates this entropy-coded segment. STOP here and seek back so the
+                // marker is consumed deterministically — RSTn at a restart boundary (see
+                // ConsumeRestartMarker), any other marker by the scan/frame parser. Silently
+                // swallowing an RSTn here (the previous behaviour) let a block read across the
+                // restart boundary, shifting every subsequent MCU and shearing the image.
                 if (stream.CanSeek)
                 {
                     stream.Seek(-2, SeekOrigin.Current);
+                }
+                if (marker >= 0xD0 && marker <= 0xD7)
+                {
+                    atRestart = true;
+                }
+                else
+                {
+                    LastMarker = marker;
+                    endOfData = true;
                 }
                 return;
             }
@@ -379,6 +372,53 @@ public sealed class JpegBitReader
 
         bitBuffer = (bitBuffer << 8) | b;
         bitsRemaining += 8;
+    }
+
+    /// <summary>
+    /// Byte-aligns and consumes the RSTn restart marker at a restart-interval boundary, skipping any
+    /// fill bytes, then resumes reading from the next entropy-coded segment. DC predictors / EOB run
+    /// are reset by the caller (they reset across every restart interval).
+    /// </summary>
+    public void ConsumeRestartMarker()
+    {
+        // Drop any buffered fill bits (the bitstream is byte-aligned before an RSTn marker).
+        bitBuffer = 0;
+        bitsRemaining = 0;
+        atRestart = false;
+        endOfData = false;
+        LastMarker = -1;
+
+        int b;
+        while ((b = stream.ReadByte()) >= 0)
+        {
+            if (b != 0xFF)
+            {
+                continue; // tolerate stray bytes before the marker
+            }
+            int m = stream.ReadByte();
+            while (m == 0xFF)
+            {
+                m = stream.ReadByte(); // skip 0xFF fill bytes preceding the marker
+            }
+            if (m < 0)
+            {
+                endOfData = true;
+                return;
+            }
+            if (m >= 0xD0 && m <= 0xD7)
+            {
+                return; // consumed the expected RSTn marker
+            }
+            // Not a restart marker (e.g. premature EOI): put it back and stop.
+            if (stream.CanSeek)
+            {
+                stream.Seek(-2, SeekOrigin.Current);
+            }
+            LastMarker = m;
+            endOfData = true;
+            return;
+        }
+        endOfData = true;
     }
 }
 
