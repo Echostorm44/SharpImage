@@ -130,21 +130,24 @@ public static class Geometry
         var result = new ImageFrame();
         result.Initialize(srcHeight, srcWidth, source.Colorspace, source.HasAlpha);
 
+        // Flat whole-buffer spans + index math — a transpose is inherently strided, so fetching a
+        // row span per pixel (the old code) cost ~W*H span allocations. Source(x, y) → Dest(x, srcHeight-1-y).
+        var src = source.GetAllPixels();
+        var dst = result.GetAllPixelsForWrite();
+        int srcStride = srcWidth * channels;
+        int dstStride = srcHeight * channels; // dest width = srcHeight
+
         for (int y = 0;y < srcHeight;y++)
         {
-            var srcRow = source.GetPixelRow(y);
+            int srcRowBase = y * srcStride;
+            int dstColBase = (srcHeight - 1 - y) * channels; // dest column dstX = srcHeight-1-y
             for (int x = 0;x < srcWidth;x++)
             {
-                // Source(x, y) → Dest(srcHeight - 1 - y, x)
-                int dstX = srcHeight - 1 - y;
-                int dstY = x;
-                var dstRow = result.GetPixelRowForWrite(dstY);
-
-                int srcOffset = x * channels;
-                int dstOffset = dstX * channels;
+                int srcOffset = srcRowBase + x * channels;
+                int dstOffset = x * dstStride + dstColBase;  // dest row dstY = x
                 for (int c = 0;c < channels;c++)
                 {
-                    dstRow[dstOffset + c] = srcRow[srcOffset + c];
+                    dst[dstOffset + c] = src[srcOffset + c];
                 }
             }
         }
@@ -190,21 +193,23 @@ public static class Geometry
         var result = new ImageFrame();
         result.Initialize(srcHeight, srcWidth, source.Colorspace, source.HasAlpha);
 
+        // Flat whole-buffer spans + index math (see Rotate90). Source(x, y) → Dest(y, srcWidth-1-x).
+        var src = source.GetAllPixels();
+        var dst = result.GetAllPixelsForWrite();
+        int srcStride = srcWidth * channels;
+        int dstStride = srcHeight * channels; // dest width = srcHeight
+
         for (int y = 0;y < srcHeight;y++)
         {
-            var srcRow = source.GetPixelRow(y);
+            int srcRowBase = y * srcStride;
+            int dstColBase = y * channels; // dest column dstX = y
             for (int x = 0;x < srcWidth;x++)
             {
-                // Source(x, y) → Dest(y, srcWidth - 1 - x)
-                int dstX = y;
-                int dstY = srcWidth - 1 - x;
-                var dstRow = result.GetPixelRowForWrite(dstY);
-
-                int srcOffset = x * channels;
-                int dstOffset = dstX * channels;
+                int srcOffset = srcRowBase + x * channels;
+                int dstOffset = (srcWidth - 1 - x) * dstStride + dstColBase; // dest row dstY = srcWidth-1-x
                 for (int c = 0;c < channels;c++)
                 {
-                    dstRow[dstOffset + c] = srcRow[srcOffset + c];
+                    dst[dstOffset + c] = src[srcOffset + c];
                 }
             }
         }

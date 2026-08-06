@@ -302,6 +302,28 @@ public class ImageFrame : IDisposable
         return pixelCache.GetRowForWrite(y);
     }
 
+    /// <summary>The whole pixel buffer (all rows, row-major, channel-interleaved) for reading.</summary>
+    internal ReadOnlySpan<ushort> GetAllPixels()
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (pixelCache is null)
+        {
+            throw new InvalidOperationException("Image not initialized");
+        }
+        return pixelCache.GetAllPixels();
+    }
+
+    /// <summary>The whole pixel buffer (all rows, row-major, channel-interleaved) for writing.</summary>
+    internal Span<ushort> GetAllPixelsForWrite()
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (pixelCache is null)
+        {
+            throw new InvalidOperationException("Image not initialized");
+        }
+        return pixelCache.GetAllPixelsForWrite();
+    }
+
     /// <summary>
     /// Gets the pixel value for a specific channel at (x, y).
     /// </summary>
