@@ -333,6 +333,47 @@ public class WebpCoderTests
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // VP8 Lossy Decode — real bitstream produced by libwebp (regression guard)
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Reference RGB sampled from libwebp's own decode of TestAssets/vp8_lossy_sample.webp
+    // (a VP8 lossy keyframe: gradients + colour blocks + a diagonal, encoded at method 4 so
+    // it exercises 16x16 modes, B_PRED, per-macroblock segmentation and chroma edges). The
+    // whole VP8 intra decode path (bool decoder, coefficient tokens, WHT/IDCT, all intra
+    // predictors, in-loop deblocking filter, fancy chroma upsampling, YUV→RGB) is bit-exact
+    // with libwebp, so these must match exactly. Guards the class of bug where the decoder
+    // silently produced garbage on real VP8 lossy files (only lossless/round-trips were tested).
+    private static readonly (int Y, int X, int R, int G, int B)[] Vp8LossyReference =
+    [
+        (0, 0, 255, 225, 249), (0, 47, 253, 0, 70), (39, 0, 2, 252, 58),
+        (39, 47, 255, 252, 130), (10, 15, 238, 42, 26), (28, 30, 23, 62, 211),
+        (20, 20, 252, 255, 223), (5, 40, 215, 32, 67), (33, 10, 50, 216, 62),
+        (19, 24, 126, 121, 59), (2, 2, 242, 249, 247), (37, 45, 246, 239, 114),
+    ];
+
+    [Test]
+    public async Task Vp8Lossy_RealBitstream_DecodesBitExact()
+    {
+        string path = Path.Combine(TestImagesDir, "vp8_lossy_sample.webp");
+        await Assert.That(File.Exists(path)).IsTrue();
+
+        using var stream = File.OpenRead(path);
+        using var image = WebpCoder.Read(stream);
+
+        await Assert.That((int)image.Columns).IsEqualTo(48);
+        await Assert.That((int)image.Rows).IsEqualTo(40);
+
+        foreach (var (y, x, r, g, b) in Vp8LossyReference)
+        {
+            var row = image.GetPixelRow(y).ToArray();
+            int off = x * image.NumberOfChannels;
+            await Assert.That((int)Quantum.ScaleToByte(row[off])).IsEqualTo(r);
+            await Assert.That((int)Quantum.ScaleToByte(row[off + 1])).IsEqualTo(g);
+            await Assert.That((int)Quantum.ScaleToByte(row[off + 2])).IsEqualTo(b);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // Helper
     // ═══════════════════════════════════════════════════════════════════
 
