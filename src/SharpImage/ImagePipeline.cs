@@ -28,7 +28,20 @@ public sealed class ImagePipeline : IDisposable
     /// <summary>Load an image from disk and start a pipeline.</summary>
     public static ImagePipeline Load(string path)
     {
-        return new ImagePipeline(FormatRegistry.Read(path));
+        var frame = FormatRegistry.Read(path);
+
+        // Bake the EXIF orientation into the pixels so the image loads upright — a phone photo shot
+        // in portrait/rotated (orientation 6/8 etc.) otherwise decodes sideways. AutoOrient no-ops
+        // for orientation 1/undefined, so only pay for the rotation when the tag actually calls for it.
+        if (frame.Orientation is not SharpImage.Core.OrientationType.TopLeft
+            and not SharpImage.Core.OrientationType.Undefined)
+        {
+            var oriented = Geometry.AutoOrient(frame);
+            frame.Dispose();
+            frame = oriented;
+        }
+
+        return new ImagePipeline(frame);
     }
 
     /// <summary>Start a pipeline from an existing frame (clones it to avoid side effects).</summary>
