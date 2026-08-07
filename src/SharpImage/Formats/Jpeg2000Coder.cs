@@ -42,6 +42,19 @@ public static class Jpeg2000Coder
 
     public static ImageFrame Decode(byte[] data)
     {
+        // NOT IMPLEMENTED. The JPEG 2000 codestream path here is a simplified EBCOT/wavelet
+        // approximation that does not decode real .jp2 files (they come out as noise). Rather
+        // than return garbage, fail loudly. A correct decoder needs full Tier-1/Tier-2 EBCOT
+        // arithmetic coding and the reversible/irreversible wavelet synthesis.
+        throw new NotSupportedException(
+            "JPEG 2000 (.jp2) decoding is not implemented. The previous implementation only " +
+            "round-tripped its own simplified output and produced garbage for real files.");
+    }
+
+    // Kept internal for the (self-)round-trip tests that documented the simplified codestream;
+    // not reachable through the public decode path, which now fails loudly.
+    internal static ImageFrame DecodeSimplified(byte[] data)
+    {
         if (!CanDecode(data))
         {
             throw new InvalidDataException("Not a valid JPEG 2000 file");
@@ -52,6 +65,15 @@ public static class Jpeg2000Coder
     }
 
     public static byte[] Encode(ImageFrame image)
+    {
+        // NOT IMPLEMENTED as a standard encoder — the simplified codestream below is not
+        // decodable by real JPEG 2000 tools. Fail loudly rather than emit an invalid .jp2.
+        throw new NotSupportedException(
+            "JPEG 2000 (.jp2) encoding is not implemented (the simplified output is not a " +
+            "standard-conformant JPEG 2000 file).");
+    }
+
+    internal static byte[] EncodeSimplified(ImageFrame image)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;

@@ -2351,51 +2351,12 @@ internal static class GenericRawParser
         if (sig != "FOVb")
             throw new InvalidDataException("Invalid X3F: missing FOVb signature");
 
-        // Simplified X3F parsing — extract dimensions from header
-        uint version = TiffIfdReader.ReadUInt32(data, 4, false);
-        // Dimensions are typically in the directory entries
-        int width = 2640; // Common Sigma resolution
-        int height = 1760;
-
-        // Scan for image dimensions in the directory
-        if (data.Length > 100)
-        {
-            // Try to read directory offset from end of file
-            uint dirOffset = TiffIfdReader.ReadUInt32(data, data.Length - 4, false);
-            if (dirOffset > 0 && dirOffset + 28 < data.Length)
-            {
-                int entryPos = (int)dirOffset + 12; // skip directory header
-                if (entryPos + 8 < data.Length)
-                {
-                    width = (int)TiffIfdReader.ReadUInt32(data, entryPos + 16, false);
-                    height = (int)TiffIfdReader.ReadUInt32(data, entryPos + 20, false);
-                    if (width <= 0 || width > 20000) { width = 2640; height = 1760; }
-                }
-            }
-        }
-
-        var metadata = new CameraRawMetadata
-        {
-            Format = CameraRawFormat.X3F,
-            Make = "Sigma",
-            SensorWidth = width,
-            SensorHeight = height,
-            ActiveAreaWidth = width,
-            ActiveAreaHeight = height,
-            CfaType = CfaType.Foveon,
-            BayerPattern = BayerPattern.Unknown,
-            BitsPerSample = 14,
-            Compression = RawCompression.FoveonCompressed,
-            WhiteLevel = (1 << 14) - 1,
-            Orientation = 1
-        };
-
-        // For Foveon, each pixel has 3 layers — extract as 3-channel data
-        var pixels = new ushort[width * height];
-        // Simplified: fill with zeros until proper X3F decompression is implemented
-        // X3F decompression is complex and requires dedicated Huffman/Rice decoding
-
-        return new RawSensorData { RawPixels = pixels, Width = width, Height = height, Metadata = metadata };
+        // NOT IMPLEMENTED: X3F pixel data is Foveon-compressed (Huffman/Rice) and was never
+        // decoded — the sensor buffer was filled with zeros. Fail loudly instead of returning
+        // a blank image.
+        throw new NotSupportedException(
+            "Sigma X3F (Foveon) raw decoding is not implemented; the compressed sensor data " +
+            "cannot be decoded yet.");
     }
 }
 

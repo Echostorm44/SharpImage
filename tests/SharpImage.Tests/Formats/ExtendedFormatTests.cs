@@ -964,34 +964,23 @@ public class ExtendedFormatTests
 
     #region JPEG 2000 Tests
 
-    [Test]
-    public async Task Jpeg2000Coder_Roundtrip_Solid()
-    {
-        var original = CreateSolidFrame(16, 16, 128, 64, 200, 255);
-        byte[] encoded = Jpeg2000Coder.Encode(original);
-        var decoded = Jpeg2000Coder.Decode(encoded);
+    // JPEG 2000 encode/decode are intentionally not implemented (they only round-tripped a
+    // non-standard codestream and garbled real .jp2 files); they now fail loudly. Detection
+    // still works so registry routing is correct.
+    private static readonly byte[] Jp2SignatureBox =
+        [0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A];
 
-        await Assert.That(decoded.Columns).IsEqualTo(16u);
-        await Assert.That(decoded.Rows).IsEqualTo(16u);
+    [Test]
+    public async Task Jpeg2000Coder_Encode_NotSupported()
+    {
+        var frame = CreateSolidFrame(16, 16, 128, 64, 200, 255);
+        await Assert.That(() => Jpeg2000Coder.Encode(frame)).Throws<NotSupportedException>();
     }
 
     [Test]
-    public async Task Jpeg2000Coder_Roundtrip_Gradient()
+    public async Task Jpeg2000Coder_Decode_NotSupported()
     {
-        var original = CreateGradientFrame(32, 24);
-        byte[] encoded = Jpeg2000Coder.Encode(original);
-        var decoded = Jpeg2000Coder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(32u);
-        await Assert.That(decoded.Rows).IsEqualTo(24u);
-    }
-
-    [Test]
-    public async Task Jpeg2000Coder_CanDecode_JP2Container()
-    {
-        var frame = CreateSolidFrame(4, 4, 100, 100, 100, 255);
-        byte[] data = Jpeg2000Coder.Encode(frame);
-        await Assert.That(Jpeg2000Coder.CanDecode(data)).IsTrue();
+        await Assert.That(() => Jpeg2000Coder.Decode(Jp2SignatureBox)).Throws<NotSupportedException>();
     }
 
     [Test]
@@ -1004,9 +993,7 @@ public class ExtendedFormatTests
     [Test]
     public async Task Jpeg2000Coder_Registry_Detection()
     {
-        var frame = CreateSolidFrame(8, 8, 50, 100, 150, 255);
-        byte[] data = Jpeg2000Coder.Encode(frame);
-        var format = FormatRegistry.DetectFormat(data);
+        var format = FormatRegistry.DetectFormat(Jp2SignatureBox);
         await Assert.That(format).IsEqualTo(ImageFileFormat.Jpeg2000);
     }
 

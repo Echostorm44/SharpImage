@@ -123,65 +123,21 @@ public class ModernFormatTests
     }
 
     // ======================= JPEG 2000 =======================
+    // JPEG 2000 is intentionally NOT implemented: the previous "codec" only round-tripped its
+    // own non-standard codestream and produced garbage (~6 dB PSNR) for real .jp2 files, so
+    // the public API now fails loudly instead of lying. See Jpeg2000Coder.
 
     [Test]
-    public async Task Jpeg2000_RoundTrip_Lossless_RGB()
+    public async Task Jpeg2000_Decode_ThrowsNotSupported()
     {
-        using var original = CreateTestFrame(16, 12);
-        byte[] encoded = Jpeg2000Coder.Encode(original);
-        using var decoded = Jpeg2000Coder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(original.Columns);
-        await Assert.That(decoded.Rows).IsEqualTo(original.Rows);
-        AssertPixelsEqual(original, decoded, tolerance: 0);
+        await Assert.That(() => Jpeg2000Coder.Decode(new byte[64])).Throws<NotSupportedException>();
     }
 
     [Test]
-    public async Task Jpeg2000_RoundTrip_Lossless_RGBA()
-    {
-        using var original = CreateTestFrame(12, 8, hasAlpha: true);
-        byte[] encoded = Jpeg2000Coder.Encode(original);
-        using var decoded = Jpeg2000Coder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(original.Columns);
-        await Assert.That(decoded.Rows).IsEqualTo(original.Rows);
-        AssertPixelsEqual(original, decoded, tolerance: 0);
-    }
-
-    [Test]
-    public async Task Jpeg2000_RoundTrip_SolidColor()
-    {
-        using var original = CreateSolidFrame(8, 8, 255, 0, 128);
-        byte[] encoded = Jpeg2000Coder.Encode(original);
-        using var decoded = Jpeg2000Coder.Decode(encoded);
-
-        AssertPixelsEqual(original, decoded, tolerance: 0);
-        await Assert.That(decoded.Columns).IsEqualTo(8);
-    }
-
-    [Test]
-    public async Task Jpeg2000_RoundTrip_LargerImage()
-    {
-        using var original = CreateTestFrame(64, 48);
-        byte[] encoded = Jpeg2000Coder.Encode(original);
-        using var decoded = Jpeg2000Coder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(64);
-        await Assert.That(decoded.Rows).IsEqualTo(48);
-        // With correct bit-depth encoding, 5/3 DWT is mathematically lossless
-        AssertPixelsEqual(original, decoded, tolerance: 0);
-    }
-
-    [Test]
-    public async Task Jpeg2000_EncodedData_HasJp2Signature()
+    public async Task Jpeg2000_Encode_ThrowsNotSupported()
     {
         using var frame = CreateTestFrame(8, 8);
-        byte[] data = Jpeg2000Coder.Encode(frame);
-
-        await Assert.That(data.Length).IsGreaterThan(12);
-        // JP2 signature box at offset 4: 'jP'
-        await Assert.That(data[4]).IsEqualTo((byte)'j');
-        await Assert.That(data[5]).IsEqualTo((byte)'P');
+        await Assert.That(() => Jpeg2000Coder.Encode(frame)).Throws<NotSupportedException>();
     }
 
     // ======================= JPEG XL =======================
@@ -334,20 +290,6 @@ public class ModernFormatTests
     }
 
     // ======================= Cross-Format =======================
-
-    [Test]
-    public async Task Jpeg2000_ToJpegXl_Lossless_RoundTrip()
-    {
-        using var original = CreateTestFrame(16, 12);
-
-        byte[] jp2Data = Jpeg2000Coder.Encode(original);
-        using var fromJp2 = Jpeg2000Coder.Decode(jp2Data);
-        byte[] jxlData = JxlCoder.Encode(fromJp2);
-        using var fromJxl = JxlCoder.Decode(jxlData);
-
-        AssertPixelsEqual(original, fromJxl, tolerance: 0);
-        await Assert.That(fromJxl.Columns).IsEqualTo(original.Columns);
-    }
 
     [Test]
     public async Task Cineon_ToDpx_SimilarPrecision()
