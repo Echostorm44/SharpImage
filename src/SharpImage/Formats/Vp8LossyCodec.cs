@@ -291,120 +291,157 @@ internal static class Vp8LossyCodec
     // VP8 Boolean Encoder
     // ═══════════════════════════════════════════════════════════════════
 
+    // Renormalisation tables for the arithmetic encoder (libwebp bit_writer_utils.c).
+    private static readonly byte[] KNorm =
+    [
+        7, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3,
+        3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
+    ];
+
+    private static readonly byte[] KNewRange =
+    [
+        127, 127, 191, 127, 159, 191, 223, 127, 143, 159, 175, 191, 207, 223, 239,
+        127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 207, 215, 223, 231, 239,
+        247, 127, 131, 135, 139, 143, 147, 151, 155, 159, 163, 167, 171, 175, 179,
+        183, 187, 191, 195, 199, 203, 207, 211, 215, 219, 223, 227, 231, 235, 239,
+        243, 247, 251, 127, 129, 131, 133, 135, 137, 139, 141, 143, 145, 147, 149,
+        151, 153, 155, 157, 159, 161, 163, 165, 167, 169, 171, 173, 175, 177, 179,
+        181, 183, 185, 187, 189, 191, 193, 195, 197, 199, 201, 203, 205, 207, 209,
+        211, 213, 215, 217, 219, 221, 223, 225, 227, 229, 231, 233, 235, 237, 239,
+        241, 243, 245, 247, 249, 251, 253, 127,
+    ];
+
+    // VP8 arithmetic (boolean) encoder — faithful port of libwebp's VP8BitWriter. Produces
+    // the exact bitstream the RFC 6386 boolean decoder (BoolDecoder above) consumes.
     private struct BoolEncoder
     {
-        private byte[] buffer;
+        private byte[] buf;
         private int pos;
-        private uint range;
-        private uint bottom;
-        private int count;
+        private int range;
+        private long value;
+        private int run;
+        private int nbBits;
 
         public void Init(int capacity)
         {
-            buffer = new byte[capacity];
+            buf = new byte[Math.Max(capacity, 256)];
             pos = 0;
-            range = 255;
-            bottom = 0;
-            count = -24;
+            range = 254;
+            value = 0;
+            run = 0;
+            nbBits = -8;
         }
 
-        public void WriteBool(int value, int probability)
+        public void PutBit(int bit, int prob)
         {
-            uint split = 1 + (((range - 1) * (uint)probability) >> 8);
-            if (value != 0)
+            int split = (range * prob) >> 8;
+            if (bit != 0)
             {
-                bottom += split;
-                range -= split;
+                value += split + 1;
+                range -= split + 1;
             }
             else
             {
                 range = split;
             }
 
-            int shift = NormShift(range);
-            range <<= shift;
-            count += shift;
-
-            if (count >= 0)
+            if (range < 127)
             {
-                int offset = (int)(bottom >> (24 - count));
-                bottom &= (uint)((1 << (24 - count)) - 1);
-                bottom <<= count;
-
-                // Carry propagation
-                if ((offset & ~0xFF) != 0)
+                int shift = KNorm[range];
+                range = KNewRange[range];
+                value <<= shift;
+                nbBits += shift;
+                if (nbBits > 0)
                 {
-                    for (int i = pos - 1;i >= 0;i--)
-                    {
-                        int v = buffer[i] + 1;
-                        buffer[i] = (byte)v;
-                        if (v <= 255)
-                        {
-                            break;
-                        }
-                    }
-                    offset &= 0xFF;
+                    Flush();
                 }
-
-                EnsureCapacity();
-                buffer[pos++] = (byte)offset;
-
-                while (count >= 8)
-                {
-                    count -= 8;
-                    offset = (int)(bottom >> (24 - count));
-                    bottom &= (uint)((1 << (24 - count)) - 1);
-                    bottom <<= count - (count - 8)/* already shifted */;
-                    EnsureCapacity();
-                    buffer[pos++] = (byte)(offset & 0xFF);
-                }
-                // Correct bottom after loop
-                count -= 0; // count is already adjusted
-            }
-            else
-            {
-                bottom <<= shift;
             }
         }
 
-        public void WriteLiteral(int value, int bits)
+        public void PutBitUniform(int bit)
         {
-            for (int i = bits - 1;i >= 0;i--)
+            int split = range >> 1;
+            if (bit != 0)
             {
-                WriteBool((value >> i) & 1, 128);
+                value += split + 1;
+                range -= split + 1;
+            }
+            else
+            {
+                range = split;
+            }
+
+            if (range < 127)
+            {
+                range = KNewRange[range];
+                value <<= 1;
+                nbBits += 1;
+                if (nbBits > 0)
+                {
+                    Flush();
+                }
+            }
+        }
+
+        public void PutBits(int v, int nb)
+        {
+            for (int mask = 1 << (nb - 1); mask != 0; mask >>= 1)
+            {
+                PutBitUniform((v & mask) != 0 ? 1 : 0);
             }
         }
 
         public byte[] Finish()
         {
-            // Flush remaining bits
-            for (int i = 0;i < 32;i++)
-            {
-                WriteBool(0, 128);
-            }
-
+            PutBits(0, 9 - nbBits);
+            nbBits = 0;
+            Flush();
             var result = new byte[pos];
-            Buffer.BlockCopy(buffer, 0, result, 0, pos);
+            Buffer.BlockCopy(buf, 0, result, 0, pos);
             return result;
         }
 
-        private void EnsureCapacity()
+        private void Flush()
         {
-            if (pos >= buffer.Length)
+            int s = 8 + nbBits;
+            long bits = value >> s;
+            value -= bits << s;
+            nbBits -= 8;
+            if ((bits & 0xff) != 0xff)
             {
-                Array.Resize(ref buffer, buffer.Length * 2);
+                Ensure(run + 1);
+                if ((bits & 0x100) != 0 && pos > 0)
+                {
+                    buf[pos - 1]++;
+                }
+
+                if (run > 0)
+                {
+                    int fill = (bits & 0x100) != 0 ? 0x00 : 0xff;
+                    for (; run > 0; run--)
+                    {
+                        buf[pos++] = (byte)fill;
+                    }
+                }
+
+                buf[pos++] = (byte)(bits & 0xff);
+            }
+            else
+            {
+                run++;
             }
         }
 
-        private static int NormShift(uint range)
+        private void Ensure(int extra)
         {
-            int shift = 0;
-            while (range < 128)
+            if (pos + extra > buf.Length)
             {
-                range <<= 1;
-                shift++;
+                Array.Resize(ref buf, Math.Max(buf.Length * 2, pos + extra));
             }
-            return shift;
         }
     }
 
@@ -1303,136 +1340,253 @@ internal static class Vp8LossyCodec
             }
         }
 
-        int qi = Math.Clamp(127 - quality, 0, 127);
+        // Map quality (0..100) to a base quantizer index (0 = finest .. 127 = coarsest).
+        int qi = Math.Clamp((int)Math.Round((100 - quality) * 127.0 / 100.0), 0, 127);
         int ydc = DcQLookup[qi];
         int yac = AcQLookup[qi];
+        int y2dc = DcQLookup[qi] * 2;
+        int y2ac = Math.Max(AcQLookup[qi] * 155 / 100, 8);
         int uvdc = Math.Min(DcQLookup[qi], 132);
         int uvac = AcQLookup[qi];
 
-        // Encode first partition (frame header)
+        // ── First (header) partition ──
+        // Encodes 16x16 DC-predicted intra keyframe, no segmentation, loop filter off
+        // (level 0 → the decoder skips filtering), single token partition, default coeff
+        // probabilities. Every macroblock is coded (never skipped) so the token stream is
+        // simple; the reconstruction below keeps prediction in lockstep with the decoder.
+        const int probSkipFalse = 255;
         var headerEnc = new BoolEncoder();
         headerEnc.Init(65536);
-
-        // Color space, clamping
-        headerEnc.WriteBool(0, 128);
-        headerEnc.WriteBool(0, 128);
-
-        // No segmentation
-        headerEnc.WriteBool(0, 128);
-
-        // Simple loop filter, level 0
-        headerEnc.WriteBool(0, 128); // filter_type
-        headerEnc.WriteLiteral(0, 6); // filter_level
-        headerEnc.WriteLiteral(0, 3); // sharpness
-        headerEnc.WriteBool(0, 128); // no loop filter adj
-
-        // Single token partition
-        headerEnc.WriteLiteral(0, 2);
-
-        // Quantizer
-        headerEnc.WriteLiteral(qi, 7);
-        headerEnc.WriteBool(0, 128); // no y_dc_delta
-        headerEnc.WriteBool(0, 128); // no y2_dc_delta
-        headerEnc.WriteBool(0, 128); // no y2_ac_delta
-        headerEnc.WriteBool(0, 128); // no uv_dc_delta
-        headerEnc.WriteBool(0, 128); // no uv_ac_delta
-
-        // Refresh probs
-        headerEnc.WriteBool(0, 128);
-
-        // No coefficient probability updates (use defaults)
-        for (int i = 0;i < 4;i++)
+        headerEnc.PutBit(0, 128); // colour space
+        headerEnc.PutBit(0, 128); // clamping type
+        headerEnc.PutBit(0, 128); // segmentation disabled
+        headerEnc.PutBit(0, 128); // filter type (simple)
+        headerEnc.PutBits(0, 6);  // filter level 0
+        headerEnc.PutBits(0, 3);  // sharpness
+        headerEnc.PutBit(0, 128); // no loop-filter deltas
+        headerEnc.PutBits(0, 2);  // log2(token partitions) = 0
+        headerEnc.PutBits(qi, 7); // base quantizer index
+        headerEnc.PutBit(0, 128); // no y_dc delta
+        headerEnc.PutBit(0, 128); // no y2_dc delta
+        headerEnc.PutBit(0, 128); // no y2_ac delta
+        headerEnc.PutBit(0, 128); // no uv_dc delta
+        headerEnc.PutBit(0, 128); // no uv_ac delta
+        headerEnc.PutBit(0, 128); // refresh_entropy_probs
+        for (int idx = 0; idx < 4 * 264; idx++)
         {
-            for (int j = 0;j < 8;j++)
-            {
-                for (int k = 0;k < 3;k++)
-                {
-                    for (int t = 0;t < 11;t++)
-                    {
-                        int idx = i * 264 + j * 33 + k * 11 + t;
-                        headerEnc.WriteBool(0, CoeffUpdateProbs[idx]);
-                    }
-                }
-            }
+            headerEnc.PutBit(0, CoeffUpdateProbs[idx]); // no coeff-probability updates
         }
 
-        // mb_no_skip_coeff
-        headerEnc.WriteBool(1, 128);
-        headerEnc.WriteLiteral(255, 8); // prob_skip_false (high = rarely skip)
+        headerEnc.PutBit(1, 128);                 // mb_no_skip_coeff enabled
+        headerEnc.PutBits(probSkipFalse, 8);
 
-        // Encode macroblocks (mode info in first partition)
-        // Token partition encoder
         var tokenEnc = new BoolEncoder();
-        tokenEnc.Init(width * height * 2);
+        tokenEnc.Init(Math.Max(width * height * 2, 4096));
 
-        for (int mbRow = 0;mbRow < mbHeight;mbRow++)
+        // Working buffers (with the 1-sample prediction border) + non-zero contexts, exactly
+        // as the decoder uses them — so the reconstructed samples the encoder predicts from
+        // are identical to what the decoder will produce.
+        const int Off = Bps + 8;
+        byte[] yb = new byte[Bps * 18];
+        byte[] ub = new byte[Bps * 10];
+        byte[] vb = new byte[Bps * 10];
+        byte[] topY = new byte[mbWidth * 16];
+        byte[] topU = new byte[mbWidth * 8];
+        byte[] topV = new byte[mbWidth * 8];
+        int[] aboveNzY = new int[mbWidth * 4];
+        int[] leftNzY = new int[4];
+        int[] aboveNzU = new int[mbWidth * 2];
+        int[] leftNzU = new int[2];
+        int[] aboveNzV = new int[mbWidth * 2];
+        int[] leftNzV = new int[2];
+        int[] aboveNzY2 = new int[mbWidth];
+        int leftNzY2 = 0;
+
+        short[] dct = new short[16];
+        short[] deq = new short[16];
+        short[] residual = new short[16];
+        short[] rawDc = new short[16];
+        short[] y2lvl = new short[16];
+        short[] dcDeq = new short[16];
+        short[][] yLvl = new short[16][];
+        for (int i = 0; i < 16; i++)
         {
-            for (int mbCol = 0;mbCol < mbWidth;mbCol++)
+            yLvl[i] = new short[16];
+        }
+
+        short[][] uLvl = new short[4][];
+        short[][] vLvl = new short[4][];
+        for (int i = 0; i < 4; i++)
+        {
+            uLvl[i] = new short[16];
+            vLvl[i] = new short[16];
+        }
+
+        for (int mbRow = 0; mbRow < mbHeight; mbRow++)
+        {
+            for (int i = 0; i < 4; i++)
             {
-                headerEnc.WriteBool(0, 255); // not skipped
+                leftNzY[i] = 0;
+            }
 
-                // Y mode = DC_PRED (mode 0 in keyframe tree)
-                // Tree: bit(145)=1 → bit(156)=0 → DC_PRED
-                headerEnc.WriteBool(1, 145);
-                headerEnc.WriteBool(0, 156);
+            leftNzU[0] = leftNzU[1] = 0;
+            leftNzV[0] = leftNzV[1] = 0;
+            leftNzY2 = 0;
+            for (int y = 0; y < 16; y++)
+            {
+                yb[Off + y * Bps - 1] = 129;
+            }
 
-                // UV mode = DC_PRED (mode 0)
-                headerEnc.WriteBool(0, 142);
+            for (int y = 0; y < 8; y++)
+            {
+                ub[Off + y * Bps - 1] = 129;
+                vb[Off + y * Bps - 1] = 129;
+            }
 
-                // Encode Y coefficients (16 4x4 blocks using Y2 DC)
-                short[] dcVals = new short[16];
-                for (int sb = 0;sb < 16;sb++)
+            if (mbRow > 0)
+            {
+                yb[Off - Bps - 1] = 129;
+                ub[Off - Bps - 1] = 129;
+                vb[Off - Bps - 1] = 129;
+            }
+
+            for (int mbCol = 0; mbCol < mbWidth; mbCol++)
+            {
+                // Bring in reconstructed left column + top row (mirror of the decoder).
+                if (mbCol > 0)
                 {
-                    int sbRow = sb / 4, sbCol = sb % 4;
-                    int bx = mbCol * 16 + sbCol * 4;
-                    int by = mbRow * 16 + sbRow * 4;
-                    short[] coeffs = new short[16];
-                    ForwardDct4x4(yPlane, yStride, bx, by, coeffs);
-                    dcVals[sb] = (short)((ydc > 0) ? coeffs[0] / ydc : 0);
-                    coeffs[0] = 0; // DC handled by Y2
-                    for (int c = 1;c < 16;c++)
+                    for (int y = -1; y < 16; y++)
                     {
-                        coeffs[c] = (short)((yac > 0) ? coeffs[c] / yac : 0);
+                        for (int k = 1; k <= 4; k++)
+                        {
+                            yb[Off + y * Bps - k] = yb[Off + y * Bps + 16 - k];
+                        }
                     }
 
-                    EncodeBlock(ref tokenEnc, DefaultCoeffProbs, 0, coeffs, 1);
-                }
-
-                // Encode Y2 (DC block via WHT)
-                short[] y2Coeffs = new short[16];
-                ForwardWht(dcVals, y2Coeffs);
-                int y2dc2 = DcQLookup[qi] * 2;
-                int y2ac2 = AcQLookup[qi] * 155 / 100;
-                if (y2ac2 < 8)
-                {
-                    y2ac2 = 8;
-                }
-
-                y2Coeffs[0] = (short)((y2dc2 > 0) ? y2Coeffs[0] / y2dc2 : 0);
-                for (int c = 1;c < 16;c++)
-                {
-                    y2Coeffs[c] = (short)((y2ac2 > 0) ? y2Coeffs[c] / y2ac2 : 0);
-                }
-
-                EncodeBlock(ref tokenEnc, DefaultCoeffProbs, 1, y2Coeffs, 0);
-
-                // Encode UV coefficients
-                for (int sb = 0;sb < 4;sb++)
-                {
-                    int sbRow = sb / 2, sbCol = sb % 2;
-                    int bx = mbCol * 8 + sbCol * 4;
-                    int by = mbRow * 8 + sbRow * 4;
-                    short[] uC = new short[16], vC = new short[16];
-                    ForwardDct4x4(uPlane, uvStride, bx, by, uC);
-                    ForwardDct4x4(vPlane, uvStride, bx, by, vC);
-                    for (int c = 0;c < 16;c++)
+                    for (int y = -1; y < 8; y++)
                     {
-                        int q = c == 0 ? uvdc : uvac;
-                        uC[c] = (short)((q > 0) ? uC[c] / q : 0);
-                        vC[c] = (short)((q > 0) ? vC[c] / q : 0);
+                        for (int k = 1; k <= 4; k++)
+                        {
+                            ub[Off + y * Bps - k] = ub[Off + y * Bps + 8 - k];
+                            vb[Off + y * Bps - k] = vb[Off + y * Bps + 8 - k];
+                        }
                     }
-                    EncodeBlock(ref tokenEnc, DefaultCoeffProbs, 2, uC, 0);
-                    EncodeBlock(ref tokenEnc, DefaultCoeffProbs, 2, vC, 0);
+                }
+
+                if (mbRow > 0)
+                {
+                    for (int x = 0; x < 16; x++)
+                    {
+                        yb[Off - Bps + x] = topY[mbCol * 16 + x];
+                    }
+
+                    for (int x = 0; x < 8; x++)
+                    {
+                        ub[Off - Bps + x] = topU[mbCol * 8 + x];
+                        vb[Off - Bps + x] = topV[mbCol * 8 + x];
+                    }
+                }
+                else
+                {
+                    for (int x = -1; x < 20; x++)
+                    {
+                        yb[Off - Bps + x] = 127;
+                    }
+
+                    for (int x = -1; x < 9; x++)
+                    {
+                        ub[Off - Bps + x] = 127;
+                        vb[Off - Bps + x] = 127;
+                    }
+                }
+
+                // Choose the best 16x16 luma and 8x8 chroma prediction modes (lowest SAD),
+                // leaving the working buffers predicted with the winners.
+                int ymode = SelectLumaMode(yb, yPlane, yStride, mbCol, mbRow);
+                int uvmode = SelectChromaMode(ub, vb, uPlane, vPlane, uvStride, mbCol, mbRow);
+
+                // Header: not skipped, 16x16 intra, chosen luma + chroma modes.
+                headerEnc.PutBit(0, probSkipFalse);
+                headerEnc.PutBit(1, 145); // is_i4x4 = 0
+                WriteLumaMode16(ref headerEnc, ymode);
+                WriteChromaMode(ref headerEnc, uvmode);
+
+                // ── Luma: forward-transform the residual, quantize ──
+                for (int n = 0; n < 16; n++)
+                {
+                    int dstIdx = Off + (n / 4) * 4 * Bps + (n % 4) * 4;
+                    int ox = mbCol * 16 + (n % 4) * 4;
+                    int oy = mbRow * 16 + (n / 4) * 4;
+                    ForwardDct(yPlane, yStride, ox, oy, yb, dstIdx, dct);
+                    rawDc[n] = dct[0];
+                    Array.Clear(yLvl[n], 0, 16);
+                    for (int j = 1; j < 16; j++)
+                    {
+                        yLvl[n][j] = QuantizeLevel(dct[j], yac);
+                    }
+                }
+
+                // Y2 (WHT of the 16 luma DCs), quantize + encode; dequantize + inverse WHT
+                // to recover the per-subblock DC used for reconstruction.
+                ForwardWht(rawDc, dct);
+                Array.Clear(y2lvl, 0, 16);
+                y2lvl[0] = QuantizeLevel(dct[0], y2dc);
+                for (int j = 1; j < 16; j++)
+                {
+                    y2lvl[j] = QuantizeLevel(dct[j], y2ac);
+                }
+
+                int ctxY2 = aboveNzY2[mbCol] + leftNzY2;
+                bool y2nz = EncodeBlock(ref tokenEnc, DefaultCoeffProbs, 1, ctxY2, 0, y2lvl);
+                aboveNzY2[mbCol] = leftNzY2 = y2nz ? 1 : 0;
+
+                deq[0] = (short)(y2lvl[0] * y2dc);
+                for (int j = 1; j < 16; j++)
+                {
+                    deq[j] = (short)(y2lvl[j] * y2ac);
+                }
+
+                InverseWht(deq, dcDeq);
+
+                // Encode luma AC (skipping DC) with neighbour context, then reconstruct.
+                for (int y = 0; y < 4; y++)
+                {
+                    int l = leftNzY[y];
+                    for (int x = 0; x < 4; x++)
+                    {
+                        int n = y * 4 + x;
+                        int ctx = l + aboveNzY[mbCol * 4 + x];
+                        bool nz = EncodeBlock(ref tokenEnc, DefaultCoeffProbs, 0, ctx, 1, yLvl[n]);
+                        int f = nz ? 1 : 0;
+                        l = f;
+                        aboveNzY[mbCol * 4 + x] = f;
+
+                        deq[0] = dcDeq[n];
+                        for (int j = 1; j < 16; j++)
+                        {
+                            deq[j] = (short)(yLvl[n][j] * yac);
+                        }
+
+                        AddResidual(yb, Off + y * 4 * Bps + x * 4, deq, residual);
+                    }
+
+                    leftNzY[y] = l;
+                }
+
+                // ── Chroma: transform, quantize, encode, reconstruct (already predicted) ──
+                EncodeChromaPlane(ub, uPlane, uvStride, mbCol, mbRow, uvdc, uvac, uLvl, aboveNzU, leftNzU, ref tokenEnc, deq, residual);
+                EncodeChromaPlane(vb, vPlane, uvStride, mbCol, mbRow, uvdc, uvac, vLvl, aboveNzV, leftNzV, ref tokenEnc, deq, residual);
+
+                // Stash the reconstructed bottom row for the next macroblock row.
+                for (int x = 0; x < 16; x++)
+                {
+                    topY[mbCol * 16 + x] = yb[Off + 15 * Bps + x];
+                }
+
+                for (int x = 0; x < 8; x++)
+                {
+                    topU[mbCol * 8 + x] = ub[Off + 7 * Bps + x];
+                    topV[mbCol * 8 + x] = vb[Off + 7 * Bps + x];
                 }
             }
         }
@@ -1578,71 +1732,310 @@ internal static class Vp8LossyCodec
 
     private static readonly int[] Cat6Probs = [ 254, 254, 254, 252, 249, 243, 230, 196, 177, 153, 140 ];
 
-    private static void EncodeBlock(ref BoolEncoder enc, byte[] probs, int blockType, short[] coeffs, int startAt)
+    // Picks the 16x16 luma prediction mode (0=DC,1=TM,2=V,3=H) with the lowest sum of
+    // absolute residuals and leaves the working buffer predicted with it.
+    private static int SelectLumaMode(byte[] yb, byte[] plane, int stride, int mbCol, int mbRow)
     {
-        int lastNonZero = -1;
-        for (int i = 15;i >= startAt;i--)
+        const int Off = Bps + 8;
+        int ox = mbCol * 16, oy = mbRow * 16;
+        int best = 0;
+        long bestSad = long.MaxValue;
+        for (int mode = 0; mode < 4; mode++)
         {
-            if (coeffs[ZigZag[i]] != 0)
+            PredBlock(yb, Off, 16, mode == 0 ? CheckMode(mbCol, mbRow, 0) : mode);
+            long sad = 0;
+            for (int r = 0; r < 16; r++)
             {
-                lastNonZero = i;
+                int pb = Off + r * Bps;
+                int ob = (oy + r) * stride + ox;
+                for (int c = 0; c < 16; c++)
+                {
+                    int d = plane[ob + c] - yb[pb + c];
+                    sad += d < 0 ? -d : d;
+                }
+            }
+
+            if (sad < bestSad)
+            {
+                bestSad = sad;
+                best = mode;
+            }
+        }
+
+        PredBlock(yb, Off, 16, best == 0 ? CheckMode(mbCol, mbRow, 0) : best);
+        return best;
+    }
+
+    // Picks one 8x8 chroma prediction mode shared by U and V (lowest combined SAD) and
+    // leaves both chroma buffers predicted with it.
+    private static int SelectChromaMode(byte[] ub, byte[] vb, byte[] up, byte[] vp, int stride, int mbCol, int mbRow)
+    {
+        const int Off = Bps + 8;
+        int ox = mbCol * 8, oy = mbRow * 8;
+        int best = 0;
+        long bestSad = long.MaxValue;
+        for (int mode = 0; mode < 4; mode++)
+        {
+            int f = mode == 0 ? CheckMode(mbCol, mbRow, 0) : mode;
+            PredBlock(ub, Off, 8, f);
+            PredBlock(vb, Off, 8, f);
+            long sad = 0;
+            for (int r = 0; r < 8; r++)
+            {
+                int pb = Off + r * Bps;
+                int ob = (oy + r) * stride + ox;
+                for (int c = 0; c < 8; c++)
+                {
+                    int du = up[ob + c] - ub[pb + c];
+                    int dv = vp[ob + c] - vb[pb + c];
+                    sad += (du < 0 ? -du : du) + (dv < 0 ? -dv : dv);
+                }
+            }
+
+            if (sad < bestSad)
+            {
+                bestSad = sad;
+                best = mode;
+            }
+        }
+
+        int bf = best == 0 ? CheckMode(mbCol, mbRow, 0) : best;
+        PredBlock(ub, Off, 8, bf);
+        PredBlock(vb, Off, 8, bf);
+        return best;
+    }
+
+    private static void WriteLumaMode16(ref BoolEncoder enc, int ymode)
+    {
+        switch (ymode)
+        {
+            case 0: enc.PutBit(0, 156); enc.PutBit(0, 163); break; // DC
+            case 2: enc.PutBit(0, 156); enc.PutBit(1, 163); break; // V
+            case 3: enc.PutBit(1, 156); enc.PutBit(0, 128); break; // H
+            default: enc.PutBit(1, 156); enc.PutBit(1, 128); break; // TM
+        }
+    }
+
+    private static void WriteChromaMode(ref BoolEncoder enc, int uvmode)
+    {
+        switch (uvmode)
+        {
+            case 0: enc.PutBit(0, 142); break; // DC
+            case 2: enc.PutBit(1, 142); enc.PutBit(0, 114); break; // V
+            case 3: enc.PutBit(1, 142); enc.PutBit(1, 114); enc.PutBit(0, 183); break; // H
+            default: enc.PutBit(1, 142); enc.PutBit(1, 114); enc.PutBit(1, 183); break; // TM
+        }
+    }
+
+    // Round a DCT coefficient to a quantized level (dequantized on decode as level*q).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static short QuantizeLevel(int coeff, int q)
+    {
+        if (q <= 0)
+        {
+            return 0;
+        }
+
+        int a = coeff < 0 ? -coeff : coeff;
+        int level = (a + (q >> 1)) / q;
+        if (level > 2047)
+        {
+            level = 2047; // fits the cat6 token range
+        }
+
+        return (short)(coeff < 0 ? -level : level);
+    }
+
+    // Encodes one 4x4 block of quantized levels as VP8 coefficient tokens — the exact
+    // inverse of GetCoeffs. Returns whether the block had any non-zero level (for the
+    // neighbour context). Levels are in natural order; tokens are emitted in scan order.
+    private static bool EncodeBlock(ref BoolEncoder enc, byte[] probs, int type, int ctx, int firstN, short[] levels)
+    {
+        int last = firstN - 1;
+        for (int n = firstN; n < 16; n++)
+        {
+            if (levels[ZigZag[n]] != 0)
+            {
+                last = n;
+            }
+        }
+
+        int ctxCur = ctx;
+        int n2 = firstN;
+        while (true)
+        {
+            int off = type * 264 + Bands[n2] * 33 + ctxCur * 11;
+            if (n2 > last)
+            {
+                enc.PutBit(0, probs[off + 0]); // EOB
+                break;
+            }
+
+            enc.PutBit(1, probs[off + 0]); // not EOB
+            while (levels[ZigZag[n2]] == 0)
+            {
+                enc.PutBit(0, probs[off + 1]); // zero coefficient
+                n2++;
+                off = type * 264 + Bands[n2] * 33; // context 0 during the run
+            }
+
+            enc.PutBit(1, probs[off + 1]); // non-zero
+            int c = levels[ZigZag[n2]];
+            int a = c < 0 ? -c : c;
+            if (a == 1)
+            {
+                enc.PutBit(0, probs[off + 2]);
+                ctxCur = 1;
+            }
+            else
+            {
+                enc.PutBit(1, probs[off + 2]);
+                EncodeLargeValue(ref enc, probs, off, a);
+                ctxCur = 2;
+            }
+
+            enc.PutBit(c < 0 ? 1 : 0, 128); // sign
+            n2++;
+            if (n2 == 16)
+            {
                 break;
             }
         }
 
-        int prevContext = 0;
-        for (int i = startAt;i < 16;i++)
+        return last >= firstN;
+    }
+
+    // Emits the magnitude of a coefficient > 1 — inverse of GetLargeValue.
+    private static void EncodeLargeValue(ref BoolEncoder enc, byte[] probs, int p, int a)
+    {
+        if (a <= 4)
         {
-            int band = Bands[i];
-            int baseIdx = blockType * 264 + band * 33 + prevContext * 11;
-            int value = coeffs[ZigZag[i]];
-
-            if (i > lastNonZero)
+            enc.PutBit(0, probs[p + 3]);
+            if (a == 2)
             {
-                // EOB
-                enc.WriteBool(0, probs[baseIdx + 0]);
-                return;
-            }
-
-            enc.WriteBool(1, probs[baseIdx + 0]); // not EOB
-            if (value == 0)
-            {
-                enc.WriteBool(0, probs[baseIdx + 1]); // DCT_0
-                prevContext = 0;
-                continue;
-            }
-
-            enc.WriteBool(1, probs[baseIdx + 1]); // not zero
-            int absVal = Math.Abs(value);
-
-            if (absVal == 1)
-            {
-                enc.WriteBool(0, probs[baseIdx + 2]);
-                enc.WriteBool(value < 0 ? 1 : 0, 128);
-                prevContext = 1;
+                enc.PutBit(0, probs[p + 4]);
             }
             else
             {
-                enc.WriteBool(1, probs[baseIdx + 2]);
-                if (absVal <= 4)
-                {
-                    enc.WriteBool(0, probs[baseIdx + 3]);
-                    if (absVal <= 2)
-                    {
-                        // value = 2, no extra
-                    }
-                    else
-                    {
-                        enc.WriteBool(1, probs[baseIdx + 3]); // Actually this is wrong path
-                    }
-                }
-                // Simplified: just encode as DCT_2 for values > 1
-                // (lossy encoding doesn't need perfect coefficient coding for basic quality)
-                enc.WriteBool(value < 0 ? 1 : 0, 128);
-                prevContext = 2;
+                enc.PutBit(1, probs[p + 4]);
+                enc.PutBit(a - 3, probs[p + 5]); // 3->0, 4->1
             }
+
+            return;
         }
-        // If we reached here without EOB, implied EOB at end
+
+        if (a <= 10)
+        {
+            enc.PutBit(1, probs[p + 3]);
+            enc.PutBit(0, probs[p + 6]);
+            if (a <= 6)
+            {
+                enc.PutBit(0, probs[p + 7]);
+                enc.PutBit(a - 5, 159); // 5->0, 6->1
+            }
+            else
+            {
+                enc.PutBit(1, probs[p + 7]);
+                enc.PutBit((a - 7) >> 1, 165);
+                enc.PutBit((a - 7) & 1, 145);
+            }
+
+            return;
+        }
+
+        // Categories 3..6 (a >= 11).
+        enc.PutBit(1, probs[p + 3]);
+        enc.PutBit(1, probs[p + 6]);
+        int cat = a <= 18 ? 0 : a <= 34 ? 1 : a <= 66 ? 2 : 3;
+        int bit1 = cat >> 1;
+        int bit0 = cat & 1;
+        enc.PutBit(bit1, probs[p + 8]);
+        enc.PutBit(bit0, probs[p + 9 + bit1]);
+        int extra = a - (3 + (8 << cat));
+        byte[] tab = Cat3456[cat];
+        for (int t = 0; t < tab.Length; t++)
+        {
+            enc.PutBit((extra >> (tab.Length - 1 - t)) & 1, tab[t]);
+        }
+    }
+
+    // Transforms, quantizes, encodes and reconstructs the four 4x4 blocks of one 8x8 chroma
+    // plane (already predicted into `pb`), updating the neighbour non-zero contexts.
+    private static void EncodeChromaPlane(byte[] pb, byte[] plane, int stride, int mbCol, int mbRow, int qdc, int qac, short[][] lvl, int[] aboveNz, int[] leftNz, ref BoolEncoder enc, short[] deq, short[] residual)
+    {
+        const int Off = Bps + 8;
+        short[] dct = new short[16];
+        for (int y = 0; y < 2; y++)
+        {
+            int l = leftNz[y];
+            for (int x = 0; x < 2; x++)
+            {
+                int n = y * 2 + x;
+                int dstIdx = Off + y * 4 * Bps + x * 4;
+                int ox = mbCol * 8 + x * 4;
+                int oy = mbRow * 8 + y * 4;
+                ForwardDct(plane, stride, ox, oy, pb, dstIdx, dct);
+                Array.Clear(lvl[n], 0, 16);
+                lvl[n][0] = QuantizeLevel(dct[0], qdc);
+                for (int j = 1; j < 16; j++)
+                {
+                    lvl[n][j] = QuantizeLevel(dct[j], qac);
+                }
+
+                int ctx = l + aboveNz[mbCol * 2 + x];
+                bool nz = EncodeBlock(ref enc, DefaultCoeffProbs, 2, ctx, 0, lvl[n]);
+                int f = nz ? 1 : 0;
+                l = f;
+                aboveNz[mbCol * 2 + x] = f;
+
+                deq[0] = (short)(lvl[n][0] * qdc);
+                for (int j = 1; j < 16; j++)
+                {
+                    deq[j] = (short)(lvl[n][j] * qac);
+                }
+
+                AddResidual(pb, dstIdx, deq, residual);
+            }
+
+            leftNz[y] = l;
+        }
+    }
+
+    // Forward 4x4 DCT of (source - prediction), bit-matched to libwebp's FTransform so the
+    // decoder's inverse transform recovers it. `src` is read from an image plane; `ref` is
+    // the predicted block in a working buffer (Bps stride). Output is natural (raster) order.
+    private static void ForwardDct(byte[] src, int srcStride, int sx, int sy, byte[] refBuf, int refIdx, short[] output)
+    {
+        Span<int> tmp = stackalloc int[16];
+        for (int i = 0; i < 4; i++)
+        {
+            int sBase = (sy + i) * srcStride + sx;
+            int rBase = refIdx + i * Bps;
+            int d0 = src[sBase + 0] - refBuf[rBase + 0];
+            int d1 = src[sBase + 1] - refBuf[rBase + 1];
+            int d2 = src[sBase + 2] - refBuf[rBase + 2];
+            int d3 = src[sBase + 3] - refBuf[rBase + 3];
+            int a0 = d0 + d3;
+            int a1 = d1 + d2;
+            int a2 = d1 - d2;
+            int a3 = d0 - d3;
+            tmp[0 + i * 4] = (a0 + a1) * 8;
+            tmp[1 + i * 4] = (a2 * 2217 + a3 * 5352 + 1812) >> 9;
+            tmp[2 + i * 4] = (a0 - a1) * 8;
+            tmp[3 + i * 4] = (a3 * 2217 - a2 * 5352 + 937) >> 9;
+        }
+
+        for (int i = 0; i < 4; i++)
+        {
+            int a0 = tmp[0 + i] + tmp[12 + i];
+            int a1 = tmp[4 + i] + tmp[8 + i];
+            int a2 = tmp[4 + i] - tmp[8 + i];
+            int a3 = tmp[0 + i] - tmp[12 + i];
+            output[0 + i] = (short)((a0 + a1 + 7) >> 4);
+            output[4 + i] = (short)(((a2 * 2217 + a3 * 5352 + 12000) >> 16) + (a3 != 0 ? 1 : 0));
+            output[8 + i] = (short)((a0 - a1 + 7) >> 4);
+            output[12 + i] = (short)((a3 * 2217 - a2 * 5352 + 51000) >> 16);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -2182,40 +2575,6 @@ internal static class Vp8LossyCodec
         }
     }
 
-    private static void ForwardDct4x4(byte[] plane, int stride, int x, int y, short[] output)
-    {
-        Span<int> temp = stackalloc int[16];
-        // Read block with DC prediction subtracted
-        int sum = 0;
-        for (int r = 0;r < 4;r++)
-        {
-            for (int c = 0;c < 4;c++)
-            {
-                int idx = (y + r) * stride + x + c;
-                sum += (idx >= 0 && idx < plane.Length) ? plane[idx] : 128;
-            }
-        }
-
-        int dc = (sum + 8) / 16;
-
-        for (int r = 0;r < 4;r++)
-        {
-            for (int c = 0;c < 4;c++)
-            {
-                int idx = (y + r) * stride + x + c;
-                int val = (idx >= 0 && idx < plane.Length) ? plane[idx] : 128;
-                temp[r * 4 + c] = val - dc;
-            }
-        }
-
-        // Simple DCT: just store DC coefficient
-        output[0] = (short)(dc * 16 - 128 * 16);
-        for (int i = 1;i < 16;i++)
-        {
-            output[i] = (short)temp[ZigZag[i < 16 ? i : 0]];
-        }
-    }
-
     private static void InverseWht(short[] input, short[] output)
     {
         Span<int> temp = stackalloc int[16];
@@ -2243,30 +2602,33 @@ internal static class Vp8LossyCodec
         }
     }
 
+    // Forward Walsh-Hadamard transform of the 16 luma DC coefficients (raster order),
+    // bit-matched to libwebp's FTransformWHT so InverseWht recovers it on decode.
     private static void ForwardWht(short[] input, short[] output)
     {
-        Span<int> temp = stackalloc int[16];
-        for (int i = 0;i < 4;i++)
+        Span<int> tmp = stackalloc int[16];
+        for (int i = 0; i < 4; i++)
         {
-            int a = input[i * 4 + 0] + input[i * 4 + 2];
-            int d = input[i * 4 + 1] + input[i * 4 + 3];
-            int c = input[i * 4 + 1] - input[i * 4 + 3];
-            int b = input[i * 4 + 0] - input[i * 4 + 2];
-            temp[i * 4 + 0] = a + d;
-            temp[i * 4 + 1] = b + c;
-            temp[i * 4 + 2] = b - c;
-            temp[i * 4 + 3] = a - d;
+            int a0 = input[i * 4 + 0] + input[i * 4 + 2];
+            int a1 = input[i * 4 + 1] + input[i * 4 + 3];
+            int a2 = input[i * 4 + 1] - input[i * 4 + 3];
+            int a3 = input[i * 4 + 0] - input[i * 4 + 2];
+            tmp[0 + i * 4] = a0 + a1;
+            tmp[1 + i * 4] = a3 + a2;
+            tmp[2 + i * 4] = a3 - a2;
+            tmp[3 + i * 4] = a0 - a1;
         }
-        for (int i = 0;i < 4;i++)
+
+        for (int i = 0; i < 4; i++)
         {
-            int a = temp[0 * 4 + i] + temp[2 * 4 + i];
-            int d = temp[1 * 4 + i] + temp[3 * 4 + i];
-            int c = temp[1 * 4 + i] - temp[3 * 4 + i];
-            int b = temp[0 * 4 + i] - temp[2 * 4 + i];
-            output[0 * 4 + i] = (short)(a + d);
-            output[1 * 4 + i] = (short)(b + c);
-            output[2 * 4 + i] = (short)(b - c);
-            output[3 * 4 + i] = (short)(a - d);
+            int a0 = tmp[0 + i] + tmp[8 + i];
+            int a1 = tmp[4 + i] + tmp[12 + i];
+            int a2 = tmp[4 + i] - tmp[12 + i];
+            int a3 = tmp[0 + i] - tmp[8 + i];
+            output[0 + i] = (short)((a0 + a1) >> 1);
+            output[4 + i] = (short)((a3 + a2) >> 1);
+            output[8 + i] = (short)((a3 - a2) >> 1);
+            output[12 + i] = (short)((a0 - a1) >> 1);
         }
     }
 

@@ -374,6 +374,64 @@ public class WebpCoderTests
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // VP8 Lossy Encode — round-trip quality (regression guard for the encoder)
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Encodes a smooth colour image to lossy VP8 and decodes it back. The encoder was once a
+    // DC-only stub that produced an undecodable bitstream; this asserts the round-trip is a
+    // faithful reproduction (high PSNR), which only holds if the whole encode path — forward
+    // DCT/WHT, quantization, arithmetic coder and coefficient tokens — is correct.
+    [Test]
+    public async Task Vp8Lossy_Encode_RoundTripsWithHighQuality()
+    {
+        int w = 96, h = 64;
+        using var original = new ImageFrame();
+        original.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = original.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int off = x * 3;
+                row[off] = Quantum.ScaleFromByte((byte)(x * 255 / (w - 1)));
+                row[off + 1] = Quantum.ScaleFromByte((byte)(y * 255 / (h - 1)));
+                row[off + 2] = Quantum.ScaleFromByte((byte)((x + y) * 128 / (w + h - 2)));
+            }
+        }
+
+        using var ms = new MemoryStream();
+        WebpCoder.Write(original, ms, quality: 90);
+        ms.Position = 0;
+
+        // Confirm it really produced a VP8 (lossy) bitstream, not VP8L.
+        byte[] bytes = ms.ToArray();
+        await Assert.That(System.Text.Encoding.ASCII.GetString(bytes, 12, 4)).IsEqualTo("VP8 ");
+
+        ms.Position = 0;
+        using var decoded = WebpCoder.Read(ms);
+        await Assert.That((int)decoded.Columns).IsEqualTo(w);
+        await Assert.That((int)decoded.Rows).IsEqualTo(h);
+
+        double mse = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var oRow = original.GetPixelRow(y).ToArray();
+            var dRow = decoded.GetPixelRow(y).ToArray();
+            for (int x = 0; x < w * 3; x++)
+            {
+                int diff = Quantum.ScaleToByte(oRow[x]) - Quantum.ScaleToByte(dRow[x]);
+                mse += diff * diff;
+            }
+        }
+
+        mse /= w * h * 3;
+        double psnr = mse <= 0 ? 99.0 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        // A smooth image at quality 90 should round-trip well above 30 dB; a broken encoder
+        // (garbage bitstream) scores far lower.
+        await Assert.That(psnr).IsGreaterThan(30.0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // Helper
     // ═══════════════════════════════════════════════════════════════════
 
