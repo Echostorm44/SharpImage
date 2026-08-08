@@ -1223,34 +1223,33 @@ public class ExtendedFormatTests
 
     #region AVIF/HEIC Tests
 
-    [Test]
-    public async Task AvifCoder_Roundtrip_Solid()
-    {
-        var original = CreateSolidFrame(16, 16, 200, 100, 50, 255);
-        byte[] encoded = HeifCoder.Encode(original, HeifContainerType.Avif);
-        var decoded = HeifCoder.Decode(encoded);
+    // AVIF decoding is real (see ModernFormatTests.Avif_DecodesRealFile). Encoding needs a
+    // real AV1/HEVC encoder that isn't implemented, so it fails loudly. Detection uses a
+    // crafted ISOBMFF ftyp header (no encoder needed).
+    private static readonly byte[] AvifFtyp =
+    [
+        0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66,
+        0x00, 0x00, 0x00, 0x00, 0x61, 0x76, 0x69, 0x66, 0x6D, 0x69, 0x66, 0x31,
+    ];
 
-        await Assert.That(decoded.Columns).IsEqualTo(16u);
-        await Assert.That(decoded.Rows).IsEqualTo(16u);
+    [Test]
+    public async Task AvifCoder_Encode_NotSupported()
+    {
+        var frame = CreateSolidFrame(16, 16, 200, 100, 50, 255);
+        await Assert.That(() => HeifCoder.Encode(frame, HeifContainerType.Avif)).Throws<NotSupportedException>();
     }
 
     [Test]
-    public async Task AvifCoder_Roundtrip_Gradient()
+    public async Task HeicCoder_Encode_NotSupported()
     {
-        var original = CreateGradientFrame(32, 24);
-        byte[] encoded = HeifCoder.Encode(original, HeifContainerType.Avif);
-        var decoded = HeifCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(32u);
-        await Assert.That(decoded.Rows).IsEqualTo(24u);
+        var frame = CreateSolidFrame(16, 16, 50, 150, 250, 255);
+        await Assert.That(() => HeifCoder.Encode(frame, HeifContainerType.Heic)).Throws<NotSupportedException>();
     }
 
     [Test]
     public async Task AvifCoder_CanDecode_Valid()
     {
-        var frame = CreateSolidFrame(4, 4, 128, 128, 128, 255);
-        byte[] data = HeifCoder.Encode(frame, HeifContainerType.Avif);
-        await Assert.That(HeifCoder.CanDecode(data)).IsTrue();
+        await Assert.That(HeifCoder.CanDecode(AvifFtyp)).IsTrue();
     }
 
     [Test]
@@ -1261,43 +1260,9 @@ public class ExtendedFormatTests
     }
 
     [Test]
-    public async Task AvifCoder_FtypBrand()
-    {
-        var frame = CreateSolidFrame(8, 8, 100, 100, 100, 255);
-        byte[] data = HeifCoder.Encode(frame, HeifContainerType.Avif);
-        // ftyp box: size(4) + "ftyp"(4) + "avif"(4)
-        string ftyp = System.Text.Encoding.ASCII.GetString(data, 4, 4);
-        string brand = System.Text.Encoding.ASCII.GetString(data, 8, 4);
-        await Assert.That(ftyp).IsEqualTo("ftyp");
-        await Assert.That(brand).IsEqualTo("avif");
-    }
-
-    [Test]
-    public async Task HeicCoder_Roundtrip_Solid()
-    {
-        var original = CreateSolidFrame(16, 16, 50, 150, 250, 255);
-        byte[] encoded = HeifCoder.Encode(original, HeifContainerType.Heic);
-        var decoded = HeifCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(16u);
-        await Assert.That(decoded.Rows).IsEqualTo(16u);
-    }
-
-    [Test]
-    public async Task HeicCoder_FtypBrand()
-    {
-        var frame = CreateSolidFrame(8, 8, 100, 100, 100, 255);
-        byte[] data = HeifCoder.Encode(frame, HeifContainerType.Heic);
-        string brand = System.Text.Encoding.ASCII.GetString(data, 8, 4);
-        await Assert.That(brand).IsEqualTo("heic");
-    }
-
-    [Test]
     public async Task AvifCoder_Registry_FormatDetection()
     {
-        var frame = CreateSolidFrame(8, 8, 100, 100, 100, 255);
-        byte[] data = HeifCoder.Encode(frame, HeifContainerType.Avif);
-        var format = FormatRegistry.DetectFormat(data);
+        var format = FormatRegistry.DetectFormat(AvifFtyp);
         await Assert.That(format).IsEqualTo(ImageFileFormat.Avif);
     }
 

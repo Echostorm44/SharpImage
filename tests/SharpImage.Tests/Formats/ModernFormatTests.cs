@@ -214,79 +214,52 @@ public class ModernFormatTests
     }
 
     // ======================= AVIF =======================
+    // AVIF decoding is real (vendored AV1 intra decoder). Encoding is not implemented
+    // (no AV1 encoder). HEIC decoding is pending an HEVC decoder. See HeifCoder.
+
+    // Reference RGB sampled from libavif's own decode of TestAssets/avif_sample.avif.
+    // Tolerance absorbs the chroma-upsampling difference (box here vs libavif's bilinear).
+    private static readonly (int Y, int X, int R, int G, int B)[] AvifReference =
+    [
+        (0, 0, 1, 1, 124), (0, 63, 250, 3, 128), (47, 0, 2, 254, 129), (47, 63, 255, 255, 130),
+        (12, 20, 220, 41, 29), (34, 45, 19, 81, 219), (24, 32, 132, 132, 132),
+        (3, 3, 12, 16, 126), (40, 10, 38, 217, 127), (20, 50, 201, 108, 126),
+    ];
 
     [Test]
-    public async Task Avif_RoundTrip_PreservesDimensions()
+    public async Task Avif_DecodesRealFile()
     {
-        using var original = CreateTestFrame(32, 24);
-        byte[] encoded = HeifCoder.Encode(original, HeifContainerType.Avif);
-        using var decoded = HeifCoder.Decode(encoded);
+        string path = System.IO.Path.Combine(System.AppContext.BaseDirectory, "TestAssets", "avif_sample.avif");
+        await Assert.That(System.IO.File.Exists(path)).IsTrue();
 
-        await Assert.That(decoded.Columns).IsEqualTo(original.Columns);
-        await Assert.That(decoded.Rows).IsEqualTo(original.Rows);
+        using var image = HeifCoder.Decode(System.IO.File.ReadAllBytes(path));
+        await Assert.That((int)image.Columns).IsEqualTo(64);
+        await Assert.That((int)image.Rows).IsEqualTo(48);
+
+        foreach (var (y, x, r, g, b) in AvifReference)
+        {
+            var row = image.GetPixelRow(y).ToArray();
+            int off = x * image.NumberOfChannels;
+            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off]) - r)).IsLessThanOrEqualTo(12);
+            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off + 1]) - g)).IsLessThanOrEqualTo(12);
+            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off + 2]) - b)).IsLessThanOrEqualTo(12);
+        }
     }
 
     [Test]
-    public async Task Avif_RoundTrip_SolidColor_ReasonableAccuracy()
-    {
-        using var original = CreateSolidFrame(16, 16, 200, 100, 50);
-        byte[] encoded = HeifCoder.Encode(original, HeifContainerType.Avif);
-        using var decoded = HeifCoder.Decode(encoded);
-
-        // Lossy: AVIF uses DC-only intra coding with significant quantization
-        AssertPixelsEqual(original, decoded, tolerance: Quantum.MaxValue / 2);
-        await Assert.That(decoded.Columns).IsEqualTo(16);
-    }
-
-    [Test]
-    public async Task Avif_EncodedData_HasFtypBox()
+    public async Task Avif_Encode_NotSupported()
     {
         using var frame = CreateTestFrame(16, 16);
-        byte[] data = HeifCoder.Encode(frame, HeifContainerType.Avif);
-
-        await Assert.That(data.Length).IsGreaterThan(12);
-        // ISOBMFF: "ftyp" at offset 4
-        await Assert.That(data[4]).IsEqualTo((byte)'f');
-        await Assert.That(data[5]).IsEqualTo((byte)'t');
-        await Assert.That(data[6]).IsEqualTo((byte)'y');
-        await Assert.That(data[7]).IsEqualTo((byte)'p');
+        await Assert.That(() => HeifCoder.Encode(frame, HeifContainerType.Avif)).Throws<NotSupportedException>();
     }
 
     // ======================= HEIC =======================
 
     [Test]
-    public async Task Heic_RoundTrip_PreservesDimensions()
-    {
-        using var original = CreateTestFrame(32, 24);
-        byte[] encoded = HeifCoder.Encode(original, HeifContainerType.Heic);
-        using var decoded = HeifCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(original.Columns);
-        await Assert.That(decoded.Rows).IsEqualTo(original.Rows);
-    }
-
-    [Test]
-    public async Task Heic_RoundTrip_SolidColor_ReasonableAccuracy()
-    {
-        using var original = CreateSolidFrame(16, 16, 100, 200, 150);
-        byte[] encoded = HeifCoder.Encode(original, HeifContainerType.Heic);
-        using var decoded = HeifCoder.Decode(encoded);
-
-        AssertPixelsEqual(original, decoded, tolerance: Quantum.MaxValue / 2);
-        await Assert.That(decoded.Columns).IsEqualTo(16);
-    }
-
-    [Test]
-    public async Task Heic_EncodedData_HasFtypBox()
+    public async Task Heic_Encode_NotSupported()
     {
         using var frame = CreateTestFrame(16, 16);
-        byte[] data = HeifCoder.Encode(frame, HeifContainerType.Heic);
-
-        await Assert.That(data.Length).IsGreaterThan(12);
-        await Assert.That(data[4]).IsEqualTo((byte)'f');
-        await Assert.That(data[5]).IsEqualTo((byte)'t');
-        await Assert.That(data[6]).IsEqualTo((byte)'y');
-        await Assert.That(data[7]).IsEqualTo((byte)'p');
+        await Assert.That(() => HeifCoder.Encode(frame, HeifContainerType.Heic)).Throws<NotSupportedException>();
     }
 
     // ======================= Cross-Format =======================

@@ -214,10 +214,13 @@ public static class HeifCoder
         var frame = new ImageFrame();
         frame.Initialize(imageWidth, imageHeight, ColorspaceType.SRGB, false);
 
+        // Colour matrix + range from the nclx colour box (defaults: BT.601, full range).
+        ParseNclxColour(data, out int matrixCoeffs, out bool fullRange);
+
         if (isAvif)
         {
             DecodeAv1IntraFrame(data.AsSpan(itemDataOffset, Math.Min(itemDataLength, data.Length - itemDataOffset)),
-                        frame);
+                        frame, matrixCoeffs, fullRange);
         }
         else
         {
@@ -228,31 +231,34 @@ public static class HeifCoder
         return frame;
     }
 
+    // Reads the colour matrix coefficients + full-range flag from the ISOBMFF 'colr'/'nclx'
+    // box so YUV→RGB uses the right matrix. Defaults to BT.601 full range when absent.
+    private static void ParseNclxColour(byte[] data, out int matrixCoeffs, out bool fullRange)
+    {
+        matrixCoeffs = 6;   // BT.601
+        fullRange = true;
+        for (int i = 0; i + 19 < data.Length; i++)
+        {
+            if (data[i] == 'c' && data[i + 1] == 'o' && data[i + 2] == 'l' && data[i + 3] == 'r'
+                && data[i + 4] == 'n' && data[i + 5] == 'c' && data[i + 6] == 'l' && data[i + 7] == 'x')
+            {
+                // colour_primaries(2) transfer(2) matrix(2) full_range_flag(1 bit, high)
+                matrixCoeffs = (data[i + 12] << 8) | data[i + 13];
+                fullRange = (data[i + 14] & 0x80) != 0;
+                return;
+            }
+        }
+    }
+
     public static byte[] Encode(ImageFrame image, HeifContainerType containerType = HeifContainerType.Avif)
     {
-        int w = (int)image.Columns;
-        int h = (int)image.Rows;
-        int imgChannels = image.NumberOfChannels;
-
-        var output = new List<byte>();
-
-        string brand = containerType == HeifContainerType.Avif ? "avif" : "heic";
-
-        // ftyp box
-        WriteFtypBox(output, brand);
-
-        // Encode image data
-        byte[] codedData = containerType == HeifContainerType.Avif
-            ? EncodeAv1IntraFrame(image)
-            : EncodeHevcIntraFrame(image);
-
-        // meta box with all required sub-boxes
-        WriteMetaBox(output, w, h, codedData.Length, containerType);
-
-        // mdat box (media data)
-        WriteBox(output, "mdat", codedData);
-
-        return output.ToArray();
+        // AVIF/HEIC encoding requires a real AV1 / HEVC *encoder*, which is not implemented
+        // (only decoding is). The previous "encoder" wrote a non-standard DC-per-block stream
+        // that no real HEIF tool could read — fail loudly instead of emitting an invalid file.
+        _ = image;
+        throw new NotSupportedException(
+            $"{containerType} encoding is not implemented (no AV1/HEVC encoder). Decoding of " +
+            "real AVIF/HEIC files is supported.");
     }
 
     #region AV1 Intra Frame Codec
@@ -318,111 +324,95 @@ public static class HeifCoder
         }
     }
 
-    private static void DecodeAv1IntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame)
+    private static void DecodeAv1IntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame, int matrixCoeffs, bool fullRange)
     {
+        // Decode the AV1 keyframe with the vendored AV1 intra decoder (pixel-exact vs dav1d),
+        // then convert its YUV planes to RGB. AVIF stores the whole temporal unit (sequence
+        // header + frame OBUs) in the item's coded data.
+        var decoder = new Av1.Av1Decoder();
+        using var yuv = decoder.Decode(codedData, 0, isKeyframe: true)
+            ?? throw new InvalidDataException("AV1 decode produced no frame.");
+
         int w = (int)frame.Columns;
         int h = (int)frame.Rows;
         int channels = frame.NumberOfChannels;
+        ConvertAv1YuvToRgb(yuv, frame, w, h, channels, matrixCoeffs == 1, fullRange);
+    }
 
-        // Parse OBUs to find frame data
-        int pos = 0;
-        ReadOnlySpan<byte> frameData = ReadOnlySpan<byte>.Empty;
+    // Converts a decoded 8/10/12-bit planar YUV 4:2:0 frame to RGB, honouring the colour
+    // matrix (BT.709 vs BT.601) and range (full vs limited) signalled by the container.
+    private static void ConvertAv1YuvToRgb(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels, bool bt709, bool fullRange)
+    {
+        var y0 = yuv.YPlane.Span;
+        var u0 = yuv.UPlane.Span;
+        var v0 = yuv.VPlane.Span;
+        int yStride = yuv.YStride;
+        int uStride = yuv.UStride;
+        int vStride = yuv.VStride;
+        bool tenBit = yuv.Format is Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12;
+        int shift = tenBit ? (yuv.Format == Av1.PixelFormat.Yuv420P12 ? 4 : 2) : 0;
 
-        while (pos < codedData.Length)
+        int Sample(ReadOnlySpan<byte> plane, int stride, int x, int y)
         {
-            if (pos >= codedData.Length)
+            if (!tenBit)
             {
-                break;
+                return plane[y * stride + x];
             }
 
-            byte header = codedData[pos++];
-            int obuType = (header >> 3) & 0xF;
-            bool hasSize = (header & 0x02) != 0;
-            bool hasExtension = (header & 0x04) != 0;
-            if (hasExtension && pos < codedData.Length)
-            {
-                pos++;
-            }
-
-            int obuSize = hasSize ? ReadLeb128(codedData, ref pos) : codedData.Length - pos;
-
-            if (obuType == 6) // OBU_FRAME or OBU_FRAME_HEADER
-            {
-                frameData = codedData[pos..Math.Min(pos + obuSize, codedData.Length)];
-                break;
-            }
-
-            pos += obuSize;
+            int idx = (y * stride + x) * 2;
+            int v = plane[idx] | (plane[idx + 1] << 8);
+            return v >> shift;
         }
 
-        // Simplified AV1 intra decode: read quantized DC coefficients per 8x8 block
-        // Then apply inverse transform and YUV→RGB conversion
-        int blockW = (w + 7) / 8;
-        int blockH = (h + 7) / 8;
-        int dataPos = 0;
-
-        int[][] yuv = new int[3][];
-        yuv[0] = new int[w * h]; // Y
-        yuv[1] = new int[w * h]; // U
-        yuv[2] = new int[w * h]; // V
-
-        // Decode Y, U, V planes from coded data
-        for (int plane = 0;plane < 3;plane++)
-        {
-            for (int by = 0;by < blockH;by++)
-            {
-                for (int bx = 0;bx < blockW;bx++)
-                {
-                    // Read DC value for this block
-                    int dc = 128; // default mid-gray
-                    if (dataPos < frameData.Length)
-                    {
-                        dc = frameData[dataPos++];
-                    }
-
-                    // Fill 8x8 block with DC value
-                    for (int dy = 0;dy < 8 && by * 8 + dy < h;dy++)
-                    {
-                        for (int dx = 0;dx < 8 && bx * 8 + dx < w;dx++)
-                        {
-                            int px = bx * 8 + dx;
-                            int py = by * 8 + dy;
-                            yuv[plane][py * w + px] = dc;
-                        }
-                    }
-                }
-            }
-        }
-
-        // YUV→RGB conversion and write to frame
-        for (int y = 0;y < h;y++)
+        for (int y = 0; y < h; y++)
         {
             var row = frame.GetPixelRowForWrite(y);
-            for (int x = 0;x < w;x++)
+            int cy = y >> 1;
+            for (int x = 0; x < w; x++)
             {
-                int pixIdx = y * w + x;
-                int yVal = yuv[0][pixIdx];
-                int uVal = yuv[1][pixIdx] - 128;
-                int vVal = yuv[2][pixIdx] - 128;
+                int cx = x >> 1;
+                int yv = Sample(y0, yStride, x, y);
+                int d = Sample(u0, uStride, cx, cy) - 128;
+                int e = Sample(v0, vStride, cx, cy) - 128;
+                byte r, g, b;
+                if (fullRange)
+                {
+                    // Full range: no Y offset, 16.16 fixed-point coefficients.
+                    (int cr, int cgU, int cgV, int cb) = bt709
+                        ? (103206, 12276, 30679, 121609)   // BT.709
+                        : (91881, 22554, 46802, 116130);   // BT.601 (JPEG)
+                    r = ClampByte(yv + ((cr * e + 32768) >> 16));
+                    g = ClampByte(yv - ((cgU * d + cgV * e + 32768) >> 16));
+                    b = ClampByte(yv + ((cb * d + 32768) >> 16));
+                }
+                else
+                {
+                    // Limited (video) range: Y scaled by 1.164 from 16, 8.8 fixed-point.
+                    int c = 298 * (yv - 16);
+                    (int cr, int cgU, int cgV, int cb) = bt709
+                        ? (459, 55, 136, 541)              // BT.709
+                        : (409, 100, 208, 516);            // BT.601
+                    r = ClampByte((c + cr * e + 128) >> 8);
+                    g = ClampByte((c - cgU * d - cgV * e + 128) >> 8);
+                    b = ClampByte((c + cb * d + 128) >> 8);
+                }
 
-                int r = Math.Clamp(yVal + (int)(1.402 * vVal), 0, 255);
-                int g = Math.Clamp(yVal - (int)(0.344136 * uVal) - (int)(0.714136 * vVal), 0, 255);
-                int b = Math.Clamp(yVal + (int)(1.772 * uVal), 0, 255);
-
-                int offset = x * channels;
-                row[offset] = Quantum.ScaleFromByte((byte)r);
+                int off = x * channels;
+                row[off] = Quantum.ScaleFromByte(r);
                 if (channels > 1)
                 {
-                    row[offset + 1] = Quantum.ScaleFromByte((byte)g);
+                    row[off + 1] = Quantum.ScaleFromByte(g);
                 }
 
                 if (channels > 2)
                 {
-                    row[offset + 2] = Quantum.ScaleFromByte((byte)b);
+                    row[off + 2] = Quantum.ScaleFromByte(b);
                 }
             }
         }
     }
+
+    private static byte ClampByte(int v) => (byte)(v < 0 ? 0 : v > 255 ? 255 : v);
 
     private static byte[] EncodeAv1IntraFrame(ImageFrame image)
     {
@@ -523,89 +513,13 @@ public static class HeifCoder
 
     private static void DecodeHevcIntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame)
     {
-        // HEVC (H.265) intra frame decoding
-        // Simplified: parse NAL units, find VPS/SPS/PPS/IDR slice
-        int w = (int)frame.Columns;
-        int h = (int)frame.Rows;
-        int channels = frame.NumberOfChannels;
-
-        // Extract raw sample data from HEVC bitstream
-        // For basic support, read length-prefixed NAL units
-        int pos = 0;
-        ReadOnlySpan<byte> sliceData = ReadOnlySpan<byte>.Empty;
-
-        while (pos + 4 <= codedData.Length)
-        {
-            int nalLen = (int)BinaryPrimitives.ReadUInt32BigEndian(codedData[pos..]);
-            pos += 4;
-            if (nalLen <= 0 || pos + nalLen > codedData.Length)
-            {
-                break;
-            }
-
-            byte nalHeader = codedData[pos];
-            int nalType = (nalHeader >> 1) & 0x3F;
-
-            // NAL types: 19=IDR_W_RADL, 20=IDR_N_LP (intra frames)
-            if (nalType is 19 or 20)
-            {
-                sliceData = codedData[pos..(pos + nalLen)];
-                break;
-            }
-            pos += nalLen;
-        }
-
-        // Simplified decode: read DC values from slice data
-        int blockW = (w + 7) / 8;
-        int blockH = (h + 7) / 8;
-        // dataPos was used for NAL header offset but DC decode is simplified
-
-        for (int y = 0;y < h;y++)
-        {
-            var row = frame.GetPixelRowForWrite(y);
-            for (int x = 0;x < w;x++)
-            {
-                int bx = x / 8, by = y / 8;
-                int blockIdx = by * blockW + bx;
-                byte val = 128;
-                if (blockIdx * 3 + 2 < sliceData.Length - 2)
-                {
-                    byte yy = sliceData[2 + blockIdx];
-                    byte uu = sliceData[2 + blockW * blockH + blockIdx];
-                    byte vv = sliceData[2 + 2 * blockW * blockH + blockIdx];
-
-                    int rv = Math.Clamp(yy + (int)(1.402 * (vv - 128)), 0, 255);
-                    int gv = Math.Clamp(yy - (int)(0.344136 * (uu - 128)) - (int)(0.714136 * (vv - 128)), 0, 255);
-                    int bv = Math.Clamp(yy + (int)(1.772 * (uu - 128)), 0, 255);
-
-                    int offset = x * channels;
-                    row[offset] = Quantum.ScaleFromByte((byte)rv);
-                    if (channels > 1)
-                    {
-                        row[offset + 1] = Quantum.ScaleFromByte((byte)gv);
-                    }
-
-                    if (channels > 2)
-                    {
-                        row[offset + 2] = Quantum.ScaleFromByte((byte)bv);
-                    }
-
-                    continue;
-                }
-
-                int off = x * channels;
-                row[off] = Quantum.ScaleFromByte(val);
-                if (channels > 1)
-                {
-                    row[off + 1] = Quantum.ScaleFromByte(val);
-                }
-
-                if (channels > 2)
-                {
-                    row[off + 2] = Quantum.ScaleFromByte(val);
-                }
-            }
-        }
+        // HEIC decoding needs a real HEVC intra decoder. The previous DC-only "decode"
+        // returned garbage for real .heic files, so fail loudly for now. A full HEVC decoder
+        // (being vendored from MediaKernel, like the AV1 one used for AVIF) will replace this.
+        _ = codedData;
+        _ = frame;
+        throw new NotSupportedException(
+            "HEIC (HEVC) decoding is not implemented yet. AVIF decoding is supported.");
     }
 
     private static byte[] EncodeHevcIntraFrame(ImageFrame image)

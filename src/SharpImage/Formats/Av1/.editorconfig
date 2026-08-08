@@ -1,0 +1,16 @@
+# Vendored AV1 decoder (from MediaKernel). This is a large, performance-tuned codec ported
+# verbatim; its null handling is deliberate (planes are allocated before use) and it carries
+# diagnostic-only fields. Relax the strict nullable/analyzer rules that SharpImage enforces
+# on its own code so the vendored source builds under -warnaserror without churn.
+[*.cs]
+dotnet_diagnostic.CS8600.severity = none
+dotnet_diagnostic.CS8601.severity = none
+dotnet_diagnostic.CS8602.severity = none
+dotnet_diagnostic.CS8603.severity = none
+dotnet_diagnostic.CS8604.severity = none
+dotnet_diagnostic.CS8618.severity = none
+dotnet_diagnostic.CS8619.severity = none
+dotnet_diagnostic.CS8625.severity = none
+dotnet_diagnostic.CS0649.severity = none
+dotnet_diagnostic.CS0169.severity = none
+dotnet_diagnostic.CS0414.severity = none
