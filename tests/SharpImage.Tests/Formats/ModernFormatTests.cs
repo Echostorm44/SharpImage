@@ -254,6 +254,35 @@ public class ModernFormatTests
     }
 
     // ======================= HEIC =======================
+    // HEIC decoding is real (vendored HEVC decoder). Reference pixels captured from the
+    // decoder's own output on TestAssets/hevc_sample.heic (a small self-built HEIC whose
+    // HEVC stream ffmpeg agrees with to maxdiff 33 — i.e. genuinely decoded, not garbage).
+    private static readonly (int Y, int X, int R, int G, int B)[] HeicReference =
+    [
+        (0, 0, 0, 10, 133), (0, 95, 255, 32, 124), (63, 0, 0, 220, 127), (63, 95, 255, 245, 132),
+        (18, 30, 238, 57, 30), (46, 60, 14, 91, 217), (32, 48, 123, 128, 129),
+        (5, 5, 15, 27, 136), (50, 10, 12, 180, 128), (25, 80, 226, 113, 130),
+    ];
+
+    [Test]
+    public async Task Heic_DecodesRealFile()
+    {
+        string path = System.IO.Path.Combine(System.AppContext.BaseDirectory, "TestAssets", "hevc_sample.heic");
+        await Assert.That(System.IO.File.Exists(path)).IsTrue();
+
+        using var image = HeifCoder.Decode(System.IO.File.ReadAllBytes(path));
+        await Assert.That((int)image.Columns).IsEqualTo(96);
+        await Assert.That((int)image.Rows).IsEqualTo(64);
+
+        foreach (var (y, x, r, g, b) in HeicReference)
+        {
+            var row = image.GetPixelRow(y).ToArray();
+            int off = x * image.NumberOfChannels;
+            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off]) - r)).IsLessThanOrEqualTo(2);
+            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off + 1]) - g)).IsLessThanOrEqualTo(2);
+            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off + 2]) - b)).IsLessThanOrEqualTo(2);
+        }
+    }
 
     [Test]
     public async Task Heic_Encode_NotSupported()

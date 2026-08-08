@@ -30,30 +30,82 @@ public static class HeifCoder
 
     public static bool CanDecode(ReadOnlySpan<byte> data)
     {
-        if (data.Length < 12)
-        {
-            return false;
-        }
-        // ISOBMFF: box size (4) + "ftyp" (4) + brand (4)
-        string boxType = Encoding.ASCII.GetString(data[4..8]);
-        if (boxType != "ftyp")
+        if (data.Length < 12 || Encoding.ASCII.GetString(data[4..8]) != "ftyp")
         {
             return false;
         }
 
-        string brand = Encoding.ASCII.GetString(data[8..12]).TrimEnd('\0');
-        return IsAvifBrand(brand) || IsHeicBrand(brand);
+        // The major brand of a real HEIC/AVIF is often the generic HEIF brand 'mif1'/'msf1',
+        // with 'heic'/'avif' listed only among the compatible brands — so check every brand
+        // in the ftyp box, and accept the generic HEIF brands too.
+        foreach (string brand in FtypBrands(data))
+        {
+            if (IsAvifBrand(brand) || IsHeicBrand(brand) || brand is "mif1" or "msf1" or "mif1")
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public static bool IsAvif(ReadOnlySpan<byte> data)
     {
-        if (data.Length < 12)
+        // An AVIF carries AV1 configuration ('av1C'); a HEIC carries 'hvcC'. Prefer that over
+        // the brand, since the major brand is frequently the generic 'mif1'.
+        if (ContainsFourCc(data, "av1C"))
+        {
+            return true;
+        }
+
+        if (ContainsFourCc(data, "hvcC"))
         {
             return false;
         }
 
-        string brand = Encoding.ASCII.GetString(data[8..12]).TrimEnd('\0');
-        return IsAvifBrand(brand);
+        foreach (string brand in FtypBrands(data))
+        {
+            if (IsAvifBrand(brand))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Enumerates the major + compatible brands in the ftyp box.
+    private static System.Collections.Generic.IEnumerable<string> FtypBrands(ReadOnlySpan<byte> data)
+    {
+        var brands = new System.Collections.Generic.List<string>();
+        if (data.Length < 16 || Encoding.ASCII.GetString(data[4..8]) != "ftyp")
+        {
+            return brands;
+        }
+
+        int boxSize = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+        int end = Math.Min(boxSize, data.Length);
+        brands.Add(Encoding.ASCII.GetString(data[8..12]).TrimEnd('\0')); // major brand
+        for (int p = 16; p + 4 <= end; p += 4)                            // compatible brands
+        {
+            brands.Add(Encoding.ASCII.GetString(data[p..(p + 4)]).TrimEnd('\0'));
+        }
+
+        return brands;
+    }
+
+    private static bool ContainsFourCc(ReadOnlySpan<byte> data, string fourcc)
+    {
+        byte a = (byte)fourcc[0], b = (byte)fourcc[1], c = (byte)fourcc[2], d = (byte)fourcc[3];
+        for (int i = 0; i + 4 <= data.Length; i++)
+        {
+            if (data[i] == a && data[i + 1] == b && data[i + 2] == c && data[i + 3] == d)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public static ImageFrame Decode(byte[] data)
@@ -224,19 +276,45 @@ public static class HeifCoder
         }
         else
         {
+            byte[] hvcC = FindConfigBox(data, "hvcC");
             DecodeHevcIntraFrame(data.AsSpan(itemDataOffset, Math.Min(itemDataLength, data.Length - itemDataOffset)),
-                        frame);
+                        frame, hvcC, matrixCoeffs, fullRange);
         }
 
         return frame;
+    }
+
+    // Finds a codec configuration box (e.g. 'hvcC') in the ISOBMFF stream and returns its
+    // payload (the decoder configuration record). Returns an empty array if not present.
+    private static byte[] FindConfigBox(byte[] data, string fourcc)
+    {
+        byte a = (byte)fourcc[0], b = (byte)fourcc[1], c = (byte)fourcc[2], d = (byte)fourcc[3];
+        for (int i = 4; i + 4 <= data.Length; i++)
+        {
+            if (data[i] == a && data[i + 1] == b && data[i + 2] == c && data[i + 3] == d)
+            {
+                int boxStart = i - 4;
+                int boxSize = (data[boxStart] << 24) | (data[boxStart + 1] << 16) | (data[boxStart + 2] << 8) | data[boxStart + 3];
+                int payloadStart = i + 4;
+                int payloadLen = boxSize - 8;
+                if (payloadLen > 0 && payloadStart + payloadLen <= data.Length)
+                {
+                    return data[payloadStart..(payloadStart + payloadLen)];
+                }
+            }
+        }
+
+        return [];
     }
 
     // Reads the colour matrix coefficients + full-range flag from the ISOBMFF 'colr'/'nclx'
     // box so YUV→RGB uses the right matrix. Defaults to BT.601 full range when absent.
     private static void ParseNclxColour(byte[] data, out int matrixCoeffs, out bool fullRange)
     {
-        matrixCoeffs = 6;   // BT.601
-        fullRange = true;
+        // Defaults when no colour box is present: BT.709, limited (video) range — the
+        // convention decoders assume for HEVC/HEIC with unspecified colour.
+        matrixCoeffs = 1;
+        fullRange = false;
         for (int i = 0; i + 19 < data.Length; i++)
         {
             if (data[i] == 'c' && data[i + 1] == 'o' && data[i + 2] == 'l' && data[i + 3] == 'r'
@@ -336,22 +414,17 @@ public static class HeifCoder
         int w = (int)frame.Columns;
         int h = (int)frame.Rows;
         int channels = frame.NumberOfChannels;
-        ConvertAv1YuvToRgb(yuv, frame, w, h, channels, matrixCoeffs == 1, fullRange);
+        bool tenBit = yuv.Format is Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12;
+        int shift = tenBit ? (yuv.Format == Av1.PixelFormat.Yuv420P12 ? 4 : 2) : 0;
+        ConvertYuvToRgb(yuv.YPlane.Span, yuv.UPlane.Span, yuv.VPlane.Span, yuv.YStride, yuv.UStride, yuv.VStride,
+            frame, w, h, channels, tenBit, shift, matrixCoeffs == 1, fullRange);
     }
 
     // Converts a decoded 8/10/12-bit planar YUV 4:2:0 frame to RGB, honouring the colour
     // matrix (BT.709 vs BT.601) and range (full vs limited) signalled by the container.
-    private static void ConvertAv1YuvToRgb(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels, bool bt709, bool fullRange)
+    // Shared by the AVIF (AV1) and HEIC (HEVC) paths.
+    private static void ConvertYuvToRgb(ReadOnlySpan<byte> y0, ReadOnlySpan<byte> u0, ReadOnlySpan<byte> v0, int yStride, int uStride, int vStride, ImageFrame frame, int w, int h, int channels, bool tenBit, int shift, bool bt709, bool fullRange)
     {
-        var y0 = yuv.YPlane.Span;
-        var u0 = yuv.UPlane.Span;
-        var v0 = yuv.VPlane.Span;
-        int yStride = yuv.YStride;
-        int uStride = yuv.UStride;
-        int vStride = yuv.VStride;
-        bool tenBit = yuv.Format is Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12;
-        int shift = tenBit ? (yuv.Format == Av1.PixelFormat.Yuv420P12 ? 4 : 2) : 0;
-
         int Sample(ReadOnlySpan<byte> plane, int stride, int x, int y)
         {
             if (!tenBit)
@@ -511,15 +584,23 @@ public static class HeifCoder
 
     #region HEVC Intra Frame Codec
 
-    private static void DecodeHevcIntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame)
+    private static void DecodeHevcIntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame, byte[] hvcC, int matrixCoeffs, bool fullRange)
     {
-        // HEIC decoding needs a real HEVC intra decoder. The previous DC-only "decode"
-        // returned garbage for real .heic files, so fail loudly for now. A full HEVC decoder
-        // (being vendored from MediaKernel, like the AV1 one used for AVIF) will replace this.
-        _ = codedData;
-        _ = frame;
-        throw new NotSupportedException(
-            "HEIC (HEVC) decoding is not implemented yet. AVIF decoding is supported.");
+        // Decode the HEVC keyframe with the vendored HEVC decoder. HEIC keeps the parameter
+        // sets (VPS/SPS/PPS) in the hvcC configuration box and the coded slice NALs in the
+        // item's data, so configure from hvcC first, then decode the slice.
+        var decoder = new Hevc.HevcDecoder();
+        decoder.Initialize(hvcC);
+        using var yuv = decoder.Decode(codedData, 0, isKeyframe: true)
+            ?? throw new InvalidDataException("HEVC decode produced no frame.");
+
+        int w = (int)frame.Columns;
+        int h = (int)frame.Rows;
+        int channels = frame.NumberOfChannels;
+        bool tenBit = yuv.Format is Hevc.PixelFormat.Yuv420P10 or Hevc.PixelFormat.Yuv420P12;
+        int shift = tenBit ? (yuv.Format == Hevc.PixelFormat.Yuv420P12 ? 4 : 2) : 0;
+        ConvertYuvToRgb(yuv.YPlane.Span, yuv.UPlane.Span, yuv.VPlane.Span, yuv.YStride, yuv.UStride, yuv.VStride,
+            frame, w, h, channels, tenBit, shift, matrixCoeffs == 1, fullRange);
     }
 
     private static byte[] EncodeHevcIntraFrame(ImageFrame image)
