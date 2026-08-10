@@ -142,75 +142,32 @@ public class ModernFormatTests
 
     // ======================= JPEG XL =======================
 
-    [Test]
-    public async Task JpegXl_RoundTrip_Lossless_RGB()
-    {
-        using var original = CreateTestFrame(16, 12);
-        byte[] encoded = JxlCoder.Encode(original);
-        using var decoded = JxlCoder.Decode(encoded);
+    // JPEG XL decoding is real (from-scratch pure-C# lossless Modular decoder). Encoding is not
+    // implemented, so it fails loudly rather than emitting a non-standard bitstream. Real-file
+    // decode is verified bit-exactly in ExtendedFormatTests against libjxl-produced assets.
 
-        await Assert.That(decoded.Columns).IsEqualTo(original.Columns);
-        await Assert.That(decoded.Rows).IsEqualTo(original.Rows);
-        AssertPixelsEqual(original, decoded, tolerance: 0);
+    [Test]
+    public async Task JpegXl_DecodesRealFile()
+    {
+        // jxl_gradient.jxl: 16x16 lossless Modular produced by libjxl.
+        string path = System.IO.Path.Combine(System.AppContext.BaseDirectory, "TestAssets", "jxl_gradient.jxl");
+        using var decoded = JxlCoder.Decode(System.IO.File.ReadAllBytes(path));
+        await Assert.That(decoded.Columns).IsEqualTo(16u);
+        await Assert.That(decoded.Rows).IsEqualTo(16u);
+        int fc = decoded.NumberOfChannels;
+        ushort[] row5 = decoded.GetPixelRow(5).ToArray();
+        // Pixel (5,5): R=min(255,5*17)=85, G=min(255,5*17)=85, B=min(255,10*8)=80.
+        await Assert.That(row5[(5 * fc) + 0]).IsEqualTo(Quantum.ScaleFromByte(85));
+        await Assert.That(row5[(5 * fc) + 1]).IsEqualTo(Quantum.ScaleFromByte(85));
+        await Assert.That(row5[(5 * fc) + 2]).IsEqualTo(Quantum.ScaleFromByte(80));
     }
 
     [Test]
-    public async Task JpegXl_RoundTrip_Lossless_RGBA()
-    {
-        using var original = CreateTestFrame(12, 10, hasAlpha: true);
-        byte[] encoded = JxlCoder.Encode(original);
-        using var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(original.Columns);
-        await Assert.That(decoded.Rows).IsEqualTo(original.Rows);
-        AssertPixelsEqual(original, decoded, tolerance: 0);
-    }
-
-    [Test]
-    public async Task JpegXl_Lossy_PreservesDimensions()
-    {
-        using var original = CreateTestFrame(32, 24);
-        byte[] encoded = JxlCoder.EncodeLossy(original, quality: 90);
-        using var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(original.Columns);
-        await Assert.That(decoded.Rows).IsEqualTo(original.Rows);
-    }
-
-    [Test]
-    public async Task JpegXl_Lossy_HighQuality_CloseToOriginal()
-    {
-        using var original = CreateSolidFrame(16, 16, 180, 90, 45);
-        byte[] encoded = JxlCoder.EncodeLossy(original, quality: 95);
-        using var decoded = JxlCoder.Decode(encoded);
-
-        // High quality lossy: within 10% of quantum range
-        AssertPixelsEqual(original, decoded, tolerance: Quantum.MaxValue / 10);
-        await Assert.That(decoded.Columns).IsEqualTo(16);
-    }
-
-    [Test]
-    public async Task JpegXl_EncodedData_HasCorrectSignature()
+    public async Task JpegXl_Encode_ThrowsNotSupported()
     {
         using var frame = CreateTestFrame(8, 8);
-        byte[] data = JxlCoder.Encode(frame);
-
-        await Assert.That(data.Length).IsGreaterThan(2);
-        // JXL bare codestream: 0xFF 0x0A
-        await Assert.That(data[0]).IsEqualTo((byte)0xFF);
-        await Assert.That(data[1]).IsEqualTo((byte)0x0A);
-    }
-
-    [Test]
-    public async Task JpegXl_RoundTrip_SmallImage()
-    {
-        using var original = CreateSolidFrame(2, 2, 100, 200, 50);
-        byte[] encoded = JxlCoder.Encode(original);
-        using var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(2);
-        await Assert.That(decoded.Rows).IsEqualTo(2);
-        AssertPixelsEqual(original, decoded, tolerance: 0);
+        await Assert.That(() => JxlCoder.Encode(frame)).Throws<NotSupportedException>();
+        await Assert.That(() => JxlCoder.EncodeLossy(frame, 90)).Throws<NotSupportedException>();
     }
 
     // ======================= AVIF =======================

@@ -1008,189 +1008,84 @@ public class ExtendedFormatTests
 
     #endregion
 
-    #region JPEG XL Tests
+    #region JPEG XL Tests (real decoder)
+
+    private static byte[] LoadJxlAsset(string name)
+        => System.IO.File.ReadAllBytes(System.IO.Path.Combine(System.AppContext.BaseDirectory, "TestAssets", name));
 
     [Test]
-    public async Task JxlCoder_Roundtrip_Solid()
+    public async Task Jxl_DecodesRealSolidFile()
     {
-        var original = CreateSolidFrame(16, 16, 200, 100, 50, 255);
-        byte[] encoded = JxlCoder.Encode(original);
-        var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(16u);
-        await Assert.That(decoded.Rows).IsEqualTo(16u);
+        // jxl_solid.jxl: a 4x4 solid RGB(100,150,200) lossless Modular file produced by libjxl.
+        var frame = JxlCoder.Decode(LoadJxlAsset("jxl_solid.jxl"));
+        await Assert.That(frame.Columns).IsEqualTo(4u);
+        await Assert.That(frame.Rows).IsEqualTo(4u);
+        int fc = frame.NumberOfChannels;
+        for (int y = 0; y < 4; y++)
+        {
+            var row = frame.GetPixelRow(y).ToArray();
+            for (int x = 0; x < 4; x++)
+            {
+                await Assert.That(row[(x * fc) + 0]).IsEqualTo(Quantum.ScaleFromByte(100));
+                await Assert.That(row[(x * fc) + 1]).IsEqualTo(Quantum.ScaleFromByte(150));
+                await Assert.That(row[(x * fc) + 2]).IsEqualTo(Quantum.ScaleFromByte(200));
+            }
+        }
     }
 
     [Test]
-    public async Task JxlCoder_Roundtrip_Gradient()
+    public async Task Jxl_DecodesRealGradientFile()
     {
-        var original = CreateGradientFrame(32, 24);
-        byte[] encoded = JxlCoder.Encode(original);
-        var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(32u);
-        await Assert.That(decoded.Rows).IsEqualTo(24u);
+        // jxl_gradient.jxl: 16x16 lossless Modular; pixel = (min(255,x*17), min(255,y*17), min(255,(x+y)*8)).
+        var frame = JxlCoder.Decode(LoadJxlAsset("jxl_gradient.jxl"));
+        await Assert.That(frame.Columns).IsEqualTo(16u);
+        await Assert.That(frame.Rows).IsEqualTo(16u);
+        int fc = frame.NumberOfChannels;
+        for (int y = 0; y < 16; y++)
+        {
+            var row = frame.GetPixelRow(y).ToArray();
+            for (int x = 0; x < 16; x++)
+            {
+                await Assert.That(row[(x * fc) + 0]).IsEqualTo(Quantum.ScaleFromByte((byte)Math.Min(255, x * 17)));
+                await Assert.That(row[(x * fc) + 1]).IsEqualTo(Quantum.ScaleFromByte((byte)Math.Min(255, y * 17)));
+                await Assert.That(row[(x * fc) + 2]).IsEqualTo(Quantum.ScaleFromByte((byte)Math.Min(255, (x + y) * 8)));
+            }
+        }
     }
 
     [Test]
-    public async Task JxlCoder_CanDecode_Valid()
+    public async Task Jxl_CanDecode_RealCodestream()
     {
-        var frame = CreateSolidFrame(4, 4, 128, 128, 128, 255);
-        byte[] data = JxlCoder.Encode(frame);
-        await Assert.That(JxlCoder.CanDecode(data)).IsTrue();
+        await Assert.That(JxlCoder.CanDecode(LoadJxlAsset("jxl_solid.jxl"))).IsTrue();
     }
 
     [Test]
-    public async Task JxlCoder_CanDecode_InvalidData()
+    public async Task Jxl_CanDecode_InvalidData()
     {
         byte[] bad = [0x00, 0x00, 0x00, 0x00];
         await Assert.That(JxlCoder.CanDecode(bad)).IsFalse();
     }
 
     [Test]
-    public async Task JxlCoder_Registry_Detection()
+    public async Task Jxl_Registry_Detection()
     {
-        var frame = CreateSolidFrame(8, 8, 50, 100, 150, 255);
-        byte[] data = JxlCoder.Encode(frame);
-        var format = FormatRegistry.DetectFormat(data);
+        var format = FormatRegistry.DetectFormat(LoadJxlAsset("jxl_solid.jxl"));
         await Assert.That(format).IsEqualTo(ImageFileFormat.JpegXl);
     }
 
     [Test]
-    public async Task JxlCoder_Extension_Detection()
+    public async Task Jxl_Extension_Detection()
     {
         var format = FormatRegistry.DetectFromExtension("test.jxl");
         await Assert.That(format).IsEqualTo(ImageFileFormat.JpegXl);
     }
 
-    #endregion
-
-    #region JPEG XL VarDCT Lossy Tests
-
     [Test]
-    public async Task JxlVarDct_Roundtrip_SolidColor()
+    public async Task Jxl_Encode_NotImplemented()
     {
-        var original = CreateSolidFrame(16, 16, 200, 100, 50, 255);
-        byte[] encoded = JxlCoder.EncodeLossy(original, 95);
-        var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(16u);
-        await Assert.That(decoded.Rows).IsEqualTo(16u);
-
-        // Solid color should survive high-quality lossy within XYB transform precision
-        var row = decoded.GetPixelRow(8);
-        int channels = decoded.NumberOfChannels;
-        int rVal = row[channels];
-        int gVal = row[channels + 1];
-        int bVal = row[channels + 2];
-        int expectedR = Quantum.ScaleFromByte(200);
-        int expectedG = Quantum.ScaleFromByte(100);
-        int expectedB = Quantum.ScaleFromByte(50);
-        // Allow ~5% error for lossy XYB + DCT quantization
-        int tolerance = Quantum.MaxValue / 20;
-        await Assert.That(Math.Abs(rVal - expectedR)).IsLessThanOrEqualTo(tolerance);
-        await Assert.That(Math.Abs(gVal - expectedG)).IsLessThanOrEqualTo(tolerance);
-        await Assert.That(Math.Abs(bVal - expectedB)).IsLessThanOrEqualTo(tolerance);
-    }
-
-    [Test]
-    public async Task JxlVarDct_Roundtrip_Gradient()
-    {
-        var original = CreateGradientFrame(32, 24);
-        byte[] encoded = JxlCoder.EncodeLossy(original, 90);
-        var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(32u);
-        await Assert.That(decoded.Rows).IsEqualTo(24u);
-    }
-
-    [Test]
-    public async Task JxlVarDct_Roundtrip_WithAlpha()
-    {
-        var original = CreateSolidFrame(16, 16, 180, 90, 45, 128);
-        byte[] encoded = JxlCoder.EncodeLossy(original, 95);
-        var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.HasAlpha).IsTrue();
-
-        // Alpha is encoded losslessly via squeeze
-        var row = decoded.GetPixelRow(8);
-        int channels = decoded.NumberOfChannels;
-        ushort alphaVal = row[channels + 3];
-        ushort expectedAlpha = Quantum.ScaleFromByte(128);
-        await Assert.That(alphaVal).IsEqualTo(expectedAlpha);
-    }
-
-    [Test]
-    public async Task JxlVarDct_HigherQuality_HigherPsnr()
-    {
-        var original = CreateGradientFrame(32, 32);
-        byte[] lowQ = JxlCoder.EncodeLossy(original, 50);
-        byte[] highQ = JxlCoder.EncodeLossy(original, 95);
-
-        var decodedLow = JxlCoder.Decode(lowQ);
-        var decodedHigh = JxlCoder.Decode(highQ);
-
-        double psnrLow = ComputePsnr(original, decodedLow);
-        double psnrHigh = ComputePsnr(original, decodedHigh);
-
-        // Higher quality should yield higher PSNR
-        await Assert.That(psnrHigh).IsGreaterThan(psnrLow);
-    }
-
-    [Test]
-    public async Task JxlVarDct_LowerQuality_SmallerFile()
-    {
-        var original = CreateGradientFrame(32, 32);
-        byte[] lowQ = JxlCoder.EncodeLossy(original, 25);
-        byte[] highQ = JxlCoder.EncodeLossy(original, 95);
-
-        // Lower quality should produce smaller files
-        await Assert.That(lowQ.Length).IsLessThan(highQ.Length);
-    }
-
-    [Test]
-    public async Task JxlVarDct_Quality95_HighPsnr()
-    {
-        var original = CreateGradientFrame(32, 32);
-        byte[] encoded = JxlCoder.EncodeLossy(original, 95);
-        var decoded = JxlCoder.Decode(encoded);
-
-        double psnr = ComputePsnr(original, decoded);
-
-        // Q95 should produce PSNR > 30 dB
-        await Assert.That(psnr).IsGreaterThan(30.0);
-    }
-
-    [Test]
-    public async Task JxlVarDct_LargeImage()
-    {
-        var original = CreateGradientFrame(100, 80);
-        byte[] encoded = JxlCoder.EncodeLossy(original, 75);
-        var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(100u);
-        await Assert.That(decoded.Rows).IsEqualTo(80u);
-    }
-
-    [Test]
-    public async Task JxlVarDct_NonBlockAligned_Dimensions()
-    {
-        // 13x11 is not divisible by 8 — tests edge block padding
-        var original = CreateGradientFrame(13, 11);
-        byte[] encoded = JxlCoder.EncodeLossy(original, 90);
-        var decoded = JxlCoder.Decode(encoded);
-
-        await Assert.That(decoded.Columns).IsEqualTo(13u);
-        await Assert.That(decoded.Rows).IsEqualTo(11u);
-    }
-
-    [Test]
-    public async Task JxlVarDct_CanDecode_LossyFile()
-    {
-        var original = CreateSolidFrame(8, 8, 128, 128, 128, 255);
-        byte[] data = JxlCoder.EncodeLossy(original, 80);
-        await Assert.That(JxlCoder.CanDecode(data)).IsTrue();
+        var frame = CreateSolidFrame(4, 4, 100, 150, 200, 255);
+        await Assert.That(() => JxlCoder.Encode(frame)).Throws<NotSupportedException>();
+        await Assert.That(() => JxlCoder.EncodeLossy(frame, 90)).Throws<NotSupportedException>();
     }
 
     private static double ComputePsnr(ImageFrame a, ImageFrame b)

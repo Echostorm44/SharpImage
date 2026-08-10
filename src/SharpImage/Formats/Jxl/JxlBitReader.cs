@@ -41,6 +41,20 @@ internal sealed class JxlBitReader
 
     public bool ReadBool() => ReadBits(1) != 0;
 
+    /// <summary>Reads <paramref name="n"/> bits without advancing the position.</summary>
+    public uint PeekBits(int n)
+    {
+        long save = bitPos;
+        uint v = ReadBits(n);
+        bitPos = save;
+        return v;
+    }
+
+    /// <summary>Advances the bit position by <paramref name="n"/> bits.</summary>
+    public void Consume(int n) => bitPos += n;
+
+    public void SeekBit(long bit) => bitPos = bit;
+
     /// <summary>Reads a value with the JXL Bits(n) + offset encoding.</summary>
     public uint ReadBitsOffset(int n, uint offset) => ReadBits(n) + offset;
 
