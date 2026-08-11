@@ -293,7 +293,7 @@ internal static class JxlModular
 
     private static int prevGrad;
 
-    private static void DecodeChannel(JxlAnsReader reader, List<MaNode> tree, byte[] ctxMap, WpHeader wpHdr, int chan, JxlChannel ch)
+    private static void DecodeChannel(JxlAnsReader reader, List<MaNode> tree, byte[] ctxMap, WpHeader wpHdr, int chan, JxlChannel ch, int groupId = 0)
     {
         int w = ch.W, h = ch.H;
         if (w == 0 || h == 0)
@@ -334,7 +334,7 @@ internal static class JxlModular
 
                 // General tree: build full property vector.
                 props[0] = chan;
-                props[1] = 0;
+                props[1] = groupId;
                 props[2] = y;
                 props[3] = x;
                 props[4] = (int)Math.Abs(top);
@@ -749,6 +749,171 @@ internal static class JxlModular
             }
         }
 
+        return chans;
+    }
+
+    private static void UndoTransforms(List<Transform> transforms, List<JxlChannel> chans, WpHeader wpHdr, int bitDepth)
+    {
+        for (int i = transforms.Count - 1; i >= 0; i--)
+        {
+            Transform t = transforms[i];
+            if (t.Id == 0)
+            {
+                InvRct(chans, t.BeginC, t.RctType);
+            }
+            else if (t.Id == 1)
+            {
+                InvPalette(chans, t, wpHdr, bitDepth);
+            }
+            else
+            {
+                throw new NotSupportedException($"JXL transform {t.Id} not supported.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Decodes a multi-group lossless Modular frame: LfGlobal (global tree + small/meta channels) plus
+    /// one section per spatial group for the channels larger than the group dimension. Ported from
+    /// libjxl (dec_modular.cc DecodeGroup/FinalizeDecoding) and validated against a Python prototype.
+    /// </summary>
+    public static List<JxlChannel> DecodeMultiGroup(byte[] data, int[] offsets, int w, int h, int nbChans, int bitDepth, int groupDim, int numGroups, int numLf, int numPasses)
+    {
+        // --- LfGlobal (section 0): global tree + histograms + GroupHeader + any small/meta channels ---
+        var lb = new JxlBitReader(data, offsets[0]);
+        lb.ReadBits(1); // DequantMatrices::DecodeDC all_default
+        bool hasTree = lb.ReadBits(1) != 0;
+        List<MaNode>? globalTree = null;
+        JxlAnsCode? globalCode = null;
+        if (hasTree)
+        {
+            globalTree = DecodeTree(lb);
+            globalCode = JxlEntropy.DecodeHistograms((globalTree.Count + 1) / 2, lb);
+        }
+
+        var chans = new List<JxlChannel>();
+        for (int i = 0; i < nbChans; i++)
+        {
+            chans.Add(new JxlChannel(w, h));
+        }
+
+        bool useGlobal = lb.ReadBool();
+        WpHeader wpHdr = ReadWpHeader(lb);
+        int nt = (int)JxlBits.ReadU32(lb, JxlBitReader.U32Enc.Val(0), JxlBitReader.U32Enc.Val(1), JxlBitReader.U32Enc.BitsOff(4, 2), JxlBitReader.U32Enc.BitsOff(8, 18));
+        var transforms = new List<Transform>();
+        for (int i = 0; i < nt; i++)
+        {
+            transforms.Add(ReadTransform(lb));
+        }
+
+        int metaCount = 0;
+        foreach (Transform t in transforms)
+        {
+            MetaApply(chans, ref metaCount, t);
+        }
+
+        List<MaNode> tree = useGlobal ? (globalTree ?? throw new InvalidOperationException("use_global_tree set but no global tree present.")) : DecodeTree(lb);
+        JxlAnsCode code = useGlobal ? globalCode! : JxlEntropy.DecodeHistograms((tree.Count + 1) / 2, lb);
+
+        // First non-meta channel whose size exceeds the group dimension: everything before it is decoded
+        // in LfGlobal, the rest per group.
+        int beginc = metaCount;
+        while (beginc < chans.Count && !(chans[beginc].W > groupDim || chans[beginc].H > groupDim))
+        {
+            beginc++;
+        }
+
+        if (beginc > 0)
+        {
+            int distMult = 0;
+            foreach (JxlChannel c in chans)
+            {
+                distMult = Math.Max(distMult, c.W);
+            }
+
+            var reader = new JxlAnsReader(code, lb, distMult);
+            for (int ci = 0; ci < beginc; ci++)
+            {
+                DecodeChannel(reader, tree, code.ContextMap, wpHdr, ci, chans[ci], 0);
+            }
+
+            reader.CheckFinal();
+        }
+
+        // --- Per-group sections ---
+        int gpr = (w + groupDim - 1) / groupDim;
+        int grpSection0 = 1 + numLf + 1;
+        int numDc = numLf;
+        for (int g = 0; g < numGroups; g++)
+        {
+            int gx = g % gpr;
+            int gy = g / gpr;
+            int rx = gx * groupDim;
+            int ry = gy * groupDim;
+            int rw = Math.Min(groupDim, w - rx);
+            int rh = Math.Min(groupDim, h - ry);
+            int groupStreamId = 1 + (3 * numDc) + 17 + (numGroups * 0) + g; // ModularStreamId::ModularAC
+
+            var gb = new JxlBitReader(data, offsets[grpSection0 + g]);
+            bool gug = gb.ReadBool();
+            WpHeader gwp = ReadWpHeader(gb);
+            int gnt = (int)JxlBits.ReadU32(gb, JxlBitReader.U32Enc.Val(0), JxlBitReader.U32Enc.Val(1), JxlBitReader.U32Enc.BitsOff(4, 2), JxlBitReader.U32Enc.BitsOff(8, 18));
+            var gtrans = new List<Transform>();
+            for (int i = 0; i < gnt; i++)
+            {
+                gtrans.Add(ReadTransform(gb));
+            }
+
+            List<MaNode> gtree = gug ? tree : DecodeTree(gb);
+            JxlAnsCode gcode = gug ? code : JxlEntropy.DecodeHistograms((gtree.Count + 1) / 2, gb);
+
+            var gchans = new List<JxlChannel>();
+            var maps = new List<int>();
+            for (int c = beginc; c < chans.Count; c++)
+            {
+                gchans.Add(new JxlChannel(rw, rh));
+                maps.Add(c);
+            }
+
+            int gmeta = 0;
+            foreach (Transform t in gtrans)
+            {
+                MetaApply(gchans, ref gmeta, t);
+            }
+
+            if (gchans.Count == 0)
+            {
+                continue;
+            }
+
+            int gdist = 0;
+            foreach (JxlChannel c in gchans)
+            {
+                gdist = Math.Max(gdist, c.W);
+            }
+
+            var greader = new JxlAnsReader(gcode, gb, gdist);
+            for (int gi = 0; gi < gchans.Count; gi++)
+            {
+                DecodeChannel(greader, gtree, gcode.ContextMap, gwp, gi, gchans[gi], groupStreamId);
+            }
+
+            greader.CheckFinal();
+            UndoTransforms(gtrans, gchans, gwp, bitDepth);
+
+            for (int gi = 0; gi < maps.Count; gi++)
+            {
+                JxlChannel fc = chans[maps[gi]];
+                JxlChannel gc = gchans[gi];
+                for (int yy = 0; yy < rh; yy++)
+                {
+                    Array.Copy(gc.Px, yy * rw, fc.Px, ((ry + yy) * fc.W) + rx, rw);
+                }
+            }
+        }
+
+        // Undo any LfGlobal (global) transforms on the assembled full image.
+        UndoTransforms(transforms, chans, wpHdr, bitDepth);
         return chans;
     }
 }

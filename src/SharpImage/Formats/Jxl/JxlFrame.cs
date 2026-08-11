@@ -242,7 +242,260 @@ internal static class JxlFrame
         }
 
         ReadExtensions(br);
+
+        // ImageMetadata tail: default_m (always), opsin matrix (only if xyb), custom upsampling weights.
+        bool defaultM = br.ReadBool();
+        if (!defaultM)
+        {
+            if (md.Xyb)
+            {
+                if (!br.ReadBool())
+                {
+                    for (int i = 0; i < 9 + 3 + 4; i++)
+                    {
+                        br.ReadF16(); // opsin inverse matrix + biases + quant biases
+                    }
+                }
+            }
+
+            uint cwMask = br.ReadBits(3);
+            if ((cwMask & 1) != 0)
+            {
+                for (int i = 0; i < 15; i++)
+                {
+                    br.ReadF16();
+                }
+            }
+
+            if ((cwMask & 2) != 0)
+            {
+                for (int i = 0; i < 55; i++)
+                {
+                    br.ReadF16();
+                }
+            }
+
+            if ((cwMask & 4) != 0)
+            {
+                for (int i = 0; i < 210; i++)
+                {
+                    br.ReadF16();
+                }
+            }
+        }
+
         return md;
+    }
+
+    // --- Frame header (jxl-oxide header.rs field order) ---
+    private sealed class FrameInfo
+    {
+        public bool IsModular;
+        public int GroupSizeShift = 1;
+        public int NumPasses = 1;
+    }
+
+    private static int ReadPasses(JxlBitReader br)
+    {
+        int num = (int)br.ReadU32(E.Val(1), E.Val(2), E.Val(3), E.BitsOff(3, 4));
+        if (num != 1)
+        {
+            int nd = (int)br.ReadU32(E.Val(0), E.Val(1), E.Val(2), E.BitsOff(1, 3));
+            for (int i = 0; i < num - 1; i++)
+            {
+                br.ReadBits(2);
+            }
+
+            for (int i = 0; i < nd; i++)
+            {
+                br.ReadU32(E.Val(1), E.Val(2), E.Val(4), E.Val(8));
+            }
+
+            for (int i = 0; i < nd; i++)
+            {
+                br.ReadU32(E.Val(0), E.Val(1), E.Val(2), E.BitsOff(3, 0));
+            }
+        }
+
+        return num;
+    }
+
+    private static void ReadBlendingInfo(JxlBitReader br, int numEc)
+    {
+        uint mode = br.ReadU32(E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3));
+        if (numEc > 0 && (mode == 2 || mode == 3))
+        {
+            br.ReadU32(E.Val(0), E.Val(1), E.Val(2), E.BitsOff(3, 3));
+        }
+
+        if ((numEc > 0 && (mode == 2 || mode == 3)) || mode == 4)
+        {
+            br.ReadBool();
+        }
+
+        if (mode != 0)
+        {
+            br.ReadBits(2); // source
+        }
+    }
+
+    private static void ReadLoopFilter(JxlBitReader br, bool isModular)
+    {
+        if (br.ReadBool())
+        {
+            return; // all_default
+        }
+
+        bool gab = br.ReadBool();
+        if (gab && br.ReadBool())
+        {
+            for (int i = 0; i < 6; i++)
+            {
+                br.ReadF16();
+            }
+        }
+
+        int epf = (int)br.ReadBits(2);
+        if (epf > 0)
+        {
+            if (!isModular && br.ReadBool())
+            {
+                for (int i = 0; i < 8; i++)
+                {
+                    br.ReadF16();
+                }
+            }
+
+            if (br.ReadBool())
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    br.ReadF16();
+                }
+            }
+
+            if (br.ReadBool())
+            {
+                if (!isModular)
+                {
+                    br.ReadF16();
+                }
+
+                br.ReadF16();
+                br.ReadF16();
+                br.ReadF16();
+            }
+
+            if (isModular)
+            {
+                br.ReadF16();
+            }
+        }
+
+        ReadExtensions(br);
+    }
+
+    private static FrameInfo ReadFrameHeader(JxlBitReader br, Meta md)
+    {
+        var fh = new FrameInfo();
+        if (br.ReadBool())
+        {
+            // all_default: regular VarDCT frame.
+            fh.IsModular = false;
+            return fh;
+        }
+
+        int frameType = (int)br.ReadBits(2); // 0=Regular,1=LfFrame,2=RefOnly,3=SkipProg
+        fh.IsModular = br.ReadBits(1) == 1;   // encoding: 0=VarDct, 1=Modular
+        ulong flags = br.ReadU64();
+        bool useLf = (flags & 0x20) != 0;
+        bool doYcbcr = false;
+        if (!md.Xyb)
+        {
+            doYcbcr = br.ReadBool();
+        }
+
+        if (doYcbcr && !useLf)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                br.ReadBits(2); // jpeg_upsampling
+            }
+        }
+
+        if (!useLf)
+        {
+            br.ReadU32(E.Val(1), E.Val(2), E.Val(4), E.Val(8)); // upsampling
+            for (int i = 0; i < md.Extra; i++)
+            {
+                br.ReadU32(E.Val(1), E.Val(2), E.Val(4), E.Val(8));
+            }
+        }
+
+        if (fh.IsModular)
+        {
+            fh.GroupSizeShift = (int)br.ReadBits(2);
+        }
+        else if (md.Xyb)
+        {
+            br.ReadBits(3);
+            br.ReadBits(3); // x_qm, b_qm
+        }
+
+        if (frameType != 2)
+        {
+            fh.NumPasses = ReadPasses(br);
+        }
+
+        if (frameType == 1)
+        {
+            br.ReadBits(2); // lf_level
+        }
+
+        bool isNormal = frameType == 0 || frameType == 3;
+        if (frameType != 1)
+        {
+            bool haveCrop = br.ReadBool();
+            if (haveCrop)
+            {
+                E c0 = E.BitsOff(8, 0), c1 = E.BitsOff(11, 256), c2 = E.BitsOff(14, 2304), c3 = E.BitsOff(30, 18688);
+                if (frameType != 2)
+                {
+                    br.ReadU32(c0, c1, c2, c3);
+                    br.ReadU32(c0, c1, c2, c3);
+                }
+
+                br.ReadU32(c0, c1, c2, c3);
+                br.ReadU32(c0, c1, c2, c3);
+            }
+        }
+
+        bool isLast = frameType == 0;
+        if (isNormal)
+        {
+            ReadBlendingInfo(br, md.Extra);
+            for (int i = 0; i < md.Extra; i++)
+            {
+                ReadBlendingInfo(br, md.Extra);
+            }
+
+            isLast = br.ReadBool();
+        }
+
+        if (frameType != 1 && !isLast)
+        {
+            br.ReadBits(2); // save_as_reference
+        }
+
+        if (frameType == 2)
+        {
+            br.ReadBool(); // save_before_ct
+        }
+
+        ReadName(br);
+        ReadLoopFilter(br, fh.IsModular);
+        ReadExtensions(br);
+        return fh;
     }
 
     private static readonly E TocDist0 = E.BitsOff(10, 0);
@@ -250,40 +503,7 @@ internal static class JxlFrame
     private static readonly E TocDist2 = E.BitsOff(22, 17408);
     private static readonly E TocDist3 = E.BitsOff(30, 4211712);
 
-    /// <summary>
-    /// Locates the byte-aligned start of the single frame-body section. The TOC of a single-group
-    /// single-pass frame has exactly one entry whose size covers the rest of the codestream, so the
-    /// section start is the unique byte-aligned position where a TOC size read leaves that invariant
-    /// true. This is exact for single-section lossless frames (the common case).
-    /// </summary>
-    private static int FindSectionByte(byte[] cs)
-    {
-        int flen = cs.Length;
-        for (int p = 40; p < flen * 8; p++)
-        {
-            var br = new JxlBitReader(cs);
-            br.SeekBit(p);
-            br.JumpToByteBoundary();
-            uint sz;
-            try
-            {
-                sz = br.ReadU32(TocDist0, TocDist1, TocDist2, TocDist3);
-            }
-            catch
-            {
-                continue;
-            }
-
-            br.JumpToByteBoundary();
-            long endByte = br.BitPosition / 8;
-            if (endByte + sz == flen)
-            {
-                return (int)endByte;
-            }
-        }
-
-        return -1;
-    }
+    private static int CeilDiv(int a, int b) => (a + b - 1) / b;
 
     /// <summary>Decodes a single-frame lossless Modular codestream (signature already at offset 0).</summary>
     public static JxlModularResult DecodeModularCodestream(byte[] cs)
@@ -293,29 +513,60 @@ internal static class JxlFrame
             throw new InvalidOperationException("Not a JPEG XL codestream.");
         }
 
-        // Parse SizeHeader + the leading part of ImageMetadata (dimensions, bit depth, extra channels
-        // and colour space are all read before the metadata tail that the frame-header parse still
-        // approximates). The frame body is located structurally via the TOC (see FindSectionByte),
-        // and the Modular ANS final-state check confirms the frame really is Modular.
         var br = new JxlBitReader(cs, 2);
         (int w, int h) = ReadSize(br);
         Meta md = ReadImageMetadata(br, w, h);
 
-        int sectionByte = FindSectionByte(cs);
-        if (sectionByte < 0)
+        // The frame body (FrameHeader + TOC + sections) is byte-aligned after ImageMetadata.
+        br.JumpToByteBoundary();
+        FrameInfo fh = ReadFrameHeader(br, md);
+        if (!fh.IsModular)
         {
-            throw new InvalidOperationException("Could not locate the JPEG XL frame body.");
+            throw new NotSupportedException("JPEG XL VarDCT (lossy) frames are not yet supported.");
+        }
+
+        int groupDim = 128 << fh.GroupSizeShift;
+        int numGroups = CeilDiv(w, groupDim) * CeilDiv(h, groupDim);
+        int lfDim = groupDim * 8;
+        int numLf = CeilDiv(w, lfDim) * CeilDiv(h, lfDim);
+        int entryCount = (numGroups == 1 && fh.NumPasses == 1)
+            ? 1
+            : 1 + numLf + 1 + (numGroups * fh.NumPasses);
+
+        // TOC.
+        if (br.ReadBool())
+        {
+            throw new NotSupportedException("JPEG XL permuted TOC is not yet supported.");
+        }
+
+        br.JumpToByteBoundary();
+        uint[] sizes = new uint[entryCount];
+        for (int i = 0; i < entryCount; i++)
+        {
+            sizes[i] = br.ReadU32(TocDist0, TocDist1, TocDist2, TocDist3);
+        }
+
+        br.JumpToByteBoundary();
+        int baseByte = (int)(br.BitPosition / 8);
+        int[] offsets = new int[entryCount];
+        int acc = baseByte;
+        for (int i = 0; i < entryCount; i++)
+        {
+            offsets[i] = acc;
+            acc += (int)sizes[i];
         }
 
         int nbChans = md.Gray ? 1 : 3;
         List<JxlChannel> chans;
         try
         {
-            chans = JxlModular.DecodeGlobalModular(cs, sectionByte, w, h, nbChans, md.Bps);
+            chans = entryCount == 1
+                ? JxlModular.DecodeGlobalModular(cs, offsets[0], w, h, nbChans, md.Bps)
+                : JxlModular.DecodeMultiGroup(cs, offsets, w, h, nbChans, md.Bps, groupDim, numGroups, numLf, fh.NumPasses);
         }
         catch (Exception e) when (e is not NotSupportedException)
         {
-            throw new NotSupportedException("This JPEG XL frame is not a supported lossless Modular frame (VarDCT/lossy is not yet implemented).", e);
+            throw new NotSupportedException("This JPEG XL frame is not a supported lossless Modular frame.", e);
         }
 
         return new JxlModularResult

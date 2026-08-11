@@ -1054,6 +1054,27 @@ public class ExtendedFormatTests
     }
 
     [Test]
+    public async Task Jxl_DecodesRealMultiGroupFile()
+    {
+        // jxl_multigroup.jxl: 600x600 lossless Modular split into 9 spatial groups (group_dim 256).
+        // Pixel = ((x*3)%256, (y*3)%256, ((x^y)*5)%256).
+        var frame = JxlCoder.Decode(LoadJxlAsset("jxl_multigroup.jxl"));
+        await Assert.That(frame.Columns).IsEqualTo(600u);
+        await Assert.That(frame.Rows).IsEqualTo(600u);
+        int fc = frame.NumberOfChannels;
+        foreach (int y in new[] { 0, 255, 256, 400, 599 })
+        {
+            ushort[] row = frame.GetPixelRow(y).ToArray();
+            foreach (int x in new[] { 0, 255, 256, 300, 599 })
+            {
+                await Assert.That(row[(x * fc) + 0]).IsEqualTo(Quantum.ScaleFromByte((byte)((x * 3) % 256)));
+                await Assert.That(row[(x * fc) + 1]).IsEqualTo(Quantum.ScaleFromByte((byte)((y * 3) % 256)));
+                await Assert.That(row[(x * fc) + 2]).IsEqualTo(Quantum.ScaleFromByte((byte)(((x ^ y) * 5) % 256)));
+            }
+        }
+    }
+
+    [Test]
     public async Task Jxl_CanDecode_RealCodestream()
     {
         await Assert.That(JxlCoder.CanDecode(LoadJxlAsset("jxl_solid.jxl"))).IsTrue();
