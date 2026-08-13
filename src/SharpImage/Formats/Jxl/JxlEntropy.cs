@@ -387,11 +387,17 @@ internal static class JxlEntropy
 
         if (code.UsePrefix)
         {
+            // All cluster alphabet sizes are read first, then all histograms (libjxl/jxl-oxide order).
             code.Huffs = new JxlHuffman[numHistograms];
+            int[] alphs = new int[numHistograms];
             for (int c = 0; c < numHistograms; c++)
             {
-                int alph = JxlHuffman.DecodeVarLenUint16(br) + 1;
-                code.Huffs[c] = alph > 1 ? new JxlHuffman(alph, br) : JxlHuffman.TrivialCode();
+                alphs[c] = JxlHuffman.DecodeVarLenUint16(br) + 1;
+            }
+
+            for (int c = 0; c < numHistograms; c++)
+            {
+                code.Huffs[c] = alphs[c] > 1 ? new JxlHuffman(alphs[c], br) : JxlHuffman.TrivialCode();
             }
         }
         else
@@ -447,6 +453,55 @@ internal static class JxlEntropy
 
         numHtrees = mx + 1;
         return cm;
+    }
+
+    /// <summary>read_clusters: decodes a distribution cluster map (used by HfBlockContext). Public wrapper.</summary>
+    public static byte[] ReadClusters(int numDist, JxlBitReader br, out int numClusters)
+    {
+        if (numDist == 1)
+        {
+            numClusters = 1;
+            return new byte[1];
+        }
+
+        return DecodeContextMap(numDist, br, out numClusters);
+    }
+
+    private static int AddLog2Ceil(uint x) => x == 0 ? 0 : (32 - System.Numerics.BitOperations.LeadingZeroCount(x + 1) - (System.Numerics.BitOperations.IsPow2(x + 1) ? 1 : 0));
+
+    /// <summary>read_permutation: Lehmer-coded permutation of `size` elements skipping the first `skip`.</summary>
+    public static int[] ReadPermutation(JxlBitReader br, JxlAnsReader rd, int size, int skip)
+    {
+        int GetContext(uint v) => Math.Min(7, AddLog2Ceil(v));
+        int end = (int)rd.ReadHybridUintCtx(GetContext((uint)size));
+        int[] lehmer = new int[end];
+        uint prev = 0;
+        for (int idx = 0; idx < end; idx++)
+        {
+            lehmer[idx] = (int)rd.ReadHybridUintCtx(GetContext(prev));
+            prev = (uint)lehmer[idx];
+        }
+
+        var temp = new List<int>();
+        for (int i = skip; i < size; i++)
+        {
+            temp.Add(i);
+        }
+
+        var perm = new List<int>(size);
+        for (int i = 0; i < skip; i++)
+        {
+            perm.Add(i);
+        }
+
+        foreach (int l in lehmer)
+        {
+            perm.Add(temp[l]);
+            temp.RemoveAt(l);
+        }
+
+        perm.AddRange(temp);
+        return perm.ToArray();
     }
 
     private static void InverseMtf(byte[] v)

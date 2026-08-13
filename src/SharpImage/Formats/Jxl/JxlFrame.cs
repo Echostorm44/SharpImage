@@ -293,6 +293,20 @@ internal static class JxlFrame
         public bool IsModular;
         public int GroupSizeShift = 1;
         public int NumPasses = 1;
+        public ulong Flags;
+        public int XQmScale = 2;
+        public int BQmScale = 2;
+
+        // Loop filter params (JXL spec defaults; overwritten by ReadLoopFilter for non-default frames).
+        public bool GabEnabled = true;
+        public float[][] GabWeights = { new[] { 0.115169525f, 0.061248592f }, new[] { 0.115169525f, 0.061248592f }, new[] { 0.115169525f, 0.061248592f } };
+        public int EpfIters = 2;
+        public float[] EpfChannelScale = { 40.0f, 5.0f, 3.5f };
+        public float[] EpfSharpLut = { 0f, 1f / 7f, 2f / 7f, 3f / 7f, 4f / 7f, 5f / 7f, 6f / 7f, 1f };
+        public float EpfQuantMul = 0.46f;
+        public float EpfPass0SigmaScale = 0.9f;
+        public float EpfPass2SigmaScale = 6.5f;
+        public float EpfBorderSadMul = 2.0f / 3.0f;
     }
 
     private static int ReadPasses(JxlBitReader br)
@@ -339,56 +353,68 @@ internal static class JxlFrame
         }
     }
 
-    private static void ReadLoopFilter(JxlBitReader br, bool isModular)
+    private static void ReadLoopFilter(JxlBitReader br, FrameInfo fh)
     {
+        bool isModular = fh.IsModular;
         if (br.ReadBool())
         {
-            return; // all_default
+            return; // all_default: FrameInfo keeps spec-default loop filter fields
         }
 
+        // Gaborish
         bool gab = br.ReadBool();
+        fh.GabEnabled = gab;
         if (gab && br.ReadBool())
         {
-            for (int i = 0; i < 6; i++)
+            // custom weights: 3 channels x (w0, w1)
+            for (int c = 0; c < 3; c++)
             {
-                br.ReadF16();
+                fh.GabWeights[c][0] = br.ReadF16();
+                fh.GabWeights[c][1] = br.ReadF16();
             }
         }
 
-        int epf = (int)br.ReadBits(2);
-        if (epf > 0)
+        // Edge-preserving filter
+        int iters = (int)br.ReadBits(2);
+        fh.EpfIters = iters;
+        if (iters > 0)
         {
             if (!isModular && br.ReadBool())
             {
+                // custom sharpness LUT (VarDct only)
                 for (int i = 0; i < 8; i++)
                 {
-                    br.ReadF16();
+                    fh.EpfSharpLut[i] = br.ReadF16();
                 }
             }
 
             if (br.ReadBool())
             {
-                for (int i = 0; i < 5; i++)
+                // custom channel scale
+                for (int i = 0; i < 3; i++)
                 {
-                    br.ReadF16();
+                    fh.EpfChannelScale[i] = br.ReadF16();
                 }
+
+                br.ReadBits(32); // reserved/ignored
             }
 
             if (br.ReadBool())
             {
+                // custom sigma params
                 if (!isModular)
                 {
-                    br.ReadF16();
+                    fh.EpfQuantMul = br.ReadF16();
                 }
 
-                br.ReadF16();
-                br.ReadF16();
-                br.ReadF16();
+                fh.EpfPass0SigmaScale = br.ReadF16();
+                fh.EpfPass2SigmaScale = br.ReadF16();
+                fh.EpfBorderSadMul = br.ReadF16();
             }
 
             if (isModular)
             {
-                br.ReadF16();
+                br.ReadF16(); // sigma_for_modular
             }
         }
 
@@ -408,6 +434,7 @@ internal static class JxlFrame
         int frameType = (int)br.ReadBits(2); // 0=Regular,1=LfFrame,2=RefOnly,3=SkipProg
         fh.IsModular = br.ReadBits(1) == 1;   // encoding: 0=VarDct, 1=Modular
         ulong flags = br.ReadU64();
+        fh.Flags = flags;
         bool useLf = (flags & 0x20) != 0;
         bool doYcbcr = false;
         if (!md.Xyb)
@@ -438,8 +465,8 @@ internal static class JxlFrame
         }
         else if (md.Xyb)
         {
-            br.ReadBits(3);
-            br.ReadBits(3); // x_qm, b_qm
+            fh.XQmScale = (int)br.ReadBits(3);
+            fh.BQmScale = (int)br.ReadBits(3);
         }
 
         if (frameType != 2)
@@ -493,7 +520,7 @@ internal static class JxlFrame
         }
 
         ReadName(br);
-        ReadLoopFilter(br, fh.IsModular);
+        ReadLoopFilter(br, fh);
         ReadExtensions(br);
         return fh;
     }
@@ -520,10 +547,6 @@ internal static class JxlFrame
         // The frame body (FrameHeader + TOC + sections) is byte-aligned after ImageMetadata.
         br.JumpToByteBoundary();
         FrameInfo fh = ReadFrameHeader(br, md);
-        if (!fh.IsModular)
-        {
-            throw new NotSupportedException("JPEG XL VarDCT (lossy) frames are not yet supported.");
-        }
 
         int groupDim = 128 << fh.GroupSizeShift;
         int numGroups = CeilDiv(w, groupDim) * CeilDiv(h, groupDim);
@@ -554,6 +577,46 @@ internal static class JxlFrame
         {
             offsets[i] = acc;
             acc += (int)sizes[i];
+        }
+
+        if (!fh.IsModular)
+        {
+            var fp = new VarDctFrameParams
+            {
+                Width = w,
+                Height = h,
+                BitDepth = md.Bps,
+                GroupDim = groupDim,
+                NumGroups = numGroups,
+                NumLf = numLf,
+                GroupsPerRow = (w + groupDim - 1) / groupDim,
+                NumPasses = fh.NumPasses,
+                Xyb = md.Xyb,
+                Flags = fh.Flags,
+                XQmScale = fh.XQmScale,
+                BQmScale = fh.BQmScale,
+                SkipAdaptiveLfSmoothing = (fh.Flags & 0x80) != 0,
+                GabEnabled = fh.GabEnabled,
+                GabWeights = fh.GabWeights,
+                EpfIters = fh.EpfIters,
+                EpfChannelScale = fh.EpfChannelScale,
+                EpfSharpLut = fh.EpfSharpLut,
+                EpfQuantMul = fh.EpfQuantMul,
+                EpfPass0SigmaScale = fh.EpfPass0SigmaScale,
+                EpfPass2SigmaScale = fh.EpfPass2SigmaScale,
+                EpfBorderSadMul = fh.EpfBorderSadMul,
+            };
+            float[][] rgb = JxlVarDct.Decode(cs, offsets, sizes, fp, null, null);
+            var vc = new List<JxlChannel> { new(w, h), new(w, h), new(w, h) };
+            for (int c = 0; c < 3; c++)
+            {
+                for (int i = 0; i < w * h; i++)
+                {
+                    vc[c].Px[i] = Math.Clamp((int)MathF.Round(rgb[c][i] * 255f), 0, 255);
+                }
+            }
+
+            return new JxlModularResult { Width = w, Height = h, NumChannels = 3, Channels = vc, Gray = false };
         }
 
         int nbChans = md.Gray ? 1 : 3;

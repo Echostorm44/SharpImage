@@ -13,6 +13,8 @@ internal sealed class JxlChannel
     public int H;
     public int[] Px;
     public bool Meta;
+    public int HShift;
+    public int VShift;
 
     public JxlChannel(int w, int h, bool meta = false)
     {
@@ -39,7 +41,15 @@ internal struct MaNode
     public int Ctx;
 }
 
-internal struct Transform
+internal struct SqueezeParam
+{
+    public bool Horizontal;
+    public bool InPlace;
+    public int BeginC;
+    public int NumC;
+}
+
+internal sealed class Transform
 {
     public int Id;
     public int BeginC;
@@ -48,6 +58,7 @@ internal struct Transform
     public int NbColors;
     public int NbDeltas;
     public int Predictor;
+    public List<SqueezeParam>? Squeezes;
 }
 
 /// <summary>Self-correcting weighted predictor state (libjxl weighted::State).</summary>
@@ -519,7 +530,105 @@ internal static class JxlModular
             return;
         }
 
+        if (t.Id == 2)
+        {
+            SqueezeMetaApply(chans, ref metaCount, t);
+            return;
+        }
+
         throw new NotSupportedException($"JXL modular transform {t.Id} not supported.");
+    }
+
+    private static List<SqueezeParam> DefaultSqueezeParams(List<JxlChannel> chans, int metaCount)
+    {
+        var sp = new List<SqueezeParam>();
+        int first = metaCount;
+        int w = chans[first].W;
+        int h = chans[first].H;
+        if (chans.Count - first >= 3)
+        {
+            JxlChannel next = chans[first + 1];
+            if (next.W == w && next.H == h)
+            {
+                sp.Add(new SqueezeParam { Horizontal = true, InPlace = false, BeginC = first + 1, NumC = 2 });
+                sp.Add(new SqueezeParam { Horizontal = false, InPlace = false, BeginC = first + 1, NumC = 2 });
+            }
+        }
+
+        int baseBegin = first;
+        int baseNum = chans.Count - first;
+        if (h >= w && h > 8)
+        {
+            sp.Add(new SqueezeParam { Horizontal = false, InPlace = true, BeginC = baseBegin, NumC = baseNum });
+            h = (h + 1) / 2;
+        }
+
+        while (w > 8 || h > 8)
+        {
+            if (w > 8)
+            {
+                sp.Add(new SqueezeParam { Horizontal = true, InPlace = true, BeginC = baseBegin, NumC = baseNum });
+                w = (w + 1) / 2;
+            }
+
+            if (h > 8)
+            {
+                sp.Add(new SqueezeParam { Horizontal = false, InPlace = true, BeginC = baseBegin, NumC = baseNum });
+                h = (h + 1) / 2;
+            }
+        }
+
+        return sp;
+    }
+
+    private static void SqueezeMetaApply(List<JxlChannel> chans, ref int metaCount, Transform t)
+    {
+        List<SqueezeParam> sp = t.Squeezes is { Count: > 0 } ? t.Squeezes : DefaultSqueezeParams(chans, metaCount);
+        t.Squeezes = sp; // remember resolved params for the inverse
+        foreach (SqueezeParam s in sp)
+        {
+            int begin = s.BeginC, num = s.NumC, end = begin + num;
+            if (begin < metaCount)
+            {
+                metaCount += num;
+            }
+
+            var residu = new List<JxlChannel>();
+            for (int idx = begin; idx < end; idx++)
+            {
+                JxlChannel ch = chans[idx];
+                var r = new JxlChannel(ch.W, ch.H) { HShift = ch.HShift, VShift = ch.VShift };
+                if (s.Horizontal)
+                {
+                    int len = ch.W;
+                    ch.W = (len + 1) / 2;
+                    ch.Px = new int[ch.W * ch.H];
+                    r.W = len / 2;
+                    r.Px = new int[r.W * r.H];
+                    if (ch.HShift >= 0) { ch.HShift++; r.HShift = ch.HShift; }
+                }
+                else
+                {
+                    int len = ch.H;
+                    ch.H = (len + 1) / 2;
+                    ch.Px = new int[ch.W * ch.H];
+                    r.H = len / 2;
+                    r.Px = new int[r.W * r.H];
+                    if (ch.VShift >= 0) { ch.VShift++; r.VShift = ch.VShift; }
+                }
+
+                residu.Add(r);
+            }
+
+            if (s.InPlace)
+            {
+                var moved = chans.GetRange(end, chans.Count - end);
+                chans.RemoveRange(end, chans.Count - end);
+                residu.AddRange(moved);
+            }
+
+            chans.AddRange(residu);
+        }
     }
 
     private static long PredictNoTree(int[] px, int x, int y, int w, int predictor, WpState? wp)
@@ -613,7 +722,7 @@ internal static class JxlModular
 
     private static Transform ReadTransform(JxlBitReader br)
     {
-        var t = default(Transform);
+        var t = new Transform();
         t.Id = (int)JxlBits.ReadU32(br, JxlBitReader.U32Enc.Val(0), JxlBitReader.U32Enc.Val(1), JxlBitReader.U32Enc.Val(2), JxlBitReader.U32Enc.Val(3));
         if (t.Id is 0 or 1)
         {
@@ -635,7 +744,18 @@ internal static class JxlModular
 
         if (t.Id == 2)
         {
-            throw new NotSupportedException("JXL Squeeze transform not yet supported.");
+            int ns = (int)JxlBits.ReadU32(br, JxlBitReader.U32Enc.Val(0), JxlBitReader.U32Enc.BitsOff(4, 1), JxlBitReader.U32Enc.BitsOff(6, 9), JxlBitReader.U32Enc.BitsOff(8, 41));
+            var sq = new List<SqueezeParam>();
+            for (int i = 0; i < ns; i++)
+            {
+                bool hz = br.ReadBool();
+                bool inpl = br.ReadBool();
+                int bc = (int)JxlBits.ReadU32(br, JxlBitReader.U32Enc.BitsOff(3, 0), JxlBitReader.U32Enc.BitsOff(6, 8), JxlBitReader.U32Enc.BitsOff(10, 72), JxlBitReader.U32Enc.BitsOff(13, 1096));
+                int nc = (int)JxlBits.ReadU32(br, JxlBitReader.U32Enc.Val(1), JxlBitReader.U32Enc.Val(2), JxlBitReader.U32Enc.Val(3), JxlBitReader.U32Enc.BitsOff(4, 4));
+                sq.Add(new SqueezeParam { Horizontal = hz, InPlace = inpl, BeginC = bc, NumC = nc });
+            }
+
+            t.Squeezes = sq;
         }
 
         return t;
@@ -765,9 +885,170 @@ internal static class JxlModular
             {
                 InvPalette(chans, t, wpHdr, bitDepth);
             }
+            else if (t.Id == 2)
+            {
+                InvSqueeze(chans, t);
+            }
             else
             {
                 throw new NotSupportedException($"JXL transform {t.Id} not supported.");
+            }
+        }
+    }
+
+    // tendency (jxl-modular squeeze.rs) with wrapping 32-bit arithmetic.
+    private static int Tendency(int a, int b, int c)
+    {
+        if (a >= b && b >= c)
+        {
+            int x = ((4 * a) - (3 * c) - b + 6) / 12;
+            if (x - (x & 1) > 2 * (a - b))
+            {
+                x = (2 * (a - b)) + 1;
+            }
+
+            if (x + (x & 1) > 2 * (b - c))
+            {
+                x = 2 * (b - c);
+            }
+
+            return x;
+        }
+
+        if (a <= b && b <= c)
+        {
+            int x = ((4 * a) - (3 * c) - b - 6) / 12;
+            if (x + (x & 1) < 2 * (a - b))
+            {
+                x = (2 * (a - b)) - 1;
+            }
+
+            if (x - (x & 1) < 2 * (b - c))
+            {
+                x = 2 * (b - c);
+            }
+
+            return x;
+        }
+
+        return 0;
+    }
+
+    private static void InverseH(int[] px, int w, int h)
+    {
+        int avgWidth = (w + 1) / 2;
+        int[] scratch = new int[w];
+        for (int y = 0; y < h; y++)
+        {
+            Array.Copy(px, y * w, scratch, 0, w);
+            int avg = scratch[0];
+            int left = avg;
+            int pairs = w / 2;
+            for (int x = 0; x < pairs; x++)
+            {
+                int residu = scratch[avgWidth + x];
+                int nextAvg = x + 1 < avgWidth ? scratch[x + 1] : avg;
+                int diff = residu + Tendency(left, avg, nextAvg);
+                int first = avg + FloorDiv2(diff);
+                int second = first - diff;
+                px[(y * w) + (2 * x)] = first;
+                px[(y * w) + (2 * x) + 1] = second;
+                avg = nextAvg;
+                left = second;
+            }
+
+            if (w % 2 == 1)
+            {
+                px[(y * w) + w - 1] = scratch[avgWidth - 1];
+            }
+        }
+    }
+
+    private static void InverseV(int[] px, int w, int h)
+    {
+        int avgHeight = (h + 1) / 2;
+        int[] scratch = new int[h];
+        for (int x = 0; x < w; x++)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                scratch[y] = px[(y * w) + x];
+            }
+
+            int avg = scratch[0];
+            int top = avg;
+            int pairs = h / 2;
+            for (int y = 0; y < pairs; y++)
+            {
+                int residu = scratch[avgHeight + y];
+                int nextAvg = y + 1 < avgHeight ? scratch[y + 1] : avg;
+                int diff = residu + Tendency(top, avg, nextAvg);
+                int first = avg + FloorDiv2(diff);
+                int second = first - diff;
+                px[(2 * y * w) + x] = first;
+                px[(((2 * y) + 1) * w) + x] = second;
+                avg = nextAvg;
+                top = second;
+            }
+
+            if (h % 2 == 1)
+            {
+                px[((h - 1) * w) + x] = scratch[avgHeight - 1];
+            }
+        }
+    }
+
+    private static int FloorDiv2(int d) => d >= 0 ? d / 2 : -(((-d) + 1) / 2); // matches Rust i32 `/ 2` (trunc toward zero)
+
+    private static void InvSqueeze(List<JxlChannel> chans, Transform t)
+    {
+        List<SqueezeParam> sp = t.Squeezes!;
+        for (int si = sp.Count - 1; si >= 0; si--)
+        {
+            SqueezeParam s = sp[si];
+            int begin = s.BeginC, num = s.NumC, end = begin + num;
+            List<JxlChannel> residual;
+            if (s.InPlace)
+            {
+                residual = chans.GetRange(end, num);
+                chans.RemoveRange(end, num);
+            }
+            else
+            {
+                residual = chans.GetRange(chans.Count - num, num);
+                chans.RemoveRange(chans.Count - num, num);
+            }
+
+            for (int k = 0; k < num; k++)
+            {
+                JxlChannel i0 = chans[begin + k];
+                JxlChannel i1 = residual[k];
+                if (s.Horizontal)
+                {
+                    int mw = i0.W + i1.W;
+                    var merged = new int[mw * i0.H];
+                    for (int y = 0; y < i0.H; y++)
+                    {
+                        Array.Copy(i0.Px, y * i0.W, merged, y * mw, i0.W);
+                        Array.Copy(i1.Px, y * i1.W, merged, (y * mw) + i0.W, i1.W);
+                    }
+
+                    InverseH(merged, mw, i0.H);
+                    i0.W = mw;
+                    i0.Px = merged;
+                    if (i0.HShift > 0) { i0.HShift--; }
+                }
+                else
+                {
+                    int mh = i0.H + i1.H;
+                    var merged = new int[i0.W * mh];
+                    Array.Copy(i0.Px, 0, merged, 0, i0.W * i0.H);
+                    Array.Copy(i1.Px, 0, merged, i0.W * i0.H, i0.W * i1.H);
+                    InverseV(merged, i0.W, mh);
+                    i0.H = mh;
+                    i0.Px = merged;
+                    if (i0.VShift > 0) { i0.VShift--; }
+                }
             }
         }
     }
@@ -915,5 +1196,69 @@ internal static class JxlModular
         // Undo any LfGlobal (global) transforms on the assembled full image.
         UndoTransforms(transforms, chans, wpHdr, bitDepth);
         return chans;
+    }
+
+    /// <summary>
+    /// Decodes a Modular sub-image (VarDCT LfCoeff / HfMetadata / raw dequant matrix). Reads the
+    /// GroupHeader, decodes the given channels using the shared global MA tree (or a local one),
+    /// undoes transforms, using <paramref name="streamId"/> as the "group" tree property.
+    /// </summary>
+    public static void DecodeSubModular(JxlBitReader br, List<JxlChannel> chans, List<MaNode>? globalTree, JxlAnsCode? globalCode, int streamId, int bitDepth)
+    {
+        // libjxl ModularDecode returns immediately for an empty image (no GroupHeader read).
+        if (chans.Count == 0)
+        {
+            return;
+        }
+
+        bool useGlobal = br.ReadBool();
+        WpHeader wpHdr = ReadWpHeader(br);
+        int nt = (int)JxlBits.ReadU32(br, JxlBitReader.U32Enc.Val(0), JxlBitReader.U32Enc.Val(1), JxlBitReader.U32Enc.BitsOff(4, 2), JxlBitReader.U32Enc.BitsOff(8, 18));
+        var transforms = new List<Transform>();
+        for (int i = 0; i < nt; i++)
+        {
+            transforms.Add(ReadTransform(br));
+        }
+
+        int metaCount = 0;
+        foreach (Transform t in transforms)
+        {
+            MetaApply(chans, ref metaCount, t);
+        }
+
+        // libjxl ModularDecode returns before creating the ANS reader when there are no channels to
+        // decode (e.g. a VarDCT global-modular stream with no colour or extra channels).
+        int nonEmpty = 0;
+        foreach (JxlChannel c in chans)
+        {
+            if (c.W > 0 && c.H > 0)
+            {
+                nonEmpty++;
+            }
+        }
+
+        if (nonEmpty == 0)
+        {
+            UndoTransforms(transforms, chans, wpHdr, bitDepth);
+            return;
+        }
+
+        List<MaNode> tree = useGlobal ? (globalTree ?? throw new InvalidOperationException("use_global_tree but no global tree.")) : DecodeTree(br);
+        JxlAnsCode code = useGlobal ? (globalCode ?? throw new InvalidOperationException("use_global_tree but no global code.")) : JxlEntropy.DecodeHistograms((tree.Count + 1) / 2, br);
+
+        int distMult = 0;
+        foreach (JxlChannel c in chans)
+        {
+            distMult = Math.Max(distMult, c.W);
+        }
+
+        var reader = new JxlAnsReader(code, br, distMult);
+        for (int ci = 0; ci < chans.Count; ci++)
+        {
+            DecodeChannel(reader, tree, code.ContextMap, wpHdr, ci, chans[ci], streamId);
+        }
+
+        reader.CheckFinal();
+        UndoTransforms(transforms, chans, wpHdr, bitDepth);
     }
 }

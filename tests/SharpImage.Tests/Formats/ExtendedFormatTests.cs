@@ -1054,6 +1054,42 @@ public class ExtendedFormatTests
     }
 
     [Test]
+    public async Task Jxl_DecodesRealVarDctFile()
+    {
+        // jxl_vardct.jxl: 64x64 RGB VarDCT (lossy, distance 1.0) produced by libjxl (ffmpeg -c:v libjxl).
+        // Exercises the full lossy pipeline: Lf/HF entropy decode, dequant matrices, inverse DCT for all
+        // varblock transforms, chroma-from-luma, XYB->sRGB, and the Gaborish + EPF loop filters.
+        // jxl_vardct_ref.png is the reference decode from jxl-oxide; we require a high-fidelity match.
+        var frame = JxlCoder.Decode(LoadJxlAsset("jxl_vardct.jxl"));
+        await Assert.That(frame.Columns).IsEqualTo(64u);
+        await Assert.That(frame.Rows).IsEqualTo(64u);
+
+        using var refImg = FormatRegistry.Decode(LoadJxlAsset("jxl_vardct_ref.png"), ImageFileFormat.Png);
+        int fc = frame.NumberOfChannels, rc = refImg.NumberOfChannels;
+        double mse = 0;
+        int n = 0;
+        for (int y = 0; y < 64; y++)
+        {
+            ushort[] got = frame.GetPixelRow(y).ToArray();
+            ushort[] rf = refImg.GetPixelRow(y).ToArray();
+            for (int x = 0; x < 64; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    double d = got[(x * fc) + c] - rf[(x * rc) + c];
+                    mse += d * d;
+                    n++;
+                }
+            }
+        }
+
+        mse /= n;
+        double psnr = mse == 0 ? 999 : 10 * Math.Log10(65535.0 * 65535.0 / mse);
+        // Bit-exact-quality decode: our result matches the reference decoder to within ~1 LSB@8-bit.
+        await Assert.That(psnr).IsGreaterThan(60.0);
+    }
+
+    [Test]
     public async Task Jxl_DecodesRealMultiGroupFile()
     {
         // jxl_multigroup.jxl: 600x600 lossless Modular split into 9 spatial groups (group_dim 256).
