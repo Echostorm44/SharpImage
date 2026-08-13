@@ -1192,10 +1192,13 @@ public class ExtendedFormatTests
     }
 
     [Test]
-    public async Task HeicCoder_Encode_NotSupported()
+    public async Task HeicCoder_Encode_Produces_Decodable_File()
     {
-        var frame = CreateSolidFrame(16, 16, 50, 150, 250, 255);
-        await Assert.That(() => HeifCoder.Encode(frame, HeifContainerType.Heic)).Throws<NotSupportedException>();
+        // HEIC encoding is implemented via the pure-C# HEVC intra encoder; AVIF is decode-only.
+        var frame = CreateSolidFrame(32, 32, 50, 150, 250, 255);
+        byte[] heic = HeifCoder.Encode(frame, HeifContainerType.Heic);
+        await Assert.That(HeifCoder.CanDecode(heic)).IsTrue();
+        await Assert.That(() => HeifCoder.Encode(frame, HeifContainerType.Avif)).Throws<NotSupportedException>();
     }
 
     [Test]

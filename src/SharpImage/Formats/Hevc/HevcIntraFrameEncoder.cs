@@ -52,6 +52,15 @@ internal sealed class HevcIntraFrameEncoder
 
     public int ChromaQpFor(int lumaQp) => ChromaQp[Math.Clamp(lumaQp, 0, 57)];
 
+    // Encoder's own reconstruction (for verifying enc/dec consistency).
+    internal byte[] LumaRecon => lumaRec;
+
+    internal byte[] CbRecon => cbRec;
+
+    internal byte[] CrRecon => crRec;
+
+    internal int PaddedWidth => pw;
+
     /// <summary>Encodes the slice segment data (RBSP payload after the slice header), byte-aligned.</summary>
     public byte[] EncodeSliceData()
     {

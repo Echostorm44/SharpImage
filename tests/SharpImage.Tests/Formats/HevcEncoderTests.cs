@@ -1,3 +1,6 @@
+using SharpImage.Core;
+using SharpImage.Formats;
+using SharpImage.Image;
 using SharpImage.Formats.Hevc;
 
 namespace SharpImage.Tests.Formats;
@@ -191,5 +194,57 @@ public class HevcEncoderTests
         }
 
         await Assert.That(fail).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task Heic_Encode_Decode_RoundTrips_At_Good_Quality()
+    {
+        // Smooth RGB gradient -> HEIC -> decode; the pure-C# HEVC intra encoder should reconstruct
+        // it at high fidelity and produce a container our own HeifCoder reads back.
+        const int w = 96, h = 80;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            int ch = frame.NumberOfChannels;
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * ch;
+                row[o] = Quantum.ScaleFromByte((byte)(x * 2));
+                row[o + 1] = Quantum.ScaleFromByte((byte)(y * 2));
+                row[o + 2] = Quantum.ScaleFromByte((byte)(128 + (x - y)));
+            }
+        }
+
+        byte[] heic = FormatRegistry.Encode(frame, ImageFileFormat.Heic);
+        await Assert.That(heic.Length).IsGreaterThan(0);
+        await Assert.That(HeifCoder.CanDecode(heic)).IsTrue();
+
+        using var decoded = FormatRegistry.Decode(heic, ImageFileFormat.Heic);
+        await Assert.That((int)decoded.Columns).IsEqualTo(w);
+        await Assert.That((int)decoded.Rows).IsEqualTo(h);
+
+        double mse = 0;
+        int n = 0;
+        int gc = decoded.NumberOfChannels;
+        for (int y = 0; y < h; y++)
+        {
+            ushort[] a = frame.GetPixelRow(y).ToArray();
+            ushort[] b = decoded.GetPixelRow(y).ToArray();
+            int ac = frame.NumberOfChannels;
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    double d = (a[(x * ac) + c] >> 8) - (b[(x * gc) + c] >> 8);
+                    mse += d * d;
+                    n++;
+                }
+            }
+        }
+
+        double psnr = mse == 0 ? 999 : 10 * Math.Log10(255.0 * 255 / (mse / n));
+        await Assert.That(psnr).IsGreaterThan(38.0);
     }
 }

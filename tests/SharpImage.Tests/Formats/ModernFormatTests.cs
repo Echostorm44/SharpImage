@@ -242,10 +242,13 @@ public class ModernFormatTests
     }
 
     [Test]
-    public async Task Heic_Encode_NotSupported()
+    public async Task Heic_Encode_Produces_Decodable_File()
     {
-        using var frame = CreateTestFrame(16, 16);
-        await Assert.That(() => HeifCoder.Encode(frame, HeifContainerType.Heic)).Throws<NotSupportedException>();
+        // HEIC encoding is implemented (pure-C# HEVC intra encoder); AVIF encoding is not.
+        using var frame = CreateTestFrame(32, 32);
+        byte[] heic = HeifCoder.Encode(frame, HeifContainerType.Heic);
+        await Assert.That(HeifCoder.CanDecode(heic)).IsTrue();
+        await Assert.That(() => HeifCoder.Encode(frame, HeifContainerType.Avif)).Throws<NotSupportedException>();
     }
 
     // ======================= Cross-Format =======================

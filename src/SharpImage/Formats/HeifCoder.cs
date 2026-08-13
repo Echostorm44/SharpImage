@@ -329,14 +329,39 @@ public static class HeifCoder
     }
 
     public static byte[] Encode(ImageFrame image, HeifContainerType containerType = HeifContainerType.Avif)
+        => Encode(image, containerType, 20);
+
+    /// <summary>
+    /// Encodes an image to HEIC (HEVC still image) at the given quantization parameter (0 = highest
+    /// quality/largest, ~51 = lowest). AVIF encoding is not supported (no AV1 encoder).
+    /// </summary>
+    public static byte[] Encode(ImageFrame image, HeifContainerType containerType, int qp)
     {
-        // AVIF/HEIC encoding requires a real AV1 / HEVC *encoder*, which is not implemented
-        // (only decoding is). The previous "encoder" wrote a non-standard DC-per-block stream
-        // that no real HEIF tool could read — fail loudly instead of emitting an invalid file.
-        _ = image;
-        throw new NotSupportedException(
-            $"{containerType} encoding is not implemented (no AV1/HEVC encoder). Decoding of " +
-            "real AVIF/HEIC files is supported.");
+        if (containerType != HeifContainerType.Heic)
+        {
+            throw new NotSupportedException(
+                "AVIF encoding is not implemented (no AV1 encoder). HEIC encoding and AVIF/HEIC " +
+                "decoding are supported.");
+        }
+
+        int w = (int)image.Columns;
+        int h = (int)image.Rows;
+        var rgb = new byte[w * h * 3];
+        for (int y = 0; y < h; y++)
+        {
+            ReadOnlySpan<ushort> row = image.GetPixelRow(y);
+            int ch = image.NumberOfChannels;
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * ch;
+                int d = ((y * w) + x) * 3;
+                rgb[d] = Quantum.ScaleToByte(row[o]);
+                rgb[d + 1] = Quantum.ScaleToByte(ch > 1 ? row[o + 1] : row[o]);
+                rgb[d + 2] = Quantum.ScaleToByte(ch > 2 ? row[o + 2] : row[o]);
+            }
+        }
+
+        return Hevc.HeicEncoder.Encode(rgb, w, h, 3, Math.Clamp(qp, 0, 51), signDataHiding: true);
     }
 
     #region AV1 Intra Frame Codec
