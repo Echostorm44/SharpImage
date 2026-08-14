@@ -1,8 +1,9 @@
 // HEVC I-slice encoder core: encodes a YUV 4:2:0 frame (dimensions padded to a multiple of the CTU
 // size) as an all-intra HEVC slice, reconstructing each block as it goes so neighbour references
-// match the decoder exactly. v1 structure: one 32x32 intra CU per 32x32 CTU (part 2Nx2N, single
-// transform unit) with a real SATD luma mode search over all 35 modes. Mirrors HevcDecoder's
-// coding_unit / transform_tree / transform_unit syntax; residual via HevcResidualEncoder.
+// match the decoder exactly. Structure: one 32x32 intra CU per 32x32 CTU (part 2Nx2N) with a SATD
+// luma mode search over all 35 modes, and a rate-distortion-decided transform quadtree (32->16->8
+// luma TUs) with per-TU intra prediction. Mirrors HevcDecoder's coding_unit / transform_tree /
+// transform_unit syntax; residual via HevcResidualEncoder, availability via HevcZScan.
 using System;
 
 namespace SharpImage.Formats.Hevc;
@@ -111,50 +112,192 @@ internal sealed class HevcIntraFrameEncoder
         // Store luma mode into tabIpm for the 32x32 CU region.
         StoreIpm(x0, y0, CtbSize, lumaMode);
 
-        // --- Chroma mode: derived from luma (signal 4) for v1 ---
-        int chromaMode = lumaMode;
-        cabac.EncodeBin(HevcCabacContextIndex.IntraChromaPredMode, 0); // derived-from-luma
+        // Chroma mode: derived from luma (signal 4).
+        cabac.EncodeBin(HevcCabacContextIndex.IntraChromaPredMode, 0);
 
-        // --- Reconstruct luma + form residual/coeffs ---
-        int lumaScan = 0; // 32x32 -> diagonal
-        var lumaCoeff = new short[CtbSize * CtbSize];
-        bool cbfLuma = EncodeAndReconstructBlock(lumaOrig, lumaRec, pw, ph, x0, y0, CtbSize, lumaMode, 0, qp, lumaScan, lumaCoeff);
+        // Plan the transform quadtree (per-TU prediction + reconstruction, RD-decided split),
+        // then encode it. Chroma is carried at every leaf (luma TU >= 8 so chroma TU >= 4).
+        double lambda = 0.85 * Math.Pow(2.0, (qp - 12) / 3.0);
+        TuNode root = PlanTu(x0, y0, CtbLog2, 0, lumaMode, lambda);
+        EncodeTuTree(cabac, root, 0, true, true, lumaMode);
+    }
 
-        // --- Chroma: 16x16 blocks at (x0/2, y0/2) ---
+    // ---- Transform quadtree ----
+
+    private sealed class TuNode
+    {
+        public bool Split;
+        public TuNode[]? Children;
+        public int X, Y, Log2Size;
+        public short[] LumaCoeff = System.Array.Empty<short>();
+        public bool CbfLuma;
+        public short[] CbCoeff = System.Array.Empty<short>();
+        public short[] CrCoeff = System.Array.Empty<short>();
+        public bool CbfCb, CbfCr;
+    }
+
+    // Decides the TU structure by rate-distortion, reconstructing luma+chroma into the recon buffers
+    // as it commits, and returns the plan + its cost.
+    private TuNode PlanTu(int x, int y, int log2Size, int depth, int lumaMode, double lambda)
+    {
+        bool canSplit = log2Size > 3 && depth < 2; // 32->16->8 (min luma TU 8, chroma 4)
+
+        // Leaf: process this TU (reconstruct), remember its recon + cost.
+        byte[] savePre = SnapshotRegion(x, y, 1 << log2Size);
+        var leaf = ProcessTuLeaf(x, y, log2Size, lumaMode);
+        double leafCost = leaf.Dist + (lambda * leaf.Bits);
+        if (!canSplit)
+        {
+            return leaf.Node;
+        }
+
+        byte[] leafRecon = SnapshotRegion(x, y, 1 << log2Size);
+
+        // Split: restore, then reconstruct 4 children in z-scan order.
+        RestoreRegion(x, y, 1 << log2Size, savePre);
+        int half = 1 << (log2Size - 1);
+        var c0 = PlanTu(x, y, log2Size - 1, depth + 1, lumaMode, lambda);
+        var c1 = PlanTu(x + half, y, log2Size - 1, depth + 1, lumaMode, lambda);
+        var c2 = PlanTu(x, y + half, log2Size - 1, depth + 1, lumaMode, lambda);
+        var c3 = PlanTu(x + half, y + half, log2Size - 1, depth + 1, lumaMode, lambda);
+        double splitCost = (lambda * 1) + RegionRdCost(x, y, log2Size, lambda, c0, c1, c2, c3);
+
+        if (leafCost <= splitCost)
+        {
+            RestoreRegion(x, y, 1 << log2Size, leafRecon);
+            return leaf.Node;
+        }
+
+        return new TuNode { Split = true, Children = new[] { c0, c1, c2, c3 }, X = x, Y = y, Log2Size = log2Size };
+    }
+
+    // Distortion+bits of a chosen split subtree (children already reconstructed in place).
+    private double RegionRdCost(int x, int y, int log2Size, double lambda, params TuNode[] children)
+    {
+        int n = 1 << log2Size;
+        long dist = SsdLuma(x, y, n) + SsdChroma(x / 2, y / 2, n / 2);
+        double bits = 0;
+        foreach (TuNode c in children)
+        {
+            bits += SubtreeBits(c);
+        }
+
+        return dist + (lambda * bits);
+    }
+
+    private double SubtreeBits(TuNode node)
+    {
+        if (node.Split)
+        {
+            double b = 1;
+            foreach (TuNode c in node.Children!)
+            {
+                b += SubtreeBits(c);
+            }
+
+            return b;
+        }
+
+        return 3 + EstBits(node.LumaCoeff) + EstBits(node.CbCoeff) + EstBits(node.CrCoeff);
+    }
+
+    private (TuNode Node, long Dist, double Bits) ProcessTuLeaf(int x, int y, int log2Size, int lumaMode)
+    {
+        int n = 1 << log2Size;
+        var node = new TuNode { X = x, Y = y, Log2Size = log2Size };
+
+        // Luma
+        var lumaCoeff = new short[n * n];
+        node.CbfLuma = ProcessPlane(lumaOrig, lumaRec, pw, ph, x, y, n, lumaMode, 0, qp, lumaCoeff);
+        node.LumaCoeff = lumaCoeff;
+
+        // Chroma (n/2)
+        int cSize = n / 2;
+        int cx = x / 2, cy = y / 2;
         int cqp = ChromaQpFor(qp);
-        int cx0 = x0 / 2, cy0 = y0 / 2, cSize = CtbSize / 2;
-        int chromaScan = 0; // 16x16 -> diagonal
         var cbCoeff = new short[cSize * cSize];
         var crCoeff = new short[cSize * cSize];
-        // Predict + form residual + coeffs, but DO NOT write to the bitstream yet — cbf order is
-        // cbf_cb, cbf_cr (in transform_tree) then cbf_luma (in transform_unit), then residuals.
-        bool cbfCb = QuantizeBlock(cbOrig, cbRec, cw, ch, cx0, cy0, cSize, chromaMode, 1, cqp, chromaScan, cbCoeff, out int[] cbPred);
-        bool cbfCr = QuantizeBlock(crOrig, crRec, cw, ch, cx0, cy0, cSize, chromaMode, 2, cqp, chromaScan, crCoeff, out int[] crPred);
+        node.CbfCb = ProcessPlane(cbOrig, cbRec, cw, ch, cx, cy, cSize, lumaMode, 1, cqp, cbCoeff);
+        node.CbfCr = ProcessPlane(crOrig, crRec, cw, ch, cx, cy, cSize, lumaMode, 2, cqp, crCoeff);
+        node.CbCoeff = cbCoeff;
+        node.CrCoeff = crCoeff;
 
-        // transform_tree (trafoDepth 0, no split): cbf_cb, cbf_cr
-        cabac.EncodeBin(HevcCabacContextIndex.CbfChroma + 0, cbfCb ? 1 : 0);
-        cabac.EncodeBin(HevcCabacContextIndex.CbfChroma + 0, cbfCr ? 1 : 0);
+        long dist = SsdLuma(x, y, n) + SsdChroma(cx, cy, cSize);
+        double bits = 3 + EstBits(lumaCoeff) + EstBits(cbCoeff) + EstBits(crCoeff);
+        return (node, dist, bits);
+    }
 
-        // transform_unit: cbf_luma (intra -> always coded), then luma residual, then chroma residuals.
-        cabac.EncodeBin(HevcCabacContextIndex.CbfLuma + 1, cbfLuma ? 1 : 0); // trafoDepth 0 -> +1
-        if (cbfLuma)
+    private void EncodeTuTree(HevcCabacEncoder cabac, TuNode node, int depth, bool parentCbfCb, bool parentCbfCr, int lumaMode)
+    {
+        // split_transform_flag is coded when log2Size in {4,5} and depth<2 (matches SPS max intra depth 2).
+        bool canSplit = node.Log2Size > 3 && depth < 2;
+        if (canSplit)
         {
-            HevcResidualEncoder.Encode(cabac, lumaCoeff, CtbLog2, lumaScan, 0, signDataHiding);
+            cabac.EncodeBin(HevcCabacContextIndex.SplitTransformFlag + 5 - node.Log2Size, node.Split ? 1 : 0);
         }
 
-        if (cbfCb)
+        // cbf_cb / cbf_cr: coded only when trafoDepth==0 or the parent had the flag set.
+        bool cbfCb = ChromaCbf(node, 1);
+        bool cbfCr = ChromaCbf(node, 2);
+        if (depth == 0 || parentCbfCb)
         {
-            HevcResidualEncoder.Encode(cabac, cbCoeff, 4, chromaScan, 1, signDataHiding);
+            cabac.EncodeBin(HevcCabacContextIndex.CbfChroma + depth, cbfCb ? 1 : 0);
         }
 
-        if (cbfCr)
+        if (depth == 0 || parentCbfCr)
         {
-            HevcResidualEncoder.Encode(cabac, crCoeff, 4, chromaScan, 1, signDataHiding);
+            cabac.EncodeBin(HevcCabacContextIndex.CbfChroma + depth, cbfCr ? 1 : 0);
         }
 
-        // Reconstruct chroma (dequant + inverse + add pred) now that coeffs are final.
-        ReconstructChroma(cbRec, cw, ch, cx0, cy0, cSize, cbCoeff, cbPred, cqp, cbfCb);
-        ReconstructChroma(crRec, cw, ch, cx0, cy0, cSize, crCoeff, crPred, cqp, cbfCr);
+        if (node.Split)
+        {
+            foreach (TuNode c in node.Children!)
+            {
+                EncodeTuTree(cabac, c, depth + 1, cbfCb, cbfCr, lumaMode);
+            }
+
+            return;
+        }
+
+        // Leaf transform_unit: cbf_luma, then luma + chroma residuals.
+        int lumaN = 1 << node.Log2Size;
+        cabac.EncodeBin(HevcCabacContextIndex.CbfLuma + (depth == 0 ? 1 : 0), node.CbfLuma ? 1 : 0);
+        if (node.CbfLuma)
+        {
+            HevcResidualEncoder.Encode(cabac, node.LumaCoeff, node.Log2Size, DeriveScan(lumaMode, lumaN), 0, signDataHiding);
+        }
+
+        // Chroma scan index uses the LUMA transform size (see DeriveIntraScanIdx call in the decoder).
+        int chromaScan = DeriveScan(lumaMode, lumaN);
+        if (node.CbfCb)
+        {
+            HevcResidualEncoder.Encode(cabac, node.CbCoeff, node.Log2Size - 1, chromaScan, 1, signDataHiding);
+        }
+
+        if (node.CbfCr)
+        {
+            HevcResidualEncoder.Encode(cabac, node.CrCoeff, node.Log2Size - 1, chromaScan, 1, signDataHiding);
+        }
+    }
+
+    // Whether a chroma component has any coded block in this subtree (cbf_cb/cr are signalled at the
+    // level where they first become non-zero; here we signal once per level as the OR over the subtree).
+    private static bool ChromaCbf(TuNode node, int comp)
+    {
+        if (!node.Split)
+        {
+            return comp == 1 ? node.CbfCb : node.CbfCr;
+        }
+
+        foreach (TuNode c in node.Children!)
+        {
+            if (ChromaCbf(c, comp))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // ---- Mode selection ----
@@ -163,7 +306,7 @@ internal sealed class HevcIntraFrameEncoder
     {
         int best = 0;
         long bestCost = long.MaxValue;
-        var avail = NeighborAvail(x0, y0, CtbSize, false);
+        var avail = HevcZScan.LumaAvail(x0, y0, CtbSize, pw, ph);
         Span<int> pred = stackalloc int[CtbSize * CtbSize];
         for (int mode = 0; mode < 35; mode++)
         {
@@ -195,33 +338,38 @@ internal sealed class HevcIntraFrameEncoder
         return sad;
     }
 
-    // ---- Prediction + transform + reconstruction ----
+    // ---- Prediction + transform + reconstruction (per transform unit) ----
 
-    private bool EncodeAndReconstructBlock(byte[] orig, byte[] rec, int stride, int height, int x0, int y0, int n,
-        int mode, int cIdx, int blockQp, int scanIdx, short[] coeff)
+    // Predicts, transforms, quantizes (+ sign-hiding), and reconstructs one plane's TU into `rec`.
+    // Returns whether the block has any nonzero coefficient (cbf). Chroma mode == luma mode.
+
+    private bool ProcessPlane(byte[] orig, byte[] rec, int stride, int planeH, int x, int y, int n,
+        int mode, int cIdx, int blockQp, short[] coeff)
     {
-        var avail = NeighborAvail(x0, y0, n, cIdx > 0);
-        Span<int> pred = stackalloc int[32 * 32];
-        HevcIntraPrediction.Predict(rec, stride, x0, y0, n, 8, cIdx, mode, avail, pred.Slice(0, n * n), false, true);
+        var avail = cIdx == 0 ? HevcZScan.LumaAvail(x, y, n, pw, ph) : HevcZScan.ChromaAvail(x, y, n, cw, ch);
+        var pred = new int[n * n];
+        HevcIntraPrediction.Predict(rec, stride, x, y, n, 8, cIdx, mode, avail, pred, false, true);
 
         var resid = new short[n * n];
-        for (int y = 0; y < n; y++)
+        for (int j = 0; j < n; j++)
         {
-            for (int x = 0; x < n; x++)
+            for (int i = 0; i < n; i++)
             {
-                resid[(y * n) + x] = (short)(orig[((y0 + y) * stride) + x0 + x] - pred[(y * n) + x]);
+                resid[(j * n) + i] = (short)(orig[((y + j) * stride) + x + i] - pred[(j * n) + i]);
             }
         }
 
         bool useDst = cIdx == 0 && n == 4;
         HevcForwardTransform.Forward(resid, coeff, n, 8, useDst);
+        // The intra scan index is derived from the LUMA transform size for both planes (HEVC 7.4.9.11 /
+        // the decoder passes log2TrafoSize, not log2TrafoSizeC, to DeriveIntraScanIdx).
+        int scan = DeriveScan(mode, cIdx == 0 ? n : n * 2);
         var orig2 = (short[])coeff.Clone();
         var deltaU = new int[n * n];
-        int qScaled = HevcForwardTransform.GetScaledQp(false, blockQp);
-        HevcForwardTransform.Quantize(coeff, qScaled, n, 8, true, deltaU);
+        HevcForwardTransform.Quantize(coeff, blockQp, n, 8, true, deltaU);
         if (signDataHiding)
         {
-            HevcForwardTransform.ApplySignHiding(coeff, orig2, deltaU, n, scanIdx);
+            HevcForwardTransform.ApplySignHiding(coeff, orig2, deltaU, n, scan);
         }
 
         bool cbf = false;
@@ -230,7 +378,6 @@ internal sealed class HevcIntraFrameEncoder
             if (coeff[i] != 0) { cbf = true; break; }
         }
 
-        // Reconstruct = pred + inverse(dequant(coeff)) when cbf, else pred.
         var recResid = new short[n * n];
         if (cbf)
         {
@@ -239,79 +386,143 @@ internal sealed class HevcIntraFrameEncoder
             HevcTransform.InverseTransform(deq, recResid, n, useDst, 8);
         }
 
-        for (int y = 0; y < n; y++)
+        for (int j = 0; j < n; j++)
         {
-            for (int x = 0; x < n; x++)
+            for (int i = 0; i < n; i++)
             {
-                int v = pred[(y * n) + x] + recResid[(y * n) + x];
-                rec[((y0 + y) * stride) + x0 + x] = (byte)Math.Clamp(v, 0, 255);
+                int v = pred[(j * n) + i] + recResid[(j * n) + i];
+                rec[((y + j) * stride) + x + i] = (byte)Math.Clamp(v, 0, 255);
             }
         }
 
         return cbf;
     }
 
-    // Chroma: quantize + hold pred for deferred reconstruction (cbf ordering).
-    private bool QuantizeBlock(byte[] orig, byte[] rec, int stride, int height, int x0, int y0, int n,
-        int mode, int cIdx, int blockQp, int scanIdx, short[] coeff, out int[] predOut)
+    // Intra scan index (0=diag, 1=horiz, 2=vert): mode-dependent only for 4x4/8x8.
+    private static int DeriveScan(int mode, int n)
     {
-        var avail = NeighborAvail(x0, y0, n, true);
-        var pred = new int[n * n];
-        HevcIntraPrediction.Predict(rec, stride, x0, y0, n, 8, cIdx, ChromaModeFromLuma(mode), avail, pred, false, true);
-        predOut = pred;
-
-        var resid = new short[n * n];
-        for (int y = 0; y < n; y++)
+        if (n == 4 || n == 8)
         {
-            for (int x = 0; x < n; x++)
+            if (mode >= 6 && mode <= 14)
             {
-                resid[(y * n) + x] = (short)(orig[((y0 + y) * stride) + x0 + x] - pred[(y * n) + x]);
+                return 2;
+            }
+
+            if (mode >= 22 && mode <= 30)
+            {
+                return 1;
             }
         }
 
-        HevcForwardTransform.Forward(resid, coeff, n, 8, false);
-        var orig2 = (short[])coeff.Clone();
-        var deltaU = new int[n * n];
-        HevcForwardTransform.Quantize(coeff, blockQp, n, 8, true, deltaU);
-        if (signDataHiding)
-        {
-            HevcForwardTransform.ApplySignHiding(coeff, orig2, deltaU, n, scanIdx);
-        }
-
-        for (int i = 0; i < n * n; i++)
-        {
-            if (coeff[i] != 0)
-            {
-                return true;
-            }
-        }
-
-        return false;
+        return 0;
     }
 
-    private void ReconstructChroma(byte[] rec, int stride, int height, int x0, int y0, int n,
-        short[] coeff, int[] pred, int blockQp, bool cbf)
+    private long SsdLuma(int x, int y, int n)
     {
-        var recResid = new short[n * n];
-        if (cbf)
+        long s = 0;
+        for (int j = 0; j < n; j++)
         {
-            var deq = (short[])coeff.Clone();
-            Dequantize(deq, n, blockQp);
-            HevcTransform.InverseTransform(deq, recResid, n, false, 8);
+            for (int i = 0; i < n; i++)
+            {
+                int d = lumaOrig[((y + j) * pw) + x + i] - lumaRec[((y + j) * pw) + x + i];
+                s += (long)d * d;
+            }
         }
 
-        for (int y = 0; y < n; y++)
+        return s;
+    }
+
+    private long SsdChroma(int cx, int cy, int n)
+    {
+        long s = 0;
+        for (int j = 0; j < n; j++)
         {
-            for (int x = 0; x < n; x++)
+            for (int i = 0; i < n; i++)
             {
-                int v = pred[(y * n) + x] + recResid[(y * n) + x];
-                rec[((y0 + y) * stride) + x0 + x] = (byte)Math.Clamp(v, 0, 255);
+                int d1 = cbOrig[((cy + j) * cw) + cx + i] - cbRec[((cy + j) * cw) + cx + i];
+                int d2 = crOrig[((cy + j) * cw) + cx + i] - crRec[((cy + j) * cw) + cx + i];
+                s += ((long)d1 * d1) + ((long)d2 * d2);
+            }
+        }
+
+        return s;
+    }
+
+    private static double EstBits(short[] coeff)
+    {
+        double b = 0;
+        foreach (short c in coeff)
+        {
+            if (c != 0)
+            {
+                int a = Math.Abs(c);
+                b += 2 + (2 * (31 - System.Numerics.BitOperations.LeadingZeroCount((uint)a)));
+            }
+        }
+
+        return b;
+    }
+
+    private byte[] SnapshotRegion(int x, int y, int n)
+    {
+        int cn = n / 2, cx = x / 2, cy = y / 2;
+        var buf = new byte[(n * n) + (2 * cn * cn)];
+        int o = 0;
+        for (int j = 0; j < n; j++)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                buf[o++] = lumaRec[((y + j) * pw) + x + i];
+            }
+        }
+
+        for (int j = 0; j < cn; j++)
+        {
+            for (int i = 0; i < cn; i++)
+            {
+                buf[o++] = cbRec[((cy + j) * cw) + cx + i];
+            }
+        }
+
+        for (int j = 0; j < cn; j++)
+        {
+            for (int i = 0; i < cn; i++)
+            {
+                buf[o++] = crRec[((cy + j) * cw) + cx + i];
+            }
+        }
+
+        return buf;
+    }
+
+    private void RestoreRegion(int x, int y, int n, byte[] buf)
+    {
+        int cn = n / 2, cx = x / 2, cy = y / 2;
+        int o = 0;
+        for (int j = 0; j < n; j++)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                lumaRec[((y + j) * pw) + x + i] = buf[o++];
+            }
+        }
+
+        for (int j = 0; j < cn; j++)
+        {
+            for (int i = 0; i < cn; i++)
+            {
+                cbRec[((cy + j) * cw) + cx + i] = buf[o++];
+            }
+        }
+
+        for (int j = 0; j < cn; j++)
+        {
+            for (int i = 0; i < cn; i++)
+            {
+                crRec[((cy + j) * cw) + cx + i] = buf[o++];
             }
         }
     }
-
-    // Chroma mode derived-from-luma == luma mode (signal 4).
-    private static int ChromaModeFromLuma(int lumaMode) => lumaMode;
 
     private void Dequantize(Span<short> coeff, int n, int blockQp)
     {
@@ -439,15 +650,5 @@ internal sealed class HevcIntraFrameEncoder
                 }
             }
         }
-    }
-
-    private HevcIntraPrediction.Avail NeighborAvail(int x0, int y0, int n, bool chroma)
-    {
-        int planeW = chroma ? cw : pw;
-        bool up = y0 > 0;
-        bool left = x0 > 0;
-        bool upLeft = up && left;
-        bool upRight = up && (x0 + n) < planeW;
-        return new HevcIntraPrediction.Avail(up, left, upLeft, upRight, false);
     }
 }

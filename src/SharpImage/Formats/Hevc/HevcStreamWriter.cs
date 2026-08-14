@@ -140,7 +140,7 @@ internal static class HevcStreamWriter
         w.Ue(0);          // log2_min_luma_transform_block_size_minus2 (min TB = 4)
         w.Ue(3);          // log2_diff_max_min_luma_transform_block_size (max TB = 32)
         w.Ue(0);          // max_transform_hierarchy_depth_inter
-        w.Ue(0);          // max_transform_hierarchy_depth_intra  (no RQT split)
+        w.Ue(2);          // max_transform_hierarchy_depth_intra (RQT split down to 8x8 luma)
         w.Flag(false);    // scaling_list_enabled_flag
         w.Flag(false);    // amp_enabled_flag
         w.Flag(false);    // sample_adaptive_offset_enabled_flag
@@ -180,9 +180,7 @@ internal static class HevcStreamWriter
         w.Flag(false);    // tiles_enabled_flag
         w.Flag(false);    // entropy_coding_sync_enabled_flag
         w.Flag(false);    // pps_loop_filter_across_slices_enabled_flag
-        w.Flag(true);     // deblocking_filter_control_present_flag
-        w.Flag(false);    //   deblocking_filter_override_enabled_flag
-        w.Flag(true);     //   pps_deblocking_filter_disabled_flag
+        w.Flag(false);    // deblocking_filter_control_present_flag (deblocking ENABLED, default offsets)
         w.Flag(false);    // pps_scaling_list_data_present_flag
         w.Flag(false);    // lists_modification_present_flag
         w.Ue(0);          // log2_parallel_merge_level_minus2

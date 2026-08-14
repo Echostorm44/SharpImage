@@ -124,8 +124,7 @@ internal sealed class HevcCabacEncoder
 
     /// <summary>Encodes <paramref name="numBins"/> bypass bins from the low bits of <paramref name="binValues"/> (MSB first).</summary>
     public void EncodeBypassBins(uint binValues, int numBins)
-    {
-        while (numBins > 8)
+    {        while (numBins > 8)
         {
             numBins -= 8;
             uint pattern = binValues >> numBins;
