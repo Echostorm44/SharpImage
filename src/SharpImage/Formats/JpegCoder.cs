@@ -151,13 +151,10 @@ public static class JpegCoder
 
                         for (int c = 0; c < componentCount; c++)
                         {
-                            int blocksH = mcuCols * components[c].HSample;
-                            int blocksV = mcuRows * components[c].VSample;
-                            components[c].Blocks = new int[blocksV * blocksH][];
-                            for (int i = 0; i < components[c].Blocks.Length; i++)
-                            {
-                                components[c].Blocks[i] = new int[64];
-                            }
+                            ref JpegComponent comp = ref components[c];
+                            int blocksH = mcuCols * comp.HSample;
+                            int blocksV = mcuRows * comp.VSample;
+                            comp.Blocks = new int[blocksV * blocksH * 64];
                         }
                         blocksAllocated = true;
                     }
@@ -180,9 +177,14 @@ public static class JpegCoder
             // All scans decoded — dequantize, IDCT, and convert to pixels
             for (int c = 0; c < componentCount; c++)
             {
-                var qt = quantTables[components[c].QuantTableIndex];
-                foreach (var block in components[c].Blocks)
-                {
+                ref JpegComponent comp = ref components[c];
+                int[] qt = quantTables[comp.QuantTableIndex];
+                int totalBlocks = comp.Blocks.Length / 64;
+                for (int blockIdx = 0; blockIdx < totalBlocks; blockIdx++)
+                {  
+                    int offset = blockIdx * 64;
+                    Span<int> block = comp.Blocks.AsSpan(offset, 64);
+
                     for (int i = 0; i < 64; i++)
                     {
                         block[i] *= qt[i];
@@ -429,7 +431,7 @@ public static class JpegCoder
                                 int blockCol = mcuCol * blocksH + bh;
                                 int blockRow = mcuRow * blocksV + bv;
                                 int blockIndex = blockRow * (mcuCols * blocksH) + blockCol;
-                                var block = components[c].Blocks[blockIndex];
+                                Span<int> block = components[c].Blocks.AsSpan(blockIndex * 64, 64);
 
                                 if (isFirstScan)
                                 {
@@ -480,7 +482,7 @@ public static class JpegCoder
                     }
 
                     int blockIndex = blockRow * strideH + blockCol;
-                    var block = components[c].Blocks[blockIndex];
+                    Span<int> block = components[c].Blocks.AsSpan(blockIndex * 64, 64);
 
                     if (isFirstScan)
                     {
@@ -498,7 +500,7 @@ public static class JpegCoder
         }
     }
 
-    private static void DecodeProgressiveAcFirst(JpegBitReader reader, int[] block,
+    private static void DecodeProgressiveAcFirst(JpegBitReader reader, Span<int> block,
         int ss, int se, int al, HuffmanTable acTable, ref int eobRun)
     {
         if (eobRun > 0)
@@ -541,7 +543,7 @@ public static class JpegCoder
         }
     }
 
-    private static void DecodeProgressiveAcRefine(JpegBitReader reader, int[] block,
+    private static void DecodeProgressiveAcRefine(JpegBitReader reader, Span<int> block,
         int ss, int se, int al, HuffmanTable acTable, ref int eobRun)
     {
         int bit = 1 << al;
@@ -672,13 +674,10 @@ public static class JpegCoder
         // Allocate block storage for each component
         for (int c = 0;c < componentCount;c++)
         {
-            int blocksH = mcuCols * components[c].HSample;
-            int blocksV = mcuRows * components[c].VSample;
-            components[c].Blocks = new int[blocksV * blocksH][];
-            for (int i = 0;i < components[c].Blocks.Length;i++)
-            {
-                components[c].Blocks[i] = new int[64];
-            }
+            ref JpegComponent comp = ref components[c];
+            int blocksH = mcuCols * comp.HSample;
+            int blocksV = mcuRows * comp.VSample;
+            comp.Blocks = new int[blocksV * blocksH * 64];
         }
 
         var bitReader = new JpegBitReader(stream);
@@ -702,8 +701,9 @@ public static class JpegCoder
                 // Decode each component's blocks in this MCU
                 for (int c = 0;c < componentCount;c++)
                 {
-                    int blocksH = components[c].HSample;
-                    int blocksV = components[c].VSample;
+                    ref JpegComponent comp = ref components[c];
+                    int blocksH = comp.HSample;
+                    int blocksV = comp.VSample;
 
                     for (int bv = 0;bv < blocksV;bv++)
                     {
@@ -713,11 +713,11 @@ public static class JpegCoder
                             int blockRow = mcuRow * blocksV + bv;
                             int blockIndex = blockRow * (mcuCols * blocksH) + blockCol;
 
-                            var block = components[c].Blocks[blockIndex];
+                            var block = comp.Blocks.AsSpan(blockIndex * 64, 64);
                             DecodeBlock(bitReader, block, ref dcPredictors[c],
-                                dcTables[components[c].DcTableIndex],
-                                acTables[components[c].AcTableIndex],
-                                quantTables[components[c].QuantTableIndex]);
+                                dcTables[comp.DcTableIndex],
+                                acTables[comp.AcTableIndex],
+                                quantTables[comp.QuantTableIndex]);
                         }
                     }
                 }
@@ -729,10 +729,10 @@ public static class JpegCoder
         return BlocksToImage(width, height, componentCount, components, maxHSample, maxVSample, mcuCols);
     }
 
-    private static void DecodeBlock(JpegBitReader reader, int[] block, ref int dcPredictor,
+    private static void DecodeBlock(JpegBitReader reader, Span<int> block, ref int dcPredictor,
         HuffmanTable dcTable, HuffmanTable acTable, int[] quantTable)
     {
-        Array.Clear(block);
+        block.Clear();
 
         // Decode DC coefficient
         byte dcCategory = dcTable.Decode(reader);
@@ -848,7 +848,8 @@ public static class JpegCoder
             return 0;
         }
 
-        return comp.Blocks[blockIndex][pixelY * 8 + pixelX];
+        Span<int> block = comp.Blocks.AsSpan(blockIndex * 64, 64);
+        return block[pixelY * 8 + pixelX];
     }
 
     #endregion
@@ -2368,6 +2369,6 @@ public static class JpegCoder
         public byte QuantTableIndex;
         public byte DcTableIndex;
         public byte AcTableIndex;
-        public int[][] Blocks;
+        public int[] Blocks;
     }
 }
