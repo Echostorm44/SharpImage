@@ -163,11 +163,33 @@ public class ModernFormatTests
     }
 
     [Test]
-    public async Task JpegXl_Encode_ThrowsNotSupported()
+    public async Task JpegXl_Encode_RoundTrips_Losslessly()
     {
+        // JPEG XL lossless (Modular) encoding is implemented; the round-trip must be pixel-exact.
         using var frame = CreateTestFrame(8, 8);
-        await Assert.That(() => JxlCoder.Encode(frame)).Throws<NotSupportedException>();
-        await Assert.That(() => JxlCoder.EncodeLossy(frame, 90)).Throws<NotSupportedException>();
+        byte[] jxl = JxlCoder.Encode(frame);
+        await Assert.That(JxlCoder.CanDecode(jxl)).IsTrue();
+
+        using var decoded = JxlCoder.Decode(jxl);
+        int fc = frame.NumberOfChannels;
+        int dc = decoded.NumberOfChannels;
+        long maxDiff = 0;
+        for (int y = 0; y < frame.Rows; y++)
+        {
+            ushort[] rf = frame.GetPixelRow(y).ToArray();
+            ushort[] rd = decoded.GetPixelRow(y).ToArray();
+            for (int x = 0; x < frame.Columns; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    int a = Quantum.ScaleToByte(rf[(x * fc) + Math.Min(c, fc - 1)]);
+                    int b = Quantum.ScaleToByte(rd[(x * dc) + Math.Min(c, dc - 1)]);
+                    maxDiff = Math.Max(maxDiff, Math.Abs(a - b));
+                }
+            }
+        }
+
+        await Assert.That(maxDiff).IsEqualTo(0L);
     }
 
     // ======================= AVIF =======================

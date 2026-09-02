@@ -1138,11 +1138,65 @@ public class ExtendedFormatTests
     }
 
     [Test]
-    public async Task Jxl_Encode_NotImplemented()
+    public async Task Jxl_Encode_SinglePixel_RoundTrip_Lossless()
     {
-        var frame = CreateSolidFrame(4, 4, 100, 150, 200, 255);
-        await Assert.That(() => JxlCoder.Encode(frame)).Throws<NotSupportedException>();
-        await Assert.That(() => JxlCoder.EncodeLossy(frame, 90)).Throws<NotSupportedException>();
+        using var frame = CreateSolidFrame(1, 1, 100, 150, 200, 255);
+        byte[] jxl = JxlCoder.Encode(frame);
+        using var decoded = JxlCoder.Decode(jxl);
+        await AssertLossless(frame, decoded);
+    }
+
+    [Test]
+    [Arguments(3, 2)]
+    [Arguments(7, 5)]
+    [Arguments(64, 64)]
+    [Arguments(256, 171)]
+    public async Task Jxl_Encode_RoundTrip_Lossless(int width, int height)
+    {
+        // The encoder emits a real lossless Modular codestream; decoding it must be pixel-exact.
+        using var frame = CreateGradientFrame(width, height);
+        byte[] jxl = JxlCoder.Encode(frame);
+
+        await Assert.That(JxlCoder.CanDecode(jxl)).IsTrue();
+        using var decoded = JxlCoder.Decode(jxl);
+        await Assert.That((int)decoded.Columns).IsEqualTo(width);
+        await Assert.That((int)decoded.Rows).IsEqualTo(height);
+        await AssertLossless(frame, decoded);
+    }
+
+    [Test]
+    public async Task Jxl_Encode_MultiGroup_RoundTrip_Lossless()
+    {
+        // 1300x1100 exceeds a single 1024 group, exercising the tiled multi-group path.
+        using var frame = CreateGradientFrame(1300, 1100);
+        byte[] jxl = JxlCoder.Encode(frame);
+        using var decoded = JxlCoder.Decode(jxl);
+        await Assert.That((int)decoded.Columns).IsEqualTo(1300);
+        await Assert.That((int)decoded.Rows).IsEqualTo(1100);
+        await AssertLossless(frame, decoded);
+    }
+
+    private static async Task AssertLossless(ImageFrame original, ImageFrame decoded)
+    {
+        int oc = original.NumberOfChannels;
+        int dc = decoded.NumberOfChannels;
+        long maxDiff = 0;
+        for (int y = 0; y < original.Rows; y++)
+        {
+            ushort[] ro = original.GetPixelRow(y).ToArray();
+            ushort[] rd = decoded.GetPixelRow(y).ToArray();
+            for (int x = 0; x < original.Columns; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    int a = Quantum.ScaleToByte(ro[(x * oc) + Math.Min(c, oc - 1)]);
+                    int b = Quantum.ScaleToByte(rd[(x * dc) + Math.Min(c, dc - 1)]);
+                    maxDiff = Math.Max(maxDiff, Math.Abs(a - b));
+                }
+            }
+        }
+
+        await Assert.That(maxDiff).IsEqualTo(0L);
     }
 
     private static double ComputePsnr(ImageFrame a, ImageFrame b)

@@ -9,9 +9,11 @@
 // bit-exactly against libjxl-produced lossless files (see SharpImage.Tests). VarDCT (lossy) frames
 // are detected and rejected — not yet implemented.
 //
-// ENCODE: NOT IMPLEMENTED. A JPEG XL encoder (Modular entropy coding / VarDCT) is a separate, large
-// piece of work; rather than emit a non-standard bitstream that only this library could read, the
-// encode entry points throw NotSupportedException.
+// ENCODE: a real, from-scratch pure-C# lossless encoder (see Formats.Jxl.JxlEncoder). It emits a
+// standard bare codestream — 8-bit sRGB, a Modular frame with the YCoCg RCT, the self-correcting
+// weighted predictor and prefix (Huffman) entropy coding, tiled into groups for large images. Output
+// is verified pixel-exact against the reference decoders (libjxl and jxl-oxide), not just round-tripped.
+// Lossy VarDCT encoding is not yet implemented; EncodeLossy falls back to lossless.
 
 using SharpImage.Core;
 using SharpImage.Image;
@@ -51,13 +53,17 @@ public static class JxlCoder
         return BuildFrame(result);
     }
 
-    /// <summary>JPEG XL encoding is not implemented; a real encoder is future work.</summary>
-    public static byte[] Encode(ImageFrame image)
-        => throw new NotSupportedException("JPEG XL encoding is not implemented. SharpImage can decode lossless Modular JPEG XL; encoding is future work.");
+    /// <summary>
+    /// Encodes an image as a lossless JPEG XL codestream (Modular mode: clamped-gradient prediction +
+    /// prefix entropy coding). Produces a standard bare codestream that libjxl / jxl-oxide decode.
+    /// </summary>
+    public static byte[] Encode(ImageFrame image) => Jxl.JxlEncoder.EncodeLossless(image);
 
-    /// <summary>JPEG XL (lossy/VarDCT) encoding is not implemented.</summary>
-    public static byte[] EncodeLossy(ImageFrame image, int quality = 75)
-        => throw new NotSupportedException("JPEG XL encoding is not implemented. SharpImage can decode lossless Modular JPEG XL; encoding is future work.");
+    /// <summary>
+    /// JPEG XL lossy (VarDCT) encoding is not yet implemented. Falls back to lossless encoding so the
+    /// output is always a valid JPEG XL file; <paramref name="quality"/> is currently ignored.
+    /// </summary>
+    public static byte[] EncodeLossy(ImageFrame image, int quality = 75) => Jxl.JxlEncoder.EncodeLossless(image);
 
     private static ImageFrame BuildFrame(Jxl.JxlModularResult r)
     {
