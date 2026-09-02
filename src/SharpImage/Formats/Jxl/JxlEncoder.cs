@@ -56,31 +56,23 @@ internal static class JxlEncoder
             }
         }
 
-        // YCoCg (RCT type 6): decorrelates colour so residuals compress better.
-        int[][] chan = { new int[w * h], new int[w * h], new int[w * h] };
-        for (int p = 0; p < w * h; p++)
-        {
-            int co = r[p] - b[p];
-            int tmp = b[p] + (co >> 1);
-            int cg = g[p] - tmp;
-            chan[0][p] = tmp + (cg >> 1);
-            chan[1][p] = co;
-            chan[2][p] = cg;
-        }
+        // Pick the reversible colour transform that minimises estimated residual cost, then apply it.
+        int rctType = ChooseRct(r, g, b, w, h);
+        int[][] chan = ForwardRct(r, g, b, w * h, rctType);
 
         // A single group can cover an image up to GroupDim on both sides; larger images are tiled.
         bool single = w <= GroupDim && h <= GroupDim;
         if (!single)
         {
-            return AssembleCodestream(w, h, GroupSizeShift, BuildMultiGroupSections(chan, w, h, nb, 128 << GroupSizeShift));
+            return AssembleCodestream(w, h, GroupSizeShift, BuildMultiGroupSections(chan, w, h, nb, 128 << GroupSizeShift, rctType));
         }
 
         int shift = SmallestShift(Math.Max(w, h));
 
-        // Candidate A: YCoCg RCT. Candidate B (when the image has few colours): the Palette transform,
-        // which usually wins big on flat/synthetic content. Keep whichever section is smaller.
+        // Candidate A: the chosen RCT. Candidate B (when the image has few colours): the Palette
+        // transform, which usually wins big on flat/synthetic content. Keep whichever section is smaller.
         var rctChannels = new List<EncChannel> { new(chan[0], w, h), new(chan[1], w, h), new(chan[2], w, h) };
-        byte[] best = BuildSingleGroupSection(rctChannels, WriteRctTransform);
+        byte[] best = BuildSingleGroupSection(rctChannels, s => WriteRctTransform(s, rctType));
 
         if (TryBuildPalette(r, g, b, w, h, out List<EncChannel> palChannels, out int nbColors))
         {
@@ -228,12 +220,107 @@ internal static class JxlEncoder
         return s.ToArray();
     }
 
-    private static void WriteRctTransform(JxlBitWriter s)
+    private static void WriteRctTransform(JxlBitWriter s, int rctType)
     {
         s.WriteU32(1, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 1
         s.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.Val(3)); // transform id = 0 (RCT)
         s.WriteU32(0, E.BitsOff(3, 0), E.BitsOff(6, 8), E.BitsOff(10, 72), E.BitsOff(13, 1096)); // begin_c = 0
-        s.WriteU32(6, E.Val(6), E.BitsOff(2, 0), E.BitsOff(4, 2), E.BitsOff(6, 10)); // rct_type = 6 (YCoCg)
+        s.WriteU32((uint)rctType, E.Val(6), E.BitsOff(2, 0), E.BitsOff(4, 2), E.BitsOff(6, 10)); // rct_type
+    }
+
+    // Forward reversible colour transform: the exact inverse of JxlModular.InvRct for the given
+    // rctType (perm * 7 + custom). Produces the three channels the decoder inverts back to RGB.
+    private static int[][] ForwardRct(int[] r, int[] g, int[] b, int n, int rctType)
+    {
+        int[][] chan = { new int[n], new int[n], new int[n] };
+        int perm = rctType / 7, custom = rctType % 7;
+        int oi0 = perm % 3, oi1 = (perm + 1 + (perm / 3)) % 3, oi2 = (perm + 2 - (perm / 3)) % 3;
+        int second = custom >> 1, third = custom & 1;
+        for (int p = 0; p < n; p++)
+        {
+            int o0 = Pick(r, g, b, oi0, p), o1 = Pick(r, g, b, oi1, p), o2 = Pick(r, g, b, oi2, p);
+            if (custom == 6)
+            {
+                int co = o0 - o2;
+                int tmp = o2 + (co >> 1);
+                int cg = o1 - tmp;
+                chan[0][p] = tmp + (cg >> 1);
+                chan[1][p] = co;
+                chan[2][p] = cg;
+            }
+            else
+            {
+                chan[0][p] = o0;
+                chan[1][p] = second == 1 ? o1 - o0 : (second == 2 ? o1 - ((o0 + o2) >> 1) : o1);
+                chan[2][p] = o2 - (third != 0 ? o0 : 0);
+            }
+        }
+
+        return chan;
+    }
+
+    private static int Pick(int[] r, int[] g, int[] b, int idx, int p) => idx == 0 ? r[p] : (idx == 1 ? g[p] : b[p]);
+
+    // Chooses the RCT with the lowest estimated cost: the summed entropy of each channel's clamped-
+    // gradient residuals (sampled), which tracks the achievable size well and is cheap. Mirrors libjxl
+    // trying all 42 RCTs and keeping the cheapest.
+    private static int ChooseRct(int[] r, int[] g, int[] b, int w, int h)
+    {
+        int n = w * h;
+        int bestType = 6;
+        double bestCost = double.MaxValue;
+        for (int rctType = 0; rctType < 42; rctType++)
+        {
+            int[][] chan = ForwardRct(r, g, b, n, rctType);
+            double cost = GradientResidualBits(chan[0], w, h) + GradientResidualBits(chan[1], w, h) + GradientResidualBits(chan[2], w, h);
+            if (cost < bestCost)
+            {
+                bestCost = cost;
+                bestType = rctType;
+            }
+        }
+
+        return bestType;
+    }
+
+    // Entropy (bits) of a channel's clamped-gradient residuals over a sampled grid.
+    private static double GradientResidualBits(int[] px, int w, int h)
+    {
+        int stride = Math.Max(1, (w * h) / (1 << 16));
+        var hist = new Dictionary<int, int>();
+        long total = 0;
+        int cnt = 0;
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                if (cnt++ % stride != 0)
+                {
+                    continue;
+                }
+
+                int left = x > 0 ? px[(y * w) + x - 1] : (y > 0 ? px[((y - 1) * w) + x] : 0);
+                int top = y > 0 ? px[((y - 1) * w) + x] : left;
+                int topleft = (x > 0 && y > 0) ? px[((y - 1) * w) + x - 1] : left;
+                int resid = px[(y * w) + x] - (int)JxlTreeLearner.ClampedGradient(left, top, topleft);
+                hist[resid] = hist.GetValueOrDefault(resid) + 1;
+                total++;
+            }
+        }
+
+        if (total == 0)
+        {
+            return 0;
+        }
+
+        double bits = 0;
+        double invLog2 = 1.0 / Math.Log(2);
+        foreach (int c in hist.Values)
+        {
+            bits -= c * Math.Log((double)c / total) * invLog2;
+        }
+
+        return bits;
     }
 
     // Palette transform: replaces the three colour channels (begin 0, num 3) with a palette meta-channel
@@ -324,7 +411,7 @@ internal static class JxlEncoder
     // sections, then one Modular-AC section per spatial group. All groups share the global tree and
     // codes; each group has its own entropy reader/window, so LZ77 and prediction run per group. Built
     // with an error-context tree and with a single-leaf tree, keeping whichever total is smaller. ---
-    private static byte[][] BuildMultiGroupSections(int[][] chan, int w, int h, int nb, int groupDim)
+    private static byte[][] BuildMultiGroupSections(int[][] chan, int w, int h, int nb, int groupDim, int rctType)
     {
         // Learn the tree from the actual tiles (per-tile prediction) so it matches the per-group encode.
         var tileRefs = new List<EncChannelRef>();
@@ -341,8 +428,8 @@ internal static class JxlEncoder
         }
 
         var learned = new LearnedTree(JxlTreeLearner.Learn(tileRefs));
-        byte[][] modelled = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, learned);
-        byte[][] plain = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree);
+        byte[][] modelled = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, learned, rctType);
+        byte[][] plain = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree, rctType);
         return TotalLength(modelled) <= TotalLength(plain) ? modelled : plain;
     }
 
@@ -357,7 +444,7 @@ internal static class JxlEncoder
         return t;
     }
 
-    private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, LearnedTree tree)
+    private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, LearnedTree tree, int rctType)
     {
         int gpr = CeilDiv(w, groupDim);
         int numGroups = gpr * CeilDiv(h, groupDim);
@@ -396,7 +483,7 @@ internal static class JxlEncoder
         s0.WriteBits(1, 1); // has_tree = 1
         WriteTree(s0, tree.Tokens);
         WriteLz77HistogramCtx(s0, plan);
-        WriteGlobalGroupHeader(s0); // use_global + wp + RCT; no channels are small enough to decode here
+        WriteGlobalGroupHeader(s0, rctType); // use_global + wp + RCT; no channels are small enough to decode here
 
         var list = new List<byte[]>(1 + numLf + 1 + numGroups) { s0.ToArray() };
         for (int i = 0; i < numLf; i++)
@@ -1103,15 +1190,12 @@ internal static class JxlEncoder
     }
 
     // GroupHeader for the global modular stream: use_global tree+code, default weighted-predictor
-    // header, and one transform — the YCoCg RCT, inverted after decode.
-    private static void WriteGlobalGroupHeader(JxlBitWriter s)
+    // header, and one transform — the chosen RCT, inverted after decode.
+    private static void WriteGlobalGroupHeader(JxlBitWriter s, int rctType)
     {
         s.WriteBool(true);  // use_global tree + code
         s.WriteBits(1, 1);  // weighted-predictor header: all default
-        s.WriteU32(1, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 1
-        s.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.Val(3)); // transform id = 0 (RCT)
-        s.WriteU32(0, E.BitsOff(3, 0), E.BitsOff(6, 8), E.BitsOff(10, 72), E.BitsOff(13, 1096)); // begin_c = 0
-        s.WriteU32(6, E.Val(6), E.BitsOff(2, 0), E.BitsOff(4, 2), E.BitsOff(6, 10)); // rct_type = 6
+        WriteRctTransform(s, rctType);
     }
 
     // Self-correcting weighted-predictor (predictor 6) residuals, packed with the JXL signed->unsigned
