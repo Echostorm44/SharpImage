@@ -164,48 +164,26 @@ internal static class JxlEncoder
     }
 
     // --- Single-group frame: one section holding the tree, the pixel histogram and every pixel token
-    // (DecodeGlobalModular). ---
+    // (DecodeGlobalModular). The three channels are decoded through one entropy reader, so LZ77 spans
+    // them: the token stream is the channels concatenated in raster order. ---
     private static byte[] BuildModularSection(int[][] chan, int w, int h, int nb)
     {
-        int[][] tokens = new int[nb][];
-        int maxToken = 0;
-        for (int c = 0; c < nb; c++)
-        {
-            tokens[c] = ComputeResidualTokens(chan[c], w, h, ref maxToken);
-        }
-
-        long[] pxFreq = new long[maxToken + 1];
-        for (int c = 0; c < nb; c++)
-        {
-            foreach (int t in tokens[c])
-            {
-                pxFreq[t]++;
-            }
-        }
-
-        var pxCode = new JxlPrefixCode(pxFreq, maxToken + 1);
+        int[] stream = ConcatChannelResiduals(chan, w, h, nb, out _);
+        var plan = PlanPixels(new List<int[]> { stream }, out List<Op>[] ops);
 
         var s = new JxlBitWriter();
         s.WriteBits(1, 1); // DequantMatrices::DecodeDC all_default
         s.WriteBits(1, 1); // has_tree = 1
         WriteSingleLeafTree(s);
-        WritePixelHistogram(s, pxCode);
+        WriteLz77Histogram(s, plan);
         WriteGlobalGroupHeader(s);
-        for (int c = 0; c < nb; c++)
-        {
-            int[] tc = tokens[c];
-            for (int i = 0; i < tc.Length; i++)
-            {
-                pxCode.WriteSymbol(s, tc[i]);
-            }
-        }
-
+        EmitOps(s, ops[0], plan);
         return s.ToArray();
     }
 
     // --- Multi-group frame: LfGlobal (tree + pixel histogram + global RCT), empty LfGroup/HfGlobal
     // sections, then one Modular-AC section per spatial group. All groups share the global pixel code;
-    // each group predicts within its own tile (matching DecodeMultiGroup). ---
+    // each group has its own entropy reader/window, so LZ77 runs per group. ---
     private static byte[][] BuildMultiGroupSections(int[][] chan, int w, int h, int nb, int groupDim)
     {
         int gpr = CeilDiv(w, groupDim);
@@ -213,41 +191,32 @@ internal static class JxlEncoder
         int lfDim = groupDim * 8;
         int numLf = CeilDiv(w, lfDim) * CeilDiv(h, lfDim);
 
-        int[][][] groupTokens = new int[numGroups][][];
-        int maxToken = 0;
+        var streams = new List<int[]>(numGroups);
         for (int g = 0; g < numGroups; g++)
         {
             int rx = (g % gpr) * groupDim;
             int ry = (g / gpr) * groupDim;
             int rw = Math.Min(groupDim, w - rx);
             int rh = Math.Min(groupDim, h - ry);
-            groupTokens[g] = new int[nb][];
+            int[] concat = new int[rw * rh * nb];
+            int dummy = 0;
             for (int c = 0; c < nb; c++)
             {
-                groupTokens[g][c] = ComputeGroupResidualTokens(chan[c], w, rx, ry, rw, rh, ref maxToken);
+                int[] tc = ComputeGroupResidualTokens(chan[c], w, rx, ry, rw, rh, ref dummy);
+                Array.Copy(tc, 0, concat, c * rw * rh, tc.Length);
             }
+
+            streams.Add(concat);
         }
 
-        long[] pxFreq = new long[maxToken + 1];
-        for (int g = 0; g < numGroups; g++)
-        {
-            for (int c = 0; c < nb; c++)
-            {
-                foreach (int t in groupTokens[g][c])
-                {
-                    pxFreq[t]++;
-                }
-            }
-        }
-
-        var pxCode = new JxlPrefixCode(pxFreq, maxToken + 1);
+        var plan = PlanPixels(streams, out List<Op>[] ops);
 
         // Section 0: LfGlobal.
         var s0 = new JxlBitWriter();
         s0.WriteBits(1, 1); // DequantMatrices::DecodeDC all_default
         s0.WriteBits(1, 1); // has_tree = 1
         WriteSingleLeafTree(s0);
-        WritePixelHistogram(s0, pxCode);
+        WriteLz77Histogram(s0, plan);
         WriteGlobalGroupHeader(s0); // use_global + wp + RCT; no channels are small enough to decode here
 
         var list = new List<byte[]>(1 + numLf + 1 + numGroups) { s0.ToArray() };
@@ -264,19 +233,24 @@ internal static class JxlEncoder
             sg.WriteBool(true); // use_global tree + code
             sg.WriteBits(1, 1); // weighted-predictor header: all default
             sg.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0
-            for (int c = 0; c < nb; c++)
-            {
-                int[] tc = groupTokens[g][c];
-                for (int i = 0; i < tc.Length; i++)
-                {
-                    pxCode.WriteSymbol(sg, tc[i]);
-                }
-            }
-
+            EmitOps(sg, ops[g], plan);
             list.Add(sg.ToArray());
         }
 
         return list.ToArray();
+    }
+
+    private static int[] ConcatChannelResiduals(int[][] chan, int w, int h, int nb, out int maxToken)
+    {
+        maxToken = 0;
+        int[] stream = new int[w * h * nb];
+        for (int c = 0; c < nb; c++)
+        {
+            int[] tc = ComputeResidualTokens(chan[c], w, h, ref maxToken);
+            Array.Copy(tc, 0, stream, c * w * h, tc.Length);
+        }
+
+        return stream;
     }
 
     // Single-leaf global MA tree: property token 0 (=> leaf), then predictor / offset / mult-log /
@@ -295,8 +269,258 @@ internal static class JxlEncoder
         treeCode.WriteSymbol(s, 0);
     }
 
-    private static void WritePixelHistogram(JxlBitWriter s, JxlPrefixCode pxCode)
-        => WriteHistogramsHeader(s, numContexts: 1, pxCode); // (treeCount+1)/2 == 1 context
+    // ─── LZ77 over the residual-token stream ───────────────────────────────────────────────────────
+    // The Modular pixel stream is entropy-coded with LZ77 enabled: a token >= a threshold signals a
+    // back-reference (length + distance) instead of a literal residual, which collapses flat and
+    // repeating regions. Two histogram clusters are used — cluster 0 for literals + length markers,
+    // cluster 1 for distances — matching DecodeHistograms + JxlAnsReader's LZ77 path.
+    private readonly struct Op
+    {
+        public readonly bool Match;
+        public readonly int A; // literal value, or match length
+        public readonly int B; // match distance
+        public Op(bool match, int a, int b) { Match = match; A = a; B = b; }
+    }
+
+    private sealed class PixelPlan
+    {
+        public int Threshold;
+        public int SeLit, SeDist, SeLen, MinLen;
+        public JxlPrefixCode Code0 = null!; // literals + length markers
+        public JxlPrefixCode Code1 = null!; // distances
+    }
+
+    private const int Lz77MinLength = 16;   // shortest worthwhile back-reference
+    private const int NumSpecialDistances = 120; // JxlEntropy.NumSpecialDistances (distanceMultiplier > 0)
+
+    private static PixelPlan PlanPixels(List<int[]> streams, out List<Op>[] opsOut)
+    {
+        int minLen = Lz77MinLength;
+        int maxToken = 0;
+        foreach (int[] st in streams)
+        {
+            foreach (int v in st)
+            {
+                if (v > maxToken)
+                {
+                    maxToken = v;
+                }
+            }
+        }
+
+        var plan = new PixelPlan
+        {
+            Threshold = Math.Max(8, maxToken + 1),
+            SeLit = Math.Min(15, Math.Max(1, BitLen(maxToken))),
+            SeDist = 4,
+            SeLen = 4,
+            MinLen = minLen,
+        };
+
+        opsOut = new List<Op>[streams.Count];
+        int max0 = 0, max1 = 0;
+        for (int i = 0; i < streams.Count; i++)
+        {
+            opsOut[i] = FindMatches(streams[i], minLen);
+            foreach (Op op in opsOut[i])
+            {
+                if (!op.Match)
+                {
+                    if (op.A > max0)
+                    {
+                        max0 = op.A;
+                    }
+                }
+                else
+                {
+                    int lenSym = plan.Threshold + PackHybridUint(plan.SeLen, op.A - minLen).Token;
+                    int dtok = PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1).Token;
+                    if (lenSym > max0)
+                    {
+                        max0 = lenSym;
+                    }
+
+                    if (dtok > max1)
+                    {
+                        max1 = dtok;
+                    }
+                }
+            }
+        }
+
+        long[] f0 = new long[max0 + 1];
+        long[] f1 = new long[max1 + 1];
+        foreach (List<Op> ops in opsOut)
+        {
+            foreach (Op op in ops)
+            {
+                if (!op.Match)
+                {
+                    f0[op.A]++;
+                }
+                else
+                {
+                    f0[plan.Threshold + PackHybridUint(plan.SeLen, op.A - minLen).Token]++;
+                    f1[PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1).Token]++;
+                }
+            }
+        }
+
+        plan.Code0 = new JxlPrefixCode(f0, max0 + 1);
+        plan.Code1 = new JxlPrefixCode(f1, max1 + 1);
+        return plan;
+    }
+
+    // Greedy longest-match LZ77 over the value stream, using a 4-gram hash with chained positions.
+    // Overlapping matches (distance < length) are allowed — they reproduce run-length fills.
+    private static List<Op> FindMatches(int[] v, int minLen)
+    {
+        var ops = new List<Op>();
+        int n = v.Length;
+        const int WindowMask = (1 << 20) - 1;
+        var head = new Dictionary<int, int>();
+        int[] prev = new int[Math.Max(1, n)];
+
+        int Hash(int i)
+        {
+            unchecked
+            {
+                uint hh = (uint)v[i];
+                hh = (hh * 2654435761u) + (uint)v[i + 1];
+                hh = (hh * 2654435761u) + (uint)v[i + 2];
+                hh = (hh * 2654435761u) + (uint)v[i + 3];
+                return (int)(hh & 0x7FFFFFFF);
+            }
+        }
+
+        void Insert(int i)
+        {
+            if (i + 4 > n)
+            {
+                return;
+            }
+
+            int hh = Hash(i);
+            prev[i] = head.TryGetValue(hh, out int p) ? p : -1;
+            head[hh] = i;
+        }
+
+        int idx = 0;
+        while (idx < n)
+        {
+            int bestLen = 0, bestDist = 0;
+            if (idx + 4 <= n && head.TryGetValue(Hash(idx), out int p))
+            {
+                int tries = 96;
+                while (p >= 0 && tries-- > 0)
+                {
+                    int dist = idx - p;
+                    if (dist > (WindowMask + 1))
+                    {
+                        break;
+                    }
+
+                    int maxl = n - idx;
+                    int l = 0;
+                    while (l < maxl && v[p + l] == v[idx + l])
+                    {
+                        l++;
+                    }
+
+                    if (l > bestLen)
+                    {
+                        bestLen = l;
+                        bestDist = dist;
+                    }
+
+                    p = prev[p];
+                }
+            }
+
+            if (bestLen >= minLen)
+            {
+                ops.Add(new Op(true, bestLen, bestDist));
+                int end = idx + bestLen;
+                for (int j = idx; j < end; j++)
+                {
+                    Insert(j);
+                }
+
+                idx = end;
+            }
+            else
+            {
+                ops.Add(new Op(false, v[idx], 0));
+                Insert(idx);
+                idx++;
+            }
+        }
+
+        return ops;
+    }
+
+    private static void EmitOps(JxlBitWriter s, List<Op> ops, PixelPlan plan)
+    {
+        foreach (Op op in ops)
+        {
+            if (!op.Match)
+            {
+                plan.Code0.WriteSymbol(s, op.A);
+                continue;
+            }
+
+            (int lenBase, int nbLen, int bitsLen) = PackHybridUint(plan.SeLen, op.A - plan.MinLen);
+            plan.Code0.WriteSymbol(s, plan.Threshold + lenBase);
+            s.WriteBits((uint)bitsLen, nbLen);
+
+            (int dtok, int nbDist, int bitsDist) = PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1);
+            plan.Code1.WriteSymbol(s, dtok);
+            s.WriteBits((uint)bitsDist, nbDist);
+        }
+    }
+
+    // DecodeHistograms mirror for the pixel stream: LZ77 enabled, a 2-entry context map (literals ->
+    // cluster 0, distances -> cluster 1), prefix coding, and the two per-cluster hybrid-uint configs.
+    private static void WriteLz77Histogram(JxlBitWriter s, PixelPlan plan)
+    {
+        s.WriteBool(true); // lz77 enabled
+        s.WriteU32((uint)plan.Threshold, E.Val(224), E.Val(512), E.Val(4096), E.BitsOff(15, 8)); // min_symbol
+        s.WriteU32((uint)plan.MinLen, E.Val(3), E.Val(4), E.BitsOff(2, 5), E.BitsOff(8, 9)); // min_length
+        WriteUintConfig(s, plan.SeLen, 0, 0, 8); // lz77 length config (logAlpha 8)
+
+        // Context map for {literal context, distance context}: simple, 1 bit per entry, [0, 1].
+        s.WriteBool(true); // is_simple
+        s.WriteBits(1, 2); // bits per entry = 1
+        s.WriteBits(0, 1); // context 0 -> cluster 0
+        s.WriteBits(1, 1); // context 1 (distance) -> cluster 1
+
+        s.WriteBool(true); // use_prefix_code
+        WriteUintConfig(s, plan.SeLit, 0, 0, 15);  // cluster 0
+        WriteUintConfig(s, plan.SeDist, 0, 0, 15); // cluster 1
+        s.WriteVarLenUint16(plan.Code0.AlphabetSize - 1);
+        s.WriteVarLenUint16(plan.Code1.AlphabetSize - 1);
+        plan.Code0.WriteHeader(s);
+        plan.Code1.WriteHeader(s);
+    }
+
+    // Encodes a value under a hybrid-uint config (SplitExp, 0, 0): values below 2^SplitExp are literal
+    // tokens; larger values become an exponent token plus mantissa extra bits. Inverse of
+    // JxlEntropy.ReadHybridUintConfig.
+    private static (int Token, int NBits, int Bits) PackHybridUint(int splitExp, int value)
+    {
+        int splitToken = 1 << splitExp;
+        if (value < splitToken)
+        {
+            return (value, 0, 0);
+        }
+
+        int nb = BitLen(value) - 1;      // floor(log2(value))
+        int token = splitToken + (nb - splitExp);
+        int bits = value - (1 << nb);
+        return (token, nb, bits);
+    }
+
+    private static int BitLen(int x) => x <= 0 ? 0 : 32 - System.Numerics.BitOperations.LeadingZeroCount((uint)x);
 
     // GroupHeader for the global modular stream: use_global tree+code, default weighted-predictor
     // header, and one transform — the YCoCg RCT, inverted after decode.
