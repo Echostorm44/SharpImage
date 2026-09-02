@@ -115,6 +115,44 @@ public class GifCoderTests
     }
 
     [Test]
+    public async Task Gif_Read_Interlaced_DeinterlacesCorrectly()
+    {
+        // Interlacing is the GIF analogue of progressive JPEG: rows are stored in 4 passes and must be
+        // reassembled (DeinterlaceRow). If the interlace flag were ignored the rows would be scrambled.
+        // Asset is an externally-encoded interlaced GIF; the reference is its correct (PIL) decode.
+        string gif = Path.Combine(TestImagesDir, "interlaced.gif");
+        string refPng = Path.Combine(TestImagesDir, "interlaced_gif_ref.png");
+
+        var decoded = GifCoder.Read(gif);
+        var reference = FormatRegistry.Read(refPng);
+        try
+        {
+            await Assert.That(decoded.Columns).IsEqualTo(reference.Columns);
+            await Assert.That(decoded.Rows).IsEqualTo(reference.Rows);
+
+            // GIF is lossless, so a correctly-deinterlaced decode is pixel-exact with the reference.
+            double totalDiff = 0;
+            long pixelCount = 0;
+            for (int y = 0; y < reference.Rows; y++)
+            {
+                var refRow = reference.GetPixelRow(y);
+                var decRow = decoded.GetPixelRow(y);
+                for (int x = 0; x < reference.Columns * reference.NumberOfChannels; x++)
+                {
+                    totalDiff += Math.Abs((double)refRow[x] - decRow[x]) / Quantum.MaxValue;
+                    pixelCount++;
+                }
+            }
+            await Assert.That(totalDiff / pixelCount).IsLessThan(0.001);
+        }
+        finally
+        {
+            decoded.Dispose();
+            reference.Dispose();
+        }
+    }
+
+    [Test]
     public async Task Gif_Read_ButtonImage_HasPixels()
     {
         string path = Path.Combine(TestImagesDir, "toggle_button.gif");
