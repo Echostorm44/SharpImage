@@ -990,9 +990,9 @@ public static class JpegCoder
             WriteProgressiveSosHeader(stream, [1], 0, 0, 0, 0);
             EncodeProgressiveDcScanSingle(stream, totalYBlocks, yBlocks, dcLumCodes);
 
-            // Scan 2: AC for Y
+            // Scan 2: AC for Y (grayscale: 1x1)
             WriteProgressiveSosHeader(stream, [1], 1, 63, 0, 0);
-            EncodeProgressiveAcScan(stream, totalYBlocks, yBlocks, acLumCodes);
+            EncodeProgressiveAcScan(stream, yBlocks, acLumCodes, mcuCols, 1, 1, 1, 1, width, height);
         }
         else
         {
@@ -1001,17 +1001,17 @@ public static class JpegCoder
             EncodeProgressiveDcScanSubsampled(stream, mcuCols, mcuRows, yBlocks, cbBlocks, crBlocks,
                 dcLumCodes, dcChrCodes, hSampleY, vSampleY);
 
-            // Scan 2: AC for Y
+            // Scan 2: AC for Y (component sampling = the luma/max factors)
             WriteProgressiveSosHeader(stream, [1], 1, 63, 0, 0);
-            EncodeProgressiveAcScan(stream, totalYBlocks, yBlocks, acLumCodes);
+            EncodeProgressiveAcScan(stream, yBlocks, acLumCodes, mcuCols, hSampleY, vSampleY, hSampleY, vSampleY, width, height);
 
-            // Scan 3: AC for Cb
+            // Scan 3: AC for Cb (chroma is 1x1; stored one block per MCU)
             WriteProgressiveSosHeader(stream, [2], 1, 63, 0, 0);
-            EncodeProgressiveAcScan(stream, totalChrBlocks, cbBlocks, acChrCodes);
+            EncodeProgressiveAcScan(stream, cbBlocks, acChrCodes, mcuCols, 1, 1, hSampleY, vSampleY, width, height);
 
             // Scan 4: AC for Cr
             WriteProgressiveSosHeader(stream, [3], 1, 63, 0, 0);
-            EncodeProgressiveAcScan(stream, totalChrBlocks, crBlocks, acChrCodes);
+            EncodeProgressiveAcScan(stream, crBlocks, acChrCodes, mcuCols, 1, 1, hSampleY, vSampleY, width, height);
         }
 
         // Write EOI
@@ -1141,15 +1141,34 @@ public static class JpegCoder
         bitWriter.Flush();
     }
 
-    private static void EncodeProgressiveAcScan(Stream stream, int totalBlocks,
-        int[][] blocks, (int code, int length)[] acCodes)
+    /// <summary>
+    /// Writes a progressive AC scan (single-component, non-interleaved). Such a scan must emit blocks
+    /// in RASTER order over the component's OWN block grid — ceil(x_i/8) × ceil(y_i/8) — not in the
+    /// MCU-interleaved order the blocks are stored in, and not the MCU-padded count. <paramref name="blocks"/>
+    /// is stored MCU-major (compH·compV blocks per MCU); we map each raster (row,col) back into it and skip
+    /// the dummy edge blocks the MCU grid pads with. (Must match the decoder's non-interleaved AC iteration.)
+    /// </summary>
+    private static void EncodeProgressiveAcScan(Stream stream, int[][] blocks, (int code, int length)[] acCodes,
+        int mcuCols, int compH, int compV, int maxH, int maxV, int width, int height)
     {
         var bitWriter = new JpegBitWriter(stream);
 
-        for (int i = 0; i < totalBlocks; i++)
+        int compSamplesW = (width * compH + maxH - 1) / maxH;
+        int compSamplesH = (height * compV + maxV - 1) / maxV;
+        int blocksW = (compSamplesW + 7) / 8;
+        int blocksH = (compSamplesH + 7) / 8;
+        int blocksPerMcu = compH * compV;
+
+        for (int br = 0; br < blocksH; br++)
         {
-            int[] block = blocks[i];
-            EncodeAcCoefficients(bitWriter, block, acCodes);
+            for (int bc = 0; bc < blocksW; bc++)
+            {
+                int mcuRow = br / compV;
+                int mcuCol = bc / compH;
+                int inMcu = (br % compV) * compH + (bc % compH);
+                int idx = (mcuRow * mcuCols + mcuCol) * blocksPerMcu + inMcu;
+                EncodeAcCoefficients(bitWriter, blocks[idx], acCodes);
+            }
         }
 
         bitWriter.Flush();

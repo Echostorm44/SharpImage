@@ -415,6 +415,44 @@ public class JpegCoderTests
     }
 
     [Test]
+    [Arguments(JpegSubsampling.Yuv444)]
+    [Arguments(JpegSubsampling.Yuv422)]
+    [Arguments(JpegSubsampling.Yuv420)]
+    public async Task ProgressiveEncode_RoundTrip_NonAlignedWidth(JpegSubsampling subsampling)
+    {
+        // Regression (encoder side): progressive AC scans are non-interleaved and must be written in
+        // RASTER order over each component's own block grid. The encoder used to emit MCU-ordered luma
+        // blocks at the MCU-padded count, so for subsampled formats at a non-MCU-aligned width (peppers
+        // is 264px -> 33 luma blocks vs 34 padded) the stream decoded to a diagonal shear. The decoder
+        // is spec-correct (verified vs external files), so a round-trip now exercises the encoder.
+        var src = JpegCoder.Read(Path.Combine(TestImagesDir, "peppers.jpg")); // 264x351, width % 16 == 8
+
+        using var ms = new MemoryStream();
+        JpegCoder.WriteProgressive(src, ms, quality: 95, subsampling: subsampling);
+        ms.Position = 0;
+        var rt = JpegCoder.Read(ms);
+
+        await Assert.That(rt.Columns).IsEqualTo(src.Columns);
+        await Assert.That(rt.Rows).IsEqualTo(src.Rows);
+
+        double totalDiff = 0;
+        long pixelCount = 0;
+        for (int y = 0; y < src.Rows; y++)
+        {
+            var srcRow = src.GetPixelRow(y);
+            var rtRow = rt.GetPixelRow(y);
+            for (int x = 0; x < src.Columns * src.NumberOfChannels; x++)
+            {
+                totalDiff += Math.Abs((double)srcRow[x] - rtRow[x]) / Quantum.MaxValue;
+                pixelCount++;
+            }
+        }
+        double meanDiff = totalDiff / pixelCount;
+        // A correct q95 round-trip is ~0.005; the old mis-ordered encode was well over 0.2.
+        await Assert.That(meanDiff).IsLessThan(0.03);
+    }
+
+    [Test]
     public async Task ProgressiveJpeg_ConvertToPng_RoundTrip()
     {
         string srcPath = Path.Combine(TestImagesDir, "landscape_progressive.jpg");
