@@ -56,27 +56,49 @@ internal static class JxlEncoder
             }
         }
 
-        // Pick the reversible colour transform that minimises estimated residual cost, then apply it.
+        // Pick the reversible colour transform, then the weighted-predictor parameter mode. The WP-mode
+        // estimate (single-context) can mispredict once the tree/context model is applied, so try the
+        // estimated-best mode and the default (mode 0) and keep whichever actually encodes smaller.
         int rctType = ChooseRct(r, g, b, w, h);
         int[][] chan = ForwardRct(r, g, b, w * h, rctType);
+        int wpEst = ChooseWpMode(chan, w, h);
+        int[] wpModes = wpEst == 0 ? new[] { 0 } : new[] { wpEst, 0 };
 
         // A single group can cover an image up to GroupDim on both sides; larger images are tiled.
         bool single = w <= GroupDim && h <= GroupDim;
         if (!single)
         {
-            return AssembleCodestream(w, h, GroupSizeShift, BuildMultiGroupSections(chan, w, h, nb, 128 << GroupSizeShift, rctType));
+            byte[][] bestSecs = null!;
+            foreach (int m in wpModes)
+            {
+                byte[][] secs = BuildMultiGroupSections(chan, w, h, nb, 128 << GroupSizeShift, rctType, m);
+                if (bestSecs == null || TotalLength(secs) < TotalLength(bestSecs))
+                {
+                    bestSecs = secs;
+                }
+            }
+
+            return AssembleCodestream(w, h, GroupSizeShift, bestSecs);
         }
 
         int shift = SmallestShift(Math.Max(w, h));
 
-        // Candidate A: the chosen RCT. Candidate B (when the image has few colours): the Palette
-        // transform, which usually wins big on flat/synthetic content. Keep whichever section is smaller.
+        // Candidate A: the chosen RCT + WP mode. Candidate B (when the image has few colours): the
+        // Palette transform (default WP mode). Keep whichever section is smaller.
         var rctChannels = new List<EncChannel> { new(chan[0], w, h), new(chan[1], w, h), new(chan[2], w, h) };
-        byte[] best = BuildSingleGroupSection(rctChannels, s => WriteRctTransform(s, rctType));
+        byte[] best = null!;
+        foreach (int m in wpModes)
+        {
+            byte[] sec = BuildSingleGroupSection(rctChannels, s => WriteRctTransform(s, rctType), m);
+            if (best == null || sec.Length < best.Length)
+            {
+                best = sec;
+            }
+        }
 
         if (TryBuildPalette(r, g, b, w, h, out List<EncChannel> palChannels, out int nbColors))
         {
-            byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors));
+            byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors), 0);
             if (palSec.Length < best.Length)
             {
                 best = palSec;
@@ -179,16 +201,18 @@ internal static class JxlEncoder
     // (DecodeGlobalModular). All channels are decoded through one entropy reader, so LZ77 spans them.
     // Builds the section with an error-context MA tree and with a plain single-leaf tree, keeping the
     // smaller — so context modelling is only used when it actually helps. ---
-    private static byte[] BuildSingleGroupSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms)
+    private static byte[] BuildSingleGroupSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, int wpMode)
     {
-        var learned = new LearnedTree(JxlTreeLearner.Learn(ToRefs(channels)));
-        byte[] modelled = BuildSection(channels, writeTransforms, learned);
-        byte[] plain = BuildSection(channels, writeTransforms, SingleLeafTree);
+        WpHeader wpHeader = WpMode(wpMode);
+        var learned = new LearnedTree(JxlTreeLearner.Learn(ToRefs(channels), wpHeader));
+        byte[] modelled = BuildSection(channels, writeTransforms, learned, wpMode);
+        byte[] plain = BuildSection(channels, writeTransforms, SingleLeafTree, wpMode);
         return modelled.Length <= plain.Length ? modelled : plain;
     }
 
-    private static byte[] BuildSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, LearnedTree tree)
+    private static byte[] BuildSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, LearnedTree tree, int wpMode)
     {
+        WpHeader wpHeader = WpMode(wpMode);
         int total = 0;
         foreach (EncChannel ch in channels)
         {
@@ -202,7 +226,7 @@ internal static class JxlEncoder
         for (int c = 0; c < channels.Count; c++)
         {
             EncChannel ch = channels[c];
-            ComputeResidualTokensCtx(ch, c, tree, stream, ctxs, off, ref maxTok);
+            ComputeResidualTokensCtx(ch, c, tree, stream, ctxs, off, ref maxTok, wpHeader);
             off += ch.W * ch.H;
         }
 
@@ -214,7 +238,7 @@ internal static class JxlEncoder
         WriteTree(s, tree.Tokens);
         WriteLz77HistogramCtx(s, plan);
         s.WriteBool(true); // use_global tree + code
-        s.WriteBits(1, 1); // weighted-predictor header: all default
+        WriteWpHeaderBits(s, wpMode);
         writeTransforms(s);
         EmitOpsCtx(s, ops[0], ctxs, plan);
         return s.ToArray();
@@ -260,6 +284,103 @@ internal static class JxlEncoder
     }
 
     private static int Pick(int[] r, int[] g, int[] b, int idx, int p) => idx == 0 ? r[p] : (idx == 1 ? g[p] : b[p]);
+
+    // The five weighted-predictor parameter sets from libjxl (context_predict.h PredictorMode). Mode 0
+    // equals WpHeader.Default().
+    private static WpHeader WpMode(int m) => m switch
+    {
+        1 => new WpHeader { P1C = 8, P2C = 8, P3Ca = 4, P3Cb = 0, P3Cc = 3, P3Cd = 23, P3Ce = 2, W = new[] { 0xd, 0xc, 0xc, 0xb } },
+        2 => new WpHeader { P1C = 10, P2C = 9, P3Ca = 7, P3Cb = 0, P3Cc = 0, P3Cd = 16, P3Ce = 9, W = new[] { 0xd, 0xc, 0xd, 0xc } },
+        3 => new WpHeader { P1C = 16, P2C = 8, P3Ca = 0, P3Cb = 16, P3Cc = 0, P3Cd = 23, P3Ce = 0, W = new[] { 0xd, 0xd, 0xc, 0xc } },
+        4 => new WpHeader { P1C = 10, P2C = 10, P3Ca = 5, P3Cb = 5, P3Cc = 5, P3Cd = 12, P3Ce = 4, W = new[] { 0xd, 0xc, 0xc, 0xc } },
+        _ => WpHeader.Default(),
+    };
+
+    // Estimated bits for a WP mode: entropy of the weighted-predictor residuals over the channels.
+    private static double EstimateWpModeCost(int[][] chan, int w, int h, int wpMode)
+    {
+        WpHeader hdr = WpMode(wpMode);
+        var hist = new Dictionary<int, int>();
+        long total = 0;
+        var buf = new List<long>(1);
+        foreach (int[] px in chan)
+        {
+            var wp = new WpState(hdr, w);
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    long left = x > 0 ? px[(y * w) + x - 1] : (y > 0 ? px[((y - 1) * w) + x] : 0);
+                    long top = y > 0 ? px[((y - 1) * w) + x] : left;
+                    long topleft = (x > 0 && y > 0) ? px[((y - 1) * w) + x - 1] : left;
+                    long topright = (x + 1 < w && y > 0) ? px[((y - 1) * w) + x + 1] : top;
+                    long toptop = y > 1 ? px[((y - 2) * w) + x] : top;
+                    buf.Clear();
+                    long guess = wp.Predict(x, y, top, left, topright, topleft, toptop, buf);
+                    int pixel = px[(y * w) + x];
+                    int resid = pixel - (int)guess;
+                    hist[resid] = hist.GetValueOrDefault(resid) + 1;
+                    total++;
+                    wp.Update(pixel, x, y);
+                }
+            }
+        }
+
+        if (total == 0)
+        {
+            return 0;
+        }
+
+        double bits = 0, invLog2 = 1.0 / Math.Log(2);
+        foreach (int c in hist.Values)
+        {
+            bits -= c * Math.Log((double)c / total) * invLog2;
+        }
+
+        return bits;
+    }
+
+    private static int ChooseWpMode(int[][] chan, int w, int h)
+    {
+        int best = 0;
+        double bestCost = double.MaxValue;
+        for (int m = 0; m < 5; m++)
+        {
+            double c = EstimateWpModeCost(chan, w, h, m);
+            if (c < bestCost)
+            {
+                bestCost = c;
+                best = m;
+            }
+        }
+
+        return best;
+    }
+
+    // Writes the weighted-predictor header: the compact "all default" bit for mode 0, else the explicit
+    // 7 parameters + 4 weights (mirrors JxlModular.ReadWpHeader).
+    private static void WriteWpHeaderBits(JxlBitWriter s, int wpMode)
+    {
+        if (wpMode == 0)
+        {
+            s.WriteBits(1, 1); // all default
+            return;
+        }
+
+        WpHeader h = WpMode(wpMode);
+        s.WriteBits(0, 1);
+        s.WriteBits((uint)h.P1C, 5);
+        s.WriteBits((uint)h.P2C, 5);
+        s.WriteBits((uint)h.P3Ca, 5);
+        s.WriteBits((uint)h.P3Cb, 5);
+        s.WriteBits((uint)h.P3Cc, 5);
+        s.WriteBits((uint)h.P3Cd, 5);
+        s.WriteBits((uint)h.P3Ce, 5);
+        for (int i = 0; i < 4; i++)
+        {
+            s.WriteBits((uint)h.W[i], 4);
+        }
+    }
 
     // Chooses the RCT with the lowest estimated cost: the summed entropy of each channel's clamped-
     // gradient residuals (sampled), which tracks the achievable size well and is cheap. Mirrors libjxl
@@ -411,7 +532,7 @@ internal static class JxlEncoder
     // sections, then one Modular-AC section per spatial group. All groups share the global tree and
     // codes; each group has its own entropy reader/window, so LZ77 and prediction run per group. Built
     // with an error-context tree and with a single-leaf tree, keeping whichever total is smaller. ---
-    private static byte[][] BuildMultiGroupSections(int[][] chan, int w, int h, int nb, int groupDim, int rctType)
+    private static byte[][] BuildMultiGroupSections(int[][] chan, int w, int h, int nb, int groupDim, int rctType, int wpMode)
     {
         // Learn the tree from the actual tiles (per-tile prediction) so it matches the per-group encode.
         var tileRefs = new List<EncChannelRef>();
@@ -427,9 +548,9 @@ internal static class JxlEncoder
             }
         }
 
-        var learned = new LearnedTree(JxlTreeLearner.Learn(tileRefs));
-        byte[][] modelled = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, learned, rctType);
-        byte[][] plain = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree, rctType);
+        var learned = new LearnedTree(JxlTreeLearner.Learn(tileRefs, WpMode(wpMode)));
+        byte[][] modelled = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, learned, rctType, wpMode);
+        byte[][] plain = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree, rctType, wpMode);
         return TotalLength(modelled) <= TotalLength(plain) ? modelled : plain;
     }
 
@@ -444,8 +565,9 @@ internal static class JxlEncoder
         return t;
     }
 
-    private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, LearnedTree tree, int rctType)
+    private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, LearnedTree tree, int rctType, int wpMode)
     {
+        WpHeader wpHeader = WpMode(wpMode);
         int gpr = CeilDiv(w, groupDim);
         int numGroups = gpr * CeilDiv(h, groupDim);
         int lfDim = groupDim * 8;
@@ -468,7 +590,7 @@ internal static class JxlEncoder
             for (int c = 0; c < nb; c++)
             {
                 int[] tile = ExtractTile(chan[c], w, rx, ry, rw, rh);
-                ComputeResidualTokensCtx(new EncChannel(tile, rw, rh), c, tree, stream, ctxs, off, ref maxTok);
+                ComputeResidualTokensCtx(new EncChannel(tile, rw, rh), c, tree, stream, ctxs, off, ref maxTok, wpHeader);
                 off += rw * rh;
             }
 
@@ -483,7 +605,7 @@ internal static class JxlEncoder
         s0.WriteBits(1, 1); // has_tree = 1
         WriteTree(s0, tree.Tokens);
         WriteLz77HistogramCtx(s0, plan);
-        WriteGlobalGroupHeader(s0, rctType); // use_global + wp + RCT; no channels are small enough to decode here
+        WriteGlobalGroupHeader(s0, rctType, wpMode); // use_global + wp + RCT; no channels are small enough to decode here
 
         var list = new List<byte[]>(1 + numLf + 1 + numGroups) { s0.ToArray() };
         for (int i = 0; i < numLf; i++)
@@ -497,7 +619,7 @@ internal static class JxlEncoder
         {
             var sg = new JxlBitWriter();
             sg.WriteBool(true); // use_global tree + code
-            sg.WriteBits(1, 1); // weighted-predictor header: all default
+            WriteWpHeaderBits(sg, wpMode);
             sg.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0
             EmitOpsCtx(sg, ops[g], streams[g].Ctxs, plan);
             list.Add(sg.ToArray());
@@ -1154,11 +1276,11 @@ internal static class JxlEncoder
     // Per-pixel residuals + contexts: walk the learned tree on the decoder's properties to pick the
     // leaf's predictor (weighted or gradient) and its context, then emit the packed residual. Uses the
     // learner's shared ComputePixel so encoder and learner never diverge. Writes stream[off..]/ctxs[off..].
-    private static void ComputeResidualTokensCtx(EncChannel ch, int chan, LearnedTree tree, int[] stream, int[] ctxs, int off, ref int maxToken)
+    private static void ComputeResidualTokensCtx(EncChannel ch, int chan, LearnedTree tree, int[] stream, int[] ctxs, int off, ref int maxToken, WpHeader wpHeader)
     {
         int w = ch.W, h = ch.H;
         int[] px = ch.Data;
-        var wp = new WpState(WpHeader.Default(), w);
+        var wp = new WpState(wpHeader, w);
         var buf = new List<long>(1);
         int[] props = new int[16];
         long[] guesses = new long[JxlTreeLearner.CandidatePredictors.Length];
@@ -1192,10 +1314,10 @@ internal static class JxlEncoder
 
     // GroupHeader for the global modular stream: use_global tree+code, default weighted-predictor
     // header, and one transform — the chosen RCT, inverted after decode.
-    private static void WriteGlobalGroupHeader(JxlBitWriter s, int rctType)
+    private static void WriteGlobalGroupHeader(JxlBitWriter s, int rctType, int wpMode)
     {
         s.WriteBool(true);  // use_global tree + code
-        s.WriteBits(1, 1);  // weighted-predictor header: all default
+        WriteWpHeaderBits(s, wpMode);
         WriteRctTransform(s, rctType);
     }
 

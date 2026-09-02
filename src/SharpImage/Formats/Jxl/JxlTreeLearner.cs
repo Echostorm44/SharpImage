@@ -43,10 +43,10 @@ internal static class JxlTreeLearner
     private const int MaxLeaves = 256;         // safety cap on tree size
 
     /// <summary>Learns a global MA tree for the given residual channels (whole-channel prediction).</summary>
-    public static MaTreeNode Learn(List<EncChannelRef> channels)
+    public static MaTreeNode Learn(List<EncChannelRef> channels, WpHeader wpHeader)
     {
         int[][] thresholds = BuildThresholds(channels);
-        var samples = CollectSamples(channels, thresholds);
+        var samples = CollectSamples(channels, thresholds, wpHeader);
         var root = new MaTreeNode { Property = -1, Predictor = WeightedPredictor };
         if (samples.Count > 1)
         {
@@ -82,7 +82,7 @@ internal static class JxlTreeLearner
         }
     }
 
-    private static Samples CollectSamples(List<EncChannelRef> channels, int[][] thresholds)
+    private static Samples CollectSamples(List<EncChannelRef> channels, int[][] thresholds, WpHeader wpHeader)
     {
         int total = 0;
         foreach (EncChannelRef ch in channels)
@@ -114,7 +114,7 @@ internal static class JxlTreeLearner
         foreach (EncChannelRef ch in channels)
         {
             int w = ch.W, h = ch.H;
-            var wp = new WpState(WpHeader.Default(), w);
+            var wp = new WpState(wpHeader, w);
             int prevGrad = 0;
             for (int y = 0; y < h; y++)
             {
