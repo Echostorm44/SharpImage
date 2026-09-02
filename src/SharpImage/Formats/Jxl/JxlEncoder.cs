@@ -184,9 +184,17 @@ internal static class JxlEncoder
     }
 
     // --- Single-group frame: one section holding the tree, the pixel histogram and every pixel token
-    // (DecodeGlobalModular). All channels are decoded through one entropy reader, so LZ77 spans them:
-    // the token stream is the channels' residuals concatenated in decode order. ---
+    // (DecodeGlobalModular). All channels are decoded through one entropy reader, so LZ77 spans them.
+    // Builds the section with an error-context MA tree and with a plain single-leaf tree, keeping the
+    // smaller — so context modelling is only used when it actually helps. ---
     private static byte[] BuildSingleGroupSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms)
+    {
+        byte[] modelled = BuildSection(channels, writeTransforms, ErrorContextTree);
+        byte[] plain = BuildSection(channels, writeTransforms, SingleLeafTree);
+        return modelled.Length <= plain.Length ? modelled : plain;
+    }
+
+    private static byte[] BuildSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, ContextTree tree)
     {
         int total = 0;
         foreach (EncChannel ch in channels)
@@ -195,26 +203,26 @@ internal static class JxlEncoder
         }
 
         int[] stream = new int[total];
+        int[] ctxs = new int[total];
         int off = 0;
         int maxTok = 0;
         foreach (EncChannel ch in channels)
         {
-            int[] t = ComputeResidualTokens(ch.Data, ch.W, ch.H, ref maxTok);
-            Array.Copy(t, 0, stream, off, t.Length);
-            off += t.Length;
+            ComputeResidualTokensCtx(ch, tree, stream, ctxs, off, ref maxTok);
+            off += ch.W * ch.H;
         }
 
-        var plan = PlanPixels(new List<int[]> { stream }, out List<Op>[] ops);
+        var plan = PlanPixelsCtx(new List<(int[], int[])> { (stream, ctxs) }, tree.LeafCount, out List<Op>[] ops);
 
         var s = new JxlBitWriter();
         s.WriteBits(1, 1); // DequantMatrices::DecodeDC all_default
         s.WriteBits(1, 1); // has_tree = 1
-        WriteSingleLeafTree(s);
-        WriteLz77Histogram(s, plan);
+        WriteTree(s, tree.Tokens);
+        WriteLz77HistogramCtx(s, plan);
         s.WriteBool(true); // use_global tree + code
         s.WriteBits(1, 1); // weighted-predictor header: all default
         writeTransforms(s);
-        EmitOps(s, ops[0], plan);
+        EmitOpsCtx(s, ops[0], ctxs, plan);
         return s.ToArray();
     }
 
@@ -311,41 +319,66 @@ internal static class JxlEncoder
     private static int Luma(int rgb) => (((rgb >> 16) & 0xFF) * 2) + (((rgb >> 8) & 0xFF) * 5) + (rgb & 0xFF);
 
     // --- Multi-group frame: LfGlobal (tree + pixel histogram + global RCT), empty LfGroup/HfGlobal
-    // sections, then one Modular-AC section per spatial group. All groups share the global pixel code;
-    // each group has its own entropy reader/window, so LZ77 runs per group. ---
+    // sections, then one Modular-AC section per spatial group. All groups share the global tree and
+    // codes; each group has its own entropy reader/window, so LZ77 and prediction run per group. Built
+    // with an error-context tree and with a single-leaf tree, keeping whichever total is smaller. ---
     private static byte[][] BuildMultiGroupSections(int[][] chan, int w, int h, int nb, int groupDim)
+    {
+        byte[][] modelled = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, ErrorContextTree);
+        byte[][] plain = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree);
+        return TotalLength(modelled) <= TotalLength(plain) ? modelled : plain;
+    }
+
+    private static int TotalLength(byte[][] sections)
+    {
+        int t = 0;
+        foreach (byte[] s in sections)
+        {
+            t += s.Length;
+        }
+
+        return t;
+    }
+
+    private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, ContextTree tree)
     {
         int gpr = CeilDiv(w, groupDim);
         int numGroups = gpr * CeilDiv(h, groupDim);
         int lfDim = groupDim * 8;
         int numLf = CeilDiv(w, lfDim) * CeilDiv(h, lfDim);
 
-        var streams = new List<int[]>(numGroups);
+        var streams = new List<(int[] Stream, int[] Ctxs)>(numGroups);
         for (int g = 0; g < numGroups; g++)
         {
             int rx = (g % gpr) * groupDim;
             int ry = (g / gpr) * groupDim;
             int rw = Math.Min(groupDim, w - rx);
             int rh = Math.Min(groupDim, h - ry);
-            int[] concat = new int[rw * rh * nb];
-            int dummy = 0;
+
+            // Each group predicts within its own tile: extract the tile of every channel and treat it as
+            // a standalone image (identical to the decoder's per-group decode).
+            int[] stream = new int[rw * rh * nb];
+            int[] ctxs = new int[rw * rh * nb];
+            int off = 0;
+            int maxTok = 0;
             for (int c = 0; c < nb; c++)
             {
-                int[] tc = ComputeGroupResidualTokens(chan[c], w, rx, ry, rw, rh, ref dummy);
-                Array.Copy(tc, 0, concat, c * rw * rh, tc.Length);
+                int[] tile = ExtractTile(chan[c], w, rx, ry, rw, rh);
+                ComputeResidualTokensCtx(new EncChannel(tile, rw, rh), tree, stream, ctxs, off, ref maxTok);
+                off += rw * rh;
             }
 
-            streams.Add(concat);
+            streams.Add((stream, ctxs));
         }
 
-        var plan = PlanPixels(streams, out List<Op>[] ops);
+        var plan = PlanPixelsCtx(streams, tree.LeafCount, out List<Op>[] ops);
 
         // Section 0: LfGlobal.
         var s0 = new JxlBitWriter();
         s0.WriteBits(1, 1); // DequantMatrices::DecodeDC all_default
         s0.WriteBits(1, 1); // has_tree = 1
-        WriteSingleLeafTree(s0);
-        WriteLz77Histogram(s0, plan);
+        WriteTree(s0, tree.Tokens);
+        WriteLz77HistogramCtx(s0, plan);
         WriteGlobalGroupHeader(s0); // use_global + wp + RCT; no channels are small enough to decode here
 
         var list = new List<byte[]>(1 + numLf + 1 + numGroups) { s0.ToArray() };
@@ -362,34 +395,31 @@ internal static class JxlEncoder
             sg.WriteBool(true); // use_global tree + code
             sg.WriteBits(1, 1); // weighted-predictor header: all default
             sg.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0
-            EmitOps(sg, ops[g], plan);
+            EmitOpsCtx(sg, ops[g], streams[g].Ctxs, plan);
             list.Add(sg.ToArray());
         }
 
         return list.ToArray();
     }
 
-    // Single-leaf global MA tree: property token 0 (=> leaf), then predictor / offset / mult-log /
-    // mult-bits. The tree stream reads six contexts, all mapped to one histogram.
-    private static void WriteSingleLeafTree(JxlBitWriter s)
+    private static int[] ExtractTile(int[] full, int fullW, int rx, int ry, int rw, int rh)
     {
-        long[] treeFreq = new long[WeightedPredictor + 1];
-        treeFreq[0] = 4;                 // property(0), offset(0), mult-log(0), mult-bits(0)
-        treeFreq[WeightedPredictor] = 1; // predictor
-        var treeCode = new JxlPrefixCode(treeFreq, WeightedPredictor + 1);
-        WriteHistogramsHeader(s, numContexts: 6, treeCode);
-        treeCode.WriteSymbol(s, 0);
-        treeCode.WriteSymbol(s, WeightedPredictor);
-        treeCode.WriteSymbol(s, 0);
-        treeCode.WriteSymbol(s, 0);
-        treeCode.WriteSymbol(s, 0);
+        int[] tile = new int[rw * rh];
+        for (int y = 0; y < rh; y++)
+        {
+            Array.Copy(full, ((ry + y) * fullW) + rx, tile, y * rw, rw);
+        }
+
+        return tile;
     }
 
+    // Single-leaf global MA tree: property token 0 (=> leaf), then predictor / offset / mult-log /
+    // mult-bits. The tree stream reads six contexts, all mapped to one histogram.
     // ─── LZ77 over the residual-token stream ───────────────────────────────────────────────────────
     // The Modular pixel stream is entropy-coded with LZ77 enabled: a token >= a threshold signals a
     // back-reference (length + distance) instead of a literal residual, which collapses flat and
-    // repeating regions. Two histogram clusters are used — cluster 0 for literals + length markers,
-    // cluster 1 for distances — matching DecodeHistograms + JxlAnsReader's LZ77 path.
+    // repeating regions. Distances go in their own histogram cluster; literals + length markers use the
+    // per-context clusters — matching DecodeHistograms + JxlAnsReader's LZ77 path.
     private readonly struct Op
     {
         public readonly bool Match;
@@ -398,94 +428,8 @@ internal static class JxlEncoder
         public Op(bool match, int a, int b) { Match = match; A = a; B = b; }
     }
 
-    private sealed class PixelPlan
-    {
-        public int Threshold;
-        public int SeLit, SeDist, SeLen, MinLen;
-        public JxlPrefixCode Code0 = null!; // literals + length markers
-        public JxlPrefixCode Code1 = null!; // distances
-    }
-
     private const int Lz77MinLength = 16;   // shortest worthwhile back-reference
     private const int NumSpecialDistances = 120; // JxlEntropy.NumSpecialDistances (distanceMultiplier > 0)
-
-    private static PixelPlan PlanPixels(List<int[]> streams, out List<Op>[] opsOut)
-    {
-        int minLen = Lz77MinLength;
-        int maxToken = 0;
-        foreach (int[] st in streams)
-        {
-            foreach (int v in st)
-            {
-                if (v > maxToken)
-                {
-                    maxToken = v;
-                }
-            }
-        }
-
-        var plan = new PixelPlan
-        {
-            Threshold = Math.Max(8, maxToken + 1),
-            SeLit = Math.Min(15, Math.Max(1, BitLen(maxToken))),
-            SeDist = 4,
-            SeLen = 4,
-            MinLen = minLen,
-        };
-
-        opsOut = new List<Op>[streams.Count];
-        int max0 = 0, max1 = 0;
-        for (int i = 0; i < streams.Count; i++)
-        {
-            opsOut[i] = FindMatches(streams[i], minLen);
-            foreach (Op op in opsOut[i])
-            {
-                if (!op.Match)
-                {
-                    if (op.A > max0)
-                    {
-                        max0 = op.A;
-                    }
-                }
-                else
-                {
-                    int lenSym = plan.Threshold + PackHybridUint(plan.SeLen, op.A - minLen).Token;
-                    int dtok = PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1).Token;
-                    if (lenSym > max0)
-                    {
-                        max0 = lenSym;
-                    }
-
-                    if (dtok > max1)
-                    {
-                        max1 = dtok;
-                    }
-                }
-            }
-        }
-
-        long[] f0 = new long[max0 + 1];
-        long[] f1 = new long[max1 + 1];
-        foreach (List<Op> ops in opsOut)
-        {
-            foreach (Op op in ops)
-            {
-                if (!op.Match)
-                {
-                    f0[op.A]++;
-                }
-                else
-                {
-                    f0[plan.Threshold + PackHybridUint(plan.SeLen, op.A - minLen).Token]++;
-                    f1[PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1).Token]++;
-                }
-            }
-        }
-
-        plan.Code0 = new JxlPrefixCode(f0, max0 + 1);
-        plan.Code1 = new JxlPrefixCode(f1, max1 + 1);
-        return plan;
-    }
 
     // Greedy longest-match LZ77 over the value stream, using a 4-gram hash with chained positions.
     // Overlapping matches (distance < length) are allowed — they reproduce run-length fills.
@@ -575,50 +519,6 @@ internal static class JxlEncoder
         return ops;
     }
 
-    private static void EmitOps(JxlBitWriter s, List<Op> ops, PixelPlan plan)
-    {
-        foreach (Op op in ops)
-        {
-            if (!op.Match)
-            {
-                plan.Code0.WriteSymbol(s, op.A);
-                continue;
-            }
-
-            (int lenBase, int nbLen, int bitsLen) = PackHybridUint(plan.SeLen, op.A - plan.MinLen);
-            plan.Code0.WriteSymbol(s, plan.Threshold + lenBase);
-            s.WriteBits((uint)bitsLen, nbLen);
-
-            (int dtok, int nbDist, int bitsDist) = PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1);
-            plan.Code1.WriteSymbol(s, dtok);
-            s.WriteBits((uint)bitsDist, nbDist);
-        }
-    }
-
-    // DecodeHistograms mirror for the pixel stream: LZ77 enabled, a 2-entry context map (literals ->
-    // cluster 0, distances -> cluster 1), prefix coding, and the two per-cluster hybrid-uint configs.
-    private static void WriteLz77Histogram(JxlBitWriter s, PixelPlan plan)
-    {
-        s.WriteBool(true); // lz77 enabled
-        s.WriteU32((uint)plan.Threshold, E.Val(224), E.Val(512), E.Val(4096), E.BitsOff(15, 8)); // min_symbol
-        s.WriteU32((uint)plan.MinLen, E.Val(3), E.Val(4), E.BitsOff(2, 5), E.BitsOff(8, 9)); // min_length
-        WriteUintConfig(s, plan.SeLen, 0, 0, 8); // lz77 length config (logAlpha 8)
-
-        // Context map for {literal context, distance context}: simple, 1 bit per entry, [0, 1].
-        s.WriteBool(true); // is_simple
-        s.WriteBits(1, 2); // bits per entry = 1
-        s.WriteBits(0, 1); // context 0 -> cluster 0
-        s.WriteBits(1, 1); // context 1 (distance) -> cluster 1
-
-        s.WriteBool(true); // use_prefix_code
-        WriteUintConfig(s, plan.SeLit, 0, 0, 15);  // cluster 0
-        WriteUintConfig(s, plan.SeDist, 0, 0, 15); // cluster 1
-        s.WriteVarLenUint16(plan.Code0.AlphabetSize - 1);
-        s.WriteVarLenUint16(plan.Code1.AlphabetSize - 1);
-        plan.Code0.WriteHeader(s);
-        plan.Code1.WriteHeader(s);
-    }
-
     // Encodes a value under a hybrid-uint config (SplitExp, 0, 0): values below 2^SplitExp are literal
     // tokens; larger values become an exponent token plus mantissa extra bits. Inverse of
     // JxlEntropy.ReadHybridUintConfig.
@@ -638,6 +538,475 @@ internal static class JxlEncoder
 
     private static int BitLen(int x) => x <= 0 ? 0 : 32 - System.Numerics.BitOperations.LeadingZeroCount((uint)x);
 
+    // ─── Context modelling ─────────────────────────────────────────────────────────────────────────
+    // A small MA tree assigns each pixel a context from the weighted predictor's error property (the
+    // decoder property 15 — the neighbour with the largest recent WP error). High-error (busy) pixels
+    // and low-error (flat) pixels get separate entropy statistics. The tree is emitted so the decoder
+    // computes the identical context; the encoder walks the same tree on the same property value.
+    private const int WpErrorProperty = 15;
+    private const int MaxLiteralClusters = 7; // keep histogram count (and header overhead) bounded
+
+    private sealed class ContextTree
+    {
+        public int[] Tokens;               // tree stream tokens (breadth-first), fed to the tree histogram
+        public int LeafCount;              // number of contexts (leaves)
+        private readonly int[]? splitVals; // ascending split thresholds (null for a single-leaf tree)
+        private readonly int[]? leafOfBucket;
+
+        public ContextTree(int[] tokens, int leafCount, int[]? splitVals, int[]? leafOfBucket)
+        {
+            Tokens = tokens;
+            LeafCount = leafCount;
+            this.splitVals = splitVals;
+            this.leafOfBucket = leafOfBucket;
+        }
+
+        // Context for a property value: the bucket between ascending thresholds, mapped to the tree's
+        // breadth-first leaf index (so it matches the decoder's DecodeTree/TreeLeaf ordering).
+        public int Context(int value)
+        {
+            if (splitVals is null)
+            {
+                return 0;
+            }
+
+            int bucket = 0;
+            while (bucket < splitVals.Length && value > splitVals[bucket])
+            {
+                bucket++;
+            }
+
+            return leafOfBucket![bucket];
+        }
+    }
+
+    private static readonly ContextTree SingleLeafTree = BuildSingleLeafTree();
+    private static readonly ContextTree ErrorContextTree = BuildErrorContextTree(
+        new[] { -64, -32, -16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16, 32, 64 }); // 16 error buckets, clustered at encode time
+
+    private static ContextTree BuildSingleLeafTree()
+    {
+        // property 0 => leaf, then predictor / offset / mult-log / mult-bits.
+        int[] tokens = { 0, WeightedPredictor, 0, 0, 0 };
+        return new ContextTree(tokens, 1, null, null);
+    }
+
+    // Balanced BST over the ascending thresholds, splitting on the WP-error property. Emitted in the
+    // breadth-first order DecodeTree consumes; leaves are numbered in that same order.
+    private static ContextTree BuildErrorContextTree(int[] thresholds)
+    {
+        // Build the node tree (object form) then serialise breadth-first.
+        TNode root = BuildBst(thresholds, 0, thresholds.Length - 1);
+        var tokens = new List<int>();
+        var queue = new Queue<TNode>();
+        queue.Enqueue(root);
+        int leafCounter = 0;
+        while (queue.Count > 0)
+        {
+            TNode node = queue.Dequeue();
+            if (node.IsLeaf)
+            {
+                node.Ctx = leafCounter++;
+                tokens.Add(0);                 // property 0 => leaf
+                tokens.Add(WeightedPredictor); // predictor
+                tokens.Add(0);                 // offset (PackSigned 0)
+                tokens.Add(0);                 // mult-log
+                tokens.Add(0);                 // mult-bits
+            }
+            else
+            {
+                tokens.Add(WpErrorProperty + 1);      // property token
+                tokens.Add(PackSigned(node.SplitVal)); // split value
+                queue.Enqueue(node.Left!);
+                queue.Enqueue(node.Right!);
+            }
+        }
+
+        // Bucket b holds values in (thresholds[b-1], thresholds[b]] (and (thresholds[last], +inf) for the
+        // top bucket). Map each to the leaf the decoder's TreeLeaf reaches for a representative value.
+        int[] leafOfBucket = new int[thresholds.Length + 1];
+        for (int bkt = 0; bkt < leafOfBucket.Length; bkt++)
+        {
+            int rep = bkt < thresholds.Length ? thresholds[bkt] : thresholds[^1] + 1;
+            leafOfBucket[bkt] = WalkNode(root, rep);
+        }
+
+        return new ContextTree(tokens.ToArray(), leafCounter, thresholds, leafOfBucket);
+    }
+
+    private sealed class TNode
+    {
+        public bool IsLeaf;
+        public int SplitVal;
+        public int Ctx;
+        public TNode? Left;   // values > SplitVal
+        public TNode? Right;  // values <= SplitVal
+    }
+
+    private static TNode BuildBst(int[] t, int lo, int hi)
+    {
+        if (lo > hi)
+        {
+            return new TNode { IsLeaf = true };
+        }
+
+        int mid = (lo + hi) / 2;
+        return new TNode
+        {
+            IsLeaf = false,
+            SplitVal = t[mid],
+            Left = BuildBst(t, mid + 1, hi),
+            Right = BuildBst(t, lo, mid - 1),
+        };
+    }
+
+    private static int WalkNode(TNode node, int value)
+    {
+        while (!node.IsLeaf)
+        {
+            node = value > node.SplitVal ? node.Left! : node.Right!;
+        }
+
+        return node.Ctx;
+    }
+
+    private static int PackSigned(int v) => (int)(uint)((v << 1) ^ (v >> 31));
+
+    private static void WriteTree(JxlBitWriter s, int[] tokens)
+    {
+        int maxv = 0;
+        foreach (int v in tokens)
+        {
+            if (v > maxv)
+            {
+                maxv = v;
+            }
+        }
+
+        long[] f = new long[maxv + 1];
+        foreach (int v in tokens)
+        {
+            f[v]++;
+        }
+
+        var treeCode = new JxlPrefixCode(f, maxv + 1);
+        WriteHistogramsHeader(s, numContexts: 6, treeCode);
+        foreach (int v in tokens)
+        {
+            treeCode.WriteSymbol(s, v);
+        }
+    }
+
+    private sealed class PixelPlanCtx
+    {
+        public int N;                     // number of pixel contexts (tree leaves)
+        public int K;                     // number of literal clusters
+        public int Threshold;
+        public int SeLit, SeDist, SeLen, MinLen;
+        public int[] ContextToCluster = null!; // [N] pixel context -> literal cluster (0..K-1)
+        public JxlPrefixCode[] Codes = null!;  // [0..K-1] literal+length clusters, [K] distance
+    }
+
+    // Plans the entropy coding for one or more token streams that share the global tree and codes
+    // (one stream for a single-group frame, one per group otherwise). Returns per-stream LZ77 ops.
+    private static PixelPlanCtx PlanPixelsCtx(List<(int[] Stream, int[] Ctxs)> streams, int n, out List<Op>[] opsOut)
+    {
+        int minLen = Lz77MinLength;
+        int maxToken = 0;
+        foreach ((int[] st, _) in streams)
+        {
+            foreach (int v in st)
+            {
+                if (v > maxToken)
+                {
+                    maxToken = v;
+                }
+            }
+        }
+
+        var plan = new PixelPlanCtx
+        {
+            N = n,
+            Threshold = Math.Max(8, maxToken + 1),
+            SeLit = Math.Min(15, Math.Max(1, BitLen(maxToken))),
+            SeDist = 4,
+            SeLen = 4,
+            MinLen = minLen,
+        };
+
+        opsOut = new List<Op>[streams.Count];
+        int gmaxLit = 0, gmaxDist = 0;
+        for (int i = 0; i < streams.Count; i++)
+        {
+            opsOut[i] = FindMatches(streams[i].Stream, minLen);
+            foreach (Op op in opsOut[i])
+            {
+                if (!op.Match)
+                {
+                    gmaxLit = Math.Max(gmaxLit, op.A);
+                }
+                else
+                {
+                    gmaxLit = Math.Max(gmaxLit, plan.Threshold + PackHybridUint(plan.SeLen, op.A - minLen).Token);
+                    gmaxDist = Math.Max(gmaxDist, PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1).Token);
+                }
+            }
+        }
+
+        // Per-context literal+length histograms (global across streams), plus one shared distance histogram.
+        long[][] ctxHist = new long[n][];
+        for (int c = 0; c < n; c++)
+        {
+            ctxHist[c] = new long[gmaxLit + 1];
+        }
+
+        long[] distHist = new long[gmaxDist + 1];
+        for (int i = 0; i < streams.Count; i++)
+        {
+            int[] ctxs = streams[i].Ctxs;
+            int pos = 0;
+            foreach (Op op in opsOut[i])
+            {
+                int ctx = ctxs[pos];
+                if (!op.Match)
+                {
+                    ctxHist[ctx][op.A]++;
+                    pos += 1;
+                }
+                else
+                {
+                    ctxHist[ctx][plan.Threshold + PackHybridUint(plan.SeLen, op.A - minLen).Token]++;
+                    distHist[PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1).Token]++;
+                    pos += op.A;
+                }
+            }
+        }
+
+        int[] contextToCluster = ClusterContexts(ctxHist, gmaxLit + 1, MaxLiteralClusters, out long[][] clusterHist, out int k);
+        plan.K = k;
+        plan.ContextToCluster = contextToCluster;
+        plan.Codes = new JxlPrefixCode[k + 1];
+        for (int c = 0; c < k; c++)
+        {
+            int alpha = 1;
+            for (int sym = clusterHist[c].Length - 1; sym >= 0; sym--)
+            {
+                if (clusterHist[c][sym] > 0)
+                {
+                    alpha = sym + 1;
+                    break;
+                }
+            }
+
+            plan.Codes[c] = new JxlPrefixCode(clusterHist[c], alpha);
+        }
+
+        plan.Codes[k] = new JxlPrefixCode(distHist, gmaxDist + 1);
+        return plan;
+    }
+
+    // Greedy agglomerative clustering of context histograms: repeatedly merge the two clusters whose
+    // union adds the fewest bits, until at most maxClusters remain. Empty contexts fold in for free.
+    private static int[] ClusterContexts(long[][] ctxHist, int alphabet, int maxClusters, out long[][] clusterHist, out int k)
+    {
+        int n = ctxHist.Length;
+        var members = new List<List<int>>();
+        var hist = new List<long[]>();
+        for (int c = 0; c < n; c++)
+        {
+            members.Add(new List<int> { c });
+            hist.Add((long[])ctxHist[c].Clone());
+        }
+
+        while (hist.Count > 1)
+        {
+            double bestCost = double.MaxValue;
+            int bi = -1, bj = -1;
+            for (int i = 0; i < hist.Count; i++)
+            {
+                for (int j = i + 1; j < hist.Count; j++)
+                {
+                    double cost = MergeCost(hist[i], hist[j]);
+                    if (cost < bestCost)
+                    {
+                        bestCost = cost;
+                        bi = i;
+                        bj = j;
+                    }
+                }
+            }
+
+            // Merge while over the cap, or while a merge is essentially free (< ~2 bytes of extra entropy).
+            if (hist.Count <= maxClusters && bestCost > 16.0)
+            {
+                break;
+            }
+
+            for (int s = 0; s < alphabet; s++)
+            {
+                hist[bi][s] += hist[bj][s];
+            }
+
+            members[bi].AddRange(members[bj]);
+            hist.RemoveAt(bj);
+            members.RemoveAt(bj);
+        }
+
+        k = hist.Count;
+        clusterHist = hist.ToArray();
+        int[] map = new int[n];
+        for (int c = 0; c < k; c++)
+        {
+            foreach (int ctx in members[c])
+            {
+                map[ctx] = c;
+            }
+        }
+
+        return map;
+    }
+
+    private static double MergeCost(long[] a, long[] b) => Bits(Sum(a, b)) - Bits(a) - Bits(b);
+
+    private static long[] Sum(long[] a, long[] b)
+    {
+        long[] r = new long[a.Length];
+        for (int i = 0; i < a.Length; i++)
+        {
+            r[i] = a[i] + b[i];
+        }
+
+        return r;
+    }
+
+    private static double Bits(long[] h)
+    {
+        long total = 0;
+        foreach (long v in h)
+        {
+            total += v;
+        }
+
+        if (total == 0)
+        {
+            return 0;
+        }
+
+        double bits = 0;
+        double lg = Math.Log(total);
+        foreach (long v in h)
+        {
+            if (v > 0)
+            {
+                bits += v * ((lg - Math.Log(v)) / Math.Log(2));
+            }
+        }
+
+        return bits;
+    }
+
+    private static void EmitOpsCtx(JxlBitWriter s, List<Op> ops, int[] ctxs, PixelPlanCtx plan)
+    {
+        int distCluster = plan.K;
+        int pos = 0;
+        foreach (Op op in ops)
+        {
+            int litCluster = plan.ContextToCluster[ctxs[pos]];
+            if (!op.Match)
+            {
+                plan.Codes[litCluster].WriteSymbol(s, op.A);
+                pos += 1;
+                continue;
+            }
+
+            (int lenBase, int nbLen, int bitsLen) = PackHybridUint(plan.SeLen, op.A - plan.MinLen);
+            plan.Codes[litCluster].WriteSymbol(s, plan.Threshold + lenBase);
+            s.WriteBits((uint)bitsLen, nbLen);
+
+            (int dtok, int nbDist, int bitsDist) = PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1);
+            plan.Codes[distCluster].WriteSymbol(s, dtok);
+            s.WriteBits((uint)bitsDist, nbDist);
+            pos += op.A;
+        }
+    }
+
+    // DecodeHistograms mirror: LZ77 enabled, an (N + 1)-entry context map (each pixel context to its
+    // literal cluster, the distance context to the distance cluster), prefix coding, per-cluster configs.
+    private static void WriteLz77HistogramCtx(JxlBitWriter s, PixelPlanCtx plan)
+    {
+        int numClusters = plan.K + 1;
+        s.WriteBool(true); // lz77 enabled
+        s.WriteU32((uint)plan.Threshold, E.Val(224), E.Val(512), E.Val(4096), E.BitsOff(15, 8)); // min_symbol
+        s.WriteU32((uint)plan.MinLen, E.Val(3), E.Val(4), E.BitsOff(2, 5), E.BitsOff(8, 9)); // min_length
+        WriteUintConfig(s, plan.SeLen, 0, 0, 8); // lz77 length config
+
+        int bpe = Math.Max(1, BitLen(numClusters - 1));
+        s.WriteBool(true);         // is_simple context map
+        s.WriteBits((uint)bpe, 2); // bits per entry
+        for (int c = 0; c < plan.N; c++)
+        {
+            s.WriteBits((uint)plan.ContextToCluster[c], bpe); // pixel context -> literal cluster
+        }
+
+        s.WriteBits((uint)plan.K, bpe); // distance context -> distance cluster
+
+        s.WriteBool(true); // use_prefix_code
+        for (int c = 0; c < plan.K; c++)
+        {
+            WriteUintConfig(s, plan.SeLit, 0, 0, 15); // literal clusters
+        }
+
+        WriteUintConfig(s, plan.SeDist, 0, 0, 15); // distance cluster
+        for (int c = 0; c < numClusters; c++)
+        {
+            s.WriteVarLenUint16(plan.Codes[c].AlphabetSize - 1);
+        }
+
+        for (int c = 0; c < numClusters; c++)
+        {
+            plan.Codes[c].WriteHeader(s);
+        }
+    }
+
+    // Weighted-predictor residuals plus a per-pixel context (bucket of the WP-error property), matching
+    // the decoder's general Modular path. Writes into stream[off..] and ctxs[off..].
+    private static void ComputeResidualTokensCtx(EncChannel ch, ContextTree tree, int[] stream, int[] ctxs, int off, ref int maxToken)
+    {
+        int w = ch.W, h = ch.H;
+        int[] px = ch.Data;
+        var wp = new WpState(WpHeader.Default(), w);
+        var buf = new List<long>(1);
+        int local = maxToken;
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int left = x > 0 ? px[(y * w) + x - 1] : (y > 0 ? px[((y - 1) * w) + x] : 0);
+                int top = y > 0 ? px[((y - 1) * w) + x] : left;
+                int topleft = (x > 0 && y > 0) ? px[((y - 1) * w) + x - 1] : left;
+                int topright = (x + 1 < w && y > 0) ? px[((y - 1) * w) + x + 1] : top;
+                int toptop = y > 1 ? px[((y - 2) * w) + x] : top;
+                buf.Clear();
+                long guess = wp.Predict(x, y, top, left, topright, topleft, toptop, buf);
+                int props15 = (int)buf[0];
+                int pixel = px[(y * w) + x];
+                int residual = pixel - (int)guess;
+                int token = (int)(uint)((residual << 1) ^ (residual >> 31));
+                int idx = off + (y * w) + x;
+                stream[idx] = token;
+                ctxs[idx] = tree.Context(props15);
+                if (token > local)
+                {
+                    local = token;
+                }
+
+                wp.Update(pixel, x, y);
+            }
+        }
+
+        maxToken = local;
+    }
+
     // GroupHeader for the global modular stream: use_global tree+code, default weighted-predictor
     // header, and one transform — the YCoCg RCT, inverted after decode.
     private static void WriteGlobalGroupHeader(JxlBitWriter s)
@@ -653,73 +1022,6 @@ internal static class JxlEncoder
     // Self-correcting weighted-predictor (predictor 6) residuals, packed with the JXL signed->unsigned
     // mapping. The encoder runs the decoder's exact WpState so the predictions — and thus residuals —
     // match the decode bit-for-bit.
-    private static int[] ComputeResidualTokens(int[] px, int w, int h, ref int maxToken)
-    {
-        int[] tokens = new int[w * h];
-        int local = maxToken;
-        var wp = new WpState(WpHeader.Default(), w);
-        for (int y = 0; y < h; y++)
-        {
-            for (int x = 0; x < w; x++)
-            {
-                int left = x > 0 ? px[(y * w) + x - 1] : (y > 0 ? px[((y - 1) * w) + x] : 0);
-                int top = y > 0 ? px[((y - 1) * w) + x] : left;
-                int topleft = (x > 0 && y > 0) ? px[((y - 1) * w) + x - 1] : left;
-                int topright = (x + 1 < w && y > 0) ? px[((y - 1) * w) + x + 1] : top;
-                int toptop = y > 1 ? px[((y - 2) * w) + x] : top;
-                long guess = wp.Predict(x, y, top, left, topright, topleft, toptop, null);
-                int pixel = px[(y * w) + x];
-                int residual = pixel - (int)guess;
-                int token = (int)(uint)((residual << 1) ^ (residual >> 31)); // PackSigned
-                tokens[(y * w) + x] = token;
-                if (token > local)
-                {
-                    local = token;
-                }
-
-                wp.Update(pixel, x, y);
-            }
-        }
-
-        maxToken = local;
-        return tokens;
-    }
-
-    // WP residuals for one tile (rx,ry,rw,rh) of a full channel. Prediction is tile-local — pixels
-    // outside the tile are treated as edges — exactly as DecodeMultiGroup decodes each group.
-    private static int[] ComputeGroupResidualTokens(int[] full, int fullW, int rx, int ry, int rw, int rh, ref int maxToken)
-    {
-        int[] tokens = new int[rw * rh];
-        int local = maxToken;
-        var wp = new WpState(WpHeader.Default(), rw);
-        int P(int xx, int yy) => full[((ry + yy) * fullW) + rx + xx];
-        for (int y = 0; y < rh; y++)
-        {
-            for (int x = 0; x < rw; x++)
-            {
-                int left = x > 0 ? P(x - 1, y) : (y > 0 ? P(x, y - 1) : 0);
-                int top = y > 0 ? P(x, y - 1) : left;
-                int topleft = (x > 0 && y > 0) ? P(x - 1, y - 1) : left;
-                int topright = (x + 1 < rw && y > 0) ? P(x + 1, y - 1) : top;
-                int toptop = y > 1 ? P(x, y - 2) : top;
-                long guess = wp.Predict(x, y, top, left, topright, topleft, toptop, null);
-                int pixel = P(x, y);
-                int residual = pixel - (int)guess;
-                int token = (int)(uint)((residual << 1) ^ (residual >> 31));
-                tokens[(y * rw) + x] = token;
-                if (token > local)
-                {
-                    local = token;
-                }
-
-                wp.Update(pixel, x, y);
-            }
-        }
-
-        maxToken = local;
-        return tokens;
-    }
-
     // DecodeHistograms mirror for a single-histogram, prefix-coded, LZ77-free entropy code.
     private static void WriteHistogramsHeader(JxlBitWriter w, int numContexts, JxlPrefixCode code)
     {
