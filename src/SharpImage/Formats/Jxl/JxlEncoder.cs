@@ -555,6 +555,28 @@ internal static class JxlEncoder
 
     private static int BitLen(int x) => x <= 0 ? 0 : 32 - System.Numerics.BitOperations.LeadingZeroCount((uint)x);
 
+    // Literals are tokenised with libjxl's compact hybrid-uint config (split 4, msb 1, lsb 2): small
+    // token alphabet (so histogram headers stay small) plus raw mantissa bits.
+    private const int LitSplit = 4, LitMsb = 1, LitLsb = 2;
+
+    // General hybrid-uint encode (inverse of JxlEntropy.ReadHybridUintConfig), ported from libjxl
+    // HybridUintConfig::Encode. Handles msb/lsb, unlike the (splitExp,0,0)-only PackHybridUint above.
+    private static (int Token, int NBits, int Bits) PackHybridFull(int splitExp, int msb, int lsb, int value)
+    {
+        int splitToken = 1 << splitExp;
+        if (value < splitToken)
+        {
+            return (value, 0, 0);
+        }
+
+        int n = BitLen(value) - 1; // floor(log2)
+        int m = value - (1 << n);
+        int token = splitToken + ((n - splitExp) << (msb + lsb)) + ((m >> (n - msb)) << lsb) + (m & ((1 << lsb) - 1));
+        int nbits = n - msb - lsb;
+        int bits = (value >> lsb) & ((1 << nbits) - 1);
+        return (token, nbits, bits);
+    }
+
     // ─── Context modelling ─────────────────────────────────────────────────────────────────────────
     // A small MA tree assigns each pixel a context from the weighted predictor's error property (the
     // decoder property 15 — the neighbour with the largest recent WP error). High-error (busy) pixels
@@ -659,7 +681,7 @@ internal static class JxlEncoder
         public int N;                     // number of pixel contexts (tree leaves)
         public int K;                     // number of literal clusters
         public int Threshold;
-        public int SeLit, SeDist, SeLen, MinLen;
+        public int SeDist, SeLen, MinLen;
         public int[] ContextToCluster = null!; // [N] pixel context -> literal cluster (0..K-1)
         public JxlPrefixCode[] Codes = null!;  // [0..K-1] literal+length clusters, [K] distance
     }
@@ -669,14 +691,22 @@ internal static class JxlEncoder
     private static PixelPlanCtx PlanPixelsCtx(List<(int[] Stream, int[] Ctxs)> streams, int n, out List<Op>[] opsOut)
     {
         int minLen = Lz77MinLength;
-        int maxToken = 0;
-        foreach ((int[] st, _) in streams)
+        opsOut = new List<Op>[streams.Count];
+        for (int i = 0; i < streams.Count; i++)
         {
-            foreach (int v in st)
+            opsOut[i] = FindMatches(streams[i].Stream, minLen);
+        }
+
+        // Literal tokens are compact (config LitSplit/LitMsb/LitLsb); the match threshold sits just above
+        // the largest literal token so length markers never collide with literals.
+        int maxLitTok = 0;
+        foreach (List<Op> ops in opsOut)
+        {
+            foreach (Op op in ops)
             {
-                if (v > maxToken)
+                if (!op.Match)
                 {
-                    maxToken = v;
+                    maxLitTok = Math.Max(maxLitTok, PackHybridFull(LitSplit, LitMsb, LitLsb, op.A).Token);
                 }
             }
         }
@@ -684,25 +714,18 @@ internal static class JxlEncoder
         var plan = new PixelPlanCtx
         {
             N = n,
-            Threshold = Math.Max(8, maxToken + 1),
-            SeLit = Math.Min(15, Math.Max(1, BitLen(maxToken))),
+            Threshold = Math.Max(8, maxLitTok + 1),
             SeDist = 4,
             SeLen = 4,
             MinLen = minLen,
         };
 
-        opsOut = new List<Op>[streams.Count];
-        int gmaxLit = 0, gmaxDist = 0;
-        for (int i = 0; i < streams.Count; i++)
+        int gmaxLit = maxLitTok, gmaxDist = 0;
+        foreach (List<Op> ops in opsOut)
         {
-            opsOut[i] = FindMatches(streams[i].Stream, minLen);
-            foreach (Op op in opsOut[i])
+            foreach (Op op in ops)
             {
-                if (!op.Match)
-                {
-                    gmaxLit = Math.Max(gmaxLit, op.A);
-                }
-                else
+                if (op.Match)
                 {
                     gmaxLit = Math.Max(gmaxLit, plan.Threshold + PackHybridUint(plan.SeLen, op.A - minLen).Token);
                     gmaxDist = Math.Max(gmaxDist, PackHybridUint(plan.SeDist, op.B + NumSpecialDistances - 1).Token);
@@ -727,7 +750,7 @@ internal static class JxlEncoder
                 int ctx = ctxs[pos];
                 if (!op.Match)
                 {
-                    ctxHist[ctx][op.A]++;
+                    ctxHist[ctx][PackHybridFull(LitSplit, LitMsb, LitLsb, op.A).Token]++;
                     pos += 1;
                 }
                 else
@@ -916,7 +939,9 @@ internal static class JxlEncoder
             int litCluster = plan.ContextToCluster[ctxs[pos]];
             if (!op.Match)
             {
-                plan.Codes[litCluster].WriteSymbol(s, op.A);
+                (int litTok, int nbLit, int bitsLit) = PackHybridFull(LitSplit, LitMsb, LitLsb, op.A);
+                plan.Codes[litCluster].WriteSymbol(s, litTok);
+                s.WriteBits((uint)bitsLit, nbLit);
                 pos += 1;
                 continue;
             }
@@ -951,7 +976,7 @@ internal static class JxlEncoder
         s.WriteBool(true); // use_prefix_code
         for (int c = 0; c < plan.K; c++)
         {
-            WriteUintConfig(s, plan.SeLit, 0, 0, 15); // literal clusters
+            WriteUintConfig(s, LitSplit, LitMsb, LitLsb, 15); // literal clusters (compact hybrid-uint)
         }
 
         WriteUintConfig(s, plan.SeDist, 0, 0, 15); // distance cluster

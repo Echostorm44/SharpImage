@@ -302,8 +302,6 @@ internal static class JxlModular
         return nodeIdx;
     }
 
-    private static int prevGrad;
-
     private static void DecodeChannel(JxlAnsReader reader, List<MaNode> tree, byte[] ctxMap, WpHeader wpHdr, int chan, JxlChannel ch, int groupId = 0)
     {
         int w = ch.W, h = ch.H;
@@ -317,6 +315,7 @@ internal static class JxlModular
         bool singleWp = tree.Count == 1;
         var props = new int[16];
         var wpPropsBuf = new List<long>(1);
+        int prevGrad = 0; // per-decode local (was a static field: not thread-safe under parallel decode)
         for (int y = 0; y < h; y++)
         {
             prevGrad = 0;

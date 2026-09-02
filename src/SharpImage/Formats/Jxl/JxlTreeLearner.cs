@@ -31,7 +31,7 @@ internal static class JxlTreeLearner
     // Properties (decoder indices) the tree may split on, in libjxl's priority order minus the group
     // property (we use one global tree). 0 = channel, 15 = WP error, 9 = gradient, 10..14 = neighbour
     // differences, 2 = y.
-    private static readonly int[] UsedProperties = { 0, 15, 9, 10, 11, 12, 13, 14, 2 };
+    private static readonly int[] UsedProperties = { 0, 15, 9, 10, 11, 12, 13, 14, 2, 4, 5, 6, 7, 8 };
 
     // libjxl's fixed weighted-predictor-error thresholds (the "< 32 values" set).
     private static readonly int[] WpThresholds =
@@ -206,23 +206,37 @@ internal static class JxlTreeLearner
 
         int stride = Math.Max(1, total / (1 << 18));
         var diffs = new List<int>();
+        var pixels = new List<int>();
         int cnt = 0;
         foreach (EncChannelRef ch in channels)
         {
             int w = ch.W, h = ch.H;
             for (int y = 0; y < h; y++)
             {
-                for (int x = 1; x < w; x++)
+                for (int x = 0; x < w; x++)
                 {
                     if (cnt++ % stride == 0)
                     {
-                        diffs.Add(ch.Data[(y * w) + x] - ch.Data[(y * w) + x - 1]);
+                        pixels.Add(ch.Data[(y * w) + x]);
+                        if (x > 0)
+                        {
+                            diffs.Add(ch.Data[(y * w) + x] - ch.Data[(y * w) + x - 1]);
+                        }
                     }
                 }
             }
         }
 
         int[] diffThresholds = QuantizeSamples(diffs, MaxPropertyValues);
+        int[] pixelThresholds = QuantizeSamples(pixels, MaxPropertyValues);
+        var absPixels = new List<int>(pixels.Count);
+        foreach (int v in pixels)
+        {
+            absPixels.Add(Math.Abs(v));
+        }
+
+        int[] absPixelThresholds = QuantizeSamples(absPixels, MaxPropertyValues);
+
         int[][] thr = new int[UsedProperties.Length][];
         for (int i = 0; i < UsedProperties.Length; i++)
         {
@@ -230,8 +244,10 @@ internal static class JxlTreeLearner
             {
                 0 => new[] { 0, 1 },
                 15 => WpThresholds,
-                2 => QuantizeCoordinate(),
-                _ => diffThresholds,
+                2 or 3 => QuantizeCoordinate(),
+                4 or 5 => absPixelThresholds, // |top|, |left|
+                6 or 7 => pixelThresholds,    // top, left
+                _ => diffThresholds,          // gradient + neighbour differences (8..14)
             };
         }
 
