@@ -381,6 +381,40 @@ public class JpegCoderTests
     }
 
     [Test]
+    public async Task ProgressiveJpeg_Yuv420_NonAlignedWidth_DecodesWithoutShear()
+    {
+        // Regression: a progressive 4:2:0 JPEG whose luma width in blocks is NOT a multiple of the
+        // MCU width (264px -> 33 luma blocks, but the MCU grid pads to 34) used to desync the
+        // non-interleaved AC scans (a phantom edge block per row -> diagonal shear + ghosting).
+        // The asset is externally encoded (PIL); the reference is its correct decode.
+        string jpgPath = Path.Combine(TestImagesDir, "progressive_yuv420.jpg");
+        string refPath = Path.Combine(TestImagesDir, "progressive_yuv420_ref.png");
+
+        var decoded = JpegCoder.Read(jpgPath);
+        var reference = FormatRegistry.Read(refPath);
+
+        await Assert.That(decoded.Columns).IsEqualTo(reference.Columns);
+        await Assert.That(decoded.Rows).IsEqualTo(reference.Rows);
+
+        double totalDiff = 0;
+        long pixelCount = 0;
+        for (int y = 0; y < reference.Rows; y++)
+        {
+            var refRow = reference.GetPixelRow(y);
+            var decRow = decoded.GetPixelRow(y);
+            for (int x = 0; x < reference.Columns * reference.NumberOfChannels; x++)
+            {
+                totalDiff += Math.Abs((double)refRow[x] - decRow[x]) / Quantum.MaxValue;
+                pixelCount++;
+            }
+        }
+        double meanDiff = totalDiff / pixelCount;
+        // A correct decode differs from the reference only by chroma-upsampling method (~0.03 on this
+        // hard-edged 4:2:0 image); the old sheared decode was far off (mean diff well over 0.2).
+        await Assert.That(meanDiff).IsLessThan(0.10);
+    }
+
+    [Test]
     public async Task ProgressiveJpeg_ConvertToPng_RoundTrip()
     {
         string srcPath = Path.Combine(TestImagesDir, "landscape_progressive.jpg");

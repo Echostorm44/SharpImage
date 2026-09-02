@@ -165,7 +165,7 @@ public static class JpegCoder
                     var scanInfo = ReadSosHeaderProgressive(stream, components, componentCount);
                     DecodeProgressiveScan(stream, componentCount, components,
                         dcTables, acTables, mcuCols, mcuRows,
-                        maxHSample, maxVSample, restartInterval, scanInfo);
+                        maxHSample, maxVSample, restartInterval, scanInfo, width, height);
                     break;
 
                 default:
@@ -393,7 +393,7 @@ public static class JpegCoder
     private static void DecodeProgressiveScan(Stream stream, int componentCount,
         JpegComponent[] components, HuffmanTable[] dcTables, HuffmanTable[] acTables,
         int mcuCols, int mcuRows, int maxHSample, int maxVSample,
-        int restartInterval, ScanInfo scan)
+        int restartInterval, ScanInfo scan, int width, int height)
     {
         var bitReader = new JpegBitReader(stream);
         int[] dcPredictors = new int[componentCount];
@@ -455,12 +455,19 @@ public static class JpegCoder
         }
         else
         {
-            // AC scan (Ss>0): always single-component
+            // AC scan (Ss>0): always single-component (non-interleaved). A non-interleaved scan
+            // iterates the component's OWN block grid — ceil(x_i/8) × ceil(y_i/8) — NOT the
+            // MCU-padded grid. (Interleaved scans pad to MCU and code dummy edge blocks; a
+            // non-interleaved scan does not, so using the padded width reads phantom blocks that
+            // aren't in the bitstream and desyncs everything after the first line.)
             int c = scan.ComponentIndices[0];
-            int blocksH = components[c].HSample;
-            int blocksV = components[c].VSample;
-            int totalBlocksH = mcuCols * blocksH;
-            int totalBlocksV = mcuRows * blocksV;
+            // Storage grid stride (blocks were allocated MCU-padded: mcuCols*HSample wide).
+            int strideH = mcuCols * components[c].HSample;
+            // Component sample dims x_i = ceil(width*Hi/Hmax), y_i = ceil(height*Vi/Vmax), then /8.
+            int compSamplesW = (width * components[c].HSample + maxHSample - 1) / maxHSample;
+            int compSamplesH = (height * components[c].VSample + maxVSample - 1) / maxVSample;
+            int totalBlocksH = (compSamplesW + BlockSize - 1) / BlockSize;
+            int totalBlocksV = (compSamplesH + BlockSize - 1) / BlockSize;
 
             for (int blockRow = 0; blockRow < totalBlocksV; blockRow++)
             {
@@ -472,7 +479,7 @@ public static class JpegCoder
                         eobRun = 0;
                     }
 
-                    int blockIndex = blockRow * totalBlocksH + blockCol;
+                    int blockIndex = blockRow * strideH + blockCol;
                     var block = components[c].Blocks[blockIndex];
 
                     if (isFirstScan)
