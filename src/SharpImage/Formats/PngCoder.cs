@@ -303,15 +303,9 @@ public static class PngCoder
             throw new InvalidDataException("PNG missing IHDR chunk.");
         }
 
-        if (interlaceMethod != 0)
-        {
-            throw new NotSupportedException("Adam7 interlaced PNGs are not yet supported.");
-        }
-
         // Decompress all IDAT data
         idatStream.Position = 0;
         using var zlibStream = new ZLibStream(idatStream, CompressionMode.Decompress);
-        byte[] decompressed = ReadAllBytes(zlibStream, width, height, bitDepth, colorType);
 
         // Create the image frame
         bool hasAlpha = colorType == ColorTypeGrayscaleAlpha || colorType == ColorTypeRgba ||
@@ -320,8 +314,22 @@ public static class PngCoder
         var image = new ImageFrame();
         image.Initialize(width, height, ColorspaceType.SRGB, hasAlpha);
 
-        // Decode filtered scanlines into pixels
-        DecodePixelData(image, decompressed, width, height, bitDepth, colorType, palette, transparencyData);
+        // Decode filtered scanlines into pixels — Adam7 (7-pass) or the normal single pass.
+        if (interlaceMethod == 1)
+        {
+            int bitsPerPixel = GetChannelCount(colorType) * bitDepth;
+            byte[] decompressed = ReadExact(zlibStream, Adam7TotalBytes(width, height, bitsPerPixel));
+            DecodeAdam7(image, decompressed, width, height, bitDepth, colorType, palette, transparencyData);
+        }
+        else if (interlaceMethod == 0)
+        {
+            byte[] decompressed = ReadAllBytes(zlibStream, width, height, bitDepth, colorType);
+            DecodePixelData(image, decompressed, width, height, bitDepth, colorType, palette, transparencyData);
+        }
+        else
+        {
+            throw new NotSupportedException($"Unknown PNG interlace method {interlaceMethod} (expected 0 or 1).");
+        }
 
         // Attach collected metadata
         if (iccProfileData is not null)
@@ -834,24 +842,27 @@ public static class PngCoder
         // Raw bytes per row (without filter byte): ceil(width * bitsPerPixel / 8)
         int rawBytesPerRow = (width * bitsPerPixel + 7) / 8;
         int totalBytes = height * (1 + rawBytesPerRow); // +1 for filter byte per row
+        return ReadExact(zlibStream, totalBytes);
+    }
 
-        byte[] buffer = new byte[totalBytes];
+    private static byte[] ReadExact(Stream stream, int count)
+    {
+        byte[] buffer = new byte[count];
         int offset = 0;
-        while (offset < totalBytes)
+        while (offset < count)
         {
-            int read = zlibStream.Read(buffer, offset, totalBytes - offset);
+            int read = stream.Read(buffer, offset, count - offset);
             if (read == 0)
             {
                 break;
             }
-
             offset += read;
         }
         return buffer;
     }
 
     private static void DecodePixelData(ImageFrame image, byte[] data, int width, int height,
-        byte bitDepth, byte colorType, byte[]? palette, byte[]? transparencyData)
+        byte bitDepth, byte colorType, byte[]? palette, byte[]? transparencyData, int dataOffset = 0)
     {
         int channels = GetChannelCount(colorType);
         int bitsPerPixel = channels * bitDepth;
@@ -868,7 +879,7 @@ public static class PngCoder
 
             for (int y = 0;y < height;y++)
             {
-                int rowOffset = y * stride;
+                int rowOffset = dataOffset + y * stride;
                 byte filterType = data[rowOffset];
 
                 // Copy raw row data
@@ -892,6 +903,79 @@ public static class PngCoder
         {
             ArrayPool<byte>.Shared.Return(currentRow);
             ArrayPool<byte>.Shared.Return(previousRow);
+        }
+    }
+
+    // Adam7 interlacing: 7 passes, each a reduced sub-image sampled on a fixed lattice.
+    private static readonly int[] Adam7XStart = [0, 4, 0, 2, 0, 1, 0];
+    private static readonly int[] Adam7YStart = [0, 0, 4, 0, 2, 0, 1];
+    private static readonly int[] Adam7XStep = [8, 8, 4, 4, 2, 2, 1];
+    private static readonly int[] Adam7YStep = [8, 8, 8, 4, 4, 2, 2];
+
+    /// <summary>Total decompressed bytes an Adam7 image occupies (sum of each non-empty pass's filtered rows).</summary>
+    private static int Adam7TotalBytes(int width, int height, int bitsPerPixel)
+    {
+        int total = 0;
+        for (int p = 0; p < 7; p++)
+        {
+            int passW = width > Adam7XStart[p] ? (width - Adam7XStart[p] + Adam7XStep[p] - 1) / Adam7XStep[p] : 0;
+            int passH = height > Adam7YStart[p] ? (height - Adam7YStart[p] + Adam7YStep[p] - 1) / Adam7YStep[p] : 0;
+            if (passW > 0 && passH > 0)
+            {
+                total += passH * (1 + (passW * bitsPerPixel + 7) / 8);
+            }
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// Decodes an Adam7-interlaced image: each of the 7 passes is a self-contained reduced image
+    /// (its own scanlines + filtering), decoded via <see cref="DecodePixelData"/> into a temporary
+    /// sub-image, then scattered into the full image on the pass's lattice.
+    /// </summary>
+    private static void DecodeAdam7(ImageFrame image, byte[] data, int width, int height,
+        byte bitDepth, byte colorType, byte[]? palette, byte[]? transparencyData)
+    {
+        int channels = GetChannelCount(colorType);
+        int bitsPerPixel = channels * bitDepth;
+        bool hasAlpha = image.HasAlpha;
+        int outChannels = image.NumberOfChannels;
+        int dataOffset = 0;
+
+        for (int p = 0; p < 7; p++)
+        {
+            int xStart = Adam7XStart[p], yStart = Adam7YStart[p];
+            int xStep = Adam7XStep[p], yStep = Adam7YStep[p];
+            int passW = width > xStart ? (width - xStart + xStep - 1) / xStep : 0;
+            int passH = height > yStart ? (height - yStart + yStep - 1) / yStep : 0;
+            if (passW <= 0 || passH <= 0)
+            {
+                continue;
+            }
+
+            // Decode this pass as a normal little image starting at dataOffset.
+            var pass = new ImageFrame();
+            pass.Initialize((uint)passW, (uint)passH, ColorspaceType.SRGB, hasAlpha);
+            DecodePixelData(pass, data, passW, passH, bitDepth, colorType, palette, transparencyData, dataOffset);
+
+            // Scatter the pass pixels onto the interlace lattice of the full image.
+            for (int py = 0; py < passH; py++)
+            {
+                ReadOnlySpan<ushort> src = pass.GetPixelRow(py);
+                Span<ushort> dest = image.GetPixelRowForWrite(yStart + py * yStep);
+                for (int px = 0; px < passW; px++)
+                {
+                    int destX = (xStart + px * xStep) * outChannels;
+                    int srcX = px * outChannels;
+                    for (int c = 0; c < outChannels; c++)
+                    {
+                        dest[destX + c] = src[srcX + c];
+                    }
+                }
+            }
+            pass.Dispose();
+
+            dataOffset += passH * (1 + (passW * bitsPerPixel + 7) / 8);
         }
     }
 

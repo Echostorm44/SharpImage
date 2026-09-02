@@ -17,6 +17,44 @@ public class PngCoderTests
     private static string TempPath(string name) =>
         Path.Combine(Path.GetTempPath(), $"sharpimage_test_{name}");
 
+    // ─── Adam7 interlacing ───────────────────────────────────────
+
+    [Test]
+    public async Task Png_Read_Adam7Interlaced_DecodesExactly()
+    {
+        // Adam7 interlacing (the PNG analogue of progressive JPEG): the image is stored as 7 passes,
+        // each a self-contained reduced sub-image (own scanlines + filtering) scattered onto a lattice.
+        // Asset is a real interlace-method-1 PNG; the reference is its correct (PIL) decode.
+        string png = Path.Combine(TestImagesDir, "interlaced_adam7.png");
+        string refPng = Path.Combine(TestImagesDir, "interlaced_adam7_ref.png");
+
+        var decoded = PngCoder.Read(png);
+        var reference = PngCoder.Read(refPng);
+        try
+        {
+            await Assert.That(decoded.Columns).IsEqualTo(reference.Columns);
+            await Assert.That(decoded.Rows).IsEqualTo(reference.Rows);
+
+            // PNG is lossless — a correct Adam7 decode is pixel-exact with the reference.
+            long diff = 0;
+            for (int y = 0; y < reference.Rows; y++)
+            {
+                var refRow = reference.GetPixelRow(y);
+                var decRow = decoded.GetPixelRow(y);
+                for (int x = 0; x < reference.Columns * reference.NumberOfChannels; x++)
+                {
+                    diff += Math.Abs(refRow[x] - decRow[x]);
+                }
+            }
+            await Assert.That(diff).IsEqualTo(0L);
+        }
+        finally
+        {
+            decoded.Dispose();
+            reference.Dispose();
+        }
+    }
+
     // ─── CRC32 Tests ─────────────────────────────────────────────
 
     [Test]
