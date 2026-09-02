@@ -1165,6 +1165,18 @@ public class ExtendedFormatTests
     }
 
     [Test]
+    public async Task Jxl_Encode_FewColors_UsesPalette_RoundTrip_Lossless()
+    {
+        // A low-colour image exercises the Palette transform path; decode must be pixel-exact.
+        using var frame = CreateCheckerboardFrame(96, 72, 8);
+        byte[] jxl = JxlCoder.Encode(frame);
+        using var decoded = JxlCoder.Decode(jxl);
+        await Assert.That((int)decoded.Columns).IsEqualTo(96);
+        await Assert.That((int)decoded.Rows).IsEqualTo(72);
+        await AssertLossless(frame, decoded);
+    }
+
+    [Test]
     public async Task Jxl_Encode_MultiGroup_RoundTrip_Lossless()
     {
         // 1300x1100 exceeds a single 1024 group, exercising the tiled multi-group path.

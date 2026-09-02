@@ -32,15 +32,9 @@ internal static class JxlEncoder
             throw new InvalidOperationException("Cannot encode an empty image.");
         }
 
-        // Extract three 8-bit channels (grayscale is expanded to RGB), then decorrelate colour with the
-        // reversible YCoCg transform (RCT type 6) so the residuals are far more compressible.
+        // Extract raw 8-bit RGB (grayscale expanded to RGB).
         int nb = 3;
-        int[][] chan = new int[nb][];
-        for (int c = 0; c < nb; c++)
-        {
-            chan[c] = new int[w * h];
-        }
-
+        int[] r = new int[w * h], g = new int[w * h], b = new int[w * h];
         int srcCh = image.NumberOfChannels;
         for (int y = 0; y < h; y++)
         {
@@ -48,39 +42,63 @@ internal static class JxlEncoder
             for (int x = 0; x < w; x++)
             {
                 int off = x * srcCh;
-                int r, g, b;
+                int p = (y * w) + x;
                 if (srcCh == 1)
                 {
-                    r = g = b = Quantum.ScaleToByte(row[off]);
+                    r[p] = g[p] = b[p] = Quantum.ScaleToByte(row[off]);
                 }
                 else
                 {
-                    r = Quantum.ScaleToByte(row[off]);
-                    g = Quantum.ScaleToByte(row[off + 1]);
-                    b = Quantum.ScaleToByte(row[off + 2]);
+                    r[p] = Quantum.ScaleToByte(row[off]);
+                    g[p] = Quantum.ScaleToByte(row[off + 1]);
+                    b[p] = Quantum.ScaleToByte(row[off + 2]);
                 }
-
-                // Forward YCoCg (inverse of JxlModular.InvRct custom==6).
-                int co = r - b;
-                int tmp = b + (co >> 1);
-                int cg = g - tmp;
-                int yy = tmp + (cg >> 1);
-                int p = (y * w) + x;
-                chan[0][p] = yy;
-                chan[1][p] = co;
-                chan[2][p] = cg;
             }
+        }
+
+        // YCoCg (RCT type 6): decorrelates colour so residuals compress better.
+        int[][] chan = { new int[w * h], new int[w * h], new int[w * h] };
+        for (int p = 0; p < w * h; p++)
+        {
+            int co = r[p] - b[p];
+            int tmp = b[p] + (co >> 1);
+            int cg = g[p] - tmp;
+            chan[0][p] = tmp + (cg >> 1);
+            chan[1][p] = co;
+            chan[2][p] = cg;
         }
 
         // A single group can cover an image up to GroupDim on both sides; larger images are tiled.
         bool single = w <= GroupDim && h <= GroupDim;
-        int shift = single ? SmallestShift(Math.Max(w, h)) : GroupSizeShift;
-        int groupDim = 128 << shift;
+        if (!single)
+        {
+            return AssembleCodestream(w, h, GroupSizeShift, BuildMultiGroupSections(chan, w, h, nb, 128 << GroupSizeShift));
+        }
 
-        byte[][] sections = single
-            ? new[] { BuildModularSection(chan, w, h, nb) }
-            : BuildMultiGroupSections(chan, w, h, nb, groupDim);
+        int shift = SmallestShift(Math.Max(w, h));
 
+        // Candidate A: YCoCg RCT. Candidate B (when the image has few colours): the Palette transform,
+        // which usually wins big on flat/synthetic content. Keep whichever section is smaller.
+        var rctChannels = new List<EncChannel> { new(chan[0], w, h), new(chan[1], w, h), new(chan[2], w, h) };
+        byte[] best = BuildSingleGroupSection(rctChannels, WriteRctTransform);
+
+        if (TryBuildPalette(r, g, b, w, h, out List<EncChannel> palChannels, out int nbColors))
+        {
+            byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors));
+            if (palSec.Length < best.Length)
+            {
+                best = palSec;
+            }
+        }
+
+        return AssembleCodestream(w, h, shift, new[] { best });
+    }
+
+    /// <summary>A modular channel to encode: pixel data with its own dimensions.</summary>
+    private readonly record struct EncChannel(int[] Data, int W, int H);
+
+    private static byte[] AssembleCodestream(int w, int h, int shift, byte[][] sections)
+    {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
         main.WriteBits(0x0A, 8);
@@ -166,11 +184,26 @@ internal static class JxlEncoder
     }
 
     // --- Single-group frame: one section holding the tree, the pixel histogram and every pixel token
-    // (DecodeGlobalModular). The three channels are decoded through one entropy reader, so LZ77 spans
-    // them: the token stream is the channels concatenated in raster order. ---
-    private static byte[] BuildModularSection(int[][] chan, int w, int h, int nb)
+    // (DecodeGlobalModular). All channels are decoded through one entropy reader, so LZ77 spans them:
+    // the token stream is the channels' residuals concatenated in decode order. ---
+    private static byte[] BuildSingleGroupSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms)
     {
-        int[] stream = ConcatChannelResiduals(chan, w, h, nb, out _);
+        int total = 0;
+        foreach (EncChannel ch in channels)
+        {
+            total += ch.W * ch.H;
+        }
+
+        int[] stream = new int[total];
+        int off = 0;
+        int maxTok = 0;
+        foreach (EncChannel ch in channels)
+        {
+            int[] t = ComputeResidualTokens(ch.Data, ch.W, ch.H, ref maxTok);
+            Array.Copy(t, 0, stream, off, t.Length);
+            off += t.Length;
+        }
+
         var plan = PlanPixels(new List<int[]> { stream }, out List<Op>[] ops);
 
         var s = new JxlBitWriter();
@@ -178,10 +211,104 @@ internal static class JxlEncoder
         s.WriteBits(1, 1); // has_tree = 1
         WriteSingleLeafTree(s);
         WriteLz77Histogram(s, plan);
-        WriteGlobalGroupHeader(s);
+        s.WriteBool(true); // use_global tree + code
+        s.WriteBits(1, 1); // weighted-predictor header: all default
+        writeTransforms(s);
         EmitOps(s, ops[0], plan);
         return s.ToArray();
     }
+
+    private static void WriteRctTransform(JxlBitWriter s)
+    {
+        s.WriteU32(1, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 1
+        s.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.Val(3)); // transform id = 0 (RCT)
+        s.WriteU32(0, E.BitsOff(3, 0), E.BitsOff(6, 8), E.BitsOff(10, 72), E.BitsOff(13, 1096)); // begin_c = 0
+        s.WriteU32(6, E.Val(6), E.BitsOff(2, 0), E.BitsOff(4, 2), E.BitsOff(6, 10)); // rct_type = 6 (YCoCg)
+    }
+
+    // Palette transform: replaces the three colour channels (begin 0, num 3) with a palette meta-channel
+    // plus a single index channel. Inverted by JxlModular.InvPalette.
+    private static void WritePaletteTransform(JxlBitWriter s, int nbColors)
+    {
+        s.WriteU32(1, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 1
+        s.WriteU32(1, E.Val(0), E.Val(1), E.Val(2), E.Val(3)); // transform id = 1 (Palette)
+        s.WriteU32(0, E.BitsOff(3, 0), E.BitsOff(6, 8), E.BitsOff(10, 72), E.BitsOff(13, 1096)); // begin_c = 0
+        s.WriteU32(3, E.Val(1), E.Val(3), E.Val(4), E.BitsOff(13, 1)); // num_c = 3
+        s.WriteU32((uint)nbColors, E.BitsOff(8, 0), E.BitsOff(10, 256), E.BitsOff(12, 1280), E.BitsOff(16, 5376)); // nb_colors
+        s.WriteU32(0, E.Val(0), E.BitsOff(8, 1), E.BitsOff(10, 257), E.BitsOff(16, 1281)); // nb_deltas = 0
+        s.WriteBits(0, 4); // predictor = 0 (palette entries stored directly, not delta-coded)
+    }
+
+    // Detects images with few enough distinct colours to palette-encode. Returns the palette meta-channel
+    // (3 rows of colour components x nbColors) followed by the index channel (w x h), matching the layout
+    // JxlModular.InvPalette reconstructs. Palette entries are ordered by luma so index gradients track
+    // colour gradients (better prediction). Returns false when there are too many colours.
+    private const int MaxPaletteColors = 4096;
+
+    private static bool TryBuildPalette(int[] r, int[] g, int[] b, int w, int h, out List<EncChannel> channels, out int nbColors)
+    {
+        channels = null!;
+        nbColors = 0;
+        int n = w * h;
+        var indexByColor = new Dictionary<int, int>();
+        foreach (int key in Keys(r, g, b, n))
+        {
+            if (!indexByColor.ContainsKey(key))
+            {
+                indexByColor[key] = 0;
+                if (indexByColor.Count > MaxPaletteColors)
+                {
+                    return false;
+                }
+            }
+        }
+
+        nbColors = indexByColor.Count;
+        int[] colors = new int[nbColors];
+        int i = 0;
+        foreach (int key in indexByColor.Keys)
+        {
+            colors[i++] = key;
+        }
+
+        // Order by luma so spatially-smooth colour maps to smooth indices.
+        Array.Sort(colors, (a, c) => Luma(a).CompareTo(Luma(c)));
+        for (int k = 0; k < nbColors; k++)
+        {
+            indexByColor[colors[k]] = k;
+        }
+
+        int[] palette = new int[3 * nbColors];
+        for (int k = 0; k < nbColors; k++)
+        {
+            palette[k] = (colors[k] >> 16) & 0xFF;              // R row
+            palette[nbColors + k] = (colors[k] >> 8) & 0xFF;    // G row
+            palette[(2 * nbColors) + k] = colors[k] & 0xFF;     // B row
+        }
+
+        int[] index = new int[n];
+        for (int p = 0; p < n; p++)
+        {
+            index[p] = indexByColor[(r[p] << 16) | (g[p] << 8) | b[p]];
+        }
+
+        channels = new List<EncChannel>
+        {
+            new(palette, nbColors, 3), // palette meta-channel decoded first
+            new(index, w, h),          // then the index channel
+        };
+        return true;
+    }
+
+    private static IEnumerable<int> Keys(int[] r, int[] g, int[] b, int n)
+    {
+        for (int p = 0; p < n; p++)
+        {
+            yield return (r[p] << 16) | (g[p] << 8) | b[p];
+        }
+    }
+
+    private static int Luma(int rgb) => (((rgb >> 16) & 0xFF) * 2) + (((rgb >> 8) & 0xFF) * 5) + (rgb & 0xFF);
 
     // --- Multi-group frame: LfGlobal (tree + pixel histogram + global RCT), empty LfGroup/HfGlobal
     // sections, then one Modular-AC section per spatial group. All groups share the global pixel code;
@@ -240,19 +367,6 @@ internal static class JxlEncoder
         }
 
         return list.ToArray();
-    }
-
-    private static int[] ConcatChannelResiduals(int[][] chan, int w, int h, int nb, out int maxToken)
-    {
-        maxToken = 0;
-        int[] stream = new int[w * h * nb];
-        for (int c = 0; c < nb; c++)
-        {
-            int[] tc = ComputeResidualTokens(chan[c], w, h, ref maxToken);
-            Array.Copy(tc, 0, stream, c * w * h, tc.Length);
-        }
-
-        return stream;
     }
 
     // Single-leaf global MA tree: property token 0 (=> leaf), then predictor / offset / mult-log /
