@@ -1,8 +1,10 @@
 // JPEG XL (lossless Modular) encoder: the inverse of the decoder in this directory. It emits a bare
-// codestream (0xFF 0x0A) with an 8-bit sRGB ImageMetadata, a single Modular frame using a one-leaf
-// MA tree with the clamped-gradient predictor (predictor 5), and prefix (Huffman) entropy coding
-// with the hybrid-uint config (15,0,0) so every packed residual is a literal token. Verified by
-// decoding the output with the reference decoders (libjxl / jxl-oxide) — not just round-tripping.
+// codestream (0xFF 0x0A) with an 8-bit sRGB ImageMetadata and a Modular frame that applies the
+// reversible YCoCg RCT, predicts with the self-correcting weighted predictor (run through the
+// decoder's own WpState so residuals match bit-for-bit), and entropy-codes the residuals with prefix
+// (Huffman) codes plus LZ77 back-references (to collapse flat/repeating regions). Large images are
+// tiled into groups. Verified by decoding the output with the reference decoders (libjxl / jxl-oxide),
+// not just round-tripping.
 using System;
 using System.Collections.Generic;
 using SharpImage.Core;
