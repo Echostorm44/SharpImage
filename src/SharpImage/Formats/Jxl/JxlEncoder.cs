@@ -189,12 +189,13 @@ internal static class JxlEncoder
     // smaller — so context modelling is only used when it actually helps. ---
     private static byte[] BuildSingleGroupSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms)
     {
-        byte[] modelled = BuildSection(channels, writeTransforms, ErrorContextTree);
+        var learned = new LearnedTree(JxlTreeLearner.Learn(ToRefs(channels)));
+        byte[] modelled = BuildSection(channels, writeTransforms, learned);
         byte[] plain = BuildSection(channels, writeTransforms, SingleLeafTree);
         return modelled.Length <= plain.Length ? modelled : plain;
     }
 
-    private static byte[] BuildSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, ContextTree tree)
+    private static byte[] BuildSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, LearnedTree tree)
     {
         int total = 0;
         foreach (EncChannel ch in channels)
@@ -206,9 +207,10 @@ internal static class JxlEncoder
         int[] ctxs = new int[total];
         int off = 0;
         int maxTok = 0;
-        foreach (EncChannel ch in channels)
+        for (int c = 0; c < channels.Count; c++)
         {
-            ComputeResidualTokensCtx(ch, tree, stream, ctxs, off, ref maxTok);
+            EncChannel ch = channels[c];
+            ComputeResidualTokensCtx(ch, c, tree, stream, ctxs, off, ref maxTok);
             off += ch.W * ch.H;
         }
 
@@ -324,7 +326,22 @@ internal static class JxlEncoder
     // with an error-context tree and with a single-leaf tree, keeping whichever total is smaller. ---
     private static byte[][] BuildMultiGroupSections(int[][] chan, int w, int h, int nb, int groupDim)
     {
-        byte[][] modelled = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, ErrorContextTree);
+        // Learn the tree from the actual tiles (per-tile prediction) so it matches the per-group encode.
+        var tileRefs = new List<EncChannelRef>();
+        int gprL = CeilDiv(w, groupDim);
+        int numG = gprL * CeilDiv(h, groupDim);
+        for (int g = 0; g < numG; g++)
+        {
+            int rx = (g % gprL) * groupDim, ry = (g / gprL) * groupDim;
+            int rw = Math.Min(groupDim, w - rx), rh = Math.Min(groupDim, h - ry);
+            for (int c = 0; c < nb; c++)
+            {
+                tileRefs.Add(new EncChannelRef(ExtractTile(chan[c], w, rx, ry, rw, rh), rw, rh, c, 0));
+            }
+        }
+
+        var learned = new LearnedTree(JxlTreeLearner.Learn(tileRefs));
+        byte[][] modelled = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, learned);
         byte[][] plain = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree);
         return TotalLength(modelled) <= TotalLength(plain) ? modelled : plain;
     }
@@ -340,7 +357,7 @@ internal static class JxlEncoder
         return t;
     }
 
-    private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, ContextTree tree)
+    private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, LearnedTree tree)
     {
         int gpr = CeilDiv(w, groupDim);
         int numGroups = gpr * CeilDiv(h, groupDim);
@@ -364,7 +381,7 @@ internal static class JxlEncoder
             for (int c = 0; c < nb; c++)
             {
                 int[] tile = ExtractTile(chan[c], w, rx, ry, rw, rh);
-                ComputeResidualTokensCtx(new EncChannel(tile, rw, rh), tree, stream, ctxs, off, ref maxTok);
+                ComputeResidualTokensCtx(new EncChannel(tile, rw, rh), c, tree, stream, ctxs, off, ref maxTok);
                 off += rw * rh;
             }
 
@@ -543,131 +560,71 @@ internal static class JxlEncoder
     // decoder property 15 — the neighbour with the largest recent WP error). High-error (busy) pixels
     // and low-error (flat) pixels get separate entropy statistics. The tree is emitted so the decoder
     // computes the identical context; the encoder walks the same tree on the same property value.
-    private const int WpErrorProperty = 15;
-    private const int MaxLiteralClusters = 7; // keep histogram count (and header overhead) bounded
+    private const int MaxLiteralClusters = 64; // upper bound on distinct histograms (libjxl-style)
 
-    private sealed class ContextTree
+    // Wraps a learned MA tree (JxlTreeLearner): serialises it in the decoder's breadth-first order,
+    // numbering leaves as contexts, and walks it per pixel to pick the leaf (context + predictor).
+    private sealed class LearnedTree
     {
-        public int[] Tokens;               // tree stream tokens (breadth-first), fed to the tree histogram
-        public int LeafCount;              // number of contexts (leaves)
-        private readonly int[]? splitVals; // ascending split thresholds (null for a single-leaf tree)
-        private readonly int[]? leafOfBucket;
+        public readonly MaTreeNode Root;
+        public readonly int[] Tokens;
+        public readonly int LeafCount;
 
-        public ContextTree(int[] tokens, int leafCount, int[]? splitVals, int[]? leafOfBucket)
+        public LearnedTree(MaTreeNode root)
         {
-            Tokens = tokens;
-            LeafCount = leafCount;
-            this.splitVals = splitVals;
-            this.leafOfBucket = leafOfBucket;
-        }
-
-        // Context for a property value: the bucket between ascending thresholds, mapped to the tree's
-        // breadth-first leaf index (so it matches the decoder's DecodeTree/TreeLeaf ordering).
-        public int Context(int value)
-        {
-            if (splitVals is null)
+            Root = root;
+            var tokens = new List<int>();
+            var queue = new Queue<MaTreeNode>();
+            queue.Enqueue(root);
+            int leaf = 0;
+            while (queue.Count > 0)
             {
-                return 0;
+                MaTreeNode node = queue.Dequeue();
+                if (node.Property == -1)
+                {
+                    node.Ctx = leaf++;
+                    tokens.Add(0);                 // property 0 => leaf
+                    tokens.Add(node.Predictor);    // predictor
+                    tokens.Add(0);                 // offset (PackSigned 0)
+                    tokens.Add(0);                 // mult-log
+                    tokens.Add(0);                 // mult-bits
+                }
+                else
+                {
+                    tokens.Add(node.Property + 1);          // property token
+                    tokens.Add(PackSigned(node.SplitVal));  // split value
+                    queue.Enqueue(node.Left!);              // property > SplitVal
+                    queue.Enqueue(node.Right!);             // property <= SplitVal
+                }
             }
 
-            int bucket = 0;
-            while (bucket < splitVals.Length && value > splitVals[bucket])
+            Tokens = tokens.ToArray();
+            LeafCount = leaf;
+        }
+
+        public MaTreeNode Walk(int[] props)
+        {
+            MaTreeNode node = Root;
+            while (node.Property != -1)
             {
-                bucket++;
+                node = props[node.Property] > node.SplitVal ? node.Left! : node.Right!;
             }
 
-            return leafOfBucket![bucket];
+            return node;
         }
     }
 
-    private static readonly ContextTree SingleLeafTree = BuildSingleLeafTree();
-    private static readonly ContextTree ErrorContextTree = BuildErrorContextTree(
-        new[] { -64, -32, -16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16, 32, 64 }); // 16 error buckets, clustered at encode time
+    private static readonly LearnedTree SingleLeafTree = new(new MaTreeNode { Property = -1, Predictor = WeightedPredictor });
 
-    private static ContextTree BuildSingleLeafTree()
+    private static List<EncChannelRef> ToRefs(List<EncChannel> channels)
     {
-        // property 0 => leaf, then predictor / offset / mult-log / mult-bits.
-        int[] tokens = { 0, WeightedPredictor, 0, 0, 0 };
-        return new ContextTree(tokens, 1, null, null);
-    }
-
-    // Balanced BST over the ascending thresholds, splitting on the WP-error property. Emitted in the
-    // breadth-first order DecodeTree consumes; leaves are numbered in that same order.
-    private static ContextTree BuildErrorContextTree(int[] thresholds)
-    {
-        // Build the node tree (object form) then serialise breadth-first.
-        TNode root = BuildBst(thresholds, 0, thresholds.Length - 1);
-        var tokens = new List<int>();
-        var queue = new Queue<TNode>();
-        queue.Enqueue(root);
-        int leafCounter = 0;
-        while (queue.Count > 0)
+        var refs = new List<EncChannelRef>(channels.Count);
+        for (int c = 0; c < channels.Count; c++)
         {
-            TNode node = queue.Dequeue();
-            if (node.IsLeaf)
-            {
-                node.Ctx = leafCounter++;
-                tokens.Add(0);                 // property 0 => leaf
-                tokens.Add(WeightedPredictor); // predictor
-                tokens.Add(0);                 // offset (PackSigned 0)
-                tokens.Add(0);                 // mult-log
-                tokens.Add(0);                 // mult-bits
-            }
-            else
-            {
-                tokens.Add(WpErrorProperty + 1);      // property token
-                tokens.Add(PackSigned(node.SplitVal)); // split value
-                queue.Enqueue(node.Left!);
-                queue.Enqueue(node.Right!);
-            }
+            refs.Add(new EncChannelRef(channels[c].Data, channels[c].W, channels[c].H, c, 0));
         }
 
-        // Bucket b holds values in (thresholds[b-1], thresholds[b]] (and (thresholds[last], +inf) for the
-        // top bucket). Map each to the leaf the decoder's TreeLeaf reaches for a representative value.
-        int[] leafOfBucket = new int[thresholds.Length + 1];
-        for (int bkt = 0; bkt < leafOfBucket.Length; bkt++)
-        {
-            int rep = bkt < thresholds.Length ? thresholds[bkt] : thresholds[^1] + 1;
-            leafOfBucket[bkt] = WalkNode(root, rep);
-        }
-
-        return new ContextTree(tokens.ToArray(), leafCounter, thresholds, leafOfBucket);
-    }
-
-    private sealed class TNode
-    {
-        public bool IsLeaf;
-        public int SplitVal;
-        public int Ctx;
-        public TNode? Left;   // values > SplitVal
-        public TNode? Right;  // values <= SplitVal
-    }
-
-    private static TNode BuildBst(int[] t, int lo, int hi)
-    {
-        if (lo > hi)
-        {
-            return new TNode { IsLeaf = true };
-        }
-
-        int mid = (lo + hi) / 2;
-        return new TNode
-        {
-            IsLeaf = false,
-            SplitVal = t[mid],
-            Left = BuildBst(t, mid + 1, hi),
-            Right = BuildBst(t, lo, mid - 1),
-        };
-    }
-
-    private static int WalkNode(TNode node, int value)
-    {
-        while (!node.IsLeaf)
-        {
-            node = value > node.SplitVal ? node.Left! : node.Right!;
-        }
-
-        return node.Ctx;
+        return refs;
     }
 
     private static int PackSigned(int v) => (int)(uint)((v << 1) ^ (v >> 31));
@@ -805,68 +762,113 @@ internal static class JxlEncoder
         return plan;
     }
 
-    // Greedy agglomerative clustering of context histograms: repeatedly merge the two clusters whose
-    // union adds the fewest bits, until at most maxClusters remain. Empty contexts fold in for free.
-    private static int[] ClusterContexts(long[][] ctxHist, int alphabet, int maxClusters, out long[][] clusterHist, out int k)
+    // Seed-based histogram clustering ported from libjxl (enc_cluster.cc FastClusterHistograms): seed
+    // the largest histogram, then repeatedly seed the histogram farthest (by merge cost) from all
+    // current seeds, until none is more than kMinDistanceForDistinct bits distinct or the cap is hit;
+    // finally assign every context to its nearest seed. Picks the natural number of histograms.
+    private const double MinDistanceForDistinct = 48.0;
+
+    private static int[] ClusterContexts(long[][] ctxHist, int alphabet, int maxHistograms, out long[][] clusterHist, out int k)
     {
         int n = ctxHist.Length;
-        var members = new List<List<int>>();
-        var hist = new List<long[]>();
-        for (int c = 0; c < n; c++)
+        double[] entropy = new double[n];
+        long[] total = new long[n];
+        double[] dist = new double[n];
+        int[] symbol = new int[n];
+        int largest = 0;
+        for (int i = 0; i < n; i++)
         {
-            members.Add(new List<int> { c });
-            hist.Add((long[])ctxHist[c].Clone());
+            symbol[i] = -1;
+            dist[i] = double.MaxValue;
+            foreach (long v in ctxHist[i])
+            {
+                total[i] += v;
+            }
+
+            if (total[i] == 0)
+            {
+                symbol[i] = 0; // empty contexts fold into cluster 0
+                dist[i] = 0;
+                continue;
+            }
+
+            entropy[i] = Bits(ctxHist[i]);
+            if (total[i] > total[largest])
+            {
+                largest = i;
+            }
         }
 
-        while (hist.Count > 1)
+        var seeds = new List<long[]>();
+        while (seeds.Count < maxHistograms)
         {
-            double bestCost = double.MaxValue;
-            int bi = -1, bj = -1;
-            for (int i = 0; i < hist.Count; i++)
+            symbol[largest] = seeds.Count;
+            seeds.Add((long[])ctxHist[largest].Clone());
+            dist[largest] = 0;
+            double seedEntropy = Bits(seeds[^1]);
+            largest = 0;
+            for (int i = 0; i < n; i++)
             {
-                for (int j = i + 1; j < hist.Count; j++)
+                if (dist[i] == 0)
                 {
-                    double cost = MergeCost(hist[i], hist[j]);
-                    if (cost < bestCost)
-                    {
-                        bestCost = cost;
-                        bi = i;
-                        bj = j;
-                    }
+                    continue;
+                }
+
+                double d = Bits(Sum(ctxHist[i], seeds[^1])) - entropy[i] - seedEntropy;
+                if (d < dist[i])
+                {
+                    dist[i] = d;
+                }
+
+                if (dist[i] > dist[largest])
+                {
+                    largest = i;
                 }
             }
 
-            // Merge while over the cap, or while a merge is essentially free (< ~2 bytes of extra entropy).
-            if (hist.Count <= maxClusters && bestCost > 16.0)
+            if (dist[largest] < MinDistanceForDistinct)
             {
                 break;
             }
+        }
 
+        if (seeds.Count == 0)
+        {
+            seeds.Add(new long[alphabet]); // degenerate: all contexts empty
+        }
+
+        // Assign each still-unassigned context to its nearest seed and accumulate (seeds and empty
+        // contexts already have a symbol and are skipped).
+        for (int i = 0; i < n; i++)
+        {
+            if (symbol[i] != -1)
+            {
+                continue;
+            }
+
+            int best = 0;
+            double bestDist = double.MaxValue;
+            for (int j = 0; j < seeds.Count; j++)
+            {
+                double d = Bits(Sum(ctxHist[i], seeds[j])) - entropy[i] - Bits(seeds[j]);
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    best = j;
+                }
+            }
+
+            symbol[i] = best;
             for (int s = 0; s < alphabet; s++)
             {
-                hist[bi][s] += hist[bj][s];
-            }
-
-            members[bi].AddRange(members[bj]);
-            hist.RemoveAt(bj);
-            members.RemoveAt(bj);
-        }
-
-        k = hist.Count;
-        clusterHist = hist.ToArray();
-        int[] map = new int[n];
-        for (int c = 0; c < k; c++)
-        {
-            foreach (int ctx in members[c])
-            {
-                map[ctx] = c;
+                seeds[best][s] += ctxHist[i][s];
             }
         }
 
-        return map;
+        k = seeds.Count;
+        clusterHist = seeds.ToArray();
+        return symbol;
     }
-
-    private static double MergeCost(long[] a, long[] b) => Bits(Sum(a, b)) - Bits(a) - Bits(b);
 
     private static long[] Sum(long[] a, long[] b)
     {
@@ -940,15 +942,11 @@ internal static class JxlEncoder
         s.WriteU32((uint)plan.MinLen, E.Val(3), E.Val(4), E.BitsOff(2, 5), E.BitsOff(8, 9)); // min_length
         WriteUintConfig(s, plan.SeLen, 0, 0, 8); // lz77 length config
 
-        int bpe = Math.Max(1, BitLen(numClusters - 1));
-        s.WriteBool(true);         // is_simple context map
-        s.WriteBits((uint)bpe, 2); // bits per entry
-        for (int c = 0; c < plan.N; c++)
-        {
-            s.WriteBits((uint)plan.ContextToCluster[c], bpe); // pixel context -> literal cluster
-        }
-
-        s.WriteBits((uint)plan.K, bpe); // distance context -> distance cluster
+        // Context map: N pixel contexts -> their literal cluster, plus the distance context -> cluster K.
+        int[] map = new int[plan.N + 1];
+        Array.Copy(plan.ContextToCluster, map, plan.N);
+        map[plan.N] = plan.K;
+        WriteContextMap(s, map, numClusters);
 
         s.WriteBool(true); // use_prefix_code
         for (int c = 0; c < plan.K; c++)
@@ -968,33 +966,105 @@ internal static class JxlEncoder
         }
     }
 
-    // Weighted-predictor residuals plus a per-pixel context (bucket of the WP-error property), matching
-    // the decoder's general Modular path. Writes into stream[off..] and ctxs[off..].
-    private static void ComputeResidualTokensCtx(EncChannel ch, ContextTree tree, int[] stream, int[] ctxs, int off, ref int maxToken)
+    // Context map (context -> histogram cluster). Uses the simple bits-per-entry form when it fits
+    // (<= 8 clusters), otherwise the complex form: a move-to-front transform then a prefix-coded symbol
+    // stream (mirrors JxlEntropy.DecodeContextMap).
+    private static void WriteContextMap(JxlBitWriter s, int[] map, int numClusters)
+    {
+        if (numClusters <= 8)
+        {
+            int bpe = Math.Max(1, BitLen(numClusters - 1));
+            s.WriteBool(true);         // is_simple
+            s.WriteBits((uint)bpe, 2); // bits per entry
+            foreach (int v in map)
+            {
+                s.WriteBits((uint)v, bpe);
+            }
+
+            return;
+        }
+
+        s.WriteBool(false); // not simple
+        s.WriteBool(true);  // use move-to-front
+        int[] mtf = MoveToFront(map);
+        int maxSym = 0;
+        foreach (int v in mtf)
+        {
+            maxSym = Math.Max(maxSym, v);
+        }
+
+        long[] freq = new long[maxSym + 1];
+        foreach (int v in mtf)
+        {
+            freq[v]++;
+        }
+
+        var cmCode = new JxlPrefixCode(freq, maxSym + 1);
+        WriteHistogramsHeader(s, numContexts: 1, cmCode); // single-context, prefix-coded stream
+        foreach (int v in mtf)
+        {
+            cmCode.WriteSymbol(s, v);
+        }
+    }
+
+    // Forward move-to-front: emit each value's current table position, then move it to the front.
+    // Inverted by JxlEntropy.InverseMtf.
+    private static int[] MoveToFront(int[] values)
+    {
+        byte[] table = new byte[256];
+        for (int i = 0; i < 256; i++)
+        {
+            table[i] = (byte)i;
+        }
+
+        int[] outv = new int[values.Length];
+        for (int i = 0; i < values.Length; i++)
+        {
+            int val = values[i];
+            int idx = 0;
+            while (table[idx] != val)
+            {
+                idx++;
+            }
+
+            outv[i] = idx;
+            for (int j = idx; j > 0; j--)
+            {
+                table[j] = table[j - 1];
+            }
+
+            table[0] = (byte)val;
+        }
+
+        return outv;
+    }
+
+    // Per-pixel residuals + contexts: walk the learned tree on the decoder's properties to pick the
+    // leaf's predictor (weighted or gradient) and its context, then emit the packed residual. Uses the
+    // learner's shared ComputePixel so encoder and learner never diverge. Writes stream[off..]/ctxs[off..].
+    private static void ComputeResidualTokensCtx(EncChannel ch, int chan, LearnedTree tree, int[] stream, int[] ctxs, int off, ref int maxToken)
     {
         int w = ch.W, h = ch.H;
         int[] px = ch.Data;
         var wp = new WpState(WpHeader.Default(), w);
         var buf = new List<long>(1);
+        int[] props = new int[16];
+        int prevGrad = 0;
         int local = maxToken;
         for (int y = 0; y < h; y++)
         {
+            prevGrad = 0;
             for (int x = 0; x < w; x++)
             {
-                int left = x > 0 ? px[(y * w) + x - 1] : (y > 0 ? px[((y - 1) * w) + x] : 0);
-                int top = y > 0 ? px[((y - 1) * w) + x] : left;
-                int topleft = (x > 0 && y > 0) ? px[((y - 1) * w) + x - 1] : left;
-                int topright = (x + 1 < w && y > 0) ? px[((y - 1) * w) + x + 1] : top;
-                int toptop = y > 1 ? px[((y - 2) * w) + x] : top;
-                buf.Clear();
-                long guess = wp.Predict(x, y, top, left, topright, topleft, toptop, buf);
-                int props15 = (int)buf[0];
+                (long wpPred, long gradGuess) = JxlTreeLearner.ComputePixel(px, w, chan, 0, x, y, wp, buf, props, ref prevGrad);
+                MaTreeNode leaf = tree.Walk(props);
+                long guess = leaf.Predictor == WeightedPredictor ? wpPred : gradGuess;
                 int pixel = px[(y * w) + x];
                 int residual = pixel - (int)guess;
                 int token = (int)(uint)((residual << 1) ^ (residual >> 31));
                 int idx = off + (y * w) + x;
                 stream[idx] = token;
-                ctxs[idx] = tree.Context(props15);
+                ctxs[idx] = leaf.Ctx;
                 if (token > local)
                 {
                     local = token;
