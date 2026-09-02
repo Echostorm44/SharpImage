@@ -302,7 +302,7 @@ internal static class JxlModular
         return nodeIdx;
     }
 
-    private static void DecodeChannel(JxlAnsReader reader, List<MaNode> tree, byte[] ctxMap, WpHeader wpHdr, int chan, JxlChannel ch, int groupId = 0)
+    private static void DecodeChannel(JxlAnsReader reader, List<MaNode> tree, byte[] ctxMap, WpHeader wpHdr, int chan, JxlChannel ch, List<JxlChannel> allChans, int groupId = 0)
     {
         int w = ch.W, h = ch.H;
         if (w == 0 || h == 0)
@@ -313,7 +313,29 @@ internal static class JxlModular
         int[] px = ch.Px;
         var wp = new WpState(wpHdr, w);
         bool singleWp = tree.Count == 1;
-        var props = new int[16];
+
+        // Property vector: props 0..15 are the non-reference properties; props 16+ are the reference
+        // (cross-channel) properties for each previously-decoded same-size channel (chan-1, chan-2, ...).
+        int maxProp = 15;
+        foreach (MaNode nd in tree)
+        {
+            if (nd.Prop > maxProp)
+            {
+                maxProp = nd.Prop;
+            }
+        }
+
+        var props = new int[maxProp + 1];
+        var refs = new List<int[]>();
+        for (int j = chan - 1; j >= 0 && 16 + (4 * refs.Count) <= maxProp; j--)
+        {
+            JxlChannel sib = allChans[j];
+            if (sib.W == w && sib.H == h && sib.HShift == ch.HShift && sib.VShift == ch.VShift)
+            {
+                refs.Add(sib.Px);
+            }
+        }
+
         var wpPropsBuf = new List<long>(1);
         int prevGrad = 0; // per-decode local (was a static field: not thread-safe under parallel decode)
         for (int y = 0; y < h; y++)
@@ -363,6 +385,24 @@ internal static class JxlModular
                 wpPropsBuf.Clear();
                 long wpPred = wp.Predict(x, y, top, left, topright, topleft, toptop, wpPropsBuf);
                 props[15] = (int)wpPropsBuf[0];
+
+                // Reference properties: |v|, v, |v-grad|, v-grad from each earlier same-size channel.
+                int roff = 16;
+                for (int k = 0; k < refs.Count; k++)
+                {
+                    int[] rp = refs[k];
+                    long rv = rp[(y * w) + x];
+                    long vleft = x > 0 ? rp[(y * w) + x - 1] : 0;
+                    long vtop = y > 0 ? rp[((y - 1) * w) + x] : vleft;
+                    long vtopleft = (x > 0 && y > 0) ? rp[((y - 1) * w) + x - 1] : vleft;
+                    long vpred = ClampedGradient(vleft, vtop, vtopleft);
+                    props[roff] = (int)Math.Abs(rv);
+                    props[roff + 1] = (int)rv;
+                    props[roff + 2] = (int)Math.Abs(rv - vpred);
+                    props[roff + 3] = (int)(rv - vpred);
+                    roff += 4;
+                }
+
                 node = tree[TreeLeaf(tree, props)];
                 uint v = reader.ReadHybridUintClustered(ctxMap[node.Ctx]);
                 long guess = node.Offset + PredictOne(node.Predictor, left, top, toptop, topleft, topright, leftleft, toprr, wpPred);
@@ -847,7 +887,7 @@ internal static class JxlModular
         var reader = new JxlAnsReader(code, br, distMult);
         for (int ci = 0; ci < chans.Count; ci++)
         {
-            DecodeChannel(reader, tree, code.ContextMap, wpHdr, ci, chans[ci]);
+            DecodeChannel(reader, tree, code.ContextMap, wpHdr, ci, chans[ci], chans);
         }
 
         if (!reader.CheckFinal())
@@ -1114,7 +1154,7 @@ internal static class JxlModular
             var reader = new JxlAnsReader(code, lb, distMult);
             for (int ci = 0; ci < beginc; ci++)
             {
-                DecodeChannel(reader, tree, code.ContextMap, wpHdr, ci, chans[ci], 0);
+                DecodeChannel(reader, tree, code.ContextMap, wpHdr, ci, chans[ci], chans, 0);
             }
 
             reader.CheckFinal();
@@ -1175,7 +1215,7 @@ internal static class JxlModular
             var greader = new JxlAnsReader(gcode, gb, gdist);
             for (int gi = 0; gi < gchans.Count; gi++)
             {
-                DecodeChannel(greader, gtree, gcode.ContextMap, gwp, gi, gchans[gi], groupStreamId);
+                DecodeChannel(greader, gtree, gcode.ContextMap, gwp, gi, gchans[gi], gchans, groupStreamId);
             }
 
             greader.CheckFinal();
@@ -1254,7 +1294,7 @@ internal static class JxlModular
         var reader = new JxlAnsReader(code, br, distMult);
         for (int ci = 0; ci < chans.Count; ci++)
         {
-            DecodeChannel(reader, tree, code.ContextMap, wpHdr, ci, chans[ci], streamId);
+            DecodeChannel(reader, tree, code.ContextMap, wpHdr, ci, chans[ci], chans, streamId);
         }
 
         reader.CheckFinal();

@@ -20,8 +20,9 @@ internal sealed class MaTreeNode
     public MaTreeNode? Right;   // property <= SplitVal
 }
 
-/// <summary>A residual channel to learn/encode from: pixel data, dimensions, channel and group ids.</summary>
-internal readonly record struct EncChannelRef(int[] Data, int W, int H, int Chan, int GroupId);
+/// <summary>A residual channel to learn/encode from: pixel data, dimensions, channel and group ids,
+/// plus the same-size earlier channels (chan-1, chan-2, ...) used for reference properties.</summary>
+internal readonly record struct EncChannelRef(int[] Data, int W, int H, int Chan, int GroupId, int[][] Refs);
 
 internal static class JxlTreeLearner
 {
@@ -31,6 +32,8 @@ internal static class JxlTreeLearner
     // Properties (decoder indices) the tree may split on, in libjxl's priority order minus the group
     // property (we use one global tree). 0 = channel, 15 = WP error, 9 = gradient, 10..14 = neighbour
     // differences, 2 = y.
+    // Non-reference properties only: after the RCT decorrelates the colour channels, cross-channel
+    // reference properties (16+) add no signal and just let the learner overfit — measured worse.
     private static readonly int[] UsedProperties = { 0, 15, 9, 10, 11, 12, 13, 14, 2, 4, 5, 6, 7, 8 };
 
     // libjxl's fixed weighted-predictor-error thresholds (the "< 32 values" set).
@@ -108,7 +111,7 @@ internal static class JxlTreeLearner
         }
 
         int counter = 0;
-        int[] props = new int[16];
+        int[] props = new int[16 + (4 * MaxRefChannels)];
         long[] guesses = new long[np];
         var wpBuf = new List<long>(1);
         foreach (EncChannelRef ch in channels)
@@ -121,7 +124,7 @@ internal static class JxlTreeLearner
                 prevGrad = 0;
                 for (int x = 0; x < w; x++)
                 {
-                    ComputePixel(ch.Data, w, ch.Chan, ch.GroupId, x, y, wp, wpBuf, props, ref prevGrad, guesses);
+                    ComputePixel(ch.Data, w, ch.Chan, ch.GroupId, x, y, wp, wpBuf, props, ref prevGrad, guesses, ch.Refs);
                     int pixel = ch.Data[(y * w) + x];
                     if (counter++ % stride == 0)
                     {
@@ -175,10 +178,14 @@ internal static class JxlTreeLearner
         return 0;
     }
 
-    // Computes props[0..15] (matching JxlModular.DecodeChannel's general path) and fills `guesses` with
-    // each candidate predictor's prediction. Shared by the learner and the encoder so they never diverge.
+    // Number of reference channels the encoder/learner consider (matches the props we may split on).
+    public const int MaxRefChannels = 2;
+
+    // Computes props[0..15] (non-reference) and props[16+] (reference/cross-channel, from refChannels,
+    // matching JxlModular.DecodeChannel) and fills `guesses` with each candidate predictor's prediction.
+    // Shared by the learner and the encoder so they never diverge.
     public static void ComputePixel(
-        int[] px, int w, int chan, int groupId, int x, int y, WpState wp, List<long> wpBuf, int[] props, ref int prevGrad, long[] guesses)
+        int[] px, int w, int chan, int groupId, int x, int y, WpState wp, List<long> wpBuf, int[] props, ref int prevGrad, long[] guesses, int[][] refChannels)
     {
         long left = x > 0 ? px[(y * w) + x - 1] : (y > 0 ? px[((y - 1) * w) + x] : 0);
         long top = y > 0 ? px[((y - 1) * w) + x] : left;
@@ -208,6 +215,22 @@ internal static class JxlTreeLearner
         wpBuf.Clear();
         long wpPred = wp.Predict(x, y, top, left, topright, topleft, toptop, wpBuf);
         props[15] = (int)wpBuf[0];
+
+        int roff = 16;
+        for (int k = 0; k < refChannels.Length && roff + 3 < props.Length; k++)
+        {
+            int[] rp = refChannels[k];
+            long v = rp[(y * w) + x];
+            long vleft = x > 0 ? rp[(y * w) + x - 1] : 0;
+            long vtop = y > 0 ? rp[((y - 1) * w) + x] : vleft;
+            long vtopleft = (x > 0 && y > 0) ? rp[((y - 1) * w) + x - 1] : vleft;
+            long vpred = ClampedGradient(vleft, vtop, vtopleft);
+            props[roff] = (int)Math.Abs(v);
+            props[roff + 1] = (int)v;
+            props[roff + 2] = (int)Math.Abs(v - vpred);
+            props[roff + 3] = (int)(v - vpred);
+            roff += 4;
+        }
 
         for (int i = 0; i < CandidatePredictors.Length; i++)
         {
@@ -278,23 +301,38 @@ internal static class JxlTreeLearner
         int[] diffThresholds = QuantizeSamples(diffs, MaxPropertyValues);
         int[] pixelThresholds = QuantizeSamples(pixels, MaxPropertyValues);
         var absPixels = new List<int>(pixels.Count);
+        var absDiffs = new List<int>(diffs.Count);
         foreach (int v in pixels)
         {
             absPixels.Add(Math.Abs(v));
         }
 
+        foreach (int v in diffs)
+        {
+            absDiffs.Add(Math.Abs(v));
+        }
+
         int[] absPixelThresholds = QuantizeSamples(absPixels, MaxPropertyValues);
+        int[] absDiffThresholds = QuantizeSamples(absDiffs, MaxPropertyValues);
 
         int[][] thr = new int[UsedProperties.Length][];
         for (int i = 0; i < UsedProperties.Length; i++)
         {
-            thr[i] = UsedProperties[i] switch
+            int p = UsedProperties[i];
+            // Reference properties (16+): the 4 sub-properties per channel are |v|, v, |v-grad|, v-grad,
+            // quantised like abs-pixel / pixel / abs-diff / diff respectively (libjxl PreQuantizeProperties).
+            int refKind = p >= 16 ? (p - 16) % 4 : -1;
+            thr[i] = p switch
             {
                 0 => new[] { 0, 1 },
                 15 => WpThresholds,
                 2 or 3 => QuantizeCoordinate(),
                 4 or 5 => absPixelThresholds, // |top|, |left|
                 6 or 7 => pixelThresholds,    // top, left
+                _ when refKind == 0 => absPixelThresholds,
+                _ when refKind == 1 => pixelThresholds,
+                _ when refKind == 2 => absDiffThresholds,
+                _ when refKind == 3 => diffThresholds,
                 _ => diffThresholds,          // gradient + neighbour differences (8..14)
             };
         }

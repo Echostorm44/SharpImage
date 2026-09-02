@@ -1014,6 +1014,37 @@ public class ExtendedFormatTests
         => System.IO.File.ReadAllBytes(System.IO.Path.Combine(System.AppContext.BaseDirectory, "TestAssets", name));
 
     [Test]
+    public async Task Jxl_DecodesLibjxlHighEffortFile_Lossless()
+    {
+        // A lossless file produced by libjxl at effort 9, which exercises the decoder's high-effort
+        // paths (learned MA tree, reference/cross-channel properties). Must decode pixel-exact.
+        string dir = System.IO.Path.Combine(System.AppContext.BaseDirectory, "TestAssets");
+        using var decoded = JxlCoder.Decode(LoadJxlAsset("photo_small_libjxl_e9.jxl"));
+        using var reference = FormatRegistry.Read(System.IO.Path.Combine(dir, "photo_small.png"));
+        await Assert.That(decoded.Columns).IsEqualTo(reference.Columns);
+        await Assert.That(decoded.Rows).IsEqualTo(reference.Rows);
+
+        int dc = decoded.NumberOfChannels, rc = reference.NumberOfChannels;
+        long maxDiff = 0;
+        for (int y = 0; y < reference.Rows; y++)
+        {
+            ushort[] rd = decoded.GetPixelRow(y).ToArray();
+            ushort[] rr = reference.GetPixelRow(y).ToArray();
+            for (int x = 0; x < reference.Columns; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    int a = Quantum.ScaleToByte(rd[(x * dc) + Math.Min(c, dc - 1)]);
+                    int b = Quantum.ScaleToByte(rr[(x * rc) + Math.Min(c, rc - 1)]);
+                    maxDiff = Math.Max(maxDiff, Math.Abs(a - b));
+                }
+            }
+        }
+
+        await Assert.That(maxDiff).IsEqualTo(0L);
+    }
+
+    [Test]
     public async Task Jxl_DecodesRealSolidFile()
     {
         // jxl_solid.jxl: a 4x4 solid RGB(100,150,200) lossless Modular file produced by libjxl.

@@ -226,7 +226,7 @@ internal static class JxlEncoder
         for (int c = 0; c < channels.Count; c++)
         {
             EncChannel ch = channels[c];
-            ComputeResidualTokensCtx(ch, c, tree, stream, ctxs, off, ref maxTok, wpHeader);
+            ComputeResidualTokensCtx(ch, c, tree, stream, ctxs, off, ref maxTok, wpHeader, RefsFor(channels, c));
             off += ch.W * ch.H;
         }
 
@@ -542,9 +542,15 @@ internal static class JxlEncoder
         {
             int rx = (g % gprL) * groupDim, ry = (g / gprL) * groupDim;
             int rw = Math.Min(groupDim, w - rx), rh = Math.Min(groupDim, h - ry);
+            var tiles = new int[nb][];
             for (int c = 0; c < nb; c++)
             {
-                tileRefs.Add(new EncChannelRef(ExtractTile(chan[c], w, rx, ry, rw, rh), rw, rh, c, 0));
+                tiles[c] = ExtractTile(chan[c], w, rx, ry, rw, rh);
+            }
+
+            for (int c = 0; c < nb; c++)
+            {
+                tileRefs.Add(new EncChannelRef(tiles[c], rw, rh, c, 0, TileRefs(tiles, c)));
             }
         }
 
@@ -552,6 +558,19 @@ internal static class JxlEncoder
         byte[][] modelled = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, learned, rctType, wpMode);
         byte[][] plain = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree, rctType, wpMode);
         return TotalLength(modelled) <= TotalLength(plain) ? modelled : plain;
+    }
+
+    // Reference channels for a same-size tile set: earlier channels (c-1, c-2, ...), up to MaxRefChannels.
+    private static int[][] TileRefs(int[][] tiles, int c)
+    {
+        int n = Math.Min(c, JxlTreeLearner.MaxRefChannels);
+        int[][] refs = new int[n][];
+        for (int k = 0; k < n; k++)
+        {
+            refs[k] = tiles[c - 1 - k];
+        }
+
+        return refs;
     }
 
     private static int TotalLength(byte[][] sections)
@@ -585,12 +604,17 @@ internal static class JxlEncoder
             // a standalone image (identical to the decoder's per-group decode).
             int[] stream = new int[rw * rh * nb];
             int[] ctxs = new int[rw * rh * nb];
+            var tiles = new int[nb][];
+            for (int c = 0; c < nb; c++)
+            {
+                tiles[c] = ExtractTile(chan[c], w, rx, ry, rw, rh);
+            }
+
             int off = 0;
             int maxTok = 0;
             for (int c = 0; c < nb; c++)
             {
-                int[] tile = ExtractTile(chan[c], w, rx, ry, rw, rh);
-                ComputeResidualTokensCtx(new EncChannel(tile, rw, rh), c, tree, stream, ctxs, off, ref maxTok, wpHeader);
+                ComputeResidualTokensCtx(new EncChannel(tiles[c], rw, rh), c, tree, stream, ctxs, off, ref maxTok, wpHeader, TileRefs(tiles, c));
                 off += rw * rh;
             }
 
@@ -852,10 +876,27 @@ internal static class JxlEncoder
         var refs = new List<EncChannelRef>(channels.Count);
         for (int c = 0; c < channels.Count; c++)
         {
-            refs.Add(new EncChannelRef(channels[c].Data, channels[c].W, channels[c].H, c, 0));
+            refs.Add(new EncChannelRef(channels[c].Data, channels[c].W, channels[c].H, c, 0, RefsFor(channels, c)));
         }
 
         return refs;
+    }
+
+    // Reference channel data for channel c: earlier same-size channels (c-1, c-2, ...), most recent
+    // first, up to MaxRefChannels — matching JxlModular.DecodeChannel's reference selection.
+    private static int[][] RefsFor(List<EncChannel> channels, int c)
+    {
+        var list = new List<int[]>();
+        EncChannel ch = channels[c];
+        for (int j = c - 1; j >= 0 && list.Count < JxlTreeLearner.MaxRefChannels; j--)
+        {
+            if (channels[j].W == ch.W && channels[j].H == ch.H)
+            {
+                list.Add(channels[j].Data);
+            }
+        }
+
+        return list.ToArray();
     }
 
     private static int PackSigned(int v) => (int)(uint)((v << 1) ^ (v >> 31));
@@ -1276,13 +1317,13 @@ internal static class JxlEncoder
     // Per-pixel residuals + contexts: walk the learned tree on the decoder's properties to pick the
     // leaf's predictor (weighted or gradient) and its context, then emit the packed residual. Uses the
     // learner's shared ComputePixel so encoder and learner never diverge. Writes stream[off..]/ctxs[off..].
-    private static void ComputeResidualTokensCtx(EncChannel ch, int chan, LearnedTree tree, int[] stream, int[] ctxs, int off, ref int maxToken, WpHeader wpHeader)
+    private static void ComputeResidualTokensCtx(EncChannel ch, int chan, LearnedTree tree, int[] stream, int[] ctxs, int off, ref int maxToken, WpHeader wpHeader, int[][] refs)
     {
         int w = ch.W, h = ch.H;
         int[] px = ch.Data;
         var wp = new WpState(wpHeader, w);
         var buf = new List<long>(1);
-        int[] props = new int[16];
+        int[] props = new int[16 + (4 * JxlTreeLearner.MaxRefChannels)];
         long[] guesses = new long[JxlTreeLearner.CandidatePredictors.Length];
         int prevGrad = 0;
         int local = maxToken;
@@ -1291,7 +1332,7 @@ internal static class JxlEncoder
             prevGrad = 0;
             for (int x = 0; x < w; x++)
             {
-                JxlTreeLearner.ComputePixel(px, w, chan, 0, x, y, wp, buf, props, ref prevGrad, guesses);
+                JxlTreeLearner.ComputePixel(px, w, chan, 0, x, y, wp, buf, props, ref prevGrad, guesses, refs);
                 MaTreeNode leaf = tree.Walk(props);
                 long guess = guesses[JxlTreeLearner.PredictorIndex(leaf.Predictor)];
                 int pixel = px[(y * w) + x];
