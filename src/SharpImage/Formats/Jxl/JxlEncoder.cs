@@ -1161,6 +1161,7 @@ internal static class JxlEncoder
         var wp = new WpState(WpHeader.Default(), w);
         var buf = new List<long>(1);
         int[] props = new int[16];
+        long[] guesses = new long[JxlTreeLearner.CandidatePredictors.Length];
         int prevGrad = 0;
         int local = maxToken;
         for (int y = 0; y < h; y++)
@@ -1168,9 +1169,9 @@ internal static class JxlEncoder
             prevGrad = 0;
             for (int x = 0; x < w; x++)
             {
-                (long wpPred, long gradGuess) = JxlTreeLearner.ComputePixel(px, w, chan, 0, x, y, wp, buf, props, ref prevGrad);
+                JxlTreeLearner.ComputePixel(px, w, chan, 0, x, y, wp, buf, props, ref prevGrad, guesses);
                 MaTreeNode leaf = tree.Walk(props);
-                long guess = leaf.Predictor == WeightedPredictor ? wpPred : gradGuess;
+                long guess = guesses[JxlTreeLearner.PredictorIndex(leaf.Predictor)];
                 int pixel = px[(y * w) + x];
                 int residual = pixel - (int)guess;
                 int token = (int)(uint)((residual << 1) ^ (residual >> 31));

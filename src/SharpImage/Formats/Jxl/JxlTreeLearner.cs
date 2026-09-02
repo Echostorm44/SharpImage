@@ -60,12 +60,11 @@ internal static class JxlTreeLearner
 
     private sealed class Samples
     {
-        public int P;
+        public int P;                 // number of properties
+        public int NP;                // number of candidate predictors
         public byte[][] Prop = null!; // [P][sample] quantised bucket index
-        public int[] TokW = null!;    // weighted-predictor token
-        public byte[] NbW = null!;
-        public int[] TokG = null!;    // gradient-predictor token
-        public byte[] NbG = null!;
+        public int[][] Tok = null!;   // [NP][sample] predictor token
+        public byte[][] Nb = null!;   // [NP][sample] extra bits count
         public int Count;
 
         public void Swap(int a, int b)
@@ -75,10 +74,11 @@ internal static class JxlTreeLearner
                 (Prop[i][a], Prop[i][b]) = (Prop[i][b], Prop[i][a]);
             }
 
-            (TokW[a], TokW[b]) = (TokW[b], TokW[a]);
-            (NbW[a], NbW[b]) = (NbW[b], NbW[a]);
-            (TokG[a], TokG[b]) = (TokG[b], TokG[a]);
-            (NbG[a], NbG[b]) = (NbG[b], NbG[a]);
+            for (int i = 0; i < NP; i++)
+            {
+                (Tok[i][a], Tok[i][b]) = (Tok[i][b], Tok[i][a]);
+                (Nb[i][a], Nb[i][b]) = (Nb[i][b], Nb[i][a]);
+            }
         }
     }
 
@@ -92,19 +92,24 @@ internal static class JxlTreeLearner
 
         int stride = total > MaxSamples ? (total / MaxSamples) + 1 : 1;
         int p = UsedProperties.Length;
+        int np = CandidatePredictors.Length;
         var propLists = new List<byte>[p];
         for (int i = 0; i < p; i++)
         {
             propLists[i] = new List<byte>();
         }
 
-        var tokW = new List<int>();
-        var nbW = new List<byte>();
-        var tokG = new List<int>();
-        var nbG = new List<byte>();
+        var tokLists = new List<int>[np];
+        var nbLists = new List<byte>[np];
+        for (int i = 0; i < np; i++)
+        {
+            tokLists[i] = new List<int>();
+            nbLists[i] = new List<byte>();
+        }
 
         int counter = 0;
         int[] props = new int[16];
+        long[] guesses = new long[np];
         var wpBuf = new List<long>(1);
         foreach (EncChannelRef ch in channels)
         {
@@ -116,7 +121,7 @@ internal static class JxlTreeLearner
                 prevGrad = 0;
                 for (int x = 0; x < w; x++)
                 {
-                    (long wpPred, long gradGuess) = ComputePixel(ch.Data, w, ch.Chan, ch.GroupId, x, y, wp, wpBuf, props, ref prevGrad);
+                    ComputePixel(ch.Data, w, ch.Chan, ch.GroupId, x, y, wp, wpBuf, props, ref prevGrad, guesses);
                     int pixel = ch.Data[(y * w) + x];
                     if (counter++ % stride == 0)
                     {
@@ -125,12 +130,12 @@ internal static class JxlTreeLearner
                             propLists[i].Add((byte)Bucket(props[UsedProperties[i]], thresholds[i]));
                         }
 
-                        (int tw, byte nw) = Tokenize(pixel - (int)wpPred);
-                        (int tg, byte ng) = Tokenize(pixel - (int)gradGuess);
-                        tokW.Add(tw);
-                        nbW.Add(nw);
-                        tokG.Add(tg);
-                        nbG.Add(ng);
+                        for (int i = 0; i < np; i++)
+                        {
+                            (int tk, byte nb) = Tokenize(pixel - (int)guesses[i]);
+                            tokLists[i].Add(tk);
+                            nbLists[i].Add(nb);
+                        }
                     }
 
                     wp.Update(pixel, x, y);
@@ -138,19 +143,42 @@ internal static class JxlTreeLearner
             }
         }
 
-        var s = new Samples { P = p, Count = tokW.Count, Prop = new byte[p][], TokW = tokW.ToArray(), NbW = nbW.ToArray(), TokG = tokG.ToArray(), NbG = nbG.ToArray() };
+        var s = new Samples { P = p, NP = np, Count = tokLists[0].Count, Prop = new byte[p][], Tok = new int[np][], Nb = new byte[np][] };
         for (int i = 0; i < p; i++)
         {
             s.Prop[i] = propLists[i].ToArray();
         }
 
+        for (int i = 0; i < np; i++)
+        {
+            s.Tok[i] = tokLists[i].ToArray();
+            s.Nb[i] = nbLists[i].ToArray();
+        }
+
         return s;
     }
 
-    // Computes props[0..15] (matching JxlModular.DecodeChannel's general path) and returns the weighted
-    // and gradient predictions. Shared by the learner and the encoder so they never diverge.
-    public static (long WpPred, long GradGuess) ComputePixel(
-        int[] px, int w, int chan, int groupId, int x, int y, WpState wp, List<long> wpBuf, int[] props, ref int prevGrad)
+    // Candidate leaf predictors the learner chooses between (decoder ids): weighted, gradient, select,
+    // average, top, left. libjxl's higher efforts likewise select among all predictors per leaf.
+    public static readonly int[] CandidatePredictors = { 6, 5, 4, 3, 2, 1 };
+
+    public static int PredictorIndex(int pred)
+    {
+        for (int i = 0; i < CandidatePredictors.Length; i++)
+        {
+            if (CandidatePredictors[i] == pred)
+            {
+                return i;
+            }
+        }
+
+        return 0;
+    }
+
+    // Computes props[0..15] (matching JxlModular.DecodeChannel's general path) and fills `guesses` with
+    // each candidate predictor's prediction. Shared by the learner and the encoder so they never diverge.
+    public static void ComputePixel(
+        int[] px, int w, int chan, int groupId, int x, int y, WpState wp, List<long> wpBuf, int[] props, ref int prevGrad, long[] guesses)
     {
         long left = x > 0 ? px[(y * w) + x - 1] : (y > 0 ? px[((y - 1) * w) + x] : 0);
         long top = y > 0 ? px[((y - 1) * w) + x] : left;
@@ -181,8 +209,28 @@ internal static class JxlTreeLearner
         long wpPred = wp.Predict(x, y, top, left, topright, topleft, toptop, wpBuf);
         props[15] = (int)wpBuf[0];
 
-        long gradGuess = ClampedGradient(left, top, topleft);
-        return (wpPred, gradGuess);
+        for (int i = 0; i < CandidatePredictors.Length; i++)
+        {
+            guesses[i] = PredictGuess(CandidatePredictors[i], left, top, topleft, wpPred);
+        }
+    }
+
+    // Mirrors JxlModular.PredictOne for the predictors we use (all need only left/top/topleft/wp).
+    private static long PredictGuess(int pred, long left, long top, long topleft, long wp) => pred switch
+    {
+        6 => wp,
+        5 => ClampedGradient(left, top, topleft),
+        4 => Select(left, top, topleft),
+        3 => (left + top) / 2,
+        2 => top,
+        1 => left,
+        _ => 0,
+    };
+
+    private static long Select(long a, long b, long c)
+    {
+        long p = a + b - c;
+        return Math.Abs(p - a) < Math.Abs(p - b) ? a : b;
     }
 
     public static long ClampedGradient(long n, long w, long l)
@@ -416,6 +464,7 @@ internal static class JxlTreeLearner
         stack.Push((0, s.Count, root));
         int leaves = 1;
 
+        int np = s.NP;
         while (stack.Count > 0)
         {
             (int b, int e, MaTreeNode cur) = stack.Pop();
@@ -427,25 +476,33 @@ internal static class JxlTreeLearner
             int maxSym = 1;
             for (int i = b; i < e; i++)
             {
-                maxSym = Math.Max(maxSym, Math.Max(s.TokW[i], s.TokG[i]) + 1);
-            }
-
-            // Base histograms for the whole range (both predictors).
-            int[] baseW = new int[maxSym];
-            int[] baseG = new int[maxSym];
-            long baseExtraW = 0, baseExtraG = 0;
-            for (int i = b; i < e; i++)
-            {
-                baseW[s.TokW[i]]++;
-                baseExtraW += s.NbW[i];
-                baseG[s.TokG[i]]++;
-                baseExtraG += s.NbG[i];
+                for (int q = 0; q < np; q++)
+                {
+                    maxSym = Math.Max(maxSym, s.Tok[q][i] + 1);
+                }
             }
 
             long rangeTotal = e - b;
-            double baseBits = cur.Predictor == WeightedPredictor
-                ? EstimateBits(baseW, maxSym, rangeTotal) + baseExtraW
-                : EstimateBits(baseG, maxSym, rangeTotal) + baseExtraG;
+
+            // Base histograms for the whole range, per predictor.
+            int[][] baseH = new int[np][];
+            long[] baseExtra = new long[np];
+            for (int q = 0; q < np; q++)
+            {
+                baseH[q] = new int[maxSym];
+            }
+
+            for (int i = b; i < e; i++)
+            {
+                for (int q = 0; q < np; q++)
+                {
+                    baseH[q][s.Tok[q][i]]++;
+                    baseExtra[q] += s.Nb[q][i];
+                }
+            }
+
+            int curIdx = PredictorIndex(cur.Predictor);
+            double baseBits = EstimateBits(baseH[curIdx], maxSym, rangeTotal) + baseExtra[curIdx];
 
             double bestCost = double.MaxValue;
             int bestPropIdx = -1, bestBucket = -1, bestLPred = WeightedPredictor, bestRPred = WeightedPredictor;
@@ -461,49 +518,62 @@ internal static class JxlTreeLearner
                 byte[] bucket = s.Prop[pi];
 
                 // Per-bucket histograms for each predictor.
-                int[][] bkW = new int[nb][];
-                int[][] bkG = new int[nb][];
-                long[] bkExtraW = new long[nb];
-                long[] bkExtraG = new long[nb];
+                int[][][] bkH = new int[np][][];
+                long[][] bkExtra = new long[np][];
                 long[] bkTotal = new long[nb];
-                for (int k = 0; k < nb; k++)
+                for (int q = 0; q < np; q++)
                 {
-                    bkW[k] = new int[maxSym];
-                    bkG[k] = new int[maxSym];
+                    bkH[q] = new int[nb][];
+                    bkExtra[q] = new long[nb];
+                    for (int k = 0; k < nb; k++)
+                    {
+                        bkH[q][k] = new int[maxSym];
+                    }
                 }
 
                 for (int i = b; i < e; i++)
                 {
                     int k = bucket[i];
-                    bkW[k][s.TokW[i]]++;
-                    bkG[k][s.TokG[i]]++;
-                    bkExtraW[k] += s.NbW[i];
-                    bkExtraG[k] += s.NbG[i];
+                    for (int q = 0; q < np; q++)
+                    {
+                        bkH[q][k][s.Tok[q][i]]++;
+                        bkExtra[q][k] += s.Nb[q][i];
+                    }
+
                     bkTotal[k]++;
                 }
 
                 // Sweep the split point; accumulate "below" (property <= threshold[bk]) from low buckets.
-                int[] belowW = new int[maxSym];
-                int[] belowG = new int[maxSym];
-                long belowExtraW = 0, belowExtraG = 0, belowTotal = 0;
-                int[] aboveW = (int[])baseW.Clone();
-                int[] aboveG = (int[])baseG.Clone();
-                long aboveExtraW = baseExtraW, aboveExtraG = baseExtraG, aboveTotal = rangeTotal;
+                int[][] below = new int[np][];
+                int[][] above = new int[np][];
+                long[] belowExtra = new long[np];
+                long[] aboveExtra = new long[np];
+                for (int q = 0; q < np; q++)
+                {
+                    below[q] = new int[maxSym];
+                    above[q] = (int[])baseH[q].Clone();
+                    aboveExtra[q] = baseExtra[q];
+                }
+
+                long belowTotal = 0, aboveTotal = rangeTotal;
 
                 for (int bk = 0; bk + 1 < nb; bk++)
                 {
-                    for (int sym = 0; sym < maxSym; sym++)
+                    for (int q = 0; q < np; q++)
                     {
-                        belowW[sym] += bkW[bk][sym];
-                        aboveW[sym] -= bkW[bk][sym];
-                        belowG[sym] += bkG[bk][sym];
-                        aboveG[sym] -= bkG[bk][sym];
+                        int[] src = bkH[q][bk];
+                        int[] bl = below[q];
+                        int[] ab = above[q];
+                        for (int sym = 0; sym < maxSym; sym++)
+                        {
+                            bl[sym] += src[sym];
+                            ab[sym] -= src[sym];
+                        }
+
+                        belowExtra[q] += bkExtra[q][bk];
+                        aboveExtra[q] -= bkExtra[q][bk];
                     }
 
-                    belowExtraW += bkExtraW[bk];
-                    aboveExtraW -= bkExtraW[bk];
-                    belowExtraG += bkExtraG[bk];
-                    aboveExtraG -= bkExtraG[bk];
                     belowTotal += bkTotal[bk];
                     aboveTotal -= bkTotal[bk];
 
@@ -512,15 +582,25 @@ internal static class JxlTreeLearner
                         continue;
                     }
 
-                    double lW = EstimateBits(belowW, maxSym, belowTotal) + belowExtraW;
-                    double lG = EstimateBits(belowG, maxSym, belowTotal) + belowExtraG;
-                    double rW = EstimateBits(aboveW, maxSym, aboveTotal) + aboveExtraW;
-                    double rG = EstimateBits(aboveG, maxSym, aboveTotal) + aboveExtraG;
+                    double lc = double.MaxValue, rc = double.MaxValue;
+                    int lp = WeightedPredictor, rp = WeightedPredictor;
+                    for (int q = 0; q < np; q++)
+                    {
+                        double l = EstimateBits(below[q], maxSym, belowTotal) + belowExtra[q];
+                        double rr = EstimateBits(above[q], maxSym, aboveTotal) + aboveExtra[q];
+                        if (l < lc)
+                        {
+                            lc = l;
+                            lp = CandidatePredictors[q];
+                        }
 
-                    int lp = lW <= lG ? WeightedPredictor : GradientPredictor;
-                    int rp = rW <= rG ? WeightedPredictor : GradientPredictor;
-                    double lc = Math.Min(lW, lG);
-                    double rc = Math.Min(rW, rG);
+                        if (rr < rc)
+                        {
+                            rc = rr;
+                            rp = CandidatePredictors[q];
+                        }
+                    }
+
                     if (lc + rc < bestCost)
                     {
                         bestCost = lc + rc;
