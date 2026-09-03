@@ -97,7 +97,7 @@ internal static partial class JxlEncoder
     public static byte[] EncodeVarDct(ImageFrame image, float distance, int[]? passShifts = null)
     {
         (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
-        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: true);
+        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: true, variableBlocks: true);
     }
 
     // Maps a Butteraugli-style distance to (global_scale, quant_lf, block_hf_mul). global_scale is fixed;
@@ -290,7 +290,7 @@ internal static partial class JxlEncoder
 
         // Block-size layout: sizeAt[pos] = (int)TransformType for a data block's top-left position, or -1
         // for a position covered by a larger block. Off => every 8x8 position is its own Dct8 block.
-        int[] sizeAt = BuildDctLayout(activity, bw, bh, variableBlocks);
+        int[] sizeAt = BuildDctLayout(xyb, stride, dm, globalScale, hfMulBlock, blockHfMul, adaptiveQuant, fp, bw, bh, variableBlocks);
 
         var dcY = new int[nbData];
         var dcX = new int[nbData];
@@ -930,11 +930,11 @@ internal static partial class JxlEncoder
         return mul;
     }
 
-    private const double ActivityDct16Threshold = 0.08; // per-8x8-block activity below which 16x16 is used
-
-    // Block-size layout: -1 marks a position covered by a larger block; otherwise (int)TransformType of the
-    // data block whose top-left sits there. Uses Dct16 for aligned, in-bounds, uniformly-smooth 2x2 regions.
-    private static int[] BuildDctLayout(double[] act, int bw, int bh, bool variableBlocks)
+    // Block-size layout via a simple rate-distortion check: for each aligned in-bounds 2x2 region, quantise
+    // it both as one Dct16 and as four Dct8 (same hf_mul so distortion is comparable) and count luma AC
+    // non-zeros; choose Dct16 only when it produces fewer coefficients (concentrated energy => smooth
+    // region), which is where it actually saves bits. -1 marks positions covered by a larger block.
+    private static int[] BuildDctLayout(float[][] xyb, int stride, DequantMatrixSet dm, uint globalScale, int[] hfMulBlock, uint blockHfMul, bool adaptiveQuant, VarDctFrameParams fp, int bw, int bh, bool variableBlocks)
     {
         var sizeAt = new int[bw * bh];
         for (int i = 0; i < sizeAt.Length; i++)
@@ -951,13 +951,17 @@ internal static partial class JxlEncoder
         {
             for (int bx = 0; bx + 1 < bw; bx += 2)
             {
-                double a0 = act[(by * bw) + bx], a1 = act[(by * bw) + bx + 1];
-                double a2 = act[((by + 1) * bw) + bx], a3 = act[((by + 1) * bw) + bx + 1];
-                if (a0 < ActivityDct16Threshold && a1 < ActivityDct16Threshold &&
-                    a2 < ActivityDct16Threshold && a3 < ActivityDct16Threshold)
+                int tl = (by * bw) + bx;
+                int bHfMul = adaptiveQuant ? hfMulBlock[tl] : (int)blockHfMul;
+                int cnt16 = CountLumaAcNonzeros(xyb[1], stride, bx, by, TransformType.Dct16, dm, globalScale, bHfMul, fp);
+                int cnt8 = CountLumaAcNonzeros(xyb[1], stride, bx, by, TransformType.Dct8, dm, globalScale, bHfMul, fp)
+                    + CountLumaAcNonzeros(xyb[1], stride, bx + 1, by, TransformType.Dct8, dm, globalScale, bHfMul, fp)
+                    + CountLumaAcNonzeros(xyb[1], stride, bx, by + 1, TransformType.Dct8, dm, globalScale, bHfMul, fp)
+                    + CountLumaAcNonzeros(xyb[1], stride, bx + 1, by + 1, TransformType.Dct8, dm, globalScale, bHfMul, fp);
+                if (cnt16 < cnt8)
                 {
-                    sizeAt[(by * bw) + bx] = (int)TransformType.Dct16;
-                    sizeAt[(by * bw) + bx + 1] = -1;
+                    sizeAt[tl] = (int)TransformType.Dct16;
+                    sizeAt[tl + 1] = -1;
                     sizeAt[((by + 1) * bw) + bx] = -1;
                     sizeAt[((by + 1) * bw) + bx + 1] = -1;
                 }
@@ -965,6 +969,41 @@ internal static partial class JxlEncoder
         }
 
         return sizeAt;
+    }
+
+    // Quantised luma (Y) AC non-zero count for one block of the given transform, for RD block-size choice.
+    private static int CountLumaAcNonzeros(float[] y, int stride, int bx, int by, TransformType t, DequantMatrixSet dm, uint globalScale, int bHfMul, VarDctFrameParams fp)
+    {
+        var (dw, dh) = JxlDct.DctSelectSize(t);
+        int pw = dw * 8, ph = dh * 8;
+        int numBlocks = dw * dh;
+        float hfMul = 65536.0f / (globalScale * (float)bHfMul);
+        float[] mat = dm.GetTransposed(1, t);
+        bool needTr = JxlDct.NeedTranspose(t);
+        (ushort X, ushort Y)[] order = JxlVarDctTables.NaturalOrder(JxlDct.OrderId(t));
+
+        var buf = new float[pw * ph];
+        var g = new JxlDct.Grid(buf, 0, pw, pw, ph);
+        for (int yy = 0; yy < ph; yy++)
+        {
+            for (int xx = 0; xx < pw; xx++)
+            {
+                g.Set(xx, yy, y[(((by * 8) + yy) * stride) + (bx * 8) + xx]);
+            }
+        }
+
+        JxlDct.Dct2D(g, false);
+        int cnt = 0;
+        for (int oi = numBlocks; oi < order.Length; oi++)
+        {
+            int k = needTr ? (order[oi].X * pw) + order[oi].Y : (order[oi].Y * pw) + order[oi].X;
+            if (QuantAc(buf[k], mat[k] * hfMul, fp.QuantBias[1], fp.QuantBiasNumerator) != 0)
+            {
+                cnt++;
+            }
+        }
+
+        return cnt;
     }
 
     // Forward AC quantiser: q = round(coeff / step). step = matrix[k] * hf_mul.

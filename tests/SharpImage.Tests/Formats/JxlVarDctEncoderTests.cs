@@ -336,8 +336,8 @@ public class JxlVarDctEncoderTests
     public async Task VarDctVariableBlocks_Dct16_RoundTrips()
     {
         const int w = 128, h = 128;
-        // A very gentle gradient (a few levels across the whole image) => low activity => the encoder
-        // chooses 16x16 (Dct16) blocks, while still carrying some low-frequency AC content.
+        // A smooth low-frequency diagonal gradient: a 16x16 DCT concentrates it into far fewer coefficients
+        // than four 8x8 DCTs, so the rate-distortion block-size chooser picks Dct16.
         var frame = new ImageFrame();
         frame.Initialize(w, h, ColorspaceType.SRGB, false);
         for (int y = 0; y < h; y++)
@@ -346,8 +346,7 @@ public class JxlVarDctEncoderTests
             for (int x = 0; x < w; x++)
             {
                 int o = x * 3;
-                int lvl = 110 + ((x + y) * 12 / (w + h)); // ~12 levels total, very smooth
-                row[o] = row[o + 1] = row[o + 2] = (ushort)(lvl * Quantum.MaxValue / 255);
+                row[o] = row[o + 1] = row[o + 2] = (ushort)((x + y) * Quantum.MaxValue / (w + h));
             }
         }
 
