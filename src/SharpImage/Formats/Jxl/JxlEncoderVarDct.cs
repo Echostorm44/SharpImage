@@ -97,10 +97,13 @@ internal static partial class JxlEncoder
     public static byte[] EncodeVarDct(ImageFrame image, float distance, int[]? passShifts = null)
     {
         (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
-        // Perceptual pipeline (ported from libjxl): the masking-based adaptive quant field sets per-block
-        // hf_mul and the EstimateEntropy cost drives block-size selection. gs sets the hf_mul resolution and
-        // the DC precision (quant_lf); the AC quant level comes from the quant field, not hfm.
-        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: false, variableBlocks: true, perceptual: true, distance: distance);
+        // Default: the distortion-guarded variable-block heuristic. It measures BETTER than the faithful
+        // libjxl perceptual port on our SSIMULACRA2 content mix (notably graphic/smooth content, where
+        // libjxl's photo+Butteraugli tuning favours small blocks and forfeits the large-block win). The
+        // ported perceptual pipeline (JxlEncoderPerceptual, adaptive quant + EstimateEntropy + Gaborish) is
+        // available opt-in via `perceptual: true`; matching full libjxl also needs its Butteraugli-based
+        // iterative quant refinement, which is impractical to port.
+        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: false, variableBlocks: true);
     }
 
     // Maps a Butteraugli-style distance to (global_scale, quant_lf, block_hf_mul). global_scale is fixed;
@@ -297,10 +300,8 @@ internal static partial class JxlEncoder
         {
             // libjxl's real model (ported): a masking-based adaptive quant field + an EstimateEntropy cost
             // (rate + masking-weighted L8 spatial distortion) driving the hierarchical block-size search.
+            // Masking field + block selection run on the ORIGINAL opsin (libjxl order: heuristics first).
             var (quantField, mask1x1) = JxlEncoderPerceptual.ComputeAdaptiveQuantField(xyb, stride, w, h, bw, bh, distance);
-            // Gaborish: pre-sharpen the opsin so the decoder's Gaborish 3x3 blur reconstructs it. Do this
-            // before block-selection/DCT so the coefficients being coded are of the pre-sharpened image.
-            JxlEncoderPerceptual.GaborishInverse(xyb, stride, strideH);
             var cfg = JxlEncoderPerceptual.MakeConfig(xyb, stride, w, h, bw, quantField, mask1x1, new[] { 0f, 0f, 1f }, dm, distance);
             sizeAt = JxlEncoderPerceptual.ProcessImage(cfg, bw, bh, distance);
             // Per-data-block hf_mul from the quant field, aggregated over the block's cells the same way
@@ -342,6 +343,13 @@ internal static partial class JxlEncoder
             // Block-size layout: sizeAt[pos] = (int)TransformType for a data block's top-left position, or -1
             // for a position covered by a larger block. Off => every 8x8 position is its own Dct8 block.
             sizeAt = BuildDctLayout(xyb, stride, dm, globalScale, hfMulBlock, blockHfMul, adaptiveQuant, fp, bw, bh, variableBlocks);
+        }
+
+        if (perceptual)
+        {
+            // Gaborish: pre-sharpen the opsin now that heuristics are done, so the CfL/forward DCT code the
+            // pre-sharpened image and the decoder's Gaborish blur reconstructs it.
+            JxlEncoderPerceptual.GaborishInverse(xyb, stride, strideH);
         }
 
         // Chroma-from-luma: per 64x64 cell, decorrelate X and B from Y (the AC coefficients). kxRaw/kbRaw
