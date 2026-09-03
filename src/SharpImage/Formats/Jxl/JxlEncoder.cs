@@ -218,21 +218,32 @@ internal static class JxlEncoder
     {
         WpHeader wpHeader = WpMode(wpMode);
         List<EncChannelRef> refs = ToRefs(channels);
-        byte[] best = BuildSection(channels, writeTransforms, SingleLeafTree, wpMode);
+        byte[] best = null!;
+        void Consider(LearnedTree tree)
+        {
+            byte[] pfx = BuildSection(channels, writeTransforms, tree, wpMode, useAns: false);
+            if (best == null || pfx.Length < best.Length)
+            {
+                best = pfx;
+            }
+
+            byte[]? ansSec = BuildSection(channels, writeTransforms, tree, wpMode, useAns: true);
+            if (ansSec != null && ansSec.Length < best.Length)
+            {
+                best = ansSec;
+            }
+        }
+
+        Consider(SingleLeafTree);
         foreach (float threshold in JxlTreeLearner.NodeThresholds)
         {
-            var learned = new LearnedTree(JxlTreeLearner.Learn(refs, wpHeader, threshold));
-            byte[] sec = BuildSection(channels, writeTransforms, learned, wpMode);
-            if (sec.Length < best.Length)
-            {
-                best = sec;
-            }
+            Consider(new LearnedTree(JxlTreeLearner.Learn(refs, wpHeader, threshold)));
         }
 
         return best;
     }
 
-    private static byte[] BuildSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, LearnedTree tree, int wpMode)
+    private static byte[] BuildSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, LearnedTree tree, int wpMode, bool useAns = false)
     {
         WpHeader wpHeader = WpMode(wpMode);
         int total = 0;
@@ -252,17 +263,53 @@ internal static class JxlEncoder
             off += ch.W * ch.H;
         }
 
-        var plan = PlanPixelsCtx(new List<(int[], int[])> { (stream, ctxs) }, tree.LeafCount, out List<Op>[] ops);
+        var streams = new List<(int[], int[])> { (stream, ctxs) };
+        var plan = PlanPixelsCtx(streams, tree.LeafCount, out List<Op>[] ops, useAns ? int.MaxValue / 2 : 0);
+
+        JxlAnsWriter? ans = null;
+        int[][] ansCounts = null!;
+        if (useAns)
+        {
+            int logAlpha = Math.Max(5, JxlBits.CeilLog2(plan.LitAlphabet));
+            if (logAlpha > 8)
+            {
+                return null!; // alphabet too large for ANS
+            }
+
+            ansCounts = new int[plan.K][];
+            for (int c = 0; c < plan.K; c++)
+            {
+                ansCounts[c] = JxlEntropy.NormalizeCounts(plan.ClusterHist[c], JxlEntropy.HistShift);
+            }
+
+            ans = new JxlAnsWriter(ansCounts, logAlpha);
+        }
 
         var s = new JxlBitWriter();
         s.WriteBits(1, 1); // DequantMatrices::DecodeDC all_default
         s.WriteBits(1, 1); // has_tree = 1
         WriteTree(s, tree.Tokens);
-        WriteLz77HistogramCtx(s, plan);
+        if (useAns)
+        {
+            WriteAnsHistogramCtx(s, plan, ansCounts, ans!.LogAlpha);
+        }
+        else
+        {
+            WriteLz77HistogramCtx(s, plan);
+        }
+
         s.WriteBool(true); // use_global tree + code
         WriteWpHeaderBits(s, wpMode);
         writeTransforms(s);
-        EmitOpsCtx(s, ops[0], ctxs, plan);
+        if (useAns)
+        {
+            EmitOpsAns(s, ops[0], ctxs, plan, ans!);
+        }
+        else
+        {
+            EmitOpsCtx(s, ops[0], ctxs, plan);
+        }
+
         return s.ToArray();
     }
 
