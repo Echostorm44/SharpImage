@@ -689,45 +689,6 @@ internal static partial class JxlEncoder
         }
     }
 
-    // Builds the PassGroup HF coefficient tokens for one 256px group's block window (inverse of
-    // JxlVarDct.WriteHfCoeff), all in cluster 0. Emission order matches the decoder: group-local block
-    // raster (y, x), channel order {Y, X, B}; per block+channel a non-zeros count token, then coefficient
-    // tokens in scan order up to (and including) the last non-zero. bx0/by0 is the group origin in blocks,
-    // gBw/gBh the group block size, bw the full-image block width (to index ac).
-    private static List<ModToken> BuildHfTokens(int bx0, int by0, int gBw, int gBh, int bw, int[][] ac)
-    {
-        var tokens = new List<ModToken>();
-        for (int y = 0; y < gBh; y++)
-        {
-            for (int x = 0; x < gBw; x++)
-            {
-                int bi = ((by0 + y) * bw) + bx0 + x;
-                for (int cc = 0; cc < 3; cc++)
-                {
-                    int c = new[] { 1, 0, 2 }[cc]; // Y, X, B
-                    int baseIdx = bi * 64;
-                    int nonZeros = 0, lastNz = 0;
-                    for (int oi = 1; oi < 64; oi++)
-                    {
-                        if (ac[c][baseIdx + oi] != 0)
-                        {
-                            nonZeros++;
-                            lastNz = oi;
-                        }
-                    }
-
-                    tokens.Add(HybridToken(nonZeros)); // non-zeros count (used directly by the decoder)
-                    for (int oi = 1; oi <= lastNz; oi++)
-                    {
-                        tokens.Add(HybridToken(PackSigned(ac[c][baseIdx + oi])));
-                    }
-                }
-            }
-        }
-
-        return tokens;
-    }
-
     private static ModToken HybridToken(int value)
     {
         (int token, int nbits, int bits) = PackHybridFull(LitSplit, LitMsb, LitLsb, value);
