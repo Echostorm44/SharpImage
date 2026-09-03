@@ -947,22 +947,51 @@ internal static partial class JxlEncoder
             return sizeAt;
         }
 
+        const int perBlockPenalty = 4;      // ~ non-zeros-count tokens + block_info per data block
+        const int rectMargin = 3;           // rectangular must beat the best square split by this margin
+
         for (int by = 0; by + 1 < bh; by += 2)
         {
             for (int bx = 0; bx + 1 < bw; bx += 2)
             {
                 int tl = (by * bw) + bx;
                 int bHfMul = adaptiveQuant ? hfMulBlock[tl] : (int)blockHfMul;
-                int cnt16 = CountLumaAcNonzeros(xyb[1], stride, bx, by, TransformType.Dct16, dm, globalScale, bHfMul, fp);
-                int cnt8 = CountLumaAcNonzeros(xyb[1], stride, bx, by, TransformType.Dct8, dm, globalScale, bHfMul, fp)
-                    + CountLumaAcNonzeros(xyb[1], stride, bx + 1, by, TransformType.Dct8, dm, globalScale, bHfMul, fp)
-                    + CountLumaAcNonzeros(xyb[1], stride, bx, by + 1, TransformType.Dct8, dm, globalScale, bHfMul, fp)
-                    + CountLumaAcNonzeros(xyb[1], stride, bx + 1, by + 1, TransformType.Dct8, dm, globalScale, bHfMul, fp);
-                if (cnt16 < cnt8)
+                int Cnt(int x, int y, TransformType t) => CountLumaAcNonzeros(xyb[1], stride, x, y, t, dm, globalScale, bHfMul, fp);
+
+                // Four ways to cover the 16x16 region; cost = luma AC non-zeros + a small per-block overhead.
+                int cost8 = Cnt(bx, by, TransformType.Dct8) + Cnt(bx + 1, by, TransformType.Dct8)
+                    + Cnt(bx, by + 1, TransformType.Dct8) + Cnt(bx + 1, by + 1, TransformType.Dct8) + (4 * perBlockPenalty);
+                int cost16 = Cnt(bx, by, TransformType.Dct16) + perBlockPenalty;
+                // Rectangular is only worth its extra block over Dct16, so require it to clearly beat both
+                // square options (its non-square DCT is a worse fit unless the region is truly directional).
+                int costV = Cnt(bx, by, TransformType.Dct16x8) + Cnt(bx + 1, by, TransformType.Dct16x8) + (2 * perBlockPenalty) + rectMargin; // two 8x16 columns
+                int costH = Cnt(bx, by, TransformType.Dct8x16) + Cnt(bx, by + 1, TransformType.Dct8x16) + (2 * perBlockPenalty) + rectMargin; // two 16x8 rows
+
+                int best = Math.Min(Math.Min(cost8, cost16), Math.Min(costV, costH));
+                if (best >= cost8)
+                {
+                    continue; // Dct8 (4x) — leave as initialised
+                }
+
+                if (best == cost16)
                 {
                     sizeAt[tl] = (int)TransformType.Dct16;
-                    sizeAt[tl + 1] = -1;
+                    sizeAt[tl + 1] = sizeAt[((by + 1) * bw) + bx] = sizeAt[((by + 1) * bw) + bx + 1] = -1;
+                }
+                else if (best == costV)
+                {
+                    // Dct16x8 covers (1 wide x 2 tall) positions: two vertical strips.
+                    sizeAt[tl] = (int)TransformType.Dct16x8;
                     sizeAt[((by + 1) * bw) + bx] = -1;
+                    sizeAt[tl + 1] = (int)TransformType.Dct16x8;
+                    sizeAt[((by + 1) * bw) + bx + 1] = -1;
+                }
+                else
+                {
+                    // Dct8x16 covers (2 wide x 1 tall) positions: two horizontal strips.
+                    sizeAt[tl] = (int)TransformType.Dct8x16;
+                    sizeAt[tl + 1] = -1;
+                    sizeAt[((by + 1) * bw) + bx] = (int)TransformType.Dct8x16;
                     sizeAt[((by + 1) * bw) + bx + 1] = -1;
                 }
             }
@@ -971,7 +1000,10 @@ internal static partial class JxlEncoder
         return sizeAt;
     }
 
-    // Quantised luma (Y) AC non-zero count for one block of the given transform, for RD block-size choice.
+    // Rough entropy-coded bit cost of one block's quantised luma (Y) AC coefficients, for RD block-size
+    // choice: each non-zero coefficient costs ~ 2 + 2*log2(|q|+1) bits (sign + magnitude), which — unlike a
+    // raw non-zero count — reflects that larger coefficients are dearer, so it stops over-picking the larger
+    // transforms. The caller adds a fixed per-block overhead.
     private static int CountLumaAcNonzeros(float[] y, int stride, int bx, int by, TransformType t, DequantMatrixSet dm, uint globalScale, int bHfMul, VarDctFrameParams fp)
     {
         var (dw, dh) = JxlDct.DctSelectSize(t);
