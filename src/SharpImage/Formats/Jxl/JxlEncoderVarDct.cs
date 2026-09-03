@@ -36,7 +36,7 @@ internal static partial class JxlEncoder
     /// for the leading (coarse) passes in DECREASING order; a final full-precision (shift 0) pass is
     /// appended automatically. E.g. [2,1] => 3 passes with shifts {2,1,0}. Null/empty => a single pass.
     /// </summary>
-    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null, bool adaptiveQuant = false, bool variableBlocks = false)
+    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null, bool adaptiveQuant = false, bool variableBlocks = false, bool perceptual = false, float distance = 1.0f)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -54,8 +54,8 @@ internal static partial class JxlEncoder
         int[] shifts = BuildPassShifts(passShifts);
 
         float[][] srgb = ExtractSrgb(image, w, h);
-        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks);
-        return AssembleVarDctCodestream(w, h, sections, shifts);
+        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks, perceptual, distance);
+        return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual);
     }
 
     private static int[] BuildPassShifts(int[]? passShifts)
@@ -97,11 +97,10 @@ internal static partial class JxlEncoder
     public static byte[] EncodeVarDct(ImageFrame image, float distance, int[]? passShifts = null)
     {
         (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
-        // adaptiveQuant is off by default: its per-block masking is a Butteraugli-style perceptual signal,
-        // but (uncalibrated) it measures net-negative on SSIMULACRA2 — it barely helps smooth content and
-        // interacts badly with variable blocks on textured photos. Variable blocks (with the distortion
-        // guard) carry the ratio win on their own.
-        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: false, variableBlocks: true);
+        // Perceptual pipeline (ported from libjxl): the masking-based adaptive quant field sets per-block
+        // hf_mul and the EstimateEntropy cost drives block-size selection. gs sets the hf_mul resolution and
+        // the DC precision (quant_lf); the AC quant level comes from the quant field, not hfm.
+        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: false, variableBlocks: true, perceptual: true, distance: distance);
     }
 
     // Maps a Butteraugli-style distance to (global_scale, quant_lf, block_hf_mul). global_scale is fixed;
@@ -169,7 +168,7 @@ internal static partial class JxlEncoder
     // For a single-group single-pass frame the whole body is one TOC section; a progressive (multi-pass)
     // frame uses the multi-section TOC (LfGlobal | LfGroup | HfGlobal | PassGroup-per-pass) so a streaming
     // decoder can render the DC preview from the LfGroup section before the AC passes arrive.
-    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts)
+    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts, bool gaborish)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
@@ -177,7 +176,7 @@ internal static partial class JxlEncoder
         WriteSizeHeader(main, w, h);
         WriteXybImageMetadata(main);
         main.JumpToByteBoundary();
-        WriteVarDctFrameHeader(main, shifts);
+        WriteVarDctFrameHeader(main, shifts, gaborish);
         main.WriteBool(false); // permuted TOC = false
         main.JumpToByteBoundary();
 
@@ -213,7 +212,7 @@ internal static partial class JxlEncoder
 
     // Frame header for a regular XYB VarDCT frame with loop filters + adaptive-LF-smoothing disabled.
     // shifts holds the per-pass coefficient shift (length == num_passes; final entry 0).
-    private static void WriteVarDctFrameHeader(JxlBitWriter w, int[] shifts)
+    private static void WriteVarDctFrameHeader(JxlBitWriter w, int[] shifts, bool gaborish)
     {
         int numPasses = shifts.Length;
         w.WriteBool(false);  // not all_default
@@ -231,7 +230,12 @@ internal static partial class JxlEncoder
         w.WriteU32(0, E.Val(0), E.BitsOff(4, 0), E.BitsOff(5, 16), E.BitsOff(10, 48)); // name length = 0
 
         w.WriteBool(false);  // loop filter: not all_default
-        w.WriteBool(false);  // gaborish = off
+        w.WriteBool(gaborish); // gaborish
+        if (gaborish)
+        {
+            w.WriteBool(false); // gab_custom = false => default weights (match the decoder)
+        }
+
         w.WriteBits(0, 2);   // epf_iters = 0
         w.WriteU64(0);       // loop-filter extensions = none
         w.WriteU64(0);       // frame-header extensions = none
@@ -253,7 +257,7 @@ internal static partial class JxlEncoder
     }
 
     // --- the frame body as TOC sections (see AssembleVarDctCodestream) ---
-    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts, bool adaptiveQuant, bool variableBlocks)
+    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts, bool adaptiveQuant, bool variableBlocks, bool perceptual = false, float distance = 1.0f)
     {
         int bw = (w + 7) / 8, bh = (h + 7) / 8;   // blocks
         int stride = bw * 8, strideH = bh * 8;
@@ -287,14 +291,58 @@ internal static partial class JxlEncoder
         float scaleB = (float)(mlf[2] * 512.0 / scaleInv);
         DequantMatrixSet dm = DequantMatrixSet.Default();
 
-        // Per-8x8-block luma HF activity (libjxl's HfModulation term): drives adaptive quant AND variable
-        // block-size selection.
-        double[] activity = ComputeActivity(xyb[1], stride, bw, bh);
-        int[] hfMulBlock = adaptiveQuant ? AdaptiveHfMulFromActivity(activity, bw, bh, blockHfMul) : null!;
+        int[] hfMulBlock;
+        int[] sizeAt;
+        if (perceptual)
+        {
+            // libjxl's real model (ported): a masking-based adaptive quant field + an EstimateEntropy cost
+            // (rate + masking-weighted L8 spatial distortion) driving the hierarchical block-size search.
+            var (quantField, mask1x1) = JxlEncoderPerceptual.ComputeAdaptiveQuantField(xyb, stride, w, h, bw, bh, distance);
+            // Gaborish: pre-sharpen the opsin so the decoder's Gaborish 3x3 blur reconstructs it. Do this
+            // before block-selection/DCT so the coefficients being coded are of the pre-sharpened image.
+            JxlEncoderPerceptual.GaborishInverse(xyb, stride, strideH);
+            var cfg = JxlEncoderPerceptual.MakeConfig(xyb, stride, w, h, bw, quantField, mask1x1, new[] { 0f, 0f, 1f }, dm, distance);
+            sizeAt = JxlEncoderPerceptual.ProcessImage(cfg, bw, bh, distance);
+            // Per-data-block hf_mul from the quant field, aggregated over the block's cells the same way
+            // EstimateEntropy aggregates it (quant_norm16). hf_mul = quant * 65536 / global_scale so that the
+            // encoder's actual quantiser (step = matrix * 65536/(gs*hf_mul)) equals coeff*invMatrix*quant.
+            hfMulBlock = new int[bw * bh];
+            for (int by = 0; by < bh; by++)
+            {
+                for (int bx = 0; bx < bw; bx++)
+                {
+                    int pos = (by * bw) + bx;
+                    if (sizeAt[pos] < 0)
+                    {
+                        continue;
+                    }
 
-        // Block-size layout: sizeAt[pos] = (int)TransformType for a data block's top-left position, or -1
-        // for a position covered by a larger block. Off => every 8x8 position is its own Dct8 block.
-        int[] sizeAt = BuildDctLayout(xyb, stride, dm, globalScale, hfMulBlock, blockHfMul, adaptiveQuant, fp, bw, bh, variableBlocks);
+                    var (qdw, qdh) = JxlDct.DctSelectSize((TransformType)sizeAt[pos]);
+                    float qn = QuantNorm(quantField, bw, bx, by, qdw, qdh);
+                    int hf = Math.Clamp((int)MathF.Round(qn * 65536f / globalScale), 1, 4096);
+                    for (int dy = 0; dy < qdh; dy++)
+                    {
+                        for (int dx = 0; dx < qdw; dx++)
+                        {
+                            hfMulBlock[((by + dy) * bw) + bx + dx] = hf;
+                        }
+                    }
+                }
+            }
+
+            adaptiveQuant = true; // forward path reads hfMulBlock per block
+        }
+        else
+        {
+            // Per-8x8-block luma HF activity (libjxl's HfModulation term): drives adaptive quant AND variable
+            // block-size selection.
+            double[] activity = ComputeActivity(xyb[1], stride, bw, bh);
+            hfMulBlock = adaptiveQuant ? AdaptiveHfMulFromActivity(activity, bw, bh, blockHfMul) : null!;
+
+            // Block-size layout: sizeAt[pos] = (int)TransformType for a data block's top-left position, or -1
+            // for a position covered by a larger block. Off => every 8x8 position is its own Dct8 block.
+            sizeAt = BuildDctLayout(xyb, stride, dm, globalScale, hfMulBlock, blockHfMul, adaptiveQuant, fp, bw, bh, variableBlocks);
+        }
 
         // Chroma-from-luma: per 64x64 cell, decorrelate X and B from Y (the AC coefficients). kxRaw/kbRaw
         // are the modular grid values in HfMetadata; the decoder applies X += (kxRaw/84)*Y and
@@ -1203,6 +1251,38 @@ internal static partial class JxlEncoder
     // choice: each non-zero coefficient costs ~ 2 + 2*log2(|q|+1) bits (sign + magnitude), which — unlike a
     // raw non-zero count — reflects that larger coefficients are dearer, so it stops over-picking the larger
     // transforms. The caller adds a fixed per-block overhead.
+    // Aggregate the quant field over a block's cells like libjxl's EstimateEntropy quant_norm16: direct for
+    // 1 cell, max for 2, a 16th-power-norm for 4+.
+    private static float QuantNorm(float[] quantField, int bw, int bx, int by, int dwBlocks, int dhBlocks)
+    {
+        int num = dwBlocks * dhBlocks;
+        if (num == 1)
+        {
+            return quantField[(by * bw) + bx];
+        }
+
+        if (num == 2)
+        {
+            return dhBlocks == 2
+                ? MathF.Max(quantField[(by * bw) + bx], quantField[((by + 1) * bw) + bx])
+                : MathF.Max(quantField[(by * bw) + bx], quantField[(by * bw) + bx + 1]);
+        }
+
+        float acc = 0;
+        for (int dy = 0; dy < dhBlocks; dy++)
+        {
+            for (int dx = 0; dx < dwBlocks; dx++)
+            {
+                float q = quantField[((by + dy) * bw) + bx + dx];
+                q *= q; q *= q; q *= q;
+                acc += q * q;
+            }
+        }
+
+        acc /= num;
+        return MathF.Pow(acc, 1.0f / 16.0f);
+    }
+
     // The finest (largest) adaptive hf_mul over the dwBlocks x dhBlocks 8x8 cells a block covers.
     private static int MaxHfMul(int[] hfMulBlock, int bw, int bx, int by, int dwBlocks, int dhBlocks)
     {
