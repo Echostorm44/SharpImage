@@ -42,18 +42,23 @@ internal static class JxlTreeLearner
 
     private const int MaxPropertyValues = 48; // quantile buckets for data-driven properties
     private const int MaxSamples = 1 << 21;   // cap learning cost on very large images
-    private const float NodeThreshold = 160f;  // min entropy-bits a split must save (libjxl ~75..150)
     private const int MaxLeaves = 256;         // safety cap on tree size
 
-    /// <summary>Learns a global MA tree for the given residual channels (whole-channel prediction).</summary>
-    public static MaTreeNode Learn(List<EncChannelRef> channels, WpHeader wpHeader)
+    // Candidate split thresholds (min entropy-bits a split must save). The right value is content-
+    // dependent — busy photographs want a higher threshold (fewer splits: the subsampled cost model
+    // over-estimates split benefit since later histogram clustering re-merges contexts), flat/synthetic
+    // content wants a lower one. The encoder learns a tree at each and keeps the smaller output.
+    public static readonly float[] NodeThresholds = { 160f, 400f };
+
+    /// <summary>Learns a global MA tree for the given residual channels at the given split threshold.</summary>
+    public static MaTreeNode Learn(List<EncChannelRef> channels, WpHeader wpHeader, float nodeThreshold)
     {
         int[][] thresholds = BuildThresholds(channels);
         var samples = CollectSamples(channels, thresholds, wpHeader);
         var root = new MaTreeNode { Property = -1, Predictor = WeightedPredictor };
         if (samples.Count > 1)
         {
-            FindBestSplit(samples, thresholds, root);
+            FindBestSplit(samples, thresholds, root, nodeThreshold);
         }
 
         return root;
@@ -161,8 +166,9 @@ internal static class JxlTreeLearner
         return s;
     }
 
-    // Candidate leaf predictors the learner chooses between (decoder ids): weighted, gradient, select,
-    // average, top, left. libjxl's higher efforts likewise select among all predictors per leaf.
+    // Candidate leaf predictors the learner chooses between (decoder ids). The full modular set is
+    // supported by PredictGuess, but using all of them overfits the subsampled cost model; this focused
+    // set (weighted, gradient, select, average, top, left) measured best.
     public static readonly int[] CandidatePredictors = { 6, 5, 4, 3, 2, 1 };
 
     public static int PredictorIndex(int pred)
@@ -193,6 +199,7 @@ internal static class JxlTreeLearner
         long topright = (x + 1 < w && y > 0) ? px[((y - 1) * w) + x + 1] : top;
         long leftleft = x > 1 ? px[(y * w) + x - 2] : left;
         long toptop = y > 1 ? px[((y - 2) * w) + x] : top;
+        long toprr = (x + 2 < w && y > 0) ? px[((y - 1) * w) + x + 2] : topright;
 
         props[0] = chan;
         props[1] = groupId;
@@ -234,19 +241,27 @@ internal static class JxlTreeLearner
 
         for (int i = 0; i < CandidatePredictors.Length; i++)
         {
-            guesses[i] = PredictGuess(CandidatePredictors[i], left, top, topleft, wpPred);
+            guesses[i] = PredictGuess(CandidatePredictors[i], left, top, toptop, topleft, topright, leftleft, toprr, wpPred);
         }
     }
 
-    // Mirrors JxlModular.PredictOne for the predictors we use (all need only left/top/topleft/wp).
-    private static long PredictGuess(int pred, long left, long top, long topleft, long wp) => pred switch
+    // Mirrors JxlModular.PredictOne for all modular predictors (0..13).
+    private static long PredictGuess(int pr, long left, long top, long toptop, long topleft, long topright, long leftleft, long toprr, long wp) => pr switch
     {
-        6 => wp,
-        5 => ClampedGradient(left, top, topleft),
-        4 => Select(left, top, topleft),
-        3 => (left + top) / 2,
-        2 => top,
+        0 => 0,
         1 => left,
+        2 => top,
+        3 => (left + top) / 2,
+        4 => Select(left, top, topleft),
+        5 => ClampedGradient(left, top, topleft),
+        6 => wp,
+        7 => topright,
+        8 => topleft,
+        9 => leftleft,
+        10 => (left + topleft) / 2,
+        11 => (topleft + top) / 2,
+        12 => (top + topright) / 2,
+        13 => ((6 * top) - (2 * toptop) + (7 * left) + leftleft + toprr + (3 * topright) + 8) / 16,
         _ => 0,
     };
 
@@ -496,7 +511,7 @@ internal static class JxlTreeLearner
 
     // ─── Greedy split search (libjxl FindBestSplit, simplified: no static-multiplier forcing) ────────
 
-    private static void FindBestSplit(Samples s, int[][] thresholds, MaTreeNode root)
+    private static void FindBestSplit(Samples s, int[][] thresholds, MaTreeNode root, double nodeThreshold)
     {
         var stack = new Stack<(int Begin, int End, MaTreeNode Node)>();
         stack.Push((0, s.Count, root));
@@ -650,7 +665,7 @@ internal static class JxlTreeLearner
                 }
             }
 
-            if (bestPropIdx >= 0 && bestCost + NodeThreshold < baseBits)
+            if (bestPropIdx >= 0 && bestCost + nodeThreshold < baseBits)
             {
                 int splitPos = Partition(s, b, e, bestPropIdx, bestBucket);
                 if (splitPos <= b || splitPos >= e)

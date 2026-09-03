@@ -204,10 +204,19 @@ internal static class JxlEncoder
     private static byte[] BuildSingleGroupSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, int wpMode)
     {
         WpHeader wpHeader = WpMode(wpMode);
-        var learned = new LearnedTree(JxlTreeLearner.Learn(ToRefs(channels), wpHeader));
-        byte[] modelled = BuildSection(channels, writeTransforms, learned, wpMode);
-        byte[] plain = BuildSection(channels, writeTransforms, SingleLeafTree, wpMode);
-        return modelled.Length <= plain.Length ? modelled : plain;
+        List<EncChannelRef> refs = ToRefs(channels);
+        byte[] best = BuildSection(channels, writeTransforms, SingleLeafTree, wpMode);
+        foreach (float threshold in JxlTreeLearner.NodeThresholds)
+        {
+            var learned = new LearnedTree(JxlTreeLearner.Learn(refs, wpHeader, threshold));
+            byte[] sec = BuildSection(channels, writeTransforms, learned, wpMode);
+            if (sec.Length < best.Length)
+            {
+                best = sec;
+            }
+        }
+
+        return best;
     }
 
     private static byte[] BuildSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, LearnedTree tree, int wpMode)
@@ -554,10 +563,18 @@ internal static class JxlEncoder
             }
         }
 
-        var learned = new LearnedTree(JxlTreeLearner.Learn(tileRefs, WpMode(wpMode)));
-        byte[][] modelled = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, learned, rctType, wpMode);
-        byte[][] plain = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree, rctType, wpMode);
-        return TotalLength(modelled) <= TotalLength(plain) ? modelled : plain;
+        byte[][] best = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree, rctType, wpMode);
+        foreach (float threshold in JxlTreeLearner.NodeThresholds)
+        {
+            var learned = new LearnedTree(JxlTreeLearner.Learn(tileRefs, WpMode(wpMode), threshold));
+            byte[][] secs = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, learned, rctType, wpMode);
+            if (TotalLength(secs) < TotalLength(best))
+            {
+                best = secs;
+            }
+        }
+
+        return best;
     }
 
     // Reference channels for a same-size tile set: earlier channels (c-1, c-2, ...), up to MaxRefChannels.
