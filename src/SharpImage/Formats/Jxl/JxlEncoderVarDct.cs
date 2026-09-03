@@ -36,7 +36,7 @@ internal static partial class JxlEncoder
     /// for the leading (coarse) passes in DECREASING order; a final full-precision (shift 0) pass is
     /// appended automatically. E.g. [2,1] => 3 passes with shifts {2,1,0}. Null/empty => a single pass.
     /// </summary>
-    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null, bool adaptiveQuant = false, bool variableBlocks = false, bool perceptual = false, float distance = 1.0f)
+    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null, bool adaptiveQuant = false, bool variableBlocks = false, bool perceptual = false, float distance = 1.0f, float[]? quantFieldOverride = null, int[]? layoutOverride = null)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -54,7 +54,7 @@ internal static partial class JxlEncoder
         int[] shifts = BuildPassShifts(passShifts);
 
         float[][] srgb = ExtractSrgb(image, w, h);
-        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks, perceptual, distance);
+        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks, perceptual, distance, quantFieldOverride, layoutOverride);
         return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual);
     }
 
@@ -104,6 +104,182 @@ internal static partial class JxlEncoder
         // available opt-in via `perceptual: true`; matching full libjxl also needs its Butteraugli-based
         // iterative quant refinement, which is impractical to port.
         return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: false, variableBlocks: true);
+    }
+
+    /// <summary>
+    /// Perceptual VarDCT with iterative quant-field refinement (libjxl's FindBestQuantization structure):
+    /// encode -> decode -> measure a per-tile perceptual distance -> raise the quant field where the
+    /// distortion exceeds the image norm (and gently lower it where below), preserving the geometric mean so
+    /// the rate stays put. Equalising perceptual distortion is the spatial bit-allocation that closes the gap
+    /// to libjxl. Uses the ported adaptive quant field + Gaborish (perceptual: true).
+    /// </summary>
+    public static byte[] EncodeVarDctRefined(ImageFrame image, float distance, int iters = 4, int[]? passShifts = null)
+    {
+        int w = (int)image.Columns, h = (int)image.Rows;
+        if (w > VarDctLfGroupDim || h > VarDctLfGroupDim)
+        {
+            throw new NotSupportedException("VarDCT encoder currently supports images up to 2048x2048 (one LF group).");
+        }
+
+        (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
+        int bw = (w + 7) / 8, bh = (h + 7) / 8, stride = bw * 8, strideH = bh * 8;
+        var fp = new VarDctFrameParams();
+
+        float[][] srgb0 = ExtractSrgb(image, w, h);
+        float[][] lin0 = ToLinear(srgb0, w, h);
+        float[][] xyb0 = PadToXyb(srgb0, w, h, stride, strideH, fp);
+        var (quantField, mask1x1) = JxlEncoderPerceptual.ComputeAdaptiveQuantField(xyb0, stride, w, h, bw, bh, distance);
+
+        // Fix the block layout ONCE from the initial field (libjxl fixes the AC strategy before refining the
+        // quant field) so the per-tile distortion is measured against a stable layout across iterations.
+        var dm = DequantMatrixSet.Default();
+        var cfg = JxlEncoderPerceptual.MakeConfig(xyb0, stride, w, h, bw, quantField, mask1x1, new[] { 0f, 0f, 1f }, dm, distance);
+        int[] layout = JxlEncoderPerceptual.ProcessImage(cfg, bw, bh, distance);
+
+        byte[] bestCs = null!;
+        double bestScore = double.NegativeInfinity;
+        for (int it = 0; it <= iters; it++)
+        {
+            byte[] cs = EncodeVarDct(image, gs, qlf, hfm, passShifts, false, true, perceptual: true, distance: distance, quantFieldOverride: quantField, layoutOverride: layout);
+
+            // Decode our own output and score it with the (ssimulacra2_rs-validated) metric; keep the best
+            // codestream across iterations (the equalisation peaks then overshoots).
+            JxlModularResult dec = JxlFrame.DecodeModularCodestream(cs);
+            float[][] linDec = DecodedToLinear(dec, w, h);
+            var (myScore, dist) = JxlEncoderSsimulacra.Compute(lin0, linDec, w, h, bw, bh, fp);
+            if (myScore > bestScore)
+            {
+                bestScore = myScore;
+                bestCs = cs;
+            }
+
+            if (it == iters)
+            {
+                break;
+            }
+
+            // Aggregate the per-tile distortion per DATA block (each multi-block transform carries one quant),
+            // then equalise the quant field (finer where the block is reconstructed worse than the image norm),
+            // geometric-mean-preserving so the rate is held.
+
+            // Aggregate the tile distances over each data block and broadcast to all its cells.
+            var blockDist = new double[bw * bh];
+            for (int by = 0; by < bh; by++)
+            {
+                for (int bx = 0; bx < bw; bx++)
+                {
+                    int pos = (by * bw) + bx;
+                    if (layout[pos] < 0)
+                    {
+                        continue;
+                    }
+
+                    var (qdw, qdh) = JxlDct.DctSelectSize((TransformType)layout[pos]);
+                    double sum = 0;
+                    for (int dy = 0; dy < qdh; dy++)
+                    {
+                        for (int dx = 0; dx < qdw; dx++)
+                        {
+                            sum += dist[((by + dy) * bw) + bx + dx];
+                        }
+                    }
+
+                    double avg = sum / (qdw * qdh);
+                    for (int dy = 0; dy < qdh; dy++)
+                    {
+                        for (int dx = 0; dx < qdw; dx++)
+                        {
+                            blockDist[((by + dy) * bw) + bx + dx] = avg;
+                        }
+                    }
+                }
+            }
+
+            double logMean = 0;
+            for (int i = 0; i < blockDist.Length; i++)
+            {
+                logMean += Math.Log(blockDist[i] + 1e-9);
+            }
+
+            double geoMean = Math.Exp(logMean / blockDist.Length);
+
+            // Equalise gently (small power damps the oscillation that a large step causes), then renormalise
+            // the field's geometric mean back to where it was so the total rate is held (pure reallocation).
+            const double power = 0.2;
+            double preLog = 0, postLog = 0;
+            for (int i = 0; i < quantField.Length; i++)
+            {
+                preLog += Math.Log(quantField[i] + 1e-9);
+                double ratio = (blockDist[i] + 1e-9) / geoMean;
+                quantField[i] *= (float)Math.Pow(ratio, power);
+                quantField[i] = Math.Clamp(quantField[i], 0.02f, 32f);
+                postLog += Math.Log(quantField[i] + 1e-9);
+            }
+
+            float renorm = (float)Math.Exp((preLog - postLog) / quantField.Length);
+            for (int i = 0; i < quantField.Length; i++)
+            {
+                quantField[i] *= renorm;
+            }
+        }
+
+        return bestCs;
+    }
+
+    // sRGB [0,1] planes -> linear RGB planes (w*h), for the SSIMULACRA2 metric.
+    private static float[][] ToLinear(float[][] srgb, int w, int h)
+    {
+        var lin = new float[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            lin[c] = new float[w * h];
+            for (int i = 0; i < w * h; i++)
+            {
+                lin[c][i] = JxlVarDctEncoder.SrgbToLinearPublic(srgb[c][i]);
+            }
+        }
+
+        return lin;
+    }
+
+    // Decoded modular result (0..255) -> linear RGB planes (w*h).
+    private static float[][] DecodedToLinear(JxlModularResult dec, int w, int h)
+    {
+        var lin = new float[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            lin[c] = new float[w * h];
+        }
+
+        for (int i = 0; i < w * h; i++)
+        {
+            for (int c = 0; c < 3; c++)
+            {
+                lin[c][i] = JxlVarDctEncoder.SrgbToLinearPublic(Math.Clamp(dec.Channels[c].Px[i], 0, 255) / 255f);
+            }
+        }
+
+        return lin;
+    }
+
+    // sRGB [0,1] planes -> padded opsin XYB (matching BuildVarDctSections' setup).
+    private static float[][] PadToXyb(float[][] srgb, int w, int h, int stride, int strideH, VarDctFrameParams fp)
+    {
+        var padded = new float[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            padded[c] = new float[stride * strideH];
+            for (int y = 0; y < strideH; y++)
+            {
+                int sy = Math.Min(y, h - 1);
+                for (int x = 0; x < stride; x++)
+                {
+                    padded[c][(y * stride) + x] = srgb[c][(sy * w) + Math.Min(x, w - 1)];
+                }
+            }
+        }
+
+        return JxlVarDctEncoder.SrgbToXyb(padded, stride * strideH, fp);
     }
 
     // Maps a Butteraugli-style distance to (global_scale, quant_lf, block_hf_mul). global_scale is fixed;
@@ -260,7 +436,7 @@ internal static partial class JxlEncoder
     }
 
     // --- the frame body as TOC sections (see AssembleVarDctCodestream) ---
-    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts, bool adaptiveQuant, bool variableBlocks, bool perceptual = false, float distance = 1.0f)
+    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts, bool adaptiveQuant, bool variableBlocks, bool perceptual = false, float distance = 1.0f, float[]? quantFieldOverride = null, int[]? layoutOverride = null)
     {
         int bw = (w + 7) / 8, bh = (h + 7) / 8;   // blocks
         int stride = bw * 8, strideH = bh * 8;
@@ -302,8 +478,13 @@ internal static partial class JxlEncoder
             // (rate + masking-weighted L8 spatial distortion) driving the hierarchical block-size search.
             // Masking field + block selection run on the ORIGINAL opsin (libjxl order: heuristics first).
             var (quantField, mask1x1) = JxlEncoderPerceptual.ComputeAdaptiveQuantField(xyb, stride, w, h, bw, bh, distance);
+            if (quantFieldOverride != null)
+            {
+                quantField = quantFieldOverride; // refinement loop supplies a per-block quant field
+            }
+
             var cfg = JxlEncoderPerceptual.MakeConfig(xyb, stride, w, h, bw, quantField, mask1x1, new[] { 0f, 0f, 1f }, dm, distance);
-            sizeAt = JxlEncoderPerceptual.ProcessImage(cfg, bw, bh, distance);
+            sizeAt = layoutOverride ?? JxlEncoderPerceptual.ProcessImage(cfg, bw, bh, distance);
             // Per-data-block hf_mul from the quant field, aggregated over the block's cells the same way
             // EstimateEntropy aggregates it (quant_norm16). hf_mul = quant * 65536 / global_scale so that the
             // encoder's actual quantiser (step = matrix * 65536/(gs*hf_mul)) equals coeff*invMatrix*quant.

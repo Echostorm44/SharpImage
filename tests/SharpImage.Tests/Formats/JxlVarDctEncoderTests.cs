@@ -295,9 +295,12 @@ public class JxlVarDctEncoderTests
             }
         }
 
+        string mode = Environment.GetEnvironmentVariable("VARDCT_MODE"); // "refine" | "perceptual" | default heuristic
         foreach (float d in new[] { 0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f })
         {
-            byte[] cs = JxlEncoder.EncodeVarDct(frame, d);
+            byte[] cs = mode == "refine" ? JxlEncoder.EncodeVarDctRefined(frame, d)
+                : mode == "perceptual" ? JxlEncoder.EncodeVarDct(frame, 8192u, (uint)Math.Clamp((int)MathF.Round(90f / d), 1, 512), 1u, null, false, true, perceptual: true, distance: d)
+                : JxlEncoder.EncodeVarDct(frame, d);
             JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
             double mse = 0;
             for (int y = 0; y < h; y++)

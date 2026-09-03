@@ -48,6 +48,41 @@ internal static class JxlVarDctEncoder
         return xyb;
     }
 
+    // Linear-RGB [0,1] planes -> opsin XYB (the ToXYB SSIMULACRA2 uses; no sRGB gamma step). rl/gl/bl are
+    // three planes of length len.
+    public static float[][] LinearToXyb(float[][] lin, int len, VarDctFrameParams fp)
+    {
+        float itscale = 255.0f / fp.IntensityTarget;
+        float[] ob = fp.OpsinBias;
+        float[] cbrtOb = { MathF.Cbrt(ob[0]), MathF.Cbrt(ob[1]), MathF.Cbrt(ob[2]) };
+        float[] minv = Invert3x3(fp.OpsinInv);
+        var xyb = new float[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            xyb[c] = new float[len];
+        }
+
+        for (int i = 0; i < len; i++)
+        {
+            float rl = lin[0][i], gl = lin[1][i], bl = lin[2][i];
+            float lms0 = (minv[0] * rl) + (minv[1] * gl) + (minv[2] * bl);
+            float lms1 = (minv[3] * rl) + (minv[4] * gl) + (minv[5] * bl);
+            float lms2 = (minv[6] * rl) + (minv[7] * gl) + (minv[8] * bl);
+            float g0 = MathF.Cbrt((lms0 / itscale) - ob[0]);
+            float g1 = MathF.Cbrt((lms1 / itscale) - ob[1]);
+            float g2 = MathF.Cbrt((lms2 / itscale) - ob[2]);
+            float yPlusX = g0 + cbrtOb[0];
+            float yMinusX = g1 + cbrtOb[1];
+            xyb[0][i] = (yPlusX - yMinusX) * 0.5f;
+            xyb[1][i] = (yPlusX + yMinusX) * 0.5f;
+            xyb[2][i] = g2 + cbrtOb[2];
+        }
+
+        return xyb;
+    }
+
+    public static float SrgbToLinearPublic(float s) => SrgbToLinear(s);
+
     private static float SrgbToLinear(float s)
     {
         if (s <= 0f)
