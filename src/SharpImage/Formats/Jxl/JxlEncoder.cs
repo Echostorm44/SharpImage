@@ -134,10 +134,17 @@ internal static class JxlEncoder
             }
         }
 
-        for (int order = 0; order < 3; order++)
+        // Palette candidate: build the palette once, then try several colour orderings (by luma, by
+        // frequency, and the top few that minimise the index's gradient-residual entropy) — each ordering
+        // sets the index values and thus how well the gradient predictor tracks region boundaries. Score
+        // them by an actual trial encode and keep the smallest, since the residual-entropy proxy only
+        // ranks candidates; the tree/entropy coder decides the real winner.
+        if (CollectPaletteColors(r, g, b, w * h, out int[] colors, out int[] counts))
         {
-            if (TryBuildPalette(r, g, b, w, h, gray, order, out List<EncChannel> palChannels, out int nbColors))
+            int nbColors = colors.Length;
+            foreach (int[] ordered in PaletteOrderings(colors, counts, r, g, b, w, h))
             {
+                List<EncChannel> palChannels = BuildPaletteChannels(ordered, r, g, b, w, h, gray);
                 byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors, gray ? 1 : 3), 0);
                 if (palSec.Length < best.Length)
                 {
@@ -593,17 +600,15 @@ internal static class JxlEncoder
         s.WriteBits(0, 4); // predictor = 0 (palette entries stored directly, not delta-coded)
     }
 
-    // Detects images with few enough distinct colours to palette-encode. Returns the palette meta-channel
-    // (3 rows of colour components x nbColors) followed by the index channel (w x h), matching the layout
-    // JxlModular.InvPalette reconstructs. Palette entries are ordered by luma so index gradients track
-    // colour gradients (better prediction). Returns false when there are too many colours.
     private const int MaxPaletteColors = 4096;
+    private const int PaletteBruteForceMax = 7;   // brute-force ordering only up to this many colours
+    private const int PaletteProxyTopK = 4;       // proxy-best orderings to trial-encode
 
-    private static bool TryBuildPalette(int[] r, int[] g, int[] b, int w, int h, bool gray, int order, out List<EncChannel> channels, out int nbColors)
+    // Collects the distinct colours (and their pixel counts). Returns false if there are too many to palette.
+    private static bool CollectPaletteColors(int[] r, int[] g, int[] b, int n, out int[] colors, out int[] counts)
     {
-        channels = null!;
-        nbColors = 0;
-        int n = w * h;
+        colors = null!;
+        counts = null!;
         var countByColor = new Dictionary<int, int>();
         foreach (int key in Keys(r, g, b, n))
         {
@@ -614,40 +619,57 @@ internal static class JxlEncoder
             }
         }
 
-        nbColors = countByColor.Count;
-        int[] colors = new int[nbColors];
+        colors = new int[countByColor.Count];
+        counts = new int[countByColor.Count];
         int i = 0;
-        foreach (int key in countByColor.Keys)
+        foreach (var kv in countByColor)
         {
-            colors[i++] = key;
+            colors[i] = kv.Key;
+            counts[i] = kv.Value;
+            i++;
         }
 
-        // Palette entry order sets the index values, which drives how well the index channel's gradient
-        // predictor tracks region boundaries. Try a few orderings (see caller) and keep the smaller.
-        // order 0: by luma. order 1: by descending frequency. order 2: for a small palette, the ordering
-        // that minimises the index's gradient-residual entropy, found by brute force over all permutations.
-        if (order == 2)
-        {
-            if (nbColors > 7)
-            {
-                return false; // too many colours to brute-force; the other orderings cover this case
-            }
+        return true;
+    }
 
-            colors = BestPaletteOrder(colors, r, g, b, w, h);
-        }
-        else if (order == 1)
+    // Candidate palette entry orderings to trial-encode (see caller): by luma, by descending frequency,
+    // and — for a small palette — the top-K orderings that minimise the index's gradient-residual entropy.
+    // The order sets the index values and thus how well the gradient predictor tracks region boundaries;
+    // the entropy proxy only ranks candidates, so the caller keeps whichever actually encodes smallest.
+    private static List<int[]> PaletteOrderings(int[] colors, int[] counts, int[] r, int[] g, int[] b, int w, int h)
+    {
+        int nbColors = colors.Length;
+        var byColor = new Dictionary<int, int>(nbColors);
+        for (int k = 0; k < nbColors; k++)
         {
-            Array.Sort(colors, (a, c) => countByColor[c].CompareTo(countByColor[a]));
-        }
-        else
-        {
-            Array.Sort(colors, (a, c) => Luma(a).CompareTo(Luma(c)));
+            byColor[colors[k]] = counts[k];
         }
 
+        var result = new List<int[]>();
+
+        int[] luma = (int[])colors.Clone();
+        Array.Sort(luma, (a, c) => Luma(a).CompareTo(Luma(c)));
+        result.Add(luma);
+
+        int[] freq = (int[])colors.Clone();
+        Array.Sort(freq, (a, c) => byColor[c].CompareTo(byColor[a]));
+        result.Add(freq);
+
+        if (nbColors <= PaletteBruteForceMax)
+        {
+            result.AddRange(TopPaletteOrders(colors, r, g, b, w, h));
+        }
+
+        return result;
+    }
+
+    private static List<EncChannel> BuildPaletteChannels(int[] orderedColors, int[] r, int[] g, int[] b, int w, int h, bool gray)
+    {
+        int nbColors = orderedColors.Length;
         var indexByColor = new Dictionary<int, int>(nbColors);
         for (int k = 0; k < nbColors; k++)
         {
-            indexByColor[colors[k]] = k;
+            indexByColor[orderedColors[k]] = k;
         }
 
         int nc = gray ? 1 : 3;
@@ -656,34 +678,34 @@ internal static class JxlEncoder
         {
             if (gray)
             {
-                palette[k] = colors[k] & 0xFF; // single grey row (r == g == b)
+                palette[k] = orderedColors[k] & 0xFF; // single grey row (r == g == b)
             }
             else
             {
-                palette[k] = (colors[k] >> 16) & 0xFF;              // R row
-                palette[nbColors + k] = (colors[k] >> 8) & 0xFF;    // G row
-                palette[(2 * nbColors) + k] = colors[k] & 0xFF;     // B row
+                palette[k] = (orderedColors[k] >> 16) & 0xFF;              // R row
+                palette[nbColors + k] = (orderedColors[k] >> 8) & 0xFF;    // G row
+                palette[(2 * nbColors) + k] = orderedColors[k] & 0xFF;     // B row
             }
         }
 
+        int n = w * h;
         int[] index = new int[n];
         for (int p = 0; p < n; p++)
         {
             index[p] = indexByColor[(r[p] << 16) | (g[p] << 8) | b[p]];
         }
 
-        channels = new List<EncChannel>
+        return new List<EncChannel>
         {
             new(palette, nbColors, nc), // palette meta-channel decoded first
             new(index, w, h),           // then the index channel
         };
-        return true;
     }
 
-    // Brute-force the palette ordering that minimises the index channel's clamped-gradient residual
-    // entropy (only called for a small palette, nbColors <= 8, so |permutations| stays bounded). The
-    // ordering that makes spatially-adjacent regions have adjacent indices predicts best.
-    private static int[] BestPaletteOrder(int[] colors, int[] r, int[] g, int[] b, int w, int h)
+    // The PaletteProxyTopK orderings (as ordered-colour arrays) with the lowest index gradient-residual
+    // entropy, brute-forced over permutations. The residual of a pixel depends only on the base indices of
+    // (self, left, top, topleft), so orderings are scored over the collapsed distinct 4-tuples, not pixels.
+    private static List<int[]> TopPaletteOrders(int[] colors, int[] r, int[] g, int[] b, int w, int h)
     {
         int nbColors = colors.Length;
         int n = w * h;
@@ -699,9 +721,6 @@ internal static class JxlEncoder
             baseIdx[p] = idxOf[(r[p] << 16) | (g[p] << 8) | b[p]];
         }
 
-        // A pixel's clamped-gradient residual depends only on the base indices of (self, left, top,
-        // topleft). Collapse the image to the counts of each distinct 4-tuple (3 bits per index) so each
-        // candidate ordering is scored over a few hundred tuples, not millions of pixels.
         var tupleCounts = new Dictionary<int, int>();
         for (int y = 0; y < h; y++)
         {
@@ -729,23 +748,36 @@ internal static class JxlEncoder
             ti++;
         }
 
+        double[] topCost = new double[PaletteProxyTopK];
+        int[][] topPerm = new int[PaletteProxyTopK][];
+        for (int i = 0; i < PaletteProxyTopK; i++)
+        {
+            topCost[i] = double.MaxValue;
+        }
+
         int[] perm = new int[nbColors];
         for (int k = 0; k < nbColors; k++)
         {
             perm[k] = k;
         }
 
-        int[] best = (int[])perm.Clone();
-        double bestCost = double.MaxValue;
         int[] counts = new int[(2 * nbColors) + 1];
-
         void Eval()
         {
             double c = OrderResidualBits(tKeys, tCnt, perm, n, counts);
-            if (c < bestCost)
+            int worst = 0;
+            for (int i = 1; i < PaletteProxyTopK; i++)
             {
-                bestCost = c;
-                Array.Copy(perm, best, nbColors);
+                if (topCost[i] > topCost[worst])
+                {
+                    worst = i;
+                }
+            }
+
+            if (c < topCost[worst])
+            {
+                topCost[worst] = c;
+                topPerm[worst] = (int[])perm.Clone();
             }
         }
 
@@ -768,13 +800,24 @@ internal static class JxlEncoder
             }
         }
 
-        int[] ordered = new int[nbColors];
-        for (int k = 0; k < nbColors; k++)
+        var result = new List<int[]>();
+        foreach (int[] tp in topPerm)
         {
-            ordered[best[k]] = colors[k];
+            if (tp == null)
+            {
+                continue;
+            }
+
+            int[] ordered = new int[nbColors];
+            for (int k = 0; k < nbColors; k++)
+            {
+                ordered[tp[k]] = colors[k];
+            }
+
+            result.Add(ordered);
         }
 
-        return ordered;
+        return result;
     }
 
     // Entropy (bits) of the clamped-gradient residuals of the index field under a given colour ordering,
