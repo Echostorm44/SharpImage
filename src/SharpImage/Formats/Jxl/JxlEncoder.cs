@@ -56,18 +56,42 @@ internal static class JxlEncoder
             }
         }
 
-        // Pick the reversible colour transform, then the weighted-predictor parameter mode. The WP-mode
-        // estimate (single-context) can mispredict once the tree/context model is applied, so try the
-        // estimated-best mode and the default (mode 0) and keep whichever actually encodes smaller.
-        int rctType = ChooseRct(r, g, b, w, h);
-        int[][] chan = ForwardRct(r, g, b, w * h, rctType);
+        // Grayscale (r == g == b everywhere) encodes as a single channel with no colour transform,
+        // matching libjxl. For a small (single-group) grayscale image also try the RGB encoding and keep
+        // whichever is smaller (a few-colour grey palette can occasionally beat the 1-channel form by a
+        // byte); larger grayscale images just take the 1-channel form (skips a redundant full encode).
+        bool gray = IsGrayscale(r, g, b, w * h);
+        if (!gray)
+        {
+            return EncodeCore(r, g, b, w, h, nb, gray: false);
+        }
+
+        byte[] grayCs = EncodeCore(r, g, b, w, h, nb, gray: true);
+        if (w <= GroupDim && h <= GroupDim)
+        {
+            byte[] rgbCs = EncodeCore(r, g, b, w, h, nb, gray: false);
+            if (rgbCs.Length < grayCs.Length)
+            {
+                return rgbCs;
+            }
+        }
+
+        return grayCs;
+    }
+
+    private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray)
+    {
+        int nbCh = gray ? 1 : nb;
+
+        // Pick the reversible colour transform (none for grayscale), then the weighted-predictor parameter
+        // mode. The WP-mode estimate (single-context) can mispredict once the tree/context model is
+        // applied, so try the estimated-best mode and the default (mode 0) and keep the smaller.
+        int rctType = gray ? -1 : ChooseRct(r, g, b, w, h);
+        int[][] chan = gray ? new[] { r } : ForwardRct(r, g, b, w * h, rctType);
         int wpEst = ChooseWpMode(chan, w, h);
         int[] wpModes = wpEst == 0 ? new[] { 0 } : new[] { wpEst, 0 };
 
-        // A single group can cover an image up to GroupDim on both sides; larger images are tiled. Try
-        // two group sizes and keep the smaller: large 1024px groups minimise per-group overhead, while
-        // small 256px groups let the global tree adapt per region (the group property, p1) — libjxl uses
-        // small groups + heavy p1 splits on busy photos. Best-per-image selection means neither can lose.
+        // A single group can cover an image up to GroupDim on both sides; larger images are tiled.
         bool single = w <= GroupDim && h <= GroupDim;
         if (!single)
         {
@@ -78,7 +102,7 @@ internal static class JxlEncoder
                 int gd = 128 << gShift;
                 foreach (int m in wpModes)
                 {
-                    byte[][] secs = BuildMultiGroupSections(chan, w, h, nb, gd, rctType, m);
+                    byte[][] secs = BuildMultiGroupSections(chan, w, h, nbCh, gd, rctType, m);
                     if (bestSecs == null || TotalLength(secs) < TotalLength(bestSecs))
                     {
                         bestSecs = secs;
@@ -87,14 +111,19 @@ internal static class JxlEncoder
                 }
             }
 
-            return AssembleCodestream(w, h, bestShift, bestSecs);
+            return AssembleCodestream(w, h, bestShift, bestSecs, gray);
         }
 
         int shift = SmallestShift(Math.Max(w, h));
 
-        // Candidate A: the chosen RCT + WP mode. Candidate B (when the image has few colours): the
-        // Palette transform (default WP mode). Keep whichever section is smaller.
-        var rctChannels = new List<EncChannel> { new(chan[0], w, h), new(chan[1], w, h), new(chan[2], w, h) };
+        // Candidate A: the chosen RCT (or no transform) + WP mode. Candidate B (when the image has few
+        // colours): the Palette transform. Keep whichever section is smaller.
+        var rctChannels = new List<EncChannel>(nbCh);
+        for (int c = 0; c < nbCh; c++)
+        {
+            rctChannels.Add(new EncChannel(chan[c], w, h));
+        }
+
         byte[] best = null!;
         foreach (int m in wpModes)
         {
@@ -105,28 +134,41 @@ internal static class JxlEncoder
             }
         }
 
-        if (TryBuildPalette(r, g, b, w, h, out List<EncChannel> palChannels, out int nbColors))
+        if (TryBuildPalette(r, g, b, w, h, gray, out List<EncChannel> palChannels, out int nbColors))
         {
-            byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors), 0);
+            byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors, gray ? 1 : 3), 0);
             if (palSec.Length < best.Length)
             {
                 best = palSec;
             }
         }
 
-        return AssembleCodestream(w, h, shift, new[] { best });
+        return AssembleCodestream(w, h, shift, new[] { best }, gray);
+    }
+
+    private static bool IsGrayscale(int[] r, int[] g, int[] b, int n)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            if (r[i] != g[i] || g[i] != b[i])
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>A modular channel to encode: pixel data with its own dimensions.</summary>
     private readonly record struct EncChannel(int[] Data, int W, int H);
 
-    private static byte[] AssembleCodestream(int w, int h, int shift, byte[][] sections)
+    private static byte[] AssembleCodestream(int w, int h, int shift, byte[][] sections, bool gray = false)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
         main.WriteBits(0x0A, 8);
         WriteSizeHeader(main, w, h);
-        WriteImageMetadata(main);
+        WriteImageMetadata(main, gray);
         main.JumpToByteBoundary();
         WriteFrameHeader(main, shift);
         main.WriteBool(false); // permuted TOC = false
@@ -171,7 +213,7 @@ internal static class JxlEncoder
         w.WriteU32((uint)width, E.BitsOff(9, 1), E.BitsOff(13, 1), E.BitsOff(18, 1), E.BitsOff(30, 1));
     }
 
-    private static void WriteImageMetadata(JxlBitWriter w)
+    private static void WriteImageMetadata(JxlBitWriter w, bool gray)
     {
         w.WriteBool(false); // not all_default
         w.WriteBool(false); // extra_fields = false
@@ -180,7 +222,23 @@ internal static class JxlEncoder
         w.WriteBool(true);  // modular_16bit_buffer_sufficient
         w.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(12, 1)); // num_extra_channels = 0
         w.WriteBool(false); // xyb_encoded = false
-        w.WriteBool(true);  // colour encoding: all_default (sRGB RGB)
+        if (gray)
+        {
+            // Explicit sRGB-grayscale colour encoding (all_default is RGB). ColorSpace kGray = 1,
+            // WhitePoint kD65 = 1, TransferFunction kSRGB = 13, RenderingIntent kRelative = 0.
+            w.WriteBool(false); // colour encoding: not all_default
+            w.WriteBool(false); // want_icc = false
+            w.WriteEnum(1);     // color_space = kGray
+            w.WriteEnum(1);     // white_point = kD65
+            w.WriteBool(false); // transfer function: have_gamma = false
+            w.WriteEnum(13);    // transfer_function = kSRGB
+            w.WriteEnum(0);     // rendering_intent = kRelative
+        }
+        else
+        {
+            w.WriteBool(true);  // colour encoding: all_default (sRGB RGB)
+        }
+
         w.WriteU64(0);      // extensions = none
         w.WriteBool(true);  // default_m (skip opsin / upsampling weights)
     }
@@ -315,6 +373,12 @@ internal static class JxlEncoder
 
     private static void WriteRctTransform(JxlBitWriter s, int rctType)
     {
+        if (rctType < 0)
+        {
+            s.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0 (grayscale: no colour transform)
+            return;
+        }
+
         s.WriteU32(1, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 1
         s.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.Val(3)); // transform id = 0 (RCT)
         s.WriteU32(0, E.BitsOff(3, 0), E.BitsOff(6, 8), E.BitsOff(10, 72), E.BitsOff(13, 1096)); // begin_c = 0
@@ -515,12 +579,12 @@ internal static class JxlEncoder
 
     // Palette transform: replaces the three colour channels (begin 0, num 3) with a palette meta-channel
     // plus a single index channel. Inverted by JxlModular.InvPalette.
-    private static void WritePaletteTransform(JxlBitWriter s, int nbColors)
+    private static void WritePaletteTransform(JxlBitWriter s, int nbColors, int numChannels)
     {
         s.WriteU32(1, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 1
         s.WriteU32(1, E.Val(0), E.Val(1), E.Val(2), E.Val(3)); // transform id = 1 (Palette)
         s.WriteU32(0, E.BitsOff(3, 0), E.BitsOff(6, 8), E.BitsOff(10, 72), E.BitsOff(13, 1096)); // begin_c = 0
-        s.WriteU32(3, E.Val(1), E.Val(3), E.Val(4), E.BitsOff(13, 1)); // num_c = 3
+        s.WriteU32((uint)numChannels, E.Val(1), E.Val(3), E.Val(4), E.BitsOff(13, 1)); // num_c (3 for RGB, 1 for grayscale)
         s.WriteU32((uint)nbColors, E.BitsOff(8, 0), E.BitsOff(10, 256), E.BitsOff(12, 1280), E.BitsOff(16, 5376)); // nb_colors
         s.WriteU32(0, E.Val(0), E.BitsOff(8, 1), E.BitsOff(10, 257), E.BitsOff(16, 1281)); // nb_deltas = 0
         s.WriteBits(0, 4); // predictor = 0 (palette entries stored directly, not delta-coded)
@@ -532,7 +596,7 @@ internal static class JxlEncoder
     // colour gradients (better prediction). Returns false when there are too many colours.
     private const int MaxPaletteColors = 4096;
 
-    private static bool TryBuildPalette(int[] r, int[] g, int[] b, int w, int h, out List<EncChannel> channels, out int nbColors)
+    private static bool TryBuildPalette(int[] r, int[] g, int[] b, int w, int h, bool gray, out List<EncChannel> channels, out int nbColors)
     {
         channels = null!;
         nbColors = 0;
@@ -565,12 +629,20 @@ internal static class JxlEncoder
             indexByColor[colors[k]] = k;
         }
 
-        int[] palette = new int[3 * nbColors];
+        int nc = gray ? 1 : 3;
+        int[] palette = new int[nc * nbColors];
         for (int k = 0; k < nbColors; k++)
         {
-            palette[k] = (colors[k] >> 16) & 0xFF;              // R row
-            palette[nbColors + k] = (colors[k] >> 8) & 0xFF;    // G row
-            palette[(2 * nbColors) + k] = colors[k] & 0xFF;     // B row
+            if (gray)
+            {
+                palette[k] = colors[k] & 0xFF; // single grey row (r == g == b)
+            }
+            else
+            {
+                palette[k] = (colors[k] >> 16) & 0xFF;              // R row
+                palette[nbColors + k] = (colors[k] >> 8) & 0xFF;    // G row
+                palette[(2 * nbColors) + k] = colors[k] & 0xFF;     // B row
+            }
         }
 
         int[] index = new int[n];
@@ -581,8 +653,8 @@ internal static class JxlEncoder
 
         channels = new List<EncChannel>
         {
-            new(palette, nbColors, 3), // palette meta-channel decoded first
-            new(index, w, h),          // then the index channel
+            new(palette, nbColors, nc), // palette meta-channel decoded first
+            new(index, w, h),           // then the index channel
         };
         return true;
     }
