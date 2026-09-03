@@ -26,7 +26,8 @@ namespace SharpImage.Formats.Jxl;
 
 internal static partial class JxlEncoder
 {
-    private const int VarDctGroupDim = 256; // 128 << group_size_shift(1)
+    private const int VarDctGroupDim = 256;       // VarDCT group side (fixed)
+    private const int VarDctLfGroupDim = 256 * 8; // 2048 — one LF group; larger needs numLf > 1 (todo)
 
     /// <summary>
     /// Encodes an image as a lossy XYB VarDCT JPEG XL codestream (single group, all-8x8 DCT).
@@ -44,9 +45,9 @@ internal static partial class JxlEncoder
             throw new InvalidOperationException("Cannot encode an empty image.");
         }
 
-        if (w > VarDctGroupDim || h > VarDctGroupDim)
+        if (w > VarDctLfGroupDim || h > VarDctLfGroupDim)
         {
-            throw new NotSupportedException("VarDCT encoder currently supports images up to 256x256 (one group).");
+            throw new NotSupportedException("VarDCT encoder currently supports images up to 2048x2048 (one LF group).");
         }
 
         // Full per-pass shift list: the caller's coarse shifts followed by the mandatory final shift 0.
@@ -333,10 +334,19 @@ internal static partial class JxlEncoder
         int modLogAlpha = Math.Max(5, JxlBits.CeilLog2(modHist.Length));
         int[] modNorm = JxlEntropy.NormalizeCounts(modHist, JxlEntropy.HistShift);
 
+        // Group layout: 256px groups (32 blocks). numLf == 1 for images <= 2048px (one LF group).
+        const int groupBlocks = VarDctGroupDim / 8; // 32
+        int groupsPerRow = (w + VarDctGroupDim - 1) / VarDctGroupDim;
+        int groupsPerCol = (h + VarDctGroupDim - 1) / VarDctGroupDim;
+        int numGroups = groupsPerRow * groupsPerCol;
+        int presetBits = BitLength(NextPow2(numGroups)); // hf_preset selector width
+
         // Split the full AC coefficients into progressive passes: pass p codes (remaining >> shift[p]) and
         // the decoder accumulates (value << shift[p]); the shifts decrease to a final 0 so the sum is exact.
+        // Within a pass, each 256px group's coefficients are a separate PassGroup ANS stream that shares the
+        // pass's HfDist histogram.
         int numPasses = shifts.Length;
-        var passTokenLists = new List<ModToken>[numPasses];
+        var passGroupTokens = new List<ModToken>[numPasses][]; // [pass][group]
         var passNorm = new int[numPasses][];
         var passLogAlpha = new int[numPasses];
         var remaining = new int[3][];
@@ -360,9 +370,18 @@ internal static partial class JxlEncoder
                 }
             }
 
-            passTokenLists[p] = BuildHfTokens(bw, bh, qp);
+            passGroupTokens[p] = new List<ModToken>[numGroups];
             var ph = new long[1];
-            AccumulateHist(passTokenLists[p], ref ph);
+            for (int g = 0; g < numGroups; g++)
+            {
+                int gx = g % groupsPerRow, gy = g / groupsPerRow;
+                int bx0 = gx * groupBlocks, by0 = gy * groupBlocks;
+                int gBw = Math.Min(groupBlocks, bw - bx0);
+                int gBh = Math.Min(groupBlocks, bh - by0);
+                passGroupTokens[p][g] = BuildHfTokens(bx0, by0, gBw, gBh, bw, qp);
+                AccumulateHist(passGroupTokens[p][g], ref ph);
+            }
+
             passLogAlpha[p] = Math.Max(5, JxlBits.CeilLog2(ph.Length));
             passNorm[p] = JxlEntropy.NormalizeCounts(ph, JxlEntropy.HistShift);
         }
@@ -393,19 +412,19 @@ internal static partial class JxlEncoder
         void WriteHfGlobal(JxlBitWriter b)
         {
             b.WriteBool(true);  // DequantMatrixSet all_default
-            // num_hf_presets: BitLength(NextPow2(numGroups)) bits => 0 bits (single group). One HfPass per pass.
+            b.WriteBits(0, presetBits); // num_hf_presets - 1 == 0 (one preset)
             for (int p = 0; p < numPasses; p++)
             {
                 WriteHfPass(b, passNorm[p], passLogAlpha[p]);
             }
         }
 
-        void WritePassGroup(JxlBitWriter b, int p)
+        void WritePassGroup(JxlBitWriter b, int p, int g)
         {
-            // hf_preset selector: BitLength(NextPow2(numGroups)) bits => 0 bits for a single group.
+            // hf_preset selector width = BitLength(NextPow2(num_hf_presets)); num_hf_presets == 1 => 0 bits.
             var ans = new JxlAnsWriter(new[] { passNorm[p] }, passLogAlpha[p]);
-            var toks = new List<AnsToken>(passTokenLists[p].Count);
-            foreach (ModToken t in passTokenLists[p])
+            var toks = new List<AnsToken>(passGroupTokens[p][g].Count);
+            foreach (ModToken t in passGroupTokens[p][g])
             {
                 toks.Add(new AnsToken(0, t.Sym, t.Bits, t.N));
             }
@@ -413,18 +432,19 @@ internal static partial class JxlEncoder
             ans.Encode(b, toks);
         }
 
-        if (numPasses == 1)
+        if (numGroups == 1 && numPasses == 1)
         {
             // Single group + single pass => one continuous TOC section.
             var body = new JxlBitWriter();
             WriteLfGlobal(body);
             WriteLfGroup(body);
             WriteHfGlobal(body);
-            WritePassGroup(body, 0);
+            WritePassGroup(body, 0, 0);
             return new List<byte[]> { body.ToArray() };
         }
 
-        // Progressive: multi-section TOC (LfGlobal | LfGroup | HfGlobal | PassGroup per pass).
+        // Multi-section TOC: LfGlobal | LfGroup (numLf == 1) | HfGlobal | PassGroups. Section index for a
+        // pass group is 2 + numLf + pass*numGroups + group, so emit pass-major.
         var sections = new List<byte[]>();
         var lfg = new JxlBitWriter();
         WriteLfGlobal(lfg);
@@ -437,9 +457,12 @@ internal static partial class JxlEncoder
         sections.Add(hfg.ToArray());
         for (int p = 0; p < numPasses; p++)
         {
-            var pg = new JxlBitWriter();
-            WritePassGroup(pg, p);
-            sections.Add(pg.ToArray());
+            for (int g = 0; g < numGroups; g++)
+            {
+                var pg = new JxlBitWriter();
+                WritePassGroup(pg, p, g);
+                sections.Add(pg.ToArray());
+            }
         }
 
         return sections;
@@ -483,17 +506,19 @@ internal static partial class JxlEncoder
 
     private const int DefaultNumBlockClusters = 15;
 
-    // Builds the PassGroup HF coefficient tokens (inverse of JxlVarDct.WriteHfCoeff), all in cluster 0.
-    // Emission order matches the decoder: block raster (y, x), channel order {Y, X, B}; per block+channel a
-    // non-zeros count token, then coefficient tokens in scan order up to (and including) the last non-zero.
-    private static List<ModToken> BuildHfTokens(int bw, int bh, int[][] ac)
+    // Builds the PassGroup HF coefficient tokens for one 256px group's block window (inverse of
+    // JxlVarDct.WriteHfCoeff), all in cluster 0. Emission order matches the decoder: group-local block
+    // raster (y, x), channel order {Y, X, B}; per block+channel a non-zeros count token, then coefficient
+    // tokens in scan order up to (and including) the last non-zero. bx0/by0 is the group origin in blocks,
+    // gBw/gBh the group block size, bw the full-image block width (to index ac).
+    private static List<ModToken> BuildHfTokens(int bx0, int by0, int gBw, int gBh, int bw, int[][] ac)
     {
         var tokens = new List<ModToken>();
-        for (int y = 0; y < bh; y++)
+        for (int y = 0; y < gBh; y++)
         {
-            for (int x = 0; x < bw; x++)
+            for (int x = 0; x < gBw; x++)
             {
-                int bi = (y * bw) + x;
+                int bi = ((by0 + y) * bw) + bx0 + x;
                 for (int cc = 0; cc < 3; cc++)
                 {
                     int c = new[] { 1, 0, 2 }[cc]; // Y, X, B
@@ -513,7 +538,6 @@ internal static partial class JxlEncoder
                     {
                         tokens.Add(HybridToken(PackSigned(ac[c][baseIdx + oi])));
                     }
-
                 }
             }
         }
@@ -620,22 +644,6 @@ internal static partial class JxlEncoder
         long lo = Math.Min(a, b);
         long hi = Math.Max(a, b);
         return grad < lo ? lo : (grad > hi ? hi : grad);
-    }
-
-    // Writes a DecodeHistograms code where numContexts (> 1) all map to a single one-symbol histogram
-    // (probability entirely on symbol 0). Used for the DC-only HfDist code.
-    private static void WriteSingleSymbolHistograms(JxlBitWriter body, int numContexts)
-    {
-        body.WriteBool(false);   // lz77 disabled
-        // Context map: numContexts entries, all cluster 0. Simple form with bits-per-entry = 0 => no
-        // per-entry bits, all zero (max cluster 0 => 1 histogram).
-        body.WriteBool(true);    // is_simple
-        body.WriteBits(0, 2);    // bits_per_entry = 0
-        body.WriteBool(false);   // use_prefix_code = false (ANS)
-        body.WriteBits(0, 2);    // log_alpha - 5 => log_alpha = 5
-        WriteUintConfig(body, LitSplit, LitMsb, LitLsb, 5);
-        var counts = new int[1] { AnsTabSizeConst };
-        JxlEntropy.WriteHistogram(body, counts, JxlEntropy.HistShift);
     }
 
     private static int NextPow2(int v)

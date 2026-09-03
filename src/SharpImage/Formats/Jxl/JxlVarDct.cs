@@ -346,7 +346,9 @@ internal static class JxlVarDct
         int lfIdxMul = (hfCtx.LfThresholds[0].Length + 1) * (hfCtx.LfThresholds[1].Length + 1) * (hfCtx.LfThresholds[2].Length + 1);
         int hfIdxMul = hfCtx.QfThresholds.Length + 1;
 
-        int hfpBits = BitLength((uint)NextPow2(fp.NumGroups));
+        // hf_preset selector width is derived from num_hf_presets (not num_groups); the num_hf_presets
+        // *field* itself is what uses num_groups, back in HfGlobal.
+        int hfpBits = BitLength((uint)NextPow2(numHfPresets));
         int hfp = (int)br.ReadBits(hfpBits);
         int ctxSize = 495 * hfCtx.NumBlockClusters;
         byte[] clusterMap = new byte[ctxSize];
@@ -1044,10 +1046,74 @@ internal static class JxlVarDct
         return (lgy * groupsPerLfRow) + lgx;
     }
 
-    // For single-group-per-lf-group frames the group's block info == the LF group's block info.
+    // Extracts the block subgrid for one 256px group out of its (larger) LF group, so per-group AC
+    // decoding + reconstruction operate on group-local coordinates. For a frame whose image fits one LF
+    // group (<= group_dim*8 == 2048px) the LF group index is 0 and the group is a 32x32-block window of it.
     private static LfGroupData SubLfGroup(LfGroupData lg, VarDctFrameParams fp, int groupIdx)
     {
-        return lg; // common case: one group per LF group (image <= group_dim*8)
+        int groupBlocks = fp.GroupDim / 8; // 32 blocks per group side
+        int lfGroupDim = fp.GroupDim * 8;
+        int groupsPerLf = lfGroupDim / fp.GroupDim; // groups per LF group side (8)
+        int gx = groupIdx % fp.GroupsPerRow;
+        int gy = groupIdx / fp.GroupsPerRow;
+        // Group origin within its LF group, in blocks.
+        int bx0 = (gx % groupsPerLf) * groupBlocks;
+        int by0 = (gy % groupsPerLf) * groupBlocks;
+        int gBw = Math.Min(groupBlocks, lg.Bw - bx0);
+        int gBh = Math.Min(groupBlocks, lg.Bh - by0);
+        if (bx0 == 0 && by0 == 0 && gBw == lg.Bw && gBh == lg.Bh)
+        {
+            return lg; // the group covers the whole LF group (single-group frame)
+        }
+
+        var sub = new LfGroupData
+        {
+            Bw = gBw,
+            Bh = gBh,
+            LfW = gBw,
+            LfH = gBh,
+            ExtraPrecision = lg.ExtraPrecision,
+            BlockInfoGrid = new BlockInfo[gBw * gBh],
+            LfQuant = new[] { new int[gBw * gBh], new int[gBw * gBh], new int[gBw * gBh] },
+            EpfSigma = new float[gBw * gBh],
+        };
+        for (int y = 0; y < gBh; y++)
+        {
+            for (int x = 0; x < gBw; x++)
+            {
+                int src = ((by0 + y) * lg.Bw) + bx0 + x;
+                int dst = (y * gBw) + x;
+                sub.BlockInfoGrid[dst] = lg.BlockInfoGrid[src];
+                sub.EpfSigma[dst] = lg.EpfSigma[src];
+                for (int c = 0; c < 3; c++)
+                {
+                    sub.LfQuant[c][dst] = lg.LfQuant[c][((by0 + y) * lg.LfW) + bx0 + x];
+                }
+            }
+        }
+
+        // Chroma-from-luma correlation grid (per 64px = 8 blocks): the group's window of it.
+        int cfW = (gBw + 7) / 8, cfH = (gBh + 7) / 8;
+        int cfx0 = bx0 / 8, cfy0 = by0 / 8;
+        sub.XFromYW = cfW;
+        sub.XFromYH = cfH;
+        sub.XFromY = new int[cfW * cfH];
+        sub.BFromY = new int[cfW * cfH];
+        for (int y = 0; y < cfH; y++)
+        {
+            for (int x = 0; x < cfW; x++)
+            {
+                int src = ((cfy0 + y) * lg.XFromYW) + cfx0 + x;
+                int dst = (y * cfW) + x;
+                if (src < lg.XFromY.Length)
+                {
+                    sub.XFromY[dst] = lg.XFromY[src];
+                    sub.BFromY[dst] = lg.BFromY[src];
+                }
+            }
+        }
+
+        return sub;
     }
 
     private static void TransformGroup(float[][] coeff, int coeffStride, LfGroupData lg, float[][] lfXyb, int lfStride, int gx, int gy, VarDctFrameParams fp, float[][] outXyb, int outStride)

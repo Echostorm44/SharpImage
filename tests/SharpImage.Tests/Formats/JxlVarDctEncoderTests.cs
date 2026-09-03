@@ -217,6 +217,65 @@ public class JxlVarDctEncoderTests
     }
 
     [Test]
+    public async Task VarDctMultiGroup_LargerThanOneGroup_RoundTrips()
+    {
+        const int w = 384, h = 320; // 2x2 groups of 256px
+        ImageFrame frame = TexturedFrame(w, h);
+        const uint gs = 4096, qlf = 64, hfm = 32;
+        byte[] cs = JxlEncoder.EncodeVarDct(frame, gs, qlf, hfm);
+        JxlModularResult res = JxlFrame.DecodeModularCodestream(cs);
+        await Assert.That(res.Width).IsEqualTo(w);
+        await Assert.That(res.Height).IsEqualTo(h);
+
+        double mse = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    double src = Quantum.ScaleToByte(srow[(x * 3) + c]);
+                    double d = src - res.Channels[c].Px[(y * w) + x];
+                    mse += d * d;
+                }
+            }
+        }
+
+        mse /= 3.0 * w * h;
+        double psnr = mse <= 1e-9 ? 99.0 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+
+        var srgb = new float[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            srgb[c] = new float[w * h];
+        }
+
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    srgb[c][(y * w) + x] = Quantum.ScaleToByte(srow[(x * 3) + c]) / 255f;
+                }
+            }
+        }
+
+        double modelPsnr = JxlVarDctEncoder.ReconstructPsnr(srgb, w, h, new VarDctFrameParams(), gs, qlf, hfm);
+        string dump = Environment.GetEnvironmentVariable("VARDCT_DUMP_MG");
+        if (!string.IsNullOrEmpty(dump))
+        {
+            System.IO.File.WriteAllBytes(dump, cs);
+        }
+
+        Console.Error.WriteLine($"[VARDCT] multigroup {w}x{h} decode PSNR={psnr:F2} (model {modelPsnr:F2}), {cs.Length} bytes");
+        await Assert.That(Math.Abs(psnr - modelPsnr)).IsLessThan(1.0); // multi-group decode matches the model
+        await Assert.That(psnr).IsGreaterThan(30.0);
+    }
+
+    [Test]
     public async Task VarDctProgressive_MultiPass_ReconstructsIdentically()
     {
         const int w = 64, h = 64;
