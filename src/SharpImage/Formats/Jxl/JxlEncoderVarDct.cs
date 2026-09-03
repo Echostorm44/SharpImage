@@ -292,6 +292,14 @@ internal static partial class JxlEncoder
         // for a position covered by a larger block. Off => every 8x8 position is its own Dct8 block.
         int[] sizeAt = BuildDctLayout(xyb, stride, dm, globalScale, hfMulBlock, blockHfMul, adaptiveQuant, fp, bw, bh, variableBlocks);
 
+        // Chroma-from-luma: per 64x64 cell, decorrelate X and B from Y (the AC coefficients). kxRaw/kbRaw
+        // are the modular grid values in HfMetadata; the decoder applies X += (kxRaw/84)*Y and
+        // B += (1 + kbRaw/84)*Y to the dequantized AC. We compute the optimal per-cell factor from the
+        // mean-subtracted spatial correlation (== AC coefficient correlation by Parseval) and subtract the
+        // *quantized* factor times the dequantized Y so encoder and decoder agree exactly.
+        int cfW = (w + 63) / 64, cfH = (h + 63) / 64;
+        (int[] cflKx, int[] cflKb) = ComputeCfLGrids(xyb, stride, w, h, cfW, cfH);
+
         var dcY = new int[nbData];
         var dcX = new int[nbData];
         var dcB = new int[nbData];
@@ -381,15 +389,17 @@ internal static partial class JxlEncoder
                 ac[1][bi] = new int[numCoeffs];
                 ac[2][bi] = new int[numCoeffs];
                 float[] matX = dm.GetTransposed(0, t), matY = dm.GetTransposed(1, t), matB = dm.GetTransposed(2, t);
+                int cell = ((by / 8) * cfW) + (bx / 8);   // 64px CfL cell for this block (blocks are <=64px, aligned)
+                float kx = cflKx[cell] / 84.0f;           // BaseCorrelationX = 0
+                float kb = 1.0f + (cflKb[cell] / 84.0f);   // BaseCorrelationB = 1
                 for (int oi = numBlocks; oi < order.Length; oi++)
                 {
                     int k = needTr ? (order[oi].X * pw) + order[oi].Y : (order[oi].Y * pw) + order[oi].X;
-                    int qX = QuantAc(coeff[0][k], matX[k] * hfMul, fp.QuantBias[0], fp.QuantBiasNumerator);
                     int qY = QuantAc(coeff[1][k], matY[k] * hfMul, fp.QuantBias[1], fp.QuantBiasNumerator);
-                    ac[0][bi][oi] = qX;
                     ac[1][bi][oi] = qY;
                     float yDeq = DequantAc(qY, matY[k] * hfMul, fp.QuantBias[1], fp.QuantBiasNumerator);
-                    ac[2][bi][oi] = QuantAc(coeff[2][k] - yDeq, matB[k] * hfMul, fp.QuantBias[2], fp.QuantBiasNumerator);
+                    ac[0][bi][oi] = QuantAc(coeff[0][k] - (kx * yDeq), matX[k] * hfMul, fp.QuantBias[0], fp.QuantBiasNumerator);
+                    ac[2][bi][oi] = QuantAc(coeff[2][k] - (kb * yDeq), matB[k] * hfMul, fp.QuantBias[2], fp.QuantBiasNumerator);
                 }
             }
         }
@@ -399,7 +409,6 @@ internal static partial class JxlEncoder
         // rejected. We use a single-leaf ClampedGradient tree and one shared histogram over all channels
         // of both sub-images.
         var dcImage = new List<SubChannel> { new(dcY, bw, bh), new(dcX, bw, bh), new(dcB, bw, bh) };
-        int cfW = (w + 63) / 64, cfH = (h + 63) / 64;
 
         // Block info is one entry per DATA block in raster visitation order (skipping covered positions):
         // row0 = dct_select, row1 = hf_mul - 1. This is also the order the HF pass codes coefficients in.
@@ -423,8 +432,8 @@ internal static partial class JxlEncoder
 
         var hfMeta = new List<SubChannel>
         {
-            new(new int[cfW * cfH], cfW, cfH),     // x_from_y (all 0)
-            new(new int[cfW * cfH], cfW, cfH),     // b_from_y (all 0)
+            new(cflKx, cfW, cfH),                  // x_from_y (per-cell CfL)
+            new(cflKb, cfW, cfH),                  // b_from_y (per-cell CfL)
             new(blockInfo, nbBlocks, 2),           // block info
             new(new int[bw * bh], bw, bh),         // sharpness (all 0)
         };
@@ -439,8 +448,8 @@ internal static partial class JxlEncoder
         var dcChans = new List<EncChannel> { new(dcY, bw, bh), new(dcX, bw, bh), new(dcB, bw, bh) };
         var metaChans = new List<EncChannel>
         {
-            new(new int[cfW * cfH], cfW, cfH),
-            new(new int[cfW * cfH], cfW, cfH),
+            new(cflKx, cfW, cfH),
+            new(cflKb, cfW, cfH),
             new(blockInfo, nbBlocks, 2),
             new(new int[bw * bh], bw, bh),
         };
@@ -896,6 +905,55 @@ internal static partial class JxlEncoder
 
     // Per-8x8-block luma HF activity (libjxl's HfModulation term): sum of clamped |neighbour Y differences|.
     // High => busy/textured, low => smooth. Drives adaptive quant and variable block-size selection.
+    // Chroma-from-luma factors per 64x64 cell. kxRaw = round(84 * cov(X,Y)/var(Y)); kbRaw =
+    // round(84 * (cov(B,Y)/var(Y) - 1)) (base_correlation_b = 1). The mean-subtracted spatial correlation
+    // over the cell equals the AC-coefficient correlation (Parseval), which is what the decoder's
+    // ChromaFromLumaHf applies. Clamped so |k| stays sane; a suboptimal factor still round-trips exactly.
+    private static (int[] kx, int[] kb) ComputeCfLGrids(float[][] xyb, int stride, int w, int h, int cfW, int cfH)
+    {
+        var kxG = new int[cfW * cfH];
+        var kbG = new int[cfW * cfH];
+        for (int cy = 0; cy < cfH; cy++)
+        {
+            int y0 = cy * 64, y1 = Math.Min(y0 + 64, h);
+            for (int cx = 0; cx < cfW; cx++)
+            {
+                int x0 = cx * 64, x1 = Math.Min(x0 + 64, w);
+                double sX = 0, sY = 0, sB = 0, sXY = 0, sYY = 0, sBY = 0;
+                int n = 0;
+                for (int py = y0; py < y1; py++)
+                {
+                    int rowOff = py * stride;
+                    for (int px = x0; px < x1; px++)
+                    {
+                        int i = rowOff + px;
+                        double X = xyb[0][i], Y = xyb[1][i], B = xyb[2][i];
+                        sX += X; sY += Y; sB += B;
+                        sXY += X * Y; sYY += Y * Y; sBY += B * Y;
+                        n++;
+                    }
+                }
+
+                if (n == 0)
+                {
+                    continue; // leaves kx=0, kb-adjust=0 (i.e. identity X, kb=1 B)
+                }
+
+                double ym = sY / n;
+                double varY = (sYY / n) - (ym * ym);
+                if (varY > 1e-8)
+                {
+                    double kx = ((sXY / n) - ((sX / n) * ym)) / varY;
+                    double kb = ((sBY / n) - ((sB / n) * ym)) / varY;
+                    kxG[(cy * cfW) + cx] = Math.Clamp((int)Math.Round(kx * 84.0), -128, 127);
+                    kbG[(cy * cfW) + cx] = Math.Clamp((int)Math.Round((kb - 1.0) * 84.0), -128, 127);
+                }
+            }
+        }
+
+        return (kxG, kbG);
+    }
+
     private static double[] ComputeActivity(float[] y, int stride, int bw, int bh)
     {
         const float valmin = 0.0206f;
