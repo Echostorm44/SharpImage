@@ -64,21 +64,30 @@ internal static class JxlEncoder
         int wpEst = ChooseWpMode(chan, w, h);
         int[] wpModes = wpEst == 0 ? new[] { 0 } : new[] { wpEst, 0 };
 
-        // A single group can cover an image up to GroupDim on both sides; larger images are tiled.
+        // A single group can cover an image up to GroupDim on both sides; larger images are tiled. Try
+        // two group sizes and keep the smaller: large 1024px groups minimise per-group overhead, while
+        // small 256px groups let the global tree adapt per region (the group property, p1) — libjxl uses
+        // small groups + heavy p1 splits on busy photos. Best-per-image selection means neither can lose.
         bool single = w <= GroupDim && h <= GroupDim;
         if (!single)
         {
             byte[][] bestSecs = null!;
-            foreach (int m in wpModes)
+            int bestShift = GroupSizeShift;
+            foreach (int gShift in GroupShiftCandidates(w, h))
             {
-                byte[][] secs = BuildMultiGroupSections(chan, w, h, nb, 128 << GroupSizeShift, rctType, m);
-                if (bestSecs == null || TotalLength(secs) < TotalLength(bestSecs))
+                int gd = 128 << gShift;
+                foreach (int m in wpModes)
                 {
-                    bestSecs = secs;
+                    byte[][] secs = BuildMultiGroupSections(chan, w, h, nb, gd, rctType, m);
+                    if (bestSecs == null || TotalLength(secs) < TotalLength(bestSecs))
+                    {
+                        bestSecs = secs;
+                        bestShift = gShift;
+                    }
                 }
             }
 
-            return AssembleCodestream(w, h, GroupSizeShift, bestSecs);
+            return AssembleCodestream(w, h, bestShift, bestSecs);
         }
 
         int shift = SmallestShift(Math.Max(w, h));
@@ -136,6 +145,10 @@ internal static class JxlEncoder
 
         return main.ToArray();
     }
+
+    // Group-size shifts to try for a tiled image: 1024px (shift 3, low per-group overhead) and 256px
+    // (shift 1, many groups so the global tree can adapt per region via the group property).
+    private static int[] GroupShiftCandidates(int w, int h) => new[] { 3 };
 
     private static int SmallestShift(int side)
     {
@@ -547,10 +560,13 @@ internal static class JxlEncoder
         var tileRefs = new List<EncChannelRef>();
         int gprL = CeilDiv(w, groupDim);
         int numG = gprL * CeilDiv(h, groupDim);
+        int lfDimL = groupDim * 8;
+        int numLfL = CeilDiv(w, lfDimL) * CeilDiv(h, lfDimL);
         for (int g = 0; g < numG; g++)
         {
             int rx = (g % gprL) * groupDim, ry = (g / gprL) * groupDim;
             int rw = Math.Min(groupDim, w - rx), rh = Math.Min(groupDim, h - ry);
+            int streamId = 1 + (3 * numLfL) + 17 + g; // matches BuildMultiGroupWithTree / the decoder
             var tiles = new int[nb][];
             for (int c = 0; c < nb; c++)
             {
@@ -559,19 +575,34 @@ internal static class JxlEncoder
 
             for (int c = 0; c < nb; c++)
             {
-                tileRefs.Add(new EncChannelRef(tiles[c], rw, rh, c, 0, TileRefs(tiles, c)));
+                tileRefs.Add(new EncChannelRef(tiles[c], rw, rh, c, streamId, TileRefs(tiles, c)));
             }
         }
 
-        byte[][] best = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, SingleLeafTree, rctType, wpMode);
+        // For each candidate tree, try both the prefix+LZ77 and the ANS (no-LZ77) entropy coder and keep
+        // whichever section set is smaller — best-per-image, so neither coder can ever regress a result.
+        void Consider(LearnedTree t, ref byte[][] bestSecs)
+        {
+            var streams = ComputeGroupStreams(chan, w, h, nb, groupDim, t, WpMode(wpMode));
+            byte[][] pfx = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, t, rctType, wpMode, useAns: false, streams);
+            if (bestSecs == null || TotalLength(pfx) < TotalLength(bestSecs))
+            {
+                bestSecs = pfx;
+            }
+
+            byte[][] ansSecs = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, t, rctType, wpMode, useAns: true, streams);
+            if (ansSecs != null && TotalLength(ansSecs) < TotalLength(bestSecs))
+            {
+                bestSecs = ansSecs;
+            }
+        }
+
+        byte[][] best = null!;
+        Consider(SingleLeafTree, ref best);
         foreach (float threshold in JxlTreeLearner.NodeThresholds)
         {
             var learned = new LearnedTree(JxlTreeLearner.Learn(tileRefs, WpMode(wpMode), threshold));
-            byte[][] secs = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, learned, rctType, wpMode);
-            if (TotalLength(secs) < TotalLength(best))
-            {
-                best = secs;
-            }
+            Consider(learned, ref best);
         }
 
         return best;
@@ -601,9 +632,10 @@ internal static class JxlEncoder
         return t;
     }
 
-    private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, LearnedTree tree, int rctType, int wpMode)
+    // The per-group residual/context streams for a tree+WP mode. Shared between the prefix and ANS coder
+    // attempts so the (expensive) weighted-predictor pass runs once per candidate, not once per coder.
+    private static List<(int[] Stream, int[] Ctxs)> ComputeGroupStreams(int[][] chan, int w, int h, int nb, int groupDim, LearnedTree tree, WpHeader wpHeader)
     {
-        WpHeader wpHeader = WpMode(wpMode);
         int gpr = CeilDiv(w, groupDim);
         int numGroups = gpr * CeilDiv(h, groupDim);
         int lfDim = groupDim * 8;
@@ -629,26 +661,78 @@ internal static class JxlEncoder
 
             int off = 0;
             int maxTok = 0;
+            int streamId = 1 + (3 * numLf) + 17 + g; // ModularStreamId::ModularAC (matches the decoder)
             for (int c = 0; c < nb; c++)
             {
-                ComputeResidualTokensCtx(new EncChannel(tiles[c], rw, rh), c, tree, stream, ctxs, off, ref maxTok, wpHeader, TileRefs(tiles, c));
+                ComputeResidualTokensCtx(new EncChannel(tiles[c], rw, rh), c, tree, stream, ctxs, off, ref maxTok, wpHeader, TileRefs(tiles, c), streamId);
                 off += rw * rh;
             }
 
             streams.Add((stream, ctxs));
         }
 
-        var plan = PlanPixelsCtx(streams, tree.LeafCount, out List<Op>[] ops);
+        return streams;
+    }
+
+    private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, LearnedTree tree, int rctType, int wpMode, bool useAns = false, List<(int[] Stream, int[] Ctxs)>? precomputedStreams = null)
+    {
+        WpHeader wpHeader = WpMode(wpMode);
+        int gpr = CeilDiv(w, groupDim);
+        int numGroups = gpr * CeilDiv(h, groupDim);
+        int lfDim = groupDim * 8;
+        int numLf = CeilDiv(w, lfDim) * CeilDiv(h, lfDim);
+
+        var streams = precomputedStreams ?? ComputeGroupStreams(chan, w, h, nb, groupDim, tree, wpHeader);
+
+        // ANS mode encodes without LZ77 (photographic residual distributions are skewed, so ANS coding at
+        // fractional bits beats prefix+LZ77). Fall back to the prefix path if the alphabet is too large.
+        JxlAnsWriter? ans = null;
+        int[][] ansCounts = null!;
+        var plan = PlanPixelsCtx(streams, tree.LeafCount, out List<Op>[] ops, useAns ? int.MaxValue / 2 : 0);
+        if (useAns)
+        {
+            int logAlpha = Math.Max(5, JxlBits.CeilLog2(plan.LitAlphabet));
+            if (logAlpha > 8)
+            {
+                return null!; // alphabet too large for ANS (max 256 symbols)
+            }
+
+            ansCounts = new int[plan.K][];
+            for (int c = 0; c < plan.K; c++)
+            {
+                ansCounts[c] = JxlEntropy.NormalizeCounts(plan.ClusterHist[c], JxlEntropy.HistShift);
+            }
+
+            ans = new JxlAnsWriter(ansCounts, logAlpha);
+        }
 
         // Section 0: LfGlobal.
         var s0 = new JxlBitWriter();
         s0.WriteBits(1, 1); // DequantMatrices::DecodeDC all_default
         s0.WriteBits(1, 1); // has_tree = 1
         WriteTree(s0, tree.Tokens);
-        WriteLz77HistogramCtx(s0, plan);
+        if (useAns)
+        {
+            WriteAnsHistogramCtx(s0, plan, ansCounts, ans!.LogAlpha);
+        }
+        else
+        {
+            WriteLz77HistogramCtx(s0, plan);
+        }
+
         WriteGlobalGroupHeader(s0, rctType, wpMode); // use_global + wp + RCT; no channels are small enough to decode here
 
-        var list = new List<byte[]>(1 + numLf + 1 + numGroups) { s0.ToArray() };
+        // The global-modular stream decodes zero channels here (all are group-sized), but an ANS decoder
+        // still reads its initial 32-bit state before finding no channels — so emit the empty-stream state
+        // (the ANS signature). Prefix codes carry no state, so nothing is written for them.
+        if (useAns)
+        {
+            s0.WriteBits((uint)JxlBits.AnsSignature << 16, 32);
+        }
+
+        byte[] s0bytes = s0.ToArray();
+
+        var list = new List<byte[]>(1 + numLf + 1 + numGroups) { s0bytes };
         for (int i = 0; i < numLf; i++)
         {
             list.Add(Array.Empty<byte>()); // LfGroup: empty for a Modular frame
@@ -662,7 +746,18 @@ internal static class JxlEncoder
             sg.WriteBool(true); // use_global tree + code
             WriteWpHeaderBits(sg, wpMode);
             sg.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0
-            EmitOpsCtx(sg, ops[g], streams[g].Ctxs, plan);
+            if (useAns)
+            {
+                EmitOpsAns(sg, ops[g], streams[g].Ctxs, plan, ans!);
+                // The ANS decoder peeks 16 bits ahead even for the final symbol; leave a few slack bytes
+                // inside the section so a strict decoder's look-ahead never runs off the section end.
+                // (slack removed)
+            }
+            else
+            {
+                EmitOpsCtx(sg, ops[g], streams[g].Ctxs, plan);
+            }
+
             list.Add(sg.ToArray());
         }
 
@@ -704,6 +799,18 @@ internal static class JxlEncoder
     {
         var ops = new List<Op>();
         int n = v.Length;
+
+        // LZ77 disabled (ANS path uses a huge minLen): skip the match search entirely and emit literals.
+        if (minLen > n)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                ops.Add(new Op(false, v[i], 0));
+            }
+
+            return ops;
+        }
+
         const int WindowMask = (1 << 20) - 1;
         var head = new Dictionary<int, int>();
         int[] prev = new int[Math.Max(1, n)];
@@ -832,7 +939,7 @@ internal static class JxlEncoder
     // decoder property 15 — the neighbour with the largest recent WP error). High-error (busy) pixels
     // and low-error (flat) pixels get separate entropy statistics. The tree is emitted so the decoder
     // computes the identical context; the encoder walks the same tree on the same property value.
-    private const int MaxLiteralClusters = 64; // upper bound on distinct histograms (libjxl-style)
+    private const int MaxLiteralClusters = 128;
 
     // Wraps a learned MA tree (JxlTreeLearner): serialises it in the decoder's breadth-first order,
     // numbering leaves as contexts, and walks it per pixel to pick the leaf (context + predictor).
@@ -951,13 +1058,15 @@ internal static class JxlEncoder
         public int SeDist, SeLen, MinLen;
         public int[] ContextToCluster = null!; // [N] pixel context -> literal cluster (0..K-1)
         public JxlPrefixCode[] Codes = null!;  // [0..K-1] literal+length clusters, [K] distance
+        public long[][] ClusterHist = null!;   // [0..K-1] raw literal+length counts (for ANS normalization)
+        public int LitAlphabet;                // literal+length token alphabet size (gmaxLit + 1)
     }
 
     // Plans the entropy coding for one or more token streams that share the global tree and codes
     // (one stream for a single-group frame, one per group otherwise). Returns per-stream LZ77 ops.
-    private static PixelPlanCtx PlanPixelsCtx(List<(int[] Stream, int[] Ctxs)> streams, int n, out List<Op>[] opsOut)
+    private static PixelPlanCtx PlanPixelsCtx(List<(int[] Stream, int[] Ctxs)> streams, int n, out List<Op>[] opsOut, int minLenOverride = 0)
     {
-        int minLen = Lz77MinLength;
+        int minLen = minLenOverride > 0 ? minLenOverride : Lz77MinLength;
         opsOut = new List<Op>[streams.Count];
         for (int i = 0; i < streams.Count; i++)
         {
@@ -1032,6 +1141,8 @@ internal static class JxlEncoder
         int[] contextToCluster = ClusterContexts(ctxHist, gmaxLit + 1, MaxLiteralClusters, out long[][] clusterHist, out int k);
         plan.K = k;
         plan.ContextToCluster = contextToCluster;
+        plan.ClusterHist = clusterHist;
+        plan.LitAlphabet = gmaxLit + 1;
         plan.Codes = new JxlPrefixCode[k + 1];
         for (int c = 0; c < k; c++)
         {
@@ -1049,6 +1160,7 @@ internal static class JxlEncoder
         }
 
         plan.Codes[k] = new JxlPrefixCode(distHist, gmaxDist + 1);
+
         return plan;
     }
 
@@ -1224,6 +1336,44 @@ internal static class JxlEncoder
         }
     }
 
+    // DecodeHistograms mirror for ANS: LZ77 disabled, an N-entry context map, ANS coding (use_prefix=0),
+    // LogAlpha, per-cluster hybrid-uint configs, then each cluster's normalized distribution.
+    private static void WriteAnsHistogramCtx(JxlBitWriter s, PixelPlanCtx plan, int[][] ansCounts, int logAlpha)
+    {
+        s.WriteBool(false); // lz77 disabled
+        WriteContextMap(s, (int[])plan.ContextToCluster.Clone(), plan.K);
+
+        s.WriteBool(false);            // use_prefix_code = false (ANS)
+        s.WriteBits((uint)(logAlpha - 5), 2);
+        for (int c = 0; c < plan.K; c++)
+        {
+            WriteUintConfig(s, LitSplit, LitMsb, LitLsb, logAlpha); // literal clusters
+        }
+
+        for (int c = 0; c < plan.K; c++)
+        {
+            JxlEntropy.WriteHistogram(s, ansCounts[c], JxlEntropy.HistShift);
+        }
+    }
+
+    // ANS token emit (LZ77 off): every op is a single literal. Build the ANS token list for the group
+    // (histogram = its literal cluster, symbol = packed residual token, plus raw mantissa bits), then let
+    // the rANS writer emit the state and interleaved bits.
+    private static void EmitOpsAns(JxlBitWriter s, List<Op> ops, int[] ctxs, PixelPlanCtx plan, JxlAnsWriter ans)
+    {
+        var tokens = new List<AnsToken>(ops.Count);
+        int pos = 0;
+        foreach (Op op in ops)
+        {
+            int litCluster = plan.ContextToCluster[ctxs[pos]];
+            (int litTok, int nbLit, int bitsLit) = PackHybridFull(LitSplit, LitMsb, LitLsb, op.A);
+            tokens.Add(new AnsToken(litCluster, litTok, (uint)bitsLit, nbLit));
+            pos += 1;
+        }
+
+        ans.Encode(s, tokens);
+    }
+
     // DecodeHistograms mirror: LZ77 enabled, an (N + 1)-entry context map (each pixel context to its
     // literal cluster, the distance context to the distance cluster), prefix coding, per-cluster configs.
     private static void WriteLz77HistogramCtx(JxlBitWriter s, PixelPlanCtx plan)
@@ -1334,7 +1484,7 @@ internal static class JxlEncoder
     // Per-pixel residuals + contexts: walk the learned tree on the decoder's properties to pick the
     // leaf's predictor (weighted or gradient) and its context, then emit the packed residual. Uses the
     // learner's shared ComputePixel so encoder and learner never diverge. Writes stream[off..]/ctxs[off..].
-    private static void ComputeResidualTokensCtx(EncChannel ch, int chan, LearnedTree tree, int[] stream, int[] ctxs, int off, ref int maxToken, WpHeader wpHeader, int[][] refs)
+    private static void ComputeResidualTokensCtx(EncChannel ch, int chan, LearnedTree tree, int[] stream, int[] ctxs, int off, ref int maxToken, WpHeader wpHeader, int[][] refs, int groupId = 0)
     {
         int w = ch.W, h = ch.H;
         int[] px = ch.Data;
@@ -1349,7 +1499,7 @@ internal static class JxlEncoder
             prevGrad = 0;
             for (int x = 0; x < w; x++)
             {
-                JxlTreeLearner.ComputePixel(px, w, chan, 0, x, y, wp, buf, props, ref prevGrad, guesses, refs);
+                JxlTreeLearner.ComputePixel(px, w, chan, groupId, x, y, wp, buf, props, ref prevGrad, guesses, refs);
                 MaTreeNode leaf = tree.Walk(props);
                 long guess = guesses[JxlTreeLearner.PredictorIndex(leaf.Predictor)];
                 int pixel = px[(y * w) + x];

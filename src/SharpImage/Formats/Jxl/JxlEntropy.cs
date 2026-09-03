@@ -317,6 +317,302 @@ internal static class JxlEntropy
         return a;
     }
 
+    // ─── ANS histogram + normalization (encoder side; inverse of ReadHistogram) ──────────────────────
+
+    // The precision shift used for ANS histograms. Counts are quantized so they are representable at this
+    // shift (each non-omit count's low bits beyond Gpcp(code, shift) are zero). Lower shift => coarser
+    // counts but smaller headers. 12 = exact; a moderate value is what real JXL files use.
+    public const int HistShift = 6;
+
+    // Quantize a count to a value representable at `shift` (floors the mantissa to Gpcp(code) bits).
+    private static int QuantizeCount(int f, int shift)
+    {
+        if (f <= 1)
+        {
+            return f;
+        }
+
+        int code = JxlBits.FloorLog2(f);
+        int bc = Gpcp(code, shift);
+        int drop = code - bc;
+        return (1 << code) + (((f - (1 << code)) >> drop) << drop);
+    }
+
+    // Normalize raw symbol counts to frequencies summing to AnsTabSize (4096), each used symbol >= 1,
+    // with every non-largest bin representable at `shift`. The largest bin (omit_pos) absorbs the
+    // remainder, so it need not be representable — the decoder reconstructs it as range - sum(others).
+    public static int[] NormalizeCounts(long[] raw, int shift)
+    {
+        int n = raw.Length;
+        int[] freq = new int[n];
+        long total = 0;
+        foreach (long v in raw)
+        {
+            total += v;
+        }
+
+        if (total == 0)
+        {
+            return freq;
+        }
+
+        int used = 0, last = 0, big = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (raw[i] > 0)
+            {
+                used++;
+                last = i;
+                if (raw[i] > raw[big])
+                {
+                    big = i;
+                }
+            }
+        }
+
+        if (used == 1)
+        {
+            freq[last] = JxlBits.AnsTabSize;
+            return freq;
+        }
+
+        _ = big;
+
+        // Proportional floor, each used symbol >= 1.
+        long assigned = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (raw[i] > 0)
+            {
+                int f = (int)Math.Floor((double)raw[i] / total * JxlBits.AnsTabSize);
+                if (f < 1)
+                {
+                    f = 1;
+                }
+
+                freq[i] = f;
+                assigned += f;
+            }
+        }
+
+        // If we overshot AnsTabSize (from bumping tiny bins to 1), shave the largest bins back down.
+        while (assigned > JxlBits.AnsTabSize)
+        {
+            int mx = -1;
+            for (int i = 0; i < n; i++)
+            {
+                if (freq[i] > 1 && (mx < 0 || freq[i] > freq[mx]))
+                {
+                    mx = i;
+                }
+            }
+
+            if (mx < 0)
+            {
+                break;
+            }
+
+            freq[mx]--;
+            assigned--;
+        }
+
+        // Quantize every bin to a value representable at `shift`, so any of them can be written exactly.
+        assigned = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (freq[i] > 0)
+            {
+                freq[i] = Math.Max(1, QuantizeCount(freq[i], shift));
+                assigned += freq[i];
+            }
+        }
+
+        // The omit position (the one the decoder reconstructs as range - sum(others)) is the first bin
+        // with the largest logcount. Give it the whole deficit so the total is exactly AnsTabSize; it need
+        // not stay representable since its count bits are not written.
+        int omit = -1, omitLc = -2;
+        for (int i = 0; i < n; i++)
+        {
+            if (freq[i] > 0)
+            {
+                int lc = JxlBits.FloorLog2(freq[i]);
+                if (lc > omitLc)
+                {
+                    omitLc = lc;
+                    omit = i;
+                }
+            }
+        }
+
+        freq[omit] += (int)(JxlBits.AnsTabSize - assigned);
+        return freq;
+    }
+
+    // Writes a distribution (sum == AnsTabSize; non-largest bins representable at `shift`) in the "full"
+    // format. Inverse of ReadHistogram.
+    public static void WriteHistogram(JxlBitWriter w, int[] counts, int shift)
+    {
+        int alphabet = counts.Length;
+        int nz = 0, first = -1, second = -1;
+        for (int i = 0; i < alphabet; i++)
+        {
+            if (counts[i] > 0)
+            {
+                nz++;
+                if (first < 0)
+                {
+                    first = i;
+                }
+                else if (second < 0)
+                {
+                    second = i;
+                }
+            }
+        }
+
+        if (nz <= 2)
+        {
+            w.WriteBits(1, 1);                       // is_simple
+            int num = Math.Max(1, nz);
+            w.WriteBits((uint)(num - 1), 1);         // num - 1
+            WriteVarLenUint8(w, first < 0 ? 0 : first);
+            if (num == 2)
+            {
+                WriteVarLenUint8(w, second);
+                w.WriteBits((uint)counts[first], JxlBits.AnsLogTabSize);
+            }
+
+            return;
+        }
+
+        int last = alphabet - 1;
+        while (last > 0 && counts[last] == 0)
+        {
+            last--;
+        }
+
+        int length = Math.Max(3, last + 1);
+
+        w.WriteBits(0, 1); // not simple
+        w.WriteBits(0, 1); // not flat
+        WriteShift(w, shift);
+        WriteVarLenUint8(w, length - 3);
+
+        int[] lc = new int[length];
+        for (int i = 0; i < length; i++)
+        {
+            lc[i] = counts[i] <= 0 ? -1 : JxlBits.FloorLog2(counts[i]);
+        }
+
+        int omit = 0, omitVal = lc[0];
+        for (int i = 1; i < length; i++)
+        {
+            if (lc[i] > omitVal)
+            {
+                omitVal = lc[i];
+                omit = i;
+            }
+        }
+
+        for (int i = 0; i < length; i++)
+        {
+            WriteLogCount(w, lc[i]);
+        }
+
+        for (int i = 0; i < length; i++)
+        {
+            if (i == omit || counts[i] <= 0)
+            {
+                continue;
+            }
+
+            int code = lc[i];
+            if (code == 0)
+            {
+                continue;
+            }
+
+            int bc = Gpcp(code, shift);
+            if (bc > 0)
+            {
+                int drop = code - bc;
+                w.WriteBits((uint)((counts[i] - (1 << code)) >> drop), bc);
+            }
+        }
+    }
+
+    // Writes the shift as ReadHistogram expects: log (unary, capped at ubl=3) then log bits, so that
+    // shift == (bits | (1 << log)) - 1.
+    private static void WriteShift(JxlBitWriter w, int shift)
+    {
+        int v = shift + 1; // v in [1, 15]
+        int log = JxlBits.FloorLog2(v);
+        int bits = v - (1 << log);
+        for (int i = 0; i < log; i++)
+        {
+            w.WriteBits(1, 1);
+        }
+
+        if (log < 3)
+        {
+            w.WriteBits(0, 1); // terminator (not present when capped at ubl == 3)
+        }
+
+        if (log > 0)
+        {
+            w.WriteBits((uint)bits, log);
+        }
+    }
+
+    private static void WriteVarLenUint8(JxlBitWriter w, int n)
+    {
+        if (n == 0)
+        {
+            w.WriteBits(0, 1);
+            return;
+        }
+
+        w.WriteBits(1, 1);
+        if (n == 1)
+        {
+            w.WriteBits(0, 3);
+            return;
+        }
+
+        int nb = JxlBits.FloorLog2(n);
+        w.WriteBits((uint)nb, 3);
+        w.WriteBits((uint)(n - (1 << nb)), nb);
+    }
+
+    // Inverse of the fixed logcount prefix code (the Huff table): for logcount value v (-1..12), emit its
+    // canonical code. Built once from Huff by finding the first table entry decoding to v.
+    private static (int Nbits, int Bits)[]? logCodeCache;
+
+    private static void WriteLogCount(JxlBitWriter w, int v)
+    {
+        if (logCodeCache == null)
+        {
+            var map = new (int, int)[14]; // index = v + 1  (v in -1..12)
+            var seen = new bool[14];
+            for (int idx = 0; idx < Huff.Length; idx++)
+            {
+                (int nbits, int val) = Huff[idx];
+                int lv = val - 1; // logcount
+                int slot = lv + 1;
+                if (slot >= 0 && slot < 14 && !seen[slot])
+                {
+                    seen[slot] = true;
+                    map[slot] = (nbits, idx & ((1 << nbits) - 1));
+                }
+            }
+
+            logCodeCache = map;
+        }
+
+        (int nb, int bits) = logCodeCache[v + 1];
+        w.WriteBits((uint)bits, nb);
+    }
+
     public static uint ReadHybridUintConfig(HybridUintConfig cfg, uint token, JxlBitReader br)
     {
         int splitToken = 1 << cfg.SplitExp;

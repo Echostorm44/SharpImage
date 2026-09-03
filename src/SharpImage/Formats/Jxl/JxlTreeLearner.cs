@@ -29,12 +29,12 @@ internal static class JxlTreeLearner
     public const int WeightedPredictor = 6;
     public const int GradientPredictor = 5;
 
-    // Properties (decoder indices) the tree may split on, in libjxl's priority order minus the group
-    // property (we use one global tree). 0 = channel, 15 = WP error, 9 = gradient, 10..14 = neighbour
-    // differences, 2 = y.
+    // Properties (decoder indices) the tree may split on, in libjxl's priority order. 0 = channel,
+    // 1 = group/stream id (per-region adaptation with small groups — libjxl splits on it heavily),
+    // 15 = WP error, 9 = gradient, 10..14 = neighbour differences, 2 = y.
     // Non-reference properties only: after the RCT decorrelates the colour channels, cross-channel
     // reference properties (16+) add no signal and just let the learner overfit — measured worse.
-    private static readonly int[] UsedProperties = { 0, 15, 9, 10, 11, 12, 13, 14, 2, 4, 5, 6, 7, 8 };
+    private static readonly int[] UsedProperties = { 0, 1, 15, 9, 10, 11, 12, 13, 14, 2, 4, 5, 6, 7, 8 };
 
     // libjxl's fixed weighted-predictor-error thresholds (the "< 32 values" set).
     private static readonly int[] WpThresholds =
@@ -42,13 +42,13 @@ internal static class JxlTreeLearner
 
     private const int MaxPropertyValues = 48; // quantile buckets for data-driven properties
     private const int MaxSamples = 1 << 21;   // cap learning cost on very large images
-    private const int MaxLeaves = 256;         // safety cap on tree size
+    private const int MaxLeaves = 512;         // safety cap on tree size
 
     // Candidate split thresholds (min entropy-bits a split must save). The right value is content-
     // dependent — busy photographs want a higher threshold (fewer splits: the subsampled cost model
     // over-estimates split benefit since later histogram clustering re-merges contexts), flat/synthetic
     // content wants a lower one. The encoder learns a tree at each and keeps the smaller output.
-    public static readonly float[] NodeThresholds = { 160f, 400f };
+    public static readonly float[] NodeThresholds = { 96f, 160f };
 
     /// <summary>Learns a global MA tree for the given residual channels at the given split threshold.</summary>
     public static MaTreeNode Learn(List<EncChannelRef> channels, WpHeader wpHeader, float nodeThreshold)
@@ -330,6 +330,26 @@ internal static class JxlTreeLearner
         int[] absPixelThresholds = QuantizeSamples(absPixels, MaxPropertyValues);
         int[] absDiffThresholds = QuantizeSamples(absDiffs, MaxPropertyValues);
 
+        // Group property (p1) thresholds: the split values are the distinct group/stream ids themselves,
+        // so the tree can isolate any region. "p1 > id_k" separates the groups after id_k.
+        var groupIds = new SortedSet<int>();
+        foreach (EncChannelRef ch in channels)
+        {
+            groupIds.Add(ch.GroupId);
+        }
+
+        int[] groupThresholds;
+        if (groupIds.Count <= 1)
+        {
+            groupThresholds = Array.Empty<int>();
+        }
+        else
+        {
+            var gl = new List<int>(groupIds);
+            gl.RemoveAt(gl.Count - 1); // drop the max: "p1 > max" is always empty
+            groupThresholds = gl.ToArray();
+        }
+
         int[][] thr = new int[UsedProperties.Length][];
         for (int i = 0; i < UsedProperties.Length; i++)
         {
@@ -340,6 +360,7 @@ internal static class JxlTreeLearner
             thr[i] = p switch
             {
                 0 => new[] { 0, 1 },
+                1 => groupThresholds,
                 15 => WpThresholds,
                 2 or 3 => QuantizeCoordinate(),
                 4 or 5 => absPixelThresholds, // |top|, |left|
