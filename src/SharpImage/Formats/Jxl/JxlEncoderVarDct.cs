@@ -113,7 +113,11 @@ internal static partial class JxlEncoder
     /// the rate stays put. Equalising perceptual distortion is the spatial bit-allocation that closes the gap
     /// to libjxl. Uses the ported adaptive quant field + Gaborish (perceptual: true).
     /// </summary>
-    public static byte[] EncodeVarDctRefined(ImageFrame image, float distance, int iters = 4, int[]? passShifts = null)
+    // perceptual=true refines the ported adaptive-quant base (where the refinement HELPS, +1, since that
+    // field is Butteraugli-tuned and suboptimal for SSIMULACRA2). On the SSIMULACRA2-tuned heuristic base
+    // (perceptual=false) the refinement only hurts — its uniform quant is already near-optimal, and the
+    // heuristic's coarse-quant cliff is a block-selection issue that quant refinement cannot fix.
+    public static byte[] EncodeVarDctRefined(ImageFrame image, float distance, int iters = 4, int[]? passShifts = null, bool perceptual = true)
     {
         int w = (int)image.Columns, h = (int)image.Rows;
         if (w > VarDctLfGroupDim || h > VarDctLfGroupDim)
@@ -128,19 +132,31 @@ internal static partial class JxlEncoder
         float[][] srgb0 = ExtractSrgb(image, w, h);
         float[][] lin0 = ToLinear(srgb0, w, h);
         float[][] xyb0 = PadToXyb(srgb0, w, h, stride, strideH, fp);
-        var (quantField, mask1x1) = JxlEncoderPerceptual.ComputeAdaptiveQuantField(xyb0, stride, w, h, bw, bh, distance);
 
-        // Fix the block layout ONCE from the initial field (libjxl fixes the AC strategy before refining the
-        // quant field) so the per-tile distortion is measured against a stable layout across iterations.
+        // Initial per-block quant field. Perceptual: the masking-based adaptive field + fixed EstimateEntropy
+        // layout. Heuristic (default, our best SSIMULACRA2 base): a uniform field at the distance's base
+        // quant, with the heuristic's activity-based layout (recomputed stably each iteration).
         var dm = DequantMatrixSet.Default();
-        var cfg = JxlEncoderPerceptual.MakeConfig(xyb0, stride, w, h, bw, quantField, mask1x1, new[] { 0f, 0f, 1f }, dm, distance);
-        int[] layout = JxlEncoderPerceptual.ProcessImage(cfg, bw, bh, distance);
+        float[] quantField;
+        int[]? layout = null;
+        if (perceptual)
+        {
+            var (qf, mask1x1) = JxlEncoderPerceptual.ComputeAdaptiveQuantField(xyb0, stride, w, h, bw, bh, distance);
+            quantField = qf;
+            var cfg = JxlEncoderPerceptual.MakeConfig(xyb0, stride, w, h, bw, qf, mask1x1, new[] { 0f, 0f, 1f }, dm, distance);
+            layout = JxlEncoderPerceptual.ProcessImage(cfg, bw, bh, distance);
+        }
+        else
+        {
+            quantField = new float[bw * bh];
+            Array.Fill(quantField, hfm * gs / 65536f); // uniform base quant (hf_mul == hfm)
+        }
 
         byte[] bestCs = null!;
         double bestScore = double.NegativeInfinity;
         for (int it = 0; it <= iters; it++)
         {
-            byte[] cs = EncodeVarDct(image, gs, qlf, hfm, passShifts, false, true, perceptual: true, distance: distance, quantFieldOverride: quantField, layoutOverride: layout);
+            byte[] cs = EncodeVarDct(image, gs, qlf, hfm, passShifts, false, true, perceptual: perceptual, distance: distance, quantFieldOverride: quantField, layoutOverride: layout);
 
             // Decode our own output and score it with the (ssimulacra2_rs-validated) metric; keep the best
             // codestream across iterations (the equalisation peaks then overshoots).
@@ -162,34 +178,43 @@ internal static partial class JxlEncoder
             // then equalise the quant field (finer where the block is reconstructed worse than the image norm),
             // geometric-mean-preserving so the rate is held.
 
-            // Aggregate the tile distances over each data block and broadcast to all its cells.
+            // Aggregate the tile distances over each data block and broadcast to all its cells (when the
+            // layout is known/fixed). Without an external layout (heuristic path), refine per 8x8 and let the
+            // encoder's quant_norm16 aggregation combine a large block's cells.
             var blockDist = new double[bw * bh];
-            for (int by = 0; by < bh; by++)
+            if (layout == null)
             {
-                for (int bx = 0; bx < bw; bx++)
+                Array.Copy(dist, blockDist, bw * bh);
+            }
+            else
+            {
+                for (int by = 0; by < bh; by++)
                 {
-                    int pos = (by * bw) + bx;
-                    if (layout[pos] < 0)
+                    for (int bx = 0; bx < bw; bx++)
                     {
-                        continue;
-                    }
-
-                    var (qdw, qdh) = JxlDct.DctSelectSize((TransformType)layout[pos]);
-                    double sum = 0;
-                    for (int dy = 0; dy < qdh; dy++)
-                    {
-                        for (int dx = 0; dx < qdw; dx++)
+                        int pos = (by * bw) + bx;
+                        if (layout[pos] < 0)
                         {
-                            sum += dist[((by + dy) * bw) + bx + dx];
+                            continue;
                         }
-                    }
 
-                    double avg = sum / (qdw * qdh);
-                    for (int dy = 0; dy < qdh; dy++)
-                    {
-                        for (int dx = 0; dx < qdw; dx++)
+                        var (qdw, qdh) = JxlDct.DctSelectSize((TransformType)layout[pos]);
+                        double sum = 0;
+                        for (int dy = 0; dy < qdh; dy++)
                         {
-                            blockDist[((by + dy) * bw) + bx + dx] = avg;
+                            for (int dx = 0; dx < qdw; dx++)
+                            {
+                                sum += dist[((by + dy) * bw) + bx + dx];
+                            }
+                        }
+
+                        double avg = sum / (qdw * qdh);
+                        for (int dy = 0; dy < qdh; dy++)
+                        {
+                            for (int dx = 0; dx < qdw; dx++)
+                            {
+                                blockDist[((by + dy) * bw) + bx + dx] = avg;
+                            }
                         }
                     }
                 }
@@ -530,7 +555,37 @@ internal static partial class JxlEncoder
 
             // Block-size layout: sizeAt[pos] = (int)TransformType for a data block's top-left position, or -1
             // for a position covered by a larger block. Off => every 8x8 position is its own Dct8 block.
-            sizeAt = BuildDctLayout(xyb, stride, dm, globalScale, hfMulBlock, blockHfMul, adaptiveQuant, fp, bw, bh, variableBlocks);
+            sizeAt = layoutOverride ?? BuildDctLayout(xyb, stride, dm, globalScale, hfMulBlock, blockHfMul, adaptiveQuant, fp, bw, bh, variableBlocks);
+
+            // The SSIMULACRA2 refinement can drive the heuristic layout too: map its per-block quant field to
+            // hf_mul (same quant_norm16 aggregation as the perceptual path).
+            if (quantFieldOverride != null)
+            {
+                hfMulBlock = new int[bw * bh];
+                for (int by = 0; by < bh; by++)
+                {
+                    for (int bx = 0; bx < bw; bx++)
+                    {
+                        int pos = (by * bw) + bx;
+                        if (sizeAt[pos] < 0)
+                        {
+                            continue;
+                        }
+
+                        var (qdw, qdh) = JxlDct.DctSelectSize((TransformType)sizeAt[pos]);
+                        int hf = Math.Clamp((int)MathF.Round(QuantNorm(quantFieldOverride, bw, bx, by, qdw, qdh) * 65536f / globalScale), 1, 4096);
+                        for (int dy = 0; dy < qdh; dy++)
+                        {
+                            for (int dx = 0; dx < qdw; dx++)
+                            {
+                                hfMulBlock[((by + dy) * bw) + bx + dx] = hf;
+                            }
+                        }
+                    }
+                }
+
+                adaptiveQuant = true;
+            }
         }
 
         if (perceptual)
