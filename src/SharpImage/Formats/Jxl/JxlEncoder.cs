@@ -134,12 +134,15 @@ internal static class JxlEncoder
             }
         }
 
-        if (TryBuildPalette(r, g, b, w, h, gray, out List<EncChannel> palChannels, out int nbColors))
+        for (int order = 0; order < 3; order++)
         {
-            byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors, gray ? 1 : 3), 0);
-            if (palSec.Length < best.Length)
+            if (TryBuildPalette(r, g, b, w, h, gray, order, out List<EncChannel> palChannels, out int nbColors))
             {
-                best = palSec;
+                byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors, gray ? 1 : 3), 0);
+                if (palSec.Length < best.Length)
+                {
+                    best = palSec;
+                }
             }
         }
 
@@ -596,34 +599,52 @@ internal static class JxlEncoder
     // colour gradients (better prediction). Returns false when there are too many colours.
     private const int MaxPaletteColors = 4096;
 
-    private static bool TryBuildPalette(int[] r, int[] g, int[] b, int w, int h, bool gray, out List<EncChannel> channels, out int nbColors)
+    private static bool TryBuildPalette(int[] r, int[] g, int[] b, int w, int h, bool gray, int order, out List<EncChannel> channels, out int nbColors)
     {
         channels = null!;
         nbColors = 0;
         int n = w * h;
-        var indexByColor = new Dictionary<int, int>();
+        var countByColor = new Dictionary<int, int>();
         foreach (int key in Keys(r, g, b, n))
         {
-            if (!indexByColor.ContainsKey(key))
+            countByColor[key] = countByColor.GetValueOrDefault(key) + 1;
+            if (countByColor.Count > MaxPaletteColors)
             {
-                indexByColor[key] = 0;
-                if (indexByColor.Count > MaxPaletteColors)
-                {
-                    return false;
-                }
+                return false;
             }
         }
 
-        nbColors = indexByColor.Count;
+        nbColors = countByColor.Count;
         int[] colors = new int[nbColors];
         int i = 0;
-        foreach (int key in indexByColor.Keys)
+        foreach (int key in countByColor.Keys)
         {
             colors[i++] = key;
         }
 
-        // Order by luma so spatially-smooth colour maps to smooth indices.
-        Array.Sort(colors, (a, c) => Luma(a).CompareTo(Luma(c)));
+        // Palette entry order sets the index values, which drives how well the index channel's gradient
+        // predictor tracks region boundaries. Try a few orderings (see caller) and keep the smaller.
+        // order 0: by luma. order 1: by descending frequency. order 2: for a small palette, the ordering
+        // that minimises the index's gradient-residual entropy, found by brute force over all permutations.
+        if (order == 2)
+        {
+            if (nbColors > 7)
+            {
+                return false; // too many colours to brute-force; the other orderings cover this case
+            }
+
+            colors = BestPaletteOrder(colors, r, g, b, w, h);
+        }
+        else if (order == 1)
+        {
+            Array.Sort(colors, (a, c) => countByColor[c].CompareTo(countByColor[a]));
+        }
+        else
+        {
+            Array.Sort(colors, (a, c) => Luma(a).CompareTo(Luma(c)));
+        }
+
+        var indexByColor = new Dictionary<int, int>(nbColors);
         for (int k = 0; k < nbColors; k++)
         {
             indexByColor[colors[k]] = k;
@@ -657,6 +678,134 @@ internal static class JxlEncoder
             new(index, w, h),           // then the index channel
         };
         return true;
+    }
+
+    // Brute-force the palette ordering that minimises the index channel's clamped-gradient residual
+    // entropy (only called for a small palette, nbColors <= 8, so |permutations| stays bounded). The
+    // ordering that makes spatially-adjacent regions have adjacent indices predicts best.
+    private static int[] BestPaletteOrder(int[] colors, int[] r, int[] g, int[] b, int w, int h)
+    {
+        int nbColors = colors.Length;
+        int n = w * h;
+        var idxOf = new Dictionary<int, int>(nbColors);
+        for (int k = 0; k < nbColors; k++)
+        {
+            idxOf[colors[k]] = k;
+        }
+
+        int[] baseIdx = new int[n];
+        for (int p = 0; p < n; p++)
+        {
+            baseIdx[p] = idxOf[(r[p] << 16) | (g[p] << 8) | b[p]];
+        }
+
+        // A pixel's clamped-gradient residual depends only on the base indices of (self, left, top,
+        // topleft). Collapse the image to the counts of each distinct 4-tuple (3 bits per index) so each
+        // candidate ordering is scored over a few hundred tuples, not millions of pixels.
+        var tupleCounts = new Dictionary<int, int>();
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int p = (y * w) + x;
+                int self = baseIdx[p];
+                // 7 marks the literal-0 neighbour fallback (the (0,0) corner), mapped to permuted index 0
+                // in the scorer — exactly matching JxlTreeLearner.ComputePixel's boundary handling.
+                int left = x > 0 ? baseIdx[p - 1] : (y > 0 ? baseIdx[p - w] : 7);
+                int top = y > 0 ? baseIdx[p - w] : left;
+                int topleft = (x > 0 && y > 0) ? baseIdx[p - w - 1] : left;
+                int key = self | (left << 3) | (top << 6) | (topleft << 9);
+                tupleCounts[key] = tupleCounts.GetValueOrDefault(key) + 1;
+            }
+        }
+
+        int[] tKeys = new int[tupleCounts.Count];
+        int[] tCnt = new int[tupleCounts.Count];
+        int ti = 0;
+        foreach (var kv in tupleCounts)
+        {
+            tKeys[ti] = kv.Key;
+            tCnt[ti] = kv.Value;
+            ti++;
+        }
+
+        int[] perm = new int[nbColors];
+        for (int k = 0; k < nbColors; k++)
+        {
+            perm[k] = k;
+        }
+
+        int[] best = (int[])perm.Clone();
+        double bestCost = double.MaxValue;
+        int[] counts = new int[(2 * nbColors) + 1];
+
+        void Eval()
+        {
+            double c = OrderResidualBits(tKeys, tCnt, perm, n, counts);
+            if (c < bestCost)
+            {
+                bestCost = c;
+                Array.Copy(perm, best, nbColors);
+            }
+        }
+
+        int[] stack = new int[nbColors];
+        Eval();
+        for (int iHeap = 0; iHeap < nbColors;)
+        {
+            if (stack[iHeap] < iHeap)
+            {
+                int a = (iHeap & 1) == 0 ? 0 : stack[iHeap];
+                (perm[a], perm[iHeap]) = (perm[iHeap], perm[a]);
+                Eval();
+                stack[iHeap]++;
+                iHeap = 0;
+            }
+            else
+            {
+                stack[iHeap] = 0;
+                iHeap++;
+            }
+        }
+
+        int[] ordered = new int[nbColors];
+        for (int k = 0; k < nbColors; k++)
+        {
+            ordered[best[k]] = colors[k];
+        }
+
+        return ordered;
+    }
+
+    // Entropy (bits) of the clamped-gradient residuals of the index field under a given colour ordering,
+    // computed over the collapsed 4-tuple counts.
+    private static double OrderResidualBits(int[] tKeys, int[] tCnt, int[] perm, int total, int[] counts)
+    {
+        Array.Clear(counts);
+        int off = counts.Length / 2;
+        for (int i = 0; i < tKeys.Length; i++)
+        {
+            int key = tKeys[i];
+            int self = perm[key & 7];
+            int lk = (key >> 3) & 7, tk = (key >> 6) & 7, tlk = (key >> 9) & 7;
+            int left = lk == 7 ? 0 : perm[lk];
+            int top = tk == 7 ? 0 : perm[tk];
+            int topleft = tlk == 7 ? 0 : perm[tlk];
+            int resid = self - (int)JxlTreeLearner.ClampedGradient(left, top, topleft);
+            counts[resid + off] += tCnt[i];
+        }
+
+        double bits = 0;
+        double invLog2 = 1.0 / Math.Log(2);
+        foreach (int c in counts)
+        {
+            if (c > 0)
+            {
+                bits -= c * Math.Log((double)c / total) * invLog2;
+            }
+        }
+
+        return bits;
     }
 
     private static IEnumerable<int> Keys(int[] r, int[] g, int[] b, int n)
