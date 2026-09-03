@@ -83,6 +83,48 @@ internal static partial class JxlEncoder
         return shifts;
     }
 
+    /// <summary>
+    /// Whether the VarDCT (lossy) encoder can handle this image (single LF group, i.e. <= 2048x2048).
+    /// </summary>
+    public static bool CanEncodeVarDct(ImageFrame image) =>
+        image.Columns > 0 && image.Rows > 0 && image.Columns <= VarDctLfGroupDim && image.Rows <= VarDctLfGroupDim;
+
+    /// <summary>
+    /// Encodes an image as a lossy VarDCT JPEG XL codestream at the given Butteraugli-style
+    /// <paramref name="distance"/> (lower = higher quality; ~1.0 is high quality, larger is lower). The
+    /// distance-to-quantiser mapping is a pragmatic approximation, not perceptually calibrated yet.
+    /// </summary>
+    public static byte[] EncodeVarDct(ImageFrame image, float distance, int[]? passShifts = null)
+    {
+        (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
+        return EncodeVarDct(image, gs, qlf, hfm, passShifts);
+    }
+
+    // Maps a Butteraugli-style distance to (global_scale, quant_lf, block_hf_mul). global_scale is fixed;
+    // block_hf_mul scales AC precision (~1/distance) and quant_lf scales DC precision, capped so the DC
+    // integers stay inside the 16-bit modular buffer.
+    private static (uint GlobalScale, uint QuantLf, uint BlockHfMul) QuantForDistance(float distance)
+    {
+        float d = Math.Clamp(distance, 0.1f, 25f);
+        uint hfm = (uint)Math.Clamp((int)MathF.Round(64f / d), 1, 4096);
+        uint qlf = (uint)Math.Clamp((int)MathF.Round(256f / d), 1, 512);
+        return (8192u, qlf, hfm);
+    }
+
+    /// <summary>Butteraugli-style distance for a JPEG-like quality in [0,100] (higher quality => lower distance).</summary>
+    public static float DistanceFromQuality(int quality)
+    {
+        int q = Math.Clamp(quality, 1, 100);
+        if (q >= 100)
+        {
+            return 0.1f; // we do not emit truly-lossless VarDCT; clamp to very high quality
+        }
+
+        return q >= 30
+            ? 0.1f + ((100 - q) * 0.09f)
+            : 6.4f + (MathF.Pow(2.5f, (30 - q) / 5f) * 0.09f);
+    }
+
     // Extract sRGB [0,1] float channels (grayscale expanded to RGB), matching EncodeLossless's sampling.
     private static float[][] ExtractSrgb(ImageFrame image, int w, int h)
     {

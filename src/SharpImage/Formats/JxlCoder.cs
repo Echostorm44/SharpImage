@@ -60,10 +60,20 @@ public static class JxlCoder
     public static byte[] Encode(ImageFrame image) => Jxl.JxlEncoder.EncodeLossless(image);
 
     /// <summary>
-    /// JPEG XL lossy (VarDCT) encoding is not yet implemented. Falls back to lossless encoding so the
-    /// output is always a valid JPEG XL file; <paramref name="quality"/> is currently ignored.
+    /// Encodes an image as a lossy JPEG XL codestream (XYB VarDCT). <paramref name="quality"/> is a
+    /// JPEG-style value in [1,100] (higher = better). Images larger than one LF group (2048x2048) are not
+    /// yet supported by the VarDCT encoder and fall back to lossless so the output is always valid.
     /// </summary>
-    public static byte[] EncodeLossy(ImageFrame image, int quality = 75) => Jxl.JxlEncoder.EncodeLossless(image);
+    public static byte[] EncodeLossy(ImageFrame image, int quality = 75)
+    {
+        if (!Jxl.JxlEncoder.CanEncodeVarDct(image))
+        {
+            return Jxl.JxlEncoder.EncodeLossless(image);
+        }
+
+        float distance = Jxl.JxlEncoder.DistanceFromQuality(quality);
+        return Jxl.JxlEncoder.EncodeVarDct(image, distance);
+    }
 
     private static ImageFrame BuildFrame(Jxl.JxlModularResult r)
     {

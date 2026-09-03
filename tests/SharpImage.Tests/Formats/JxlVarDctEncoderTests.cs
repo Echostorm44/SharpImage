@@ -217,6 +217,48 @@ public class JxlVarDctEncoderTests
     }
 
     [Test]
+    public async Task JxlCoder_EncodeLossy_QualityKnob_Monotonic()
+    {
+        const int w = 128, h = 128;
+        ImageFrame frame = TexturedFrame(w, h);
+
+        byte[] hi = SharpImage.Formats.JxlCoder.EncodeLossy(frame, 92);
+        byte[] lo = SharpImage.Formats.JxlCoder.EncodeLossy(frame, 40);
+
+        double PsnrOf(byte[] cs)
+        {
+            JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+            double mse = 0;
+            for (int y = 0; y < h; y++)
+            {
+                var srow = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    for (int c = 0; c < 3; c++)
+                    {
+                        double d = Quantum.ScaleToByte(srow[(x * 3) + c]) - r.Channels[c].Px[(y * w) + x];
+                        mse += d * d;
+                    }
+                }
+            }
+
+            mse /= 3.0 * w * h;
+            return mse <= 1e-9 ? 99.0 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        }
+
+        double hiPsnr = PsnrOf(hi), loPsnr = PsnrOf(lo);
+        string dump = Environment.GetEnvironmentVariable("VARDCT_DUMP_Q");
+        if (!string.IsNullOrEmpty(dump))
+        {
+            System.IO.File.WriteAllBytes(dump, hi);
+        }
+
+        Console.Error.WriteLine($"[VARDCT] q92 {hi.Length}B {hiPsnr:F1}dB  q40 {lo.Length}B {loPsnr:F1}dB");
+        await Assert.That(hiPsnr).IsGreaterThan(loPsnr);   // higher quality reconstructs better
+        await Assert.That(hi.Length).IsGreaterThan(lo.Length); // and costs more bytes
+    }
+
+    [Test]
     public async Task VarDctMultiGroup_LargerThanOneGroup_RoundTrips()
     {
         const int w = 384, h = 320; // 2x2 groups of 256px
