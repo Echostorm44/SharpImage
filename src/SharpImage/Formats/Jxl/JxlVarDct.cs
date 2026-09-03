@@ -775,7 +775,7 @@ internal static class JxlVarDct
         }
     }
 
-    private static void XybToSrgb(float[][] xyb, int len, VarDctFrameParams fp)
+    internal static void XybToSrgb(float[][] xyb, int len, VarDctFrameParams fp)
     {
         float itscale = 255.0f / fp.IntensityTarget;
         float[] ob = fp.OpsinBias;

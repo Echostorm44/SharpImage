@@ -131,6 +131,35 @@ internal sealed class DequantMatrixSet
         _ => 0,
     };
 
+    // Builds the all-default matrix set (what Parse yields when all_default is set) — used by the encoder.
+    public static DequantMatrixSet Default()
+    {
+        var set = new DequantMatrixSet();
+        for (int i = 0; i < 17; i++)
+        {
+            TransformType dctSelect = DctSelectList[i];
+            float[][] mat = DequantMatrixParams.DefaultWith(dctSelect).IntoMatrix();
+            set.matrices[i] = mat;
+            var (w, h) = JxlDct.DequantMatrixSize(dctSelect);
+            var tr = new float[3][];
+            for (int c = 0; c < 3; c++)
+            {
+                var m = mat[c];
+                var outp = new float[m.Length];
+                for (int idx = 0; idx < m.Length; idx++)
+                {
+                    outp[idx] = m[((idx % h) * w) + (idx / h)];
+                }
+
+                tr[c] = outp;
+            }
+
+            set.matricesTr[i] = tr;
+        }
+
+        return set;
+    }
+
     public float[] Get(int channel, TransformType t) => matrices[ParamIndex(t)][channel];
 
     public float[] GetTransposed(int channel, TransformType t) => matricesTr[ParamIndex(t)][channel];
