@@ -8,11 +8,14 @@
 // pre-subtracted in the encoder — so the decoder's reconstruction equals JxlVarDctEncoder's validated
 // forward/inverse model exactly.
 //
-// Two conformance points that cost real debugging: (1) ImageMetadata must be written out explicitly with
-// xyb_encoded = true — the all_default metadata is read as non-XYB by libjxl/jxl-oxide, which then expect
-// a do_ycbcr bit and desync; (2) the LfGroup modular sub-images must reference a *global* MA tree in
-// LfGlobal (use_global_tree = true) — local per-image trees are rejected by both reference decoders.
-// Output verified decodable by libjxl (ffmpeg) and jxl-oxide, plus this repo's own decoder.
+// Three conformance points that cost real debugging: (1) ImageMetadata must be written out explicitly
+// with xyb_encoded = true — the all_default metadata is read as non-XYB by libjxl/jxl-oxide, which then
+// expect a do_ycbcr bit and desync; (2) the LfGroup modular sub-images must reference a *global* MA tree
+// in LfGlobal (use_global_tree = true) — local per-image trees are rejected by both reference decoders;
+// (3) Dct8 needs transposition (NeedTranspose(Dct8) == true) — the decoder places each coefficient at the
+// transposed block position and dequantises with the transposed matrix, so the encoder must too.
+// Output verified decodable by libjxl (ffmpeg) and jxl-oxide (which agree pixel-close), plus this repo's
+// own decoder — whose reconstruction matches the validated forward model to ~0.05 dB.
 using System;
 using System.Collections.Generic;
 using SharpImage.Core;
@@ -167,41 +170,79 @@ internal static partial class JxlEncoder
         var fp = new VarDctFrameParams();
         float[][] xyb = JxlVarDctEncoder.SrgbToXyb(padded, stride * strideH, fp);
 
-        // Quantise DC per block. Modular DC channels are [Y, X, B]; CfL adds +1*Y to B on decode, so we
-        // store B with the (quantised) Y term pre-subtracted, and X unchanged (kx == 0).
+        // Per-block forward DCT + quantisation. Modular DC channels are [Y, X, B]; default CfL adds +1*Y
+        // to B on decode (kx == 0, kb == 1), so B is stored with the dequantised Y term pre-subtracted
+        // (both for the DC/LF value and every AC/HF coefficient); X is stored as-is.
         float[] mlf = { 1f / 32f, 1f / 4f, 1f / 2f };                 // m_x, m_y, m_b
         double scaleInv = (double)globalScale * quantLf;
         float scaleX = (float)(mlf[0] * 512.0 / scaleInv);
         float scaleY = (float)(mlf[1] * 512.0 / scaleInv);
         float scaleB = (float)(mlf[2] * 512.0 / scaleInv);
+        DequantMatrixSet dm = DequantMatrixSet.Default();
+        // Dct8 needs transposition (NeedTranspose(Dct8) == true, since its 1x1 block has h >= w): the
+        // decoder places coefficients at the transposed block position and dequantises with the transposed
+        // matrix, so the encoder must do the same.
+        float[] matX = dm.GetTransposed(0, TransformType.Dct8);
+        float[] matY = dm.GetTransposed(1, TransformType.Dct8);
+        float[] matB = dm.GetTransposed(2, TransformType.Dct8);
+        float hfMul = 65536.0f / (globalScale * (float)blockHfMul);
+        (ushort X, ushort Y)[] order = JxlVarDctTables.NaturalOrder(0); // Dct8 scan order
 
         var dcY = new int[nbData];
         var dcX = new int[nbData];
         var dcB = new int[nbData];
+        // AC coefficients per block, laid out by scan position: ac[c][block*64 + oi]. oi 0 (DC) unused.
+        var ac = new int[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            ac[c] = new int[nbData * 64];
+        }
+
+        var coeffRaster = new float[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            coeffRaster[c] = new float[64];
+        }
+
         for (int by = 0; by < bh; by++)
         {
             for (int bx = 0; bx < bw; bx++)
             {
-                // Forward DCT DC == mean*8 of the block; compute coeff[0] for each channel.
-                float sumX = 0, sumY = 0, sumB = 0;
-                for (int yy = 0; yy < 8; yy++)
+                int bi = (by * bw) + bx;
+                for (int c = 0; c < 3; c++)
                 {
-                    for (int xx = 0; xx < 8; xx++)
+                    var g = new JxlDct.Grid(coeffRaster[c], 0, 8, 8, 8);
+                    for (int yy = 0; yy < 8; yy++)
                     {
-                        int p = (((by * 8) + yy) * stride) + (bx * 8) + xx;
-                        sumX += xyb[0][p];
-                        sumY += xyb[1][p];
-                        sumB += xyb[2][p];
+                        for (int xx = 0; xx < 8; xx++)
+                        {
+                            g.Set(xx, yy, xyb[c][(((by * 8) + yy) * stride) + (bx * 8) + xx]);
+                        }
                     }
+
+                    JxlDct.Dct2D(g, false); // forward DCT -> coeffRaster[c] in raster order
                 }
 
-                // DCT-II DC coefficient with the codec's 0.5 forward scale is mean over the 8x8 block.
-                float dcXf = sumX / 64f, dcYf = sumY / 64f, dcBf = sumB / 64f;
-                int bi = (by * bw) + bx;
-                int yInt = (int)MathF.Round(dcYf / scaleY);
-                dcY[bi] = yInt;
-                dcX[bi] = (int)MathF.Round(dcXf / scaleX);
-                dcB[bi] = (int)MathF.Round((dcBf - (yInt * scaleY)) / scaleB);
+                // DC (channel order X=0, Y=1, B=2); B pre-subtracts the dequantised Y DC.
+                int yDcInt = (int)MathF.Round(coeffRaster[1][0] / scaleY);
+                dcY[bi] = yDcInt;
+                dcX[bi] = (int)MathF.Round(coeffRaster[0][0] / scaleX);
+                dcB[bi] = (int)MathF.Round((coeffRaster[2][0] - (yDcInt * scaleY)) / scaleB);
+
+                // AC: quantise each channel; B pre-subtracts the dequantised Y AC per coefficient.
+                for (int oi = 1; oi < 64; oi++)
+                {
+                    // Transposed placement raster (matches the decoder's NeedTranspose swap for Dct8).
+                    int k = (order[oi].X * 8) + order[oi].Y;
+                    // X and Y quantise directly.
+                    int qX = QuantAc(coeffRaster[0][k], matX[k] * hfMul, fp.QuantBias[0], fp.QuantBiasNumerator);
+                    int qY = QuantAc(coeffRaster[1][k], matY[k] * hfMul, fp.QuantBias[1], fp.QuantBiasNumerator);
+                    ac[0][(bi * 64) + oi] = qX;
+                    ac[1][(bi * 64) + oi] = qY;
+                    // B: subtract the dequantised Y coefficient (CfL kb == 1) before quantising.
+                    float yDeq = DequantAc(qY, matY[k] * hfMul, fp.QuantBias[1], fp.QuantBiasNumerator);
+                    ac[2][(bi * 64) + oi] = QuantAc(coeffRaster[2][k] - yDeq, matB[k] * hfMul, fp.QuantBias[2], fp.QuantBiasNumerator);
+                }
             }
         }
 
@@ -225,6 +266,7 @@ internal static partial class JxlEncoder
             new(blockInfo, nbData, 2),             // block info
             new(new int[bw * bh], bw, bh),         // sharpness (all 0)
         };
+
 
         List<ModToken> dcTokens = GradientTokens(dcImage);
         List<ModToken> metaTokens = GradientTokens(hfMeta);
@@ -251,6 +293,7 @@ internal static partial class JxlEncoder
         }
 
         int logAlpha = Math.Max(5, JxlBits.CeilLog2(maxToken + 1));
+
         int[] normalized = JxlEntropy.NormalizeCounts(hist, JxlEntropy.HistShift);
 
         var body = new JxlBitWriter();
@@ -276,66 +319,128 @@ internal static partial class JxlEncoder
         body.WriteBits((uint)(nbData - 1), nbBits);
         WriteSubModularUsingGlobal(body, metaTokens, normalized, logAlpha);
 
+        // Build the HF (AC) coefficient tokens for the pass group, then the shared HfDist histogram.
+        List<ModToken> hfTokens = BuildHfTokens(bw, bh, ac);
+        int hfMax = 0;
+        foreach (ModToken t in hfTokens)
+        {
+            hfMax = Math.Max(hfMax, t.Sym);
+        }
+
+        var hfHist = new long[hfMax + 1];
+        foreach (ModToken t in hfTokens)
+        {
+            hfHist[t.Sym]++;
+        }
+
+        int hfLogAlpha = Math.Max(5, JxlBits.CeilLog2(hfMax + 1));
+
+        int[] hfNormalized = JxlEntropy.NormalizeCounts(hfHist, JxlEntropy.HistShift);
+
         // ===== HfGlobal =====
         body.WriteBool(true);  // DequantMatrixSet all_default
         // num_hf_presets: BitLength(NextPow2(numGroups)) bits; numGroups == 1 => 0 bits.
-        WriteHfPassDcOnly(body);
+        WriteHfPass(body, hfNormalized, hfLogAlpha);
 
         // ===== PassGroup 0 (pass 0) =====
         // hf_preset selector: BitLength(NextPow2(numGroups)) bits => 0 bits for numGroups == 1.
-        WritePassGroupDcOnly(body, bw, bh);
+        var passAns = new JxlAnsWriter(new[] { hfNormalized }, hfLogAlpha);
+        var passTokens = new List<AnsToken>(hfTokens.Count);
+        foreach (ModToken t in hfTokens)
+        {
+            passTokens.Add(new AnsToken(0, t.Sym, t.Bits, t.N));
+        }
 
+        passAns.Encode(body, passTokens);
         return body.ToArray();
     }
 
     // The single HF pass: used_orders = 0 (natural coefficient order, no permutations), then the HfDist
-    // entropy code. For DC-only every block emits a single "0 non-zeros" token, so a one-symbol histogram
-    // covering all 495*num_block_clusters contexts suffices.
-    private static void WriteHfPassDcOnly(JxlBitWriter body)
+    // entropy code. All 495*num_block_clusters contexts map to one shared histogram (context clustering is
+    // an optimisation left for later; correctness only needs the histogram to cover every emitted symbol).
+    private static void WriteHfPass(JxlBitWriter body, int[] hfNormalized, int hfLogAlpha)
     {
         body.WriteU32(0, E.Val(0x5F), E.Val(0x13), E.Val(0x00), E.BitsOff(13, 0)); // used_orders = 0
         int numContexts = 495 * DefaultNumBlockClusters; // num_hf_presets == 1
-        WriteSingleSymbolHistograms(body, numContexts);
+        body.WriteBool(false);   // lz77 disabled
+        body.WriteBool(true);    // context map: is_simple
+        body.WriteBits(0, 2);    // bits_per_entry = 0 => all contexts map to cluster 0
+        body.WriteBool(false);   // use_prefix_code = false (ANS)
+        body.WriteBits((uint)(hfLogAlpha - 5), 2);
+        WriteUintConfig(body, LitSplit, LitMsb, LitLsb, hfLogAlpha);
+        JxlEntropy.WriteHistogram(body, hfNormalized, JxlEntropy.HistShift);
+        _ = numContexts;
     }
 
     private const int DefaultNumBlockClusters = 15;
-    private static readonly byte[] DefaultBlockCtxMap =
-    {
-        0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14,
-        14, 14, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
-    };
 
-    // Emits the PassGroup HF coefficient ANS stream for the DC-only case: one "non-zeros == 0" token per
-    // (block, channel), in the decoder's read order (y, x, then channel order {Y, X, B}). All tokens are
-    // symbol 0 in the single HfDist histogram.
-    private static void WritePassGroupDcOnly(JxlBitWriter body, int bw, int bh)
+    // Builds the PassGroup HF coefficient tokens (inverse of JxlVarDct.WriteHfCoeff), all in cluster 0.
+    // Emission order matches the decoder: block raster (y, x), channel order {Y, X, B}; per block+channel a
+    // non-zeros count token, then coefficient tokens in scan order up to (and including) the last non-zero.
+    private static List<ModToken> BuildHfTokens(int bw, int bh, int[][] ac)
     {
-        var tokens = new List<AnsToken>(bw * bh * 3);
-        var nonZerosGrid = new uint[3][];
-        for (int c = 0; c < 3; c++)
-        {
-            nonZerosGrid[c] = new uint[bw];
-        }
-
+        var tokens = new List<ModToken>();
         for (int y = 0; y < bh; y++)
         {
             for (int x = 0; x < bw; x++)
             {
+                int bi = (y * bw) + x;
                 for (int cc = 0; cc < 3; cc++)
                 {
-                    int c = new[] { 1, 0, 2 }[cc];
-                    // The non-zeros context is computed but all contexts map to histogram 0, so the emitted
-                    // token is always symbol 0 (value 0). We still advance nonZerosGrid to mirror the decoder.
-                    nonZerosGrid[c][x] = 0;
-                    tokens.Add(new AnsToken(0, 0, 0, 0));
+                    int c = new[] { 1, 0, 2 }[cc]; // Y, X, B
+                    int baseIdx = bi * 64;
+                    int nonZeros = 0, lastNz = 0;
+                    for (int oi = 1; oi < 64; oi++)
+                    {
+                        if (ac[c][baseIdx + oi] != 0)
+                        {
+                            nonZeros++;
+                            lastNz = oi;
+                        }
+                    }
+
+                    tokens.Add(HybridToken(nonZeros)); // non-zeros count (used directly by the decoder)
+                    for (int oi = 1; oi <= lastNz; oi++)
+                    {
+                        tokens.Add(HybridToken(PackSigned(ac[c][baseIdx + oi])));
+                    }
+
                 }
             }
         }
 
-        var counts = new int[1];
-        counts[0] = AnsTabSizeConst;
-        var ans = new JxlAnsWriter(new[] { counts }, 5);
-        ans.Encode(body, tokens);
+        return tokens;
+    }
+
+    private static ModToken HybridToken(int value)
+    {
+        (int token, int nbits, int bits) = PackHybridFull(LitSplit, LitMsb, LitLsb, value);
+        return new ModToken(token, (uint)bits, nbits);
+    }
+
+    // Forward AC quantiser: q = round(coeff / step). step = matrix[k] * hf_mul.
+    private static int QuantAc(float coeff, float step, float quantBias, float quantBiasNum)
+    {
+        _ = quantBias;
+        _ = quantBiasNum;
+        return (int)MathF.Round(coeff / step);
+    }
+
+    // Dequantises exactly as JxlVarDct.DequantHf (quant bias then * step), so B's CfL pre-subtraction of
+    // the reconstructed Y coefficient is bit-consistent with the decoder.
+    private static float DequantAc(int q, float step, float quantBias, float quantBiasNum)
+    {
+        float qf = q;
+        if (MathF.Abs(qf) <= 1.0f)
+        {
+            qf *= quantBias;
+        }
+        else
+        {
+            qf -= quantBiasNum / qf;
+        }
+
+        return qf * step;
     }
 
     private const int AnsTabSizeConst = 1 << 12;

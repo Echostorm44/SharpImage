@@ -135,6 +135,87 @@ public class JxlVarDctEncoderTests
         await Assert.That(true).IsTrue();
     }
 
+    private static ImageFrame TexturedFrame(int width, int height)
+    {
+        var frame = new ImageFrame();
+        frame.Initialize(width, height, ColorspaceType.SRGB, false);
+        for (int y = 0; y < height; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < width; x++)
+            {
+                int o = x * 3;
+                float r = 0.5f + (0.4f * MathF.Sin(x * 0.7f));
+                float g = 0.5f + (0.4f * MathF.Cos(y * 0.5f));
+                float b = 0.5f + (0.3f * MathF.Sin((x + y) * 0.4f));
+                row[o] = (ushort)(Math.Clamp(r, 0f, 1f) * Quantum.MaxValue);
+                row[o + 1] = (ushort)(Math.Clamp(g, 0f, 1f) * Quantum.MaxValue);
+                row[o + 2] = (ushort)(Math.Clamp(b, 0f, 1f) * Quantum.MaxValue);
+            }
+        }
+
+        return frame;
+    }
+
+    [Test]
+    public async Task VarDctAc_TexturedImage_CapturesDetail()
+    {
+        const int w = 64, h = 64;
+        ImageFrame frame = TexturedFrame(w, h);
+        // Keep DC quant moderate (global_scale x quant_lf) so DC ints stay in range, and refine the AC
+        // via the per-block hf_mul (global_scale x block_hf_mul) independently.
+        const uint gs = 4096, qlf = 64, hfm = 32;
+        byte[] cs = JxlEncoder.EncodeVarDct(frame, globalScale: gs, quantLf: qlf, blockHfMul: hfm);
+        JxlModularResult res = JxlFrame.DecodeModularCodestream(cs);
+
+        double mse = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    double src = Quantum.ScaleToByte(srow[(x * 3) + c]);
+                    double d = src - res.Channels[c].Px[(y * w) + x];
+                    mse += d * d;
+                }
+            }
+        }
+
+        mse /= 3.0 * w * h;
+        double psnr = mse <= 1e-9 ? 99.0 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        string dump = Environment.GetEnvironmentVariable("VARDCT_DUMP_AC");
+        if (!string.IsNullOrEmpty(dump))
+        {
+            System.IO.File.WriteAllBytes(dump, cs);
+        }
+
+        // Model PSNR: what the encoder's own forward/inverse math predicts (no CfL) at the same quant.
+        var srgb = new float[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            srgb[c] = new float[w * h];
+        }
+
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    srgb[c][(y * w) + x] = Quantum.ScaleToByte(srow[(x * 3) + c]) / 255f;
+                }
+            }
+        }
+
+        double modelPsnr = JxlVarDctEncoder.ReconstructPsnr(srgb, w, h, new VarDctFrameParams(), gs, qlf, hfm);
+        Console.Error.WriteLine($"[VARDCT] textured AC decode PSNR={psnr:F2} dB (model {modelPsnr:F2}), {cs.Length} bytes");
+        await Assert.That(psnr).IsGreaterThan(30.0);                 // AC coefficients recover real detail
+        await Assert.That(Math.Abs(psnr - modelPsnr)).IsLessThan(1.0); // decode matches the validated forward model
+    }
+
     [Test]
     public async Task VarDctDcOnly_RoundTripsThroughDecoder()
     {
