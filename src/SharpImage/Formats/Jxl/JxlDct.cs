@@ -114,6 +114,9 @@ internal static class JxlDct
 
     private static float ScaleF(int c, int logb) => ScaleFTable[c << logb];
 
+    /// <summary>The DCT LF-scaling factor (encoder uses this to invert TransformVarblock's LF handling).</summary>
+    internal static float ScaleFactor(int c, int logb) => ScaleFTable[c << logb];
+
     private static readonly float[][] SecHalfSmall =
     {
         new[] { 0.541196100146197f, 1.3065629648763764f },

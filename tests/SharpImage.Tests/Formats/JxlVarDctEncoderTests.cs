@@ -333,6 +333,59 @@ public class JxlVarDctEncoderTests
     }
 
     [Test]
+    public async Task VarDctVariableBlocks_Dct16_RoundTrips()
+    {
+        const int w = 128, h = 128;
+        // A very gentle gradient (a few levels across the whole image) => low activity => the encoder
+        // chooses 16x16 (Dct16) blocks, while still carrying some low-frequency AC content.
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * 3;
+                int lvl = 110 + ((x + y) * 12 / (w + h)); // ~12 levels total, very smooth
+                row[o] = row[o + 1] = row[o + 2] = (ushort)(lvl * Quantum.MaxValue / 255);
+            }
+        }
+
+        byte[] fixed8 = JxlEncoder.EncodeVarDct(frame, 4096, 128, 16, null, false, variableBlocks: false);
+        byte[] vb = JxlEncoder.EncodeVarDct(frame, 4096, 128, 16, null, false, variableBlocks: true);
+        await Assert.That(vb.Length).IsNotEqualTo(fixed8.Length); // Dct16 layout differs from all-8x8
+
+        JxlModularResult res = JxlFrame.DecodeModularCodestream(vb);
+        await Assert.That(res.Width).IsEqualTo(w);
+
+        // Reconstruction should still track the smooth source well.
+        double mse = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    double d = Quantum.ScaleToByte(srow[(x * 3) + c]) - res.Channels[c].Px[(y * w) + x];
+                    mse += d * d;
+                }
+            }
+        }
+
+        mse /= 3.0 * w * h;
+        double psnr = 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        string dump = Environment.GetEnvironmentVariable("VARDCT_DUMP_VB");
+        if (!string.IsNullOrEmpty(dump))
+        {
+            System.IO.File.WriteAllBytes(dump, vb);
+        }
+
+        Console.Error.WriteLine($"[VARDCT] variable-blocks {vb.Length}B vs 8x8 {fixed8.Length}B, {psnr:F1} dB");
+        await Assert.That(psnr).IsGreaterThan(30.0);
+    }
+
+    [Test]
     public async Task VarDctAdaptiveQuant_VariesAndRoundTrips()
     {
         const int w = 128, h = 64;

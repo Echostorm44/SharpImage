@@ -36,7 +36,7 @@ internal static partial class JxlEncoder
     /// for the leading (coarse) passes in DECREASING order; a final full-precision (shift 0) pass is
     /// appended automatically. E.g. [2,1] => 3 passes with shifts {2,1,0}. Null/empty => a single pass.
     /// </summary>
-    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null, bool adaptiveQuant = false)
+    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null, bool adaptiveQuant = false, bool variableBlocks = false)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -54,7 +54,7 @@ internal static partial class JxlEncoder
         int[] shifts = BuildPassShifts(passShifts);
 
         float[][] srgb = ExtractSrgb(image, w, h);
-        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant);
+        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks);
         return AssembleVarDctCodestream(w, h, sections, shifts);
     }
 
@@ -249,7 +249,7 @@ internal static partial class JxlEncoder
     }
 
     // --- the frame body as TOC sections (see AssembleVarDctCodestream) ---
-    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts, bool adaptiveQuant)
+    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts, bool adaptiveQuant, bool variableBlocks)
     {
         int bw = (w + 7) / 8, bh = (h + 7) / 8;   // blocks
         int stride = bw * 8, strideH = bh * 8;
@@ -282,36 +282,26 @@ internal static partial class JxlEncoder
         float scaleY = (float)(mlf[1] * 512.0 / scaleInv);
         float scaleB = (float)(mlf[2] * 512.0 / scaleInv);
         DequantMatrixSet dm = DequantMatrixSet.Default();
-        // Dct8 needs transposition (NeedTranspose(Dct8) == true, since its 1x1 block has h >= w): the
-        // decoder places coefficients at the transposed block position and dequantises with the transposed
-        // matrix, so the encoder must do the same.
-        float[] matX = dm.GetTransposed(0, TransformType.Dct8);
-        float[] matY = dm.GetTransposed(1, TransformType.Dct8);
-        float[] matB = dm.GetTransposed(2, TransformType.Dct8);
-        (ushort X, ushort Y)[] order = JxlVarDctTables.NaturalOrder(0); // Dct8 scan order
 
-        // Adaptive quantisation: modulate the per-block AC quant multiplier by local luma HF activity
-        // (libjxl's masking model — busy blocks tolerate coarser quant, smooth blocks need finer), keeping
-        // the geometric mean at the distance-calibrated base. hf_mul >= 1; larger => finer.
-        int[] hfMulBlock = adaptiveQuant
-            ? AdaptiveHfMul(xyb[1], stride, bw, bh, blockHfMul)
-            : null!;
+        // Per-8x8-block luma HF activity (libjxl's HfModulation term): drives adaptive quant AND variable
+        // block-size selection.
+        double[] activity = ComputeActivity(xyb[1], stride, bw, bh);
+        int[] hfMulBlock = adaptiveQuant ? AdaptiveHfMulFromActivity(activity, bw, bh, blockHfMul) : null!;
+
+        // Block-size layout: sizeAt[pos] = (int)TransformType for a data block's top-left position, or -1
+        // for a position covered by a larger block. Off => every 8x8 position is its own Dct8 block.
+        int[] sizeAt = BuildDctLayout(activity, bw, bh, variableBlocks);
 
         var dcY = new int[nbData];
         var dcX = new int[nbData];
         var dcB = new int[nbData];
-        var blockHfMuls = new int[nbData]; // per-block hf_mul actually used (for block_info + dequant)
-        // AC coefficients per block, laid out by scan position: ac[c][block*64 + oi]. oi 0 (DC) unused.
+        var blockHfMuls = new int[nbData];   // per data-block-position hf_mul (for block_info + dequant)
+        // AC coefficients laid out per position by scan index: ac[c][pos*MaxBlockCoeffs + oi] (oi < numBlocks
+        // are the LF, not stored here). Sized for the largest supported block (Dct16 => 256).
         var ac = new int[3][];
         for (int c = 0; c < 3; c++)
         {
-            ac[c] = new int[nbData * 64];
-        }
-
-        var coeffRaster = new float[3][];
-        for (int c = 0; c < 3; c++)
-        {
-            coeffRaster[c] = new float[64];
+            ac[c] = new int[nbData * MaxBlockCoeffs];
         }
 
         for (int by = 0; by < bh; by++)
@@ -319,42 +309,82 @@ internal static partial class JxlEncoder
             for (int bx = 0; bx < bw; bx++)
             {
                 int bi = (by * bw) + bx;
+                if (sizeAt[bi] < 0)
+                {
+                    continue; // covered by a larger block whose top-left was already processed
+                }
+
+                var t = (TransformType)sizeAt[bi];
+                var (dw, dh) = JxlDct.DctSelectSize(t);   // in 8-blocks: Dct8 (1,1), Dct16 (2,2)
+                int pw = dw * 8, ph = dh * 8;              // pixels
+                int numBlocks = dw * dh;
+                bool needTr = JxlDct.NeedTranspose(t);
+                (ushort X, ushort Y)[] order = JxlVarDctTables.NaturalOrder(JxlDct.OrderId(t));
                 int bHfMul = adaptiveQuant ? hfMulBlock[bi] : (int)blockHfMul;
                 blockHfMuls[bi] = bHfMul;
                 float hfMul = 65536.0f / (globalScale * (float)bHfMul);
+
+                // Forward DCT of each channel's (pw x ph) block.
+                var coeff = new float[3][];
                 for (int c = 0; c < 3; c++)
                 {
-                    var g = new JxlDct.Grid(coeffRaster[c], 0, 8, 8, 8);
-                    for (int yy = 0; yy < 8; yy++)
+                    coeff[c] = new float[pw * ph];
+                    var g = new JxlDct.Grid(coeff[c], 0, pw, pw, ph);
+                    for (int yy = 0; yy < ph; yy++)
                     {
-                        for (int xx = 0; xx < 8; xx++)
+                        for (int xx = 0; xx < pw; xx++)
                         {
                             g.Set(xx, yy, xyb[c][(((by * 8) + yy) * stride) + (bx * 8) + xx]);
                         }
                     }
 
-                    JxlDct.Dct2D(g, false); // forward DCT -> coeffRaster[c] in raster order
+                    JxlDct.Dct2D(g, false);
                 }
 
-                // DC (channel order X=0, Y=1, B=2); B pre-subtracts the dequantised Y DC.
-                int yDcInt = (int)MathF.Round(coeffRaster[1][0] / scaleY);
-                dcY[bi] = yDcInt;
-                dcX[bi] = (int)MathF.Round(coeffRaster[0][0] / scaleX);
-                dcB[bi] = (int)MathF.Round((coeffRaster[2][0] - (yDcInt * scaleY)) / scaleB);
-
-                // AC: quantise each channel; B pre-subtracts the dequantised Y AC per coefficient.
-                for (int oi = 1; oi < 64; oi++)
+                // LF -> DC image. Invert TransformVarblock: dcVals = IDCT_(dw x dh)( coeff_lf * ScaleF ).
+                // For Dct8 this reduces to dcVals = coeff[0] (1x1 IDCT and ScaleF are identities).
+                int logbw = System.Numerics.BitOperations.TrailingZeroCount(dw);
+                int logbh = System.Numerics.BitOperations.TrailingZeroCount(dh);
+                var lf = new float[3][];
+                for (int c = 0; c < 3; c++)
                 {
-                    // Transposed placement raster (matches the decoder's NeedTranspose swap for Dct8).
-                    int k = (order[oi].X * 8) + order[oi].Y;
-                    // X and Y quantise directly.
-                    int qX = QuantAc(coeffRaster[0][k], matX[k] * hfMul, fp.QuantBias[0], fp.QuantBiasNumerator);
-                    int qY = QuantAc(coeffRaster[1][k], matY[k] * hfMul, fp.QuantBias[1], fp.QuantBiasNumerator);
-                    ac[0][(bi * 64) + oi] = qX;
-                    ac[1][(bi * 64) + oi] = qY;
-                    // B: subtract the dequantised Y coefficient (CfL kb == 1) before quantising.
+                    lf[c] = new float[numBlocks];
+                    var lg = new JxlDct.Grid(lf[c], 0, dw, dw, dh);
+                    for (int ly = 0; ly < dh; ly++)
+                    {
+                        for (int lx = 0; lx < dw; lx++)
+                        {
+                            lg.Set(lx, ly, coeff[c][(ly * pw) + lx] * JxlDct.ScaleFactor(ly, 5 - logbh) * JxlDct.ScaleFactor(lx, 5 - logbw));
+                        }
+                    }
+
+                    JxlDct.Dct2D(lg, true); // inverse -> dcVals in raster (dw x dh)
+                }
+
+                for (int ly = 0; ly < dh; ly++)
+                {
+                    for (int lx = 0; lx < dw; lx++)
+                    {
+                        int p2 = ((by + ly) * bw) + bx + lx;
+                        int li = (ly * dw) + lx;
+                        int yDcInt = (int)MathF.Round(lf[1][li] / scaleY);
+                        dcY[p2] = yDcInt;
+                        dcX[p2] = (int)MathF.Round(lf[0][li] / scaleX);
+                        dcB[p2] = (int)MathF.Round((lf[2][li] - (yDcInt * scaleY)) / scaleB);
+                    }
+                }
+
+                // HF: scan positions numBlocks.. in the block's natural order, transposed placement.
+                float[] matX = dm.GetTransposed(0, t), matY = dm.GetTransposed(1, t), matB = dm.GetTransposed(2, t);
+                for (int oi = numBlocks; oi < order.Length; oi++)
+                {
+                    int k = needTr ? (order[oi].X * pw) + order[oi].Y : (order[oi].Y * pw) + order[oi].X;
+                    int qX = QuantAc(coeff[0][k], matX[k] * hfMul, fp.QuantBias[0], fp.QuantBiasNumerator);
+                    int qY = QuantAc(coeff[1][k], matY[k] * hfMul, fp.QuantBias[1], fp.QuantBiasNumerator);
+                    ac[0][(bi * MaxBlockCoeffs) + oi] = qX;
+                    ac[1][(bi * MaxBlockCoeffs) + oi] = qY;
                     float yDeq = DequantAc(qY, matY[k] * hfMul, fp.QuantBias[1], fp.QuantBiasNumerator);
-                    ac[2][(bi * 64) + oi] = QuantAc(coeffRaster[2][k] - yDeq, matB[k] * hfMul, fp.QuantBias[2], fp.QuantBiasNumerator);
+                    ac[2][(bi * MaxBlockCoeffs) + oi] = QuantAc(coeff[2][k] - yDeq, matB[k] * hfMul, fp.QuantBias[2], fp.QuantBiasNumerator);
                 }
             }
         }
@@ -365,18 +395,32 @@ internal static partial class JxlEncoder
         // of both sub-images.
         var dcImage = new List<SubChannel> { new(dcY, bw, bh), new(dcX, bw, bh), new(dcB, bw, bh) };
         int cfW = (w + 63) / 64, cfH = (h + 63) / 64;
-        var blockInfo = new int[nbData * 2];       // row0 = dct_select (0 = Dct8), row1 = hf_mul - 1
-        for (int i = 0; i < nbData; i++)
+
+        // Block info is one entry per DATA block in raster visitation order (skipping covered positions):
+        // row0 = dct_select, row1 = hf_mul - 1. This is also the order the HF pass codes coefficients in.
+        var dataBlocks = new List<int>();
+        for (int pos = 0; pos < nbData; pos++)
         {
-            blockInfo[i] = 0;
-            blockInfo[nbData + i] = blockHfMuls[i] - 1;
+            if (sizeAt[pos] >= 0)
+            {
+                dataBlocks.Add(pos);
+            }
+        }
+
+        int nbBlocks = dataBlocks.Count;
+        var blockInfo = new int[nbBlocks * 2];
+        for (int di = 0; di < nbBlocks; di++)
+        {
+            int pos = dataBlocks[di];
+            blockInfo[di] = sizeAt[pos];                     // dct_select
+            blockInfo[nbBlocks + di] = blockHfMuls[pos] - 1; // hf_mul - 1
         }
 
         var hfMeta = new List<SubChannel>
         {
             new(new int[cfW * cfH], cfW, cfH),     // x_from_y (all 0)
             new(new int[cfW * cfH], cfW, cfH),     // b_from_y (all 0)
-            new(blockInfo, nbData, 2),             // block info
+            new(blockInfo, nbBlocks, 2),           // block info
             new(new int[bw * bh], bw, bh),         // sharpness (all 0)
         };
 
@@ -392,7 +436,7 @@ internal static partial class JxlEncoder
         {
             new(new int[cfW * cfH], cfW, cfH),
             new(new int[cfW * cfH], cfW, cfH),
-            new(blockInfo, nbData, 2),
+            new(blockInfo, nbBlocks, 2),
             new(new int[bw * bh], bw, bh),
         };
 
@@ -501,8 +545,8 @@ internal static partial class JxlEncoder
             var qp = new int[3][];
             for (int c = 0; c < 3; c++)
             {
-                qp[c] = new int[nbData * 64];
-                for (int idx = 0; idx < nbData * 64; idx++)
+                qp[c] = new int[nbData * MaxBlockCoeffs];
+                for (int idx = 0; idx < nbData * MaxBlockCoeffs; idx++)
                 {
                     int q = remaining[c][idx] >> sp; // arithmetic shift (floor) — matches decoder's << sp
                     qp[c][idx] = q;
@@ -521,7 +565,7 @@ internal static partial class JxlEncoder
                 int gBh = Math.Min(groupBlocks, bh - by0);
                 var ctxs = new List<int>();
                 var toks = new List<ModToken>();
-                BuildHfTokensCtx(bx0, by0, gBw, gBh, bw, qp, ctxs, toks);
+                BuildHfTokensCtx(bx0, by0, gBw, gBh, bw, qp, sizeAt, ctxs, toks);
                 passGroupCtxs[p][g] = ctxs;
                 passGroupTokens[p][g] = toks;
                 foreach (ModToken t in toks)
@@ -586,13 +630,13 @@ internal static partial class JxlEncoder
             if (useLearnedDc)
             {
                 WriteSubModularOps(b, dcOps[0], dcCtx, dcPlan, dcAns, dcWpMode);
-                b.WriteBits((uint)(nbData - 1), nbBits); // HfMetadata num_blocks
+                b.WriteBits((uint)(nbBlocks - 1), nbBits); // HfMetadata num_blocks
                 WriteSubModularOps(b, dcOps[1], metaCtx, dcPlan, dcAns, dcWpMode);
             }
             else
             {
                 WriteSubModularUsingGlobal(b, dcTokens, modNorm, modLogAlpha);
-                b.WriteBits((uint)(nbData - 1), nbBits);
+                b.WriteBits((uint)(nbBlocks - 1), nbBits);
                 WriteSubModularUsingGlobal(b, metaTokens, modNorm, modLogAlpha);
             }
         }
@@ -726,8 +770,9 @@ internal static partial class JxlEncoder
 
     // Builds the PassGroup HF tokens for one 256px group WITH their entropy context id (0..495*15-1),
     // replicating JxlVarDct.WriteHfCoeff's context model exactly (block context, non-zeros prediction,
-    // coefficient frequency / running-non-zeros / prev-non-zero). All-8x8 (num_blocks == 1, order_id == 0).
-    private static void BuildHfTokensCtx(int bx0, int by0, int gBw, int gBh, int bw, int[][] qp, List<int> ctxsOut, List<ModToken> toksOut)
+    // coefficient frequency / running-non-zeros / prev-non-zero). Layout-aware: each data block uses its
+    // own dct_select (num_blocks, order_id, coefficient count); covered positions are skipped.
+    private static void BuildHfTokensCtx(int bx0, int by0, int gBw, int gBh, int bw, int[][] qp, int[] sizeAt, List<int> ctxsOut, List<ModToken> toksOut)
     {
         const int nbc = DefaultNumBlockClusters;
         var nonZerosGrid = new uint[3][];
@@ -740,11 +785,24 @@ internal static partial class JxlEncoder
         {
             for (int lx = 0; lx < gBw; lx++)
             {
-                int baseIdx = (((by0 + ly) * bw) + bx0 + lx) * 64;
+                int pos = ((by0 + ly) * bw) + bx0 + lx;
+                if (sizeAt[pos] < 0)
+                {
+                    continue; // covered by a larger block
+                }
+
+                var t = (TransformType)sizeAt[pos];
+                var (dw, dh) = JxlDct.DctSelectSize(t);
+                int numBlocks = dw * dh;
+                int numBlocksLog = System.Numerics.BitOperations.TrailingZeroCount(numBlocks);
+                int orderId = JxlDct.OrderId(t);
+                int numCoeffs = numBlocks * 64;
+                int baseIdx = pos * MaxBlockCoeffs;
+
                 for (int cc = 0; cc < 3; cc++)
                 {
                     int c = new[] { 1, 0, 2 }[cc]; // Y, X, B
-                    int blockCtx = DefaultBlockCtxMap[cc * 13]; // order_id 0, lf_idx/hf_idx 0
+                    int blockCtx = DefaultBlockCtxMap[(cc * 13) + orderId]; // lf_idx/hf_idx 0
                     uint predicted = ly == 0
                         ? (lx == 0 ? 32u : nonZerosGrid[c][lx - 1])
                         : (lx == 0 ? nonZerosGrid[c][lx] : (nonZerosGrid[c][lx] + nonZerosGrid[c][lx - 1] + 1) >> 1);
@@ -752,7 +810,7 @@ internal static partial class JxlEncoder
                     int nonZerosCtx = blockCtx + (int)(nzIdx * nbc);
 
                     int nonZeros = 0, lastNz = 0;
-                    for (int oi = 1; oi < 64; oi++)
+                    for (int oi = numBlocks; oi < numCoeffs; oi++)
                     {
                         if (qp[c][baseIdx + oi] != 0)
                         {
@@ -763,18 +821,26 @@ internal static partial class JxlEncoder
 
                     ctxsOut.Add(nonZerosCtx);
                     toksOut.Add(HybridToken(nonZeros));
-                    nonZerosGrid[c][lx] = (uint)nonZeros; // num_blocks == 1 => non_zeros_val == non_zeros
+                    uint nonZerosVal = (uint)((nonZeros + numBlocks - 1) >> numBlocksLog);
+                    for (int dx = 0; dx < dw; dx++)
+                    {
+                        nonZerosGrid[c][lx + dx] = nonZerosVal;
+                    }
+
                     if (nonZeros == 0)
                     {
                         continue;
                     }
 
-                    uint isPrevNonzero = nonZeros <= 4 ? 1u : 0u; // num_blocks * 4
+                    uint isPrevNonzero = nonZeros <= numBlocks * 4 ? 1u : 0u;
                     int coeffCtxBase = (blockCtx * 458) + (37 * nbc);
                     int rem = nonZeros;
-                    for (int oi = 1; oi <= lastNz; oi++)
+                    for (int oi = numBlocks; oi <= lastNz; oi++)
                     {
-                        int coeffCtx = (int)(((CoeffNumNonzeroContext[rem - 1] + CoeffFreqContext[oi - 1]) * 2) + isPrevNonzero);
+                        int fidx = oi - numBlocks;
+                        int nzForCtx = (rem - 1) >> numBlocksLog;
+                        int fq = fidx >> numBlocksLog;
+                        int coeffCtx = (int)(((CoeffNumNonzeroContext[nzForCtx] + CoeffFreqContext[fq]) * 2) + isPrevNonzero);
                         int ctx = coeffCtxBase + coeffCtx;
                         int q = qp[c][baseIdx + oi];
                         ctxsOut.Add(ctx);
@@ -804,17 +870,14 @@ internal static partial class JxlEncoder
         return new ModToken(token, (uint)bits, nbits);
     }
 
-    // Per-block AC quant multiplier from local luma HF activity (libjxl's HfModulation masking term):
-    // sum of clamped |neighbour luma differences| per 8x8 block => "busy". Busy blocks tolerate coarser
-    // quant (smaller hf_mul), smooth blocks get finer, with the geometric mean pinned to the base so the
-    // distance calibration (average rate) is preserved. Returns hf_mul >= 1 per block (row-major).
-    private static int[] AdaptiveHfMul(float[] y, int stride, int bw, int bh, uint baseHfMul)
+    private const int MaxBlockCoeffs = 256; // Dct16 (16x16); raise when larger DCTs are added
+
+    // Per-8x8-block luma HF activity (libjxl's HfModulation term): sum of clamped |neighbour Y differences|.
+    // High => busy/textured, low => smooth. Drives adaptive quant and variable block-size selection.
+    private static double[] ComputeActivity(float[] y, int stride, int bw, int bh)
     {
-        const float valmin = 0.0206f;     // libjxl HfModulation clamp
-        const double kMul = -0.38;        // libjxl HfModulation weight
-        int nb = bw * bh;
-        var act = new double[nb];
-        double meanAct = 0;
+        const float valmin = 0.0206f;
+        var act = new double[bw * bh];
         for (int by = 0; by < bh; by++)
         {
             for (int bx = 0; bx < bw; bx++)
@@ -838,8 +901,22 @@ internal static partial class JxlEncoder
                 }
 
                 act[(by * bw) + bx] = sum;
-                meanAct += sum;
             }
+        }
+
+        return act;
+    }
+
+    // hf_mul per block from activity: busy => coarser (smaller), smooth => finer, geometric mean pinned to
+    // the distance-calibrated base so the average rate is preserved (libjxl's masking direction).
+    private static int[] AdaptiveHfMulFromActivity(double[] act, int bw, int bh, uint baseHfMul)
+    {
+        const double kMul = -0.38;
+        int nb = bw * bh;
+        double meanAct = 0;
+        for (int i = 0; i < nb; i++)
+        {
+            meanAct += act[i];
         }
 
         meanAct /= nb;
@@ -847,11 +924,47 @@ internal static partial class JxlEncoder
         int cap = (int)baseHfMul * 4;
         for (int i = 0; i < nb; i++)
         {
-            double factor = Math.Exp(kMul * (act[i] - meanAct)); // busy => <1 (coarser), smooth => >1 (finer)
-            mul[i] = Math.Clamp((int)Math.Round(baseHfMul * factor), 1, cap);
+            mul[i] = Math.Clamp((int)Math.Round(baseHfMul * Math.Exp(kMul * (act[i] - meanAct))), 1, cap);
         }
 
         return mul;
+    }
+
+    private const double ActivityDct16Threshold = 0.08; // per-8x8-block activity below which 16x16 is used
+
+    // Block-size layout: -1 marks a position covered by a larger block; otherwise (int)TransformType of the
+    // data block whose top-left sits there. Uses Dct16 for aligned, in-bounds, uniformly-smooth 2x2 regions.
+    private static int[] BuildDctLayout(double[] act, int bw, int bh, bool variableBlocks)
+    {
+        var sizeAt = new int[bw * bh];
+        for (int i = 0; i < sizeAt.Length; i++)
+        {
+            sizeAt[i] = (int)TransformType.Dct8;
+        }
+
+        if (!variableBlocks)
+        {
+            return sizeAt;
+        }
+
+        for (int by = 0; by + 1 < bh; by += 2)
+        {
+            for (int bx = 0; bx + 1 < bw; bx += 2)
+            {
+                double a0 = act[(by * bw) + bx], a1 = act[(by * bw) + bx + 1];
+                double a2 = act[((by + 1) * bw) + bx], a3 = act[((by + 1) * bw) + bx + 1];
+                if (a0 < ActivityDct16Threshold && a1 < ActivityDct16Threshold &&
+                    a2 < ActivityDct16Threshold && a3 < ActivityDct16Threshold)
+                {
+                    sizeAt[(by * bw) + bx] = (int)TransformType.Dct16;
+                    sizeAt[(by * bw) + bx + 1] = -1;
+                    sizeAt[((by + 1) * bw) + bx] = -1;
+                    sizeAt[((by + 1) * bw) + bx + 1] = -1;
+                }
+            }
+        }
+
+        return sizeAt;
     }
 
     // Forward AC quantiser: q = round(coeff / step). step = matrix[k] * hf_mul.
