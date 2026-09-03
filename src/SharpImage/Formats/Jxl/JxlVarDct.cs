@@ -12,6 +12,7 @@ internal sealed class VarDctFrameParams
 {
     public int Width, Height, BitDepth;
     public int GroupDim, NumGroups, NumLf, GroupsPerRow, NumPasses;
+    public int[] PassShift = { 0 }; // per-pass coefficient left-shift (progressive); last pass is 0
     public bool Xyb;
     public ulong Flags;
     public int XQmScale, BQmScale;
@@ -339,7 +340,7 @@ internal static class JxlVarDct
         206, 206, 206, 206, 206, 206, 206,
     };
 
-    private static void WriteHfCoeff(JxlBitReader br, VarDctFrameParams fp, HfBlockContext hfCtx, HfPass pass, LfGroupData lg, int numHfPresets, float[][] coeffOut, int coeffStride)
+    private static void WriteHfCoeff(JxlBitReader br, VarDctFrameParams fp, HfBlockContext hfCtx, HfPass pass, LfGroupData lg, int numHfPresets, float[][] coeffOut, int coeffStride, int coeffShift = 0)
     {
         var code = pass.HfDist;
         int lfIdxMul = (hfCtx.LfThresholds[0].Length + 1) * (hfCtx.LfThresholds[1].Length + 1) * (hfCtx.LfThresholds[2].Length + 1);
@@ -453,7 +454,7 @@ internal static class JxlVarDct
                             continue;
                         }
 
-                        int coeff = JxlBits.UnpackSigned(ucoeff);
+                        int coeff = JxlBits.UnpackSigned(ucoeff) << coeffShift;
                         var (dx, dy) = order[oi];
                         int cx = dx, cy = dy;
                         if (JxlDct.NeedTranspose(dctSelect))
@@ -949,7 +950,8 @@ internal static class JxlVarDct
             for (int p = 0; p < fp.NumPasses; p++)
             {
                 JxlBitReader pb = single ? lb : SectionReader(2 + fp.NumLf + (p * fp.NumGroups) + grp);
-                WriteHfCoeff(pb, fp, hfCtx, hfPasses[p], groupLg, numHfPresets, coeff, gStride);
+                int passShift = p < fp.PassShift.Length ? fp.PassShift[p] : 0;
+                WriteHfCoeff(pb, fp, hfCtx, hfPasses[p], groupLg, numHfPresets, coeff, gStride, passShift);
             }
 
             DequantHf(fp, hfCtx, dm, quant, groupLg, coeff, gStride);

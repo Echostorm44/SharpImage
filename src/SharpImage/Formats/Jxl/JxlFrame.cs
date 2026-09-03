@@ -293,6 +293,7 @@ internal static class JxlFrame
         public bool IsModular;
         public int GroupSizeShift = 1;
         public int NumPasses = 1;
+        public int[] PassShift = { 0 };
         public ulong Flags;
         public int XQmScale = 2;
         public int BQmScale = 2;
@@ -309,15 +310,16 @@ internal static class JxlFrame
         public float EpfBorderSadMul = 2.0f / 3.0f;
     }
 
-    private static int ReadPasses(JxlBitReader br)
+    private static int ReadPasses(JxlBitReader br, out int[] shift)
     {
         int num = (int)br.ReadU32(E.Val(1), E.Val(2), E.Val(3), E.BitsOff(3, 4));
+        shift = new int[num]; // shift[num-1] stays 0 (final pass is always full precision)
         if (num != 1)
         {
             int nd = (int)br.ReadU32(E.Val(0), E.Val(1), E.Val(2), E.BitsOff(1, 3));
             for (int i = 0; i < num - 1; i++)
             {
-                br.ReadBits(2);
+                shift[i] = (int)br.ReadBits(2);
             }
 
             for (int i = 0; i < nd; i++)
@@ -471,7 +473,8 @@ internal static class JxlFrame
 
         if (frameType != 2)
         {
-            fh.NumPasses = ReadPasses(br);
+            fh.NumPasses = ReadPasses(br, out int[] passShift);
+            fh.PassShift = passShift;
         }
 
         if (frameType == 1)
@@ -591,6 +594,7 @@ internal static class JxlFrame
                 NumLf = numLf,
                 GroupsPerRow = (w + groupDim - 1) / groupDim,
                 NumPasses = fh.NumPasses,
+                PassShift = fh.PassShift,
                 Xyb = md.Xyb,
                 Flags = fh.Flags,
                 XQmScale = fh.XQmScale,

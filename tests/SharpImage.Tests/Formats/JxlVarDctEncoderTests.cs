@@ -217,6 +217,41 @@ public class JxlVarDctEncoderTests
     }
 
     [Test]
+    public async Task VarDctProgressive_MultiPass_ReconstructsIdentically()
+    {
+        const int w = 64, h = 64;
+        ImageFrame frame = TexturedFrame(w, h);
+        const uint gs = 4096, qlf = 64, hfm = 32;
+
+        // Single-pass reference and a 3-pass progressive encode {shift 2, 1, 0} of the SAME image.
+        byte[] single = JxlEncoder.EncodeVarDct(frame, gs, qlf, hfm);
+        byte[] prog = JxlEncoder.EncodeVarDct(frame, gs, qlf, hfm, passShifts: new[] { 2, 1 });
+
+        JxlModularResult r1 = JxlFrame.DecodeModularCodestream(single);
+        JxlModularResult rp = JxlFrame.DecodeModularCodestream(prog);
+
+        // Decoding ALL passes of the progressive stream must reproduce the single-pass result exactly:
+        // the shifted coefficient contributions sum back to the full coefficients.
+        long diff = 0;
+        for (int c = 0; c < 3; c++)
+        {
+            for (int i = 0; i < w * h; i++)
+            {
+                diff += Math.Abs(r1.Channels[c].Px[i] - rp.Channels[c].Px[i]);
+            }
+        }
+
+        string dump = Environment.GetEnvironmentVariable("VARDCT_DUMP_PROG");
+        if (!string.IsNullOrEmpty(dump))
+        {
+            System.IO.File.WriteAllBytes(dump, prog);
+        }
+
+        Console.Error.WriteLine($"[VARDCT] progressive vs single: total abs pixel diff={diff}, prog {prog.Length}B vs single {single.Length}B");
+        await Assert.That(diff).IsEqualTo(0L); // all-pass progressive == single-pass, pixel-exact
+    }
+
+    [Test]
     public async Task VarDctDcOnly_RoundTripsThroughDecoder()
     {
         const int w = 64, h = 64;

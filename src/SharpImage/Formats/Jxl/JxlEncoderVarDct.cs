@@ -29,10 +29,13 @@ internal static partial class JxlEncoder
     private const int VarDctGroupDim = 256; // 128 << group_size_shift(1)
 
     /// <summary>
-    /// Encodes an image as a lossy XYB VarDCT JPEG XL codestream (single group, DC-only for now).
+    /// Encodes an image as a lossy XYB VarDCT JPEG XL codestream (single group, all-8x8 DCT).
     /// globalScale/quantLf/blockHfMul are the quantiser knobs (see JxlVarDctEncoder.ReconstructPsnr).
+    /// <paramref name="passShifts"/> enables progressive decoding: it lists the AC coefficient left-shifts
+    /// for the leading (coarse) passes in DECREASING order; a final full-precision (shift 0) pass is
+    /// appended automatically. E.g. [2,1] => 3 passes with shifts {2,1,0}. Null/empty => a single pass.
     /// </summary>
-    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1)
+    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -46,9 +49,37 @@ internal static partial class JxlEncoder
             throw new NotSupportedException("VarDCT encoder currently supports images up to 256x256 (one group).");
         }
 
+        // Full per-pass shift list: the caller's coarse shifts followed by the mandatory final shift 0.
+        int[] shifts = BuildPassShifts(passShifts);
+
         float[][] srgb = ExtractSrgb(image, w, h);
-        byte[] body = BuildVarDctBody(srgb, w, h, globalScale, quantLf, blockHfMul);
-        return AssembleVarDctCodestream(w, h, body);
+        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts);
+        return AssembleVarDctCodestream(w, h, sections, shifts);
+    }
+
+    private static int[] BuildPassShifts(int[]? passShifts)
+    {
+        if (passShifts == null || passShifts.Length == 0)
+        {
+            return new[] { 0 };
+        }
+
+        for (int i = 0; i < passShifts.Length; i++)
+        {
+            if (passShifts[i] < 1 || passShifts[i] > 3)
+            {
+                throw new ArgumentException("Progressive pass shifts must be in 1..3 (2-bit field).");
+            }
+
+            if (i > 0 && passShifts[i] >= passShifts[i - 1])
+            {
+                throw new ArgumentException("Progressive pass shifts must be strictly decreasing.");
+            }
+        }
+
+        var shifts = new int[passShifts.Length + 1];
+        Array.Copy(passShifts, shifts, passShifts.Length); // final entry stays 0 (full precision)
+        return shifts;
     }
 
     // Extract sRGB [0,1] float channels (grayscale expanded to RGB), matching EncodeLossless's sampling.
@@ -85,8 +116,11 @@ internal static partial class JxlEncoder
         return srgb;
     }
 
-    // --- codestream assembly (signature + size + all_default metadata + frame header + single section) ---
-    private static byte[] AssembleVarDctCodestream(int w, int h, byte[] body)
+    // --- codestream assembly (signature + size + metadata + frame header + TOC + sections) ---
+    // For a single-group single-pass frame the whole body is one TOC section; a progressive (multi-pass)
+    // frame uses the multi-section TOC (LfGlobal | LfGroup | HfGlobal | PassGroup-per-pass) so a streaming
+    // decoder can render the DC preview from the LfGroup section before the AC passes arrive.
+    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
@@ -94,14 +128,21 @@ internal static partial class JxlEncoder
         WriteSizeHeader(main, w, h);
         WriteXybImageMetadata(main);
         main.JumpToByteBoundary();
-        WriteVarDctFrameHeader(main);
+        WriteVarDctFrameHeader(main, shifts);
         main.WriteBool(false); // permuted TOC = false
         main.JumpToByteBoundary();
 
-        // Single TOC entry (numGroups == 1 && numPasses == 1).
-        main.WriteU32((uint)body.Length, E.BitsOff(10, 0), E.BitsOff(14, 1024), E.BitsOff(22, 17408), E.BitsOff(30, 4211712));
+        foreach (byte[] sec in sections)
+        {
+            main.WriteU32((uint)sec.Length, E.BitsOff(10, 0), E.BitsOff(14, 1024), E.BitsOff(22, 17408), E.BitsOff(30, 4211712));
+        }
+
         main.JumpToByteBoundary();
-        main.AppendBytes(body);
+        foreach (byte[] sec in sections)
+        {
+            main.AppendBytes(sec);
+        }
+
         return main.ToArray();
     }
 
@@ -122,8 +163,10 @@ internal static partial class JxlEncoder
     }
 
     // Frame header for a regular XYB VarDCT frame with loop filters + adaptive-LF-smoothing disabled.
-    private static void WriteVarDctFrameHeader(JxlBitWriter w)
+    // shifts holds the per-pass coefficient shift (length == num_passes; final entry 0).
+    private static void WriteVarDctFrameHeader(JxlBitWriter w, int[] shifts)
     {
+        int numPasses = shifts.Length;
         w.WriteBool(false);  // not all_default
         w.WriteBits(0, 2);   // frame_type = Regular
         w.WriteBits(0, 1);   // encoding = VarDCT
@@ -132,7 +175,7 @@ internal static partial class JxlEncoder
         w.WriteU32(1, E.Val(1), E.Val(2), E.Val(4), E.Val(8)); // upsampling = 1 (no extra channels)
         w.WriteBits(2, 3);   // x_qm_scale = 2 (default)
         w.WriteBits(2, 3);   // b_qm_scale = 2 (default)
-        w.WriteU32(1, E.Val(1), E.Val(2), E.Val(3), E.BitsOff(3, 4)); // num_passes = 1
+        WritePasses(w, numPasses, shifts);
         w.WriteBool(false);  // have_crop = false
         w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3)); // blending mode = 0 (replace)
         w.WriteBool(true);   // is_last = true
@@ -145,8 +188,23 @@ internal static partial class JxlEncoder
         w.WriteU64(0);       // frame-header extensions = none
     }
 
-    // --- the frame body: one continuous bitstream (single-section frame) ---
-    private static byte[] BuildVarDctBody(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul)
+    // Passes bundle (JxlFrame.ReadPasses inverse): num_passes, then for >1 passes num_downsample=0 and the
+    // (num_passes - 1) leading shift values (2 bits each; the final pass is implicitly shift 0).
+    private static void WritePasses(JxlBitWriter w, int numPasses, int[] shifts)
+    {
+        w.WriteU32((uint)numPasses, E.Val(1), E.Val(2), E.Val(3), E.BitsOff(3, 4));
+        if (numPasses != 1)
+        {
+            w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(1, 3)); // num_downsample = 0
+            for (int i = 0; i < numPasses - 1; i++)
+            {
+                w.WriteBits((uint)shifts[i], 2);
+            }
+        }
+    }
+
+    // --- the frame body as TOC sections (see AssembleVarDctCodestream) ---
+    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts)
     {
         int bw = (w + 7) / 8, bh = (h + 7) / 8;   // blocks
         int stride = bw * 8, strideH = bh * 8;
@@ -267,92 +325,143 @@ internal static partial class JxlEncoder
             new(new int[bw * bh], bw, bh),         // sharpness (all 0)
         };
 
-
         List<ModToken> dcTokens = GradientTokens(dcImage);
         List<ModToken> metaTokens = GradientTokens(hfMeta);
-        int maxToken = 0;
-        foreach (ModToken t in dcTokens)
+        var modHist = new long[1];
+        AccumulateHist(dcTokens, ref modHist);
+        AccumulateHist(metaTokens, ref modHist);
+        int modLogAlpha = Math.Max(5, JxlBits.CeilLog2(modHist.Length));
+        int[] modNorm = JxlEntropy.NormalizeCounts(modHist, JxlEntropy.HistShift);
+
+        // Split the full AC coefficients into progressive passes: pass p codes (remaining >> shift[p]) and
+        // the decoder accumulates (value << shift[p]); the shifts decrease to a final 0 so the sum is exact.
+        int numPasses = shifts.Length;
+        var passTokenLists = new List<ModToken>[numPasses];
+        var passNorm = new int[numPasses][];
+        var passLogAlpha = new int[numPasses];
+        var remaining = new int[3][];
+        for (int c = 0; c < 3; c++)
         {
-            maxToken = Math.Max(maxToken, t.Sym);
+            remaining[c] = (int[])ac[c].Clone();
         }
 
-        foreach (ModToken t in metaTokens)
+        for (int p = 0; p < numPasses; p++)
         {
-            maxToken = Math.Max(maxToken, t.Sym);
+            int sp = shifts[p];
+            var qp = new int[3][];
+            for (int c = 0; c < 3; c++)
+            {
+                qp[c] = new int[nbData * 64];
+                for (int idx = 0; idx < nbData * 64; idx++)
+                {
+                    int q = remaining[c][idx] >> sp; // arithmetic shift (floor) — matches decoder's << sp
+                    qp[c][idx] = q;
+                    remaining[c][idx] -= q << sp;
+                }
+            }
+
+            passTokenLists[p] = BuildHfTokens(bw, bh, qp);
+            var ph = new long[1];
+            AccumulateHist(passTokenLists[p], ref ph);
+            passLogAlpha[p] = Math.Max(5, JxlBits.CeilLog2(ph.Length));
+            passNorm[p] = JxlEntropy.NormalizeCounts(ph, JxlEntropy.HistShift);
         }
 
-        var hist = new long[maxToken + 1];
-        foreach (ModToken t in dcTokens)
-        {
-            hist[t.Sym]++;
-        }
-
-        foreach (ModToken t in metaTokens)
-        {
-            hist[t.Sym]++;
-        }
-
-        int logAlpha = Math.Max(5, JxlBits.CeilLog2(maxToken + 1));
-
-        int[] normalized = JxlEntropy.NormalizeCounts(hist, JxlEntropy.HistShift);
-
-        var body = new JxlBitWriter();
-
-        // ===== LfGlobal =====
-        body.WriteBool(true);  // lf_channel_dequant all_default {1/32, 1/4, 1/2}
-        body.WriteU32(globalScale, E.BitsOff(11, 1), E.BitsOff(11, 2049), E.BitsOff(12, 4097), E.BitsOff(16, 8193));
-        body.WriteU32(quantLf, E.Val(16), E.BitsOff(5, 1), E.BitsOff(8, 1), E.BitsOff(16, 1));
-        body.WriteBool(true);  // hf_block_context all_default (15 clusters, default map)
-        body.WriteBool(true);  // lf_channel_correlation all_default (base_x 0, base_b 1)
-        body.WriteBits(1, 1);  // GlobalModular: has_tree = 1 (shared single-leaf tree for all sub-images)
         var leaf = new LearnedTree(new MaTreeNode { Property = -1, Predictor = 5 }); // ClampedGradient
-        WriteTree(body, leaf.Tokens);
-        WriteSingleContextAnsHeader(body, normalized, logAlpha);
-        // GlobalModular body has 0 channels for VarDCT => nothing more is read.
-
-        // ===== LfGroup 0 =====
-        body.WriteBits(0, 2);  // extra_precision = 0
-        WriteSubModularUsingGlobal(body, dcTokens, normalized, logAlpha);
-
-        // HfMetadata: num_blocks then the 4-channel modular image.
         int nbBits = BitLength(NextPow2(bw * bh));
-        body.WriteBits((uint)(nbData - 1), nbBits);
-        WriteSubModularUsingGlobal(body, metaTokens, normalized, logAlpha);
 
-        // Build the HF (AC) coefficient tokens for the pass group, then the shared HfDist histogram.
-        List<ModToken> hfTokens = BuildHfTokens(bw, bh, ac);
-        int hfMax = 0;
-        foreach (ModToken t in hfTokens)
+        void WriteLfGlobal(JxlBitWriter b)
         {
-            hfMax = Math.Max(hfMax, t.Sym);
+            b.WriteBool(true);  // lf_channel_dequant all_default {1/32, 1/4, 1/2}
+            b.WriteU32(globalScale, E.BitsOff(11, 1), E.BitsOff(11, 2049), E.BitsOff(12, 4097), E.BitsOff(16, 8193));
+            b.WriteU32(quantLf, E.Val(16), E.BitsOff(5, 1), E.BitsOff(8, 1), E.BitsOff(16, 1));
+            b.WriteBool(true);  // hf_block_context all_default (15 clusters, default map)
+            b.WriteBool(true);  // lf_channel_correlation all_default (base_x 0, base_b 1)
+            b.WriteBits(1, 1);  // GlobalModular: has_tree = 1 (shared single-leaf tree for all sub-images)
+            WriteTree(b, leaf.Tokens);
+            WriteSingleContextAnsHeader(b, modNorm, modLogAlpha);
         }
 
-        var hfHist = new long[hfMax + 1];
-        foreach (ModToken t in hfTokens)
+        void WriteLfGroup(JxlBitWriter b)
         {
-            hfHist[t.Sym]++;
+            b.WriteBits(0, 2);  // extra_precision = 0
+            WriteSubModularUsingGlobal(b, dcTokens, modNorm, modLogAlpha);
+            b.WriteBits((uint)(nbData - 1), nbBits); // HfMetadata num_blocks
+            WriteSubModularUsingGlobal(b, metaTokens, modNorm, modLogAlpha);
         }
 
-        int hfLogAlpha = Math.Max(5, JxlBits.CeilLog2(hfMax + 1));
-
-        int[] hfNormalized = JxlEntropy.NormalizeCounts(hfHist, JxlEntropy.HistShift);
-
-        // ===== HfGlobal =====
-        body.WriteBool(true);  // DequantMatrixSet all_default
-        // num_hf_presets: BitLength(NextPow2(numGroups)) bits; numGroups == 1 => 0 bits.
-        WriteHfPass(body, hfNormalized, hfLogAlpha);
-
-        // ===== PassGroup 0 (pass 0) =====
-        // hf_preset selector: BitLength(NextPow2(numGroups)) bits => 0 bits for numGroups == 1.
-        var passAns = new JxlAnsWriter(new[] { hfNormalized }, hfLogAlpha);
-        var passTokens = new List<AnsToken>(hfTokens.Count);
-        foreach (ModToken t in hfTokens)
+        void WriteHfGlobal(JxlBitWriter b)
         {
-            passTokens.Add(new AnsToken(0, t.Sym, t.Bits, t.N));
+            b.WriteBool(true);  // DequantMatrixSet all_default
+            // num_hf_presets: BitLength(NextPow2(numGroups)) bits => 0 bits (single group). One HfPass per pass.
+            for (int p = 0; p < numPasses; p++)
+            {
+                WriteHfPass(b, passNorm[p], passLogAlpha[p]);
+            }
         }
 
-        passAns.Encode(body, passTokens);
-        return body.ToArray();
+        void WritePassGroup(JxlBitWriter b, int p)
+        {
+            // hf_preset selector: BitLength(NextPow2(numGroups)) bits => 0 bits for a single group.
+            var ans = new JxlAnsWriter(new[] { passNorm[p] }, passLogAlpha[p]);
+            var toks = new List<AnsToken>(passTokenLists[p].Count);
+            foreach (ModToken t in passTokenLists[p])
+            {
+                toks.Add(new AnsToken(0, t.Sym, t.Bits, t.N));
+            }
+
+            ans.Encode(b, toks);
+        }
+
+        if (numPasses == 1)
+        {
+            // Single group + single pass => one continuous TOC section.
+            var body = new JxlBitWriter();
+            WriteLfGlobal(body);
+            WriteLfGroup(body);
+            WriteHfGlobal(body);
+            WritePassGroup(body, 0);
+            return new List<byte[]> { body.ToArray() };
+        }
+
+        // Progressive: multi-section TOC (LfGlobal | LfGroup | HfGlobal | PassGroup per pass).
+        var sections = new List<byte[]>();
+        var lfg = new JxlBitWriter();
+        WriteLfGlobal(lfg);
+        sections.Add(lfg.ToArray());
+        var lgr = new JxlBitWriter();
+        WriteLfGroup(lgr);
+        sections.Add(lgr.ToArray());
+        var hfg = new JxlBitWriter();
+        WriteHfGlobal(hfg);
+        sections.Add(hfg.ToArray());
+        for (int p = 0; p < numPasses; p++)
+        {
+            var pg = new JxlBitWriter();
+            WritePassGroup(pg, p);
+            sections.Add(pg.ToArray());
+        }
+
+        return sections;
+    }
+
+    private static void AccumulateHist(List<ModToken> tokens, ref long[] hist)
+    {
+        int max = hist.Length - 1;
+        foreach (ModToken t in tokens)
+        {
+            max = Math.Max(max, t.Sym);
+        }
+
+        if (max + 1 > hist.Length)
+        {
+            Array.Resize(ref hist, max + 1);
+        }
+
+        foreach (ModToken t in tokens)
+        {
+            hist[t.Sym]++;
+        }
     }
 
     // The single HF pass: used_orders = 0 (natural coefficient order, no permutations), then the HfDist
