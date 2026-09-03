@@ -370,13 +370,96 @@ internal static partial class JxlEncoder
             new(new int[bw * bh], bw, bh),         // sharpness (all 0)
         };
 
-        List<ModToken> dcTokens = GradientTokens(dcImage);
-        List<ModToken> metaTokens = GradientTokens(hfMeta);
+        // The DC image (3 channels) and HfMetadata (4 channels) are two sub-modular streams that share one
+        // global MA tree in LfGlobal. Encode them with the (libjxl-matching) lossless modular machinery: a
+        // learned tree over both streams' channels + the weighted predictor + clustered ANS histograms.
+        // Decoder stream ids (== group property): DC = 1 + lfGroupIdx, HfMetadata = 1 + 2*numLf + lfGroupIdx
+        // (numLf == 1, lfGroupIdx == 0).
+        const int dcStreamId = 1, metaStreamId = 3, dcWpMode = 0;
+        WpHeader dcWp = WpMode(dcWpMode);
+        var dcChans = new List<EncChannel> { new(dcY, bw, bh), new(dcX, bw, bh), new(dcB, bw, bh) };
+        var metaChans = new List<EncChannel>
+        {
+            new(new int[cfW * cfH], cfW, cfH),
+            new(new int[cfW * cfH], cfW, cfH),
+            new(blockInfo, nbData, 2),
+            new(new int[bw * bh], bw, bh),
+        };
+
+        var learnRefs = new List<EncChannelRef>();
+        for (int c = 0; c < dcChans.Count; c++)
+        {
+            learnRefs.Add(new EncChannelRef(dcChans[c].Data, dcChans[c].W, dcChans[c].H, c, dcStreamId, RefsFor(dcChans, c)));
+        }
+
+        for (int c = 0; c < metaChans.Count; c++)
+        {
+            learnRefs.Add(new EncChannelRef(metaChans[c].Data, metaChans[c].W, metaChans[c].H, c, metaStreamId, RefsFor(metaChans, c)));
+        }
+
+        var dcTree = new LearnedTree(JxlTreeLearner.Learn(learnRefs, dcWp, DcNodeThreshold));
+
+        int dcLen = 0;
+        foreach (EncChannel ch in dcChans)
+        {
+            dcLen += ch.W * ch.H;
+        }
+
+        int metaLen = 0;
+        foreach (EncChannel ch in metaChans)
+        {
+            metaLen += ch.W * ch.H;
+        }
+
+        var dcStream = new int[dcLen];
+        var dcCtx = new int[dcLen];
+        var metaStream = new int[metaLen];
+        var metaCtx = new int[metaLen];
+        int dcMaxTok = 0, dcOff = 0;
+        for (int c = 0; c < dcChans.Count; c++)
+        {
+            ComputeResidualTokensCtx(dcChans[c], c, dcTree, dcStream, dcCtx, dcOff, ref dcMaxTok, dcWp, RefsFor(dcChans, c), dcStreamId);
+            dcOff += dcChans[c].W * dcChans[c].H;
+        }
+
+        int metaOff = 0;
+        for (int c = 0; c < metaChans.Count; c++)
+        {
+            ComputeResidualTokensCtx(metaChans[c], c, dcTree, metaStream, metaCtx, metaOff, ref dcMaxTok, dcWp, RefsFor(metaChans, c), metaStreamId);
+            metaOff += metaChans[c].W * metaChans[c].H;
+        }
+
+        var dcStreams = new List<(int[], int[])> { (dcStream, dcCtx), (metaStream, metaCtx) };
+        PixelPlanCtx dcPlan = PlanPixelsCtx(dcStreams, dcTree.LeafCount, out List<Op>[] dcOps, int.MaxValue / 2);
+        int dcLogAlpha = Math.Max(5, JxlBits.CeilLog2(dcPlan.LitAlphabet));
+        bool useLearnedDc = dcLogAlpha <= 8; // ANS alphabet limit; else fall back to the gradient path
+        int[][] dcAnsCounts = null!;
+        JxlAnsWriter dcAns = null!;
+        if (useLearnedDc)
+        {
+            dcAnsCounts = new int[dcPlan.K][];
+            for (int c = 0; c < dcPlan.K; c++)
+            {
+                dcAnsCounts[c] = JxlEntropy.NormalizeCounts(dcPlan.ClusterHist[c], JxlEntropy.HistShift);
+            }
+
+            dcAns = new JxlAnsWriter(dcAnsCounts, dcLogAlpha);
+        }
+
+        // Fallback (rare, very fine quant): the earlier single-leaf gradient + one-histogram sub-images.
+        List<ModToken> dcTokens = useLearnedDc ? null! : GradientTokens(dcImage);
+        List<ModToken> metaTokens = useLearnedDc ? null! : GradientTokens(hfMeta);
         var modHist = new long[1];
-        AccumulateHist(dcTokens, ref modHist);
-        AccumulateHist(metaTokens, ref modHist);
-        int modLogAlpha = Math.Max(5, JxlBits.CeilLog2(modHist.Length));
-        int[] modNorm = JxlEntropy.NormalizeCounts(modHist, JxlEntropy.HistShift);
+        int modLogAlpha = 5;
+        int[] modNorm = null!;
+        var fallbackLeaf = new LearnedTree(new MaTreeNode { Property = -1, Predictor = 5 });
+        if (!useLearnedDc)
+        {
+            AccumulateHist(dcTokens, ref modHist);
+            AccumulateHist(metaTokens, ref modHist);
+            modLogAlpha = Math.Max(5, JxlBits.CeilLog2(modHist.Length));
+            modNorm = JxlEntropy.NormalizeCounts(modHist, JxlEntropy.HistShift);
+        }
 
         // Group layout: 256px groups (32 blocks). numLf == 1 for images <= 2048px (one LF group).
         const int groupBlocks = VarDctGroupDim / 8; // 32
@@ -465,7 +548,6 @@ internal static partial class JxlEncoder
             }
         }
 
-        var leaf = new LearnedTree(new MaTreeNode { Property = -1, Predictor = 5 }); // ClampedGradient
         int nbBits = BitLength(NextPow2(bw * bh));
 
         void WriteLfGlobal(JxlBitWriter b)
@@ -475,17 +557,34 @@ internal static partial class JxlEncoder
             b.WriteU32(quantLf, E.Val(16), E.BitsOff(5, 1), E.BitsOff(8, 1), E.BitsOff(16, 1));
             b.WriteBool(true);  // hf_block_context all_default (15 clusters, default map)
             b.WriteBool(true);  // lf_channel_correlation all_default (base_x 0, base_b 1)
-            b.WriteBits(1, 1);  // GlobalModular: has_tree = 1 (shared single-leaf tree for all sub-images)
-            WriteTree(b, leaf.Tokens);
-            WriteSingleContextAnsHeader(b, modNorm, modLogAlpha);
+            b.WriteBits(1, 1);  // GlobalModular: has_tree = 1 (shared tree for the DC + metadata sub-images)
+            if (useLearnedDc)
+            {
+                WriteTree(b, dcTree.Tokens);
+                WriteAnsHistogramCtx(b, dcPlan, dcAnsCounts, dcLogAlpha);
+            }
+            else
+            {
+                WriteTree(b, fallbackLeaf.Tokens);
+                WriteSingleContextAnsHeader(b, modNorm, modLogAlpha);
+            }
         }
 
         void WriteLfGroup(JxlBitWriter b)
         {
             b.WriteBits(0, 2);  // extra_precision = 0
-            WriteSubModularUsingGlobal(b, dcTokens, modNorm, modLogAlpha);
-            b.WriteBits((uint)(nbData - 1), nbBits); // HfMetadata num_blocks
-            WriteSubModularUsingGlobal(b, metaTokens, modNorm, modLogAlpha);
+            if (useLearnedDc)
+            {
+                WriteSubModularOps(b, dcOps[0], dcCtx, dcPlan, dcAns, dcWpMode);
+                b.WriteBits((uint)(nbData - 1), nbBits); // HfMetadata num_blocks
+                WriteSubModularOps(b, dcOps[1], metaCtx, dcPlan, dcAns, dcWpMode);
+            }
+            else
+            {
+                WriteSubModularUsingGlobal(b, dcTokens, modNorm, modLogAlpha);
+                b.WriteBits((uint)(nbData - 1), nbBits);
+                WriteSubModularUsingGlobal(b, metaTokens, modNorm, modLogAlpha);
+            }
         }
 
         void WriteHfGlobal(JxlBitWriter b)
@@ -762,6 +861,18 @@ internal static partial class JxlEncoder
         body.WriteBits((uint)(logAlpha - 5), 2);
         WriteUintConfig(body, LitSplit, LitMsb, LitLsb, logAlpha);
         JxlEntropy.WriteHistogram(body, normalized, JxlEntropy.HistShift);
+    }
+
+    private const float DcNodeThreshold = 96f; // MA-tree split threshold for the DC/metadata learner
+
+    // Writes one modular sub-image that references the global learned tree + clustered code
+    // (use_global_tree = true): the GroupHeader then the stream's ANS ops via the lossless emitter.
+    private static void WriteSubModularOps(JxlBitWriter body, List<Op> ops, int[] ctxs, PixelPlanCtx plan, JxlAnsWriter ans, int wpMode)
+    {
+        body.WriteBool(true);            // use_global_tree = true
+        WriteWpHeaderBits(body, wpMode);
+        body.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0
+        EmitOpsAns(body, ops, ctxs, plan, ans);
     }
 
     // Writes one modular sub-image that references the global tree + code (use_global_tree = true): the
