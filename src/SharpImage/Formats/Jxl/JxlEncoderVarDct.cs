@@ -105,9 +105,11 @@ internal static partial class JxlEncoder
     // integers stay inside the 16-bit modular buffer.
     private static (uint GlobalScale, uint QuantLf, uint BlockHfMul) QuantForDistance(float distance)
     {
+        // Bases calibrated so distance 1.0 lands near libjxl's distance-1 quality (~39 dB) on detailed
+        // content, rather than the near-lossless our earlier bases produced.
         float d = Math.Clamp(distance, 0.1f, 25f);
-        uint hfm = (uint)Math.Clamp((int)MathF.Round(64f / d), 1, 4096);
-        uint qlf = (uint)Math.Clamp((int)MathF.Round(256f / d), 1, 512);
+        uint hfm = (uint)Math.Clamp((int)MathF.Round(22f / d), 1, 4096);
+        uint qlf = (uint)Math.Clamp((int)MathF.Round(90f / d), 1, 512);
         return (8192u, qlf, hfm);
     }
 

@@ -217,6 +217,80 @@ public class JxlVarDctEncoderTests
     }
 
     [Test]
+    public async Task VarDct_RatioProbe_AgainstLibjxl()
+    {
+        string outDir = Environment.GetEnvironmentVariable("VARDCT_RATIO_DIR");
+        if (string.IsNullOrEmpty(outDir))
+        {
+            return; // measurement-only; runs when VARDCT_RATIO_DIR is set
+        }
+
+        const int w = 256, h = 256;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                // Detail-rich synthetic: overlaid sinusoids + a radial ramp.
+                float fx = x / (float)w, fy = y / (float)h;
+                float r = 0.5f + (0.25f * MathF.Sin(x * 0.3f)) + (0.2f * MathF.Cos(y * 0.11f));
+                float g = 0.5f + (0.25f * MathF.Sin((x + y) * 0.17f)) + (0.15f * fx);
+                float b = 0.5f + (0.25f * MathF.Cos(x * 0.07f + y * 0.05f)) + (0.15f * fy);
+                int o = x * 3;
+                row[o] = (ushort)(Math.Clamp(r, 0f, 1f) * Quantum.MaxValue);
+                row[o + 1] = (ushort)(Math.Clamp(g, 0f, 1f) * Quantum.MaxValue);
+                row[o + 2] = (ushort)(Math.Clamp(b, 0f, 1f) * Quantum.MaxValue);
+            }
+        }
+
+        // Dump the source as a binary PPM so libjxl can encode the identical pixels.
+        using (var ppm = new System.IO.FileStream(System.IO.Path.Combine(outDir, "src.ppm"), System.IO.FileMode.Create))
+        {
+            byte[] hdr = System.Text.Encoding.ASCII.GetBytes($"P6\n{w} {h}\n255\n");
+            ppm.Write(hdr, 0, hdr.Length);
+            for (int y = 0; y < h; y++)
+            {
+                var srow = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    for (int c = 0; c < 3; c++)
+                    {
+                        ppm.WriteByte((byte)Quantum.ScaleToByte(srow[(x * 3) + c]));
+                    }
+                }
+            }
+        }
+
+        foreach (float d in new[] { 1.0f, 2.0f, 3.0f })
+        {
+            byte[] cs = JxlEncoder.EncodeVarDct(frame, d);
+            JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+            double mse = 0;
+            for (int y = 0; y < h; y++)
+            {
+                var srow = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    for (int c = 0; c < 3; c++)
+                    {
+                        double diff = Quantum.ScaleToByte(srow[(x * 3) + c]) - r.Channels[c].Px[(y * w) + x];
+                        mse += diff * diff;
+                    }
+                }
+            }
+
+            mse /= 3.0 * w * h;
+            double psnr = 10.0 * Math.Log10(255.0 * 255.0 / mse);
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(outDir, $"ours_d{d}.jxl"), cs);
+            Console.Error.WriteLine($"[RATIO] ours d={d}: {cs.Length} bytes, {psnr:F2} dB");
+        }
+
+        await Assert.That(true).IsTrue();
+    }
+
+    [Test]
     public async Task JxlCoder_EncodeLossy_QualityKnob_Monotonic()
     {
         const int w = 128, h = 128;
