@@ -389,9 +389,12 @@ internal static partial class JxlEncoder
         // the decoder accumulates (value << shift[p]); the shifts decrease to a final 0 so the sum is exact.
         // Within a pass, each 256px group's coefficients are a separate PassGroup ANS stream that shares the
         // pass's HfDist histogram.
+        const int hfNumContexts = 495 * DefaultNumBlockClusters; // 7425
         int numPasses = shifts.Length;
-        var passGroupTokens = new List<ModToken>[numPasses][]; // [pass][group]
-        var passNorm = new int[numPasses][];
+        var passGroupTokens = new List<ModToken>[numPasses][];     // [pass][group]
+        var passGroupCtxs = new List<int>[numPasses][];            // [pass][group]
+        var passClusterNorm = new int[numPasses][][];              // [pass][cluster][alphabet]
+        var passMap = new int[numPasses][];                        // [pass][context] -> cluster
         var passLogAlpha = new int[numPasses];
         var remaining = new int[3][];
         for (int c = 0; c < 3; c++)
@@ -415,19 +418,51 @@ internal static partial class JxlEncoder
             }
 
             passGroupTokens[p] = new List<ModToken>[numGroups];
-            var ph = new long[1];
+            passGroupCtxs[p] = new List<int>[numGroups];
+            int maxSym = 0;
             for (int g = 0; g < numGroups; g++)
             {
                 int gx = g % groupsPerRow, gy = g / groupsPerRow;
                 int bx0 = gx * groupBlocks, by0 = gy * groupBlocks;
                 int gBw = Math.Min(groupBlocks, bw - bx0);
                 int gBh = Math.Min(groupBlocks, bh - by0);
-                passGroupTokens[p][g] = BuildHfTokens(bx0, by0, gBw, gBh, bw, qp);
-                AccumulateHist(passGroupTokens[p][g], ref ph);
+                var ctxs = new List<int>();
+                var toks = new List<ModToken>();
+                BuildHfTokensCtx(bx0, by0, gBw, gBh, bw, qp, ctxs, toks);
+                passGroupCtxs[p][g] = ctxs;
+                passGroupTokens[p][g] = toks;
+                foreach (ModToken t in toks)
+                {
+                    maxSym = Math.Max(maxSym, t.Sym);
+                }
             }
 
-            passLogAlpha[p] = Math.Max(5, JxlBits.CeilLog2(ph.Length));
-            passNorm[p] = JxlEntropy.NormalizeCounts(ph, JxlEntropy.HistShift);
+            int alphabet = maxSym + 1;
+            passLogAlpha[p] = Math.Max(5, JxlBits.CeilLog2(alphabet));
+
+            // Per-context histograms over every group of this pass, then cluster into a small set.
+            var ctxHist = new long[hfNumContexts][];
+            for (int i = 0; i < hfNumContexts; i++)
+            {
+                ctxHist[i] = new long[alphabet];
+            }
+
+            for (int g = 0; g < numGroups; g++)
+            {
+                List<int> ctxs = passGroupCtxs[p][g];
+                List<ModToken> toks = passGroupTokens[p][g];
+                for (int i = 0; i < toks.Count; i++)
+                {
+                    ctxHist[ctxs[i]][toks[i].Sym]++;
+                }
+            }
+
+            passMap[p] = ClusterContexts(ctxHist, alphabet, MaxHfClusters, out long[][] clusterHist, out int k);
+            passClusterNorm[p] = new int[k][];
+            for (int cIdx = 0; cIdx < k; cIdx++)
+            {
+                passClusterNorm[p][cIdx] = JxlEntropy.NormalizeCounts(clusterHist[cIdx], JxlEntropy.HistShift);
+            }
         }
 
         var leaf = new LearnedTree(new MaTreeNode { Property = -1, Predictor = 5 }); // ClampedGradient
@@ -459,21 +494,24 @@ internal static partial class JxlEncoder
             b.WriteBits(0, presetBits); // num_hf_presets - 1 == 0 (one preset)
             for (int p = 0; p < numPasses; p++)
             {
-                WriteHfPass(b, passNorm[p], passLogAlpha[p]);
+                WriteHfPass(b, passMap[p], passClusterNorm[p], passLogAlpha[p]);
             }
         }
 
         void WritePassGroup(JxlBitWriter b, int p, int g)
         {
             // hf_preset selector width = BitLength(NextPow2(num_hf_presets)); num_hf_presets == 1 => 0 bits.
-            var ans = new JxlAnsWriter(new[] { passNorm[p] }, passLogAlpha[p]);
-            var toks = new List<AnsToken>(passGroupTokens[p][g].Count);
-            foreach (ModToken t in passGroupTokens[p][g])
+            var ans = new JxlAnsWriter(passClusterNorm[p], passLogAlpha[p]);
+            List<ModToken> toks = passGroupTokens[p][g];
+            List<int> ctxs = passGroupCtxs[p][g];
+            var ansToks = new List<AnsToken>(toks.Count);
+            for (int i = 0; i < toks.Count; i++)
             {
-                toks.Add(new AnsToken(0, t.Sym, t.Bits, t.N));
+                ModToken t = toks[i];
+                ansToks.Add(new AnsToken(passMap[p][ctxs[i]], t.Sym, t.Bits, t.N));
             }
 
-            ans.Encode(b, toks);
+            ans.Encode(b, ansToks);
         }
 
         if (numGroups == 1 && numPasses == 1)
@@ -531,24 +569,125 @@ internal static partial class JxlEncoder
         }
     }
 
-    // The single HF pass: used_orders = 0 (natural coefficient order, no permutations), then the HfDist
-    // entropy code. All 495*num_block_clusters contexts map to one shared histogram (context clustering is
-    // an optimisation left for later; correctness only needs the histogram to cover every emitted symbol).
-    private static void WriteHfPass(JxlBitWriter body, int[] hfNormalized, int hfLogAlpha)
+    private const int MaxHfClusters = 64; // cap on distinct HfDist histograms per pass
+
+    // One HF pass: used_orders = 0 (natural order), then the HfDist entropy code — a context map over the
+    // 495*num_block_clusters contexts to `k` clustered ANS histograms.
+    private static void WriteHfPass(JxlBitWriter body, int[] contextToCluster, int[][] clusterNorm, int hfLogAlpha)
     {
         body.WriteU32(0, E.Val(0x5F), E.Val(0x13), E.Val(0x00), E.BitsOff(13, 0)); // used_orders = 0
-        int numContexts = 495 * DefaultNumBlockClusters; // num_hf_presets == 1
+        int k = clusterNorm.Length;
         body.WriteBool(false);   // lz77 disabled
-        body.WriteBool(true);    // context map: is_simple
-        body.WriteBits(0, 2);    // bits_per_entry = 0 => all contexts map to cluster 0
+        WriteContextMap(body, (int[])contextToCluster.Clone(), k);
         body.WriteBool(false);   // use_prefix_code = false (ANS)
         body.WriteBits((uint)(hfLogAlpha - 5), 2);
-        WriteUintConfig(body, LitSplit, LitMsb, LitLsb, hfLogAlpha);
-        JxlEntropy.WriteHistogram(body, hfNormalized, JxlEntropy.HistShift);
-        _ = numContexts;
+        for (int c = 0; c < k; c++)
+        {
+            WriteUintConfig(body, LitSplit, LitMsb, LitLsb, hfLogAlpha);
+        }
+
+        for (int c = 0; c < k; c++)
+        {
+            JxlEntropy.WriteHistogram(body, clusterNorm[c], JxlEntropy.HistShift);
+        }
     }
 
     private const int DefaultNumBlockClusters = 15;
+
+    private static readonly byte[] DefaultBlockCtxMap =
+    {
+        0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14,
+        14, 14, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+    };
+
+    private static readonly uint[] CoeffFreqContext =
+    {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19,
+        20, 20, 21, 21, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27,
+        27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30,
+    };
+
+    private static readonly uint[] CoeffNumNonzeroContext =
+    {
+        0, 31, 62, 62, 93, 93, 93, 93, 123, 123, 123, 123, 152, 152, 152, 152, 152, 152, 152, 152,
+        180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206,
+        206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
+        206, 206, 206, 206, 206, 206, 206,
+    };
+
+    // Builds the PassGroup HF tokens for one 256px group WITH their entropy context id (0..495*15-1),
+    // replicating JxlVarDct.WriteHfCoeff's context model exactly (block context, non-zeros prediction,
+    // coefficient frequency / running-non-zeros / prev-non-zero). All-8x8 (num_blocks == 1, order_id == 0).
+    private static void BuildHfTokensCtx(int bx0, int by0, int gBw, int gBh, int bw, int[][] qp, List<int> ctxsOut, List<ModToken> toksOut)
+    {
+        const int nbc = DefaultNumBlockClusters;
+        var nonZerosGrid = new uint[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            nonZerosGrid[c] = new uint[gBw];
+        }
+
+        for (int ly = 0; ly < gBh; ly++)
+        {
+            for (int lx = 0; lx < gBw; lx++)
+            {
+                int baseIdx = (((by0 + ly) * bw) + bx0 + lx) * 64;
+                for (int cc = 0; cc < 3; cc++)
+                {
+                    int c = new[] { 1, 0, 2 }[cc]; // Y, X, B
+                    int blockCtx = DefaultBlockCtxMap[cc * 13]; // order_id 0, lf_idx/hf_idx 0
+                    uint predicted = ly == 0
+                        ? (lx == 0 ? 32u : nonZerosGrid[c][lx - 1])
+                        : (lx == 0 ? nonZerosGrid[c][lx] : (nonZerosGrid[c][lx] + nonZerosGrid[c][lx - 1] + 1) >> 1);
+                    uint nzIdx = predicted >= 8 ? 4 + (predicted / 2) : predicted;
+                    int nonZerosCtx = blockCtx + (int)(nzIdx * nbc);
+
+                    int nonZeros = 0, lastNz = 0;
+                    for (int oi = 1; oi < 64; oi++)
+                    {
+                        if (qp[c][baseIdx + oi] != 0)
+                        {
+                            nonZeros++;
+                            lastNz = oi;
+                        }
+                    }
+
+                    ctxsOut.Add(nonZerosCtx);
+                    toksOut.Add(HybridToken(nonZeros));
+                    nonZerosGrid[c][lx] = (uint)nonZeros; // num_blocks == 1 => non_zeros_val == non_zeros
+                    if (nonZeros == 0)
+                    {
+                        continue;
+                    }
+
+                    uint isPrevNonzero = nonZeros <= 4 ? 1u : 0u; // num_blocks * 4
+                    int coeffCtxBase = (blockCtx * 458) + (37 * nbc);
+                    int rem = nonZeros;
+                    for (int oi = 1; oi <= lastNz; oi++)
+                    {
+                        int coeffCtx = (int)(((CoeffNumNonzeroContext[rem - 1] + CoeffFreqContext[oi - 1]) * 2) + isPrevNonzero);
+                        int ctx = coeffCtxBase + coeffCtx;
+                        int q = qp[c][baseIdx + oi];
+                        ctxsOut.Add(ctx);
+                        if (q == 0)
+                        {
+                            toksOut.Add(HybridToken(0));
+                            isPrevNonzero = 0;
+                            continue;
+                        }
+
+                        toksOut.Add(HybridToken(PackSigned(q)));
+                        isPrevNonzero = 1;
+                        rem--;
+                        if (rem == 0)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Builds the PassGroup HF coefficient tokens for one 256px group's block window (inverse of
     // JxlVarDct.WriteHfCoeff), all in cluster 0. Emission order matches the decoder: group-local block
