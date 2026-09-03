@@ -333,6 +333,37 @@ public class JxlVarDctEncoderTests
     }
 
     [Test]
+    public async Task VarDctAdaptiveQuant_VariesAndRoundTrips()
+    {
+        const int w = 128, h = 64;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        var rng = new Random(7);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                // Left half: smooth gradient. Right half: high-frequency noise (busy).
+                float v = x < w / 2 ? (x / (float)(w / 2)) : (float)rng.NextDouble();
+                int o = x * 3;
+                row[o] = row[o + 1] = row[o + 2] = (ushort)(Math.Clamp(v, 0f, 1f) * Quantum.MaxValue);
+            }
+        }
+
+        byte[] uniform = JxlEncoder.EncodeVarDct(frame, 4096, 64, 16, null, adaptiveQuant: false);
+        byte[] adaptive = JxlEncoder.EncodeVarDct(frame, 4096, 64, 16, null, adaptiveQuant: true);
+
+        // Adaptive quant must actually change the encoding (per-block hf_mul varies by luma activity)...
+        await Assert.That(adaptive.Length).IsNotEqualTo(uniform.Length);
+        // ...and both must still be valid, decodable frames.
+        JxlModularResult ra = JxlFrame.DecodeModularCodestream(adaptive);
+        JxlModularResult ru = JxlFrame.DecodeModularCodestream(uniform);
+        await Assert.That(ra.Width).IsEqualTo(w);
+        await Assert.That(ru.Width).IsEqualTo(w);
+    }
+
+    [Test]
     public async Task VarDctMultiGroup_LargerThanOneGroup_RoundTrips()
     {
         const int w = 384, h = 320; // 2x2 groups of 256px

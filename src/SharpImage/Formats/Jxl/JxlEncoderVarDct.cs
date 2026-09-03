@@ -36,7 +36,7 @@ internal static partial class JxlEncoder
     /// for the leading (coarse) passes in DECREASING order; a final full-precision (shift 0) pass is
     /// appended automatically. E.g. [2,1] => 3 passes with shifts {2,1,0}. Null/empty => a single pass.
     /// </summary>
-    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null)
+    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null, bool adaptiveQuant = false)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -54,7 +54,7 @@ internal static partial class JxlEncoder
         int[] shifts = BuildPassShifts(passShifts);
 
         float[][] srgb = ExtractSrgb(image, w, h);
-        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts);
+        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant);
         return AssembleVarDctCodestream(w, h, sections, shifts);
     }
 
@@ -97,7 +97,7 @@ internal static partial class JxlEncoder
     public static byte[] EncodeVarDct(ImageFrame image, float distance, int[]? passShifts = null)
     {
         (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
-        return EncodeVarDct(image, gs, qlf, hfm, passShifts);
+        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: true);
     }
 
     // Maps a Butteraugli-style distance to (global_scale, quant_lf, block_hf_mul). global_scale is fixed;
@@ -249,7 +249,7 @@ internal static partial class JxlEncoder
     }
 
     // --- the frame body as TOC sections (see AssembleVarDctCodestream) ---
-    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts)
+    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts, bool adaptiveQuant)
     {
         int bw = (w + 7) / 8, bh = (h + 7) / 8;   // blocks
         int stride = bw * 8, strideH = bh * 8;
@@ -288,12 +288,19 @@ internal static partial class JxlEncoder
         float[] matX = dm.GetTransposed(0, TransformType.Dct8);
         float[] matY = dm.GetTransposed(1, TransformType.Dct8);
         float[] matB = dm.GetTransposed(2, TransformType.Dct8);
-        float hfMul = 65536.0f / (globalScale * (float)blockHfMul);
         (ushort X, ushort Y)[] order = JxlVarDctTables.NaturalOrder(0); // Dct8 scan order
+
+        // Adaptive quantisation: modulate the per-block AC quant multiplier by local luma HF activity
+        // (libjxl's masking model — busy blocks tolerate coarser quant, smooth blocks need finer), keeping
+        // the geometric mean at the distance-calibrated base. hf_mul >= 1; larger => finer.
+        int[] hfMulBlock = adaptiveQuant
+            ? AdaptiveHfMul(xyb[1], stride, bw, bh, blockHfMul)
+            : null!;
 
         var dcY = new int[nbData];
         var dcX = new int[nbData];
         var dcB = new int[nbData];
+        var blockHfMuls = new int[nbData]; // per-block hf_mul actually used (for block_info + dequant)
         // AC coefficients per block, laid out by scan position: ac[c][block*64 + oi]. oi 0 (DC) unused.
         var ac = new int[3][];
         for (int c = 0; c < 3; c++)
@@ -312,6 +319,9 @@ internal static partial class JxlEncoder
             for (int bx = 0; bx < bw; bx++)
             {
                 int bi = (by * bw) + bx;
+                int bHfMul = adaptiveQuant ? hfMulBlock[bi] : (int)blockHfMul;
+                blockHfMuls[bi] = bHfMul;
+                float hfMul = 65536.0f / (globalScale * (float)bHfMul);
                 for (int c = 0; c < 3; c++)
                 {
                     var g = new JxlDct.Grid(coeffRaster[c], 0, 8, 8, 8);
@@ -359,7 +369,7 @@ internal static partial class JxlEncoder
         for (int i = 0; i < nbData; i++)
         {
             blockInfo[i] = 0;
-            blockInfo[nbData + i] = (int)blockHfMul - 1;
+            blockInfo[nbData + i] = blockHfMuls[i] - 1;
         }
 
         var hfMeta = new List<SubChannel>
@@ -792,6 +802,56 @@ internal static partial class JxlEncoder
     {
         (int token, int nbits, int bits) = PackHybridFull(LitSplit, LitMsb, LitLsb, value);
         return new ModToken(token, (uint)bits, nbits);
+    }
+
+    // Per-block AC quant multiplier from local luma HF activity (libjxl's HfModulation masking term):
+    // sum of clamped |neighbour luma differences| per 8x8 block => "busy". Busy blocks tolerate coarser
+    // quant (smaller hf_mul), smooth blocks get finer, with the geometric mean pinned to the base so the
+    // distance calibration (average rate) is preserved. Returns hf_mul >= 1 per block (row-major).
+    private static int[] AdaptiveHfMul(float[] y, int stride, int bw, int bh, uint baseHfMul)
+    {
+        const float valmin = 0.0206f;     // libjxl HfModulation clamp
+        const double kMul = -0.38;        // libjxl HfModulation weight
+        int nb = bw * bh;
+        var act = new double[nb];
+        double meanAct = 0;
+        for (int by = 0; by < bh; by++)
+        {
+            for (int bx = 0; bx < bw; bx++)
+            {
+                double sum = 0;
+                for (int yy = 0; yy < 8; yy++)
+                {
+                    for (int xx = 0; xx < 8; xx++)
+                    {
+                        int p = (((by * 8) + yy) * stride) + (bx * 8) + xx;
+                        if (xx < 7)
+                        {
+                            sum += Math.Min(valmin, Math.Abs(y[p] - y[p + 1]));
+                        }
+
+                        if (yy < 7)
+                        {
+                            sum += Math.Min(valmin, Math.Abs(y[p] - y[p + stride]));
+                        }
+                    }
+                }
+
+                act[(by * bw) + bx] = sum;
+                meanAct += sum;
+            }
+        }
+
+        meanAct /= nb;
+        var mul = new int[nb];
+        int cap = (int)baseHfMul * 4;
+        for (int i = 0; i < nb; i++)
+        {
+            double factor = Math.Exp(kMul * (act[i] - meanAct)); // busy => <1 (coarser), smooth => >1 (finer)
+            mul[i] = Math.Clamp((int)Math.Round(baseHfMul * factor), 1, cap);
+        }
+
+        return mul;
     }
 
     // Forward AC quantiser: q = round(coeff / step). step = matrix[k] * hf_mul.
