@@ -975,42 +975,71 @@ internal static partial class JxlEncoder
 
         int Count(int x, int y, TransformType t, int hfMul) => CountLumaAcNonzeros(xyb[1], stride, x, y, t, dm, globalScale, hfMul, fp);
 
-        // Pass 1: Dct32 over aligned 4x4-block (32x32px) regions, chosen only when it clearly beats splitting
-        // into 16 Dct8 (a very large transform only pays off on big flat areas). Marks the 16 positions.
+        // Assigns a square block of `side` 8x8 positions (its top-left = type t, the rest -1) iff it clearly
+        // beats splitting into side*side Dct8; only over aligned in-bounds regions of still-all-Dct8 cells.
+        bool TryLargeSquare(int bx, int by, int side, TransformType t, int margin)
+        {
+            for (int dy = 0; dy < side; dy++)
+            {
+                for (int dx = 0; dx < side; dx++)
+                {
+                    if (sizeAt[((by + dy) * bw) + bx + dx] != (int)TransformType.Dct8)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            int hf = adaptiveQuant ? hfMulBlock[(by * bw) + bx] : (int)blockHfMul;
+            int costBig = Count(bx, by, t, hf) + perBlockPenalty;
+            int costSplit = side * side * perBlockPenalty;
+            for (int dy = 0; dy < side; dy++)
+            {
+                for (int dx = 0; dx < side; dx++)
+                {
+                    costSplit += Count(bx + dx, by + dy, TransformType.Dct8, hf);
+                }
+            }
+
+            if (costBig + margin >= costSplit)
+            {
+                return false;
+            }
+
+            sizeAt[(by * bw) + bx] = (int)t;
+            for (int dy = 0; dy < side; dy++)
+            {
+                for (int dx = 0; dx < side; dx++)
+                {
+                    if (dx != 0 || dy != 0)
+                    {
+                        sizeAt[((by + dy) * bw) + bx + dx] = -1;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        // Pass 0: Dct64 over aligned 8x8-block (64x64px) regions (very large flat areas only).
+        for (int by = 0; by + 7 < bh; by += 8)
+        {
+            for (int bx = 0; bx + 7 < bw; bx += 8)
+            {
+                TryLargeSquare(bx, by, 8, TransformType.Dct64, 24);
+            }
+        }
+
+        // Pass 1: Dct32 over aligned 4x4-block (32x32px) regions (skips cells already taken by a Dct64).
         for (int by = 0; by + 3 < bh; by += 4)
         {
             for (int bx = 0; bx + 3 < bw; bx += 4)
             {
-                int tl32 = (by * bw) + bx;
-                int hf = adaptiveQuant ? hfMulBlock[tl32] : (int)blockHfMul;
-                int cost32 = Count(bx, by, TransformType.Dct32, hf) + perBlockPenalty;
-                int cost8x16 = 16 * perBlockPenalty;
-                for (int dy = 0; dy < 4; dy++)
-                {
-                    for (int dx = 0; dx < 4; dx++)
-                    {
-                        cost8x16 += Count(bx + dx, by + dy, TransformType.Dct8, hf);
-                    }
-                }
-
-                if (cost32 + dct32Margin < cost8x16)
-                {
-                    sizeAt[tl32] = (int)TransformType.Dct32;
-                    for (int dy = 0; dy < 4; dy++)
-                    {
-                        for (int dx = 0; dx < 4; dx++)
-                        {
-                            if (dx != 0 || dy != 0)
-                            {
-                                sizeAt[((by + dy) * bw) + bx + dx] = -1;
-                            }
-                        }
-                    }
-                }
+                TryLargeSquare(bx, by, 4, TransformType.Dct32, dct32Margin);
             }
         }
 
-        // Pass 2: the 16x16 (2x2-block) region choice, skipping any region already consumed by a Dct32.
+        // Pass 2: the 16x16 (2x2-block) region choice, skipping any region already consumed by a larger block.
         for (int by = 0; by + 1 < bh; by += 2)
         {
             for (int bx = 0; bx + 1 < bw; bx += 2)
