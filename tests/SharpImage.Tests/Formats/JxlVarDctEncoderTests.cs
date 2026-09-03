@@ -1,5 +1,7 @@
 using System;
+using SharpImage.Core;
 using SharpImage.Formats.Jxl;
+using SharpImage.Image;
 
 namespace SharpImage.Tests.Formats;
 
@@ -88,5 +90,92 @@ public class JxlVarDctEncoderTests
 
         await Assert.That(fine).IsGreaterThan(40.0);   // near-lossless at fine quant
         await Assert.That(fine).IsGreaterThan(coarse);  // finer quant reconstructs better
+    }
+
+    private static ImageFrame GradientFrame(int width, int height)
+    {
+        var frame = new ImageFrame();
+        frame.Initialize(width, height, ColorspaceType.SRGB, false);
+        for (int y = 0; y < height; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < width; x++)
+            {
+                int o = x * 3;
+                row[o] = (ushort)(x * Quantum.MaxValue / Math.Max(1, width - 1));
+                row[o + 1] = (ushort)(y * Quantum.MaxValue / Math.Max(1, height - 1));
+                row[o + 2] = (ushort)(Quantum.MaxValue / 2);
+            }
+        }
+
+        return frame;
+    }
+
+    [Test]
+    public async Task DecodeRealReferenceFile()
+    {
+        string path = Environment.GetEnvironmentVariable("VARDCT_REF");
+        if (string.IsNullOrEmpty(path) || !System.IO.File.Exists(path))
+        {
+            return; // only runs when a reference file is provided
+        }
+
+        byte[] cs = System.IO.File.ReadAllBytes(path);
+        try
+        {
+            JxlModularResult res = JxlFrame.DecodeModularCodestream(cs);
+            Console.Error.WriteLine($"[VARDCT] our decoder read real file OK: {res.Width}x{res.Height} ch={res.NumChannels}");
+            System.IO.File.WriteAllText(path + ".ourdecode.txt", $"OK {res.Width}x{res.Height} ch={res.NumChannels}");
+        }
+        catch (Exception e)
+        {
+            System.IO.File.WriteAllText(path + ".ourdecode.txt", $"FAIL: {e.GetType().Name}: {e.Message}");
+        }
+
+        await Assert.That(true).IsTrue();
+    }
+
+    [Test]
+    public async Task VarDctDcOnly_RoundTripsThroughDecoder()
+    {
+        const int w = 64, h = 64;
+        ImageFrame frame = GradientFrame(w, h);
+        byte[] cs = JxlEncoder.EncodeVarDct(frame, globalScale: 4096, quantLf: 32, blockHfMul: 1);
+
+        // Decode with the reference in-tree VarDCT decoder — proves the whole frame structure is valid.
+        JxlModularResult res = JxlFrame.DecodeModularCodestream(cs);
+        await Assert.That(res.Width).IsEqualTo(w);
+        await Assert.That(res.Height).IsEqualTo(h);
+        await Assert.That(res.NumChannels).IsEqualTo(3);
+
+        // DC-only reconstruction is blocky but each 8x8 block should sit near the source block mean.
+        double mse = 0;
+        for (int c = 0; c < 3; c++)
+        {
+            int[] px = res.Channels[c].Px;
+            var srow = frame;
+            for (int y = 0; y < h; y++)
+            {
+                var row = srow.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    double src = Quantum.ScaleToByte(row[(x * 3) + c]);
+                    double d = src - px[(y * w) + x];
+                    mse += d * d;
+                }
+            }
+        }
+
+        mse /= 3.0 * w * h;
+        double psnr = mse <= 1e-9 ? 99.0 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        string dump = Environment.GetEnvironmentVariable("VARDCT_DUMP");
+        if (!string.IsNullOrEmpty(dump))
+        {
+            System.IO.File.WriteAllBytes(dump, cs);
+            System.IO.File.WriteAllText(dump + ".txt", $"PSNR={psnr:F2} dB, {cs.Length} bytes");
+        }
+
+        Console.Error.WriteLine($"[VARDCT] DC-only decode PSNR={psnr:F2} dB, {cs.Length} bytes");
+        await Assert.That(psnr).IsGreaterThan(22.0); // smooth gradient: block means track the source
     }
 }

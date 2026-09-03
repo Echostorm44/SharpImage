@@ -1,0 +1,439 @@
+// JPEG XL VarDCT (lossy) codestream writer — the exact inverse of the JxlVarDct decoder + JxlFrame
+// frame parser. Emits a single-section XYB VarDCT frame (LfGlobal, one LfGroup, HfGlobal, one PassGroup)
+// for images up to one group (256x256, since VarDCT group_size_shift defaults to 1). The forward
+// transform math lives in JxlVarDctEncoder; this file produces the bitstream around it.
+//
+// Loop filters (Gaborish/EPF) and adaptive-LF smoothing are disabled via the frame header, and
+// chroma-from-luma is left at its all-default correlation (X: +0*Y, B: +1*Y) with the B luma term
+// pre-subtracted in the encoder — so the decoder's reconstruction equals JxlVarDctEncoder's validated
+// forward/inverse model exactly.
+//
+// Two conformance points that cost real debugging: (1) ImageMetadata must be written out explicitly with
+// xyb_encoded = true — the all_default metadata is read as non-XYB by libjxl/jxl-oxide, which then expect
+// a do_ycbcr bit and desync; (2) the LfGroup modular sub-images must reference a *global* MA tree in
+// LfGlobal (use_global_tree = true) — local per-image trees are rejected by both reference decoders.
+// Output verified decodable by libjxl (ffmpeg) and jxl-oxide, plus this repo's own decoder.
+using System;
+using System.Collections.Generic;
+using SharpImage.Core;
+using SharpImage.Image;
+using E = SharpImage.Formats.Jxl.JxlBitReader.U32Enc;
+
+namespace SharpImage.Formats.Jxl;
+
+internal static partial class JxlEncoder
+{
+    private const int VarDctGroupDim = 256; // 128 << group_size_shift(1)
+
+    /// <summary>
+    /// Encodes an image as a lossy XYB VarDCT JPEG XL codestream (single group, DC-only for now).
+    /// globalScale/quantLf/blockHfMul are the quantiser knobs (see JxlVarDctEncoder.ReconstructPsnr).
+    /// </summary>
+    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1)
+    {
+        int w = (int)image.Columns;
+        int h = (int)image.Rows;
+        if (w <= 0 || h <= 0)
+        {
+            throw new InvalidOperationException("Cannot encode an empty image.");
+        }
+
+        if (w > VarDctGroupDim || h > VarDctGroupDim)
+        {
+            throw new NotSupportedException("VarDCT encoder currently supports images up to 256x256 (one group).");
+        }
+
+        float[][] srgb = ExtractSrgb(image, w, h);
+        byte[] body = BuildVarDctBody(srgb, w, h, globalScale, quantLf, blockHfMul);
+        return AssembleVarDctCodestream(w, h, body);
+    }
+
+    // Extract sRGB [0,1] float channels (grayscale expanded to RGB), matching EncodeLossless's sampling.
+    private static float[][] ExtractSrgb(ImageFrame image, int w, int h)
+    {
+        var srgb = new float[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            srgb[c] = new float[w * h];
+        }
+
+        int srcCh = image.NumberOfChannels;
+        for (int y = 0; y < h; y++)
+        {
+            var row = image.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                int off = x * srcCh;
+                int p = (y * w) + x;
+                if (srcCh == 1)
+                {
+                    float v = Quantum.ScaleToByte(row[off]) / 255f;
+                    srgb[0][p] = srgb[1][p] = srgb[2][p] = v;
+                }
+                else
+                {
+                    srgb[0][p] = Quantum.ScaleToByte(row[off]) / 255f;
+                    srgb[1][p] = Quantum.ScaleToByte(row[off + 1]) / 255f;
+                    srgb[2][p] = Quantum.ScaleToByte(row[off + 2]) / 255f;
+                }
+            }
+        }
+
+        return srgb;
+    }
+
+    // --- codestream assembly (signature + size + all_default metadata + frame header + single section) ---
+    private static byte[] AssembleVarDctCodestream(int w, int h, byte[] body)
+    {
+        var main = new JxlBitWriter();
+        main.WriteBits(0xFF, 8);
+        main.WriteBits(0x0A, 8);
+        WriteSizeHeader(main, w, h);
+        WriteXybImageMetadata(main);
+        main.JumpToByteBoundary();
+        WriteVarDctFrameHeader(main);
+        main.WriteBool(false); // permuted TOC = false
+        main.JumpToByteBoundary();
+
+        // Single TOC entry (numGroups == 1 && numPasses == 1).
+        main.WriteU32((uint)body.Length, E.BitsOff(10, 0), E.BitsOff(14, 1024), E.BitsOff(22, 17408), E.BitsOff(30, 4211712));
+        main.JumpToByteBoundary();
+        main.AppendBytes(body);
+        return main.ToArray();
+    }
+
+    // Explicit ImageMetadata: 8-bit sRGB RGB, XYB-encoded, no extra channels, default opsin/upsampling.
+    // Written out in full (not all_default) so xyb_encoded is unambiguously set for the decoder.
+    private static void WriteXybImageMetadata(JxlBitWriter w)
+    {
+        w.WriteBool(false); // not all_default
+        w.WriteBool(false); // extra_fields = false
+        w.WriteBool(false); // bit depth: not floating
+        w.WriteU32(8, E.Val(8), E.Val(10), E.Val(12), E.BitsOff(6, 1)); // 8 bits per sample
+        w.WriteBool(true);  // modular_16bit_buffer_sufficient
+        w.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(12, 1)); // num_extra_channels = 0
+        w.WriteBool(true);  // xyb_encoded = true
+        w.WriteBool(true);  // colour encoding: all_default (sRGB RGB)
+        w.WriteU64(0);      // extensions = none
+        w.WriteBool(true);  // default_m (skip opsin / upsampling weights — use XYB defaults)
+    }
+
+    // Frame header for a regular XYB VarDCT frame with loop filters + adaptive-LF-smoothing disabled.
+    private static void WriteVarDctFrameHeader(JxlBitWriter w)
+    {
+        w.WriteBool(false);  // not all_default
+        w.WriteBits(0, 2);   // frame_type = Regular
+        w.WriteBits(0, 1);   // encoding = VarDCT
+        w.WriteU64(0x80);    // flags = kSkipAdaptiveDCSmoothing (0x80); no patches/splines/noise/useLf
+        // md.Xyb => no do_ycbcr bit.
+        w.WriteU32(1, E.Val(1), E.Val(2), E.Val(4), E.Val(8)); // upsampling = 1 (no extra channels)
+        w.WriteBits(2, 3);   // x_qm_scale = 2 (default)
+        w.WriteBits(2, 3);   // b_qm_scale = 2 (default)
+        w.WriteU32(1, E.Val(1), E.Val(2), E.Val(3), E.BitsOff(3, 4)); // num_passes = 1
+        w.WriteBool(false);  // have_crop = false
+        w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3)); // blending mode = 0 (replace)
+        w.WriteBool(true);   // is_last = true
+        w.WriteU32(0, E.Val(0), E.BitsOff(4, 0), E.BitsOff(5, 16), E.BitsOff(10, 48)); // name length = 0
+
+        w.WriteBool(false);  // loop filter: not all_default
+        w.WriteBool(false);  // gaborish = off
+        w.WriteBits(0, 2);   // epf_iters = 0
+        w.WriteU64(0);       // loop-filter extensions = none
+        w.WriteU64(0);       // frame-header extensions = none
+    }
+
+    // --- the frame body: one continuous bitstream (single-section frame) ---
+    private static byte[] BuildVarDctBody(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul)
+    {
+        int bw = (w + 7) / 8, bh = (h + 7) / 8;   // blocks
+        int stride = bw * 8, strideH = bh * 8;
+        int nbData = bw * bh;                      // all 8x8 => one data block each
+
+        // Pad the source to whole blocks (edge-replicate), then convert to XYB.
+        var padded = new float[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            padded[c] = new float[stride * strideH];
+            for (int y = 0; y < strideH; y++)
+            {
+                int sy = Math.Min(y, h - 1);
+                for (int x = 0; x < stride; x++)
+                {
+                    padded[c][(y * stride) + x] = srgb[c][(sy * w) + Math.Min(x, w - 1)];
+                }
+            }
+        }
+
+        var fp = new VarDctFrameParams();
+        float[][] xyb = JxlVarDctEncoder.SrgbToXyb(padded, stride * strideH, fp);
+
+        // Quantise DC per block. Modular DC channels are [Y, X, B]; CfL adds +1*Y to B on decode, so we
+        // store B with the (quantised) Y term pre-subtracted, and X unchanged (kx == 0).
+        float[] mlf = { 1f / 32f, 1f / 4f, 1f / 2f };                 // m_x, m_y, m_b
+        double scaleInv = (double)globalScale * quantLf;
+        float scaleX = (float)(mlf[0] * 512.0 / scaleInv);
+        float scaleY = (float)(mlf[1] * 512.0 / scaleInv);
+        float scaleB = (float)(mlf[2] * 512.0 / scaleInv);
+
+        var dcY = new int[nbData];
+        var dcX = new int[nbData];
+        var dcB = new int[nbData];
+        for (int by = 0; by < bh; by++)
+        {
+            for (int bx = 0; bx < bw; bx++)
+            {
+                // Forward DCT DC == mean*8 of the block; compute coeff[0] for each channel.
+                float sumX = 0, sumY = 0, sumB = 0;
+                for (int yy = 0; yy < 8; yy++)
+                {
+                    for (int xx = 0; xx < 8; xx++)
+                    {
+                        int p = (((by * 8) + yy) * stride) + (bx * 8) + xx;
+                        sumX += xyb[0][p];
+                        sumY += xyb[1][p];
+                        sumB += xyb[2][p];
+                    }
+                }
+
+                // DCT-II DC coefficient with the codec's 0.5 forward scale is mean over the 8x8 block.
+                float dcXf = sumX / 64f, dcYf = sumY / 64f, dcBf = sumB / 64f;
+                int bi = (by * bw) + bx;
+                int yInt = (int)MathF.Round(dcYf / scaleY);
+                dcY[bi] = yInt;
+                dcX[bi] = (int)MathF.Round(dcXf / scaleX);
+                dcB[bi] = (int)MathF.Round((dcBf - (yInt * scaleY)) / scaleB);
+            }
+        }
+
+        // Build the LfGroup modular sub-images. libjxl (and jxl-oxide) require a *global* MA tree in
+        // LfGlobal that every sub-image references (use_global_tree = true); local per-image trees are
+        // rejected. We use a single-leaf ClampedGradient tree and one shared histogram over all channels
+        // of both sub-images.
+        var dcImage = new List<SubChannel> { new(dcY, bw, bh), new(dcX, bw, bh), new(dcB, bw, bh) };
+        int cfW = (w + 63) / 64, cfH = (h + 63) / 64;
+        var blockInfo = new int[nbData * 2];       // row0 = dct_select (0 = Dct8), row1 = hf_mul - 1
+        for (int i = 0; i < nbData; i++)
+        {
+            blockInfo[i] = 0;
+            blockInfo[nbData + i] = (int)blockHfMul - 1;
+        }
+
+        var hfMeta = new List<SubChannel>
+        {
+            new(new int[cfW * cfH], cfW, cfH),     // x_from_y (all 0)
+            new(new int[cfW * cfH], cfW, cfH),     // b_from_y (all 0)
+            new(blockInfo, nbData, 2),             // block info
+            new(new int[bw * bh], bw, bh),         // sharpness (all 0)
+        };
+
+        List<ModToken> dcTokens = GradientTokens(dcImage);
+        List<ModToken> metaTokens = GradientTokens(hfMeta);
+        int maxToken = 0;
+        foreach (ModToken t in dcTokens)
+        {
+            maxToken = Math.Max(maxToken, t.Sym);
+        }
+
+        foreach (ModToken t in metaTokens)
+        {
+            maxToken = Math.Max(maxToken, t.Sym);
+        }
+
+        var hist = new long[maxToken + 1];
+        foreach (ModToken t in dcTokens)
+        {
+            hist[t.Sym]++;
+        }
+
+        foreach (ModToken t in metaTokens)
+        {
+            hist[t.Sym]++;
+        }
+
+        int logAlpha = Math.Max(5, JxlBits.CeilLog2(maxToken + 1));
+        int[] normalized = JxlEntropy.NormalizeCounts(hist, JxlEntropy.HistShift);
+
+        var body = new JxlBitWriter();
+
+        // ===== LfGlobal =====
+        body.WriteBool(true);  // lf_channel_dequant all_default {1/32, 1/4, 1/2}
+        body.WriteU32(globalScale, E.BitsOff(11, 1), E.BitsOff(11, 2049), E.BitsOff(12, 4097), E.BitsOff(16, 8193));
+        body.WriteU32(quantLf, E.Val(16), E.BitsOff(5, 1), E.BitsOff(8, 1), E.BitsOff(16, 1));
+        body.WriteBool(true);  // hf_block_context all_default (15 clusters, default map)
+        body.WriteBool(true);  // lf_channel_correlation all_default (base_x 0, base_b 1)
+        body.WriteBits(1, 1);  // GlobalModular: has_tree = 1 (shared single-leaf tree for all sub-images)
+        var leaf = new LearnedTree(new MaTreeNode { Property = -1, Predictor = 5 }); // ClampedGradient
+        WriteTree(body, leaf.Tokens);
+        WriteSingleContextAnsHeader(body, normalized, logAlpha);
+        // GlobalModular body has 0 channels for VarDCT => nothing more is read.
+
+        // ===== LfGroup 0 =====
+        body.WriteBits(0, 2);  // extra_precision = 0
+        WriteSubModularUsingGlobal(body, dcTokens, normalized, logAlpha);
+
+        // HfMetadata: num_blocks then the 4-channel modular image.
+        int nbBits = BitLength(NextPow2(bw * bh));
+        body.WriteBits((uint)(nbData - 1), nbBits);
+        WriteSubModularUsingGlobal(body, metaTokens, normalized, logAlpha);
+
+        // ===== HfGlobal =====
+        body.WriteBool(true);  // DequantMatrixSet all_default
+        // num_hf_presets: BitLength(NextPow2(numGroups)) bits; numGroups == 1 => 0 bits.
+        WriteHfPassDcOnly(body);
+
+        // ===== PassGroup 0 (pass 0) =====
+        // hf_preset selector: BitLength(NextPow2(numGroups)) bits => 0 bits for numGroups == 1.
+        WritePassGroupDcOnly(body, bw, bh);
+
+        return body.ToArray();
+    }
+
+    // The single HF pass: used_orders = 0 (natural coefficient order, no permutations), then the HfDist
+    // entropy code. For DC-only every block emits a single "0 non-zeros" token, so a one-symbol histogram
+    // covering all 495*num_block_clusters contexts suffices.
+    private static void WriteHfPassDcOnly(JxlBitWriter body)
+    {
+        body.WriteU32(0, E.Val(0x5F), E.Val(0x13), E.Val(0x00), E.BitsOff(13, 0)); // used_orders = 0
+        int numContexts = 495 * DefaultNumBlockClusters; // num_hf_presets == 1
+        WriteSingleSymbolHistograms(body, numContexts);
+    }
+
+    private const int DefaultNumBlockClusters = 15;
+    private static readonly byte[] DefaultBlockCtxMap =
+    {
+        0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14,
+        14, 14, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+    };
+
+    // Emits the PassGroup HF coefficient ANS stream for the DC-only case: one "non-zeros == 0" token per
+    // (block, channel), in the decoder's read order (y, x, then channel order {Y, X, B}). All tokens are
+    // symbol 0 in the single HfDist histogram.
+    private static void WritePassGroupDcOnly(JxlBitWriter body, int bw, int bh)
+    {
+        var tokens = new List<AnsToken>(bw * bh * 3);
+        var nonZerosGrid = new uint[3][];
+        for (int c = 0; c < 3; c++)
+        {
+            nonZerosGrid[c] = new uint[bw];
+        }
+
+        for (int y = 0; y < bh; y++)
+        {
+            for (int x = 0; x < bw; x++)
+            {
+                for (int cc = 0; cc < 3; cc++)
+                {
+                    int c = new[] { 1, 0, 2 }[cc];
+                    // The non-zeros context is computed but all contexts map to histogram 0, so the emitted
+                    // token is always symbol 0 (value 0). We still advance nonZerosGrid to mirror the decoder.
+                    nonZerosGrid[c][x] = 0;
+                    tokens.Add(new AnsToken(0, 0, 0, 0));
+                }
+            }
+        }
+
+        var counts = new int[1];
+        counts[0] = AnsTabSizeConst;
+        var ans = new JxlAnsWriter(new[] { counts }, 5);
+        ans.Encode(body, tokens);
+    }
+
+    private const int AnsTabSizeConst = 1 << 12;
+
+    // --- a minimal sub-modular image writer (inverse of JxlModular.DecodeSubModular) ---
+    private readonly record struct SubChannel(int[] Px, int W, int H);
+    private readonly record struct ModToken(int Sym, uint Bits, int N);
+
+    // Computes ClampedGradient-predictor residual tokens for a list of channels in decode order (each
+    // channel raster-scanned), replicating JxlModular's single-leaf DecodeChannel neighbour rules exactly.
+    private static List<ModToken> GradientTokens(List<SubChannel> chans)
+    {
+        var outTokens = new List<ModToken>();
+        foreach (SubChannel ch in chans)
+        {
+            int w = ch.W, h = ch.H;
+            int[] px = ch.Px;
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    long left = x > 0 ? px[(y * w) + x - 1] : (y > 0 ? px[((y - 1) * w) + x] : 0);
+                    long top = y > 0 ? px[((y - 1) * w) + x] : left;
+                    long topleft = (x > 0 && y > 0) ? px[((y - 1) * w) + x - 1] : left;
+                    long guess = ClampedGradient(left, top, topleft);
+                    int packed = PackSigned((int)(px[(y * w) + x] - guess));
+                    (int token, int nbits, int bits) = PackHybridFull(LitSplit, LitMsb, LitLsb, packed);
+                    outTokens.Add(new ModToken(token, (uint)bits, nbits));
+                }
+            }
+        }
+
+        return outTokens;
+    }
+
+    // Writes the single-context ANS histograms header for the frame's global modular code (numContexts
+    // == 1 for a single-leaf tree, so no context map). Shared by every LfGroup sub-image.
+    private static void WriteSingleContextAnsHeader(JxlBitWriter body, int[] normalized, int logAlpha)
+    {
+        body.WriteBool(false);                    // lz77 disabled
+        body.WriteBool(false);                    // use_prefix_code = false (ANS)
+        body.WriteBits((uint)(logAlpha - 5), 2);
+        WriteUintConfig(body, LitSplit, LitMsb, LitLsb, logAlpha);
+        JxlEntropy.WriteHistogram(body, normalized, JxlEntropy.HistShift);
+    }
+
+    // Writes one modular sub-image that references the global tree + code (use_global_tree = true): the
+    // GroupHeader then a self-contained ANS stream over the channels' residual tokens.
+    private static void WriteSubModularUsingGlobal(JxlBitWriter body, List<ModToken> tokens, int[] normalized, int logAlpha)
+    {
+        body.WriteBool(true);            // use_global_tree = true
+        body.WriteBits(1, 1);            // WpHeader all_default
+        body.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0
+
+        var ans = new JxlAnsWriter(new[] { normalized }, logAlpha);
+        var ansTokens = new List<AnsToken>(tokens.Count);
+        foreach (ModToken t in tokens)
+        {
+            ansTokens.Add(new AnsToken(0, t.Sym, t.Bits, t.N));
+        }
+
+        ans.Encode(body, ansTokens);
+    }
+
+    private static long ClampedGradient(long a, long b, long c)
+    {
+        long grad = a + b - c;
+        long lo = Math.Min(a, b);
+        long hi = Math.Max(a, b);
+        return grad < lo ? lo : (grad > hi ? hi : grad);
+    }
+
+    // Writes a DecodeHistograms code where numContexts (> 1) all map to a single one-symbol histogram
+    // (probability entirely on symbol 0). Used for the DC-only HfDist code.
+    private static void WriteSingleSymbolHistograms(JxlBitWriter body, int numContexts)
+    {
+        body.WriteBool(false);   // lz77 disabled
+        // Context map: numContexts entries, all cluster 0. Simple form with bits-per-entry = 0 => no
+        // per-entry bits, all zero (max cluster 0 => 1 histogram).
+        body.WriteBool(true);    // is_simple
+        body.WriteBits(0, 2);    // bits_per_entry = 0
+        body.WriteBool(false);   // use_prefix_code = false (ANS)
+        body.WriteBits(0, 2);    // log_alpha - 5 => log_alpha = 5
+        WriteUintConfig(body, LitSplit, LitMsb, LitLsb, 5);
+        var counts = new int[1] { AnsTabSizeConst };
+        JxlEntropy.WriteHistogram(body, counts, JxlEntropy.HistShift);
+    }
+
+    private static int NextPow2(int v)
+    {
+        int p = 1;
+        while (p < v)
+        {
+            p <<= 1;
+        }
+
+        return p;
+    }
+
+    private static int BitLength(int v) => v <= 1 ? 0 : 32 - System.Numerics.BitOperations.LeadingZeroCount((uint)(v - 1));
+}

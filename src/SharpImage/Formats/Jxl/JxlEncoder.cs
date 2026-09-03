@@ -13,7 +13,7 @@ using E = SharpImage.Formats.Jxl.JxlBitReader.U32Enc;
 
 namespace SharpImage.Formats.Jxl;
 
-internal static class JxlEncoder
+internal static partial class JxlEncoder
 {
     // MA-tree leaf predictor: 6 = self-correcting weighted predictor (see JxlModular.PredictOne).
     private const int WeightedPredictor = 6;
