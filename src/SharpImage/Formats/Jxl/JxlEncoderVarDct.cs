@@ -97,7 +97,11 @@ internal static partial class JxlEncoder
     public static byte[] EncodeVarDct(ImageFrame image, float distance, int[]? passShifts = null)
     {
         (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
-        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: true, variableBlocks: true);
+        // adaptiveQuant is off by default: its per-block masking is a Butteraugli-style perceptual signal,
+        // but (uncalibrated) it measures net-negative on SSIMULACRA2 — it barely helps smooth content and
+        // interacts badly with variable blocks on textured photos. Variable blocks (with the distortion
+        // guard) carry the ratio win on their own.
+        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: false, variableBlocks: true);
     }
 
     // Maps a Butteraugli-style distance to (global_scale, quant_lf, block_hf_mul). global_scale is fixed;
@@ -329,7 +333,13 @@ internal static partial class JxlEncoder
                 int numBlocks = dw * dh;
                 bool needTr = JxlDct.NeedTranspose(t);
                 (ushort X, ushort Y)[] order = JxlVarDctTables.NaturalOrder(JxlDct.OrderId(t));
-                int bHfMul = adaptiveQuant ? hfMulBlock[bi] : (int)blockHfMul;
+                // A large block spans several 8x8 activity cells but can carry only one hf_mul. Use the
+                // *finest* (max) of its cells so it never quantises any region coarser than a per-cell Dct8
+                // split would — otherwise, on textured content, one busy cell's extreme-coarse multiplier
+                // (adaptive quant drives busy blocks toward hf_mul=1) gets smeared over the whole 64x64 and
+                // annihilates detail. On uniform (smooth) activity this equals the top-left cell, so the
+                // smooth-content gains are preserved.
+                int bHfMul = adaptiveQuant ? MaxHfMul(hfMulBlock, bw, bx, by, dw, dh) : (int)blockHfMul;
                 blockHfMuls[bi] = bHfMul;
                 float hfMul = 65536.0f / (globalScale * (float)bHfMul);
 
@@ -1031,7 +1041,14 @@ internal static partial class JxlEncoder
         const int rectMargin = 3;           // rectangular must beat the best square split by this margin
         const int dct32Margin = 8;          // Dct32 (very large) must clearly beat the 16 8x8 split
 
-        int Count(int x, int y, TransformType t, int hfMul) => CountLumaAcNonzeros(xyb[1], stride, x, y, t, dm, globalScale, hfMul, fp);
+        AcCost Cost(int x, int y, TransformType t, int hfMul) => CountLumaAcNonzeros(xyb[1], stride, x, y, t, dm, globalScale, hfMul, fp);
+
+        // A large/merged block must not lose much more detail than the per-Dct8 split: veto it when its
+        // distortion exceeds the split's by more than this factor (plus a small absolute slack so trivially
+        // small distortions never trip it). This is what stops texture-destroying merges at coarse quant,
+        // where the rate proxy alone favours the (few-non-zero) large block.
+        const double distGuardFactor = 1.0;
+        const double distGuardSlack = 1e-9;
 
         // Assigns a square block of `side` 8x8 positions (its top-left = type t, the rest -1) iff it clearly
         // beats splitting into side*side Dct8; only over aligned in-bounds regions of still-all-Dct8 cells.
@@ -1048,18 +1065,29 @@ internal static partial class JxlEncoder
                 }
             }
 
-            int hf = adaptiveQuant ? hfMulBlock[(by * bw) + bx] : (int)blockHfMul;
-            int costBig = Count(bx, by, t, hf) + perBlockPenalty;
+            // Evaluate each candidate at the hf_mul it would actually be encoded with: the large block at
+            // the finest (max) of its cells, each Dct8 of the split at its own cell.
+            int hfBig = adaptiveQuant ? MaxHfMul(hfMulBlock, bw, bx, by, side, side) : (int)blockHfMul;
+            AcCost big = Cost(bx, by, t, hfBig);
             int costSplit = side * side * perBlockPenalty;
+            double distSplit = 0;
             for (int dy = 0; dy < side; dy++)
             {
                 for (int dx = 0; dx < side; dx++)
                 {
-                    costSplit += Count(bx + dx, by + dy, TransformType.Dct8, hf);
+                    int hfCell = adaptiveQuant ? hfMulBlock[((by + dy) * bw) + bx + dx] : (int)blockHfMul;
+                    AcCost c = Cost(bx + dx, by + dy, TransformType.Dct8, hfCell);
+                    costSplit += c.Nz;
+                    distSplit += c.Dist;
                 }
             }
 
-            if (costBig + margin >= costSplit)
+            if (big.Dist > (distSplit * distGuardFactor) + distGuardSlack)
+            {
+                return false; // large block loses too much detail vs the split
+            }
+
+            if (big.Nz + perBlockPenalty + margin >= costSplit)
             {
                 return false;
             }
@@ -1109,17 +1137,34 @@ internal static partial class JxlEncoder
                     continue; // part of a Dct32 block
                 }
 
-                int bHfMul = adaptiveQuant ? hfMulBlock[tl] : (int)blockHfMul;
-                int Cnt(int x, int y, TransformType t) => Count(x, y, t, bHfMul);
+                // Each candidate is evaluated at the hf_mul it would actually be encoded with (large/rect
+                // blocks at the finest cell they cover, single Dct8s at their own cell).
+                AcCost Cnt(int x, int y, TransformType t)
+                {
+                    var (cdw, cdh) = JxlDct.DctSelectSize(t);
+                    int hf = adaptiveQuant ? MaxHfMul(hfMulBlock, bw, x, y, cdw, cdh) : (int)blockHfMul;
+                    return Cost(x, y, t, hf);
+                }
+
+                const int inf = int.MaxValue / 2;
 
                 // Four ways to cover the 16x16 region; cost = luma AC non-zeros + a small per-block overhead.
-                int cost8 = Cnt(bx, by, TransformType.Dct8) + Cnt(bx + 1, by, TransformType.Dct8)
-                    + Cnt(bx, by + 1, TransformType.Dct8) + Cnt(bx + 1, by + 1, TransformType.Dct8) + (4 * perBlockPenalty);
-                int cost16 = Cnt(bx, by, TransformType.Dct16) + perBlockPenalty;
+                // The Dct8 split is the detail reference; a merged candidate whose distortion exceeds it by
+                // more than the guard is disqualified (inf) so it cannot blur textured content.
+                AcCost a = Cnt(bx, by, TransformType.Dct8), b = Cnt(bx + 1, by, TransformType.Dct8),
+                    c = Cnt(bx, by + 1, TransformType.Dct8), d = Cnt(bx + 1, by + 1, TransformType.Dct8);
+                double distSplit = a.Dist + b.Dist + c.Dist + d.Dist;
+                double distGuard = (distSplit * distGuardFactor) + distGuardSlack;
+                int cost8 = a.Nz + b.Nz + c.Nz + d.Nz + (4 * perBlockPenalty);
+
+                AcCost m16 = Cnt(bx, by, TransformType.Dct16);
+                int cost16 = m16.Dist > distGuard ? inf : m16.Nz + perBlockPenalty;
                 // Rectangular is only worth its extra block over Dct16, so require it to clearly beat both
                 // square options (its non-square DCT is a worse fit unless the region is truly directional).
-                int costV = Cnt(bx, by, TransformType.Dct16x8) + Cnt(bx + 1, by, TransformType.Dct16x8) + (2 * perBlockPenalty) + rectMargin; // two 8x16 columns
-                int costH = Cnt(bx, by, TransformType.Dct8x16) + Cnt(bx, by + 1, TransformType.Dct8x16) + (2 * perBlockPenalty) + rectMargin; // two 16x8 rows
+                AcCost v0 = Cnt(bx, by, TransformType.Dct16x8), v1 = Cnt(bx + 1, by, TransformType.Dct16x8);
+                int costV = (v0.Dist + v1.Dist) > distGuard ? inf : v0.Nz + v1.Nz + (2 * perBlockPenalty) + rectMargin; // two 8x16 columns
+                AcCost h0 = Cnt(bx, by, TransformType.Dct8x16), h1 = Cnt(bx, by + 1, TransformType.Dct8x16);
+                int costH = (h0.Dist + h1.Dist) > distGuard ? inf : h0.Nz + h1.Nz + (2 * perBlockPenalty) + rectMargin; // two 16x8 rows
 
                 int best = Math.Min(Math.Min(cost8, cost16), Math.Min(costV, costH));
                 if (best >= cost8)
@@ -1158,7 +1203,26 @@ internal static partial class JxlEncoder
     // choice: each non-zero coefficient costs ~ 2 + 2*log2(|q|+1) bits (sign + magnitude), which — unlike a
     // raw non-zero count — reflects that larger coefficients are dearer, so it stops over-picking the larger
     // transforms. The caller adds a fixed per-block overhead.
-    private static int CountLumaAcNonzeros(float[] y, int stride, int bx, int by, TransformType t, DequantMatrixSet dm, uint globalScale, int bHfMul, VarDctFrameParams fp)
+    // The finest (largest) adaptive hf_mul over the dwBlocks x dhBlocks 8x8 cells a block covers.
+    private static int MaxHfMul(int[] hfMulBlock, int bw, int bx, int by, int dwBlocks, int dhBlocks)
+    {
+        int m = 0;
+        for (int dy = 0; dy < dhBlocks; dy++)
+        {
+            for (int dx = 0; dx < dwBlocks; dx++)
+            {
+                int v = hfMulBlock[((by + dy) * bw) + bx + dx];
+                if (v > m)
+                {
+                    m = v;
+                }
+            }
+        }
+
+        return m;
+    }
+
+    private static AcCost CountLumaAcNonzeros(float[] y, int stride, int bx, int by, TransformType t, DequantMatrixSet dm, uint globalScale, int bHfMul, VarDctFrameParams fp)
     {
         var (dw, dh) = JxlDct.DctSelectSize(t);
         int pw = dw * 8, ph = dh * 8;
@@ -1180,17 +1244,35 @@ internal static partial class JxlEncoder
 
         JxlDct.Dct2D(g, false);
         int cnt = 0;
+        double dist = 0;
         for (int oi = numBlocks; oi < order.Length; oi++)
         {
             int k = needTr ? (order[oi].X * pw) + order[oi].Y : (order[oi].Y * pw) + order[oi].X;
-            if (QuantAc(buf[k], mat[k] * hfMul, fp.QuantBias[1], fp.QuantBiasNumerator) != 0)
+            float step = mat[k] * hfMul;
+            int q = QuantAc(buf[k], step, fp.QuantBias[1], fp.QuantBiasNumerator);
+            if (q != 0)
             {
                 cnt++;
             }
+
+            // Frequency-weighted distortion: a coefficient's error is weighted by its normalised spatial
+            // frequency ((cycles/pixel)^2), so zeroing high-frequency *texture* is expensive while smoothing
+            // a low-frequency gradient is cheap. Plain MSE can't tell these apart — a large DCT over texture
+            // has *lower* MSE than the Dct8 split yet reads far worse — which is why the block-size guard
+            // needs this instead. The scale (cx/pw, cy/ph) is comparable across block sizes.
+            float fu = order[oi].X / (float)pw, fv = order[oi].Y / (float)ph;
+            float e = buf[k] - DequantAc(q, step, fp.QuantBias[1], fp.QuantBiasNumerator);
+            dist += (fu * fu + fv * fv) * e * e;
         }
 
-        return cnt;
+        return new AcCost(cnt, dist);
     }
+
+    // Rate (non-zero count) and distortion (sum of squared luma AC quantisation errors, == spatial MSE by
+    // Parseval) of a candidate block, so block-size selection can reject a large block that would destroy
+    // detail (high distortion) even though it codes cheaply (few non-zeros) — the failure mode on textured
+    // content at coarse quant.
+    private readonly record struct AcCost(int Nz, double Dist);
 
     // Forward AC quantiser: q = round(coeff / step). step = matrix[k] * hf_mul.
     private static int QuantAc(float coeff, float step, float quantBias, float quantBiasNum)

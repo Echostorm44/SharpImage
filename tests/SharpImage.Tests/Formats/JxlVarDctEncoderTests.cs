@@ -228,6 +228,38 @@ public class JxlVarDctEncoderTests
         const int w = 256, h = 256;
         var frame = new ImageFrame();
         frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        string srcPpm = Environment.GetEnvironmentVariable("VARDCT_RATIO_SRC");
+        if (!string.IsNullOrEmpty(srcPpm))
+        {
+            // Load a P6 binary PPM (max 256x256) so we can measure real photographic content.
+            byte[] raw = System.IO.File.ReadAllBytes(srcPpm);
+            int p = 0;
+            string Token()
+            {
+                while (p < raw.Length && (raw[p] == ' ' || raw[p] == '\n' || raw[p] == '\r' || raw[p] == '\t')) p++;
+                int s = p;
+                while (p < raw.Length && raw[p] != ' ' && raw[p] != '\n' && raw[p] != '\r' && raw[p] != '\t') p++;
+                return System.Text.Encoding.ASCII.GetString(raw, s, p - s);
+            }
+            Token(); // "P6"
+            int pw = int.Parse(Token()), ph = int.Parse(Token());
+            Token(); // maxval
+            p++;     // single whitespace after maxval
+            for (int y = 0; y < h; y++)
+            {
+                var row = frame.GetPixelRowForWrite(y);
+                for (int x = 0; x < w; x++)
+                {
+                    int o = x * 3;
+                    for (int c = 0; c < 3; c++)
+                    {
+                        int idx = p + (((Math.Min(y, ph - 1) * pw) + Math.Min(x, pw - 1)) * 3) + c;
+                        row[o + c] = Quantum.ScaleFromByte(raw[idx]);
+                    }
+                }
+            }
+        }
+        else
         for (int y = 0; y < h; y++)
         {
             var row = frame.GetPixelRowForWrite(y);
@@ -263,7 +295,7 @@ public class JxlVarDctEncoderTests
             }
         }
 
-        foreach (float d in new[] { 1.0f, 2.0f, 3.0f })
+        foreach (float d in new[] { 0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f })
         {
             byte[] cs = JxlEncoder.EncodeVarDct(frame, d);
             JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
