@@ -55,7 +55,7 @@ internal static partial class JxlEncoder
 
         float[][] srgb = ExtractSrgb(image, w, h);
         List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks, perceptual, distance, quantFieldOverride, layoutOverride);
-        return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual);
+        return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual, epfIters: 0);
     }
 
     private static int[] BuildPassShifts(int[]? passShifts)
@@ -347,7 +347,7 @@ internal static partial class JxlEncoder
     // For a single-group single-pass frame the whole body is one TOC section; a progressive (multi-pass)
     // frame uses the multi-section TOC (LfGlobal | LfGroup | HfGlobal | PassGroup-per-pass) so a streaming
     // decoder can render the DC preview from the LfGroup section before the AC passes arrive.
-    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts, bool gaborish)
+    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts, bool gaborish, int epfIters = 0)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
@@ -355,7 +355,7 @@ internal static partial class JxlEncoder
         WriteSizeHeader(main, w, h);
         WriteXybImageMetadata(main);
         main.JumpToByteBoundary();
-        WriteVarDctFrameHeader(main, shifts, gaborish);
+        WriteVarDctFrameHeader(main, shifts, gaborish, epfIters);
         main.WriteBool(false); // permuted TOC = false
         main.JumpToByteBoundary();
 
@@ -391,7 +391,7 @@ internal static partial class JxlEncoder
 
     // Frame header for a regular XYB VarDCT frame with loop filters + adaptive-LF-smoothing disabled.
     // shifts holds the per-pass coefficient shift (length == num_passes; final entry 0).
-    private static void WriteVarDctFrameHeader(JxlBitWriter w, int[] shifts, bool gaborish)
+    private static void WriteVarDctFrameHeader(JxlBitWriter w, int[] shifts, bool gaborish, int epfIters = 0)
     {
         int numPasses = shifts.Length;
         w.WriteBool(false);  // not all_default
@@ -415,7 +415,14 @@ internal static partial class JxlEncoder
             w.WriteBool(false); // gab_custom = false => default weights (match the decoder)
         }
 
-        w.WriteBits(0, 2);   // epf_iters = 0
+        w.WriteBits((uint)epfIters, 2);   // epf_iters (0 = off)
+        if (epfIters > 0)
+        {
+            w.WriteBool(false); // custom sharpness LUT = false (default)
+            w.WriteBool(false); // custom channel scale = false (default)
+            w.WriteBool(false); // custom sigma params = false (default); decoder derives sigma from hf_mul
+        }
+
         w.WriteU64(0);       // loop-filter extensions = none
         w.WriteU64(0);       // frame-header extensions = none
     }
@@ -677,12 +684,18 @@ internal static partial class JxlEncoder
             blockInfo[nbBlocks + di] = blockHfMuls[pos] - 1; // hf_mul - 1
         }
 
+        // EPF sharpness index per block (0..7): selects EpfSharpLut[sp] in the decoder's sigma. Left 0 (EPF
+        // off): the frame-header EPF path is wired (WriteVarDctFrameHeader epfIters), but measured harmful on
+        // SSIMULACRA2 — EPF blurs to reduce ringing and SSIMULACRA2 penalises that blur (detail-loss term).
+        // It is a Butteraugli-tuned filter, so it stays off for our target metric.
+        var sharpness = new int[bw * bh];
+
         var hfMeta = new List<SubChannel>
         {
             new(cflKx, cfW, cfH),                  // x_from_y (per-cell CfL)
             new(cflKb, cfW, cfH),                  // b_from_y (per-cell CfL)
             new(blockInfo, nbBlocks, 2),           // block info
-            new(new int[bw * bh], bw, bh),         // sharpness (all 0)
+            new(sharpness, bw, bh),                // sharpness (EPF)
         };
 
         // The DC image (3 channels) and HfMetadata (4 channels) are two sub-modular streams that share one
@@ -698,7 +711,7 @@ internal static partial class JxlEncoder
             new(cflKx, cfW, cfH),
             new(cflKb, cfW, cfH),
             new(blockInfo, nbBlocks, 2),
-            new(new int[bw * bh], bw, bh),
+            new(sharpness, bw, bh),
         };
 
         var learnRefs = new List<EncChannelRef>();
