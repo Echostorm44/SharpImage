@@ -502,10 +502,37 @@ internal static class JxlIcc
         return outp.ToArray();
     }
 
-    // Build a valid (but non-optimal) transform-layer stream for a raw ICC profile: predict the header, then
-    // copy the entire body with a single literal command. decode_icc reconstructs this exactly. libjxl's
-    // encoder additionally recognises tags/shuffles/deltas to shrink the stream; the entropy layer still gives
-    // most of the compression, and this keeps the encoder simple and obviously correct.
+    // Non-expanding tag command code for a common tag signature (prefer codes 4..20, and 7/11 for rXYZ/rTRC,
+    // so decode_icc never triggers the tagcode 2/3 rTRC/rXYZ auto-expansion). null => not a common tag.
+    private static byte? CommonTagCode(byte[] sig)
+    {
+        // CommonTags index -> tagcode is (index + 2); indices 0 (rTRC) and 1 (rXYZ) auto-expand, so map those
+        // signatures to their non-expanding duplicates (rTRC->11, rXYZ->7) instead.
+        for (int i = 2; i < CommonTags.Length; i++)
+        {
+            if (SigEq(CommonTags[i], sig))
+            {
+                return (byte)(i + 2);
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsXyzTag(byte[] sig) =>
+        SigEq(sig, "rXYZ") || SigEq(sig, "gXYZ") || SigEq(sig, "bXYZ") || SigEq(sig, "kXYZ") ||
+        SigEq(sig, "wtpt") || SigEq(sig, "bkpt") || SigEq(sig, "lumi");
+
+    private static bool SigEq(byte[] a, byte[] b) => a.Length == 4 && b.Length == 4 && a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+
+    private static bool SigEq(byte[] a, string s) => a.Length == 4 && a[0] == (byte)s[0] && a[1] == (byte)s[1] && a[2] == (byte)s[2] && a[3] == (byte)s[3];
+
+    // Build a valid transform-layer stream for a raw ICC profile: predict the header, encode the tag table as
+    // tag commands (common-tag codes + contiguous start/size prediction, so a typical tag costs ~1 byte
+    // instead of 12), then copy the remaining tag data with a literal command. decode_icc reconstructs this
+    // exactly. A malformed/unusual tag table falls back to a single whole-body literal (always correct).
+    // libjxl additionally shuffles/delta-predicts the numeric LUT data; that mainly helps large uncommon
+    // profiles and is left to the entropy layer here.
     public static byte[] EncodeTransform(byte[] raw)
     {
         int outputSize = raw.Length;
@@ -529,10 +556,29 @@ internal static class JxlIcc
 
         if (outputSize > 128)
         {
-            WriteVarint(commands, 0);                         // v=0 => no tag section, straight to Main
-            commands.Add(1);                                  // Main command 1: literal
-            WriteVarint(commands, (ulong)(outputSize - 128)); // copy the whole body
-            data.AddRange(raw[128..]);
+            int bodyStart = 128; // where the tag table starts in the reconstructed output
+            if (!TryEncodeTagTable(raw, outputSize, commands, data, ref bodyStart))
+            {
+                // Fallback: no tag section, one whole-body literal.
+                commands.Clear();
+                data.Clear();
+                data.AddRange(headerDelta);
+                WriteVarint(commands, 0);
+                commands.Add(1);
+                WriteVarint(commands, (ulong)(outputSize - 128));
+                data.AddRange(raw[128..]);
+            }
+            else
+            {
+                // Main section: everything after the tag table, copied literally.
+                int bodyLen = outputSize - bodyStart;
+                if (bodyLen > 0)
+                {
+                    commands.Add(1);
+                    WriteVarint(commands, (ulong)bodyLen);
+                    data.AddRange(raw[bodyStart..]);
+                }
+            }
         }
 
         var stream = new List<byte>();
@@ -542,6 +588,77 @@ internal static class JxlIcc
         stream.AddRange(data);
         return stream.ToArray();
     }
+
+    // Encodes the ICC tag table (raw bytes 128..) as decode_icc tag commands. Returns false (leaving commands/
+    // data untouched enough for the caller to reset) if the table is malformed or uses the auto-expanding tag
+    // layout we don't emit. On success, `dataBodyStart` is set to the first byte after the tag table.
+    private static bool TryEncodeTagTable(byte[] raw, int outputSize, List<byte> commands, List<byte> data, ref int dataBodyStart)
+    {
+        if (outputSize < 132)
+        {
+            return false;
+        }
+
+        uint numTags = ReadBE(raw, 128);
+        long tableEnd = 132L + ((long)numTags * 12);
+        if (numTags == 0 || numTags > (outputSize - 128) / 12 || tableEnd > outputSize)
+        {
+            return false;
+        }
+
+        int cmdMark = commands.Count;
+        int dataMark = data.Count;
+
+        WriteVarint(commands, numTags + 1u);
+        uint prevStart = (numTags * 12) + 128;
+        uint prevSize = 0;
+        for (int t = 0; t < numTags; t++)
+        {
+            int e = 132 + (t * 12);
+            var sig = raw[e..(e + 4)];
+            uint tagstart = ReadBE(raw, e + 4);
+            uint tagsize = ReadBE(raw, e + 8);
+            if ((long)tagstart + tagsize > outputSize)
+            {
+                commands.RemoveRange(cmdMark, commands.Count - cmdMark); // malformed entry -> abandon
+                data.RemoveRange(dataMark, data.Count - dataMark);
+                return false;
+            }
+
+            byte? common = CommonTagCode(sig);
+            byte tagcode = common ?? (byte)1;
+
+            bool startExplicit = tagstart != prevStart + prevSize;
+            uint defaultSize = IsXyzTag(sig) ? 20u : prevSize;
+            bool sizeExplicit = tagsize != defaultSize;
+
+            byte command = (byte)(tagcode | (startExplicit ? 64 : 0) | (sizeExplicit ? 128 : 0));
+            commands.Add(command);
+            if (common == null)
+            {
+                data.AddRange(sig); // tagcode 1: explicit 4-byte signature
+            }
+
+            if (startExplicit)
+            {
+                WriteVarint(commands, tagstart);
+            }
+
+            if (sizeExplicit)
+            {
+                WriteVarint(commands, tagsize);
+            }
+
+            prevStart = tagstart;
+            prevSize = tagsize;
+        }
+
+        commands.Add(0); // end of tag section
+        dataBodyStart = (int)tableEnd;
+        return true;
+    }
+
+    private static uint ReadBE(byte[] b, int o) => (uint)((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]);
 
     // ---- Entropy layer: the full ICC blob as it sits in the codestream ----
 
