@@ -61,10 +61,12 @@ public static class JxlCoder
 
     /// <summary>
     /// Encodes an image as a lossy JPEG XL codestream (XYB VarDCT). <paramref name="quality"/> is a
-    /// JPEG-style value in [1,100] (higher = better). Any positive size is supported: the frame is tiled
-    /// into 2048x2048 LF groups and 256px coding groups.
+    /// JPEG-style value in [1,100] (higher = better). <paramref name="effort"/> in [1,9] trades speed for
+    /// quality/size (1-3 = fast single-pass at any size; 7 = default; higher runs more SSIMULACRA2-guided
+    /// block-refinement roundtrips over a larger pixel budget). Any positive size is supported: the frame is
+    /// tiled into 2048x2048 LF groups and 256px coding groups.
     /// </summary>
-    public static byte[] EncodeLossy(ImageFrame image, int quality = 75)
+    public static byte[] EncodeLossy(ImageFrame image, int quality = 75, int effort = 7)
     {
         if (!Jxl.JxlEncoder.CanEncodeVarDct(image))
         {
@@ -72,17 +74,31 @@ public static class JxlCoder
         }
 
         float distance = Jxl.JxlEncoder.DistanceFromQuality(quality);
+        effort = Math.Clamp(effort, 1, 9);
 
-        // The block-refined path runs several encode->decode->SSIMULACRA2 roundtrips to close the
-        // coarse-quant "cliff"; its cost scales with pixels, so cap it by megapixels and use the fast
-        // single-pass encoder above the cap. (A proper speed/effort dial is future work.)
-        const long BlockRefineMaxPixels = 2_000_000;
-        if ((long)image.Columns * image.Rows > BlockRefineMaxPixels)
+        // Effort/speed dial. The block-refined path runs several encode->decode->SSIMULACRA2 roundtrips to
+        // close the coarse-quant "cliff"; its cost scales with pixels x iterations, so higher effort buys
+        // more refinement iterations and a larger pixel budget below which it's used (single-pass above it,
+        // which is fast at any size). effort<=3 is always the fast single-pass path.
+        long pixels = (long)image.Columns * image.Rows;
+        long budget = effort switch
+        {
+            <= 3 => 0,
+            4 => 500_000,
+            5 => 1_000_000,
+            6 => 1_500_000,
+            7 => 2_000_000,   // default: block-refined up to ~2 MP (matches the prior default)
+            8 => 4_000_000,
+            _ => long.MaxValue,
+        };
+
+        if (pixels > budget)
         {
             return Jxl.JxlEncoder.EncodeVarDct(image, distance);
         }
 
-        return Jxl.JxlEncoder.EncodeVarDctBlockRefined(image, distance);
+        int iters = Math.Clamp(effort - 2, 2, 7); // effort 4 -> 2 refinement iterations, effort 9 -> 7
+        return Jxl.JxlEncoder.EncodeVarDctBlockRefined(image, distance, iters);
     }
 
     /// <summary>

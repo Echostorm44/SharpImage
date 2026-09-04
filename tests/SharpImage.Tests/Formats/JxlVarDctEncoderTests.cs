@@ -667,6 +667,41 @@ public class JxlVarDctEncoderTests
         await Assert.That(hi.Length).IsGreaterThan(lo.Length); // and costs more bytes
     }
 
+    // The effort dial (1-9): every level produces a valid, correctly-sized, decodable file at a given
+    // quality; effort<=3 is the fast single-pass path, higher levels add SSIMULACRA2 block-refinement.
+    [Test]
+    [Arguments(1)]
+    [Arguments(3)]
+    [Arguments(7)]
+    [Arguments(9)]
+    public async Task JxlCoder_EncodeLossy_Effort_Decodes(int effort)
+    {
+        const int w = 160, h = 160;
+        ImageFrame frame = TexturedFrame(w, h);
+        byte[] cs = SharpImage.Formats.JxlCoder.EncodeLossy(frame, quality: 75, effort: effort);
+        JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+        await Assert.That(r.Width).IsEqualTo(w);
+        await Assert.That(r.Height).IsEqualTo(h);
+
+        double mse = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    double d = Quantum.ScaleToByte(srow[(x * 3) + c]) - r.Channels[c].Px[(y * w) + x];
+                    mse += d * d;
+                }
+            }
+        }
+
+        mse /= 3.0 * w * h;
+        double psnr = mse <= 1e-9 ? 99.0 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        await Assert.That(psnr).IsGreaterThan(28.0);
+    }
+
     [Test]
     public async Task VarDctVariableBlocks_Dct16_RoundTrips()
     {
@@ -886,5 +921,116 @@ public class JxlVarDctEncoderTests
 
         Console.Error.WriteLine($"[VARDCT] DC-only decode PSNR={psnr:F2} dB, {cs.Length} bytes");
         await Assert.That(psnr).IsGreaterThan(22.0); // smooth gradient: block means track the source
+    }
+
+    // Deep-test driver: reads a P6 (RGB) or P7/PAM-ish binary via VARDCT_DEEP_SRC (actually a P6 PPM or a
+    // P6 + separate alpha via VARDCT_DEEP_ALPHA PGM), encodes lossless + lossy at several qualities, round-
+    // trips through our own decoder (lossless MUST be exact), and dumps each .jxl to VARDCT_DEEP_DIR for the
+    // external-decoder cross-check. Gated; driven over the whole corpus by scripts/deeptest.
+    [Test]
+    public async Task VarDct_DeepTest()
+    {
+        string src = Environment.GetEnvironmentVariable("VARDCT_DEEP_SRC");
+        string dir = Environment.GetEnvironmentVariable("VARDCT_DEEP_DIR");
+        if (string.IsNullOrEmpty(src) || string.IsNullOrEmpty(dir))
+        {
+            return;
+        }
+
+        byte[] raw = System.IO.File.ReadAllBytes(src);
+        int p = 0;
+        string Token()
+        {
+            while (p < raw.Length && (raw[p] == ' ' || raw[p] == '\n' || raw[p] == '\r' || raw[p] == '\t')) p++;
+            int s = p;
+            while (p < raw.Length && raw[p] != ' ' && raw[p] != '\n' && raw[p] != '\r' && raw[p] != '\t') p++;
+            return System.Text.Encoding.ASCII.GetString(raw, s, p - s);
+        }
+        Token(); // P6
+        int w = int.Parse(Token()), h = int.Parse(Token());
+        Token(); p++;
+        string alphaPath = Environment.GetEnvironmentVariable("VARDCT_DEEP_ALPHA");
+        bool hasAlpha = !string.IsNullOrEmpty(alphaPath) && System.IO.File.Exists(alphaPath);
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, hasAlpha);
+        int nch = frame.NumberOfChannels;
+        byte[]? ac = null;
+        if (hasAlpha)
+        {
+            byte[] araw = System.IO.File.ReadAllBytes(alphaPath!);
+            int ap = 0; // parse P5 header
+            string AT() { while (ap < araw.Length && (araw[ap] == ' ' || araw[ap] == '\n' || araw[ap] == '\r' || araw[ap] == '\t')) ap++; int s2 = ap; while (ap < araw.Length && araw[ap] != ' ' && araw[ap] != '\n' && araw[ap] != '\r' && araw[ap] != '\t') ap++; return System.Text.Encoding.ASCII.GetString(araw, s2, ap - s2); }
+            AT(); AT(); AT(); AT(); ap++;
+            ac = new byte[w * h];
+            Array.Copy(araw, ap, ac, 0, Math.Min(w * h, araw.Length - ap));
+        }
+
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * nch, ip = p + (((y * w) + x) * 3);
+                row[o] = Quantum.ScaleFromByte(raw[ip]);
+                row[o + 1] = Quantum.ScaleFromByte(raw[ip + 1]);
+                row[o + 2] = Quantum.ScaleFromByte(raw[ip + 2]);
+                if (hasAlpha) row[o + 3] = Quantum.ScaleFromByte(ac![(y * w) + x]);
+            }
+        }
+
+        double PsnrRgb(JxlModularResult r)
+        {
+            // The lossless path may emit a 1-channel grayscale file when the content is R==G==B (matches
+            // libjxl); compare each source colour channel to the decoded channel (gray replicates channel 0).
+            double mse = 0;
+            int rn = r.NumChannels;
+            for (int y = 0; y < h; y++)
+            {
+                var srow = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    for (int c = 0; c < 3; c++)
+                    {
+                        int dc = rn >= 3 ? c : 0;
+                        double d = Quantum.ScaleToByte(srow[(x * nch) + c]) - r.Channels[dc].Px[(y * w) + x];
+                        mse += d * d;
+                    }
+                }
+            }
+
+            mse /= 3.0 * w * h;
+            return mse <= 0 ? 999 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        }
+
+        var report = new System.Text.StringBuilder();
+        string name = System.IO.Path.GetFileNameWithoutExtension(src);
+
+        // Lossless: MUST round-trip exactly.
+        byte[] ll = SharpImage.Formats.JxlCoder.Encode(frame);
+        JxlModularResult llr = JxlFrame.DecodeModularCodestream(ll);
+        System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, $"{name}_lossless.jxl"), ll);
+        double llPsnr = PsnrRgb(llr);
+        report.AppendLine($"{name} {w}x{h} alpha={hasAlpha} lossless={ll.Length}B psnr={llPsnr:F1}");
+        await Assert.That(llr.Width).IsEqualTo(w);
+        await Assert.That(llPsnr).IsGreaterThan(80.0); // lossless => exact
+
+        // Lossy at several quality levels: round-trips, correct dims, monotone-ish quality.
+        foreach (int q in new[] { 90, 75, 50 })
+        {
+            byte[] cs = SharpImage.Formats.JxlCoder.EncodeLossy(frame, q);
+            JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, $"{name}_q{q}.jxl"), cs);
+            double ps = PsnrRgb(r);
+            report.AppendLine($"{name} q{q}={cs.Length}B psnr={ps:F1} ch={r.NumChannels}");
+            await Assert.That(r.Width).IsEqualTo(w);
+            await Assert.That(r.Height).IsEqualTo(h);
+            await Assert.That(ps).IsGreaterThan(20.0); // sane reconstruction
+            if (hasAlpha)
+            {
+                await Assert.That(r.HasAlpha).IsTrue();
+            }
+        }
+
+        System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "_deepreport.txt"), report.ToString());
     }
 }
