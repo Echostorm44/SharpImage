@@ -299,7 +299,8 @@ public class JxlVarDctEncoderTests
         float qlfNum = float.TryParse(Environment.GetEnvironmentVariable("VARDCT_QLF"), out float qn) ? qn : 90f;
         foreach (float d in new[] { 0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f })
         {
-            byte[] cs = mode == "refine" ? JxlEncoder.EncodeVarDctRefined(frame, d)
+            byte[] cs = mode == "block" ? JxlEncoder.EncodeVarDctBlockRefined(frame, d)
+                : mode == "refine" ? JxlEncoder.EncodeVarDctRefined(frame, d)
                 : mode == "perceptual" ? JxlEncoder.EncodeVarDct(frame, 8192u, (uint)Math.Clamp((int)MathF.Round(qlfNum / d), 1, 512), 1u, null, false, true, perceptual: true, distance: d)
                 : JxlEncoder.EncodeVarDct(frame, d);
             JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);

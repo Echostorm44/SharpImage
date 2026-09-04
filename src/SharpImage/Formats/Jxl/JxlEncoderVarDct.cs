@@ -251,6 +251,114 @@ internal static partial class JxlEncoder
         return bestCs;
     }
 
+    /// <summary>
+    /// The heuristic (default block-size selection) plus a roundtrip block-split refinement that removes the
+    /// coarse-quant cliff: large blocks flatten texture there, and MSE-based guards can't tell (a flattened
+    /// block has low MSE but reads far worse). Encode -> decode -> measure per-block SSIMULACRA2 distortion
+    /// -> split the worst large blocks to Dct8 -> re-encode; keep the best-scoring codestream (so it never
+    /// regresses below the plain heuristic).
+    /// </summary>
+    public static byte[] EncodeVarDctBlockRefined(ImageFrame image, float distance, int iters = 5, int[]? passShifts = null)
+    {
+        int w = (int)image.Columns, h = (int)image.Rows;
+        if (w > VarDctLfGroupDim || h > VarDctLfGroupDim)
+        {
+            throw new NotSupportedException("VarDCT encoder currently supports images up to 2048x2048 (one LF group).");
+        }
+
+        (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
+        int bw = (w + 7) / 8, bh = (h + 7) / 8, stride = bw * 8, strideH = bh * 8;
+        var fp = new VarDctFrameParams();
+        float[][] srgb0 = ExtractSrgb(image, w, h);
+        float[][] lin0 = ToLinear(srgb0, w, h);
+        float[][] xyb0 = PadToXyb(srgb0, w, h, stride, strideH, fp);
+        var dm = DequantMatrixSet.Default();
+
+        // Start from the heuristic's own layout, then split badly-reconstructed large blocks.
+        int[] layout = BuildDctLayout(xyb0, stride, dm, gs, null!, hfm, false, fp, bw, bh, true);
+
+        byte[] bestCs = null!;
+        double bestScore = double.NegativeInfinity;
+        for (int it = 0; it <= iters; it++)
+        {
+            byte[] cs = EncodeVarDct(image, gs, qlf, hfm, passShifts, false, true, perceptual: false, distance: distance, quantFieldOverride: null, layoutOverride: layout);
+            JxlModularResult dec = JxlFrame.DecodeModularCodestream(cs);
+            float[][] linDec = DecodedToLinear(dec, w, h);
+            var (score, dist) = JxlEncoderSsimulacra.Compute(lin0, linDec, w, h, bw, bh, fp);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestCs = cs;
+            }
+
+            if (it == iters)
+            {
+                break;
+            }
+
+            // Only split blocks that are clearly worse than the image norm — a large block reconstructing a
+            // flat region well (low distortion, e.g. all of a smooth gradient) must be left intact so the
+            // large-block win on smooth/graphic content is preserved. Threshold = 2x the median tile distortion.
+            var sortedDist = (double[])dist.Clone();
+            Array.Sort(sortedDist);
+            double medDist = sortedDist[sortedDist.Length / 2];
+            double splitThreshold = 2.0 * medDist;
+
+            // Rank the current large blocks by per-pixel SSIMULACRA2 distortion; split the worst that remain.
+            var large = new List<(double DistPP, int Pos, int Dw, int Dh)>();
+            for (int by = 0; by < bh; by++)
+            {
+                for (int bx = 0; bx < bw; bx++)
+                {
+                    int pos = (by * bw) + bx;
+                    if (layout[pos] <= (int)TransformType.Dct8)
+                    {
+                        continue; // Dct8 or covered
+                    }
+
+                    var (qdw, qdh) = JxlDct.DctSelectSize((TransformType)layout[pos]);
+                    double sum = 0;
+                    for (int dy = 0; dy < qdh; dy++)
+                    {
+                        for (int dx = 0; dx < qdw; dx++)
+                        {
+                            sum += dist[((by + dy) * bw) + bx + dx];
+                        }
+                    }
+
+                    double avg = sum / (qdw * qdh);
+                    if (avg > splitThreshold)
+                    {
+                        large.Add((avg, pos, qdw, qdh));
+                    }
+                }
+            }
+
+            if (large.Count == 0)
+            {
+                break; // nothing left to split
+            }
+
+            // Split the worst third of remaining large blocks (progressive; keep-best guards regressions).
+            large.Sort((a, b) => b.DistPP.CompareTo(a.DistPP));
+            int nSplit = Math.Max(1, large.Count / 3);
+            for (int i = 0; i < nSplit; i++)
+            {
+                var (_, pos, qdw, qdh) = large[i];
+                int bx = pos % bw, by = pos / bw;
+                for (int dy = 0; dy < qdh; dy++)
+                {
+                    for (int dx = 0; dx < qdw; dx++)
+                    {
+                        layout[((by + dy) * bw) + bx + dx] = (int)TransformType.Dct8;
+                    }
+                }
+            }
+        }
+
+        return bestCs;
+    }
+
     // sRGB [0,1] planes -> linear RGB planes (w*h), for the SSIMULACRA2 metric.
     private static float[][] ToLinear(float[][] srgb, int w, int h)
     {

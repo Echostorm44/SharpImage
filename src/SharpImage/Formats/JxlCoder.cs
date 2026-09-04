@@ -72,7 +72,7 @@ public static class JxlCoder
         }
 
         float distance = Jxl.JxlEncoder.DistanceFromQuality(quality);
-        return Jxl.JxlEncoder.EncodeVarDct(image, distance);
+        return Jxl.JxlEncoder.EncodeVarDctBlockRefined(image, distance);
     }
 
     private static ImageFrame BuildFrame(Jxl.JxlModularResult r)
