@@ -1037,6 +1037,129 @@ public class JxlVarDctEncoderTests
         }
     }
 
+    // ICC transform layer: EncodeTransform -> DecodeTransform reproduces a raw ICC profile byte-exact, and
+    // DecodeTransform reads real profiles compressed by the reference (the jxl-color test corpus / Windows
+    // profiles), when VARDCT_ICC_DIR points at a directory of *.icc/*.icm files.
+    [Test]
+    public async Task Jxl_Icc_TransformRoundTrips()
+    {
+        string dir = Environment.GetEnvironmentVariable("VARDCT_ICC_DIR") ?? "";
+        var profiles = new System.Collections.Generic.List<byte[]>();
+        if (!string.IsNullOrEmpty(dir) && System.IO.Directory.Exists(dir))
+        {
+            foreach (string f in System.IO.Directory.GetFiles(dir))
+            {
+                string ext = System.IO.Path.GetExtension(f).ToLowerInvariant();
+                if (ext == ".icc" || ext == ".icm")
+                {
+                    profiles.Add(System.IO.File.ReadAllBytes(f));
+                }
+            }
+        }
+
+        // Always include a couple of synthetic "profiles" (arbitrary bytes with a plausible header) so the
+        // test self-checks even without the corpus.
+        var rnd = new Random(7);
+        foreach (int n in new[] { 60, 300, 940, 3000 })
+        {
+            var p = new byte[n];
+            rnd.NextBytes(p);
+            p[0] = (byte)(n >> 24); p[1] = (byte)(n >> 16); p[2] = (byte)(n >> 8); p[3] = (byte)n; // size
+            System.Text.Encoding.ASCII.GetBytes("mntrRGB XYZ ").CopyTo(p, 12);
+            System.Text.Encoding.ASCII.GetBytes("acsp").CopyTo(p, 36);
+            profiles.Add(p);
+        }
+
+        foreach (byte[] raw in profiles)
+        {
+            byte[] enc = JxlIcc.EncodeTransform(raw);
+            byte[] dec = JxlIcc.DecodeTransform(enc);
+            await Assert.That(dec.Length).IsEqualTo(raw.Length);
+            await Assert.That(dec.AsSpan().SequenceEqual(raw)).IsTrue();
+
+            // Full entropy layer: write the ICC blob to a bitstream, read it back.
+            var bw = new JxlBitWriter();
+            JxlIcc.EncodeStream(bw, raw);
+            byte[] blob = bw.ToArray();
+            var br = new JxlBitReader(blob);
+            byte[] round = JxlIcc.DecodeStream(br);
+            await Assert.That(round.Length).IsEqualTo(raw.Length);
+            await Assert.That(round.AsSpan().SequenceEqual(raw)).IsTrue();
+        }
+    }
+
+    // End-to-end ICC: a lossless image carrying an embedded ICC profile round-trips through the full
+    // codestream (encode -> decode) with the profile bytes preserved exactly and the pixels bit-exact.
+    [Test]
+    public async Task Jxl_Icc_Embedded_RoundTrips()
+    {
+        const int w = 64, h = 48;
+        // A plausible ICC-shaped blob (real profiles are tested in Jxl_Icc_TransformRoundTrips; here we only
+        // need the codestream plumbing to preserve arbitrary profile bytes).
+        var rnd = new Random(11);
+        var icc = new byte[520];
+        rnd.NextBytes(icc);
+        icc[0] = (byte)(icc.Length >> 24); icc[1] = (byte)(icc.Length >> 16);
+        icc[2] = (byte)(icc.Length >> 8); icc[3] = (byte)icc.Length;
+        System.Text.Encoding.ASCII.GetBytes("mntrRGB XYZ ").CopyTo(icc, 12);
+        System.Text.Encoding.ASCII.GetBytes("acsp").CopyTo(icc, 36);
+
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        frame.IccProfile = icc;
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * 3;
+                row[o] = Quantum.ScaleFromByte((byte)(x * 4));
+                row[o + 1] = Quantum.ScaleFromByte((byte)(y * 5));
+                row[o + 2] = Quantum.ScaleFromByte((byte)(x + y));
+            }
+        }
+
+        byte[] cs = SharpImage.Formats.JxlCoder.Encode(frame);
+        ImageFrame dec = SharpImage.Formats.JxlCoder.Decode(cs);
+        await Assert.That(dec.IccProfile).IsNotNull();
+        await Assert.That(dec.IccProfile!.AsSpan().SequenceEqual(icc)).IsTrue();
+
+        bool pixelsMatch = true;
+        for (int y = 0; y < h && pixelsMatch; y++)
+        {
+            var a = frame.GetPixelRow(y);
+            var bb = dec.GetPixelRow(y);
+            for (int x = 0; x < w * 3; x++)
+            {
+                if (bb[x] != a[x])
+                {
+                    pixelsMatch = false;
+                    break;
+                }
+            }
+        }
+
+        await Assert.That(pixelsMatch).IsTrue();
+
+        string dir = Environment.GetEnvironmentVariable("VARDCT_ICC_DIR");
+        if (!string.IsNullOrEmpty(dir))
+        {
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "embedded.jxl"), cs);
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "embedded.icc"), icc);
+
+            // Also embed a REAL profile (so a reference decoder can colour-manage, not just extract).
+            string realIcc = System.IO.Path.Combine(dir, "srgb-rel.icc");
+            if (System.IO.File.Exists(realIcc))
+            {
+                frame.IccProfile = System.IO.File.ReadAllBytes(realIcc);
+                byte[] cs2 = SharpImage.Formats.JxlCoder.Encode(frame);
+                ImageFrame dec2 = SharpImage.Formats.JxlCoder.Decode(cs2);
+                await Assert.That(dec2.IccProfile!.AsSpan().SequenceEqual(frame.IccProfile)).IsTrue();
+                System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "embedded_real.jxl"), cs2);
+            }
+        }
+    }
+
     // Wide-gamut lossy (Display P3): the XYB transform converts P3<->sRGB primaries in linear light (JXL's
     // XYB is always sRGB-referred), so the file declares P3 and a P3-aware decoder recovers P3 colours.
     // Verified externally against jxl-oxide: decoding this file to *linear sRGB* (XYB's own reference space,

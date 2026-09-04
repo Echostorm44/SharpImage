@@ -35,6 +35,13 @@ public class ImageFrame : IDisposable
     public ColorspaceType Colorspace { get; set; } = ColorspaceType.SRGB;
 
     /// <summary>
+    /// Optional embedded ICC colour profile (raw bytes). When present, it is the authoritative colour
+    /// description and overrides <see cref="Colorspace"/>. Codecs that support it (e.g. JPEG XL) preserve it
+    /// on decode and re-embed it on encode.
+    /// </summary>
+    public byte[]? IccProfile { get; set; }
+
+    /// <summary>
     /// Direct (true color) or Pseudo (palette-indexed).
     /// </summary>
     public StorageClass StorageClass { get; set; } = StorageClass.Direct;

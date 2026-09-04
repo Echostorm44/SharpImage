@@ -167,6 +167,7 @@ public static class JxlCoder
         int h = r.Height;
         var frame = new ImageFrame();
         frame.Initialize(w, h, r.Colorspace, r.HasAlpha);
+        frame.IccProfile = r.IccProfile;
         int frameChannels = frame.NumberOfChannels;
         int nb = r.NumChannels;
 

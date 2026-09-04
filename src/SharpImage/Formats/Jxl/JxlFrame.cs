@@ -19,6 +19,7 @@ internal sealed class JxlModularResult
     public bool HasAlpha { get; init; }
     public int Bps { get; init; } = 8; // bits per sample of the decoded channel values
     public Core.ColorspaceType Colorspace { get; init; } = Core.ColorspaceType.SRGB;
+    public byte[]? IccProfile { get; init; }
 }
 
 internal static class JxlFrame
@@ -64,14 +65,15 @@ internal static class JxlFrame
         return (x / 1e6, y / 1e6);
     }
 
-    private static Core.ColorspaceType ReadColorEncoding(JxlBitReader br)
+    private static Core.ColorspaceType ReadColorEncoding(JxlBitReader br, out bool wantIcc)
     {
+        wantIcc = false;
         if (br.ReadBool())
         {
             return Core.ColorspaceType.SRGB; // all_default sRGB RGB
         }
 
-        bool wantIcc = br.ReadBool();
+        wantIcc = br.ReadBool();
         int cs = (int)br.ReadEnum(); // 0=RGB,1=Gray,2=XYB,3=Unknown
         int primaries = 1, transfer = 13;
         bool customIsAdobe = false;
@@ -225,6 +227,7 @@ internal static class JxlFrame
         public bool HaveAnimation;
         public uint TpsNum = 1, TpsDenom = 1, NumLoops;
         public Core.ColorspaceType Colorspace = Core.ColorspaceType.SRGB;
+        public byte[]? IccProfile;
     }
 
     private static Meta ReadImageMetadata(JxlBitReader br, int w, int h)
@@ -269,7 +272,7 @@ internal static class JxlFrame
         }
 
         md.Xyb = br.ReadBool();
-        md.Colorspace = ReadColorEncoding(br);
+        md.Colorspace = ReadColorEncoding(br, out bool wantIcc);
         md.Gray = md.Colorspace is Core.ColorspaceType.Gray or Core.ColorspaceType.LinearGray;
         if (extraFields)
         {
@@ -317,6 +320,14 @@ internal static class JxlFrame
                     br.ReadF16();
                 }
             }
+        }
+
+        // The embedded ICC profile (if any) follows the whole ImageMetadata bundle (after default_m), before
+        // the byte-align that precedes the frames (jxl-oxide try_init: ImageHeader::parse -> read_icc ->
+        // zero_pad_to_byte).
+        if (wantIcc)
+        {
+            md.IccProfile = JxlIcc.DecodeStream(br);
         }
 
         return md;
@@ -693,7 +704,7 @@ internal static class JxlFrame
                 vc.Add(a);
             }
 
-            return new JxlModularResult { Width = w, Height = h, NumChannels = hasAlpha ? 4 : 3, Channels = vc, Gray = false, HasAlpha = hasAlpha, Bps = md.Bps, Colorspace = md.Colorspace };
+            return new JxlModularResult { Width = w, Height = h, NumChannels = hasAlpha ? 4 : 3, Channels = vc, Gray = false, HasAlpha = hasAlpha, Bps = md.Bps, Colorspace = md.Colorspace, IccProfile = md.IccProfile };
         }
 
         int nbChans = (md.Gray ? 1 : 3) + md.Extra; // colour channels + extra channels (e.g. alpha)
@@ -719,6 +730,7 @@ internal static class JxlFrame
             Bps = md.Bps,
             HasAlpha = md.Extra > 0,
             Colorspace = md.Colorspace,
+            IccProfile = md.IccProfile,
         };
     }
 
