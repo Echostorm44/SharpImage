@@ -923,6 +923,55 @@ public class JxlVarDctEncoderTests
         await Assert.That(psnr).IsGreaterThan(22.0); // smooth gradient: block means track the source
     }
 
+    // Wide-gamut lossless: a Display P3 image is stored losslessly and declared as P3 in the metadata (pixels
+    // as-is, no conversion) and the decoder surfaces the colorspace. Verified in jxl-oxide/libjxl (VARDCT_P3_DIR).
+    [Test]
+    [Arguments(ColorspaceType.DisplayP3)]
+    [Arguments(ColorspaceType.ScRGB)]
+    public async Task Jxl_Lossless_WideGamut_RoundTrips(ColorspaceType space)
+    {
+        const int w = 96, h = 96;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, space, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * 3;
+                row[o] = Quantum.ScaleFromByte((byte)(x * 2 + 20));
+                row[o + 1] = Quantum.ScaleFromByte((byte)(y * 2 + 10));
+                row[o + 2] = Quantum.ScaleFromByte((byte)((x + y) & 0xFF));
+            }
+        }
+
+        byte[] cs = SharpImage.Formats.JxlCoder.Encode(frame);
+        JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+        await Assert.That(r.Colorspace).IsEqualTo(space); // colorspace declaration round-trips
+
+        // Bit-exact (pixels stored as-is, losslessly).
+        long e2 = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    e2 += Math.Abs((int)Quantum.ScaleToByte(srow[(x * 3) + c]) - r.Channels[c].Px[(y * w) + x]);
+                }
+            }
+        }
+
+        await Assert.That(e2).IsEqualTo(0L);
+
+        string dir = Environment.GetEnvironmentVariable("VARDCT_P3_DIR");
+        if (!string.IsNullOrEmpty(dir))
+        {
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, $"wg_{space}.jxl"), cs);
+        }
+    }
+
     // Animation: a multi-frame ImageSequence encodes to one multi-frame JXL codestream. Verified as a valid
     // animation (multiple frames) in jxl-oxide + libjxl when VARDCT_ANIM_DIR is set.
     [Test]

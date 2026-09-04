@@ -151,7 +151,7 @@ public static class JxlCoder
         int w = r.Width;
         int h = r.Height;
         var frame = new ImageFrame();
-        frame.Initialize(w, h, ColorspaceType.SRGB, r.HasAlpha);
+        frame.Initialize(w, h, r.Colorspace, r.HasAlpha);
         int frameChannels = frame.NumberOfChannels;
         int nb = r.NumChannels;
 

@@ -18,6 +18,7 @@ internal sealed class JxlModularResult
     public bool Gray { get; init; }
     public bool HasAlpha { get; init; }
     public int Bps { get; init; } = 8; // bits per sample of the decoded channel values
+    public Core.ColorspaceType Colorspace { get; init; } = Core.ColorspaceType.SRGB;
 }
 
 internal static class JxlFrame
@@ -62,16 +63,16 @@ internal static class JxlFrame
         br.ReadU32(E.BitsOff(19, 0), E.BitsOff(19, 524288), E.BitsOff(20, 1048576), E.BitsOff(21, 2097152));
     }
 
-    private static bool ReadColorEncoding(JxlBitReader br)
+    private static Core.ColorspaceType ReadColorEncoding(JxlBitReader br)
     {
-        // Returns isGray.
         if (br.ReadBool())
         {
-            return false; // all_default sRGB RGB
+            return Core.ColorspaceType.SRGB; // all_default sRGB RGB
         }
 
         bool wantIcc = br.ReadBool();
         int cs = (int)br.ReadEnum(); // 0=RGB,1=Gray,2=XYB,3=Unknown
+        int primaries = 1, transfer = 13;
         if (!wantIcc)
         {
             bool implicitWhite = cs == 2;
@@ -87,8 +88,8 @@ internal static class JxlFrame
             bool hasPrimaries = cs == 0;
             if (hasPrimaries)
             {
-                uint pr = br.ReadEnum();
-                if (pr == 2)
+                primaries = (int)br.ReadEnum();
+                if (primaries == 2)
                 {
                     ReadCustomXy(br);
                     ReadCustomXy(br);
@@ -106,14 +107,30 @@ internal static class JxlFrame
                 }
                 else
                 {
-                    br.ReadEnum();
+                    transfer = (int)br.ReadEnum();
                 }
             }
 
             br.ReadEnum(); // rendering intent
         }
 
-        return cs == 1;
+        // Map the parsed encoding to a ColorspaceType (best effort; ICC/custom fall back to sRGB/Gray).
+        if (cs == 1)
+        {
+            return transfer == 8 ? Core.ColorspaceType.LinearGray : Core.ColorspaceType.Gray;
+        }
+
+        if (!wantIcc && primaries == 11)
+        {
+            return Core.ColorspaceType.DisplayP3; // kP3
+        }
+
+        if (!wantIcc && transfer == 8)
+        {
+            return Core.ColorspaceType.ScRGB; // linear sRGB
+        }
+
+        return Core.ColorspaceType.SRGB;
     }
 
     private static void ReadToneMapping(JxlBitReader br)
@@ -195,6 +212,7 @@ internal static class JxlFrame
         public bool Xyb = true, Gray;
         public bool HaveAnimation;
         public uint TpsNum = 1, TpsDenom = 1, NumLoops;
+        public Core.ColorspaceType Colorspace = Core.ColorspaceType.SRGB;
     }
 
     private static Meta ReadImageMetadata(JxlBitReader br, int w, int h)
@@ -239,7 +257,8 @@ internal static class JxlFrame
         }
 
         md.Xyb = br.ReadBool();
-        md.Gray = ReadColorEncoding(br);
+        md.Colorspace = ReadColorEncoding(br);
+        md.Gray = md.Colorspace is Core.ColorspaceType.Gray or Core.ColorspaceType.LinearGray;
         if (extraFields)
         {
             ReadToneMapping(br);
@@ -661,7 +680,7 @@ internal static class JxlFrame
                 vc.Add(a);
             }
 
-            return new JxlModularResult { Width = w, Height = h, NumChannels = hasAlpha ? 4 : 3, Channels = vc, Gray = false, HasAlpha = hasAlpha, Bps = md.Bps };
+            return new JxlModularResult { Width = w, Height = h, NumChannels = hasAlpha ? 4 : 3, Channels = vc, Gray = false, HasAlpha = hasAlpha, Bps = md.Bps, Colorspace = md.Colorspace };
         }
 
         int nbChans = (md.Gray ? 1 : 3) + md.Extra; // colour channels + extra channels (e.g. alpha)
@@ -686,6 +705,7 @@ internal static class JxlFrame
             Gray = md.Gray,
             Bps = md.Bps,
             HasAlpha = md.Extra > 0,
+            Colorspace = md.Colorspace,
         };
     }
 

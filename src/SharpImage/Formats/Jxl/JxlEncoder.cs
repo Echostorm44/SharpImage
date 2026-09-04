@@ -106,16 +106,17 @@ internal static partial class JxlEncoder
         // byte); larger grayscale images just take the 1-channel form (skips a redundant full encode).
         // Alpha images take the colour (RGBA) path so the decoded result is [R,G,B,A]; grayscale-with-alpha
         // is rare and the extra colour channels cost little.
+        Core.ColorspaceType colorspace = image.Colorspace;
         bool gray = alpha == null && IsGrayscale(r, g, b, w * h);
         if (!gray)
         {
-            return EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha);
+            return EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha, colorspace);
         }
 
-        byte[] grayCs = EncodeCore(r, g, b, w, h, nb, gray: true, bits, alpha);
+        byte[] grayCs = EncodeCore(r, g, b, w, h, nb, gray: true, bits, alpha, colorspace);
         if (w <= GroupDim && h <= GroupDim && alpha == null)
         {
-            byte[] rgbCs = EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha);
+            byte[] rgbCs = EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha, colorspace);
             if (rgbCs.Length < grayCs.Length)
             {
                 return rgbCs;
@@ -209,10 +210,10 @@ internal static partial class JxlEncoder
         return (r, g, b, alpha);
     }
 
-    private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8, int[]? alpha = null)
+    private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8, int[]? alpha = null, Core.ColorspaceType colorspace = Core.ColorspaceType.SRGB)
     {
         var (sections, shift) = EncodeCoreSections(r, g, b, w, h, nb, gray, bits, alpha);
-        return AssembleCodestream(w, h, shift, sections, gray, bits, alpha != null ? 1 : 0);
+        return AssembleCodestream(w, h, shift, sections, gray, bits, alpha != null ? 1 : 0, colorspace);
     }
 
     // Returns the frame's Modular sections + the group-size shift (the caller assembles them into a single-
@@ -321,13 +322,13 @@ internal static partial class JxlEncoder
     /// <summary>A modular channel to encode: pixel data with its own dimensions.</summary>
     private readonly record struct EncChannel(int[] Data, int W, int H);
 
-    private static byte[] AssembleCodestream(int w, int h, int shift, byte[][] sections, bool gray = false, int bits = 8, int numExtra = 0)
+    private static byte[] AssembleCodestream(int w, int h, int shift, byte[][] sections, bool gray = false, int bits = 8, int numExtra = 0, Core.ColorspaceType colorspace = Core.ColorspaceType.SRGB)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
         main.WriteBits(0x0A, 8);
         WriteSizeHeader(main, w, h);
-        WriteImageMetadata(main, gray, bits, numExtra);
+        WriteImageMetadata(main, gray, bits, numExtra, colorspace: colorspace);
         main.JumpToByteBoundary();
         WriteFrameBody(main, shift, sections, numExtra, isLast: true, durationTicks: 0);
         return main.ToArray();
@@ -378,7 +379,7 @@ internal static partial class JxlEncoder
         w.WriteU32((uint)width, E.BitsOff(9, 1), E.BitsOff(13, 1), E.BitsOff(18, 1), E.BitsOff(30, 1));
     }
 
-    private static void WriteImageMetadata(JxlBitWriter w, bool gray, int bits = 8, int numExtra = 0, bool animation = false, uint numLoops = 0)
+    private static void WriteImageMetadata(JxlBitWriter w, bool gray, int bits = 8, int numExtra = 0, bool animation = false, uint numLoops = 0, Core.ColorspaceType colorspace = Core.ColorspaceType.SRGB)
     {
         w.WriteBool(false); // not all_default
         w.WriteBool(animation); // extra_fields (only needed to carry animation)
@@ -421,22 +422,7 @@ internal static partial class JxlEncoder
         }
 
         w.WriteBool(false); // xyb_encoded = false
-        if (gray)
-        {
-            // Explicit sRGB-grayscale colour encoding (all_default is RGB). ColorSpace kGray = 1,
-            // WhitePoint kD65 = 1, TransferFunction kSRGB = 13, RenderingIntent kRelative = 0.
-            w.WriteBool(false); // colour encoding: not all_default
-            w.WriteBool(false); // want_icc = false
-            w.WriteEnum(1);     // color_space = kGray
-            w.WriteEnum(1);     // white_point = kD65
-            w.WriteBool(false); // transfer function: have_gamma = false
-            w.WriteEnum(13);    // transfer_function = kSRGB
-            w.WriteEnum(0);     // rendering_intent = kRelative
-        }
-        else
-        {
-            w.WriteBool(true);  // colour encoding: all_default (sRGB RGB)
-        }
+        WriteColourEncoding(w, gray, colorspace);
 
         if (animation)
         {
@@ -445,6 +431,37 @@ internal static partial class JxlEncoder
 
         w.WriteU64(0);      // extensions = none
         w.WriteBool(true);  // default_m (skip opsin / upsampling weights)
+    }
+
+    // Writes the colour encoding for a lossless (non-XYB) frame. sRGB is all_default; grayscale and the
+    // enum-representable wide-gamut spaces (Display P3, linear sRGB) are written explicitly so the pixels
+    // (stored as-is, losslessly) are declared in the right space. TransferFunction kSRGB=13, kLinear=8;
+    // WhitePoint kD65=1; Primaries kSRGB=1, kP3=11; ColorSpace kRGB=0, kGray=1; RenderingIntent kRelative=0.
+    private static void WriteColourEncoding(JxlBitWriter w, bool gray, Core.ColorspaceType colorspace)
+    {
+        bool linear = colorspace == Core.ColorspaceType.LinearGray || colorspace == Core.ColorspaceType.ScRGB;
+        int primaries = colorspace == Core.ColorspaceType.DisplayP3 ? 11 : 1; // kP3 else kSRGB
+        int transfer = linear ? 8 : 13; // kLinear else kSRGB
+
+        // sRGB RGB with the sRGB transfer is exactly all_default.
+        if (!gray && primaries == 1 && transfer == 13)
+        {
+            w.WriteBool(true); // all_default (sRGB RGB)
+            return;
+        }
+
+        w.WriteBool(false); // not all_default
+        w.WriteBool(false); // want_icc = false
+        w.WriteEnum((uint)(gray ? 1 : 0));   // color_space (kGray / kRGB)
+        w.WriteEnum(1);                       // white_point = kD65
+        if (!gray)
+        {
+            w.WriteEnum((uint)primaries);     // primaries (only present for RGB)
+        }
+
+        w.WriteBool(false);                   // transfer function: have_gamma = false
+        w.WriteEnum((uint)transfer);          // transfer_function
+        w.WriteEnum(0);                       // rendering_intent = kRelative
     }
 
     private static void WriteFrameHeader(JxlBitWriter w, int shift, int numExtra = 0, bool isLast = true, uint durationTicks = 0, bool animation = false)
