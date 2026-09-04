@@ -85,6 +85,27 @@ public static class JxlCoder
         return Jxl.JxlEncoder.EncodeVarDctBlockRefined(image, distance);
     }
 
+    /// <summary>
+    /// Decodes a possibly-truncated JPEG XL codestream into a best-effort preview. For a progressive /
+    /// multi-section VarDCT frame, any section not yet fully arrived is treated as zero (the guarantee is
+    /// section-granular — an ANS stream can't be safely decoded from a partial tail), so a prefix renders a
+    /// DC-only, then partial-pass, image that sharpens as whole sections arrive, and the complete buffer
+    /// reconstructs exactly. The signature, header and TOC must be present. A single-section (non-progressive)
+    /// frame can only be previewed once fully received.
+    /// </summary>
+    public static ImageFrame DecodePreview(byte[] partialData)
+    {
+        if (partialData.Length < 2 || partialData[0] != 0xFF || partialData[1] != 0x0A)
+        {
+            // Only bare codestreams (0xFF 0x0A) are supported for preview; a truncated container box header
+            // may not even locate the codestream.
+            throw new InvalidDataException("Preview decode requires a bare JPEG XL codestream (0xFF 0x0A).");
+        }
+
+        Jxl.JxlModularResult result = Jxl.JxlFrame.DecodeModularCodestream(partialData, allowTruncated: true);
+        return BuildFrame(result);
+    }
+
     private static ImageFrame BuildFrame(Jxl.JxlModularResult r)
     {
         int w = r.Width;

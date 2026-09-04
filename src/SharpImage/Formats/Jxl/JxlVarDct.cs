@@ -308,6 +308,29 @@ internal static class JxlVarDct
         return lg;
     }
 
+    // A not-yet-received LF group (truncated-preview decode): zero DC and an empty block grid, so its
+    // region reconstructs as blank. Dimensions match a real LF group so the assembly loops index safely.
+    private static LfGroupData EmptyLfGroup(int lfW, int lfH)
+    {
+        int w8 = (lfW + 7) / 8, h8 = (lfH + 7) / 8;
+        int cfW = (lfW + 63) / 64, cfH = (lfH + 63) / 64;
+        return new LfGroupData
+        {
+            LfW = w8,
+            LfH = h8,
+            Bw = w8,
+            Bh = h8,
+            LfQuant = new[] { new int[w8 * h8], new int[w8 * h8], new int[w8 * h8] },
+            BlockInfoGrid = new BlockInfo[w8 * h8], // all unoccupied => no data blocks
+            EpfSigma = new float[w8 * h8],
+            XFromY = new int[cfW * cfH],
+            BFromY = new int[cfW * cfH],
+            XFromYW = cfW,
+            XFromYH = cfH,
+            ExtraPrecision = 0,
+        };
+    }
+
     private static int NextPow2(int v)
     {
         int p = 1;
@@ -821,12 +844,23 @@ internal static class JxlVarDct
     }
 
     /// <summary>Decodes a VarDCT frame body. Sections are laid out per the TOC; returns 3 sRGB float channels [0,1].</summary>
-    public static float[][] Decode(byte[] data, int[] offsets, uint[] sizes, VarDctFrameParams fp, List<MaNode>? gTreeIn, JxlAnsCode? gCodeIn)
+    public static float[][] Decode(byte[] data, int[] offsets, uint[] sizes, VarDctFrameParams fp, List<MaNode>? gTreeIn, JxlAnsCode? gCodeIn, bool allowTruncated = false)
     {
         bool single = offsets.Length == 1;
         int w = fp.Width, h = fp.Height;
         int stride = ((w + 7) / 8) * 8; // rounded up to block
         int strideH = ((h + 7) / 8) * 8;
+
+        // A section is usable only if it is FULLY present in the buffer (an ANS stream can't be safely
+        // decoded from a partial tail). When allowTruncated is false every section is treated as present,
+        // so the strict decode path is byte-for-byte unchanged. When true, missing sections default to zero:
+        // absent HfGlobal / PassGroups => a DC-only (or partial-pass) preview, absent LfGroups => a blank
+        // region — the progressive/streaming semantics, at section granularity.
+        bool Avail(int idx) => !allowTruncated || (idx < offsets.Length && offsets[idx] + (long)sizes[idx] <= data.Length);
+        if (!Avail(0))
+        {
+            throw new InvalidOperationException("JPEG XL codestream is truncated before the first frame section (nothing to preview).");
+        }
 
         // Section reader helpers.
         JxlBitReader SectionReader(int idx) => new(data, offsets[idx]);
@@ -860,22 +894,36 @@ internal static class JxlVarDct
         int lfgPerRow = (w + lfGroupDim - 1) / lfGroupDim;
         for (int lg = 0; lg < fp.NumLf; lg++)
         {
-            JxlBitReader r = single ? lb : SectionReader(1 + lg);
             int gx = lg % lfgPerRow;
             int gy = lg / lfgPerRow;
             int lfW = Math.Min(lfGroupDim, w - (gx * lfGroupDim));
             int lfH = Math.Min(lfGroupDim, h - (gy * lfGroupDim));
-            lfGroups[lg] = ReadLfGroup(r, fp, lg, lfW, lfH, gTree, gCode, quant, lfDequant, hfCtx);
+            if (single || Avail(1 + lg))
+            {
+                JxlBitReader r = single ? lb : SectionReader(1 + lg);
+                lfGroups[lg] = ReadLfGroup(r, fp, lg, lfW, lfH, gTree, gCode, quant, lfDequant, hfCtx);
+            }
+            else
+            {
+                lfGroups[lg] = EmptyLfGroup(lfW, lfH); // not yet received: blank region
+            }
         }
 
-        // --- HfGlobal ---
-        JxlBitReader hb = single ? lb : SectionReader(1 + fp.NumLf);
-        DequantMatrixSet dm = DequantMatrixSet.Parse(hb, fp.BitDepth, fp.NumLf, gTree, gCode);
-        int numHfPresets = (int)hb.ReadBits(BitLength((uint)NextPow2(fp.NumGroups))) + 1;
-        var hfPasses = new HfPass[fp.NumPasses];
-        for (int p = 0; p < fp.NumPasses; p++)
+        // --- HfGlobal --- (absent under truncation => no AC at all, i.e. a DC-only preview)
+        bool hasAc = single || Avail(1 + fp.NumLf);
+        DequantMatrixSet dm = null!;
+        int numHfPresets = 1;
+        HfPass[] hfPasses = null!;
+        if (hasAc)
         {
-            hfPasses[p] = ReadHfPass(hb, hfCtx, numHfPresets);
+            JxlBitReader hb = single ? lb : SectionReader(1 + fp.NumLf);
+            dm = DequantMatrixSet.Parse(hb, fp.BitDepth, fp.NumLf, gTree, gCode);
+            numHfPresets = (int)hb.ReadBits(BitLength((uint)NextPow2(fp.NumGroups))) + 1;
+            hfPasses = new HfPass[fp.NumPasses];
+            for (int p = 0; p < fp.NumPasses; p++)
+            {
+                hfPasses[p] = ReadHfPass(hb, hfCtx, numHfPresets);
+            }
         }
 
         // --- Build LF (DC) images per LF group, dequant + CfL + adaptive smoothing ---
@@ -949,17 +997,29 @@ internal static class JxlVarDct
             // NOTE: block_info for the group is a subgrid of the LF group; for single-group frames it's the whole thing.
             var groupLg = SubLfGroup(lg, fp, grp);
 
-            for (int p = 0; p < fp.NumPasses; p++)
+            if (hasAc)
             {
-                JxlBitReader pb = single ? lb : SectionReader(2 + fp.NumLf + (p * fp.NumGroups) + grp);
-                int passShift = p < fp.PassShift.Length ? fp.PassShift[p] : 0;
-                WriteHfCoeff(pb, fp, hfCtx, hfPasses[p], groupLg, numHfPresets, coeff, gStride, passShift);
+                // Decode every pass whose PassGroup section is present; missing passes leave their coeff
+                // contribution at zero (a partial-pass preview). coeff stays all-zero for a group whose
+                // sections haven't arrived => TransformGroup renders its DC only.
+                for (int p = 0; p < fp.NumPasses; p++)
+                {
+                    int sectionIdx = 2 + fp.NumLf + (p * fp.NumGroups) + grp;
+                    if (!single && !Avail(sectionIdx))
+                    {
+                        continue;
+                    }
+
+                    JxlBitReader pb = single ? lb : SectionReader(sectionIdx);
+                    int passShift = p < fp.PassShift.Length ? fp.PassShift[p] : 0;
+                    WriteHfCoeff(pb, fp, hfCtx, hfPasses[p], groupLg, numHfPresets, coeff, gStride, passShift);
+                }
+
+                DequantHf(fp, hfCtx, dm, quant, groupLg, coeff, gStride);
+                ChromaFromLumaHf(coeff, gStride, gStride, gH, groupLg, corr);
             }
 
-            DequantHf(fp, hfCtx, dm, quant, groupLg, coeff, gStride);
-            ChromaFromLumaHf(coeff, gStride, gStride, gH, groupLg, corr);
-
-            // transform each varblock adding LF DC, write into outXyb.
+            // transform each varblock adding LF DC, write into outXyb (DC-only when coeff is all zero).
             TransformGroup(coeff, gStride, groupLg, lfXyb, lfFullW, gx, gy, fp, outXyb, stride);
         }
 

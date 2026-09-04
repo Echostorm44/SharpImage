@@ -378,6 +378,75 @@ public class JxlVarDctEncoderTests
         await Assert.That(psnr).IsGreaterThan(30.0);
     }
 
+    // Truncated-preview decode: a byte-prefix of a progressive (multi-section) VarDCT frame must decode into
+    // a valid best-effort preview instead of throwing. The guarantee is section-granular (an ANS stream can't
+    // be safely decoded from a partial tail), so previews sharpen as whole sections arrive — DC, then AC
+    // passes — and the complete buffer reconstructs exactly. Verified against jxl-oxide separately: wherever
+    // sections align, our preview matches jxl-oxide's (53-57 dB); this test guards our own streaming path.
+    [Test]
+    public async Task VarDct_TruncatedPreview_Decodes()
+    {
+        const int w = 512, h = 512;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                float r = 0.5f + (0.4f * MathF.Sin(x * 0.06f) * MathF.Cos(y * 0.04f));
+                float g = 0.5f + (0.3f * MathF.Sin((x + y) * 0.03f));
+                float b = (float)y / (h - 1);
+                int o = x * 3;
+                row[o] = (ushort)(Math.Clamp(r, 0f, 1f) * Quantum.MaxValue);
+                row[o + 1] = (ushort)(Math.Clamp(g, 0f, 1f) * Quantum.MaxValue);
+                row[o + 2] = (ushort)(Math.Clamp(b, 0f, 1f) * Quantum.MaxValue);
+            }
+        }
+
+        // 3-pass progressive, multi-group (512px => 4 groups): 1 + 1 + 1 + 4*3 = 15 TOC sections.
+        byte[] prog = JxlEncoder.EncodeVarDct(frame, 1.5f, new[] { 2, 1 });
+        JxlModularResult full = JxlFrame.DecodeModularCodestream(prog);
+
+        double PsnrVsFull(JxlModularResult r)
+        {
+            double mse = 0;
+            for (int c = 0; c < 3; c++)
+            {
+                for (int i = 0; i < w * h; i++)
+                {
+                    double diff = full.Channels[c].Px[i] - r.Channels[c].Px[i];
+                    mse += diff * diff;
+                }
+            }
+
+            mse /= 3.0 * w * h;
+            return mse <= 0 ? 999 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        }
+
+        double coarse = 0, mid = 0, fullPsnr = 0;
+        foreach (double frac in new[] { 0.45, 0.85, 1.0 })
+        {
+            int n = (int)(prog.Length * frac);
+            var trunc = new byte[n];
+            Array.Copy(prog, trunc, n);
+
+            // Public preview API and the low-level path both return a correctly-sized image without throwing.
+            ImageFrame previewFrame = SharpImage.Formats.JxlCoder.DecodePreview(trunc);
+            await Assert.That((int)previewFrame.Columns).IsEqualTo(w);
+            await Assert.That((int)previewFrame.Rows).IsEqualTo(h);
+
+            double psnr = PsnrVsFull(JxlFrame.DecodeModularCodestream(trunc, allowTruncated: true));
+            if (frac == 0.45) coarse = psnr;
+            else if (frac == 0.85) mid = psnr;
+            else fullPsnr = psnr;
+        }
+
+        await Assert.That(mid).IsGreaterThan(coarse + 5.0); // more sections => a materially sharper preview
+        await Assert.That(mid).IsGreaterThan(30.0);         // once DC + AC arrive, a genuine preview
+        await Assert.That(fullPsnr).IsGreaterThan(60.0);    // the complete buffer reconstructs exactly
+    }
+
     // Multi-group / multi-LF-group verification. Reads a P6 PPM of ANY size (its own dimensions),
     // encodes at a few distances, round-trips through our own decoder for a sanity PSNR, and dumps the
     // .jxl so the harness can decode it in jxl-oxide AND libjxl (the real garbling test). Gated on

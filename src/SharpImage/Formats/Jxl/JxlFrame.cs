@@ -535,8 +535,11 @@ internal static class JxlFrame
 
     private static int CeilDiv(int a, int b) => (a + b - 1) / b;
 
-    /// <summary>Decodes a single-frame lossless Modular codestream (signature already at offset 0).</summary>
-    public static JxlModularResult DecodeModularCodestream(byte[] cs)
+    /// <summary>Decodes a single-frame JPEG XL codestream (signature already at offset 0). When
+    /// <paramref name="allowTruncated"/> is set and the buffer is a prefix of a progressive/multi-section
+    /// VarDCT frame, sections that have not fully arrived are treated as zero — yielding a DC-only or
+    /// partial-pass preview instead of throwing (the header and TOC must still be present).</summary>
+    public static JxlModularResult DecodeModularCodestream(byte[] cs, bool allowTruncated = false)
     {
         if (cs.Length < 2 || cs[0] != 0xFF || cs[1] != 0x0A)
         {
@@ -610,7 +613,7 @@ internal static class JxlFrame
                 EpfPass2SigmaScale = fh.EpfPass2SigmaScale,
                 EpfBorderSadMul = fh.EpfBorderSadMul,
             };
-            float[][] rgb = JxlVarDct.Decode(cs, offsets, sizes, fp, null, null);
+            float[][] rgb = JxlVarDct.Decode(cs, offsets, sizes, fp, null, null, allowTruncated);
             var vc = new List<JxlChannel> { new(w, h), new(w, h), new(w, h) };
             for (int c = 0; c < 3; c++)
             {
