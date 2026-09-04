@@ -928,6 +928,7 @@ public class JxlVarDctEncoderTests
     [Test]
     [Arguments(ColorspaceType.DisplayP3)]
     [Arguments(ColorspaceType.ScRGB)]
+    [Arguments(ColorspaceType.Adobe98)]
     public async Task Jxl_Lossless_WideGamut_RoundTrips(ColorspaceType space)
     {
         const int w = 96, h = 96;

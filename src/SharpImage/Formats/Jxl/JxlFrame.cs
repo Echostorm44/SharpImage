@@ -57,10 +57,11 @@ internal static class JxlFrame
         return (b, (int)br.ReadBits(4) + 1);
     }
 
-    private static void ReadCustomXy(JxlBitReader br)
+    private static (double X, double Y) ReadCustomXy(JxlBitReader br)
     {
-        br.ReadU32(E.BitsOff(19, 0), E.BitsOff(19, 524288), E.BitsOff(20, 1048576), E.BitsOff(21, 2097152));
-        br.ReadU32(E.BitsOff(19, 0), E.BitsOff(19, 524288), E.BitsOff(20, 1048576), E.BitsOff(21, 2097152));
+        int x = JxlBits.UnpackSigned(br.ReadU32(E.BitsOff(19, 0), E.BitsOff(19, 524288), E.BitsOff(20, 1048576), E.BitsOff(21, 2097152)));
+        int y = JxlBits.UnpackSigned(br.ReadU32(E.BitsOff(19, 0), E.BitsOff(19, 524288), E.BitsOff(20, 1048576), E.BitsOff(21, 2097152)));
+        return (x / 1e6, y / 1e6);
     }
 
     private static Core.ColorspaceType ReadColorEncoding(JxlBitReader br)
@@ -73,6 +74,7 @@ internal static class JxlFrame
         bool wantIcc = br.ReadBool();
         int cs = (int)br.ReadEnum(); // 0=RGB,1=Gray,2=XYB,3=Unknown
         int primaries = 1, transfer = 13;
+        bool customIsAdobe = false;
         if (!wantIcc)
         {
             bool implicitWhite = cs == 2;
@@ -91,9 +93,14 @@ internal static class JxlFrame
                 primaries = (int)br.ReadEnum();
                 if (primaries == 2)
                 {
-                    ReadCustomXy(br);
-                    ReadCustomXy(br);
-                    ReadCustomXy(br);
+                    (double rx, double ry) = ReadCustomXy(br);
+                    ReadCustomXy(br); // green
+                    ReadCustomXy(br); // blue
+                    // Recognise Adobe RGB (1998) by its red primary (0.64, 0.33) so it round-trips.
+                    if (Math.Abs(rx - 0.64) < 0.01 && Math.Abs(ry - 0.33) < 0.01)
+                    {
+                        customIsAdobe = true;
+                    }
                 }
             }
 
@@ -118,6 +125,11 @@ internal static class JxlFrame
         if (cs == 1)
         {
             return transfer == 8 ? Core.ColorspaceType.LinearGray : Core.ColorspaceType.Gray;
+        }
+
+        if (!wantIcc && customIsAdobe)
+        {
+            return Core.ColorspaceType.Adobe98;
         }
 
         if (!wantIcc && primaries == 11)

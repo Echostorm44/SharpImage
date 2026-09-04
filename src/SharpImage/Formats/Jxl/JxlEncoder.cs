@@ -437,10 +437,14 @@ internal static partial class JxlEncoder
     // enum-representable wide-gamut spaces (Display P3, linear sRGB) are written explicitly so the pixels
     // (stored as-is, losslessly) are declared in the right space. TransferFunction kSRGB=13, kLinear=8;
     // WhitePoint kD65=1; Primaries kSRGB=1, kP3=11; ColorSpace kRGB=0, kGray=1; RenderingIntent kRelative=0.
+    // Adobe RGB (1998) primaries (x,y) — white D65, encoding gamma 563/256.
+    private static readonly double[] Adobe98Primaries = { 0.64, 0.33, 0.21, 0.71, 0.15, 0.06 };
+
     private static void WriteColourEncoding(JxlBitWriter w, bool gray, Core.ColorspaceType colorspace)
     {
         bool linear = colorspace == Core.ColorspaceType.LinearGray || colorspace == Core.ColorspaceType.ScRGB;
-        int primaries = colorspace == Core.ColorspaceType.DisplayP3 ? 11 : 1; // kP3 else kSRGB
+        bool adobe = colorspace == Core.ColorspaceType.Adobe98;
+        int primaries = colorspace == Core.ColorspaceType.DisplayP3 ? 11 : (adobe ? 2 : 1); // kP3 / kCustom / kSRGB
         int transfer = linear ? 8 : 13; // kLinear else kSRGB
 
         // sRGB RGB with the sRGB transfer is exactly all_default.
@@ -457,11 +461,35 @@ internal static partial class JxlEncoder
         if (!gray)
         {
             w.WriteEnum((uint)primaries);     // primaries (only present for RGB)
+            if (primaries == 2)               // kCustom => write the three (x,y) chromaticities
+            {
+                for (int i = 0; i < 6; i++)
+                {
+                    WriteCustomXy(w, Adobe98Primaries[i]);
+                }
+            }
         }
 
-        w.WriteBool(false);                   // transfer function: have_gamma = false
-        w.WriteEnum((uint)transfer);          // transfer_function
-        w.WriteEnum(0);                       // rendering_intent = kRelative
+        if (adobe)
+        {
+            w.WriteBool(true); // have_gamma
+            w.WriteBits((uint)Math.Round(1e7 / (563.0 / 256.0)), 24); // inverted encoding gamma (~4547069)
+        }
+        else
+        {
+            w.WriteBool(false);               // have_gamma = false
+            w.WriteEnum((uint)transfer);      // transfer_function
+        }
+
+        w.WriteEnum(0);                       // rendering_intent
+    }
+
+    // Chromaticity coordinate: PackSigned(round(xy * 1e6)) via the Customxy U32 encoding.
+    private static void WriteCustomXy(JxlBitWriter w, double xy)
+    {
+        int v = (int)Math.Round(xy * 1e6);
+        uint packed = (uint)((v << 1) ^ (v >> 31)); // PackSigned (zigzag)
+        w.WriteU32(packed, E.BitsOff(19, 0), E.BitsOff(19, 524288), E.BitsOff(20, 1048576), E.BitsOff(21, 2097152));
     }
 
     private static void WriteFrameHeader(JxlBitWriter w, int shift, int numExtra = 0, bool isLast = true, uint durationTicks = 0, bool animation = false)
