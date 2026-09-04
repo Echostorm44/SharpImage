@@ -908,6 +908,7 @@ internal static class JxlVarDct
         else if (extraGroupSplit)
         {
             JxlModular.SkipModularHeader(lb); // header-only; tiles filled in the PassGroup loop
+            lb.ReadBits(32);                  // empty ANS stream initial state (0 inline channels)
             for (int e = 0; e < fp.NumExtra; e++)
             {
                 extraOut![e] = new int[w * h];

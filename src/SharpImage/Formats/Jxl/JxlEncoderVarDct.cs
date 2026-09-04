@@ -2267,11 +2267,16 @@ internal static partial class JxlEncoder
 
     // GlobalModular header for a modular image whose channels are all group-split (no data coded here): the
     // decoder reads the header to learn the channel exists, then reads its tiles from the per-group sections.
+    // A modular decoder still initialises its ANS reader (reads the 32-bit initial state) before finding no
+    // channels to decode, so emit the empty-stream state (the ANS signature) — matching the lossless
+    // multi-group path (BuildMultiGroupWithTree). Without it, libjxl is lenient but jxl-oxide reads past the
+    // section and fails ("unexpected end of file").
     private static void WriteSubModularHeaderOnly(JxlBitWriter body, int wpMode)
     {
         body.WriteBool(true);            // use_global_tree = true
         WriteWpHeaderBits(body, wpMode);
         body.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0
+        body.WriteBits((uint)JxlBits.AnsSignature << 16, 32); // empty ANS stream (initial state, 0 symbols)
     }
 
     // Writes one modular sub-image that references the global tree + code (use_global_tree = true): the
