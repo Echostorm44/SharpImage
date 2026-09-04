@@ -108,6 +108,13 @@ public static class JxlCoder
             return Jxl.JxlEncoder.EncodeVarDct(image, distance, null, 16);
         }
 
+        // Wide-gamut (non-sRGB primaries): the XYB transform converts to/from sRGB primaries, but the
+        // block-refined roundtrip's SSIMULACRA2 metric assumes an sRGB pixel space, so use single-pass.
+        if (image.Colorspace != ColorspaceType.SRGB)
+        {
+            return Jxl.JxlEncoder.EncodeVarDct(image, distance);
+        }
+
         // Effort/speed dial. The block-refined path runs several encode->decode->SSIMULACRA2 roundtrips to
         // close the coarse-quant "cliff"; its cost scales with pixels x iterations, so higher effort buys
         // more refinement iterations and a larger pixel budget below which it's used (single-pass above it,

@@ -24,11 +24,20 @@ internal static class JxlVarDctEncoder
             xyb[c] = new float[len];
         }
 
+        float[]? pm = fp.PrimFwd; // target-linear -> sRGB-linear (null == sRGB, identity)
         for (int i = 0; i < len; i++)
         {
             float rl = SrgbToLinear(srgb[0][i]);
             float gl = SrgbToLinear(srgb[1][i]);
             float bl = SrgbToLinear(srgb[2][i]);
+
+            if (pm != null)
+            {
+                float rr = (pm[0] * rl) + (pm[1] * gl) + (pm[2] * bl);
+                float gg = (pm[3] * rl) + (pm[4] * gl) + (pm[5] * bl);
+                float bb = (pm[6] * rl) + (pm[7] * gl) + (pm[8] * bl);
+                rl = rr; gl = gg; bl = bb;
+            }
 
             float lms0 = (minv[0] * rl) + (minv[1] * gl) + (minv[2] * bl);
             float lms1 = (minv[3] * rl) + (minv[4] * gl) + (minv[5] * bl);

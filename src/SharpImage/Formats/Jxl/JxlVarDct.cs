@@ -25,6 +25,26 @@ internal sealed class VarDctFrameParams
     public float IntensityTarget = 255.0f;
     public bool SkipAdaptiveLfSmoothing;
 
+    // Wide-gamut: linear primaries conversion applied inside the XYB transform (target primaries are related
+    // to the opsin's sRGB reference by a 3x3 in LINEAR light, so it must sit between linearise and the opsin,
+    // where out-of-gamut values stay unclamped). null == sRGB primaries (identity). PrimFwd: target->sRGB
+    // (encode, before opsin); PrimInv: sRGB->target (decode, after inverse opsin).
+    public float[]? PrimFwd;
+    public float[]? PrimInv;
+
+    // Display P3 (D65) <-> sRGB (D65) linear matrices (row-major 3x3). Same white point => no adaptation.
+    public static readonly float[] P3ToSrgb = { 1.2249401f, -0.2249404f, 0f, -0.0420569f, 1.0420571f, 0f, -0.0196376f, -0.0786361f, 1.0982735f };
+    public static readonly float[] SrgbToP3 = { 0.8224621f, 0.1775380f, 0f, 0.0331941f, 0.9668058f, 0f, 0.0170827f, 0.0723974f, 0.9105199f };
+
+    public void SetPrimaries(Core.ColorspaceType space)
+    {
+        if (space == Core.ColorspaceType.DisplayP3)
+        {
+            PrimFwd = P3ToSrgb;
+            PrimInv = SrgbToP3;
+        }
+    }
+
     // Loop filters (defaults per JXL spec; apply for all_default frames).
     public bool GabEnabled = true;
     public float[][] GabWeights = { new[] { 0.115169525f, 0.061248592f }, new[] { 0.115169525f, 0.061248592f }, new[] { 0.115169525f, 0.061248592f } };
@@ -823,6 +843,16 @@ internal static class JxlVarDct
             float r = (m[0] * lms0) + (m[1] * lms1) + (m[2] * lms2);
             float g = (m[3] * lms0) + (m[4] * lms1) + (m[5] * lms2);
             float bl = (m[6] * lms0) + (m[7] * lms1) + (m[8] * lms2);
+
+            float[]? pm = fp.PrimInv; // sRGB-linear -> target-linear (null == sRGB, identity)
+            if (pm != null)
+            {
+                float r2 = (pm[0] * r) + (pm[1] * g) + (pm[2] * bl);
+                float g2 = (pm[3] * r) + (pm[4] * g) + (pm[5] * bl);
+                float b2 = (pm[6] * r) + (pm[7] * g) + (pm[8] * bl);
+                r = r2; g = g2; bl = b2;
+            }
+
             xyb[0][i] = LinearToSrgb(r);
             xyb[1][i] = LinearToSrgb(g);
             xyb[2][i] = LinearToSrgb(bl);

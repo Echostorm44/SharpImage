@@ -1037,6 +1037,91 @@ public class JxlVarDctEncoderTests
         }
     }
 
+    // Wide-gamut lossy (Display P3): the XYB transform converts P3<->sRGB primaries in linear light (JXL's
+    // XYB is always sRGB-referred), so the file declares P3 and a P3-aware decoder recovers P3 colours.
+    // Verified externally against jxl-oxide: decoding this file to *linear sRGB* (XYB's own reference space,
+    // via --target-colorspace tf=linear) matches source(P3)->sRGB-linear at 56.8 dB — the same agreement bar
+    // as an sRGB VarDCT file. (Comparing jxl-oxide's 8-bit *P3* PNG to raw source pixels reads far lower only
+    // because of jxl-oxide's display-side gamut mapping, not any codec loss.) Here we gate on our own P3
+    // round-trip + the P3 declaration; set VARDCT_P3L_DIR to re-dump the artifacts for the external check.
+    [Test]
+    public async Task VarDct_WideGamutLossy_P3()
+    {
+        const int w = 160, h = 160;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.DisplayP3, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * 3;
+                row[o] = Quantum.ScaleFromByte((byte)(x * 255 / (w - 1)));
+                row[o + 1] = Quantum.ScaleFromByte((byte)(y * 255 / (h - 1)));
+                row[o + 2] = Quantum.ScaleFromByte((byte)(200 - (x + y) * 100 / (w + h)));
+            }
+        }
+
+        byte[] cs = SharpImage.Formats.JxlCoder.EncodeLossy(frame, quality: 95, effort: 1);
+        JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+        await Assert.That(r.Colorspace).IsEqualTo(ColorspaceType.DisplayP3); // P3 declared + surfaced
+
+        // Our own round-trip: P3 in -> XYB -> P3 out reproduces the source within lossy tolerance.
+        double mse = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    double d = (int)Quantum.ScaleToByte(srow[(x * 3) + c]) - r.Channels[c].Px[(y * w) + x];
+                    mse += d * d;
+                }
+            }
+        }
+
+        mse /= 3.0 * w * h;
+        double psnr = mse <= 1e-9 ? 99 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        await Assert.That(psnr).IsGreaterThan(38.0); // high-quality lossy P3 round-trip
+
+        string dir = Environment.GetEnvironmentVariable("VARDCT_P3L_DIR");
+        if (!string.IsNullOrEmpty(dir))
+        {
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "p3lossy.jxl"), cs);
+            using (var od = new System.IO.FileStream(System.IO.Path.Combine(dir, "p3ourdec.ppm"), System.IO.FileMode.Create))
+            {
+                byte[] oh = System.Text.Encoding.ASCII.GetBytes($"P6\n{w} {h}\n255\n");
+                od.Write(oh, 0, oh.Length);
+                for (int y = 0; y < h; y++)
+                {
+                    for (int x = 0; x < w; x++)
+                    {
+                        for (int c = 0; c < 3; c++)
+                        {
+                            od.WriteByte((byte)Math.Clamp(r.Channels[c].Px[(y * w) + x], 0, 255));
+                        }
+                    }
+                }
+            }
+
+            using var ppm = new System.IO.FileStream(System.IO.Path.Combine(dir, "p3src.ppm"), System.IO.FileMode.Create);
+            byte[] hdr = System.Text.Encoding.ASCII.GetBytes($"P6\n{w} {h}\n255\n");
+            ppm.Write(hdr, 0, hdr.Length);
+            for (int y = 0; y < h; y++)
+            {
+                var srow = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    for (int c = 0; c < 3; c++)
+                    {
+                        ppm.WriteByte((byte)Quantum.ScaleToByte(srow[(x * 3) + c]));
+                    }
+                }
+            }
+        }
+    }
+
     // 16-bit lossy (opt-in): EncodeLossy(bits:16) declares 16-bit output and keeps full input precision, so a
     // smooth 16-bit gradient decodes at 16-bit (no 8-bit banding). Verified decodable in jxl-oxide + libjxl.
     [Test]

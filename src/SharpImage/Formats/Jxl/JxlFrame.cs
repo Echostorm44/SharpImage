@@ -668,6 +668,7 @@ internal static class JxlFrame
                 EpfBorderSadMul = fh.EpfBorderSadMul,
                 NumExtra = md.Extra,
             };
+            fp.SetPrimaries(md.Colorspace); // wide-gamut XYB target primaries (e.g. Display P3)
             float[][] rgb = JxlVarDct.Decode(cs, offsets, sizes, fp, null, null, out int[][]? extra, allowTruncated);
             int maxV = (1 << md.Bps) - 1; // honor the declared output depth (e.g. 16-bit XYB files)
             var vc = new List<JxlChannel> { new(w, h), new(w, h), new(w, h) };
