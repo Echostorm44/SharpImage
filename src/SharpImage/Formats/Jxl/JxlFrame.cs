@@ -17,6 +17,7 @@ internal sealed class JxlModularResult
     public List<JxlChannel> Channels { get; init; } = [];
     public bool Gray { get; init; }
     public bool HasAlpha { get; init; }
+    public int Bps { get; init; } = 8; // bits per sample of the decoded channel values
 }
 
 internal static class JxlFrame
@@ -637,7 +638,7 @@ internal static class JxlFrame
                 vc.Add(a);
             }
 
-            return new JxlModularResult { Width = w, Height = h, NumChannels = hasAlpha ? 4 : 3, Channels = vc, Gray = false, HasAlpha = hasAlpha };
+            return new JxlModularResult { Width = w, Height = h, NumChannels = hasAlpha ? 4 : 3, Channels = vc, Gray = false, HasAlpha = hasAlpha, Bps = md.Bps };
         }
 
         int nbChans = md.Gray ? 1 : 3;
@@ -660,6 +661,7 @@ internal static class JxlFrame
             NumChannels = nbChans,
             Channels = chans,
             Gray = md.Gray,
+            Bps = md.Bps,
         };
     }
 }

@@ -138,9 +138,10 @@ public static class JxlCoder
             {
                 int pix = (y * w) + x;
                 int off = x * frameChannels;
+                int maxV = (1 << r.Bps) - 1;
                 if (nb == 1)
                 {
-                    ushort g = Quantum.ScaleFromByte((byte)Math.Clamp(r.Channels[0].Px[pix], 0, 255));
+                    ushort g = Quantum.ScaleFromDepth((uint)Math.Clamp(r.Channels[0].Px[pix], 0, maxV), r.Bps);
                     row[off] = g;
                     if (frameChannels >= 3)
                     {
@@ -153,7 +154,7 @@ public static class JxlCoder
                     int m = Math.Min(nb, frameChannels);
                     for (int c = 0; c < m; c++)
                     {
-                        row[off + c] = Quantum.ScaleFromByte((byte)Math.Clamp(r.Channels[c].Px[pix], 0, 255));
+                        row[off + c] = Quantum.ScaleFromDepth((uint)Math.Clamp(r.Channels[c].Px[pix], 0, maxV), r.Bps);
                     }
                 }
             }

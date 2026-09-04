@@ -32,10 +32,36 @@ internal static partial class JxlEncoder
             throw new InvalidOperationException("Cannot encode an empty image.");
         }
 
-        // Extract raw 8-bit RGB (grayscale expanded to RGB).
+        // Extract RGB (grayscale expanded to RGB). Detect the actual precision so lossless stays lossless:
+        // 8-bit if every sample is 8-bit-representable (the common case, smaller files), else full 16-bit.
         int nb = 3;
-        int[] r = new int[w * h], g = new int[w * h], b = new int[w * h];
         int srcCh = image.NumberOfChannels;
+        bool is16 = false;
+        for (int y = 0; y < h && !is16; y++)
+        {
+            var row = image.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                int off = x * srcCh;
+                for (int c = 0; c < srcCh; c++)
+                {
+                    ushort q = row[off + c];
+                    if (Quantum.ScaleFromByte(Quantum.ScaleToByte(q)) != q)
+                    {
+                        is16 = true;
+                        break;
+                    }
+                }
+
+                if (is16)
+                {
+                    break;
+                }
+            }
+        }
+
+        int bits = is16 ? 16 : 8;
+        int[] r = new int[w * h], g = new int[w * h], b = new int[w * h];
         for (int y = 0; y < h; y++)
         {
             var row = image.GetPixelRow(y);
@@ -45,13 +71,13 @@ internal static partial class JxlEncoder
                 int p = (y * w) + x;
                 if (srcCh == 1)
                 {
-                    r[p] = g[p] = b[p] = Quantum.ScaleToByte(row[off]);
+                    r[p] = g[p] = b[p] = Quantum.ScaleToDepth(row[off], bits);
                 }
                 else
                 {
-                    r[p] = Quantum.ScaleToByte(row[off]);
-                    g[p] = Quantum.ScaleToByte(row[off + 1]);
-                    b[p] = Quantum.ScaleToByte(row[off + 2]);
+                    r[p] = Quantum.ScaleToDepth(row[off], bits);
+                    g[p] = Quantum.ScaleToDepth(row[off + 1], bits);
+                    b[p] = Quantum.ScaleToDepth(row[off + 2], bits);
                 }
             }
         }
@@ -63,13 +89,13 @@ internal static partial class JxlEncoder
         bool gray = IsGrayscale(r, g, b, w * h);
         if (!gray)
         {
-            return EncodeCore(r, g, b, w, h, nb, gray: false);
+            return EncodeCore(r, g, b, w, h, nb, gray: false, bits);
         }
 
-        byte[] grayCs = EncodeCore(r, g, b, w, h, nb, gray: true);
+        byte[] grayCs = EncodeCore(r, g, b, w, h, nb, gray: true, bits);
         if (w <= GroupDim && h <= GroupDim)
         {
-            byte[] rgbCs = EncodeCore(r, g, b, w, h, nb, gray: false);
+            byte[] rgbCs = EncodeCore(r, g, b, w, h, nb, gray: false, bits);
             if (rgbCs.Length < grayCs.Length)
             {
                 return rgbCs;
@@ -79,7 +105,7 @@ internal static partial class JxlEncoder
         return grayCs;
     }
 
-    private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray)
+    private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8)
     {
         int nbCh = gray ? 1 : nb;
 
@@ -111,7 +137,7 @@ internal static partial class JxlEncoder
                 }
             }
 
-            return AssembleCodestream(w, h, bestShift, bestSecs, gray);
+            return AssembleCodestream(w, h, bestShift, bestSecs, gray, bits);
         }
 
         int shift = SmallestShift(Math.Max(w, h));
@@ -153,7 +179,7 @@ internal static partial class JxlEncoder
             }
         }
 
-        return AssembleCodestream(w, h, shift, new[] { best }, gray);
+        return AssembleCodestream(w, h, shift, new[] { best }, gray, bits);
     }
 
     private static bool IsGrayscale(int[] r, int[] g, int[] b, int n)
@@ -172,13 +198,13 @@ internal static partial class JxlEncoder
     /// <summary>A modular channel to encode: pixel data with its own dimensions.</summary>
     private readonly record struct EncChannel(int[] Data, int W, int H);
 
-    private static byte[] AssembleCodestream(int w, int h, int shift, byte[][] sections, bool gray = false)
+    private static byte[] AssembleCodestream(int w, int h, int shift, byte[][] sections, bool gray = false, int bits = 8)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
         main.WriteBits(0x0A, 8);
         WriteSizeHeader(main, w, h);
-        WriteImageMetadata(main, gray);
+        WriteImageMetadata(main, gray, bits);
         main.JumpToByteBoundary();
         WriteFrameHeader(main, shift);
         main.WriteBool(false); // permuted TOC = false
@@ -223,13 +249,15 @@ internal static partial class JxlEncoder
         w.WriteU32((uint)width, E.BitsOff(9, 1), E.BitsOff(13, 1), E.BitsOff(18, 1), E.BitsOff(30, 1));
     }
 
-    private static void WriteImageMetadata(JxlBitWriter w, bool gray)
+    private static void WriteImageMetadata(JxlBitWriter w, bool gray, int bits = 8)
     {
         w.WriteBool(false); // not all_default
         w.WriteBool(false); // extra_fields = false
         w.WriteBool(false); // bit depth: not floating
-        w.WriteU32(8, E.Val(8), E.Val(10), E.Val(12), E.BitsOff(6, 1)); // 8 bits per sample
-        w.WriteBool(true);  // modular_16bit_buffer_sufficient
+        w.WriteU32((uint)bits, E.Val(8), E.Val(10), E.Val(12), E.BitsOff(6, 1)); // bits per sample
+        // 16-bit samples with the RCT + predictors exceed the 16-bit modular range, so the decoder needs a
+        // 32-bit working buffer; 8-bit content fits 16 bits.
+        w.WriteBool(bits <= 8);
         w.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(12, 1)); // num_extra_channels = 0
         w.WriteBool(false); // xyb_encoded = false
         if (gray)

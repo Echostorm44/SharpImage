@@ -923,6 +923,85 @@ public class JxlVarDctEncoderTests
         await Assert.That(psnr).IsGreaterThan(22.0); // smooth gradient: block means track the source
     }
 
+    // 16-bit lossless: genuine 16-bit content (samples not 8-bit-representable) must round-trip EXACTLY and
+    // the file must declare 16 bits/sample. Verified decodable in jxl-oxide + libjxl when VARDCT_16_DIR is set.
+    [Test]
+    public async Task Jxl_Lossless_16Bit_RoundTrips()
+    {
+        const int w = 96, h = 96;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * 3;
+                // 16-bit gradients with values that are NOT multiples of 257 (so not 8-bit-representable).
+                row[o] = (ushort)((x * 673) & 0xFFFF);
+                row[o + 1] = (ushort)((y * 701) & 0xFFFF);
+                row[o + 2] = (ushort)(((x + y) * 337 + 12345) & 0xFFFF);
+            }
+        }
+
+        byte[] cs = SharpImage.Formats.JxlCoder.Encode(frame);
+        JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+        await Assert.That(r.Bps).IsEqualTo(16);         // encoder detected + declared 16-bit
+        await Assert.That(r.Width).IsEqualTo(w);
+
+        long err = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    err += Math.Abs((int)srow[(x * 3) + c] - r.Channels[c].Px[(y * w) + x]);
+                }
+            }
+        }
+
+        await Assert.That(err).IsEqualTo(0L);           // 16-bit lossless => bit-exact
+
+        // And the full ImageFrame round-trip via JxlCoder.Decode preserves the 16-bit samples.
+        ImageFrame dec = SharpImage.Formats.JxlCoder.Decode(cs);
+        long ferr = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            var drow = dec.GetPixelRow(y);
+            for (int x = 0; x < w * 3; x++)
+            {
+                ferr += Math.Abs((int)srow[x] - drow[x]);
+            }
+        }
+
+        await Assert.That(ferr).IsEqualTo(0L);
+
+        string dir = Environment.GetEnvironmentVariable("VARDCT_16_DIR");
+        if (!string.IsNullOrEmpty(dir))
+        {
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "ours_16bit.jxl"), cs);
+            using var ppm = new System.IO.FileStream(System.IO.Path.Combine(dir, "src_16bit.ppm"), System.IO.FileMode.Create);
+            byte[] hdr = System.Text.Encoding.ASCII.GetBytes($"P6\n{w} {h}\n65535\n");
+            ppm.Write(hdr, 0, hdr.Length);
+            for (int y = 0; y < h; y++)
+            {
+                var srow = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    for (int c = 0; c < 3; c++)
+                    {
+                        ushort v = srow[(x * 3) + c];
+                        ppm.WriteByte((byte)(v >> 8)); // PPM 16-bit is big-endian
+                        ppm.WriteByte((byte)(v & 0xFF));
+                    }
+                }
+            }
+        }
+    }
+
     // Deep-test driver: reads a P6 (RGB) or P7/PAM-ish binary via VARDCT_DEEP_SRC (actually a P6 PPM or a
     // P6 + separate alpha via VARDCT_DEEP_ALPHA PGM), encodes lossless + lossy at several qualities, round-
     // trips through our own decoder (lossless MUST be exact), and dumps each .jxl to VARDCT_DEEP_DIR for the
