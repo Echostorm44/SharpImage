@@ -444,17 +444,32 @@ internal static partial class JxlEncoder
     // integers stay inside the 16-bit modular buffer.
     private static (uint GlobalScale, uint QuantLf, uint BlockHfMul) QuantForDistance(float distance)
     {
-        // Bases calibrated so distance 1.0 lands near libjxl's distance-1 quality (~39 dB) on detailed
-        // content, rather than the near-lossless our earlier bases produced.
+        // Calibrated against libjxl at matched SSIMULACRA2 on real photos: our distance now tracks libjxl's
+        // distance (d=1 ~= SSIMULACRA2 89-90, d=2 ~= 84, d=3 ~= 80), instead of the old 22/d that stayed
+        // near-lossless (d=3 was still ~90) and could not reach low bitrates. The AC step is matrix * hf_mul,
+        // hf_mul = 65536/(global_scale * block_hf_mul); coarser = smaller block_hf_mul, then (below 1) a
+        // smaller global_scale.
         float d = Math.Clamp(distance, 0.1f, 25f);
-        uint hfm = (uint)Math.Clamp((int)MathF.Round(22f / d), 1, 4096);
+        float hfmF = 6.5f / d;
+        uint gs = 8192;
+        uint hfm;
+        if (hfmF >= 1f)
+        {
+            hfm = (uint)Math.Clamp((int)MathF.Round(hfmF), 1, 4096);
+        }
+        else
+        {
+            // Below block_hf_mul = 1 the only way coarser is to shrink global_scale (the step scales as 1/gs).
+            hfm = 1;
+            gs = (uint)Math.Clamp((int)MathF.Round(8192f * hfmF), 256, 8192);
+        }
         // DC precision follows libjxl's InitialQuantDC shape: DC needs to be fine at fine quant but gets
         // relatively coarser as distance grows (the ^0.83 term), because at coarse quant the old flat 90/d
         // DC was ~a quarter of the file while barely moving SSIMULACRA2. Calibrated so d=1 keeps ~90 (where
         // the fine-quant heuristic wants it) and it drops toward ~35 at d=3.
         float targetDc = MathF.Max(0.5f * d, MathF.Min(d, 0.3f * MathF.Pow(d / 0.3f, 0.83f)));
         uint qlf = (uint)Math.Clamp((int)MathF.Round(73.4f / targetDc), 1, 512);
-        return (8192u, qlf, hfm);
+        return (gs, qlf, hfm);
     }
 
     /// <summary>Butteraugli-style distance for a JPEG-like quality in [0,100] (higher quality => lower distance).</summary>

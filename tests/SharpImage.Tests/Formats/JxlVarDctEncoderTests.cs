@@ -305,6 +305,21 @@ public class JxlVarDctEncoderTests
             }
         }
 
+        // Raw (global_scale, block_hf_mul) sweep to build the distance->quant calibration curve.
+        if (Environment.GetEnvironmentVariable("VARDCT_QUANT_SWEEP") is { Length: > 0 })
+        {
+            foreach ((uint gs, uint hfm) in new (uint, uint)[]
+                     { (8192, 22), (8192, 11), (8192, 6), (8192, 3), (8192, 1), (4096, 1), (2048, 1), (1024, 1), (512, 1) })
+            {
+                uint qlf = (uint)Math.Clamp((int)(73.4f / 1.5f), 1, 512);
+                byte[] cs = JxlEncoder.EncodeVarDct(frame, gs, qlf, hfm, null, false, true, perceptual: false, distance: 1.5f);
+                System.IO.File.WriteAllBytes(System.IO.Path.Combine(outDir, $"sweep_gs{gs}_hfm{hfm}.jxl"), cs);
+            }
+
+            await Assert.That(true).IsTrue();
+            return;
+        }
+
         string mode = Environment.GetEnvironmentVariable("VARDCT_MODE"); // "refine" | "perceptual" | default heuristic
         float qlfNum = float.TryParse(Environment.GetEnvironmentVariable("VARDCT_QLF"), out float qn) ? qn : 90f;
         foreach (float d in new[] { 0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f })
@@ -699,7 +714,9 @@ public class JxlVarDctEncoderTests
 
         mse /= 3.0 * w * h;
         double psnr = mse <= 1e-9 ? 99.0 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
-        await Assert.That(psnr).IsGreaterThan(28.0);
+        // quality 75 now maps to libjxl's quality-75 semantics (distance ~2.35) after the distance->quant
+        // recalibration, so this textured crop lands around 27 dB (was ~29 under the old over-quality mapping).
+        await Assert.That(psnr).IsGreaterThan(24.0);
     }
 
     [Test]
