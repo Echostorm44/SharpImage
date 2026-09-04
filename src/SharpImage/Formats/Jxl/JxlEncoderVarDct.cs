@@ -36,7 +36,7 @@ internal static partial class JxlEncoder
     /// for the leading (coarse) passes in DECREASING order; a final full-precision (shift 0) pass is
     /// appended automatically. E.g. [2,1] => 3 passes with shifts {2,1,0}. Null/empty => a single pass.
     /// </summary>
-    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null, bool adaptiveQuant = false, bool variableBlocks = false, bool perceptual = false, float distance = 1.0f, float[]? quantFieldOverride = null, int[]? layoutOverride = null)
+    public static byte[] EncodeVarDct(ImageFrame image, uint globalScale = 4096, uint quantLf = 32, uint blockHfMul = 1, int[]? passShifts = null, bool adaptiveQuant = false, bool variableBlocks = false, bool perceptual = false, float distance = 1.0f, float[]? quantFieldOverride = null, int[]? layoutOverride = null, int bits = 8)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -48,7 +48,7 @@ internal static partial class JxlEncoder
         // Full per-pass shift list: the caller's coarse shifts followed by the mandatory final shift 0.
         int[] shifts = BuildPassShifts(passShifts);
 
-        float[][] srgb = ExtractSrgb(image, w, h);
+        float[][] srgb = ExtractSrgb(image, w, h, bits);
         int[]? alpha = ExtractAlpha(image, w, h);
 
         // Alpha placement: a single-group image (<= 256px) codes the whole channel in the GlobalModular
@@ -62,9 +62,7 @@ internal static partial class JxlEncoder
         }
 
         List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks, perceptual, distance, quantFieldOverride, layoutOverride, alpha);
-        // Lossy output is 8-bit (standard; 16-bit lossy would be an explicit opt-in — the XYB pipeline is
-        // float, so only ExtractSrgb precision + this metadata bit would change). Lossless preserves 16-bit.
-        return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual, epfIters: 0, hasAlpha: alpha != null);
+        return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual, epfIters: 0, hasAlpha: alpha != null, bits: bits);
     }
 
     // The alpha channel (last channel) as 8-bit values, or null if the image is opaque. Alpha is coded as a
@@ -128,7 +126,7 @@ internal static partial class JxlEncoder
     /// <paramref name="distance"/> (lower = higher quality; ~1.0 is high quality, larger is lower). The
     /// distance-to-quantiser mapping is a pragmatic approximation, not perceptually calibrated yet.
     /// </summary>
-    public static byte[] EncodeVarDct(ImageFrame image, float distance, int[]? passShifts = null)
+    public static byte[] EncodeVarDct(ImageFrame image, float distance, int[]? passShifts = null, int bits = 8)
     {
         (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
         // Default: the distortion-guarded variable-block heuristic. It measures BETTER than the faithful
@@ -137,7 +135,7 @@ internal static partial class JxlEncoder
         // ported perceptual pipeline (JxlEncoderPerceptual, adaptive quant + EstimateEntropy + Gaborish) is
         // available opt-in via `perceptual: true`; matching full libjxl also needs its Butteraugli-based
         // iterative quant refinement, which is impractical to port.
-        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: false, variableBlocks: true);
+        return EncodeVarDct(image, gs, qlf, hfm, passShifts, adaptiveQuant: false, variableBlocks: true, bits: bits);
     }
 
     /// <summary>
@@ -473,7 +471,7 @@ internal static partial class JxlEncoder
     }
 
     // Extract sRGB [0,1] float channels (grayscale expanded to RGB), matching EncodeLossless's sampling.
-    private static float[][] ExtractSrgb(ImageFrame image, int w, int h)
+    private static float[][] ExtractSrgb(ImageFrame image, int w, int h, int bits = 8)
     {
         var srgb = new float[3][];
         for (int c = 0; c < 3; c++)
@@ -481,6 +479,10 @@ internal static partial class JxlEncoder
             srgb[c] = new float[w * h];
         }
 
+        // 8-bit output: quantise to 8-bit first (byte-identical to the historical path). 16-bit output: keep
+        // the full 16-bit precision so a 16-bit source is encoded without 8-bit banding.
+        bool full = bits >= 16;
+        float Norm(ushort q) => full ? q * (1f / 65535f) : Quantum.ScaleToByte(q) / 255f;
         int srcCh = image.NumberOfChannels;
         for (int y = 0; y < h; y++)
         {
@@ -491,14 +493,14 @@ internal static partial class JxlEncoder
                 int p = (y * w) + x;
                 if (srcCh == 1)
                 {
-                    float v = Quantum.ScaleToByte(row[off]) / 255f;
+                    float v = Norm(row[off]);
                     srgb[0][p] = srgb[1][p] = srgb[2][p] = v;
                 }
                 else
                 {
-                    srgb[0][p] = Quantum.ScaleToByte(row[off]) / 255f;
-                    srgb[1][p] = Quantum.ScaleToByte(row[off + 1]) / 255f;
-                    srgb[2][p] = Quantum.ScaleToByte(row[off + 2]) / 255f;
+                    srgb[0][p] = Norm(row[off]);
+                    srgb[1][p] = Norm(row[off + 1]);
+                    srgb[2][p] = Norm(row[off + 2]);
                 }
             }
         }

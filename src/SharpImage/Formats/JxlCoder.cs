@@ -87,10 +87,11 @@ public static class JxlCoder
     /// Encodes an image as a lossy JPEG XL codestream (XYB VarDCT). <paramref name="quality"/> is a
     /// JPEG-style value in [1,100] (higher = better). <paramref name="effort"/> in [1,9] trades speed for
     /// quality/size (1-3 = fast single-pass at any size; 7 = default; higher runs more SSIMULACRA2-guided
-    /// block-refinement roundtrips over a larger pixel budget). Any positive size is supported: the frame is
-    /// tiled into 2048x2048 LF groups and 256px coding groups.
+    /// block-refinement roundtrips over a larger pixel budget). <paramref name="bits"/> is the output bit
+    /// depth (8 default; 16 keeps full precision for a 16-bit source, avoiding 8-bit banding). Any positive
+    /// size is supported: the frame is tiled into 2048x2048 LF groups and 256px coding groups.
     /// </summary>
-    public static byte[] EncodeLossy(ImageFrame image, int quality = 75, int effort = 7)
+    public static byte[] EncodeLossy(ImageFrame image, int quality = 75, int effort = 7, int bits = 8)
     {
         if (!Jxl.JxlEncoder.CanEncodeVarDct(image))
         {
@@ -99,6 +100,13 @@ public static class JxlCoder
 
         float distance = Jxl.JxlEncoder.DistanceFromQuality(quality);
         effort = Math.Clamp(effort, 1, 9);
+
+        // 16-bit output (opt-in): the XYB pipeline is float, so this just keeps full input precision + declares
+        // 16-bit. Uses the fast single-pass path (the block-refined roundtrip's metric assumes 8-bit).
+        if (bits >= 16)
+        {
+            return Jxl.JxlEncoder.EncodeVarDct(image, distance, null, 16);
+        }
 
         // Effort/speed dial. The block-refined path runs several encode->decode->SSIMULACRA2 roundtrips to
         // close the coarse-quant "cliff"; its cost scales with pixels x iterations, so higher effort buys

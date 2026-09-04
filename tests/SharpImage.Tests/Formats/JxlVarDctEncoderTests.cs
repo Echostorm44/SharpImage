@@ -1037,6 +1037,64 @@ public class JxlVarDctEncoderTests
         }
     }
 
+    // 16-bit lossy (opt-in): EncodeLossy(bits:16) declares 16-bit output and keeps full input precision, so a
+    // smooth 16-bit gradient decodes at 16-bit (no 8-bit banding). Verified decodable in jxl-oxide + libjxl.
+    [Test]
+    public async Task Jxl_Lossy_16Bit_Output()
+    {
+        const int w = 128, h = 128;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * 3;
+                row[o] = (ushort)(x * 65535 / (w - 1));      // full-range 16-bit smooth gradient
+                row[o + 1] = (ushort)(y * 65535 / (h - 1));
+                row[o + 2] = (ushort)((x + y) * 65535 / (w + h - 2));
+            }
+        }
+
+        byte[] cs = SharpImage.Formats.JxlCoder.EncodeLossy(frame, quality: 95, effort: 7, bits: 16);
+        JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+        await Assert.That(r.Bps).IsEqualTo(16); // 16-bit output declared
+
+        // The decoded channel uses more than 8-bit precision (values aren't all multiples of 257).
+        bool sub8 = false;
+        double mse = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    int dv = r.Channels[c].Px[(y * w) + x];
+                    if (dv % 257 != 0)
+                    {
+                        sub8 = true;
+                    }
+
+                    double d = ((int)srow[(x * 3) + c] - dv) / 257.0; // compare in ~8-bit units
+                    mse += d * d;
+                }
+            }
+        }
+
+        mse /= 3.0 * w * h;
+        double psnr = mse <= 1e-9 ? 99 : 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        await Assert.That(sub8).IsTrue();            // genuine 16-bit precision used
+        await Assert.That(psnr).IsGreaterThan(35.0); // high-quality lossy
+
+        string dir = Environment.GetEnvironmentVariable("VARDCT_16L_DIR");
+        if (!string.IsNullOrEmpty(dir))
+        {
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "lossy16.jxl"), cs);
+        }
+    }
+
     // Lossless RGBA: color + alpha must round-trip bit-exact (alpha as a Modular extra channel). Verified in
     // jxl-oxide + libjxl when VARDCT_LLA_DIR is set.
     [Test]
