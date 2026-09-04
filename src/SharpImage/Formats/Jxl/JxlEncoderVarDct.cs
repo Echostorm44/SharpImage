@@ -63,7 +63,7 @@ internal static partial class JxlEncoder
 
         Core.ColorspaceType colorspace = image.Colorspace;
         List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks, perceptual, distance, quantFieldOverride, layoutOverride, alpha, colorspace);
-        return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual, epfIters: 0, hasAlpha: alpha != null, bits: bits, colorspace: colorspace);
+        return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual, epfIters: 0, hasAlpha: alpha != null, bits: bits, colorspace: colorspace, icc: image.IccProfile);
     }
 
     // The alpha channel (last channel) as 8-bit values, or null if the image is opaque. Alpha is coded as a
@@ -513,13 +513,13 @@ internal static partial class JxlEncoder
     // For a single-group single-pass frame the whole body is one TOC section; a progressive (multi-pass)
     // frame uses the multi-section TOC (LfGlobal | LfGroup | HfGlobal | PassGroup-per-pass) so a streaming
     // decoder can render the DC preview from the LfGroup section before the AC passes arrive.
-    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts, bool gaborish, int epfIters = 0, bool hasAlpha = false, int bits = 8, Core.ColorspaceType colorspace = Core.ColorspaceType.SRGB)
+    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts, bool gaborish, int epfIters = 0, bool hasAlpha = false, int bits = 8, Core.ColorspaceType colorspace = Core.ColorspaceType.SRGB, byte[]? icc = null)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
         main.WriteBits(0x0A, 8);
         WriteSizeHeader(main, w, h);
-        WriteXybImageMetadata(main, hasAlpha, bits, colorspace);
+        WriteXybImageMetadata(main, hasAlpha, bits, colorspace, icc);
         main.JumpToByteBoundary();
         WriteVarDctFrameHeader(main, shifts, gaborish, epfIters, hasAlpha ? 1 : 0);
         main.WriteBool(false); // permuted TOC = false
@@ -541,7 +541,7 @@ internal static partial class JxlEncoder
 
     // Explicit ImageMetadata: 8-bit sRGB RGB, XYB-encoded, no extra channels, default opsin/upsampling.
     // Written out in full (not all_default) so xyb_encoded is unambiguously set for the decoder.
-    private static void WriteXybImageMetadata(JxlBitWriter w, bool hasAlpha = false, int bits = 8, Core.ColorspaceType colorspace = Core.ColorspaceType.SRGB)
+    private static void WriteXybImageMetadata(JxlBitWriter w, bool hasAlpha = false, int bits = 8, Core.ColorspaceType colorspace = Core.ColorspaceType.SRGB, byte[]? icc = null)
     {
         w.WriteBool(false); // not all_default
         w.WriteBool(false); // extra_fields = false
@@ -555,7 +555,15 @@ internal static partial class JxlEncoder
         }
 
         w.WriteBool(true);  // xyb_encoded = true
-        if (colorspace == Core.ColorspaceType.DisplayP3)
+        if (icc != null)
+        {
+            // The embedded ICC profile is the authoritative target colour for XYB->RGB; only the colour-space
+            // kind is declared (kRGB), the enum primaries/transfer/intent are omitted. Blob follows the metadata.
+            w.WriteBool(false); // colour encoding: not all_default
+            w.WriteBool(true);  // want_icc = true
+            w.WriteEnum(0);     // color_space = kRGB
+        }
+        else if (colorspace == Core.ColorspaceType.DisplayP3)
         {
             // Target colour encoding for XYB->RGB: RGB / D65 / primaries kP3 / sRGB transfer.
             w.WriteBool(false); // colour encoding: not all_default
@@ -574,6 +582,12 @@ internal static partial class JxlEncoder
 
         w.WriteU64(0);      // extensions = none
         w.WriteBool(true);  // default_m (skip opsin / upsampling weights — use XYB defaults)
+
+        // The embedded ICC profile (if any) follows the whole ImageMetadata bundle, before the frames.
+        if (icc != null)
+        {
+            JxlIcc.EncodeStream(w, icc);
+        }
     }
 
     // Frame header for a regular XYB VarDCT frame with loop filters + adaptive-LF-smoothing disabled.

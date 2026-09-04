@@ -1242,6 +1242,59 @@ public class JxlVarDctEncoderTests
         }
     }
 
+    // ICC on the LOSSY (VarDCT/XYB) path: a lossy encode carrying an embedded ICC profile round-trips the
+    // profile bytes exactly (the XYB frame declares want_icc + kRGB and re-embeds the compressed blob), and
+    // the reference decoders accept it (dumped to VARDCT_ICC_DIR for the external jxl-oxide/libjxl check).
+    [Test]
+    public async Task Jxl_Icc_Lossy_RoundTrips()
+    {
+        const int w = 96, h = 72;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * 3;
+                row[o] = (ushort)(Math.Clamp(0.5f + (0.4f * MathF.Sin(x * 0.05f)), 0f, 1f) * Quantum.MaxValue);
+                row[o + 1] = (ushort)(Math.Clamp((float)y / (h - 1), 0f, 1f) * Quantum.MaxValue);
+                row[o + 2] = (ushort)(Math.Clamp(0.5f + (0.3f * MathF.Cos(y * 0.06f)), 0f, 1f) * Quantum.MaxValue);
+            }
+        }
+
+        // Prefer a real profile from the corpus dir (so a reference decoder can colour-manage); else synthetic.
+        string dir = Environment.GetEnvironmentVariable("VARDCT_ICC_DIR") ?? "";
+        string realIcc = System.IO.Path.Combine(dir, "srgb-rel.icc");
+        byte[] icc;
+        if (!string.IsNullOrEmpty(dir) && System.IO.File.Exists(realIcc))
+        {
+            icc = System.IO.File.ReadAllBytes(realIcc);
+        }
+        else
+        {
+            var rnd = new Random(23);
+            icc = new byte[400];
+            rnd.NextBytes(icc);
+            icc[0] = (byte)(icc.Length >> 24); icc[1] = (byte)(icc.Length >> 16);
+            icc[2] = (byte)(icc.Length >> 8); icc[3] = (byte)icc.Length;
+            System.Text.Encoding.ASCII.GetBytes("mntrRGB XYZ ").CopyTo(icc, 12);
+            System.Text.Encoding.ASCII.GetBytes("acsp").CopyTo(icc, 36);
+        }
+
+        frame.IccProfile = icc;
+        byte[] cs = SharpImage.Formats.JxlCoder.EncodeLossy(frame, quality: 90, effort: 7);
+        ImageFrame dec = SharpImage.Formats.JxlCoder.Decode(cs);
+        await Assert.That(dec.IccProfile).IsNotNull();
+        await Assert.That(dec.IccProfile!.AsSpan().SequenceEqual(icc)).IsTrue();
+
+        if (!string.IsNullOrEmpty(dir) && System.IO.Directory.Exists(dir))
+        {
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "lossy_icc.jxl"), cs);
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "lossy_icc.icc"), icc);
+        }
+    }
+
     // Wide-gamut lossy (Display P3): the XYB transform converts P3<->sRGB primaries in linear light (JXL's
     // XYB is always sRGB-referred), so the file declares P3 and a P3-aware decoder recovers P3 colours.
     // Verified externally against jxl-oxide: decoding this file to *linear sRGB* (XYB's own reference space,
