@@ -612,8 +612,9 @@ internal static class JxlFrame
                 EpfPass0SigmaScale = fh.EpfPass0SigmaScale,
                 EpfPass2SigmaScale = fh.EpfPass2SigmaScale,
                 EpfBorderSadMul = fh.EpfBorderSadMul,
+                NumExtra = md.Extra,
             };
-            float[][] rgb = JxlVarDct.Decode(cs, offsets, sizes, fp, null, null, allowTruncated);
+            float[][] rgb = JxlVarDct.Decode(cs, offsets, sizes, fp, null, null, out int[][]? extra, allowTruncated);
             var vc = new List<JxlChannel> { new(w, h), new(w, h), new(w, h) };
             for (int c = 0; c < 3; c++)
             {
@@ -623,7 +624,20 @@ internal static class JxlFrame
                 }
             }
 
-            return new JxlModularResult { Width = w, Height = h, NumChannels = 3, Channels = vc, Gray = false };
+            // A single alpha extra channel is surfaced as a 4th channel (RGBA).
+            bool hasAlpha = extra != null && extra.Length >= 1;
+            if (hasAlpha)
+            {
+                var a = new JxlChannel(w, h);
+                for (int i = 0; i < w * h; i++)
+                {
+                    a.Px[i] = Math.Clamp(extra![0][i], 0, 255);
+                }
+
+                vc.Add(a);
+            }
+
+            return new JxlModularResult { Width = w, Height = h, NumChannels = hasAlpha ? 4 : 3, Channels = vc, Gray = false, HasAlpha = hasAlpha };
         }
 
         int nbChans = md.Gray ? 1 : 3;

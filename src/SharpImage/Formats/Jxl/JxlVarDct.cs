@@ -12,6 +12,7 @@ internal sealed class VarDctFrameParams
 {
     public int Width, Height, BitDepth;
     public int GroupDim, NumGroups, NumLf, GroupsPerRow, NumPasses;
+    public int NumExtra; // extra channels (e.g. alpha), coded as Modular channels in the GlobalModular stream
     public int[] PassShift = { 0 }; // per-pass coefficient left-shift (progressive); last pass is 0
     public bool Xyb;
     public ulong Flags;
@@ -844,8 +845,9 @@ internal static class JxlVarDct
     }
 
     /// <summary>Decodes a VarDCT frame body. Sections are laid out per the TOC; returns 3 sRGB float channels [0,1].</summary>
-    public static float[][] Decode(byte[] data, int[] offsets, uint[] sizes, VarDctFrameParams fp, List<MaNode>? gTreeIn, JxlAnsCode? gCodeIn, bool allowTruncated = false)
+    public static float[][] Decode(byte[] data, int[] offsets, uint[] sizes, VarDctFrameParams fp, List<MaNode>? gTreeIn, JxlAnsCode? gCodeIn, out int[][]? extraOut, bool allowTruncated = false)
     {
+        extraOut = null;
         bool single = offsets.Length == 1;
         int w = fp.Width, h = fp.Height;
         int stride = ((w + 7) / 8) * 8; // rounded up to block
@@ -883,9 +885,22 @@ internal static class JxlVarDct
             gCode = JxlEntropy.DecodeHistograms((gTree.Count + 1) / 2, lb);
         }
 
-        // GroupHeader for gmodular (0 color channels for VarDCT, no extra channels assumed).
-        var emptyChans = new List<JxlChannel>();
-        JxlModular.DecodeSubModular(lb, emptyChans, gTree, gCode, 0, fp.BitDepth);
+        // GlobalModular stream (id 0): for a VarDCT frame it carries the extra channels (e.g. alpha) as
+        // full-resolution Modular channels; color is VarDCT. With no extra channels it is empty (and
+        // DecodeSubModular reads no header). Extra channels here require the whole image to fit the
+        // GlobalModular (single-group); larger images split them per group (not yet emitted/read).
+        var globalChans = new List<JxlChannel>();
+        for (int e = 0; e < fp.NumExtra; e++)
+        {
+            globalChans.Add(new JxlChannel(w, h));
+        }
+
+        JxlModular.DecodeSubModular(lb, globalChans, gTree, gCode, 0, fp.BitDepth);
+        extraOut = fp.NumExtra > 0 ? new int[fp.NumExtra][] : null;
+        for (int e = 0; e < fp.NumExtra; e++)
+        {
+            extraOut![e] = globalChans[e].Px;
+        }
 
         // For single-section frames, everything continues in `lb`. For multi-section, use offsets.
         // --- LfGroups ---

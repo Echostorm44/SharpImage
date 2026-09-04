@@ -49,8 +49,43 @@ internal static partial class JxlEncoder
         int[] shifts = BuildPassShifts(passShifts);
 
         float[][] srgb = ExtractSrgb(image, w, h);
-        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks, perceptual, distance, quantFieldOverride, layoutOverride);
-        return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual, epfIters: 0);
+        int[]? alpha = ExtractAlpha(image, w, h);
+
+        // Alpha is emitted as one full-resolution Modular channel in the GlobalModular stream, which is only
+        // spec-valid when the whole channel fits a single group (<= 256px) — reference decoders require
+        // per-group splitting above that (an "ANS stream verification failed" otherwise). Larger extra
+        // channels need per-group modular AC streams (not yet emitted), so drop alpha there to stay valid.
+        if (alpha != null && (w > VarDctGroupDim || h > VarDctGroupDim))
+        {
+            alpha = null;
+        }
+
+        List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks, perceptual, distance, quantFieldOverride, layoutOverride, alpha);
+        return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual, epfIters: 0, hasAlpha: alpha != null);
+    }
+
+    // The alpha channel (last channel) as 8-bit values, or null if the image is opaque. Alpha is coded as a
+    // Modular extra channel in the frame's GlobalModular stream (stream 0), separate from the XYB VarDCT color.
+    private static int[]? ExtractAlpha(ImageFrame image, int w, int h)
+    {
+        if (!image.HasAlpha)
+        {
+            return null;
+        }
+
+        int srcCh = image.NumberOfChannels;
+        int ai = srcCh - 1;
+        var alpha = new int[w * h];
+        for (int y = 0; y < h; y++)
+        {
+            var row = image.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                alpha[(y * w) + x] = Quantum.ScaleToByte(row[(x * srcCh) + ai]);
+            }
+        }
+
+        return alpha;
     }
 
     private static int[] BuildPassShifts(int[]? passShifts)
@@ -472,15 +507,15 @@ internal static partial class JxlEncoder
     // For a single-group single-pass frame the whole body is one TOC section; a progressive (multi-pass)
     // frame uses the multi-section TOC (LfGlobal | LfGroup | HfGlobal | PassGroup-per-pass) so a streaming
     // decoder can render the DC preview from the LfGroup section before the AC passes arrive.
-    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts, bool gaborish, int epfIters = 0)
+    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts, bool gaborish, int epfIters = 0, bool hasAlpha = false)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
         main.WriteBits(0x0A, 8);
         WriteSizeHeader(main, w, h);
-        WriteXybImageMetadata(main);
+        WriteXybImageMetadata(main, hasAlpha);
         main.JumpToByteBoundary();
-        WriteVarDctFrameHeader(main, shifts, gaborish, epfIters);
+        WriteVarDctFrameHeader(main, shifts, gaborish, epfIters, hasAlpha ? 1 : 0);
         main.WriteBool(false); // permuted TOC = false
         main.JumpToByteBoundary();
 
@@ -500,14 +535,19 @@ internal static partial class JxlEncoder
 
     // Explicit ImageMetadata: 8-bit sRGB RGB, XYB-encoded, no extra channels, default opsin/upsampling.
     // Written out in full (not all_default) so xyb_encoded is unambiguously set for the decoder.
-    private static void WriteXybImageMetadata(JxlBitWriter w)
+    private static void WriteXybImageMetadata(JxlBitWriter w, bool hasAlpha = false)
     {
         w.WriteBool(false); // not all_default
         w.WriteBool(false); // extra_fields = false
         w.WriteBool(false); // bit depth: not floating
         w.WriteU32(8, E.Val(8), E.Val(10), E.Val(12), E.BitsOff(6, 1)); // 8 bits per sample
         w.WriteBool(true);  // modular_16bit_buffer_sufficient
-        w.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(12, 1)); // num_extra_channels = 0
+        w.WriteU32(hasAlpha ? 1u : 0u, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(12, 1)); // num_extra_channels
+        if (hasAlpha)
+        {
+            w.WriteBool(true); // ExtraChannelInfo: all_default (8-bit unassociated Alpha, dim_shift 0)
+        }
+
         w.WriteBool(true);  // xyb_encoded = true
         w.WriteBool(true);  // colour encoding: all_default (sRGB RGB)
         w.WriteU64(0);      // extensions = none
@@ -516,7 +556,7 @@ internal static partial class JxlEncoder
 
     // Frame header for a regular XYB VarDCT frame with loop filters + adaptive-LF-smoothing disabled.
     // shifts holds the per-pass coefficient shift (length == num_passes; final entry 0).
-    private static void WriteVarDctFrameHeader(JxlBitWriter w, int[] shifts, bool gaborish, int epfIters = 0)
+    private static void WriteVarDctFrameHeader(JxlBitWriter w, int[] shifts, bool gaborish, int epfIters = 0, int numExtra = 0)
     {
         int numPasses = shifts.Length;
         w.WriteBool(false);  // not all_default
@@ -524,12 +564,22 @@ internal static partial class JxlEncoder
         w.WriteBits(0, 1);   // encoding = VarDCT
         w.WriteU64(0x80);    // flags = kSkipAdaptiveDCSmoothing (0x80); no patches/splines/noise/useLf
         // md.Xyb => no do_ycbcr bit.
-        w.WriteU32(1, E.Val(1), E.Val(2), E.Val(4), E.Val(8)); // upsampling = 1 (no extra channels)
+        w.WriteU32(1, E.Val(1), E.Val(2), E.Val(4), E.Val(8)); // upsampling = 1
+        for (int i = 0; i < numExtra; i++)
+        {
+            w.WriteU32(1, E.Val(1), E.Val(2), E.Val(4), E.Val(8)); // ec_upsampling = 1 (full res)
+        }
+
         w.WriteBits(2, 3);   // x_qm_scale = 2 (default)
         w.WriteBits(2, 3);   // b_qm_scale = 2 (default)
         WritePasses(w, numPasses, shifts);
         w.WriteBool(false);  // have_crop = false
-        w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3)); // blending mode = 0 (replace)
+        w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3)); // color blending mode = 0 (replace)
+        for (int i = 0; i < numExtra; i++)
+        {
+            w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3)); // extra-channel blending mode = 0
+        }
+
         w.WriteBool(true);   // is_last = true
         w.WriteU32(0, E.Val(0), E.BitsOff(4, 0), E.BitsOff(5, 16), E.BitsOff(10, 48)); // name length = 0
 
@@ -568,7 +618,7 @@ internal static partial class JxlEncoder
     }
 
     // --- the frame body as TOC sections (see AssembleVarDctCodestream) ---
-    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts, bool adaptiveQuant, bool variableBlocks, bool perceptual = false, float distance = 1.0f, float[]? quantFieldOverride = null, int[]? layoutOverride = null)
+    private static List<byte[]> BuildVarDctSections(float[][] srgb, int w, int h, uint globalScale, uint quantLf, uint blockHfMul, int[] shifts, bool adaptiveQuant, bool variableBlocks, bool perceptual = false, float distance = 1.0f, float[]? quantFieldOverride = null, int[]? layoutOverride = null, int[]? alpha = null)
     {
         int bw = (w + 7) / 8, bh = (h + 7) / 8;   // blocks
         int stride = bw * 8, strideH = bh * 8;
@@ -928,7 +978,15 @@ internal static partial class JxlEncoder
             }
         }
 
-        // One global MA tree over every LF group's DC + HfMetadata channels (with the correct stream ids).
+        // Optional alpha extra channel: one full-res Modular channel in the GlobalModular stream (id 0),
+        // learned under the same global tree as the DC/HfMeta sub-images (its stream id is a tree property).
+        List<EncChannel>? alphaChans = alpha == null ? null : new List<EncChannel> { new(alpha, w, h) };
+        if (alphaChans != null)
+        {
+            learnRefs.Add(new EncChannelRef(alphaChans[0].Data, w, h, 0, 0, RefsFor(alphaChans, 0)));
+        }
+
+        // One global MA tree over every LF group's DC + HfMetadata channels (+ alpha) with correct stream ids.
         var dcTree = new LearnedTree(JxlTreeLearner.Learn(learnRefs, dcWp, DcNodeThreshold));
 
         // Residual tokens per sub-image, in stream order [DC0, meta0, DC1, meta1, ...]. dcOps[i]/streamCtx[i]
@@ -978,6 +1036,18 @@ internal static partial class JxlEncoder
             streamCtx.Add(metaCtx);
         }
 
+        // Alpha is the last stream (index 2*numLf); WriteLfGlobal emits it as the stream-0 GlobalModular body.
+        int alphaOpsIdx = -1;
+        if (alphaChans != null)
+        {
+            var aStream = new int[w * h];
+            var aCtx = new int[w * h];
+            ComputeResidualTokensCtx(alphaChans[0], 0, dcTree, aStream, aCtx, 0, ref dcMaxTok, dcWp, RefsFor(alphaChans, 0), 0);
+            alphaOpsIdx = dcStreams.Count;
+            dcStreams.Add((aStream, aCtx));
+            streamCtx.Add(aCtx);
+        }
+
         PixelPlanCtx dcPlan = PlanPixelsCtx(dcStreams, dcTree.LeafCount, out List<Op>[] dcOps, out long[][] dcRawCtxHist, int.MaxValue / 2);
         int dcLogAlpha = Math.Max(5, JxlBits.CeilLog2(dcPlan.LitAlphabet));
         // Re-cluster the DC/HfMeta contexts with the total-cost criterion (same header-overhead issue as the
@@ -1023,6 +1093,7 @@ internal static partial class JxlEncoder
         // DC and HfMetadata sub-images. Per-LF-group token lists, indexed [lg].
         var lfDcTokens = new List<ModToken>[numLf];
         var lfMetaTokens = new List<ModToken>[numLf];
+        List<ModToken>? alphaTokens = null;
         var modHist = new long[1];
         int modLogAlpha = 5;
         int[] modNorm = null!;
@@ -1035,6 +1106,12 @@ internal static partial class JxlEncoder
                 lfMetaTokens[lg] = GradientTokens(lfMetaSub[lg]);
                 AccumulateHist(lfDcTokens[lg], ref modHist);
                 AccumulateHist(lfMetaTokens[lg], ref modHist);
+            }
+
+            if (alpha != null)
+            {
+                alphaTokens = GradientTokens(new List<SubChannel> { new(alpha, w, h) });
+                AccumulateHist(alphaTokens, ref modHist);
             }
 
             modLogAlpha = Math.Max(5, JxlBits.CeilLog2(modHist.Length));
@@ -1162,6 +1239,20 @@ internal static partial class JxlEncoder
             {
                 WriteTree(b, fallbackLeaf.Tokens);
                 WriteSingleContextAnsHeader(b, modNorm, modLogAlpha);
+            }
+
+            // GlobalModular stream (id 0) body: the alpha extra channel, or nothing (the decoder's
+            // DecodeSubModular returns immediately for a zero-channel stream, so we emit no header then).
+            if (alpha != null)
+            {
+                if (useLearnedDc)
+                {
+                    WriteSubModularOps(b, dcOps[alphaOpsIdx], streamCtx[alphaOpsIdx], dcPlan, dcAns, dcWpMode);
+                }
+                else
+                {
+                    WriteSubModularUsingGlobal(b, alphaTokens!, modNorm, modLogAlpha);
+                }
             }
         }
 

@@ -378,6 +378,89 @@ public class JxlVarDctEncoderTests
         await Assert.That(psnr).IsGreaterThan(30.0);
     }
 
+    // Builds a synthetic RGBA frame with a known alpha ramp, encodes it lossy, and (when VARDCT_ALPHA_DIR is
+    // set) dumps ours_alpha.jxl + the reference alpha as alpha_ref.pgm for external verification.
+    [Test]
+    public async Task VarDct_Alpha_Encode()
+    {
+        int sz = int.TryParse(Environment.GetEnvironmentVariable("VARDCT_ALPHA_SIZE"), out int s) ? s : 200;
+        int w = sz, h = sz;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, hasAlpha: true);
+        int nch = frame.NumberOfChannels; // 4
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * nch;
+                row[o] = Quantum.ScaleFromByte((byte)(x * 255 / (w - 1)));
+                row[o + 1] = Quantum.ScaleFromByte((byte)(y * 255 / (h - 1)));
+                row[o + 2] = Quantum.ScaleFromByte(128);
+                row[o + 3] = Quantum.ScaleFromByte((byte)((x + y) * 255 / (w + h - 2))); // alpha ramp
+            }
+        }
+
+        byte[] cs = JxlEncoder.EncodeVarDct(frame, 1.0f);
+        await Assert.That(cs.Length).IsGreaterThan(0);
+
+        JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+        // Alpha is emitted (and must round-trip bit-exact, being lossless) only for single-group images
+        // (<= 256px); larger images currently drop it to stay spec-valid, so we get a clean color-only file.
+        bool expectAlpha = w <= 256 && h <= 256;
+        await Assert.That(r.HasAlpha).IsEqualTo(expectAlpha);
+        if (expectAlpha)
+        {
+            await Assert.That(r.NumChannels).IsEqualTo(4);
+            long alphaErr = 0;
+            for (int y = 0; y < h; y++)
+            {
+                var srow = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    alphaErr += Math.Abs((int)Quantum.ScaleToByte(srow[(x * nch) + 3]) - r.Channels[3].Px[(y * w) + x]);
+                }
+            }
+
+            await Assert.That(alphaErr).IsEqualTo(0L); // alpha is lossless
+        }
+
+        // The public EncodeLossy path (block-refined for <=2MP) must also preserve alpha for single-group.
+        if (expectAlpha)
+        {
+            JxlModularResult rl = JxlFrame.DecodeModularCodestream(SharpImage.Formats.JxlCoder.EncodeLossy(frame, 80));
+            await Assert.That(rl.HasAlpha).IsTrue();
+            long e2 = 0;
+            for (int y = 0; y < h; y++)
+            {
+                var srow = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    e2 += Math.Abs((int)Quantum.ScaleToByte(srow[(x * nch) + 3]) - rl.Channels[3].Px[(y * w) + x]);
+                }
+            }
+
+            await Assert.That(e2).IsEqualTo(0L);
+        }
+
+        string dir = Environment.GetEnvironmentVariable("VARDCT_ALPHA_DIR");
+        if (!string.IsNullOrEmpty(dir))
+        {
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "ours_alpha.jxl"), cs);
+            using var pgm = new System.IO.FileStream(System.IO.Path.Combine(dir, "alpha_ref.pgm"), System.IO.FileMode.Create);
+            byte[] hdr = System.Text.Encoding.ASCII.GetBytes($"P5\n{w} {h}\n255\n");
+            pgm.Write(hdr, 0, hdr.Length);
+            for (int y = 0; y < h; y++)
+            {
+                var row = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    pgm.WriteByte((byte)Quantum.ScaleToByte(row[(x * nch) + 3]));
+                }
+            }
+        }
+    }
+
     // Truncated-preview decode: a byte-prefix of a progressive (multi-section) VarDCT frame must decode into
     // a valid best-effort preview instead of throwing. The guarantee is section-granular (an ANS stream can't
     // be safely decoded from a partial tail), so previews sharpen as whole sections arrive — DC, then AC
