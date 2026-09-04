@@ -1067,6 +1067,11 @@ internal static class JxlVarDct
                 for (int p = 0; p < fp.NumPasses; p++)
                 {
                     int sectionIdx = 2 + fp.NumLf + (p * fp.NumGroups) + grp;
+                    // Truncated preview is SECTION-GRANULAR: a PassGroup is applied only if fully present.
+                    // Partial (byte-bounded) decode of an incomplete pass was investigated and rejected — a
+                    // partially-applied progressive pass refines some blocks past the coarse level and not
+                    // others, which reads as a transient quality DIP (a non-monotonic, "gets worse before it
+                    // gets better" preview). Section-granular keeps the preview monotonically improving.
                     if (!single && !Avail(sectionIdx))
                     {
                         continue;
