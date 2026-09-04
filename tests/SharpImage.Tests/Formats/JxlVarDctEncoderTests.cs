@@ -126,6 +126,16 @@ public class JxlVarDctEncoderTests
             JxlModularResult res = JxlFrame.DecodeModularCodestream(cs);
             Console.Error.WriteLine($"[VARDCT] our decoder read real file OK: {res.Width}x{res.Height} ch={res.NumChannels}");
             System.IO.File.WriteAllText(path + ".ourdecode.txt", $"OK {res.Width}x{res.Height} ch={res.NumChannels}");
+            if (res.NumChannels == 4)
+            {
+                using var pgm = new System.IO.FileStream(path + ".ouralpha.pgm", System.IO.FileMode.Create);
+                byte[] hdr = System.Text.Encoding.ASCII.GetBytes($"P5\n{res.Width} {res.Height}\n255\n");
+                pgm.Write(hdr, 0, hdr.Length);
+                for (int i = 0; i < res.Width * res.Height; i++)
+                {
+                    pgm.WriteByte((byte)Math.Clamp(res.Channels[3].Px[i], 0, 255));
+                }
+            }
         }
         catch (Exception e)
         {
@@ -378,12 +388,16 @@ public class JxlVarDctEncoderTests
         await Assert.That(psnr).IsGreaterThan(30.0);
     }
 
-    // Builds a synthetic RGBA frame with a known alpha ramp, encodes it lossy, and (when VARDCT_ALPHA_DIR is
-    // set) dumps ours_alpha.jxl + the reference alpha as alpha_ref.pgm for external verification.
+    // Builds a synthetic RGBA frame with a known alpha ramp, encodes it lossy, and checks the alpha round-
+    // trips bit-exact (it is coded losslessly). 200px exercises the single-group GlobalModular path; 512px the
+    // multi-group per-group ModularAC tiles. Verified separately bit-exact in jxl-oxide AND libjxl. When
+    // VARDCT_ALPHA_DIR is set it also dumps ours_alpha.jxl + alpha_ref.pgm for that external check.
     [Test]
-    public async Task VarDct_Alpha_Encode()
+    [Arguments(200)]
+    [Arguments(512)]
+    public async Task VarDct_Alpha_Encode(int argSize)
     {
-        int sz = int.TryParse(Environment.GetEnvironmentVariable("VARDCT_ALPHA_SIZE"), out int s) ? s : 200;
+        int sz = int.TryParse(Environment.GetEnvironmentVariable("VARDCT_ALPHA_SIZE"), out int s) ? s : argSize;
         int w = sz, h = sz;
         var frame = new ImageFrame();
         frame.Initialize(w, h, ColorspaceType.SRGB, hasAlpha: true);
@@ -405,9 +419,9 @@ public class JxlVarDctEncoderTests
         await Assert.That(cs.Length).IsGreaterThan(0);
 
         JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
-        // Alpha is emitted (and must round-trip bit-exact, being lossless) only for single-group images
-        // (<= 256px); larger images currently drop it to stay spec-valid, so we get a clean color-only file.
-        bool expectAlpha = w <= 256 && h <= 256;
+        // Alpha (lossless, so bit-exact) is emitted for single-group (GlobalModular) and multi-group
+        // (per-group ModularAC tiles) single-pass images alike.
+        bool expectAlpha = true;
         await Assert.That(r.HasAlpha).IsEqualTo(expectAlpha);
         if (expectAlpha)
         {

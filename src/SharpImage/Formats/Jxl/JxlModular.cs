@@ -1242,6 +1242,20 @@ internal static class JxlModular
     /// GroupHeader, decodes the given channels using the shared global MA tree (or a local one),
     /// undoes transforms, using <paramref name="streamId"/> as the "group" tree property.
     /// </summary>
+    // Reads (and discards) a modular GroupHeader with no channel data: use_global_tree, the WP header, and
+    // the transform list. Used for a group-split GlobalModular stream in a VarDCT frame (the extra channels
+    // are declared here but their data is coded per-group).
+    public static void SkipModularHeader(JxlBitReader br)
+    {
+        br.ReadBool(); // use_global_tree
+        ReadWpHeader(br);
+        int nt = (int)JxlBits.ReadU32(br, JxlBitReader.U32Enc.Val(0), JxlBitReader.U32Enc.Val(1), JxlBitReader.U32Enc.BitsOff(4, 2), JxlBitReader.U32Enc.BitsOff(8, 18));
+        for (int i = 0; i < nt; i++)
+        {
+            ReadTransform(br);
+        }
+    }
+
     public static void DecodeSubModular(JxlBitReader br, List<JxlChannel> chans, List<MaNode>? globalTree, JxlAnsCode? globalCode, int streamId, int bitDepth)
     {
         // libjxl ModularDecode returns immediately for an empty image (no GroupHeader read).

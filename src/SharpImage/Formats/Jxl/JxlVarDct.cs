@@ -886,20 +886,37 @@ internal static class JxlVarDct
         }
 
         // GlobalModular stream (id 0): for a VarDCT frame it carries the extra channels (e.g. alpha) as
-        // full-resolution Modular channels; color is VarDCT. With no extra channels it is empty (and
-        // DecodeSubModular reads no header). Extra channels here require the whole image to fit the
-        // GlobalModular (single-group); larger images split them per group (not yet emitted/read).
-        var globalChans = new List<JxlChannel>();
-        for (int e = 0; e < fp.NumExtra; e++)
-        {
-            globalChans.Add(new JxlChannel(w, h));
-        }
-
-        JxlModular.DecodeSubModular(lb, globalChans, gTree, gCode, 0, fp.BitDepth);
+        // full-resolution Modular channels; color is VarDCT. A channel that fits one group (<= group_dim in
+        // both dims) is decoded inline here; a larger channel is group-split — declared by the header here,
+        // its tiles decoded per group in the PassGroup sections (mirrors jxl-modular prepare_gmodular).
+        bool extraGroupSplit = fp.NumExtra > 0 && (w > fp.GroupDim || h > fp.GroupDim);
         extraOut = fp.NumExtra > 0 ? new int[fp.NumExtra][] : null;
-        for (int e = 0; e < fp.NumExtra; e++)
+        if (fp.NumExtra > 0 && !extraGroupSplit)
         {
-            extraOut![e] = globalChans[e].Px;
+            var globalChans = new List<JxlChannel>();
+            for (int e = 0; e < fp.NumExtra; e++)
+            {
+                globalChans.Add(new JxlChannel(w, h));
+            }
+
+            JxlModular.DecodeSubModular(lb, globalChans, gTree, gCode, 0, fp.BitDepth);
+            for (int e = 0; e < fp.NumExtra; e++)
+            {
+                extraOut![e] = globalChans[e].Px;
+            }
+        }
+        else if (extraGroupSplit)
+        {
+            JxlModular.SkipModularHeader(lb); // header-only; tiles filled in the PassGroup loop
+            lb.ReadBits(32);                  // empty ANS stream initial state (0 inline channels)
+            for (int e = 0; e < fp.NumExtra; e++)
+            {
+                extraOut![e] = new int[w * h];
+            }
+        }
+        else
+        {
+            JxlModular.DecodeSubModular(lb, new List<JxlChannel>(), gTree, gCode, 0, fp.BitDepth);
         }
 
         // For single-section frames, everything continues in `lb`. For multi-section, use offsets.
@@ -1028,6 +1045,31 @@ internal static class JxlVarDct
                     JxlBitReader pb = single ? lb : SectionReader(sectionIdx);
                     int passShift = p < fp.PassShift.Length ? fp.PassShift[p] : 0;
                     WriteHfCoeff(pb, fp, hfCtx, hfPasses[p], groupLg, numHfPresets, coeff, gStride, passShift);
+
+                    // Group-split extra channels (alpha): the tile for this group follows the VarDCT AC in the
+                    // same section (all extra channels are in pass 0), decoded with the ModularAC stream id.
+                    if (extraGroupSplit && p == 0)
+                    {
+                        int tw = Math.Min(fp.GroupDim, w - (gx * fp.GroupDim));
+                        int th = Math.Min(fp.GroupDim, h - (gy * fp.GroupDim));
+                        var tileChans = new List<JxlChannel>();
+                        for (int e = 0; e < fp.NumExtra; e++)
+                        {
+                            tileChans.Add(new JxlChannel(tw, th));
+                        }
+
+                        JxlModular.DecodeSubModular(pb, tileChans, gTree, gCode, 1 + (3 * fp.NumLf) + 17 + (p * fp.NumGroups) + grp, fp.BitDepth);
+                        for (int e = 0; e < fp.NumExtra; e++)
+                        {
+                            for (int ty = 0; ty < th; ty++)
+                            {
+                                for (int tx = 0; tx < tw; tx++)
+                                {
+                                    extraOut![e][(((gy * fp.GroupDim) + ty) * w) + (gx * fp.GroupDim) + tx] = tileChans[e].Px[(ty * tw) + tx];
+                                }
+                            }
+                        }
+                    }
                 }
 
                 DequantHf(fp, hfCtx, dm, quant, groupLg, coeff, gStride);
