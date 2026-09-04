@@ -895,19 +895,10 @@ internal static class JxlModular
             throw new InvalidOperationException("JXL modular ANS stream did not end in the expected state.");
         }
 
-        for (int i = transforms.Count - 1; i >= 0; i--)
-        {
-            Transform t = transforms[i];
-            if (t.Id == 0)
-            {
-                InvRct(chans, t.BeginC, t.RctType);
-            }
-            else if (t.Id == 1)
-            {
-                InvPalette(chans, t, wpHdr, bitDepth);
-            }
-        }
-
+        // Invert every transform (RCT, Palette, and Squeeze) in reverse order. Squeeze was previously skipped
+        // here, so a single-group libjxl file whose channels were Squeeze-transformed (e.g. responsive/
+        // progressive Modular) decoded at the wrong resolution; UndoTransforms handles all three.
+        UndoTransforms(transforms, chans, wpHdr, bitDepth);
         return chans;
     }
 
@@ -1090,6 +1081,148 @@ internal static class JxlModular
                 }
             }
         }
+    }
+
+    // Forward horizontal squeeze: full-res row -> [avg(avgWidth) | residu(w/2)]. The exact inverse of
+    // InverseH, derived independently from the lifting relations (avg = A - FloorDiv2(A-B); residu = diff -
+    // Tendency(left, avg, nextAvg)). Used only by the round-trip test hook below.
+    private static void ForwardH(int[] px, int w, int h)
+    {
+        int avgWidth = (w + 1) / 2;
+        int pairs = w / 2;
+        var avg = new int[avgWidth];
+        var diff = new int[pairs];
+        var residu = new int[pairs];
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < pairs; x++)
+            {
+                int a = px[(y * w) + (2 * x)], b = px[(y * w) + (2 * x) + 1];
+                diff[x] = a - b;
+                avg[x] = a - FloorDiv2(diff[x]);
+            }
+
+            if (w % 2 == 1)
+            {
+                avg[avgWidth - 1] = px[(y * w) + w - 1];
+            }
+
+            // Compute residuals reading only the original samples (px[2x+1] for `left`), then write — writing
+            // in-place during this loop would clobber px[avgWidth+x] samples that later reads still need.
+            int left = avgWidth > 0 ? avg[0] : 0;
+            for (int x = 0; x < pairs; x++)
+            {
+                int nextAvg = x + 1 < avgWidth ? avg[x + 1] : avg[x];
+                residu[x] = diff[x] - Tendency(left, avg[x], nextAvg);
+                left = px[(y * w) + (2 * x) + 1];
+            }
+
+            for (int x = 0; x < avgWidth; x++)
+            {
+                px[(y * w) + x] = avg[x];
+            }
+
+            for (int x = 0; x < pairs; x++)
+            {
+                px[(y * w) + avgWidth + x] = residu[x];
+            }
+        }
+    }
+
+    private static void ForwardV(int[] px, int w, int h)
+    {
+        int avgHeight = (h + 1) / 2;
+        int pairs = h / 2;
+        var avg = new int[avgHeight];
+        var diff = new int[pairs];
+        var residu = new int[pairs];
+        for (int x = 0; x < w; x++)
+        {
+            for (int y = 0; y < pairs; y++)
+            {
+                int a = px[((2 * y) * w) + x], b = px[(((2 * y) + 1) * w) + x];
+                diff[y] = a - b;
+                avg[y] = a - FloorDiv2(diff[y]);
+            }
+
+            if (h % 2 == 1)
+            {
+                avg[avgHeight - 1] = px[((h - 1) * w) + x];
+            }
+
+            int top = avgHeight > 0 ? avg[0] : 0;
+            for (int y = 0; y < pairs; y++)
+            {
+                int nextAvg = y + 1 < avgHeight ? avg[y + 1] : avg[y];
+                residu[y] = diff[y] - Tendency(top, avg[y], nextAvg);
+                top = px[(((2 * y) + 1) * w) + x];
+            }
+
+            for (int y = 0; y < avgHeight; y++)
+            {
+                px[(y * w) + x] = avg[y];
+            }
+
+            for (int y = 0; y < pairs; y++)
+            {
+                px[((avgHeight + y) * w) + x] = residu[y];
+            }
+        }
+    }
+
+    // Test hook: forward-squeeze a single channel with the given params, then InvSqueeze, so a passing
+    // round-trip proves the inverse (used by the real decode path) is correct. Mirrors InvSqueeze's channel
+    // bookkeeping (avg stays in place, residual channel inserted after `end` for InPlace, appended otherwise).
+    internal static int[] TestSqueezeRoundTrip(int[] px, int w, int h, List<SqueezeParam> sp)
+    {
+        var chans = new List<JxlChannel> { new(w, h) { Px = (int[])px.Clone() } };
+        foreach (SqueezeParam s in sp)
+        {
+            int begin = s.BeginC, num = s.NumC, end = begin + num;
+            var residuals = new List<JxlChannel>();
+            for (int k = 0; k < num; k++)
+            {
+                JxlChannel ch = chans[begin + k];
+                if (s.Horizontal)
+                {
+                    ForwardH(ch.Px, ch.W, ch.H);
+                    int aw = (ch.W + 1) / 2, rw = ch.W / 2;
+                    var avgCh = new JxlChannel(aw, ch.H);
+                    var resCh = new JxlChannel(rw, ch.H);
+                    for (int y = 0; y < ch.H; y++)
+                    {
+                        Array.Copy(ch.Px, y * ch.W, avgCh.Px, y * aw, aw);
+                        Array.Copy(ch.Px, (y * ch.W) + aw, resCh.Px, y * rw, rw);
+                    }
+
+                    chans[begin + k] = avgCh;
+                    residuals.Add(resCh);
+                }
+                else
+                {
+                    ForwardV(ch.Px, ch.W, ch.H);
+                    int ah = (ch.H + 1) / 2, rh = ch.H / 2;
+                    var avgCh = new JxlChannel(ch.W, ah);
+                    var resCh = new JxlChannel(ch.W, rh);
+                    Array.Copy(ch.Px, 0, avgCh.Px, 0, ch.W * ah);
+                    Array.Copy(ch.Px, ch.W * ah, resCh.Px, 0, ch.W * rh);
+                    chans[begin + k] = avgCh;
+                    residuals.Add(resCh);
+                }
+            }
+
+            if (s.InPlace)
+            {
+                chans.InsertRange(end, residuals);
+            }
+            else
+            {
+                chans.AddRange(residuals);
+            }
+        }
+
+        InvSqueeze(chans, new Transform { Id = 2, Squeezes = sp });
+        return chans[0].Px;
     }
 
     /// <summary>

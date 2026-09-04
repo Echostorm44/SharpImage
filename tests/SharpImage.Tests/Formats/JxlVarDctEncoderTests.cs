@@ -1054,6 +1054,47 @@ public class JxlVarDctEncoderTests
         }
     }
 
+    // Squeeze (Modular transform id 2) inverse: the single-group decode path now inverts Squeeze (via the same
+    // UndoTransforms as the multi-group path) instead of silently skipping it, so a libjxl responsive/
+    // progressive Modular file whose channels were Squeeze-transformed decodes at the right resolution. Squeeze
+    // is lossless integer lifting, so a forward->inverse round-trip must be bit-exact. Covers InPlace/non-
+    // InPlace, horizontal+vertical, and odd dimensions.
+    [Test]
+    [Arguments(64, 48, true)]
+    [Arguments(63, 47, true)]   // odd dimensions (the (w+1)/2 avg / w/2 residual split edge case)
+    [Arguments(64, 48, false)]  // non-InPlace layout (residuals appended at the end)
+    public async Task Jxl_ModularSqueeze_InverseRoundTrips(int w, int h, bool inPlace)
+    {
+        var px = new int[w * h];
+        var rnd = new Random(5);
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                // Smooth base (where squeeze's tendency prediction matters) plus a little noise.
+                px[(y * w) + x] = ((x * 3) + (y * 5) + (rnd.Next(7) - 3)) & 0xFFF;
+            }
+        }
+
+        // Isolate: horizontal-only, vertical-only, then combined.
+        var hOnly = new System.Collections.Generic.List<SqueezeParam> { new() { Horizontal = true, InPlace = inPlace, BeginC = 0, NumC = 1 } };
+        var vOnly = new System.Collections.Generic.List<SqueezeParam> { new() { Horizontal = false, InPlace = inPlace, BeginC = 0, NumC = 1 } };
+        int[] rh = JxlModular.TestSqueezeRoundTrip(px, w, h, hOnly);
+        await Assert.That(rh.AsSpan().SequenceEqual(px)).IsTrue();
+        int[] rv = JxlModular.TestSqueezeRoundTrip(px, w, h, vOnly);
+        await Assert.That(rv.AsSpan().SequenceEqual(px)).IsTrue();
+
+        var sp = new System.Collections.Generic.List<SqueezeParam>
+        {
+            new() { Horizontal = true, InPlace = inPlace, BeginC = 0, NumC = 1 },
+            new() { Horizontal = false, InPlace = inPlace, BeginC = 0, NumC = 1 },
+        };
+
+        int[] recovered = JxlModular.TestSqueezeRoundTrip(px, w, h, sp);
+        await Assert.That(recovered.Length).IsEqualTo(px.Length);
+        await Assert.That(recovered.AsSpan().SequenceEqual(px)).IsTrue();
+    }
+
     // ICC transform layer: EncodeTransform -> DecodeTransform reproduces a raw ICC profile byte-exact, and
     // DecodeTransform reads real profiles compressed by the reference (the jxl-color test corpus / Windows
     // profiles), when VARDCT_ICC_DIR points at a directory of *.icc/*.icm files.
