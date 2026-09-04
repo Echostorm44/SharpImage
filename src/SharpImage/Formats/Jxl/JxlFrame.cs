@@ -616,12 +616,13 @@ internal static class JxlFrame
                 NumExtra = md.Extra,
             };
             float[][] rgb = JxlVarDct.Decode(cs, offsets, sizes, fp, null, null, out int[][]? extra, allowTruncated);
+            int maxV = (1 << md.Bps) - 1; // honor the declared output depth (e.g. 16-bit XYB files)
             var vc = new List<JxlChannel> { new(w, h), new(w, h), new(w, h) };
             for (int c = 0; c < 3; c++)
             {
                 for (int i = 0; i < w * h; i++)
                 {
-                    vc[c].Px[i] = Math.Clamp((int)MathF.Round(rgb[c][i] * 255f), 0, 255);
+                    vc[c].Px[i] = Math.Clamp((int)MathF.Round(rgb[c][i] * maxV), 0, maxV);
                 }
             }
 
@@ -632,7 +633,7 @@ internal static class JxlFrame
                 var a = new JxlChannel(w, h);
                 for (int i = 0; i < w * h; i++)
                 {
-                    a.Px[i] = Math.Clamp(extra![0][i], 0, 255);
+                    a.Px[i] = Math.Clamp(extra![0][i], 0, maxV);
                 }
 
                 vc.Add(a);

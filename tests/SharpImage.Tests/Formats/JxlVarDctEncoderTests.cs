@@ -1093,10 +1093,13 @@ public class JxlVarDctEncoderTests
         await Assert.That(llr.Width).IsEqualTo(w);
         await Assert.That(llPsnr).IsGreaterThan(80.0); // lossless => exact
 
-        // Lossy at several quality levels: round-trips, correct dims, monotone-ish quality.
+        // Lossy at several quality levels: round-trips, correct dims, monotone-ish quality. VARDCT_DEEP_EFFORT
+        // (default 7) lets the corpus cross-check sweep run fast (effort 1 = single-pass) — decodability is
+        // what the sweep validates, not block-refinement quality.
+        int effort = int.TryParse(Environment.GetEnvironmentVariable("VARDCT_DEEP_EFFORT"), out int ef) ? ef : 7;
         foreach (int q in new[] { 90, 75, 50 })
         {
-            byte[] cs = SharpImage.Formats.JxlCoder.EncodeLossy(frame, q);
+            byte[] cs = SharpImage.Formats.JxlCoder.EncodeLossy(frame, q, effort);
             JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
             System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, $"{name}_q{q}.jxl"), cs);
             double ps = PsnrRgb(r);
