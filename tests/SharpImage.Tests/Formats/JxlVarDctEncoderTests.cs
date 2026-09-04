@@ -327,6 +327,138 @@ public class JxlVarDctEncoderTests
         await Assert.That(true).IsTrue();
     }
 
+    // Self-contained multi-LF-group regression: images larger than one 2048px LF group tile into
+    // numLf > 1. DC + HfMetadata are independent per-LF-group modular sub-streams (prediction never
+    // crosses an LF boundary), so the encoder must slice them per group; a bug there round-trips wrong.
+    // 2100x300 => 2x1 LF groups (horizontal split); 300x2100 => 1x2 (vertical split).
+    [Test]
+    [Arguments(2100, 300)]
+    [Arguments(300, 2100)]
+    public async Task VarDct_MultiLfGroup_RoundTrips(int w, int h)
+    {
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                // Detail across the LF-group boundary so AC coefficients (not just flat DC) are exercised.
+                float r = 0.5f + (0.4f * MathF.Sin(x * 0.05f) * MathF.Cos(y * 0.03f));
+                float g = (float)x / (w - 1);
+                float b = 0.5f + (0.3f * MathF.Sin((x + y) * 0.02f));
+                int o = x * 3;
+                row[o] = (ushort)(Math.Clamp(r, 0f, 1f) * Quantum.MaxValue);
+                row[o + 1] = (ushort)(Math.Clamp(g, 0f, 1f) * Quantum.MaxValue);
+                row[o + 2] = (ushort)(Math.Clamp(b, 0f, 1f) * Quantum.MaxValue);
+            }
+        }
+
+        byte[] cs = JxlEncoder.EncodeVarDct(frame, 1.5f);
+        JxlModularResult r2 = JxlFrame.DecodeModularCodestream(cs);
+        await Assert.That(r2.Width).IsEqualTo(w);
+        await Assert.That(r2.Height).IsEqualTo(h);
+
+        double mse = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    double diff = Quantum.ScaleToByte(srow[(x * 3) + c]) - r2.Channels[c].Px[(y * w) + x];
+                    mse += diff * diff;
+                }
+            }
+        }
+
+        mse /= 3.0 * w * h;
+        double psnr = 10.0 * Math.Log10(255.0 * 255.0 / mse);
+        await Assert.That(psnr).IsGreaterThan(30.0);
+    }
+
+    // Multi-group / multi-LF-group verification. Reads a P6 PPM of ANY size (its own dimensions),
+    // encodes at a few distances, round-trips through our own decoder for a sanity PSNR, and dumps the
+    // .jxl so the harness can decode it in jxl-oxide AND libjxl (the real garbling test). Gated on
+    // VARDCT_LARGE_DIR (out) + VARDCT_LARGE_SRC (a binary PPM).
+    [Test]
+    public async Task VarDct_LargeImage_MultiGroup()
+    {
+        string outDir = Environment.GetEnvironmentVariable("VARDCT_LARGE_DIR");
+        string srcPpm = Environment.GetEnvironmentVariable("VARDCT_LARGE_SRC");
+        if (string.IsNullOrEmpty(outDir) || string.IsNullOrEmpty(srcPpm))
+        {
+            return; // measurement-only
+        }
+
+        byte[] raw = System.IO.File.ReadAllBytes(srcPpm);
+        int p = 0;
+        string Token()
+        {
+            while (p < raw.Length && (raw[p] == ' ' || raw[p] == '\n' || raw[p] == '\r' || raw[p] == '\t')) p++;
+            int s = p;
+            while (p < raw.Length && raw[p] != ' ' && raw[p] != '\n' && raw[p] != '\r' && raw[p] != '\t') p++;
+            return System.Text.Encoding.ASCII.GetString(raw, s, p - s);
+        }
+        Token(); // "P6"
+        int w = int.Parse(Token()), h = int.Parse(Token());
+        Token(); // maxval
+        p++;     // single whitespace after maxval
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * 3, ip = p + (((y * w) + x) * 3);
+                for (int c = 0; c < 3; c++)
+                {
+                    row[o + c] = Quantum.ScaleFromByte(raw[ip + c]);
+                }
+            }
+        }
+
+        Console.Error.WriteLine($"[LARGE] {w}x{h}");
+        if (Environment.GetEnvironmentVariable("VARDCT_LARGE_LOSSY") != null)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            byte[] lossy = SharpImage.Formats.JxlCoder.EncodeLossy(frame, 75);
+            sw.Stop();
+            JxlModularResult lr = JxlFrame.DecodeModularCodestream(lossy);
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(outDir, "large_lossy.jxl"), lossy);
+            Console.Error.WriteLine($"[LARGE] EncodeLossy(q75): {lossy.Length} bytes in {sw.ElapsedMilliseconds} ms, decoded {lr.Width}x{lr.Height}");
+            await Assert.That(lr.Width).IsEqualTo(w);
+            await Assert.That(lr.Height).IsEqualTo(h);
+        }
+
+        foreach (float d in new[] { 1.0f, 2.0f })
+        {
+            byte[] cs = JxlEncoder.EncodeVarDct(frame, d);
+            JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+            double mse = 0;
+            for (int y = 0; y < h; y++)
+            {
+                var srow = frame.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    for (int c = 0; c < 3; c++)
+                    {
+                        double diff = Quantum.ScaleToByte(srow[(x * 3) + c]) - r.Channels[c].Px[(y * w) + x];
+                        mse += diff * diff;
+                    }
+                }
+            }
+
+            mse /= 3.0 * w * h;
+            double psnr = 10.0 * Math.Log10(255.0 * 255.0 / mse);
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(outDir, $"large_d{d}.jxl"), cs);
+            Console.Error.WriteLine($"[LARGE] ours d={d}: {cs.Length} bytes, self-decode {psnr:F2} dB");
+            await Assert.That(psnr).IsGreaterThan(28.0);
+        }
+    }
+
     [Test]
     public async Task JxlCoder_EncodeLossy_QualityKnob_Monotonic()
     {

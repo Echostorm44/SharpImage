@@ -27,7 +27,7 @@ namespace SharpImage.Formats.Jxl;
 internal static partial class JxlEncoder
 {
     private const int VarDctGroupDim = 256;       // VarDCT group side (fixed)
-    private const int VarDctLfGroupDim = 256 * 8; // 2048 — one LF group; larger needs numLf > 1 (todo)
+    private const int VarDctLfGroupDim = 256 * 8; // 2048 — one LF group; larger images tile into numLf > 1
 
     /// <summary>
     /// Encodes an image as a lossy XYB VarDCT JPEG XL codestream (single group, all-8x8 DCT).
@@ -43,11 +43,6 @@ internal static partial class JxlEncoder
         if (w <= 0 || h <= 0)
         {
             throw new InvalidOperationException("Cannot encode an empty image.");
-        }
-
-        if (w > VarDctLfGroupDim || h > VarDctLfGroupDim)
-        {
-            throw new NotSupportedException("VarDCT encoder currently supports images up to 2048x2048 (one LF group).");
         }
 
         // Full per-pass shift list: the caller's coarse shifts followed by the mandatory final shift 0.
@@ -84,10 +79,11 @@ internal static partial class JxlEncoder
     }
 
     /// <summary>
-    /// Whether the VarDCT (lossy) encoder can handle this image (single LF group, i.e. <= 2048x2048).
+    /// Whether the VarDCT (lossy) encoder can handle this image. Images are tiled into 2048x2048 LF groups,
+    /// so any positive size is supported.
     /// </summary>
     public static bool CanEncodeVarDct(ImageFrame image) =>
-        image.Columns > 0 && image.Rows > 0 && image.Columns <= VarDctLfGroupDim && image.Rows <= VarDctLfGroupDim;
+        image.Columns > 0 && image.Rows > 0;
 
     /// <summary>
     /// Encodes an image as a lossy VarDCT JPEG XL codestream at the given Butteraugli-style
@@ -120,11 +116,6 @@ internal static partial class JxlEncoder
     public static byte[] EncodeVarDctRefined(ImageFrame image, float distance, int iters = 4, int[]? passShifts = null, bool perceptual = true)
     {
         int w = (int)image.Columns, h = (int)image.Rows;
-        if (w > VarDctLfGroupDim || h > VarDctLfGroupDim)
-        {
-            throw new NotSupportedException("VarDCT encoder currently supports images up to 2048x2048 (one LF group).");
-        }
-
         (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
         int bw = (w + 7) / 8, bh = (h + 7) / 8, stride = bw * 8, strideH = bh * 8;
         var fp = new VarDctFrameParams();
@@ -261,11 +252,6 @@ internal static partial class JxlEncoder
     public static byte[] EncodeVarDctBlockRefined(ImageFrame image, float distance, int iters = 5, int[]? passShifts = null)
     {
         int w = (int)image.Columns, h = (int)image.Rows;
-        if (w > VarDctLfGroupDim || h > VarDctLfGroupDim)
-        {
-            throw new NotSupportedException("VarDCT encoder currently supports images up to 2048x2048 (one LF group).");
-        }
-
         (uint gs, uint qlf, uint hfm) = QuantForDistance(distance);
         int bw = (w + 7) / 8, bh = (h + 7) / 8, stride = bw * 8, strideH = bh * 8;
         var fp = new VarDctFrameParams();
@@ -829,104 +815,169 @@ internal static partial class JxlEncoder
 
         // Build the LfGroup modular sub-images. libjxl (and jxl-oxide) require a *global* MA tree in
         // LfGlobal that every sub-image references (use_global_tree = true); local per-image trees are
-        // rejected. We use a single-leaf ClampedGradient tree and one shared histogram over all channels
-        // of both sub-images.
-        var dcImage = new List<SubChannel> { new(dcY, bw, bh), new(dcX, bw, bh), new(dcB, bw, bh) };
+        // rejected. There is one LfGroup per 2048x2048 tile (256x256 blocks): DC + HfMetadata are separate
+        // per-LF-group modular sub-streams whose prediction NEVER crosses an LF-group boundary, so we slice
+        // the full-image DC/CfL/block metadata into per-group sub-images. Every sub-image shares the ONE
+        // global MA tree learned over all of them; the tree keys on stream id (property 1), so encoder and
+        // decoder must agree on it: DC(lg) = 1 + lg, HfMetadata(lg) = 1 + 2*numLf + lg.
+        const int lfBlocks = VarDctLfGroupDim / 8;          // 256 blocks per LF-group side
+        int lfPerRow = (bw + lfBlocks - 1) / lfBlocks;
+        int lfPerCol = (bh + lfBlocks - 1) / lfBlocks;
+        int numLf = lfPerRow * lfPerCol;
+        const int dcWpMode = 0;
+        WpHeader dcWp = WpMode(dcWpMode);
 
-        // Block info is one entry per DATA block in raster visitation order (skipping covered positions):
-        // row0 = dct_select, row1 = hf_mul - 1. This is also the order the HF pass codes coefficients in.
-        var dataBlocks = new List<int>();
-        for (int pos = 0; pos < nbData; pos++)
+        var lfDcChans = new List<EncChannel>[numLf];
+        var lfMetaChans = new List<EncChannel>[numLf];
+        var lfDcSub = new List<SubChannel>[numLf];          // same data, for the gradient fallback path
+        var lfMetaSub = new List<SubChannel>[numLf];
+        var lfBwArr = new int[numLf];
+        var lfBhArr = new int[numLf];
+        var lfNbBlocks = new int[numLf];
+        var learnRefs = new List<EncChannelRef>();
+        for (int lg = 0; lg < numLf; lg++)
         {
-            if (sizeAt[pos] >= 0)
+            int lgx = lg % lfPerRow, lgy = lg / lfPerRow;
+            int bx0 = lgx * lfBlocks, by0 = lgy * lfBlocks;
+            int lfBw = Math.Min(lfBlocks, bw - bx0);
+            int lfBh = Math.Min(lfBlocks, bh - by0);
+            lfBwArr[lg] = lfBw; lfBhArr[lg] = lfBh;
+
+            // DC image (Y, X, B), sliced from the full-image DC in LF-group-local raster.
+            var dY = new int[lfBw * lfBh];
+            var dX = new int[lfBw * lfBh];
+            var dB = new int[lfBw * lfBh];
+            for (int y = 0; y < lfBh; y++)
             {
-                dataBlocks.Add(pos);
+                for (int x = 0; x < lfBw; x++)
+                {
+                    int src = ((by0 + y) * bw) + bx0 + x, dst = (y * lfBw) + x;
+                    dY[dst] = dcY[src]; dX[dst] = dcX[src]; dB[dst] = dcB[src];
+                }
+            }
+
+            // CfL grid slice (64px cells). The LF group starts at cell (lgx*32, lgy*32); its cell extent is
+            // (lfW+63)/64 x (lfH+63)/64 where lfW/lfH are the group's pixel dims (matches the decoder).
+            int lfW = Math.Min(VarDctLfGroupDim, w - (lgx * VarDctLfGroupDim));
+            int lfH = Math.Min(VarDctLfGroupDim, h - (lgy * VarDctLfGroupDim));
+            int cfWlg = (lfW + 63) / 64, cfHlg = (lfH + 63) / 64;
+            int cx0 = lgx * (VarDctLfGroupDim / 64), cy0 = lgy * (VarDctLfGroupDim / 64); // 32 cells / LF group
+            var kX = new int[cfWlg * cfHlg];
+            var kB = new int[cfWlg * cfHlg];
+            for (int cy = 0; cy < cfHlg; cy++)
+            {
+                for (int cx = 0; cx < cfWlg; cx++)
+                {
+                    int src = ((cy0 + cy) * cfW) + cx0 + cx, dst = (cy * cfWlg) + cx;
+                    kX[dst] = cflKx[src]; kB[dst] = cflKb[src];
+                }
+            }
+
+            // Block info: one entry per DATA block in LF-group-local raster visitation order (skipping covered
+            // positions): row0 = dct_select, row1 = hf_mul - 1. Blocks (max 4x4) never cross a 2048px boundary,
+            // so each LF group's blocks are self-contained.
+            var dataBlocks = new List<int>();
+            for (int y = 0; y < lfBh; y++)
+            {
+                for (int x = 0; x < lfBw; x++)
+                {
+                    int pos = ((by0 + y) * bw) + bx0 + x;
+                    if (sizeAt[pos] >= 0)
+                    {
+                        dataBlocks.Add(pos);
+                    }
+                }
+            }
+
+            int nbLg = dataBlocks.Count;
+            lfNbBlocks[lg] = nbLg;
+            var bInfo = new int[nbLg * 2];
+            for (int di = 0; di < nbLg; di++)
+            {
+                int pos = dataBlocks[di];
+                bInfo[di] = sizeAt[pos];                     // dct_select
+                bInfo[nbLg + di] = blockHfMuls[pos] - 1;     // hf_mul - 1
+            }
+
+            // EPF sharpness index per block (0..7): 0 == EPF off. The frame-header EPF path is wired, but EPF
+            // blurs to reduce ringing and SSIMULACRA2 penalises that blur, so it stays off for our metric.
+            var sharp = new int[lfBw * lfBh];
+
+            var dcChans = new List<EncChannel> { new(dY, lfBw, lfBh), new(dX, lfBw, lfBh), new(dB, lfBw, lfBh) };
+            var metaChans = new List<EncChannel>
+            {
+                new(kX, cfWlg, cfHlg),        // x_from_y (per-cell CfL)
+                new(kB, cfWlg, cfHlg),        // b_from_y (per-cell CfL)
+                new(bInfo, nbLg, 2),          // block info
+                new(sharp, lfBw, lfBh),       // sharpness (EPF)
+            };
+            lfDcChans[lg] = dcChans;
+            lfMetaChans[lg] = metaChans;
+            lfDcSub[lg] = new List<SubChannel> { new(dY, lfBw, lfBh), new(dX, lfBw, lfBh), new(dB, lfBw, lfBh) };
+            lfMetaSub[lg] = new List<SubChannel> { new(kX, cfWlg, cfHlg), new(kB, cfWlg, cfHlg), new(bInfo, nbLg, 2), new(sharp, lfBw, lfBh) };
+
+            int dcSid = 1 + lg, metaSid = 1 + (2 * numLf) + lg;
+            for (int c = 0; c < dcChans.Count; c++)
+            {
+                learnRefs.Add(new EncChannelRef(dcChans[c].Data, dcChans[c].W, dcChans[c].H, c, dcSid, RefsFor(dcChans, c)));
+            }
+
+            for (int c = 0; c < metaChans.Count; c++)
+            {
+                learnRefs.Add(new EncChannelRef(metaChans[c].Data, metaChans[c].W, metaChans[c].H, c, metaSid, RefsFor(metaChans, c)));
             }
         }
 
-        int nbBlocks = dataBlocks.Count;
-        var blockInfo = new int[nbBlocks * 2];
-        for (int di = 0; di < nbBlocks; di++)
-        {
-            int pos = dataBlocks[di];
-            blockInfo[di] = sizeAt[pos];                     // dct_select
-            blockInfo[nbBlocks + di] = blockHfMuls[pos] - 1; // hf_mul - 1
-        }
-
-        // EPF sharpness index per block (0..7): selects EpfSharpLut[sp] in the decoder's sigma. Left 0 (EPF
-        // off): the frame-header EPF path is wired (WriteVarDctFrameHeader epfIters), but measured harmful on
-        // SSIMULACRA2 — EPF blurs to reduce ringing and SSIMULACRA2 penalises that blur (detail-loss term).
-        // It is a Butteraugli-tuned filter, so it stays off for our target metric.
-        var sharpness = new int[bw * bh];
-
-        var hfMeta = new List<SubChannel>
-        {
-            new(cflKx, cfW, cfH),                  // x_from_y (per-cell CfL)
-            new(cflKb, cfW, cfH),                  // b_from_y (per-cell CfL)
-            new(blockInfo, nbBlocks, 2),           // block info
-            new(sharpness, bw, bh),                // sharpness (EPF)
-        };
-
-        // The DC image (3 channels) and HfMetadata (4 channels) are two sub-modular streams that share one
-        // global MA tree in LfGlobal. Encode them with the (libjxl-matching) lossless modular machinery: a
-        // learned tree over both streams' channels + the weighted predictor + clustered ANS histograms.
-        // Decoder stream ids (== group property): DC = 1 + lfGroupIdx, HfMetadata = 1 + 2*numLf + lfGroupIdx
-        // (numLf == 1, lfGroupIdx == 0).
-        const int dcStreamId = 1, metaStreamId = 3, dcWpMode = 0;
-        WpHeader dcWp = WpMode(dcWpMode);
-        var dcChans = new List<EncChannel> { new(dcY, bw, bh), new(dcX, bw, bh), new(dcB, bw, bh) };
-        var metaChans = new List<EncChannel>
-        {
-            new(cflKx, cfW, cfH),
-            new(cflKb, cfW, cfH),
-            new(blockInfo, nbBlocks, 2),
-            new(sharpness, bw, bh),
-        };
-
-        var learnRefs = new List<EncChannelRef>();
-        for (int c = 0; c < dcChans.Count; c++)
-        {
-            learnRefs.Add(new EncChannelRef(dcChans[c].Data, dcChans[c].W, dcChans[c].H, c, dcStreamId, RefsFor(dcChans, c)));
-        }
-
-        for (int c = 0; c < metaChans.Count; c++)
-        {
-            learnRefs.Add(new EncChannelRef(metaChans[c].Data, metaChans[c].W, metaChans[c].H, c, metaStreamId, RefsFor(metaChans, c)));
-        }
-
+        // One global MA tree over every LF group's DC + HfMetadata channels (with the correct stream ids).
         var dcTree = new LearnedTree(JxlTreeLearner.Learn(learnRefs, dcWp, DcNodeThreshold));
 
-        int dcLen = 0;
-        foreach (EncChannel ch in dcChans)
+        // Residual tokens per sub-image, in stream order [DC0, meta0, DC1, meta1, ...]. dcOps[i]/streamCtx[i]
+        // index into this order; WriteLfGroup(lg) writes streams 2*lg (DC) and 2*lg+1 (HfMetadata).
+        var dcStreams = new List<(int[], int[])>(2 * numLf);
+        var streamCtx = new List<int[]>(2 * numLf);
+        int dcMaxTok = 0;
+        for (int lg = 0; lg < numLf; lg++)
         {
-            dcLen += ch.W * ch.H;
+            List<EncChannel> dcChans = lfDcChans[lg], metaChans = lfMetaChans[lg];
+            int dcSid = 1 + lg, metaSid = 1 + (2 * numLf) + lg;
+
+            int dcLen = 0;
+            foreach (EncChannel ch in dcChans)
+            {
+                dcLen += ch.W * ch.H;
+            }
+
+            var dcStream = new int[dcLen];
+            var dcCtx = new int[dcLen];
+            int dcOff = 0;
+            for (int c = 0; c < dcChans.Count; c++)
+            {
+                ComputeResidualTokensCtx(dcChans[c], c, dcTree, dcStream, dcCtx, dcOff, ref dcMaxTok, dcWp, RefsFor(dcChans, c), dcSid);
+                dcOff += dcChans[c].W * dcChans[c].H;
+            }
+
+            dcStreams.Add((dcStream, dcCtx));
+            streamCtx.Add(dcCtx);
+
+            int metaLen = 0;
+            foreach (EncChannel ch in metaChans)
+            {
+                metaLen += ch.W * ch.H;
+            }
+
+            var metaStream = new int[metaLen];
+            var metaCtx = new int[metaLen];
+            int metaOff = 0;
+            for (int c = 0; c < metaChans.Count; c++)
+            {
+                ComputeResidualTokensCtx(metaChans[c], c, dcTree, metaStream, metaCtx, metaOff, ref dcMaxTok, dcWp, RefsFor(metaChans, c), metaSid);
+                metaOff += metaChans[c].W * metaChans[c].H;
+            }
+
+            dcStreams.Add((metaStream, metaCtx));
+            streamCtx.Add(metaCtx);
         }
 
-        int metaLen = 0;
-        foreach (EncChannel ch in metaChans)
-        {
-            metaLen += ch.W * ch.H;
-        }
-
-        var dcStream = new int[dcLen];
-        var dcCtx = new int[dcLen];
-        var metaStream = new int[metaLen];
-        var metaCtx = new int[metaLen];
-        int dcMaxTok = 0, dcOff = 0;
-        for (int c = 0; c < dcChans.Count; c++)
-        {
-            ComputeResidualTokensCtx(dcChans[c], c, dcTree, dcStream, dcCtx, dcOff, ref dcMaxTok, dcWp, RefsFor(dcChans, c), dcStreamId);
-            dcOff += dcChans[c].W * dcChans[c].H;
-        }
-
-        int metaOff = 0;
-        for (int c = 0; c < metaChans.Count; c++)
-        {
-            ComputeResidualTokensCtx(metaChans[c], c, dcTree, metaStream, metaCtx, metaOff, ref dcMaxTok, dcWp, RefsFor(metaChans, c), metaStreamId);
-            metaOff += metaChans[c].W * metaChans[c].H;
-        }
-
-        var dcStreams = new List<(int[], int[])> { (dcStream, dcCtx), (metaStream, metaCtx) };
         PixelPlanCtx dcPlan = PlanPixelsCtx(dcStreams, dcTree.LeafCount, out List<Op>[] dcOps, out long[][] dcRawCtxHist, int.MaxValue / 2);
         int dcLogAlpha = Math.Max(5, JxlBits.CeilLog2(dcPlan.LitAlphabet));
         // Re-cluster the DC/HfMeta contexts with the total-cost criterion (same header-overhead issue as the
@@ -968,22 +1019,29 @@ internal static partial class JxlEncoder
             dcAns = new JxlAnsWriter(dcAnsCounts, dcLogAlpha);
         }
 
-        // Fallback (rare, very fine quant): the earlier single-leaf gradient + one-histogram sub-images.
-        List<ModToken> dcTokens = useLearnedDc ? null! : GradientTokens(dcImage);
-        List<ModToken> metaTokens = useLearnedDc ? null! : GradientTokens(hfMeta);
+        // Fallback (rare, very fine quant): single-leaf gradient + one shared histogram over every LF group's
+        // DC and HfMetadata sub-images. Per-LF-group token lists, indexed [lg].
+        var lfDcTokens = new List<ModToken>[numLf];
+        var lfMetaTokens = new List<ModToken>[numLf];
         var modHist = new long[1];
         int modLogAlpha = 5;
         int[] modNorm = null!;
         var fallbackLeaf = new LearnedTree(new MaTreeNode { Property = -1, Predictor = 5 });
         if (!useLearnedDc)
         {
-            AccumulateHist(dcTokens, ref modHist);
-            AccumulateHist(metaTokens, ref modHist);
+            for (int lg = 0; lg < numLf; lg++)
+            {
+                lfDcTokens[lg] = GradientTokens(lfDcSub[lg]);
+                lfMetaTokens[lg] = GradientTokens(lfMetaSub[lg]);
+                AccumulateHist(lfDcTokens[lg], ref modHist);
+                AccumulateHist(lfMetaTokens[lg], ref modHist);
+            }
+
             modLogAlpha = Math.Max(5, JxlBits.CeilLog2(modHist.Length));
             modNorm = JxlEntropy.NormalizeCounts(modHist, JxlEntropy.HistShift);
         }
 
-        // Group layout: 256px groups (32 blocks). numLf == 1 for images <= 2048px (one LF group).
+        // Group layout: 256px groups (32 blocks). LF groups are 2048px (8x8 groups); a group never spans two.
         const int groupBlocks = VarDctGroupDim / 8; // 32
         int groupsPerRow = (w + VarDctGroupDim - 1) / VarDctGroupDim;
         int groupsPerCol = (h + VarDctGroupDim - 1) / VarDctGroupDim;
@@ -1087,8 +1145,6 @@ internal static partial class JxlEncoder
             (passMap[p], passClusterNorm[p], int _) = ClusterContextsTotalCost(ctxHist, alphabet, MaxHfClusters, passLogAlpha[p]);
         }
 
-        int nbBits = BitLength(NextPow2(bw * bh));
-
         void WriteLfGlobal(JxlBitWriter b)
         {
             b.WriteBool(true);  // lf_channel_dequant all_default {1/32, 1/4, 1/2}
@@ -1109,20 +1165,22 @@ internal static partial class JxlEncoder
             }
         }
 
-        void WriteLfGroup(JxlBitWriter b)
+        void WriteLfGroup(JxlBitWriter b, int lg)
         {
+            // num_blocks field width is per-LF-group: BitLength(NextPow2(lfBw*lfBh)) (matches the decoder).
+            int nbBits = BitLength(NextPow2(lfBwArr[lg] * lfBhArr[lg]));
             b.WriteBits(0, 2);  // extra_precision = 0
             if (useLearnedDc)
             {
-                WriteSubModularOps(b, dcOps[0], dcCtx, dcPlan, dcAns, dcWpMode);
-                b.WriteBits((uint)(nbBlocks - 1), nbBits); // HfMetadata num_blocks
-                WriteSubModularOps(b, dcOps[1], metaCtx, dcPlan, dcAns, dcWpMode);
+                WriteSubModularOps(b, dcOps[2 * lg], streamCtx[2 * lg], dcPlan, dcAns, dcWpMode);
+                b.WriteBits((uint)(lfNbBlocks[lg] - 1), nbBits); // HfMetadata num_blocks
+                WriteSubModularOps(b, dcOps[(2 * lg) + 1], streamCtx[(2 * lg) + 1], dcPlan, dcAns, dcWpMode);
             }
             else
             {
-                WriteSubModularUsingGlobal(b, dcTokens, modNorm, modLogAlpha);
-                b.WriteBits((uint)(nbBlocks - 1), nbBits);
-                WriteSubModularUsingGlobal(b, metaTokens, modNorm, modLogAlpha);
+                WriteSubModularUsingGlobal(b, lfDcTokens[lg], modNorm, modLogAlpha);
+                b.WriteBits((uint)(lfNbBlocks[lg] - 1), nbBits);
+                WriteSubModularUsingGlobal(b, lfMetaTokens[lg], modNorm, modLogAlpha);
             }
         }
 
@@ -1152,26 +1210,30 @@ internal static partial class JxlEncoder
             ans.Encode(b, ansToks);
         }
 
-        if (numGroups == 1 && numPasses == 1)
+        if (numGroups == 1 && numPasses == 1 && numLf == 1)
         {
-            // Single group + single pass => one continuous TOC section.
+            // Single LF group + single group + single pass => one continuous TOC section.
             var body = new JxlBitWriter();
             WriteLfGlobal(body);
-            WriteLfGroup(body);
+            WriteLfGroup(body, 0);
             WriteHfGlobal(body);
             WritePassGroup(body, 0, 0);
             return new List<byte[]> { body.ToArray() };
         }
 
-        // Multi-section TOC: LfGlobal | LfGroup (numLf == 1) | HfGlobal | PassGroups. Section index for a
-        // pass group is 2 + numLf + pass*numGroups + group, so emit pass-major.
+        // Multi-section TOC: LfGlobal | LfGroup[0..numLf) | HfGlobal | PassGroups. LF groups are in raster
+        // order; the pass-group section index is 2 + numLf + pass*numGroups + group, so emit pass-major.
         var sections = new List<byte[]>();
         var lfg = new JxlBitWriter();
         WriteLfGlobal(lfg);
         sections.Add(lfg.ToArray());
-        var lgr = new JxlBitWriter();
-        WriteLfGroup(lgr);
-        sections.Add(lgr.ToArray());
+        for (int lg = 0; lg < numLf; lg++)
+        {
+            var lgr = new JxlBitWriter();
+            WriteLfGroup(lgr, lg);
+            sections.Add(lgr.ToArray());
+        }
+
         var hfg = new JxlBitWriter();
         WriteHfGlobal(hfg);
         sections.Add(hfg.ToArray());

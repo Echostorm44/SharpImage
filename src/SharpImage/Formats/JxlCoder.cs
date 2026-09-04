@@ -61,8 +61,8 @@ public static class JxlCoder
 
     /// <summary>
     /// Encodes an image as a lossy JPEG XL codestream (XYB VarDCT). <paramref name="quality"/> is a
-    /// JPEG-style value in [1,100] (higher = better). Images larger than one LF group (2048x2048) are not
-    /// yet supported by the VarDCT encoder and fall back to lossless so the output is always valid.
+    /// JPEG-style value in [1,100] (higher = better). Any positive size is supported: the frame is tiled
+    /// into 2048x2048 LF groups and 256px coding groups.
     /// </summary>
     public static byte[] EncodeLossy(ImageFrame image, int quality = 75)
     {
@@ -72,6 +72,16 @@ public static class JxlCoder
         }
 
         float distance = Jxl.JxlEncoder.DistanceFromQuality(quality);
+
+        // The block-refined path runs several encode->decode->SSIMULACRA2 roundtrips to close the
+        // coarse-quant "cliff"; its cost scales with pixels, so cap it by megapixels and use the fast
+        // single-pass encoder above the cap. (A proper speed/effort dial is future work.)
+        const long BlockRefineMaxPixels = 2_000_000;
+        if ((long)image.Columns * image.Rows > BlockRefineMaxPixels)
+        {
+            return Jxl.JxlEncoder.EncodeVarDct(image, distance);
+        }
+
         return Jxl.JxlEncoder.EncodeVarDctBlockRefined(image, distance);
     }
 
