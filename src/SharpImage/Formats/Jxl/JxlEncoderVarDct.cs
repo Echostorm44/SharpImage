@@ -942,12 +942,10 @@ internal static partial class JxlEncoder
                 }
             }
 
-            passMap[p] = ClusterContexts(ctxHist, alphabet, MaxHfClusters, out long[][] clusterHist, out int k);
-            passClusterNorm[p] = new int[k][];
-            for (int cIdx = 0; cIdx < k; cIdx++)
-            {
-                passClusterNorm[p][cIdx] = JxlEntropy.NormalizeCounts(clusterHist[cIdx], JxlEntropy.HistShift);
-            }
+            // Pick the number of histograms K that minimises the REAL total: symbol coding (cross-entropy
+            // under each cluster's quantised histogram) + the actual encoded header (context map + the K
+            // histograms, measured by encoding). Cheap on small/coarse data where the header dominates.
+            (passMap[p], passClusterNorm[p], int _) = ClusterContextsTotalCost(ctxHist, alphabet, MaxHfClusters, passLogAlpha[p]);
         }
 
         int nbBits = BitLength(NextPow2(bw * bh));
@@ -1071,6 +1069,211 @@ internal static partial class JxlEncoder
     }
 
     private const int MaxHfClusters = 64; // cap on distinct HfDist histograms per pass
+
+    // Seed histograms greedily (libjxl FastClusterHistograms order: largest, then farthest-by-merge-cost),
+    // recording the seed order and each context's merge cost to every seed. Then pick the K that minimises
+    // total bits = coding(first K seeds) + K*headerCost — the correct trade the per-seed distance threshold
+    // can't make, since a seed's true benefit is the coding it saves across ALL contexts that pick it, not
+    // its own merge distance. Small/coarse data => few histograms; rich data => many.
+    // Actual ANS coding cost of a histogram under its OWN quantized (HistShift) normalisation — unlike ideal
+    // entropy, this charges the quantisation loss that hits small clusters hardest, so the total-cost search
+    // doesn't over-value splitting into many tiny histograms.
+    private static double NormalizedCost(long[] hist)
+    {
+        long total = 0;
+        foreach (long v in hist)
+        {
+            total += v;
+        }
+
+        if (total == 0)
+        {
+            return 0;
+        }
+
+        int[] norm = JxlEntropy.NormalizeCounts(hist, JxlEntropy.HistShift);
+        long tableSum = 0;
+        foreach (int v in norm)
+        {
+            tableSum += v;
+        }
+
+        double cost = 0, invLog2 = 1.0 / Math.Log(2);
+        for (int i = 0; i < hist.Length; i++)
+        {
+            if (hist[i] > 0)
+            {
+                cost -= hist[i] * Math.Log((double)norm[i] / tableSum) * invLog2;
+            }
+        }
+
+        return cost;
+    }
+
+    private static (int[] Map, int[][] Norm, int K) ClusterContextsTotalCost(long[][] ctxHist, int alphabet, int maxHistograms, int hfLogAlpha)
+    {
+        int n = ctxHist.Length;
+        var entropy = new double[n];
+        var total = new long[n];
+        for (int i = 0; i < n; i++)
+        {
+            foreach (long v in ctxHist[i])
+            {
+                total[i] += v;
+            }
+
+            entropy[i] = total[i] == 0 ? 0 : Bits(ctxHist[i]);
+        }
+
+        // Greedy seeding.
+        var seeds = new List<int>();
+        var dist = new double[n];
+        Array.Fill(dist, double.MaxValue);
+        var distToSeed = new List<double[]>(); // distToSeed[s][i] = merge cost of context i with seed s
+        int largest = 0;
+        for (int i = 1; i < n; i++)
+        {
+            if (total[i] > total[largest])
+            {
+                largest = i;
+            }
+        }
+
+        while (seeds.Count < maxHistograms)
+        {
+            int seedCtx = largest;
+            seeds.Add(seedCtx);
+            dist[seedCtx] = 0;
+            double seedEntropy = entropy[seedCtx];
+            var d2s = new double[n];
+            largest = -1;
+            for (int i = 0; i < n; i++)
+            {
+                double d = total[i] == 0 ? 0 : Bits(Sum(ctxHist[i], ctxHist[seedCtx])) - entropy[i] - seedEntropy;
+                d2s[i] = d;
+                if (dist[i] != 0 && d < dist[i])
+                {
+                    dist[i] = d;
+                }
+
+                if (dist[i] != 0 && (largest == -1 || dist[i] > dist[largest]))
+                {
+                    largest = i;
+                }
+            }
+
+            distToSeed.Add(d2s);
+            if (largest == -1 || dist[largest] < 1.0)
+            {
+                break; // no context is meaningfully distinct from the current seeds
+            }
+        }
+
+        int numSeeds = seeds.Count;
+
+        // Evaluate total cost for K = 1..numSeeds; pick the minimiser.
+        int bestK = 1;
+        double bestCost = double.MaxValue;
+        var assign = new int[n];
+        for (int k = 1; k <= numSeeds; k++)
+        {
+            // Assign each context to its nearest of the first k seeds, accumulate cluster histograms.
+            var chist = new long[k][];
+            for (int c = 0; c < k; c++)
+            {
+                chist[c] = new long[alphabet];
+            }
+
+            for (int i = 0; i < n; i++)
+            {
+                if (total[i] == 0)
+                {
+                    assign[i] = 0;
+                    continue;
+                }
+
+                int best = 0;
+                double bd = distToSeed[0][i];
+                for (int s = 1; s < k; s++)
+                {
+                    if (distToSeed[s][i] < bd)
+                    {
+                        bd = distToSeed[s][i];
+                        best = s;
+                    }
+                }
+
+                assign[i] = best;
+                long[] src = ctxHist[i], dst = chist[best];
+                for (int a = 0; a < alphabet; a++)
+                {
+                    dst[a] += src[a];
+                }
+            }
+
+            double coding = 0;
+            var candNorm = new int[k][];
+            for (int c = 0; c < k; c++)
+            {
+                coding += NormalizedCost(chist[c]);
+                candNorm[c] = JxlEntropy.NormalizeCounts(chist[c], JxlEntropy.HistShift);
+            }
+
+            // Real header bits for this K: encode the context map + the K histograms and measure.
+            var hw = new JxlBitWriter();
+            WriteHfPass(hw, (int[])assign.Clone(), candNorm, hfLogAlpha);
+            double headerBits = hw.ToArray().Length * 8.0;
+
+            double cost = coding + headerBits;
+            if (cost < bestCost)
+            {
+                bestCost = cost;
+                bestK = k;
+            }
+        }
+
+        // Final assignment with bestK seeds.
+        var map = new int[n];
+        var finalHist = new long[bestK][];
+        for (int c = 0; c < bestK; c++)
+        {
+            finalHist[c] = new long[alphabet];
+        }
+
+        for (int i = 0; i < n; i++)
+        {
+            if (total[i] == 0)
+            {
+                map[i] = 0;
+                continue;
+            }
+
+            int best = 0;
+            double bd = distToSeed[0][i];
+            for (int s = 1; s < bestK; s++)
+            {
+                if (distToSeed[s][i] < bd)
+                {
+                    bd = distToSeed[s][i];
+                    best = s;
+                }
+            }
+
+            map[i] = best;
+            for (int a = 0; a < alphabet; a++)
+            {
+                finalHist[best][a] += ctxHist[i][a];
+            }
+        }
+
+        var norm = new int[bestK][];
+        for (int c = 0; c < bestK; c++)
+        {
+            norm[c] = JxlEntropy.NormalizeCounts(finalHist[c], JxlEntropy.HistShift);
+        }
+
+        return (map, norm, bestK);
+    }
 
     // One HF pass: used_orders = 0 (natural order), then the HfDist entropy code — a context map over the
     // 495*num_block_clusters contexts to `k` clustered ANS histograms.

@@ -1482,6 +1482,12 @@ internal static partial class JxlEncoder
     private const double MinDistanceForDistinct = 48.0;
 
     private static int[] ClusterContexts(long[][] ctxHist, int alphabet, int maxHistograms, out long[][] clusterHist, out int k)
+        => ClusterContexts(ctxHist, alphabet, maxHistograms, MinDistanceForDistinct, out clusterHist, out k);
+
+    // minDistance = the coding-bits gain a new histogram must beat before it is worth adding. It should
+    // cover the histogram's own header cost, else clustering over-splits and the header (HfGlobal) bloats —
+    // dominant on small images at coarse quant. The lossless path keeps the libjxl-matching 48.
+    private static int[] ClusterContexts(long[][] ctxHist, int alphabet, int maxHistograms, double minDistance, out long[][] clusterHist, out int k)
     {
         int n = ctxHist.Length;
         double[] entropy = new double[n];
@@ -1539,7 +1545,7 @@ internal static partial class JxlEncoder
                 }
             }
 
-            if (dist[largest] < MinDistanceForDistinct)
+            if (dist[largest] < minDistance)
             {
                 break;
             }
