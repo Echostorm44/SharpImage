@@ -923,6 +923,57 @@ public class JxlVarDctEncoderTests
         await Assert.That(psnr).IsGreaterThan(22.0); // smooth gradient: block means track the source
     }
 
+    // Lossless RGBA: color + alpha must round-trip bit-exact (alpha as a Modular extra channel). Verified in
+    // jxl-oxide + libjxl when VARDCT_LLA_DIR is set.
+    [Test]
+    [Arguments(200)]
+    [Arguments(512)]
+    public async Task Jxl_Lossless_Alpha_RoundTrips(int sz)
+    {
+        int w = sz, h = sz;
+        var frame = new ImageFrame();
+        frame.Initialize(w, h, ColorspaceType.SRGB, hasAlpha: true);
+        int nch = frame.NumberOfChannels;
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * nch;
+                row[o] = Quantum.ScaleFromByte((byte)((x * 3 + y) & 0xFF));
+                row[o + 1] = Quantum.ScaleFromByte((byte)((y * 5) & 0xFF));
+                row[o + 2] = Quantum.ScaleFromByte((byte)((x ^ y) & 0xFF));
+                row[o + 3] = Quantum.ScaleFromByte((byte)((x + y * 2) & 0xFF)); // alpha
+            }
+        }
+
+        byte[] cs = SharpImage.Formats.JxlCoder.Encode(frame);
+        JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
+        await Assert.That(r.HasAlpha).IsTrue();
+        await Assert.That(r.NumChannels).IsEqualTo(4);
+
+        long err = 0;
+        for (int y = 0; y < h; y++)
+        {
+            var srow = frame.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                for (int c = 0; c < 4; c++)
+                {
+                    err += Math.Abs((int)Quantum.ScaleToByte(srow[(x * nch) + c]) - r.Channels[c].Px[(y * w) + x]);
+                }
+            }
+        }
+
+        await Assert.That(err).IsEqualTo(0L); // lossless RGBA is bit-exact
+
+        string dir = Environment.GetEnvironmentVariable("VARDCT_LLA_DIR");
+        if (!string.IsNullOrEmpty(dir))
+        {
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, $"lla_{sz}.jxl"), cs);
+        }
+    }
+
     // 16-bit lossless: genuine 16-bit content (samples not 8-bit-representable) must round-trip EXACTLY and
     // the file must declare 16 bits/sample. Verified decodable in jxl-oxide + libjxl when VARDCT_16_DIR is set.
     [Test]

@@ -83,20 +83,39 @@ internal static partial class JxlEncoder
             }
         }
 
+        // Alpha (last channel) is coded losslessly as one Modular extra channel appended after the colour
+        // channels (the RCT only touches the 3 colour channels); the metadata declares one extra channel.
+        int[]? alpha = null;
+        if (image.HasAlpha)
+        {
+            int ai = srcCh - 1;
+            alpha = new int[w * h];
+            for (int y = 0; y < h; y++)
+            {
+                var row = image.GetPixelRow(y);
+                for (int x = 0; x < w; x++)
+                {
+                    alpha[(y * w) + x] = Quantum.ScaleToDepth(row[(x * srcCh) + ai], bits);
+                }
+            }
+        }
+
         // Grayscale (r == g == b everywhere) encodes as a single channel with no colour transform,
         // matching libjxl. For a small (single-group) grayscale image also try the RGB encoding and keep
         // whichever is smaller (a few-colour grey palette can occasionally beat the 1-channel form by a
         // byte); larger grayscale images just take the 1-channel form (skips a redundant full encode).
-        bool gray = IsGrayscale(r, g, b, w * h);
+        // Alpha images take the colour (RGBA) path so the decoded result is [R,G,B,A]; grayscale-with-alpha
+        // is rare and the extra colour channels cost little.
+        bool gray = alpha == null && IsGrayscale(r, g, b, w * h);
         if (!gray)
         {
-            return EncodeCore(r, g, b, w, h, nb, gray: false, bits);
+            return EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha);
         }
 
-        byte[] grayCs = EncodeCore(r, g, b, w, h, nb, gray: true, bits);
-        if (w <= GroupDim && h <= GroupDim)
+        byte[] grayCs = EncodeCore(r, g, b, w, h, nb, gray: true, bits, alpha);
+        if (w <= GroupDim && h <= GroupDim && alpha == null)
         {
-            byte[] rgbCs = EncodeCore(r, g, b, w, h, nb, gray: false, bits);
+            byte[] rgbCs = EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha);
             if (rgbCs.Length < grayCs.Length)
             {
                 return rgbCs;
@@ -106,15 +125,18 @@ internal static partial class JxlEncoder
         return grayCs;
     }
 
-    private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8)
+    private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8, int[]? alpha = null)
     {
-        int nbCh = gray ? 1 : nb;
+        int numExtra = alpha != null ? 1 : 0;
+        int nbCh = (gray ? 1 : nb) + numExtra;
 
         // Pick the reversible colour transform (none for grayscale), then the weighted-predictor parameter
         // mode. The WP-mode estimate (single-context) can mispredict once the tree/context model is
         // applied, so try the estimated-best mode and the default (mode 0) and keep the smaller.
         int rctType = gray ? -1 : ChooseRct(r, g, b, w, h);
-        int[][] chan = gray ? new[] { r } : ForwardRct(r, g, b, w * h, rctType);
+        int[][] colorChan = gray ? new[] { r } : ForwardRct(r, g, b, w * h, rctType);
+        // Append the alpha extra channel (untouched by the RCT, which only covers the 3 colour channels).
+        int[][] chan = alpha == null ? colorChan : Append(colorChan, alpha);
         int wpEst = ChooseWpMode(chan, w, h);
         int[] wpModes = wpEst == 0 ? new[] { 0 } : new[] { wpEst, 0 };
 
@@ -138,7 +160,7 @@ internal static partial class JxlEncoder
                 }
             }
 
-            return AssembleCodestream(w, h, bestShift, bestSecs, gray, bits);
+            return AssembleCodestream(w, h, bestShift, bestSecs, gray, bits, numExtra);
         }
 
         int shift = SmallestShift(Math.Max(w, h));
@@ -166,7 +188,7 @@ internal static partial class JxlEncoder
         // sets the index values and thus how well the gradient predictor tracks region boundaries. Score
         // them by an actual trial encode and keep the smallest, since the residual-entropy proxy only
         // ranks candidates; the tree/entropy coder decides the real winner.
-        if (CollectPaletteColors(r, g, b, w * h, out int[] colors, out int[] counts))
+        if (alpha == null && CollectPaletteColors(r, g, b, w * h, out int[] colors, out int[] counts))
         {
             int nbColors = colors.Length;
             foreach (int[] ordered in PaletteOrderings(colors, counts, r, g, b, w, h))
@@ -180,7 +202,15 @@ internal static partial class JxlEncoder
             }
         }
 
-        return AssembleCodestream(w, h, shift, new[] { best }, gray, bits);
+        return AssembleCodestream(w, h, shift, new[] { best }, gray, bits, numExtra);
+    }
+
+    private static int[][] Append(int[][] chans, int[] extra)
+    {
+        var res = new int[chans.Length + 1][];
+        Array.Copy(chans, res, chans.Length);
+        res[chans.Length] = extra;
+        return res;
     }
 
     private static bool IsGrayscale(int[] r, int[] g, int[] b, int n)
@@ -199,15 +229,15 @@ internal static partial class JxlEncoder
     /// <summary>A modular channel to encode: pixel data with its own dimensions.</summary>
     private readonly record struct EncChannel(int[] Data, int W, int H);
 
-    private static byte[] AssembleCodestream(int w, int h, int shift, byte[][] sections, bool gray = false, int bits = 8)
+    private static byte[] AssembleCodestream(int w, int h, int shift, byte[][] sections, bool gray = false, int bits = 8, int numExtra = 0)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
         main.WriteBits(0x0A, 8);
         WriteSizeHeader(main, w, h);
-        WriteImageMetadata(main, gray, bits);
+        WriteImageMetadata(main, gray, bits, numExtra);
         main.JumpToByteBoundary();
-        WriteFrameHeader(main, shift);
+        WriteFrameHeader(main, shift, numExtra);
         main.WriteBool(false); // permuted TOC = false
         main.JumpToByteBoundary();
 
@@ -250,7 +280,7 @@ internal static partial class JxlEncoder
         w.WriteU32((uint)width, E.BitsOff(9, 1), E.BitsOff(13, 1), E.BitsOff(18, 1), E.BitsOff(30, 1));
     }
 
-    private static void WriteImageMetadata(JxlBitWriter w, bool gray, int bits = 8)
+    private static void WriteImageMetadata(JxlBitWriter w, bool gray, int bits = 8, int numExtra = 0)
     {
         w.WriteBool(false); // not all_default
         w.WriteBool(false); // extra_fields = false
@@ -259,7 +289,27 @@ internal static partial class JxlEncoder
         // 16-bit samples with the RCT + predictors exceed the 16-bit modular range, so the decoder needs a
         // 32-bit working buffer; 8-bit content fits 16 bits.
         w.WriteBool(bits <= 8);
-        w.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(12, 1)); // num_extra_channels = 0
+        w.WriteU32((uint)numExtra, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(12, 1)); // num_extra_channels
+        for (int i = 0; i < numExtra; i++)
+        {
+            if (bits <= 8)
+            {
+                w.WriteBool(true); // ExtraChannelInfo: all_default (8-bit unassociated Alpha, dim_shift 0)
+            }
+            else
+            {
+                // Explicit alpha at the image bit depth (all_default alpha is 8-bit, which would mis-scale a
+                // 16-bit alpha channel).
+                w.WriteBool(false);  // not all_default
+                w.WriteEnum(0);      // type = Alpha
+                w.WriteBool(false);  // bit depth: not floating
+                w.WriteU32((uint)bits, E.Val(8), E.Val(10), E.Val(12), E.BitsOff(6, 1)); // bits per sample
+                w.WriteU32(0, E.Val(0), E.Val(3), E.Val(4), E.BitsOff(3, 1)); // dim_shift = 0
+                w.WriteU32(0, E.Val(0), E.BitsOff(4, 0), E.BitsOff(5, 16), E.BitsOff(10, 48)); // name length = 0
+                w.WriteBool(false);  // alpha_associated = false
+            }
+        }
+
         w.WriteBool(false); // xyb_encoded = false
         if (gray)
         {
@@ -282,7 +332,7 @@ internal static partial class JxlEncoder
         w.WriteBool(true);  // default_m (skip opsin / upsampling weights)
     }
 
-    private static void WriteFrameHeader(JxlBitWriter w, int shift)
+    private static void WriteFrameHeader(JxlBitWriter w, int shift, int numExtra = 0)
     {
         w.WriteBool(false);  // not all_default
         w.WriteBits(0, 2);   // frame_type = Regular
@@ -290,10 +340,20 @@ internal static partial class JxlEncoder
         w.WriteU64(0);       // flags = 0
         w.WriteBool(false);  // do_ycbcr = false (non-XYB)
         w.WriteU32(1, E.Val(1), E.Val(2), E.Val(4), E.Val(8)); // upsampling = 1
+        for (int i = 0; i < numExtra; i++)
+        {
+            w.WriteU32(1, E.Val(1), E.Val(2), E.Val(4), E.Val(8)); // ec_upsampling = 1
+        }
+
         w.WriteBits((uint)shift, 2); // group_size_shift
         w.WriteU32(1, E.Val(1), E.Val(2), E.Val(3), E.BitsOff(3, 4)); // num_passes = 1
         w.WriteBool(false);  // have_crop = false
-        w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3)); // blending mode = 0 (replace)
+        w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3)); // color blending mode = 0 (replace)
+        for (int i = 0; i < numExtra; i++)
+        {
+            w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3)); // extra-channel blending mode = 0
+        }
+
         w.WriteBool(true);   // is_last = true
         w.WriteU32(0, E.Val(0), E.BitsOff(4, 0), E.BitsOff(5, 16), E.BitsOff(10, 48)); // name length = 0
 

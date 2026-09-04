@@ -642,7 +642,7 @@ internal static class JxlFrame
             return new JxlModularResult { Width = w, Height = h, NumChannels = hasAlpha ? 4 : 3, Channels = vc, Gray = false, HasAlpha = hasAlpha, Bps = md.Bps };
         }
 
-        int nbChans = md.Gray ? 1 : 3;
+        int nbChans = (md.Gray ? 1 : 3) + md.Extra; // colour channels + extra channels (e.g. alpha)
         List<JxlChannel> chans;
         try
         {
@@ -663,6 +663,7 @@ internal static class JxlFrame
             Channels = chans,
             Gray = md.Gray,
             Bps = md.Bps,
+            HasAlpha = md.Extra > 0,
         };
     }
 }
