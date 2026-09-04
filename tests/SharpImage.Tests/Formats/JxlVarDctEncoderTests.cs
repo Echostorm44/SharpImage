@@ -957,6 +957,29 @@ public class JxlVarDctEncoderTests
         await Assert.That(cs[0]).IsEqualTo((byte)0xFF);
         await Assert.That(cs[1]).IsEqualTo((byte)0x0A);
 
+        // Our own decoder round-trips every frame bit-exact (lossless) with the per-frame delay + loop count.
+        SharpImage.Image.ImageSequence dec = SharpImage.Formats.JxlCoder.DecodeAnimation(cs);
+        await Assert.That(dec.Frames.Count).IsEqualTo(cols.Length);
+        await Assert.That(dec.LoopCount).IsEqualTo(0);
+        for (int fi = 0; fi < cols.Length; fi++)
+        {
+            ImageFrame sf = seq.Frames[fi];
+            ImageFrame df = dec.Frames[fi];
+            await Assert.That(df.Delay).IsEqualTo(10);
+            long e = 0;
+            for (int y = 0; y < h; y++)
+            {
+                var srow = sf.GetPixelRow(y);
+                var drow = df.GetPixelRow(y);
+                for (int x = 0; x < w * 3; x++)
+                {
+                    e += Math.Abs((int)Quantum.ScaleToByte(srow[x]) - (int)Quantum.ScaleToByte(drow[x]));
+                }
+            }
+
+            await Assert.That(e).IsEqualTo(0L); // lossless animation frame
+        }
+
         string dir = Environment.GetEnvironmentVariable("VARDCT_ANIM_DIR");
         if (!string.IsNullOrEmpty(dir))
         {

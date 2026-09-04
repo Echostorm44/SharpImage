@@ -66,6 +66,23 @@ public static class JxlCoder
     /// </summary>
     public static byte[] EncodeAnimation(ImageSequence sequence) => Jxl.JxlEncoder.EncodeSequence(sequence);
 
+    /// <summary>Decodes a (possibly animated) JPEG XL codestream into an image sequence, one frame per JXL
+    /// frame with its per-frame <see cref="ImageFrame.Delay"/> (centiseconds) and the loop count.</summary>
+    public static ImageSequence DecodeAnimation(byte[] data)
+    {
+        byte[] cs = FindCodestream(data);
+        (var frames, int numLoops, uint tpsNum, uint tpsDenom) = Jxl.JxlFrame.DecodeSequence(cs);
+        var seq = new ImageSequence { LoopCount = numLoops };
+        foreach ((Jxl.JxlModularResult res, int durationTicks) in frames)
+        {
+            ImageFrame frame = BuildFrame(res);
+            frame.Delay = tpsNum > 0 ? (int)((long)durationTicks * 100 * tpsDenom / tpsNum) : durationTicks;
+            seq.AddFrame(frame);
+        }
+
+        return seq;
+    }
+
     /// <summary>
     /// Encodes an image as a lossy JPEG XL codestream (XYB VarDCT). <paramref name="quality"/> is a
     /// JPEG-style value in [1,100] (higher = better). <paramref name="effort"/> in [1,9] trades speed for

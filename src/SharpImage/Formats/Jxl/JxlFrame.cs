@@ -193,6 +193,8 @@ internal static class JxlFrame
     {
         public int Width, Height, Bps = 8, Extra;
         public bool Xyb = true, Gray;
+        public bool HaveAnimation;
+        public uint TpsNum = 1, TpsDenom = 1, NumLoops;
     }
 
     private static Meta ReadImageMetadata(JxlBitReader br, int w, int h)
@@ -217,12 +219,13 @@ internal static class JxlFrame
                 ReadSize(br); // preview
             }
 
-            if (br.ReadBool())
+            if (br.ReadBool()) // have_animation
             {
-                br.ReadU32(E.Val(100), E.Val(1000), E.BitsOff(10, 1), E.BitsOff(30, 1));
-                br.ReadU32(E.Val(1), E.Val(1001), E.BitsOff(8, 1), E.BitsOff(10, 1));
-                br.ReadU32(E.Val(0), E.BitsOff(3, 0), E.BitsOff(16, 0), E.BitsOff(32, 0));
-                br.ReadBool();
+                md.HaveAnimation = true;
+                md.TpsNum = br.ReadU32(E.Val(100), E.Val(1000), E.BitsOff(10, 1), E.BitsOff(30, 1));
+                md.TpsDenom = br.ReadU32(E.Val(1), E.Val(1001), E.BitsOff(8, 1), E.BitsOff(10, 1));
+                md.NumLoops = br.ReadU32(E.Val(0), E.BitsOff(3, 0), E.BitsOff(16, 0), E.BitsOff(32, 0));
+                br.ReadBool(); // have_timecodes
             }
         }
 
@@ -296,6 +299,8 @@ internal static class JxlFrame
         public int NumPasses = 1;
         public int[] PassShift = { 0 };
         public ulong Flags;
+        public bool IsLast = true;
+        public uint Duration; // animation: frame duration in ticks
         public int XQmScale = 2;
         public int BQmScale = 2;
 
@@ -510,8 +515,16 @@ internal static class JxlFrame
                 ReadBlendingInfo(br, md.Extra);
             }
 
+            if (md.HaveAnimation)
+            {
+                fh.Duration = br.ReadU32(E.Val(0), E.Val(1), E.BitsOff(8, 0), E.BitsOff(32, 0)); // frame duration (ticks)
+                // have_timecodes is false at the metadata level, so no timecode field.
+            }
+
             isLast = br.ReadBool();
         }
+
+        fh.IsLast = isLast;
 
         if (frameType != 1 && !isLast)
         {
@@ -551,9 +564,16 @@ internal static class JxlFrame
         (int w, int h) = ReadSize(br);
         Meta md = ReadImageMetadata(br, w, h);
 
-        // The frame body (FrameHeader + TOC + sections) is byte-aligned after ImageMetadata.
+        return DecodeFrame(cs, br, w, h, md, allowTruncated, out _, out _);
+    }
+
+    // Decodes one frame from `br` (positioned at the frame header). Sets endByte to the offset of the next
+    // frame (after the last section) and fh to the frame header (carrying is_last / animation duration).
+    private static JxlModularResult DecodeFrame(byte[] cs, JxlBitReader br, int w, int h, Meta md, bool allowTruncated, out int endByte, out FrameInfo fh)
+    {
+        // The frame body (FrameHeader + TOC + sections) is byte-aligned after the metadata / previous frame.
         br.JumpToByteBoundary();
-        FrameInfo fh = ReadFrameHeader(br, md);
+        fh = ReadFrameHeader(br, md);
 
         int groupDim = 128 << fh.GroupSizeShift;
         int numGroups = CeilDiv(w, groupDim) * CeilDiv(h, groupDim);
@@ -585,6 +605,8 @@ internal static class JxlFrame
             offsets[i] = acc;
             acc += (int)sizes[i];
         }
+
+        endByte = acc; // byte after the last section = start of the next frame (if any)
 
         if (!fh.IsModular)
         {
@@ -665,5 +687,35 @@ internal static class JxlFrame
             Bps = md.Bps,
             HasAlpha = md.Extra > 0,
         };
+    }
+
+    /// <summary>Decodes every frame of a (possibly animated) codestream: returns each frame with its
+    /// animation duration in ticks (and the loop count / ticks-per-second from the metadata).</summary>
+    public static (List<(JxlModularResult Frame, int DurationTicks)> Frames, int NumLoops, uint TpsNum, uint TpsDenom) DecodeSequence(byte[] cs)
+    {
+        if (cs.Length < 2 || cs[0] != 0xFF || cs[1] != 0x0A)
+        {
+            throw new InvalidOperationException("Not a JPEG XL codestream.");
+        }
+
+        var br = new JxlBitReader(cs, 2);
+        (int w, int h) = ReadSize(br);
+        Meta md = ReadImageMetadata(br, w, h);
+
+        var frames = new List<(JxlModularResult, int)>();
+        int cur = (int)((br.BitPosition + 7) / 8); // first frame is byte-aligned after the metadata
+        while (cur < cs.Length)
+        {
+            var fbr = new JxlBitReader(cs, cur);
+            JxlModularResult res = DecodeFrame(cs, fbr, w, h, md, allowTruncated: false, out int endByte, out FrameInfo fh);
+            frames.Add((res, (int)fh.Duration));
+            cur = endByte;
+            if (fh.IsLast)
+            {
+                break;
+            }
+        }
+
+        return (frames, (int)md.NumLoops, md.TpsNum, md.TpsDenom);
     }
 }
