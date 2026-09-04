@@ -125,7 +125,99 @@ internal static partial class JxlEncoder
         return grayCs;
     }
 
+    /// <summary>Encodes an animated image sequence as a single multi-frame lossless JPEG XL codestream
+    /// (shared ImageMetadata with animation; one Modular frame per image with its per-frame duration).</summary>
+    public static byte[] EncodeSequence(ImageSequence seq)
+    {
+        var frames = seq.Frames;
+        if (frames.Count == 0)
+        {
+            throw new InvalidOperationException("Cannot encode an empty image sequence.");
+        }
+
+        if (frames.Count == 1)
+        {
+            return EncodeLossless(frames[0]); // a single frame is just a still image
+        }
+
+        int w = (int)frames[0].Columns, h = (int)frames[0].Rows;
+        int numExtra = 0, bits = 8;
+        foreach (ImageFrame f in frames)
+        {
+            if (f.HasAlpha)
+            {
+                numExtra = 1;
+            }
+
+            bits = Math.Max(bits, DetectBits(f));
+        }
+
+        var main = new JxlBitWriter();
+        main.WriteBits(0xFF, 8);
+        main.WriteBits(0x0A, 8);
+        WriteSizeHeader(main, w, h);
+        WriteImageMetadata(main, gray: false, bits, numExtra, animation: true, numLoops: (uint)Math.Max(0, seq.LoopCount));
+        main.JumpToByteBoundary();
+
+        for (int i = 0; i < frames.Count; i++)
+        {
+            ImageFrame f = frames[i];
+            if ((int)f.Columns != w || (int)f.Rows != h)
+            {
+                throw new NotSupportedException("Animation frames must all match the canvas size.");
+            }
+
+            (int[] r, int[] g, int[] b, int[]? alpha) = ExtractRgbAlpha(f, bits, numExtra > 0);
+            (byte[][] sections, int shift) = EncodeCoreSections(r, g, b, w, h, 3, gray: false, bits, alpha);
+            uint duration = (uint)Math.Max(0, f.Delay); // tps = 100 => ticks are centiseconds
+            WriteFrameBody(main, shift, sections, numExtra, isLast: i == frames.Count - 1, duration, animation: true);
+        }
+
+        return main.ToArray();
+    }
+
+    private static (int[] R, int[] G, int[] B, int[]? Alpha) ExtractRgbAlpha(ImageFrame image, int bits, bool needAlpha)
+    {
+        int w = (int)image.Columns, h = (int)image.Rows, srcCh = image.NumberOfChannels;
+        int[] r = new int[w * h], g = new int[w * h], b = new int[w * h];
+        int[]? alpha = needAlpha ? new int[w * h] : null;
+        int maxV = (1 << bits) - 1;
+        for (int y = 0; y < h; y++)
+        {
+            var row = image.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                int off = x * srcCh, p = (y * w) + x;
+                if (srcCh == 1)
+                {
+                    r[p] = g[p] = b[p] = Quantum.ScaleToDepth(row[off], bits);
+                }
+                else
+                {
+                    r[p] = Quantum.ScaleToDepth(row[off], bits);
+                    g[p] = Quantum.ScaleToDepth(row[off + 1], bits);
+                    b[p] = Quantum.ScaleToDepth(row[off + 2], bits);
+                }
+
+                if (alpha != null)
+                {
+                    alpha[p] = image.HasAlpha ? Quantum.ScaleToDepth(row[off + srcCh - 1], bits) : maxV;
+                }
+            }
+        }
+
+        return (r, g, b, alpha);
+    }
+
     private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8, int[]? alpha = null)
+    {
+        var (sections, shift) = EncodeCoreSections(r, g, b, w, h, nb, gray, bits, alpha);
+        return AssembleCodestream(w, h, shift, sections, gray, bits, alpha != null ? 1 : 0);
+    }
+
+    // Returns the frame's Modular sections + the group-size shift (the caller assembles them into a single-
+    // image codestream or an animation frame body).
+    private static (byte[][] Sections, int Shift) EncodeCoreSections(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8, int[]? alpha = null)
     {
         int numExtra = alpha != null ? 1 : 0;
         int nbCh = (gray ? 1 : nb) + numExtra;
@@ -160,7 +252,7 @@ internal static partial class JxlEncoder
                 }
             }
 
-            return AssembleCodestream(w, h, bestShift, bestSecs, gray, bits, numExtra);
+            return (bestSecs, bestShift);
         }
 
         int shift = SmallestShift(Math.Max(w, h));
@@ -202,7 +294,7 @@ internal static partial class JxlEncoder
             }
         }
 
-        return AssembleCodestream(w, h, shift, new[] { best }, gray, bits, numExtra);
+        return (new[] { best }, shift);
     }
 
     private static int[][] Append(int[][] chans, int[] extra)
@@ -237,7 +329,15 @@ internal static partial class JxlEncoder
         WriteSizeHeader(main, w, h);
         WriteImageMetadata(main, gray, bits, numExtra);
         main.JumpToByteBoundary();
-        WriteFrameHeader(main, shift, numExtra);
+        WriteFrameBody(main, shift, sections, numExtra, isLast: true, durationTicks: 0);
+        return main.ToArray();
+    }
+
+    // One frame's body: frame header (with is_last / animation duration) + non-permuted TOC + sections.
+    // Shared by the single-image codestream and the animation (multi-frame) codestream.
+    private static void WriteFrameBody(JxlBitWriter main, int shift, byte[][] sections, int numExtra, bool isLast, uint durationTicks, bool animation = false)
+    {
+        WriteFrameHeader(main, shift, numExtra, isLast, durationTicks, animation);
         main.WriteBool(false); // permuted TOC = false
         main.JumpToByteBoundary();
 
@@ -251,8 +351,6 @@ internal static partial class JxlEncoder
         {
             main.AppendBytes(sec);
         }
-
-        return main.ToArray();
     }
 
     // Group-size shifts to try for a tiled image: 1024px (shift 3, low per-group overhead) and 256px
@@ -280,10 +378,22 @@ internal static partial class JxlEncoder
         w.WriteU32((uint)width, E.BitsOff(9, 1), E.BitsOff(13, 1), E.BitsOff(18, 1), E.BitsOff(30, 1));
     }
 
-    private static void WriteImageMetadata(JxlBitWriter w, bool gray, int bits = 8, int numExtra = 0)
+    private static void WriteImageMetadata(JxlBitWriter w, bool gray, int bits = 8, int numExtra = 0, bool animation = false, uint numLoops = 0)
     {
         w.WriteBool(false); // not all_default
-        w.WriteBool(false); // extra_fields = false
+        w.WriteBool(animation); // extra_fields (only needed to carry animation)
+        if (animation)
+        {
+            w.WriteBits(0, 3);   // orientation - 1 = 0
+            w.WriteBool(false);  // have_intrinsic_size = false
+            w.WriteBool(false);  // have_preview = false
+            w.WriteBool(true);   // have_animation = true
+            w.WriteU32(100, E.Val(100), E.Val(1000), E.BitsOff(10, 1), E.BitsOff(30, 1)); // tps_numerator (100 => ticks are centiseconds)
+            w.WriteU32(1, E.Val(1), E.Val(1001), E.BitsOff(8, 1), E.BitsOff(10, 1));       // tps_denominator = 1
+            w.WriteU32(numLoops, E.Val(0), E.BitsOff(3, 0), E.BitsOff(16, 0), E.BitsOff(32, 0)); // num_loops (0 = infinite)
+            w.WriteBool(false);  // have_timecodes = false
+        }
+
         w.WriteBool(false); // bit depth: not floating
         w.WriteU32((uint)bits, E.Val(8), E.Val(10), E.Val(12), E.BitsOff(6, 1)); // bits per sample
         // 16-bit samples with the RCT + predictors exceed the 16-bit modular range, so the decoder needs a
@@ -328,11 +438,16 @@ internal static partial class JxlEncoder
             w.WriteBool(true);  // colour encoding: all_default (sRGB RGB)
         }
 
+        if (animation)
+        {
+            w.WriteBool(true); // ToneMapping all_default (only present when extra_fields is set)
+        }
+
         w.WriteU64(0);      // extensions = none
         w.WriteBool(true);  // default_m (skip opsin / upsampling weights)
     }
 
-    private static void WriteFrameHeader(JxlBitWriter w, int shift, int numExtra = 0)
+    private static void WriteFrameHeader(JxlBitWriter w, int shift, int numExtra = 0, bool isLast = true, uint durationTicks = 0, bool animation = false)
     {
         w.WriteBool(false);  // not all_default
         w.WriteBits(0, 2);   // frame_type = Regular
@@ -354,7 +469,18 @@ internal static partial class JxlEncoder
             w.WriteU32(0, E.Val(0), E.Val(1), E.Val(2), E.BitsOff(2, 3)); // extra-channel blending mode = 0
         }
 
-        w.WriteBool(true);   // is_last = true
+        if (animation)
+        {
+            w.WriteU32(durationTicks, E.Val(0), E.Val(1), E.BitsOff(8, 0), E.BitsOff(32, 0)); // frame duration (ticks)
+            // have_timecodes is false at the ImageMetadata level, so no timecode field here.
+        }
+
+        w.WriteBool(isLast); // is_last
+        if (!isLast)
+        {
+            w.WriteBits(0, 2); // save_as_reference = 0
+        }
+
         w.WriteU32(0, E.Val(0), E.BitsOff(4, 0), E.BitsOff(5, 16), E.BitsOff(10, 48)); // name length = 0
 
         // Loop filter: the all_default filter leaves Gaborish + EPF ON, which libjxl applies even to a

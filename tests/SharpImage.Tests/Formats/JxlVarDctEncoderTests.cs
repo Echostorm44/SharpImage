@@ -923,6 +923,47 @@ public class JxlVarDctEncoderTests
         await Assert.That(psnr).IsGreaterThan(22.0); // smooth gradient: block means track the source
     }
 
+    // Animation: a multi-frame ImageSequence encodes to one multi-frame JXL codestream. Verified as a valid
+    // animation (multiple frames) in jxl-oxide + libjxl when VARDCT_ANIM_DIR is set.
+    [Test]
+    public async Task Jxl_Animation_Encodes()
+    {
+        const int w = 64, h = 64;
+        var seq = new SharpImage.Image.ImageSequence { LoopCount = 0 };
+        (byte, byte, byte)[] cols = { (220, 40, 40), (40, 200, 60), (50, 70, 230), (230, 210, 40) };
+        foreach (var (cr, cg, cb) in cols)
+        {
+            var f = new ImageFrame();
+            f.Initialize(w, h, ColorspaceType.SRGB, false);
+            f.Delay = 10; // centiseconds
+            for (int y = 0; y < h; y++)
+            {
+                var row = f.GetPixelRowForWrite(y);
+                for (int x = 0; x < w; x++)
+                {
+                    int o = x * 3;
+                    // a solid colour with a small gradient so each frame differs and isn't trivially empty
+                    row[o] = Quantum.ScaleFromByte((byte)Math.Clamp(cr + (x & 7), 0, 255));
+                    row[o + 1] = Quantum.ScaleFromByte((byte)Math.Clamp(cg + (y & 7), 0, 255));
+                    row[o + 2] = Quantum.ScaleFromByte(cb);
+                }
+            }
+
+            seq.AddFrame(f);
+        }
+
+        byte[] cs = SharpImage.Formats.JxlCoder.EncodeAnimation(seq);
+        await Assert.That(cs.Length).IsGreaterThan(0);
+        await Assert.That(cs[0]).IsEqualTo((byte)0xFF);
+        await Assert.That(cs[1]).IsEqualTo((byte)0x0A);
+
+        string dir = Environment.GetEnvironmentVariable("VARDCT_ANIM_DIR");
+        if (!string.IsNullOrEmpty(dir))
+        {
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "anim.jxl"), cs);
+        }
+    }
+
     // Lossless RGBA: color + alpha must round-trip bit-exact (alpha as a Modular extra channel). Verified in
     // jxl-oxide + libjxl when VARDCT_LLA_DIR is set.
     [Test]
