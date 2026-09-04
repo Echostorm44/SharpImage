@@ -813,8 +813,33 @@ internal static partial class JxlEncoder
         }
 
         var dcStreams = new List<(int[], int[])> { (dcStream, dcCtx), (metaStream, metaCtx) };
-        PixelPlanCtx dcPlan = PlanPixelsCtx(dcStreams, dcTree.LeafCount, out List<Op>[] dcOps, int.MaxValue / 2);
+        PixelPlanCtx dcPlan = PlanPixelsCtx(dcStreams, dcTree.LeafCount, out List<Op>[] dcOps, out long[][] dcRawCtxHist, int.MaxValue / 2);
         int dcLogAlpha = Math.Max(5, JxlBits.CeilLog2(dcPlan.LitAlphabet));
+        // Re-cluster the DC/HfMeta contexts with the total-cost criterion (same header-overhead issue as the
+        // AC): the threshold clustering keeps 10-19 histograms over an ~88-symbol alphabet, whose headers
+        // (WriteAnsHistogramCtx) are a fifth of the DC section. Only when the ANS path is used (dcLogAlpha<=8).
+        if (dcLogAlpha <= 8)
+        {
+            var (dcMap, _, dcK) = ClusterContextsTotalCost(dcRawCtxHist, dcPlan.LitAlphabet, MaxLiteralClusters, dcLogAlpha);
+            var dcClusterHist = new long[dcK][];
+            for (int c = 0; c < dcK; c++)
+            {
+                dcClusterHist[c] = new long[dcPlan.LitAlphabet];
+            }
+
+            for (int ctx = 0; ctx < dcMap.Length; ctx++)
+            {
+                long[] src = dcRawCtxHist[ctx], dst = dcClusterHist[dcMap[ctx]];
+                for (int a = 0; a < src.Length; a++)
+                {
+                    dst[a] += src[a];
+                }
+            }
+
+            dcPlan.K = dcK;
+            dcPlan.ContextToCluster = dcMap;
+            dcPlan.ClusterHist = dcClusterHist;
+        }
         bool useLearnedDc = dcLogAlpha <= 8; // ANS alphabet limit; else fall back to the gradient path
         int[][] dcAnsCounts = null!;
         JxlAnsWriter dcAns = null!;

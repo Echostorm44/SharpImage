@@ -332,7 +332,7 @@ internal static partial class JxlEncoder
         }
 
         var streams = new List<(int[], int[])> { (stream, ctxs) };
-        var plan = PlanPixelsCtx(streams, tree.LeafCount, out List<Op>[] ops, useAns ? int.MaxValue / 2 : 0);
+        var plan = PlanPixelsCtx(streams, tree.LeafCount, out List<Op>[] ops, out _, useAns ? int.MaxValue / 2 : 0);
 
         JxlAnsWriter? ans = null;
         int[][] ansCounts = null!;
@@ -999,7 +999,7 @@ internal static partial class JxlEncoder
         // fractional bits beats prefix+LZ77). Fall back to the prefix path if the alphabet is too large.
         JxlAnsWriter? ans = null;
         int[][] ansCounts = null!;
-        var plan = PlanPixelsCtx(streams, tree.LeafCount, out List<Op>[] ops, useAns ? int.MaxValue / 2 : 0);
+        var plan = PlanPixelsCtx(streams, tree.LeafCount, out List<Op>[] ops, out _, useAns ? int.MaxValue / 2 : 0);
         if (useAns)
         {
             int logAlpha = Math.Max(5, JxlBits.CeilLog2(plan.LitAlphabet));
@@ -1375,7 +1375,7 @@ internal static partial class JxlEncoder
 
     // Plans the entropy coding for one or more token streams that share the global tree and codes
     // (one stream for a single-group frame, one per group otherwise). Returns per-stream LZ77 ops.
-    private static PixelPlanCtx PlanPixelsCtx(List<(int[] Stream, int[] Ctxs)> streams, int n, out List<Op>[] opsOut, int minLenOverride = 0)
+    private static PixelPlanCtx PlanPixelsCtx(List<(int[] Stream, int[] Ctxs)> streams, int n, out List<Op>[] opsOut, out long[][] rawCtxHist, int minLenOverride = 0)
     {
         int minLen = minLenOverride > 0 ? minLenOverride : Lz77MinLength;
         opsOut = new List<Op>[streams.Count];
@@ -1449,6 +1449,7 @@ internal static partial class JxlEncoder
             }
         }
 
+        rawCtxHist = ctxHist;
         int[] contextToCluster = ClusterContexts(ctxHist, gmaxLit + 1, MaxLiteralClusters, out long[][] clusterHist, out int k);
         plan.K = k;
         plan.ContextToCluster = contextToCluster;
