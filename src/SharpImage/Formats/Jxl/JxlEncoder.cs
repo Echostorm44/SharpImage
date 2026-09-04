@@ -23,6 +23,31 @@ internal static partial class JxlEncoder
     private const int GroupSizeShift = 3; // 128 << 3 == 1024
 
     /// <summary>Encodes an image as a lossless RGB JPEG XL codestream.</summary>
+    // Returns the smallest standard bit depth (8 or 16) that represents every sample exactly. Used so 8-bit
+    // content stays 8-bit (smaller) while genuine 16-bit content is preserved losslessly / without banding.
+    internal static int DetectBits(ImageFrame image)
+    {
+        int w = (int)image.Columns, h = (int)image.Rows, srcCh = image.NumberOfChannels;
+        for (int y = 0; y < h; y++)
+        {
+            var row = image.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                int off = x * srcCh;
+                for (int c = 0; c < srcCh; c++)
+                {
+                    ushort q = row[off + c];
+                    if (Quantum.ScaleFromByte(Quantum.ScaleToByte(q)) != q)
+                    {
+                        return 16;
+                    }
+                }
+            }
+        }
+
+        return 8;
+    }
+
     public static byte[] EncodeLossless(ImageFrame image)
     {
         int w = (int)image.Columns;
@@ -36,31 +61,7 @@ internal static partial class JxlEncoder
         // 8-bit if every sample is 8-bit-representable (the common case, smaller files), else full 16-bit.
         int nb = 3;
         int srcCh = image.NumberOfChannels;
-        bool is16 = false;
-        for (int y = 0; y < h && !is16; y++)
-        {
-            var row = image.GetPixelRow(y);
-            for (int x = 0; x < w; x++)
-            {
-                int off = x * srcCh;
-                for (int c = 0; c < srcCh; c++)
-                {
-                    ushort q = row[off + c];
-                    if (Quantum.ScaleFromByte(Quantum.ScaleToByte(q)) != q)
-                    {
-                        is16 = true;
-                        break;
-                    }
-                }
-
-                if (is16)
-                {
-                    break;
-                }
-            }
-        }
-
-        int bits = is16 ? 16 : 8;
+        int bits = DetectBits(image);
         int[] r = new int[w * h], g = new int[w * h], b = new int[w * h];
         for (int y = 0; y < h; y++)
         {

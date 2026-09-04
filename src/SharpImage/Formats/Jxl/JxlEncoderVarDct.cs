@@ -62,6 +62,8 @@ internal static partial class JxlEncoder
         }
 
         List<byte[]> sections = BuildVarDctSections(srgb, w, h, globalScale, quantLf, blockHfMul, shifts, adaptiveQuant, variableBlocks, perceptual, distance, quantFieldOverride, layoutOverride, alpha);
+        // Lossy output is 8-bit (standard; 16-bit lossy would be an explicit opt-in — the XYB pipeline is
+        // float, so only ExtractSrgb precision + this metadata bit would change). Lossless preserves 16-bit.
         return AssembleVarDctCodestream(w, h, sections, shifts, gaborish: perceptual, epfIters: 0, hasAlpha: alpha != null);
     }
 
@@ -508,13 +510,13 @@ internal static partial class JxlEncoder
     // For a single-group single-pass frame the whole body is one TOC section; a progressive (multi-pass)
     // frame uses the multi-section TOC (LfGlobal | LfGroup | HfGlobal | PassGroup-per-pass) so a streaming
     // decoder can render the DC preview from the LfGroup section before the AC passes arrive.
-    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts, bool gaborish, int epfIters = 0, bool hasAlpha = false)
+    private static byte[] AssembleVarDctCodestream(int w, int h, List<byte[]> sections, int[] shifts, bool gaborish, int epfIters = 0, bool hasAlpha = false, int bits = 8)
     {
         var main = new JxlBitWriter();
         main.WriteBits(0xFF, 8);
         main.WriteBits(0x0A, 8);
         WriteSizeHeader(main, w, h);
-        WriteXybImageMetadata(main, hasAlpha);
+        WriteXybImageMetadata(main, hasAlpha, bits);
         main.JumpToByteBoundary();
         WriteVarDctFrameHeader(main, shifts, gaborish, epfIters, hasAlpha ? 1 : 0);
         main.WriteBool(false); // permuted TOC = false
@@ -536,13 +538,13 @@ internal static partial class JxlEncoder
 
     // Explicit ImageMetadata: 8-bit sRGB RGB, XYB-encoded, no extra channels, default opsin/upsampling.
     // Written out in full (not all_default) so xyb_encoded is unambiguously set for the decoder.
-    private static void WriteXybImageMetadata(JxlBitWriter w, bool hasAlpha = false)
+    private static void WriteXybImageMetadata(JxlBitWriter w, bool hasAlpha = false, int bits = 8)
     {
         w.WriteBool(false); // not all_default
         w.WriteBool(false); // extra_fields = false
         w.WriteBool(false); // bit depth: not floating
-        w.WriteU32(8, E.Val(8), E.Val(10), E.Val(12), E.BitsOff(6, 1)); // 8 bits per sample
-        w.WriteBool(true);  // modular_16bit_buffer_sufficient
+        w.WriteU32((uint)bits, E.Val(8), E.Val(10), E.Val(12), E.BitsOff(6, 1)); // bits per sample (output depth)
+        w.WriteBool(true);  // modular_16bit_buffer_sufficient (XYB colour is float; alpha extra channel <= 16-bit)
         w.WriteU32(hasAlpha ? 1u : 0u, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(12, 1)); // num_extra_channels
         if (hasAlpha)
         {
