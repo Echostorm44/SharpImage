@@ -405,9 +405,9 @@ public class JxlVarDctEncoderTests
         await Assert.That(cs.Length).IsGreaterThan(0);
 
         JxlModularResult r = JxlFrame.DecodeModularCodestream(cs);
-        // Alpha is emitted (and must round-trip bit-exact, being lossless) only for single-group images
-        // (<= 256px); larger images currently drop it to stay spec-valid, so we get a clean color-only file.
-        bool expectAlpha = w <= 256 && h <= 256;
+        // Alpha (lossless, so bit-exact) is emitted for single-group (GlobalModular) and multi-group
+        // (per-group ModularAC tiles) single-pass images alike.
+        bool expectAlpha = true;
         await Assert.That(r.HasAlpha).IsEqualTo(expectAlpha);
         if (expectAlpha)
         {

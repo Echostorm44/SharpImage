@@ -51,11 +51,12 @@ internal static partial class JxlEncoder
         float[][] srgb = ExtractSrgb(image, w, h);
         int[]? alpha = ExtractAlpha(image, w, h);
 
-        // Alpha is emitted as one full-resolution Modular channel in the GlobalModular stream, which is only
-        // spec-valid when the whole channel fits a single group (<= 256px) — reference decoders require
-        // per-group splitting above that (an "ANS stream verification failed" otherwise). Larger extra
-        // channels need per-group modular AC streams (not yet emitted), so drop alpha there to stay valid.
-        if (alpha != null && (w > VarDctGroupDim || h > VarDctGroupDim))
+        // Alpha placement: a single-group image (<= 256px) codes the whole channel in the GlobalModular
+        // stream; a larger image splits it into per-group ModularAC tiles appended to each PassGroup section.
+        // The per-group split assigns all alpha to pass 0, so multi-pass (progressive) + multi-group alpha
+        // isn't supported yet — drop alpha there to stay spec-valid.
+        bool multiGroupAlpha = w > VarDctGroupDim || h > VarDctGroupDim;
+        if (alpha != null && multiGroupAlpha && shifts.Length > 1)
         {
             alpha = null;
         }
@@ -978,12 +979,41 @@ internal static partial class JxlEncoder
             }
         }
 
-        // Optional alpha extra channel: one full-res Modular channel in the GlobalModular stream (id 0),
-        // learned under the same global tree as the DC/HfMeta sub-images (its stream id is a tree property).
-        List<EncChannel>? alphaChans = alpha == null ? null : new List<EncChannel> { new(alpha, w, h) };
-        if (alphaChans != null)
+        // Optional alpha extra channel, coded losslessly under the same global tree as DC/HfMeta (stream id is
+        // a tree property). Single-group images (<= 256px) put the whole channel in the GlobalModular stream
+        // (id 0); larger images split it into per-group tiles in the ModularAC streams (1 + 3*numLf + 17 + g),
+        // appended to each group's PassGroup section (see pass_group.rs).
+        int aGpr = (w + VarDctGroupDim - 1) / VarDctGroupDim;
+        int aNumGroups = aGpr * ((h + VarDctGroupDim - 1) / VarDctGroupDim);
+        bool alphaGlobal = alpha != null && aNumGroups == 1;
+        bool alphaPerGroup = alpha != null && aNumGroups > 1;
+        List<EncChannel>? alphaChans = alphaGlobal ? new List<EncChannel> { new(alpha!, w, h) } : null;
+        (int[] Data, int W, int H)[]? alphaTiles = null;
+        if (alphaGlobal)
         {
-            learnRefs.Add(new EncChannelRef(alphaChans[0].Data, w, h, 0, 0, RefsFor(alphaChans, 0)));
+            learnRefs.Add(new EncChannelRef(alphaChans![0].Data, w, h, 0, 0, RefsFor(alphaChans, 0)));
+        }
+        else if (alphaPerGroup)
+        {
+            alphaTiles = new (int[], int, int)[aNumGroups];
+            for (int g = 0; g < aNumGroups; g++)
+            {
+                int gx = g % aGpr, gy = g / aGpr;
+                int rx = gx * VarDctGroupDim, ry = gy * VarDctGroupDim;
+                int rw = Math.Min(VarDctGroupDim, w - rx), rh = Math.Min(VarDctGroupDim, h - ry);
+                var tile = new int[rw * rh];
+                for (int y = 0; y < rh; y++)
+                {
+                    for (int x = 0; x < rw; x++)
+                    {
+                        tile[(y * rw) + x] = alpha![((ry + y) * w) + rx + x];
+                    }
+                }
+
+                alphaTiles[g] = (tile, rw, rh);
+                var tchans = new List<EncChannel> { new(tile, rw, rh) };
+                learnRefs.Add(new EncChannelRef(tile, rw, rh, 0, 1 + (3 * numLf) + 17 + g, RefsFor(tchans, 0)));
+            }
         }
 
         // One global MA tree over every LF group's DC + HfMetadata channels (+ alpha) with correct stream ids.
@@ -1036,16 +1066,33 @@ internal static partial class JxlEncoder
             streamCtx.Add(metaCtx);
         }
 
-        // Alpha is the last stream (index 2*numLf); WriteLfGlobal emits it as the stream-0 GlobalModular body.
+        // Alpha token streams (appended after DC/HfMeta so WriteLfGroup's 2*lg indexing is intact).
+        // Single-group: one GlobalModular stream (alphaOpsIdx). Multi-group: one ModularAC stream per group.
         int alphaOpsIdx = -1;
-        if (alphaChans != null)
+        int[]? alphaTileOpsIdx = null;
+        if (alphaGlobal)
         {
             var aStream = new int[w * h];
             var aCtx = new int[w * h];
-            ComputeResidualTokensCtx(alphaChans[0], 0, dcTree, aStream, aCtx, 0, ref dcMaxTok, dcWp, RefsFor(alphaChans, 0), 0);
+            ComputeResidualTokensCtx(alphaChans![0], 0, dcTree, aStream, aCtx, 0, ref dcMaxTok, dcWp, RefsFor(alphaChans, 0), 0);
             alphaOpsIdx = dcStreams.Count;
             dcStreams.Add((aStream, aCtx));
             streamCtx.Add(aCtx);
+        }
+        else if (alphaPerGroup)
+        {
+            alphaTileOpsIdx = new int[aNumGroups];
+            for (int g = 0; g < aNumGroups; g++)
+            {
+                var (tile, rw, rh) = alphaTiles![g];
+                var ts = new int[rw * rh];
+                var tc = new int[rw * rh];
+                var tchans = new List<EncChannel> { new(tile, rw, rh) };
+                ComputeResidualTokensCtx(tchans[0], 0, dcTree, ts, tc, 0, ref dcMaxTok, dcWp, RefsFor(tchans, 0), 1 + (3 * numLf) + 17 + g);
+                alphaTileOpsIdx[g] = dcStreams.Count;
+                dcStreams.Add((ts, tc));
+                streamCtx.Add(tc);
+            }
         }
 
         PixelPlanCtx dcPlan = PlanPixelsCtx(dcStreams, dcTree.LeafCount, out List<Op>[] dcOps, out long[][] dcRawCtxHist, int.MaxValue / 2);
@@ -1093,7 +1140,8 @@ internal static partial class JxlEncoder
         // DC and HfMetadata sub-images. Per-LF-group token lists, indexed [lg].
         var lfDcTokens = new List<ModToken>[numLf];
         var lfMetaTokens = new List<ModToken>[numLf];
-        List<ModToken>? alphaTokens = null;
+        List<ModToken>? alphaTokens = null;                 // single-group GlobalModular alpha
+        List<ModToken>[]? alphaTileTokens = null;           // per-group ModularAC alpha tiles
         var modHist = new long[1];
         int modLogAlpha = 5;
         int[] modNorm = null!;
@@ -1108,10 +1156,20 @@ internal static partial class JxlEncoder
                 AccumulateHist(lfMetaTokens[lg], ref modHist);
             }
 
-            if (alpha != null)
+            if (alphaGlobal)
             {
-                alphaTokens = GradientTokens(new List<SubChannel> { new(alpha, w, h) });
+                alphaTokens = GradientTokens(new List<SubChannel> { new(alpha!, w, h) });
                 AccumulateHist(alphaTokens, ref modHist);
+            }
+            else if (alphaPerGroup)
+            {
+                alphaTileTokens = new List<ModToken>[aNumGroups];
+                for (int g = 0; g < aNumGroups; g++)
+                {
+                    var (tile, rw, rh) = alphaTiles![g];
+                    alphaTileTokens[g] = GradientTokens(new List<SubChannel> { new(tile, rw, rh) });
+                    AccumulateHist(alphaTileTokens[g], ref modHist);
+                }
             }
 
             modLogAlpha = Math.Max(5, JxlBits.CeilLog2(modHist.Length));
@@ -1241,9 +1299,11 @@ internal static partial class JxlEncoder
                 WriteSingleContextAnsHeader(b, modNorm, modLogAlpha);
             }
 
-            // GlobalModular stream (id 0) body: the alpha extra channel, or nothing (the decoder's
+            // GlobalModular stream (id 0) body: the single-group alpha channel, or nothing (the decoder's
             // DecodeSubModular returns immediately for a zero-channel stream, so we emit no header then).
-            if (alpha != null)
+            // Multi-group alpha is group-split: the GlobalModular still DECLARES it (header only, no inline
+            // data) and the tiles are coded per group in the PassGroup sections (see WritePassGroup).
+            if (alphaGlobal)
             {
                 if (useLearnedDc)
                 {
@@ -1253,6 +1313,10 @@ internal static partial class JxlEncoder
                 {
                     WriteSubModularUsingGlobal(b, alphaTokens!, modNorm, modLogAlpha);
                 }
+            }
+            else if (alphaPerGroup)
+            {
+                WriteSubModularHeaderOnly(b, dcWpMode);
             }
         }
 
@@ -1299,6 +1363,20 @@ internal static partial class JxlEncoder
             }
 
             ans.Encode(b, ansToks);
+
+            // Multi-group alpha: the extra channel's tile for this group follows the VarDCT AC in the same
+            // section (pass_group.rs: write_hf_coeff then the modular subimage). All alpha is in pass 0.
+            if (alphaPerGroup && p == 0)
+            {
+                if (useLearnedDc)
+                {
+                    WriteSubModularOps(b, dcOps[alphaTileOpsIdx![g]], streamCtx[alphaTileOpsIdx[g]], dcPlan, dcAns, dcWpMode);
+                }
+                else
+                {
+                    WriteSubModularUsingGlobal(b, alphaTileTokens![g], modNorm, modLogAlpha);
+                }
+            }
         }
 
         if (numGroups == 1 && numPasses == 1 && numLf == 1)
@@ -2185,6 +2263,15 @@ internal static partial class JxlEncoder
         WriteWpHeaderBits(body, wpMode);
         body.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0
         EmitOpsAns(body, ops, ctxs, plan, ans);
+    }
+
+    // GlobalModular header for a modular image whose channels are all group-split (no data coded here): the
+    // decoder reads the header to learn the channel exists, then reads its tiles from the per-group sections.
+    private static void WriteSubModularHeaderOnly(JxlBitWriter body, int wpMode)
+    {
+        body.WriteBool(true);            // use_global_tree = true
+        WriteWpHeaderBits(body, wpMode);
+        body.WriteU32(0, E.Val(0), E.Val(1), E.BitsOff(4, 2), E.BitsOff(8, 18)); // num_transforms = 0
     }
 
     // Writes one modular sub-image that references the global tree + code (use_global_tree = true): the
