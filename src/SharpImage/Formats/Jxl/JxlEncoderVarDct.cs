@@ -316,7 +316,12 @@ internal static partial class JxlEncoder
         // content, rather than the near-lossless our earlier bases produced.
         float d = Math.Clamp(distance, 0.1f, 25f);
         uint hfm = (uint)Math.Clamp((int)MathF.Round(22f / d), 1, 4096);
-        uint qlf = (uint)Math.Clamp((int)MathF.Round(90f / d), 1, 512);
+        // DC precision follows libjxl's InitialQuantDC shape: DC needs to be fine at fine quant but gets
+        // relatively coarser as distance grows (the ^0.83 term), because at coarse quant the old flat 90/d
+        // DC was ~a quarter of the file while barely moving SSIMULACRA2. Calibrated so d=1 keeps ~90 (where
+        // the fine-quant heuristic wants it) and it drops toward ~35 at d=3.
+        float targetDc = MathF.Max(0.5f * d, MathF.Min(d, 0.3f * MathF.Pow(d / 0.3f, 0.83f)));
+        uint qlf = (uint)Math.Clamp((int)MathF.Round(73.4f / targetDc), 1, 512);
         return (8192u, qlf, hfm);
     }
 
