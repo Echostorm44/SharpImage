@@ -301,8 +301,9 @@ internal static partial class JxlEncoder
             // large-block win on smooth/graphic content is preserved. Threshold = 2x the median tile distortion.
             var sortedDist = (double[])dist.Clone();
             Array.Sort(sortedDist);
-            double medDist = sortedDist[sortedDist.Length / 2];
-            double splitThreshold = 2.0 * medDist;
+            // 1.2x the median: aggressive enough to catch every texture-flattening block on photos, yet
+            // smooth/graphic content (uniform low distortion) stays below it, so its large blocks survive.
+            double splitThreshold = 1.2 * sortedDist[sortedDist.Length / 2];
 
             // Rank the current large blocks by per-pixel SSIMULACRA2 distortion; split the worst that remain.
             var large = new List<(double DistPP, int Pos, int Dw, int Dh)>();
