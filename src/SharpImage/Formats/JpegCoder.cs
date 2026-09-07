@@ -20,6 +20,32 @@ public enum JpegSubsampling
     Yuv420 = 2,
 }
 
+/// <summary>Quantized DCT data of a baseline JPEG (for lossless DCT-domain transcode). Coefficients and
+/// quantization tables are in natural (row-major) 8x8 order.</summary>
+public sealed class JpegDctData
+{
+    public int Width;
+    public int Height;
+    public int ComponentCount;
+    public int MaxHSample;
+    public int MaxVSample;
+    public int RestartInterval;
+    public int[][] QuantTables = new int[4][];      // [tableIndex][64], natural order
+    public JpegDctComponent[] Components = Array.Empty<JpegDctComponent>();
+}
+
+/// <summary>One component's quantized DCT blocks (natural order), sampling factors and quant-table index.</summary>
+public sealed class JpegDctComponent
+{
+    public int Id;
+    public int HSample;
+    public int VSample;
+    public int QuantTableIndex;
+    public int BlocksPerRow;                          // mcuCols * HSample
+    public int BlocksPerCol;                          // mcuRows * VSample
+    public int[][] Blocks = Array.Empty<int[]>();     // [BlocksPerRow*BlocksPerCol][64], quantized, natural order
+}
+
 /// <summary>
 /// Pure C# JPEG reader/writer (ITU-T T.81 / ISO 10918-1). Supports: SOF0 baseline DCT, SOF2 progressive DCT,
 /// Huffman coding, YCbCr/grayscale, 4:4:4/4:2:2/4:2:0 subsampling, optimized Huffman tables.
@@ -193,6 +219,90 @@ public static class JpegCoder
             var progFrame = BlocksToImage(width, height, componentCount, components, maxHSample, maxVSample, mcuCols);
             AttachMetadata(progFrame, exifData, iccChunks, iptcData, xmpData);
             return progFrame;
+        }
+
+        throw new InvalidDataException("JPEG missing SOS marker.");
+    }
+
+    /// <summary>
+    /// Parses a baseline (SOF0) JPEG into its quantized DCT coefficients, quantization tables and sampling
+    /// factors — the raw data needed for a lossless DCT-domain transcode (e.g. JPEG->JXL recompression),
+    /// without dequantising or running the IDCT. Progressive JPEGs are not yet supported here.
+    /// </summary>
+    public static JpegDctData ReadDctData(Stream stream)
+    {
+        if (stream.ReadByte() != 0xFF || stream.ReadByte() != SOI)
+        {
+            throw new InvalidDataException("Not a valid JPEG file (missing SOI marker).");
+        }
+
+        int width = 0, height = 0, componentCount = 0, restartInterval = 0;
+        var components = new JpegComponent[MaxComponents];
+        int maxHSample = 1, maxVSample = 1;
+        var quantTables = new int[4][];
+        var dcTables = new HuffmanTable[4];
+        var acTables = new HuffmanTable[4];
+
+        while (true)
+        {
+            int marker = ReadMarker(stream);
+            if (marker < 0 || marker == EOI)
+            {
+                break;
+            }
+
+            switch (marker)
+            {
+                case SOF0:
+                    ReadSof(stream, ref width, ref height, ref componentCount, components, ref maxHSample, ref maxVSample);
+                    break;
+                case SOF2:
+                    throw new NotSupportedException("Progressive JPEG DCT extraction is not yet supported.");
+                case DHT:
+                    ReadDht(stream, dcTables, acTables);
+                    break;
+                case DQT:
+                    ReadDqt(stream, quantTables);
+                    break;
+                case DRI:
+                    ReadDri(stream, ref restartInterval);
+                    break;
+                case SOS:
+                    ReadSosHeader(stream, components, componentCount);
+                    int mcuCols = DecodeScanBlocks(stream, width, height, componentCount, components, quantTables,
+                        dcTables, acTables, maxHSample, maxVSample, restartInterval, coefficientsOnly: true);
+                    int mcuWidth = maxHSample * BlockSize, mcuHeight = maxVSample * BlockSize;
+                    int mcuRows = (height + mcuHeight - 1) / mcuHeight;
+                    var dct = new JpegDctData
+                    {
+                        Width = width,
+                        Height = height,
+                        ComponentCount = componentCount,
+                        MaxHSample = maxHSample,
+                        MaxVSample = maxVSample,
+                        RestartInterval = restartInterval,
+                        QuantTables = quantTables,
+                        Components = new JpegDctComponent[componentCount],
+                    };
+                    for (int c = 0; c < componentCount; c++)
+                    {
+                        dct.Components[c] = new JpegDctComponent
+                        {
+                            Id = components[c].Id,
+                            HSample = components[c].HSample,
+                            VSample = components[c].VSample,
+                            QuantTableIndex = components[c].QuantTableIndex,
+                            BlocksPerRow = mcuCols * components[c].HSample,
+                            BlocksPerCol = mcuRows * components[c].VSample,
+                            Blocks = components[c].Blocks,
+                        };
+                    }
+
+                    return dct;
+                default:
+                    SkipMarkerSegment(stream);
+                    break;
+            }
         }
 
         throw new InvalidDataException("JPEG missing SOS marker.");
@@ -663,6 +773,19 @@ public static class JpegCoder
         HuffmanTable[] dcTables, HuffmanTable[] acTables,
         int maxHSample, int maxVSample, int restartInterval)
     {
+        int mcols = DecodeScanBlocks(stream, width, height, componentCount, components, quantTables,
+            dcTables, acTables, maxHSample, maxVSample, restartInterval);
+        return BlocksToImage(width, height, componentCount, components, maxHSample, maxVSample, mcols);
+    }
+
+    // Decodes a baseline scan into per-component quantized-coefficient blocks (natural order) on
+    // components[c].Blocks, without dequantising or running the IDCT. Returns mcuCols. Shared by the pixel
+    // decoder (DecodeScanData) and the DCT extractor (ReadDctData).
+    private static int DecodeScanBlocks(Stream stream, int width, int height,
+        int componentCount, JpegComponent[] components, int[][] quantTables,
+        HuffmanTable[] dcTables, HuffmanTable[] acTables,
+        int maxHSample, int maxVSample, int restartInterval, bool coefficientsOnly = false)
+    {
         // Calculate MCU dimensions
         int mcuWidth = maxHSample * BlockSize;
         int mcuHeight = maxVSample * BlockSize;
@@ -717,7 +840,7 @@ public static class JpegCoder
                             DecodeBlock(bitReader, block, ref dcPredictors[c],
                                 dcTables[components[c].DcTableIndex],
                                 acTables[components[c].AcTableIndex],
-                                quantTables[components[c].QuantTableIndex]);
+                                quantTables[components[c].QuantTableIndex], coefficientsOnly);
                         }
                     }
                 }
@@ -725,12 +848,11 @@ public static class JpegCoder
             }
         }
 
-        // Convert decoded blocks to image pixels
-        return BlocksToImage(width, height, componentCount, components, maxHSample, maxVSample, mcuCols);
+        return mcuCols;
     }
 
     private static void DecodeBlock(JpegBitReader reader, int[] block, ref int dcPredictor,
-        HuffmanTable dcTable, HuffmanTable acTable, int[] quantTable)
+        HuffmanTable dcTable, HuffmanTable acTable, int[] quantTable, bool coefficientsOnly = false)
     {
         Array.Clear(block);
 
@@ -770,6 +892,11 @@ public static class JpegCoder
             int acValue = JpegBitReader.Extend(reader.ReadBits(acCategory), acCategory);
             block[JpegTables.NaturalOrder[position]] = acValue;
             position++;
+        }
+
+        if (coefficientsOnly)
+        {
+            return; // keep the raw quantized coefficients (for DCT-domain transcode)
         }
 
         // Dequantize
