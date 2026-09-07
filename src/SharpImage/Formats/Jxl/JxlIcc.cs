@@ -533,7 +533,14 @@ internal static class JxlIcc
     // exactly. A malformed/unusual tag table falls back to a single whole-body literal (always correct).
     // libjxl additionally shuffles/delta-predicts the numeric LUT data; that mainly helps large uncommon
     // profiles and is left to the entropy layer here.
-    public static byte[] EncodeTransform(byte[] raw)
+    public static byte[] EncodeTransform(byte[] raw) => EncodeTransform(raw, deltaWidth: 0);
+
+    // deltaWidth (0 = literal copy): encode the tag-data region with a width-`deltaWidth` order-1 linear delta
+    // predictor (command 4) instead of a literal (command 1). width 1 suits byte data, width 2 the 16-bit
+    // curve/LUT tables in larger profiles; either turns slowly-varying numeric data into small residuals the
+    // entropy layer codes far better. On text/structured data it can be worse, so EncodeStream tries each and
+    // keeps the smallest.
+    public static byte[] EncodeTransform(byte[] raw, int deltaWidth)
     {
         int outputSize = raw.Length;
         int headerSize = Math.Min(outputSize, 128);
@@ -570,9 +577,33 @@ internal static class JxlIcc
             }
             else
             {
-                // Main section: everything after the tag table, copied literally.
+                // Main section: everything after the tag table.
                 int bodyLen = outputSize - bodyStart;
-                if (bodyLen > 0)
+                int w = deltaWidth;
+                if (bodyLen >= w && w >= 1 && bodyStart >= 4 * w && (bodyLen % w) == 0)
+                {
+                    // Command 4, width w, order 1, stride w. decode: prev0/prev1 are the two preceding w-byte
+                    // big-endian values; out[pos..pos+w] = shuffled[i..i+w] + (p >> per-byte-shift), p = 2*prev0
+                    // - prev1. So the residual per group is raw[pos..] - p (big-endian, per byte), then the
+                    // whole residual stream is inverse-shuffled (decode re-shuffles it).
+                    var shuffled = new byte[bodyLen];
+                    for (int i = 0; i < bodyLen; i += w)
+                    {
+                        int pos = bodyStart + i;
+                        uint p = (2u * ReadBEn(raw, pos - w, w)) - ReadBEn(raw, pos - (2 * w), w);
+                        for (int j = 0; j < w; j++)
+                        {
+                            shuffled[i + j] = (byte)(raw[pos + j] - (p >> (8 * (w - 1 - j))));
+                        }
+                    }
+
+                    byte[] deltaData = w == 1 ? shuffled : InverseShuffle(shuffled, w);
+                    commands.Add(4);
+                    commands.Add((byte)((w - 1) | (1 << 2))); // width-1, order 1, no stride flag (stride == width)
+                    WriteVarint(commands, (ulong)bodyLen);
+                    data.AddRange(deltaData);
+                }
+                else if (bodyLen > 0)
                 {
                     commands.Add(1);
                     WriteVarint(commands, (ulong)bodyLen);
@@ -660,6 +691,70 @@ internal static class JxlIcc
 
     private static uint ReadBE(byte[] b, int o) => (uint)((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]);
 
+    // Read `width` bytes big-endian, right-aligned into a uint (matches the decoder's `prev` reconstruction).
+    private static uint ReadBEn(byte[] b, int o, int width)
+    {
+        uint v = 0;
+        for (int k = 0; k < width; k++)
+        {
+            v = (v << 8) | b[o + k];
+        }
+
+        return v;
+    }
+
+    // Inverse of Shuffle2/Shuffle4: given the bytes the decoder will produce (bytes == Shuffle_width(data)),
+    // recover `data` so the decoder's shuffle reproduces `bytes`.
+    private static byte[] InverseShuffle(byte[] bytes, int width)
+    {
+        int len = bytes.Length;
+        var data = new byte[len];
+        if (width == 2)
+        {
+            int height = len / 2;
+            int odd = len % 2;
+            for (int idx = 0; idx < height; idx++)
+            {
+                data[idx] = bytes[2 * idx];
+                data[idx + height + odd] = bytes[(2 * idx) + 1];
+            }
+
+            if (odd != 0)
+            {
+                data[height] = bytes[len - 1];
+            }
+
+            return data;
+        }
+
+        // width == 4: invert Shuffle4's mapping by re-deriving its output index order.
+        int step = len / 4;
+        int wideCount = len % 4;
+        int outPos = 0;
+        for (int idx = 0; idx < step; idx++)
+        {
+            int baseI = idx;
+            for (int k = 0; k < wideCount; k++)
+            {
+                data[baseI] = bytes[outPos++];
+                baseI += step + 1;
+            }
+
+            for (int k = wideCount; k < 4; k++)
+            {
+                data[baseI] = bytes[outPos++];
+                baseI += step;
+            }
+        }
+
+        for (int idx = 1; idx <= wideCount; idx++)
+        {
+            data[((step + 1) * idx) - 1] = bytes[outPos++];
+        }
+
+        return data;
+    }
+
     // ---- Entropy layer: the full ICC blob as it sits in the codestream ----
 
     // Reads an embedded ICC profile from the bitstream (enc_size + a 41-context entropy stream) and returns
@@ -702,7 +797,21 @@ internal static class JxlIcc
     // for a little more compression, which our general decoder still reads).
     public static void EncodeStream(JxlBitWriter w, byte[] rawIcc)
     {
-        byte[] encoded = EncodeTransform(rawIcc);
+        // Try the literal body and the width-1 / width-2 delta-predicted bodies; keep whichever entropy-codes
+        // smallest (delta helps numeric LUT/curve data, hurts text — the choice is data-driven).
+        byte[] encoded = EncodeTransform(rawIcc, deltaWidth: 0);
+        double best = EntropyCost(encoded);
+        foreach (int w2 in new[] { 1, 2 })
+        {
+            byte[] cand = EncodeTransform(rawIcc, deltaWidth: w2);
+            double cost = EntropyCost(cand);
+            if (cost < best)
+            {
+                best = cost;
+                encoded = cand;
+            }
+        }
+
         w.WriteU64((ulong)encoded.Length);
 
         int maxSym = 0;
@@ -732,6 +841,33 @@ internal static class JxlIcc
         {
             codeTab.WriteSymbol(w, b);
         }
+    }
+
+    // Order-0 entropy (bits) of a byte stream — a faithful proxy for our single-shared-histogram ANS layer,
+    // used to choose between the literal and delta-predicted body.
+    private static double EntropyCost(byte[] bytes)
+    {
+        if (bytes.Length == 0)
+        {
+            return 0;
+        }
+
+        var counts = new int[256];
+        foreach (byte b in bytes)
+        {
+            counts[b]++;
+        }
+
+        double bits = 0;
+        foreach (int c in counts)
+        {
+            if (c > 0)
+            {
+                bits += c * -Math.Log2((double)c / bytes.Length);
+            }
+        }
+
+        return bits;
     }
 
     private static void WriteUintConfig(JxlBitWriter w, int splitExp, int logAlpha)
