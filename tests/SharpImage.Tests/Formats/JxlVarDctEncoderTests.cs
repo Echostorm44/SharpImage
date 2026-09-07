@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using SharpImage.Core;
 using SharpImage.Formats.Jxl;
 using SharpImage.Image;
@@ -1051,6 +1052,40 @@ public class JxlVarDctEncoderTests
         if (!string.IsNullOrEmpty(dir))
         {
             System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "anim.jxl"), cs);
+        }
+    }
+
+    // Context map ANS coding: a large, highly-skewed context map (like the 7425-entry HF map, ~99% one
+    // cluster in long runs) must round-trip through WriteContextMap -> ReadClusters at every bit alignment.
+    // Guards the switch from a prefix code (1-bit-per-entry floor -> ~900 B) to ANS (sub-1-bit -> ~80 B),
+    // and the logAlpha-from-alphabet derivation that a hardcoded value got wrong.
+    [Test]
+    [Arguments(0)]
+    [Arguments(1)]
+    [Arguments(4)]
+    [Arguments(7)]
+    public async Task Jxl_ContextMapAns_RoundTrips(int padBits)
+    {
+        var rnd = new Random(99);
+        foreach (int clusters in new[] { 2, 8, 9, 40, 64 })
+        {
+            var map = new int[7425];
+            for (int i = 0; i < map.Length; i++)
+            {
+                map[i] = rnd.Next(80) == 0 ? rnd.Next(clusters) : 0; // sparse, skewed, run-structured
+            }
+
+            int nc = map.Max() + 1;
+            byte[] bytes = JxlEncoder.TestWriteContextMap(map, nc, out long wbits, padBits);
+            var br = new JxlBitReader(bytes);
+            if (padBits > 0)
+            {
+                br.ReadBits(padBits);
+            }
+
+            byte[] got = JxlEntropy.ReadClusters(map.Length, br, out _);
+            await Assert.That(got.AsSpan().SequenceEqual(map.Select(v => (byte)v).ToArray())).IsTrue();
+            await Assert.That(br.BitPosition).IsEqualTo(wbits); // reader consumed exactly what was written (no desync)
         }
     }
 

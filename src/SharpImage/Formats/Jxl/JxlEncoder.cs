@@ -2006,9 +2006,36 @@ internal static partial class JxlEncoder
     // Context map (context -> histogram cluster). Uses the simple bits-per-entry form when it fits
     // (<= 8 clusters), otherwise the complex form: a move-to-front transform then a prefix-coded symbol
     // stream (mirrors JxlEntropy.DecodeContextMap).
+    // Largest context map still coded with raw fixed-width bits ("simple"). Above this, an MTF+ANS stream is
+    // far smaller: a prefix code has a 1-bit-per-entry floor, catastrophic for the big HF map (7425 entries,
+    // ~99% one cluster in long runs) — ANS codes a near-certain symbol in a small fraction of a bit.
+    private const int SimpleContextMapMaxSize = 256;
+
+    // Test hook: write a context map and return the bytes (padded to a byte), for a round-trip against
+    // JxlEntropy.ReadClusters.
+    internal static byte[] TestWriteContextMap(int[] map, int numClusters, out long bitLen, int padBits = 0)
+    {
+        var w = new JxlBitWriter();
+        if (padBits > 0)
+        {
+            w.WriteBits(0, padBits); // misalign to mimic mid-stream writing
+        }
+
+        WriteContextMap(w, map, numClusters);
+        bitLen = w.BitPosition;
+        return w.ToArray();
+    }
+
     private static void WriteContextMap(JxlBitWriter s, int[] map, int numClusters)
     {
-        if (numClusters <= 8)
+        if (numClusters <= 1)
+        {
+            s.WriteBool(true);  // is_simple
+            s.WriteBits(0, 2);  // bits per entry = 0 => every entry is cluster 0
+            return;
+        }
+
+        if (numClusters <= 8 && map.Length <= SimpleContextMapMaxSize)
         {
             int bpe = Math.Max(1, BitLen(numClusters - 1));
             s.WriteBool(true);         // is_simple
@@ -2021,6 +2048,9 @@ internal static partial class JxlEncoder
             return;
         }
 
+        // MTF + ANS. The decoder reads: is_simple=false, use_mtf, then a 1-context entropy stream
+        // (DecodeHistograms(1): lz77 off, use_prefix=false, logAlpha, uint config, histogram), then `size`
+        // symbols, then inverse-MTF.
         s.WriteBool(false); // not simple
         s.WriteBool(true);  // use move-to-front
         int[] mtf = MoveToFront(map);
@@ -2036,12 +2066,25 @@ internal static partial class JxlEncoder
             freq[v]++;
         }
 
-        var cmCode = new JxlPrefixCode(freq, maxSym + 1);
-        WriteHistogramsHeader(s, numContexts: 1, cmCode); // single-context, prefix-coded stream
+        // logAlpha must match the alphabet (as the modular ANS path derives it): the alias table is built for
+        // this precision, so a hardcoded 8 desyncs for a small alphabet. split_exp == logAlpha keeps token ==
+        // value (symbols are MTF positions < numClusters <= 2^logAlpha).
+        int logAlpha = Math.Max(5, BitLen(maxSym)); // BitLen(maxSym) == CeilLog2(maxSym+1) for maxSym >= 1
+        int[] norm = JxlEntropy.NormalizeCounts(freq, JxlEntropy.HistShift);
+        s.WriteBool(false);                  // lz77 disabled
+        s.WriteBool(false);                  // use_prefix_code = false (ANS)
+        s.WriteBits((uint)(logAlpha - 5), 2);
+        WriteUintConfig(s, logAlpha, 0, 0, logAlpha); // split_exp == logAlpha => token == value, no extra bits
+        JxlEntropy.WriteHistogram(s, norm, JxlEntropy.HistShift);
+
+        var ans = new JxlAnsWriter(new[] { norm }, logAlpha);
+        var toks = new List<AnsToken>(mtf.Length);
         foreach (int v in mtf)
         {
-            cmCode.WriteSymbol(s, v);
+            toks.Add(new AnsToken(0, v, 0, 0));
         }
+
+        ans.Encode(s, toks);
     }
 
     // Forward move-to-front: emit each value's current table position, then move it to the front.
