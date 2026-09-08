@@ -56,11 +56,46 @@ public static class JpegXlLossless
             w.Write(c.BlocksPerCol);
         }
 
+        // Progressive scan script: each scan's band + approximation + restart interval, its participating
+        // components (with their Huffman selectors), and the verbatim inter-scan bytes preceding its entropy.
+        w.Write(d.Progressive);
+        if (d.Progressive)
+        {
+            w.Write(d.Scans.Count);
+            foreach (JpegScan s in d.Scans)
+            {
+                w.Write(s.Ss);
+                w.Write(s.Se);
+                w.Write(s.Ah);
+                w.Write(s.Al);
+                w.Write(s.RestartInterval);
+                w.Write(s.ComponentIndices.Length);
+                for (int i = 0; i < s.ComponentIndices.Length; i++)
+                {
+                    w.Write(s.ComponentIndices[i]);
+                    w.Write(s.CompDcTable[i]);
+                    w.Write(s.CompAcTable[i]);
+                }
+
+                WriteBlob(w, s.Prefix);
+            }
+        }
+
         // The coefficients are coded with the DCT-aware AC context model (non-zero-count prediction from
         // neighbouring blocks + per-frequency-band contexts) and ANS — the same machinery the lossy VarDCT
         // encoder uses — which beats JPEG's per-block Huffman by exploiting inter-block correlation.
         WriteBlob(w, Jxl.JxlEncoder.EncodeJpegCoefficients(d));
-        return ms.ToArray();
+        byte[] container = ms.ToArray();
+
+        // Self-certify: only emit a container that reconstructs the source JPEG byte-for-byte. A source this
+        // path cannot reproduce (an atypical progressive encoder, say) is refused cleanly rather than corrupted.
+        byte[] check = Decode(container);
+        if (!check.AsSpan().SequenceEqual(jpeg))
+        {
+            throw new NotSupportedException("JPEG could not be losslessly recompressed (byte-exact reconstruction failed).");
+        }
+
+        return container;
     }
 
     /// <summary>Reconstructs the exact original JPEG bytes from a SharpImage lossless-JPEG container.</summary>
@@ -99,6 +134,37 @@ public static class JpegXlLossless
                 BlocksPerRow = r.ReadInt32(),
                 BlocksPerCol = r.ReadInt32(),
             };
+        }
+
+        d.Progressive = r.ReadBoolean();
+        if (d.Progressive)
+        {
+            int scanCount = r.ReadInt32();
+            d.Scans = new System.Collections.Generic.List<JpegScan>(scanCount);
+            for (int si = 0; si < scanCount; si++)
+            {
+                var s = new JpegScan
+                {
+                    Ss = r.ReadInt32(),
+                    Se = r.ReadInt32(),
+                    Ah = r.ReadInt32(),
+                    Al = r.ReadInt32(),
+                    RestartInterval = r.ReadInt32(),
+                };
+                int compCount = r.ReadInt32();
+                s.ComponentIndices = new int[compCount];
+                s.CompDcTable = new int[compCount];
+                s.CompAcTable = new int[compCount];
+                for (int i = 0; i < compCount; i++)
+                {
+                    s.ComponentIndices[i] = r.ReadInt32();
+                    s.CompDcTable[i] = r.ReadInt32();
+                    s.CompAcTable[i] = r.ReadInt32();
+                }
+
+                s.Prefix = ReadBlob(r);
+                d.Scans.Add(s);
+            }
         }
 
         Jxl.JxlEncoder.DecodeJpegCoefficients(ReadBlob(r), d);

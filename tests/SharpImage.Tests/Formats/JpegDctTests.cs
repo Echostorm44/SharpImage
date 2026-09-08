@@ -173,6 +173,36 @@ public class JpegDctTests
         await Assert.That(restored.AsSpan().SequenceEqual(jpeg)).IsTrue();
     }
 
+    // A real PROGRESSIVE (SOF2) JPEG — multi-scan DC first/refine + AC first/refine with EOBRUN grouping —
+    // must recompress and reconstruct byte-for-byte. This embeds a small libjpeg-family progressive JPEG so
+    // the coverage runs everywhere (no external corpus needed). Guards the progressive scan re-encoder and the
+    // AC-refine EOBRUN decode fix.
+    [Test]
+    public async Task Jpeg_Progressive_ByteExact_RoundTrips()
+    {
+        byte[] jpeg = Convert.FromBase64String(ProgressiveJpegBase64);
+
+        // Sanity: it really is progressive (contains an SOF2 marker).
+        bool isProgressive = false;
+        for (int i = 2; i < jpeg.Length - 1; i++)
+        {
+            if (jpeg[i] == 0xFF && jpeg[i + 1] == 0xC2)
+            {
+                isProgressive = true;
+                break;
+            }
+        }
+
+        await Assert.That(isProgressive).IsTrue();
+
+        byte[] container = JpegXlLossless.Encode(jpeg); // self-verifies byte-exactness internally
+        byte[] restored = JpegXlLossless.Decode(container);
+        await Assert.That(restored.AsSpan().SequenceEqual(jpeg)).IsTrue();
+    }
+
+    private const string ProgressiveJpegBase64 =
+        "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";
+
     // Byte-exact round-trip of REAL third-party JPEGs (libjpeg/ffmpeg) from VARDCT_JBRD_DIR, which exercise
     // real Huffman tables, APPn/COM segments and restart markers.
     [Test]

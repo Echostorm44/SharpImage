@@ -38,6 +38,26 @@ public sealed class JpegDctData
     // (from Components' coefficients + the Huffman tables parsed out of HeaderBytes) between them.
     public byte[] HeaderBytes = Array.Empty<byte>();
     public byte[] TrailingBytes = Array.Empty<byte>();
+
+    // Progressive (SOF2): the coefficients are the FINAL values after all scans. Each scan is re-emitted from
+    // them in order (its verbatim prefix — inter-scan markers + SOS header — then its re-encoded entropy).
+    public bool Progressive;
+    public System.Collections.Generic.List<JpegScan> Scans = new();
+}
+
+/// <summary>One progressive scan: its spectral/approximation band, participating components, and the verbatim
+/// bytes (marker segments + SOS header) that precede its entropy-coded data.</summary>
+public sealed class JpegScan
+{
+    public int Ss;
+    public int Se;
+    public int Ah;
+    public int Al;
+    public int RestartInterval;                          // DRI in effect for this scan (0 = none)
+    public int[] ComponentIndices = Array.Empty<int>(); // indices into JpegDctData.Components
+    public int[] CompDcTable = Array.Empty<int>();       // DC Huffman selector per scan component
+    public int[] CompAcTable = Array.Empty<int>();       // AC Huffman selector per scan component
+    public byte[] Prefix = Array.Empty<byte>();          // markers + SOS header emitted before the entropy data
 }
 
 /// <summary>One component's quantized DCT blocks (natural order), sampling factors and quant-table index.</summary>
@@ -59,7 +79,7 @@ public sealed class JpegDctComponent
 /// Huffman coding, YCbCr/grayscale, 4:4:4/4:2:2/4:2:0 subsampling, optimized Huffman tables.
 /// Does not support: arithmetic coding, lossless, JPEG2000.
 /// </summary>
-public static class JpegCoder
+public static partial class JpegCoder
 {
     // JPEG markers
     private const byte MarkerPrefix = 0xFF;
@@ -249,6 +269,7 @@ public static class JpegCoder
         }
 
         int width = 0, height = 0, componentCount = 0, restartInterval = 0;
+        bool isProgressive = false;
         var components = new JpegComponent[MaxComponents];
         int maxHSample = 1, maxVSample = 1;
         var quantTables = new int[4][];
@@ -269,7 +290,9 @@ public static class JpegCoder
                     ReadSof(stream, ref width, ref height, ref componentCount, components, ref maxHSample, ref maxVSample);
                     break;
                 case SOF2:
-                    throw new NotSupportedException("Progressive JPEG DCT extraction is not yet supported.");
+                    isProgressive = true;
+                    ReadSof(stream, ref width, ref height, ref componentCount, components, ref maxHSample, ref maxVSample);
+                    break;
                 case DHT:
                     ReadDht(stream, dcTables, acTables);
                     break;
@@ -279,6 +302,9 @@ public static class JpegCoder
                 case DRI:
                     ReadDri(stream, ref restartInterval);
                     break;
+                case SOS when isProgressive:
+                    return ReadProgressiveDctData(stream, data, marker, width, height, componentCount, components,
+                        quantTables, dcTables, acTables, maxHSample, maxVSample, restartInterval);
                 case SOS:
                     ReadSosHeader(stream, components, componentCount);
                     int scanStart = (int)stream.Position; // entropy-coded data begins here (SOS header captured verbatim)
@@ -326,6 +352,121 @@ public static class JpegCoder
         throw new InvalidDataException("JPEG missing SOS marker.");
     }
 
+    // Progressive (SOF2) DCT extraction: iterates every scan, decoding into the shared final coefficient
+    // blocks, and captures each scan's spectral/approximation band + the verbatim bytes (inter-scan markers +
+    // SOS header) preceding its entropy data, so RebuildJpeg can re-emit the whole multi-scan file byte-exact.
+    // Entered with `stream` positioned just after the FIRST SOS marker's two bytes.
+    private static JpegDctData ReadProgressiveDctData(MemoryStream stream, byte[] data, int marker,
+        int width, int height, int componentCount, JpegComponent[] components,
+        int[][] quantTables, HuffmanTable[] dcTables, HuffmanTable[] acTables,
+        int maxHSample, int maxVSample, int restartInterval)
+    {
+        int mcuWidth = maxHSample * BlockSize, mcuHeight = maxVSample * BlockSize;
+        int mcuCols = (width + mcuWidth - 1) / mcuWidth;
+        int mcuRows = (height + mcuHeight - 1) / mcuHeight;
+        for (int c = 0; c < componentCount; c++)
+        {
+            int blocksH = mcuCols * components[c].HSample;
+            int blocksV = mcuRows * components[c].VSample;
+            components[c].Blocks = new int[blocksV * blocksH][];
+            for (int i = 0; i < components[c].Blocks.Length; i++)
+            {
+                components[c].Blocks[i] = new int[64];
+            }
+        }
+
+        var scans = new List<JpegScan>();
+        int prevEnd = 0; // start of file: scan 0's prefix carries SOI..first-SOS-header verbatim
+        while (true)
+        {
+            if (marker == SOS)
+            {
+                ScanInfo scanInfo = ReadSosHeaderProgressive(stream, components, componentCount);
+                int entropyStart = (int)stream.Position;
+                var scan = new JpegScan
+                {
+                    Ss = scanInfo.Ss,
+                    Se = scanInfo.Se,
+                    Ah = scanInfo.Ah,
+                    Al = scanInfo.Al,
+                    RestartInterval = restartInterval,
+                    ComponentIndices = (int[])scanInfo.ComponentIndices.Clone(),
+                    CompDcTable = new int[scanInfo.ComponentCount],
+                    CompAcTable = new int[scanInfo.ComponentCount],
+                    Prefix = data[prevEnd..entropyStart],
+                };
+                for (int si = 0; si < scanInfo.ComponentCount; si++)
+                {
+                    int c = scanInfo.ComponentIndices[si];
+                    scan.CompDcTable[si] = components[c].DcTableIndex;
+                    scan.CompAcTable[si] = components[c].AcTableIndex;
+                }
+
+                scans.Add(scan);
+                DecodeProgressiveScan(stream, componentCount, components, dcTables, acTables,
+                    mcuCols, mcuRows, maxHSample, maxVSample, restartInterval, scanInfo, width, height);
+                int entropyEnd = FindScanEnd(data, entropyStart);
+                prevEnd = entropyEnd;
+                stream.Position = entropyEnd;
+            }
+            else if (marker == DHT)
+            {
+                ReadDht(stream, dcTables, acTables);
+            }
+            else if (marker == DQT)
+            {
+                ReadDqt(stream, quantTables);
+            }
+            else if (marker == DRI)
+            {
+                ReadDri(stream, ref restartInterval);
+            }
+            else if (marker < 0 || marker == EOI)
+            {
+                break;
+            }
+            else
+            {
+                SkipMarkerSegment(stream);
+            }
+
+            marker = ReadMarker(stream);
+        }
+
+        var dct = new JpegDctData
+        {
+            Width = width,
+            Height = height,
+            ComponentCount = componentCount,
+            MaxHSample = maxHSample,
+            MaxVSample = maxVSample,
+            RestartInterval = restartInterval,
+            QuantTables = quantTables,
+            Progressive = true,
+            Scans = scans,
+            Components = new JpegDctComponent[componentCount],
+            HeaderBytes = scans.Count > 0 ? scans[0].Prefix : Array.Empty<byte>(),
+            TrailingBytes = data[prevEnd..],
+        };
+        for (int c = 0; c < componentCount; c++)
+        {
+            dct.Components[c] = new JpegDctComponent
+            {
+                Id = components[c].Id,
+                HSample = components[c].HSample,
+                VSample = components[c].VSample,
+                QuantTableIndex = components[c].QuantTableIndex,
+                DcTableIndex = components[c].DcTableIndex,
+                AcTableIndex = components[c].AcTableIndex,
+                BlocksPerRow = mcuCols * components[c].HSample,
+                BlocksPerCol = mcuRows * components[c].VSample,
+                Blocks = components[c].Blocks,
+            };
+        }
+
+        return dct;
+    }
+
     // Finds the byte offset of the marker that terminates the entropy-coded scan (EOI for baseline), skipping
     // byte-stuffed 0xFF00 and RSTn restart markers embedded in the data.
     private static int FindScanEnd(byte[] data, int start)
@@ -357,6 +498,11 @@ public static class JpegCoder
     /// </summary>
     public static byte[] RebuildJpeg(JpegDctData d)
     {
+        if (d.Progressive)
+        {
+            return RebuildProgressiveJpeg(d);
+        }
+
         var dcEnc = new (int Code, int Len)[4][];
         var acEnc = new (int Code, int Len)[4][];
         ParseHuffmanEncodeTables(d.HeaderBytes, dcEnc, acEnc);
@@ -419,9 +565,14 @@ public static class JpegCoder
 
     // Parses every DHT segment out of the verbatim header into canonical (code,length)-per-symbol encode
     // tables, indexed [tableIndex][symbol]. dcEnc/acEnc are 4-slot arrays (JPEG allows table indices 0..3).
-    private static void ParseHuffmanEncodeTables(byte[] header, (int Code, int Len)[][] dcEnc, (int Code, int Len)[][] acEnc)
+    private static void ParseHuffmanEncodeTables(byte[] header, (int Code, int Len)[][] dcEnc, (int Code, int Len)[][] acEnc) =>
+        ParseHuffmanEncodeTables(header, 2, dcEnc, acEnc);
+
+    // Scans `header` from `start` for DHT segments, filling/overwriting the encode tables (progressive files may
+    // (re)define Huffman tables between scans; call this cumulatively over each scan prefix, later defs winning).
+    private static void ParseHuffmanEncodeTables(byte[] header, int start, (int Code, int Len)[][] dcEnc, (int Code, int Len)[][] acEnc)
     {
-        int p = 2; // skip SOI
+        int p = start;
         while (p + 4 <= header.Length)
         {
             if (header[p] != 0xFF)
@@ -920,7 +1071,9 @@ public static class JpegCoder
                             }
                         }
                     }
-                    eobRun--;
+
+                    // eobRun now holds the count of FOLLOWING blocks covered by this EOB run (the current
+                    // block was just refined above). Matches the AC-first convention — do NOT decrement again.
                     return;
                 }
             }
