@@ -18,9 +18,10 @@ internal static partial class JxlEncoder
                                                                    // vs the clustering loss it removes).
     private const int JpegDcBuckets = 8;                           // DC residual conditioned on neighbour activity
 
-    // AC block clusters: one per component. (Conditioning the AC block context additionally on the block's DC
-    // magnitude was tried and measured worse — the flat/busy split is already captured by the non-zeros
-    // context, so the extra contexts only add histogram overhead.) Runtime so grayscale uses just 1 (not 3).
+    // AC block clusters: one per component. (Conditioning the AC coefficient context additionally on a causal
+    // DC-activity bucket sharpens the raw per-context distributions — measured -2.7KB zeroth-order on the
+    // configure screenshot — but the 2-4x context explosion costs more in clustering + LZ77 context-map and
+    // histogram overhead than it saves, a net regression at every bucket count tried. Kept at 1/component.)
     private static int JpegNbc(int componentCount) => componentCount;
 
     private static int JpegDcContextBase(int nbc) => 495 * nbc;
@@ -207,6 +208,11 @@ internal static partial class JxlEncoder
                 BuildJpegTokens(d, orders, useWp, vals, ctxs);
                 int[] valArr = vals.ToArray();
                 int[] ctxArr = ctxs.ToArray();
+                if (!useWp && useCustomOrder && Environment.GetEnvironmentVariable("JPEGAC_STATS") != null)
+                {
+                    JpegStats(d, valArr, ctxArr);
+                }
+
                 byte[] plain = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, 0); // 0 = no LZ77
                 if (best == null || plain.Length < best.Length)
                 {
@@ -240,6 +246,61 @@ internal static partial class JxlEncoder
         }
 
         return best!;
+    }
+
+    // Diagnostic: context-conditioned zeroth-order entropy split by token category (DC residual, AC nonzero
+    // count, AC coefficients) plus the raw extra-bits mantissa. Approximates the no-LZ77 ANS coded size and
+    // shows where the bytes live. Gated on JPEGAC_STATS.
+    private static void JpegStats(Formats.JpegDctData d, int[] vals, int[] ctxs)
+    {
+        int nbc = JpegNbc(d.ComponentCount);
+        int dcBase = JpegDcContextBase(nbc), countMax = 37 * nbc;
+        int total = JpegTotalContexts(nbc, d.ComponentCount);
+        var hist = new Dictionary<int, long>[total];
+        var extra = new double[3];
+        var toks = new long[3];
+        int Cat(int c) => c >= dcBase ? 0 : (c < countMax ? 1 : 2);
+        for (int i = 0; i < vals.Length; i++)
+        {
+            (int tok, int nb, int _) = PackHybridFull(4, 2, 0, vals[i]);
+            int cat = Cat(ctxs[i]);
+            extra[cat] += nb;
+            toks[cat]++;
+            (hist[ctxs[i]] ??= new Dictionary<int, long>()).TryGetValue(tok, out long cur);
+            hist[ctxs[i]][tok] = cur + 1;
+        }
+
+        var symBits = new double[3];
+        for (int c = 0; c < total; c++)
+        {
+            if (hist[c] == null)
+            {
+                continue;
+            }
+
+            long tot = 0;
+            foreach (long v in hist[c].Values)
+            {
+                tot += v;
+            }
+
+            int cat = Cat(c);
+            foreach (long v in hist[c].Values)
+            {
+                symBits[cat] += -v * Math.Log((double)v / tot, 2);
+            }
+        }
+
+        string[] name = { "DC     ", "ACcount", "ACcoeff" };
+        double gt = 0;
+        for (int cat = 0; cat < 3; cat++)
+        {
+            double bytes = (symBits[cat] + extra[cat]) / 8;
+            gt += bytes;
+            Console.Error.WriteLine($"  {name[cat]}: toks={toks[cat],8}  sym={symBits[cat] / 8,9:F0}B  extra={extra[cat] / 8,9:F0}B  total={bytes,9:F0}B");
+        }
+
+        Console.Error.WriteLine($"  (zeroth-order no-LZ77 estimate total = {gt:F0}B)");
     }
 
     private static int[][] NaturalOrders(int componentCount)
