@@ -5,13 +5,14 @@
 // and controlled entirely by this repo, so byte-exact reconstruction is guaranteed by JpegCoder.RebuildJpeg.
 using System;
 using System.Collections.Generic;
+using E = SharpImage.Formats.Jxl.JxlBitReader.U32Enc;
 
 namespace SharpImage.Formats.Jxl;
 
 internal static partial class JxlEncoder
 {
     private const int JpegBlockClusters = 3;                       // one AC block-context per component
-    private const int JpegMaxClusters = 256;                       // JPEG coeffs have far more distinct
+    private const int JpegMaxClusters = 64;                        // JPEG coeffs have far more distinct
                                                                    // per-band distributions than the lossy
                                                                    // path — allow more ANS histograms than
                                                                    // MaxHfClusters (context-map cost is tiny
@@ -86,8 +87,10 @@ internal static partial class JxlEncoder
         return orders;
     }
 
-    // Builds the token + per-token-context stream for one baseline JPEG's coefficients (all components).
-    private static void BuildJpegTokens(Formats.JpegDctData d, int[][] orders, List<ModToken> toks, List<int> ctxs)
+    // Builds the raw-value + per-position-context stream for one baseline JPEG's coefficients (all
+    // components). Values are the pre-hybrid unsigned integers (PackSigned for signed coeffs/DC residuals,
+    // the count for non-zeros); the caller hybrid-packs them (and optionally LZ77s the value stream).
+    private static void BuildJpegTokens(Formats.JpegDctData d, int[][] orders, List<int> vals, List<int> ctxs)
     {
         for (int ci = 0; ci < d.ComponentCount; ci++)
         {
@@ -107,7 +110,7 @@ internal static partial class JxlEncoder
                     int above = by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : left;
                     int aboveLeft = bx > 0 && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx - 1][0] : above;
                     ctxs.Add(JpegDcContext(ci, left, above, aboveLeft));
-                    toks.Add(HybridToken(PackSigned(block[0] - ClampGradient(left, above, aboveLeft))));
+                    vals.Add(PackSigned(block[0] - ClampGradient(left, above, aboveLeft)));
 
                     // AC: non-zero count (predicted from neighbours), then coefficients in zigzag order.
                     uint predicted = by == 0
@@ -127,7 +130,7 @@ internal static partial class JxlEncoder
                     }
 
                     ctxs.Add(nonZerosCtx);
-                    toks.Add(HybridToken(nonZeros));
+                    vals.Add(nonZeros);
                     nonZerosGrid[bx] = (uint)nonZeros;
                     if (nonZeros == 0)
                     {
@@ -145,12 +148,12 @@ internal static partial class JxlEncoder
                         int q = block[order[oi]];
                         if (q == 0)
                         {
-                            toks.Add(HybridToken(0));
+                            vals.Add(0);
                             isPrevNonzero = 0;
                             continue;
                         }
 
-                        toks.Add(HybridToken(PackSigned(q)));
+                        vals.Add(PackSigned(q));
                         isPrevNonzero = 1;
                         if (--rem == 0)
                         {
@@ -162,14 +165,44 @@ internal static partial class JxlEncoder
         }
     }
 
+    // Candidate LZ77 minimum match lengths tried in the best-of. The greedy matcher favours longer minimums
+    // (short matches inflate the histograms and pre-empt better long matches), and 16 vs 32 win on different
+    // content, so try both plus no-LZ77 and keep the smallest.
+    private static readonly int[] JpegLz77MinLens = { 16, 32 };
+    private const int JpegSeLen = 4;          // hybrid config split for LZ77 length
+    private const int JpegSeDist = 4;         // hybrid config split for LZ77 distance
+
     /// <summary>Entropy-codes a JPEG's quantized DCT coefficients with the DCT-aware context model + ANS.</summary>
     internal static byte[] EncodeJpegCoefficients(Formats.JpegDctData d)
     {
-        // Optimized per-component scan order tightens the coefficient model but costs a transmitted order
-        // table; on tiny images that table can outweigh the saving, so encode both ways and keep the smaller.
-        byte[] custom = EncodeWithOrders(d, ComputeOrders(d), useCustomOrder: true);
-        byte[] natural = EncodeWithOrders(d, NaturalOrders(d.ComponentCount), useCustomOrder: false);
-        return custom.Length <= natural.Length ? custom : natural;
+        // Two independent choices, kept best-of: the scan order (custom tightens the model but costs a
+        // transmitted table) and LZ77 (catches repeated token runs in graphics but adds a small header).
+        byte[]? best = null;
+        foreach (bool useCustomOrder in new[] { true, false })
+        {
+            int[][] orders = useCustomOrder ? ComputeOrders(d) : NaturalOrders(d.ComponentCount);
+            var vals = new List<int>();
+            var ctxs = new List<int>();
+            BuildJpegTokens(d, orders, vals, ctxs);
+            int[] valArr = vals.ToArray();
+            int[] ctxArr = ctxs.ToArray();
+            byte[] plain = EncodeStream(d, orders, useCustomOrder, valArr, ctxArr, 0); // 0 = no LZ77
+            if (best == null || plain.Length < best.Length)
+            {
+                best = plain;
+            }
+
+            foreach (int minLen in JpegLz77MinLens)
+            {
+                byte[] blob = EncodeStream(d, orders, useCustomOrder, valArr, ctxArr, minLen);
+                if (blob.Length < best.Length)
+                {
+                    best = blob;
+                }
+            }
+        }
+
+        return best!;
     }
 
     private static int[][] NaturalOrders(int componentCount)
@@ -190,38 +223,12 @@ internal static partial class JxlEncoder
         return orders;
     }
 
-    private static byte[] EncodeWithOrders(Formats.JpegDctData d, int[][] orders, bool useCustomOrder)
+    // Writes the container prefix (token count + optional scan-order table), then the entropy-coded value
+    // stream — either plain per-context ANS or ANS with LZ77 back-references over the value stream.
+    private static byte[] EncodeStream(Formats.JpegDctData d, int[][] orders, bool useCustomOrder, int[] vals, int[] ctxs, int minLen)
     {
-        var toks = new List<ModToken>();
-        var ctxs = new List<int>();
-        BuildJpegTokens(d, orders, toks, ctxs);
-
-        int maxTok = 0;
-        foreach (ModToken t in toks)
-        {
-            if (t.Sym > maxTok)
-            {
-                maxTok = t.Sym;
-            }
-        }
-
-        int alphabet = maxTok + 1;
-        int logAlpha = Math.Max(5, BitLen(maxTok));
-        var ctxHist = new long[JpegTotalContexts][];
-        for (int i = 0; i < JpegTotalContexts; i++)
-        {
-            ctxHist[i] = new long[alphabet];
-        }
-
-        for (int i = 0; i < toks.Count; i++)
-        {
-            ctxHist[ctxs[i]][toks[i].Sym]++;
-        }
-
-        (int[] map, int[][] norm, int k) = ClusterContextsTotalCost(ctxHist, alphabet, JpegMaxClusters, logAlpha);
-
         var w = new JxlBitWriter();
-        w.WriteBits((uint)toks.Count, 32);
+        w.WriteBits((uint)vals.Length, 32);
         w.WriteBool(useCustomOrder);
         if (useCustomOrder)
         {
@@ -234,6 +241,48 @@ internal static partial class JxlEncoder
                 }
             }
         }
+
+        if (minLen > 0)
+        {
+            EncodeEntropyLz77(w, vals, ctxs, minLen);
+        }
+        else
+        {
+            EncodeEntropyPlain(w, vals, ctxs);
+        }
+
+        return w.ToArray();
+    }
+
+    // Plain per-context ANS: hybrid-pack each value, cluster the contexts, emit the standard entropy header.
+    private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs)
+    {
+        int n = vals.Length;
+        var packed = new (int Tok, int NBits, int Bits)[n];
+        int maxTok = 0;
+        for (int i = 0; i < n; i++)
+        {
+            packed[i] = PackHybridFull(LitSplit, LitMsb, LitLsb, vals[i]);
+            if (packed[i].Tok > maxTok)
+            {
+                maxTok = packed[i].Tok;
+            }
+        }
+
+        int alphabet = maxTok + 1;
+        int logAlpha = Math.Max(5, BitLen(maxTok));
+        var ctxHist = new long[JpegTotalContexts][];
+        for (int i = 0; i < JpegTotalContexts; i++)
+        {
+            ctxHist[i] = new long[alphabet];
+        }
+
+        for (int i = 0; i < n; i++)
+        {
+            ctxHist[ctxs[i]][packed[i].Tok]++;
+        }
+
+        (int[] map, int[][] norm, int k) = ClusterContextsTotalCost(ctxHist, alphabet, JpegMaxClusters, logAlpha);
 
         // Entropy header, byte-for-byte the layout DecodeHistograms consumes: lz77, context map,
         // use_prefix, logAlpha, per-cluster uint configs, per-cluster histograms.
@@ -252,15 +301,120 @@ internal static partial class JxlEncoder
         }
 
         var ans = new JxlAnsWriter(norm, logAlpha);
-        var ansToks = new List<AnsToken>(toks.Count);
-        for (int i = 0; i < toks.Count; i++)
+        var ansToks = new List<AnsToken>(n);
+        for (int i = 0; i < n; i++)
         {
-            ModToken t = toks[i];
-            ansToks.Add(new AnsToken(map[ctxs[i]], t.Sym, t.Bits, t.N));
+            ansToks.Add(new AnsToken(map[ctxs[i]], packed[i].Tok, (uint)packed[i].Bits, packed[i].NBits));
         }
 
         ans.Encode(w, ansToks);
-        return w.ToArray();
+    }
+
+    // ANS with LZ77 back-references over the value stream. Length markers live in the literal alphabet above
+    // `threshold` (coded in the position's own context); distances use a dedicated extra cluster. The DECODER
+    // (JxlAnsReader) handles the copies transparently, so DecodeJpegCoefficients needs no changes.
+    private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen)
+    {
+        List<Op> ops = FindMatches(vals, minLen);
+
+        int maxLitTok = 0;
+        foreach (Op op in ops)
+        {
+            if (!op.Match)
+            {
+                maxLitTok = Math.Max(maxLitTok, PackHybridFull(LitSplit, LitMsb, LitLsb, op.A).Token);
+            }
+        }
+
+        int threshold = Math.Max(8, maxLitTok + 1);
+        int gmaxLit = maxLitTok, gmaxDist = 0;
+        foreach (Op op in ops)
+        {
+            if (op.Match)
+            {
+                gmaxLit = Math.Max(gmaxLit, threshold + PackHybridUint(JpegSeLen, op.A - minLen).Token);
+                gmaxDist = Math.Max(gmaxDist, PackHybridUint(JpegSeDist, op.B - 1).Token);
+            }
+        }
+
+        int logAlpha = Math.Max(5, BitLen(Math.Max(gmaxLit, gmaxDist)));
+        var ctxHist = new long[JpegTotalContexts][];
+        for (int i = 0; i < JpegTotalContexts; i++)
+        {
+            ctxHist[i] = new long[gmaxLit + 1];
+        }
+
+        var distHist = new long[gmaxDist + 1];
+        int pos = 0;
+        foreach (Op op in ops)
+        {
+            int ctx = ctxs[pos];
+            if (!op.Match)
+            {
+                ctxHist[ctx][PackHybridFull(LitSplit, LitMsb, LitLsb, op.A).Token]++;
+                pos += 1;
+            }
+            else
+            {
+                ctxHist[ctx][threshold + PackHybridUint(JpegSeLen, op.A - minLen).Token]++;
+                distHist[PackHybridUint(JpegSeDist, op.B - 1).Token]++;
+                pos += op.A;
+            }
+        }
+
+        (int[] map, int[][] norm, int k) = ClusterContextsTotalCost(ctxHist, gmaxLit + 1, JpegMaxClusters, logAlpha);
+
+        // Combined context map: N literal contexts -> their cluster, plus a final distance context -> cluster k.
+        var combinedMap = new int[JpegTotalContexts + 1];
+        Array.Copy(map, combinedMap, JpegTotalContexts);
+        combinedMap[JpegTotalContexts] = k;
+
+        int[] distNorm = JxlEntropy.NormalizeCounts(distHist, JxlEntropy.HistShift);
+        var norm2 = new int[k + 1][];
+        Array.Copy(norm, norm2, k);
+        norm2[k] = distNorm;
+
+        w.WriteBool(true); // lz77 enabled
+        w.WriteU32((uint)threshold, E.Val(224), E.Val(512), E.Val(4096), E.BitsOff(15, 8)); // min_symbol
+        w.WriteU32((uint)minLen, E.Val(3), E.Val(4), E.BitsOff(2, 5), E.BitsOff(8, 9));    // min_length
+        WriteUintConfig(w, JpegSeLen, 0, 0, 8);            // lz77 length config
+        WriteContextMap(w, combinedMap, k + 1);
+        w.WriteBool(false); // use_prefix_code = false (ANS)
+        w.WriteBits((uint)(logAlpha - 5), 2);
+        for (int c = 0; c < k; c++)
+        {
+            WriteUintConfig(w, LitSplit, LitMsb, LitLsb, logAlpha); // literal+length clusters
+        }
+
+        WriteUintConfig(w, JpegSeDist, 0, 0, logAlpha); // distance cluster
+        for (int c = 0; c <= k; c++)
+        {
+            JxlEntropy.WriteHistogram(w, norm2[c], JxlEntropy.HistShift);
+        }
+
+        var ans = new JxlAnsWriter(norm2, logAlpha);
+        var ansToks = new List<AnsToken>();
+        pos = 0;
+        foreach (Op op in ops)
+        {
+            int ctx = ctxs[pos];
+            if (!op.Match)
+            {
+                (int tok, int nb, int bits) = PackHybridFull(LitSplit, LitMsb, LitLsb, op.A);
+                ansToks.Add(new AnsToken(map[ctx], tok, (uint)bits, nb));
+                pos += 1;
+            }
+            else
+            {
+                (int lt, int ln, int lb) = PackHybridUint(JpegSeLen, op.A - minLen);
+                ansToks.Add(new AnsToken(map[ctx], threshold + lt, (uint)lb, ln));
+                (int dt, int dn, int db) = PackHybridUint(JpegSeDist, op.B - 1);
+                ansToks.Add(new AnsToken(k, dt, (uint)db, dn));
+                pos += op.A;
+            }
+        }
+
+        ans.Encode(w, ansToks);
     }
 
     /// <summary>Decodes the coefficients back into d.Components[*].Blocks (BlocksPerRow/Col must be set).</summary>
