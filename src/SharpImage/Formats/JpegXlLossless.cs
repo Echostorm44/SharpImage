@@ -149,48 +149,75 @@ public static class JpegXlLossless
         return JpegCoder.RebuildJpeg(d);
     }
 
+    // LEB128 varint — lengths are small (headers ~300 B, prefixes a few KB), so 1-2 bytes instead of 4.
+    private static void WriteVarint(BinaryWriter w, int value)
+    {
+        uint v = (uint)value;
+        while (v >= 0x80)
+        {
+            w.Write((byte)(v | 0x80));
+            v >>= 7;
+        }
+
+        w.Write((byte)v);
+    }
+
+    private static int ReadVarint(BinaryReader r)
+    {
+        int v = 0, shift = 0;
+        while (true)
+        {
+            byte b = r.ReadByte();
+            v |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
+            {
+                return v;
+            }
+
+            shift += 7;
+        }
+    }
+
     private static void WriteBlob(BinaryWriter w, byte[] data)
     {
-        w.Write(data.Length);
+        WriteVarint(w, data.Length);
         w.Write(data);
     }
 
-    private static byte[] ReadBlob(BinaryReader r)
-    {
-        int len = r.ReadInt32();
-        return r.ReadBytes(len);
-    }
+    private static byte[] ReadBlob(BinaryReader r) => r.ReadBytes(ReadVarint(r));
 
-    // Brotli-compressed blob: [origLen][payloadLen][payload]. Falls back to storing raw (origLen == -1 sentinel
-    // in the payload-length slot is avoided by comparing sizes) when compression doesn't help.
+    // Brotli-compressed blob: [flag][origLen][compLen][payload] for brotli, or [flag=0][len][data] raw when
+    // compression doesn't help — all lengths varint-coded.
     private static void WriteCompressedBlob(BinaryWriter w, byte[] data)
     {
         var buf = new byte[System.IO.Compression.BrotliEncoder.GetMaxCompressedLength(data.Length)];
         bool ok = System.IO.Compression.BrotliEncoder.TryCompress(data, buf, out int written, quality: 11, window: 22);
         if (ok && written < data.Length)
         {
-            w.Write(data.Length);   // original length (>= 0)
-            w.Write(written);       // compressed length
+            w.Write((byte)1); // brotli
+            WriteVarint(w, data.Length);
+            WriteVarint(w, written);
             w.Write(buf, 0, written);
         }
         else
         {
-            w.Write(-1);            // sentinel: stored raw
-            w.Write(data.Length);
+            w.Write((byte)0); // raw
+            WriteVarint(w, data.Length);
             w.Write(data);
         }
     }
 
     private static byte[] ReadCompressedBlob(BinaryReader r)
     {
-        int origLen = r.ReadInt32();
-        int payloadLen = r.ReadInt32();
-        byte[] payload = r.ReadBytes(payloadLen);
-        if (origLen < 0)
+        byte flag = r.ReadByte();
+        if (flag == 0)
         {
-            return payload; // stored raw
+            return r.ReadBytes(ReadVarint(r)); // stored raw
         }
 
+        int origLen = ReadVarint(r);
+        int payloadLen = ReadVarint(r);
+        byte[] payload = r.ReadBytes(payloadLen);
         var outBuf = new byte[origLen];
         System.IO.Compression.BrotliDecoder.TryDecompress(payload, outBuf, out int decoded);
         if (decoded != origLen)
