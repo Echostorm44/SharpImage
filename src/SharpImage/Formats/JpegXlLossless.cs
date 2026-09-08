@@ -40,7 +40,15 @@ public static class JpegXlLossless
         // All the geometry/sampling/table-index/block-grid metadata is DERIVABLE from the header, so it is not
         // stored here — Decode re-parses it via JpegCoder.PopulateDctMetadata (saves ~66 B per file).
         WriteCompressedBlob(w, d.HeaderBytes);
-        WriteCompressedBlob(w, d.TrailingBytes);
+
+        // Trailer is almost always just the 2-byte EOI marker; flag that common case in 1 byte instead of
+        // spending ~10 bytes framing a compressed blob (matters for the near-tie tiny files).
+        bool bareEoi = d.TrailingBytes.Length == 2 && d.TrailingBytes[0] == 0xFF && d.TrailingBytes[1] == 0xD9;
+        w.Write(bareEoi);
+        if (!bareEoi)
+        {
+            WriteCompressedBlob(w, d.TrailingBytes);
+        }
 
         // Progressive scan script: each scan's band + approximation + restart interval, its participating
         // components (with their Huffman selectors), and the verbatim inter-scan bytes preceding its entropy.
@@ -97,8 +105,8 @@ public static class JpegXlLossless
         var d = new JpegDctData
         {
             HeaderBytes = ReadCompressedBlob(r),
-            TrailingBytes = ReadCompressedBlob(r),
         };
+        d.TrailingBytes = r.ReadBoolean() ? new byte[] { 0xFF, 0xD9 } : ReadCompressedBlob(r);
 
         // Re-derive geometry / sampling / per-component sampling+table indices / block grid from the header.
         JpegCoder.PopulateDctMetadata(d);

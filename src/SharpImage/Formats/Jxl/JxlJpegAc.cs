@@ -250,7 +250,6 @@ internal static partial class JxlEncoder
     private static byte[] EncodeStream(Formats.JpegDctData d, int[][] orders, bool useCustomOrder, bool useWp, int[] vals, int[] ctxs, int minLen)
     {
         var w = new JxlBitWriter();
-        w.WriteBits((uint)vals.Length, 32);
         w.WriteBool(useWp);
         w.WriteBool(useCustomOrder);
         if (useCustomOrder)
@@ -871,8 +870,6 @@ internal static partial class JxlEncoder
     {
         byte[] zz = Compression.JpegTables.NaturalOrder;
         var br = new JxlBitReader(data);
-        int tokenCount = (int)br.ReadBits(32);
-        _ = tokenCount; // blocks are walked by structure; the count is a stored sanity value only
         bool useWp = br.ReadBool();
         bool useCustomOrder = br.ReadBool();
         var orders = new int[d.ComponentCount][];
