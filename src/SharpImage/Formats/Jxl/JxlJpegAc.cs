@@ -363,8 +363,133 @@ internal static partial class JxlEncoder
         return (bestCfg.S, bestCfg.M, bestCfg.L, bestNorm, bestMax);
     }
 
-    // Plain per-context ANS: cluster the contexts (on the default config), then optimise each cluster's
-    // hybrid-uint config independently and emit the standard entropy header.
+    // Lloyd-style joint refinement of the cluster ASSIGNMENT and the per-cluster hybrid-uint CONFIGS. The
+    // initial clustering runs on the default config; once each cluster picks its own optimal config, the
+    // real per-context coding cost changes, so contexts may now belong to a different cluster. Iterate:
+    // optimize configs -> reassign each context to the cluster that codes its values cheapest -> repeat.
+    // Mutates `map`; returns the final configs, normalized histograms and shared logAlpha.
+    private static (int[] CfgS, int[] CfgM, int[] CfgL, int[][] Norm, int LogAlpha) RefineClusters(
+        Dictionary<int, long>[] ctxVH, int[] map, int k, int maxVal, int tokenCap = JpegMaxToken)
+    {
+        int n = ctxVH.Length;
+        var cfgS = new int[k];
+        var cfgM = new int[k];
+        var cfgL = new int[k];
+        var norm = new int[k][];
+        var mtk = new int[k];
+
+        void Optimize()
+        {
+            var clHist = new long[k][];
+            for (int c = 0; c < k; c++)
+            {
+                clHist[c] = new long[maxVal + 1];
+            }
+
+            for (int i = 0; i < n; i++)
+            {
+                if (ctxVH[i] != null)
+                {
+                    long[] h = clHist[map[i]];
+                    foreach (var kv in ctxVH[i])
+                    {
+                        h[kv.Key] += kv.Value;
+                    }
+                }
+            }
+
+            for (int c = 0; c < k; c++)
+            {
+                (cfgS[c], cfgM[c], cfgL[c], norm[c], mtk[c]) = OptimizeClusterConfig(clHist[c], tokenCap);
+            }
+        }
+
+        Optimize();
+
+        double tableSum = JxlBits.AnsTabSize;
+        for (int iter = 0; iter < 3; iter++)
+        {
+            // Per-cluster per-token cost = -log2(p); a token absent from a cluster's histogram gets a high
+            // fallback cost (the next Optimize adds it if a context actually moves there).
+            var tokCost = new double[k][];
+            for (int c = 0; c < k; c++)
+            {
+                int[] nc = norm[c];
+                var tc = new double[nc.Length];
+                for (int t = 0; t < nc.Length; t++)
+                {
+                    tc[t] = nc[t] > 0 ? -Math.Log2(nc[t] / tableSum) : 16.0;
+                }
+
+                tokCost[c] = tc;
+            }
+
+            int changed = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (ctxVH[i] == null || ctxVH[i].Count == 0)
+                {
+                    continue;
+                }
+
+                int bestC = map[i];
+                double bestCost = double.MaxValue;
+                for (int c = 0; c < k; c++)
+                {
+                    double cost = 0;
+                    double[] tc = tokCost[c];
+                    foreach (var kv in ctxVH[i])
+                    {
+                        (int tok, int nb, _) = PackHybridFull(cfgS[c], cfgM[c], cfgL[c], kv.Key);
+                        cost += kv.Value * ((tok < tc.Length ? tc[tok] : 16.0) + nb);
+                    }
+
+                    if (cost < bestCost)
+                    {
+                        bestCost = cost;
+                        bestC = c;
+                    }
+                }
+
+                if (bestC != map[i])
+                {
+                    map[i] = bestC;
+                    changed++;
+                }
+            }
+
+            Optimize();
+            if (changed == 0)
+            {
+                break;
+            }
+        }
+
+        int logAlpha = 5;
+        for (int c = 0; c < k; c++)
+        {
+            logAlpha = Math.Max(logAlpha, Math.Max(BitLen(mtk[c]), cfgS[c]));
+        }
+
+        return (cfgS, cfgM, cfgL, norm, logAlpha);
+    }
+
+    // Builds per-context value histograms (sparse) for the refinement pass.
+    private static Dictionary<int, long>[] BuildCtxValueHists(int[] vals, int[] ctxs, int totalContexts)
+    {
+        var ctxVH = new Dictionary<int, long>[totalContexts];
+        for (int i = 0; i < vals.Length; i++)
+        {
+            var d = ctxVH[ctxs[i]] ??= new Dictionary<int, long>();
+            d.TryGetValue(vals[i], out long cur);
+            d[vals[i]] = cur + 1;
+        }
+
+        return ctxVH;
+    }
+
+    // Plain per-context ANS: cluster the contexts (on the default config), then jointly refine the assignment
+    // and per-cluster hybrid-uint configs, and emit the standard entropy header.
     private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs, int totalContexts)
     {
         int n = vals.Length;
@@ -397,28 +522,9 @@ internal static partial class JxlEncoder
 
         (int[] map, int[][] _, int k) = ClusterContextsTotalCost(ctxHist, maxTokDefault + 1, JpegMaxClusters, Math.Max(5, BitLen(maxTokDefault)));
 
-        // Per-cluster value histograms, then an optimal config per cluster.
-        var valHist = new long[k][];
-        for (int c = 0; c < k; c++)
-        {
-            valHist[c] = new long[maxVal + 1];
-        }
-
-        for (int i = 0; i < n; i++)
-        {
-            valHist[map[ctxs[i]]][vals[i]]++;
-        }
-
-        var cfgS = new int[k];
-        var cfgM = new int[k];
-        var cfgL = new int[k];
-        var norm = new int[k][];
-        int logAlpha = 5;
-        for (int c = 0; c < k; c++)
-        {
-            (cfgS[c], cfgM[c], cfgL[c], norm[c], int mt) = OptimizeClusterConfig(valHist[c]);
-            logAlpha = Math.Max(logAlpha, Math.Max(BitLen(mt), cfgS[c]));
-        }
+        // Jointly refine the assignment + per-cluster configs (Lloyd-style) starting from that clustering.
+        Dictionary<int, long>[] ctxVH = BuildCtxValueHists(vals, ctxs, totalContexts);
+        (int[] cfgS, int[] cfgM, int[] cfgL, int[][] norm, int logAlpha) = RefineClusters(ctxVH, map, k, maxVal);
 
         // Entropy header: lz77, context map, use_prefix, logAlpha, per-cluster uint configs, per-cluster histograms.
         w.WriteBool(false); // lz77 disabled
@@ -623,18 +729,17 @@ internal static partial class JxlEncoder
             }
         }
 
-        var litHist = new long[k][];
-        for (int c = 0; c < k; c++)
-        {
-            litHist[c] = new long[maxVal + 1];
-        }
-
+        // Per-context LITERAL value histograms, then joint Lloyd-style refinement of assignment + configs.
+        // Literal tokens capped at 220 so the length markers still fit below 256 (logAlpha <= 8).
+        var ctxVH = new Dictionary<int, long>[totalContexts];
         pos = 0;
         foreach (Op op in ops)
         {
             if (!op.Match)
             {
-                litHist[map[ctxs[pos]]][op.A]++;
+                var d = ctxVH[ctxs[pos]] ??= new Dictionary<int, long>();
+                d.TryGetValue(op.A, out long cur);
+                d[op.A] = cur + 1;
                 pos += 1;
             }
             else
@@ -643,14 +748,22 @@ internal static partial class JxlEncoder
             }
         }
 
-        var cfgS = new int[k];
-        var cfgM = new int[k];
-        var cfgL = new int[k];
+        (int[] cfgS, int[] cfgM, int[] cfgL, int[][] _3, int _4) = RefineClusters(ctxVH, map, k, maxVal, tokenCap: 220);
+
         int threshold = 8;
-        for (int c = 0; c < k; c++)
+        pos = 0;
+        foreach (Op op in ops)
         {
-            (cfgS[c], cfgM[c], cfgL[c], int[] _2, int mt) = OptimizeClusterConfig(litHist[c], 220);
-            threshold = Math.Max(threshold, mt + 1);
+            if (!op.Match)
+            {
+                int c = map[ctxs[pos]];
+                threshold = Math.Max(threshold, PackHybridFull(cfgS[c], cfgM[c], cfgL[c], op.A).Token + 1);
+                pos += 1;
+            }
+            else
+            {
+                pos += op.A;
+            }
         }
 
         // --- Build per-cluster token histograms (literals via cfg + length markers) + distance histogram ---
