@@ -11,14 +11,6 @@ namespace SharpImage.Formats.Jxl;
 
 internal static partial class JxlEncoder
 {
-    // Hybrid-uint config for JPEG coefficient literals. JPEG magnitudes are Laplacian, so the upper mantissa
-    // bits are non-uniform — capturing more of them in the ANS token (larger msb/lsb) rather than as raw
-    // extra bits lets the entropy coder compress them. Tuned for the coefficient distribution (vs the shared
-    // LitSplit/LitMsb/LitLsb the lossy path uses).
-    private const int JLitSplit = 4;
-    private const int JLitMsb = 2;
-    private const int JLitLsb = 1;
-
     private const int JpegMaxClusters = 64;                        // JPEG coeffs have far more distinct
                                                                    // per-band distributions than the lossy
                                                                    // path — allow more ANS histograms than
