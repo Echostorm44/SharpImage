@@ -270,45 +270,160 @@ internal static partial class JxlEncoder
         return w.ToArray();
     }
 
-    // Plain per-context ANS: hybrid-pack each value, cluster the contexts, emit the standard entropy header.
-    private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs, int totalContexts)
+    // Candidate hybrid-uint configs (split_exponent, msb_in_token, lsb_in_token) — a subset of libjxl's
+    // ChooseUintConfigs kBest set, bounded so any produced token stays < 256 (i.e. logAlpha <= 8).
+    private static readonly (int S, int M, int L)[] JpegUintCandidates =
     {
-        int n = vals.Length;
-        var packed = new (int Tok, int NBits, int Bits)[n];
-        int maxTok = 0;
-        for (int i = 0; i < n; i++)
+        (4, 2, 0), (4, 1, 0), (4, 2, 1), (4, 2, 2), (4, 1, 2),
+        (5, 2, 0), (5, 1, 0), (5, 2, 1), (5, 2, 2), (5, 1, 2),
+        (3, 2, 0), (3, 1, 0), (3, 2, 1), (3, 1, 2),
+        (2, 0, 1), (0, 0, 0),
+        (6, 0, 0), (6, 1, 5), (6, 2, 4),
+        (7, 0, 0), (8, 0, 0),
+    };
+
+    private const int JpegMaxToken = 256; // keeps logAlpha <= 8 (fits the 2-bit logAlpha-5 field)
+
+    // Picks the hybrid-uint config minimising ANS population cost + raw extra bits + config signalling for one
+    // cluster's value histogram (libjxl ChooseUintConfigs). Returns the config, its normalized token histogram
+    // and the max token produced. This is the key to matching libjxl: a cluster of small coefficients can
+    // direct-code them (no extra bits), one with a heavy tail can spend extra bits — instead of one fixed config.
+    private static (int S, int M, int L, int[] Norm, int MaxTok) OptimizeClusterConfig(long[] valHist, int tokenCap = JpegMaxToken)
+    {
+        int maxVal = valHist.Length - 1;
+        while (maxVal > 0 && valHist[maxVal] == 0)
         {
-            packed[i] = PackHybridFull(JLitSplit, JLitMsb, JLitLsb, vals[i]);
-            if (packed[i].Tok > maxTok)
+            maxVal--;
+        }
+
+        double best = double.MaxValue;
+        (int S, int M, int L) bestCfg = (4, 2, 0);
+        int[] bestNorm = new int[1];
+        int bestMax = 0;
+        foreach ((int s, int m, int l) in JpegUintCandidates)
+        {
+            int maxTok = 0;
+            long extra = 0;
+            bool ok = true;
+            for (int v = 0; v <= maxVal; v++)
             {
-                maxTok = packed[i].Tok;
+                if (valHist[v] == 0)
+                {
+                    continue;
+                }
+
+                (int tok, int nb, _) = PackHybridFull(s, m, l, v);
+                if (tok >= tokenCap)
+                {
+                    ok = false;
+                    break;
+                }
+
+                if (tok > maxTok)
+                {
+                    maxTok = tok;
+                }
+
+                extra += valHist[v] * nb;
+            }
+
+            if (!ok)
+            {
+                continue;
+            }
+
+            var tokHist = new long[maxTok + 1];
+            for (int v = 0; v <= maxVal; v++)
+            {
+                if (valHist[v] != 0)
+                {
+                    tokHist[PackHybridFull(s, m, l, v).Token] += valHist[v];
+                }
+            }
+
+            // Cost = ANS coding + raw extra bits + config signalling + HISTOGRAM TRANSMISSION (else a bigger
+            // token alphabet, e.g. direct coding, looks free when it actually costs more to transmit).
+            int[] cand = JxlEntropy.NormalizeCounts(tokHist, JxlEntropy.HistShift);
+            var probe = new JxlBitWriter();
+            JxlEntropy.WriteHistogram(probe, cand, JxlEntropy.HistShift);
+            double cost = NormalizedCost(tokHist) + extra + JxlBits.CeilLog2(s + 1) + JxlBits.CeilLog2(s - m + 1) + probe.BitPosition;
+            if (cost < best)
+            {
+                best = cost;
+                bestCfg = (s, m, l);
+                bestNorm = cand;
+                bestMax = maxTok;
             }
         }
 
-        int alphabet = maxTok + 1;
-        int logAlpha = Math.Max(5, BitLen(maxTok));
+        return (bestCfg.S, bestCfg.M, bestCfg.L, bestNorm, bestMax);
+    }
+
+    // Plain per-context ANS: cluster the contexts (on the default config), then optimise each cluster's
+    // hybrid-uint config independently and emit the standard entropy header.
+    private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs, int totalContexts)
+    {
+        int n = vals.Length;
+        int maxTokDefault = 0, maxVal = 0;
+        var packedDefault = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            packedDefault[i] = PackHybridFull(4, 2, 0, vals[i]).Token;
+            if (packedDefault[i] > maxTokDefault)
+            {
+                maxTokDefault = packedDefault[i];
+            }
+
+            if (vals[i] > maxVal)
+            {
+                maxVal = vals[i];
+            }
+        }
+
         var ctxHist = new long[totalContexts][];
         for (int i = 0; i < totalContexts; i++)
         {
-            ctxHist[i] = new long[alphabet];
+            ctxHist[i] = new long[maxTokDefault + 1];
         }
 
         for (int i = 0; i < n; i++)
         {
-            ctxHist[ctxs[i]][packed[i].Tok]++;
+            ctxHist[ctxs[i]][packedDefault[i]]++;
         }
 
-        (int[] map, int[][] norm, int k) = ClusterContextsTotalCost(ctxHist, alphabet, JpegMaxClusters, logAlpha);
+        (int[] map, int[][] _, int k) = ClusterContextsTotalCost(ctxHist, maxTokDefault + 1, JpegMaxClusters, Math.Max(5, BitLen(maxTokDefault)));
 
-        // Entropy header, byte-for-byte the layout DecodeHistograms consumes: lz77, context map,
-        // use_prefix, logAlpha, per-cluster uint configs, per-cluster histograms.
+        // Per-cluster value histograms, then an optimal config per cluster.
+        var valHist = new long[k][];
+        for (int c = 0; c < k; c++)
+        {
+            valHist[c] = new long[maxVal + 1];
+        }
+
+        for (int i = 0; i < n; i++)
+        {
+            valHist[map[ctxs[i]]][vals[i]]++;
+        }
+
+        var cfgS = new int[k];
+        var cfgM = new int[k];
+        var cfgL = new int[k];
+        var norm = new int[k][];
+        int logAlpha = 5;
+        for (int c = 0; c < k; c++)
+        {
+            (cfgS[c], cfgM[c], cfgL[c], norm[c], int mt) = OptimizeClusterConfig(valHist[c]);
+            logAlpha = Math.Max(logAlpha, Math.Max(BitLen(mt), cfgS[c]));
+        }
+
+        // Entropy header: lz77, context map, use_prefix, logAlpha, per-cluster uint configs, per-cluster histograms.
         w.WriteBool(false); // lz77 disabled
         WriteContextMap(w, (int[])map.Clone(), k);
         w.WriteBool(false); // use_prefix_code = false (ANS)
         w.WriteBits((uint)(logAlpha - 5), 2);
         for (int c = 0; c < k; c++)
         {
-            WriteUintConfig(w, JLitSplit, JLitMsb, JLitLsb, logAlpha);
+            WriteUintConfig(w, cfgS[c], cfgM[c], cfgL[c], logAlpha);
         }
 
         for (int c = 0; c < k; c++)
@@ -320,7 +435,9 @@ internal static partial class JxlEncoder
         var ansToks = new List<AnsToken>(n);
         for (int i = 0; i < n; i++)
         {
-            ansToks.Add(new AnsToken(map[ctxs[i]], packed[i].Tok, (uint)packed[i].Bits, packed[i].NBits));
+            int c = map[ctxs[i]];
+            (int tok, int nb, int bits) = PackHybridFull(cfgS[c], cfgM[c], cfgL[c], vals[i]);
+            ansToks.Add(new AnsToken(c, tok, (uint)bits, nb));
         }
 
         ans.Encode(w, ansToks);
@@ -447,17 +564,93 @@ internal static partial class JxlEncoder
     {
         List<Op> ops = lazy ? FindMatchesLazy(vals, minLen) : FindMatches(vals, minLen);
 
-        int maxLitTok = 0;
+        // --- Cluster on the default config (4,2,0) + a default threshold ---
+        int maxLitDefault = 0;
         foreach (Op op in ops)
         {
             if (!op.Match)
             {
-                maxLitTok = Math.Max(maxLitTok, PackHybridFull(JLitSplit, JLitMsb, JLitLsb, op.A).Token);
+                maxLitDefault = Math.Max(maxLitDefault, PackHybridFull(4, 2, 0, op.A).Token);
             }
         }
 
-        int threshold = Math.Max(8, maxLitTok + 1);
-        int gmaxLit = maxLitTok, gmaxDist = 0;
+        int thrDefault = Math.Max(8, maxLitDefault + 1);
+        int gmaxDefault = maxLitDefault;
+        foreach (Op op in ops)
+        {
+            if (op.Match)
+            {
+                gmaxDefault = Math.Max(gmaxDefault, thrDefault + PackHybridUint(JpegSeLen, op.A - minLen).Token);
+            }
+        }
+
+        var ctxHist = new long[totalContexts][];
+        for (int i = 0; i < totalContexts; i++)
+        {
+            ctxHist[i] = new long[gmaxDefault + 1];
+        }
+
+        int pos = 0;
+        foreach (Op op in ops)
+        {
+            int ctx = ctxs[pos];
+            if (!op.Match)
+            {
+                ctxHist[ctx][PackHybridFull(4, 2, 0, op.A).Token]++;
+                pos += 1;
+            }
+            else
+            {
+                ctxHist[ctx][thrDefault + PackHybridUint(JpegSeLen, op.A - minLen).Token]++;
+                pos += op.A;
+            }
+        }
+
+        (int[] map, int[][] _, int k) = ClusterContextsTotalCost(ctxHist, gmaxDefault + 1, JpegMaxClusters, Math.Max(5, BitLen(gmaxDefault)));
+
+        // --- Per-cluster literal value histograms, then an optimal config per cluster (capped so the length
+        //     markers still fit below 256 => logAlpha <= 8) ---
+        int maxVal = 0;
+        foreach (Op op in ops)
+        {
+            if (!op.Match && op.A > maxVal)
+            {
+                maxVal = op.A;
+            }
+        }
+
+        var litHist = new long[k][];
+        for (int c = 0; c < k; c++)
+        {
+            litHist[c] = new long[maxVal + 1];
+        }
+
+        pos = 0;
+        foreach (Op op in ops)
+        {
+            if (!op.Match)
+            {
+                litHist[map[ctxs[pos]]][op.A]++;
+                pos += 1;
+            }
+            else
+            {
+                pos += op.A;
+            }
+        }
+
+        var cfgS = new int[k];
+        var cfgM = new int[k];
+        var cfgL = new int[k];
+        int threshold = 8;
+        for (int c = 0; c < k; c++)
+        {
+            (cfgS[c], cfgM[c], cfgL[c], int[] _2, int mt) = OptimizeClusterConfig(litHist[c], 220);
+            threshold = Math.Max(threshold, mt + 1);
+        }
+
+        // --- Build per-cluster token histograms (literals via cfg + length markers) + distance histogram ---
+        int gmaxLit = threshold - 1, gmaxDist = 0;
         foreach (Op op in ops)
         {
             if (op.Match)
@@ -467,42 +660,47 @@ internal static partial class JxlEncoder
             }
         }
 
-        int logAlpha = Math.Max(5, BitLen(Math.Max(gmaxLit, gmaxDist)));
-        var ctxHist = new long[totalContexts][];
-        for (int i = 0; i < totalContexts; i++)
+        var tokHist = new long[k][];
+        for (int c = 0; c < k; c++)
         {
-            ctxHist[i] = new long[gmaxLit + 1];
+            tokHist[c] = new long[gmaxLit + 1];
         }
 
         var distHist = new long[gmaxDist + 1];
-        int pos = 0;
+        pos = 0;
         foreach (Op op in ops)
         {
-            int ctx = ctxs[pos];
+            int cl = map[ctxs[pos]];
             if (!op.Match)
             {
-                ctxHist[ctx][PackHybridFull(JLitSplit, JLitMsb, JLitLsb, op.A).Token]++;
+                tokHist[cl][PackHybridFull(cfgS[cl], cfgM[cl], cfgL[cl], op.A).Token]++;
                 pos += 1;
             }
             else
             {
-                ctxHist[ctx][threshold + PackHybridUint(JpegSeLen, op.A - minLen).Token]++;
+                tokHist[cl][threshold + PackHybridUint(JpegSeLen, op.A - minLen).Token]++;
                 distHist[PackHybridUint(JpegSeDist, op.B - 1).Token]++;
                 pos += op.A;
             }
         }
 
-        (int[] map, int[][] norm, int k) = ClusterContextsTotalCost(ctxHist, gmaxLit + 1, JpegMaxClusters, logAlpha);
+        int logAlpha = Math.Max(5, Math.Max(BitLen(gmaxLit), BitLen(gmaxDist)));
+        for (int c = 0; c < k; c++)
+        {
+            logAlpha = Math.Max(logAlpha, cfgS[c]);
+        }
 
-        // Combined context map: N literal contexts -> their cluster, plus a final distance context -> cluster k.
+        var norm = new int[k + 1][];
+        for (int c = 0; c < k; c++)
+        {
+            norm[c] = JxlEntropy.NormalizeCounts(tokHist[c], JxlEntropy.HistShift);
+        }
+
+        norm[k] = JxlEntropy.NormalizeCounts(distHist, JxlEntropy.HistShift);
+
         var combinedMap = new int[totalContexts + 1];
         Array.Copy(map, combinedMap, totalContexts);
         combinedMap[totalContexts] = k;
-
-        int[] distNorm = JxlEntropy.NormalizeCounts(distHist, JxlEntropy.HistShift);
-        var norm2 = new int[k + 1][];
-        Array.Copy(norm, norm2, k);
-        norm2[k] = distNorm;
 
         w.WriteBool(true); // lz77 enabled
         w.WriteU32((uint)threshold, E.Val(224), E.Val(512), E.Val(4096), E.BitsOff(15, 8)); // min_symbol
@@ -513,31 +711,31 @@ internal static partial class JxlEncoder
         w.WriteBits((uint)(logAlpha - 5), 2);
         for (int c = 0; c < k; c++)
         {
-            WriteUintConfig(w, JLitSplit, JLitMsb, JLitLsb, logAlpha); // literal+length clusters
+            WriteUintConfig(w, cfgS[c], cfgM[c], cfgL[c], logAlpha); // literal+length clusters
         }
 
         WriteUintConfig(w, JpegSeDist, 0, 0, logAlpha); // distance cluster
         for (int c = 0; c <= k; c++)
         {
-            JxlEntropy.WriteHistogram(w, norm2[c], JxlEntropy.HistShift);
+            JxlEntropy.WriteHistogram(w, norm[c], JxlEntropy.HistShift);
         }
 
-        var ans = new JxlAnsWriter(norm2, logAlpha);
+        var ans = new JxlAnsWriter(norm, logAlpha);
         var ansToks = new List<AnsToken>();
         pos = 0;
         foreach (Op op in ops)
         {
-            int ctx = ctxs[pos];
+            int cl = map[ctxs[pos]];
             if (!op.Match)
             {
-                (int tok, int nb, int bits) = PackHybridFull(JLitSplit, JLitMsb, JLitLsb, op.A);
-                ansToks.Add(new AnsToken(map[ctx], tok, (uint)bits, nb));
+                (int tok, int nb, int bits) = PackHybridFull(cfgS[cl], cfgM[cl], cfgL[cl], op.A);
+                ansToks.Add(new AnsToken(cl, tok, (uint)bits, nb));
                 pos += 1;
             }
             else
             {
                 (int lt, int ln, int lb) = PackHybridUint(JpegSeLen, op.A - minLen);
-                ansToks.Add(new AnsToken(map[ctx], threshold + lt, (uint)lb, ln));
+                ansToks.Add(new AnsToken(cl, threshold + lt, (uint)lb, ln));
                 (int dt, int dn, int db) = PackHybridUint(JpegSeDist, op.B - 1);
                 ansToks.Add(new AnsToken(k, dt, (uint)db, dn));
                 pos += op.A;
