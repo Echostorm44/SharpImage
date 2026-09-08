@@ -410,7 +410,7 @@ internal static partial class JxlEncoder
         Optimize();
 
         double tableSum = JxlBits.AnsTabSize;
-        for (int iter = 0; iter < 3; iter++)
+        for (int iter = 0; iter < 5; iter++)
         {
             // Per-cluster per-token cost = -log2(p); a token absent from a cluster's histogram gets a high
             // fallback cost (the next Optimize adds it if a context actually moves there).
