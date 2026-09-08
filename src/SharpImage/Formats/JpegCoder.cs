@@ -32,6 +32,12 @@ public sealed class JpegDctData
     public int RestartInterval;
     public int[][] QuantTables = new int[4][];      // [tableIndex][64], natural order
     public JpegDctComponent[] Components = Array.Empty<JpegDctComponent>();
+
+    // Byte-exact reconstruction (jbrd): everything before the entropy-coded scan data (SOI..SOS header) and
+    // everything from the EOI marker onward, captured verbatim. RebuildJpeg re-encodes only the entropy stream
+    // (from Components' coefficients + the Huffman tables parsed out of HeaderBytes) between them.
+    public byte[] HeaderBytes = Array.Empty<byte>();
+    public byte[] TrailingBytes = Array.Empty<byte>();
 }
 
 /// <summary>One component's quantized DCT blocks (natural order), sampling factors and quant-table index.</summary>
@@ -41,6 +47,8 @@ public sealed class JpegDctComponent
     public int HSample;
     public int VSample;
     public int QuantTableIndex;
+    public int DcTableIndex;                          // DC Huffman table selector (from SOS)
+    public int AcTableIndex;                          // AC Huffman table selector (from SOS)
     public int BlocksPerRow;                          // mcuCols * HSample
     public int BlocksPerCol;                          // mcuRows * VSample
     public int[][] Blocks = Array.Empty<int[]>();     // [BlocksPerRow*BlocksPerCol][64], quantized, natural order
@@ -229,8 +237,12 @@ public static class JpegCoder
     /// factors — the raw data needed for a lossless DCT-domain transcode (e.g. JPEG->JXL recompression),
     /// without dequantising or running the IDCT. Progressive JPEGs are not yet supported here.
     /// </summary>
-    public static JpegDctData ReadDctData(Stream stream)
+    public static JpegDctData ReadDctData(Stream input)
     {
+        using var buf = new MemoryStream();
+        input.CopyTo(buf);
+        byte[] data = buf.ToArray();
+        var stream = new MemoryStream(data);
         if (stream.ReadByte() != 0xFF || stream.ReadByte() != SOI)
         {
             throw new InvalidDataException("Not a valid JPEG file (missing SOI marker).");
@@ -269,10 +281,12 @@ public static class JpegCoder
                     break;
                 case SOS:
                     ReadSosHeader(stream, components, componentCount);
+                    int scanStart = (int)stream.Position; // entropy-coded data begins here (SOS header captured verbatim)
                     int mcuCols = DecodeScanBlocks(stream, width, height, componentCount, components, quantTables,
                         dcTables, acTables, maxHSample, maxVSample, restartInterval, coefficientsOnly: true);
                     int mcuWidth = maxHSample * BlockSize, mcuHeight = maxVSample * BlockSize;
                     int mcuRows = (height + mcuHeight - 1) / mcuHeight;
+                    int eoiPos = FindScanEnd(data, scanStart);
                     var dct = new JpegDctData
                     {
                         Width = width,
@@ -283,6 +297,8 @@ public static class JpegCoder
                         RestartInterval = restartInterval,
                         QuantTables = quantTables,
                         Components = new JpegDctComponent[componentCount],
+                        HeaderBytes = data[..scanStart],
+                        TrailingBytes = data[eoiPos..],
                     };
                     for (int c = 0; c < componentCount; c++)
                     {
@@ -292,6 +308,8 @@ public static class JpegCoder
                             HSample = components[c].HSample,
                             VSample = components[c].VSample,
                             QuantTableIndex = components[c].QuantTableIndex,
+                            DcTableIndex = components[c].DcTableIndex,
+                            AcTableIndex = components[c].AcTableIndex,
                             BlocksPerRow = mcuCols * components[c].HSample,
                             BlocksPerCol = mcuRows * components[c].VSample,
                             Blocks = components[c].Blocks,
@@ -306,6 +324,176 @@ public static class JpegCoder
         }
 
         throw new InvalidDataException("JPEG missing SOS marker.");
+    }
+
+    // Finds the byte offset of the marker that terminates the entropy-coded scan (EOI for baseline), skipping
+    // byte-stuffed 0xFF00 and RSTn restart markers embedded in the data.
+    private static int FindScanEnd(byte[] data, int start)
+    {
+        for (int i = start; i < data.Length - 1; i++)
+        {
+            if (data[i] != 0xFF)
+            {
+                continue;
+            }
+
+            byte m = data[i + 1];
+            if (m == 0x00 || (m >= 0xD0 && m <= 0xD7))
+            {
+                i++; // stuffing or RSTn — part of the scan
+                continue;
+            }
+
+            return i; // real marker (EOI for a single-scan baseline JPEG)
+        }
+
+        return data.Length;
+    }
+
+    /// <summary>
+    /// Byte-exact inverse of <see cref="ReadDctData(Stream)"/>: re-emits the verbatim header, re-encodes the
+    /// entropy-coded scan from the quantized coefficients using the JPEG's own Huffman tables (parsed from the
+    /// header), then re-emits the verbatim trailer — reproducing the original baseline JPEG byte-for-byte.
+    /// </summary>
+    public static byte[] RebuildJpeg(JpegDctData d)
+    {
+        var dcEnc = new (int Code, int Len)[4][];
+        var acEnc = new (int Code, int Len)[4][];
+        ParseHuffmanEncodeTables(d.HeaderBytes, dcEnc, acEnc);
+
+        using var ms = new MemoryStream();
+        ms.Write(d.HeaderBytes, 0, d.HeaderBytes.Length);
+        EncodeEntropyScan(ms, d, dcEnc, acEnc);
+        ms.Write(d.TrailingBytes, 0, d.TrailingBytes.Length);
+        return ms.ToArray();
+    }
+
+    // Re-encodes the interleaved baseline scan (same MCU/block order as DecodeScanBlocks), inserting restart
+    // markers + DC-predictor resets at the restart interval, with 1-bit padding before each marker.
+    private static void EncodeEntropyScan(Stream stream, JpegDctData d, (int Code, int Len)[][] dcEnc, (int Code, int Len)[][] acEnc)
+    {
+        int mcuWidth = d.MaxHSample * BlockSize, mcuHeight = d.MaxVSample * BlockSize;
+        int mcuCols = (d.Width + mcuWidth - 1) / mcuWidth;
+        int mcuRows = (d.Height + mcuHeight - 1) / mcuHeight;
+        var dcPred = new int[d.ComponentCount];
+        var writer = new JpegBitWriter(stream);
+        int mcuCount = 0, restartCounter = 0;
+
+        for (int mcuRow = 0; mcuRow < mcuRows; mcuRow++)
+        {
+            for (int mcuCol = 0; mcuCol < mcuCols; mcuCol++)
+            {
+                if (d.RestartInterval > 0 && mcuCount > 0 && mcuCount % d.RestartInterval == 0)
+                {
+                    writer.Flush();
+                    stream.WriteByte(0xFF);
+                    stream.WriteByte((byte)(0xD0 + (restartCounter & 7)));
+                    Array.Clear(dcPred);
+                    restartCounter++;
+                }
+
+                for (int c = 0; c < d.ComponentCount; c++)
+                {
+                    JpegDctComponent comp = d.Components[c];
+                    int blocksPerRow = mcuCols * comp.HSample;
+                    for (int bv = 0; bv < comp.VSample; bv++)
+                    {
+                        for (int bh = 0; bh < comp.HSample; bh++)
+                        {
+                            int blockRow = (mcuRow * comp.VSample) + bv;
+                            int blockCol = (mcuCol * comp.HSample) + bh;
+                            int[] block = comp.Blocks[(blockRow * blocksPerRow) + blockCol];
+                            EncodeDcCoefficient(writer, block[0] - dcPred[c], dcEnc[comp.DcTableIndex]);
+                            dcPred[c] = block[0];
+                            EncodeAcCoefficients(writer, block, acEnc[comp.AcTableIndex]);
+                        }
+                    }
+                }
+
+                mcuCount++;
+            }
+        }
+
+        writer.Flush();
+    }
+
+    // Parses every DHT segment out of the verbatim header into canonical (code,length)-per-symbol encode
+    // tables, indexed [tableIndex][symbol]. dcEnc/acEnc are 4-slot arrays (JPEG allows table indices 0..3).
+    private static void ParseHuffmanEncodeTables(byte[] header, (int Code, int Len)[][] dcEnc, (int Code, int Len)[][] acEnc)
+    {
+        int p = 2; // skip SOI
+        while (p + 4 <= header.Length)
+        {
+            if (header[p] != 0xFF)
+            {
+                p++;
+                continue;
+            }
+
+            byte marker = header[p + 1];
+            if (marker == DHT)
+            {
+                int len = (header[p + 2] << 8) | header[p + 3];
+                int seg = p + 4, end = p + 2 + len;
+                while (seg < end)
+                {
+                    int tcth = header[seg++];
+                    int tclass = tcth >> 4, tindex = tcth & 0x0F;
+                    var counts = new byte[16];
+                    int total = 0;
+                    for (int i = 0; i < 16; i++)
+                    {
+                        counts[i] = header[seg + i];
+                        total += counts[i];
+                    }
+
+                    seg += 16;
+                    var values = new byte[total];
+                    Array.Copy(header, seg, values, 0, total);
+                    seg += total;
+
+                    var enc = BuildEncodeTable(counts, values);
+                    if (tclass == 0)
+                    {
+                        dcEnc[tindex] = enc;
+                    }
+                    else
+                    {
+                        acEnc[tindex] = enc;
+                    }
+                }
+
+                p = end;
+            }
+            else if (marker == SOS || marker == 0xD8 || (marker >= 0xD0 && marker <= 0xD7))
+            {
+                p += 2;
+            }
+            else
+            {
+                int len = (header[p + 2] << 8) | header[p + 3];
+                p += 2 + len;
+            }
+        }
+    }
+
+    // Canonical JPEG Huffman codes (T.81 Annex C): assign increasing codes by length, in `values` order.
+    private static (int Code, int Len)[] BuildEncodeTable(byte[] counts, byte[] values)
+    {
+        var enc = new (int Code, int Len)[256];
+        int code = 0, k = 0;
+        for (int len = 1; len <= 16; len++)
+        {
+            for (int i = 0; i < counts[len - 1]; i++)
+            {
+                enc[values[k++]] = (code, len);
+                code++;
+            }
+
+            code <<= 1;
+        }
+
+        return enc;
     }
 
     private static void ReadSof(Stream stream, ref int width, ref int height,

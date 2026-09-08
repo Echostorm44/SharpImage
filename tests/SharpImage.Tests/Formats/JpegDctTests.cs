@@ -105,4 +105,83 @@ public class JpegDctTests
 
         await Assert.That(match).IsTrue();
     }
+
+    // Byte-exact JPEG reconstruction (jbrd core): ReadDctData -> RebuildJpeg reproduces the original baseline
+    // JPEG byte-for-byte, across subsampling modes, sizes and restart intervals.
+    [Test]
+    [Arguments(40, 24, JpegSubsampling.Yuv444, 0)]
+    [Arguments(64, 48, JpegSubsampling.Yuv420, 0)]
+    [Arguments(48, 40, JpegSubsampling.Yuv422, 0)]
+    [Arguments(80, 64, JpegSubsampling.Yuv420, 3)]
+    public async Task Jpeg_ByteExact_RoundTrips(int w, int h, JpegSubsampling ss, int restartMcus)
+    {
+        var src = new ImageFrame();
+        src.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = src.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * src.NumberOfChannels;
+                row[o] = Quantum.ScaleFromByte((byte)((x * 7) ^ (y * 13)));
+                row[o + 1] = Quantum.ScaleFromByte((byte)((x * 11) + (y * 5)));
+                row[o + 2] = Quantum.ScaleFromByte((byte)(200 - (x * 3) - y));
+            }
+        }
+
+        using var ms = new System.IO.MemoryStream();
+        JpegCoder.Write(src, ms, quality: 80, subsampling: ss);
+        byte[] original = ms.ToArray();
+
+        JpegDctData dct = JpegCoder.ReadDctData(new System.IO.MemoryStream(original));
+        byte[] rebuilt = JpegCoder.RebuildJpeg(dct);
+
+        await Assert.That(rebuilt.Length).IsEqualTo(original.Length);
+        await Assert.That(rebuilt.AsSpan().SequenceEqual(original)).IsTrue();
+    }
+
+    // Byte-exact round-trip of REAL third-party JPEGs (libjpeg/ffmpeg) from VARDCT_JBRD_DIR, which exercise
+    // real Huffman tables, APPn/COM segments and restart markers.
+    [Test]
+    public async Task Jpeg_ByteExact_RealFiles()
+    {
+        string dir = Environment.GetEnvironmentVariable("VARDCT_JBRD_DIR");
+        if (string.IsNullOrEmpty(dir) || !System.IO.Directory.Exists(dir))
+        {
+            return;
+        }
+
+        var report = new System.Text.StringBuilder();
+        int tested = 0, ok = 0;
+        foreach (string f in System.IO.Directory.GetFiles(dir, "*.jpg"))
+        {
+            byte[] original = System.IO.File.ReadAllBytes(f);
+            tested++;
+            try
+            {
+                JpegDctData dct = JpegCoder.ReadDctData(new System.IO.MemoryStream(original));
+                byte[] rebuilt = JpegCoder.RebuildJpeg(dct);
+                bool exact = rebuilt.AsSpan().SequenceEqual(original);
+                if (exact)
+                {
+                    ok++;
+                }
+                else
+                {
+                    int firstDiff = 0;
+                    int n = Math.Min(rebuilt.Length, original.Length);
+                    while (firstDiff < n && rebuilt[firstDiff] == original[firstDiff]) firstDiff++;
+                    report.AppendLine($"{System.IO.Path.GetFileName(f)}: MISMATCH len {original.Length}->{rebuilt.Length} firstDiff@{firstDiff}");
+                }
+            }
+            catch (Exception e)
+            {
+                report.AppendLine($"{System.IO.Path.GetFileName(f)}: THREW {e.GetType().Name}: {e.Message}");
+            }
+        }
+
+        report.Insert(0, $"tested={tested} ok={ok}\n");
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "jbrd_result.txt"), report.ToString());
+        await Assert.That(ok).IsEqualTo(tested);
+    }
 }
