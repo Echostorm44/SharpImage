@@ -11,16 +11,29 @@ namespace SharpImage.Formats.Jxl;
 
 internal static partial class JxlEncoder
 {
-    private const int JpegBlockClusters = 3;                       // one AC block-context per component
+    // Hybrid-uint config for JPEG coefficient literals. JPEG magnitudes are Laplacian, so the upper mantissa
+    // bits are non-uniform — capturing more of them in the ANS token (larger msb/lsb) rather than as raw
+    // extra bits lets the entropy coder compress them. Tuned for the coefficient distribution (vs the shared
+    // LitSplit/LitMsb/LitLsb the lossy path uses).
+    private const int JLitSplit = 4;
+    private const int JLitMsb = 2;
+    private const int JLitLsb = 1;
+
     private const int JpegMaxClusters = 64;                        // JPEG coeffs have far more distinct
                                                                    // per-band distributions than the lossy
                                                                    // path — allow more ANS histograms than
                                                                    // MaxHfClusters (context-map cost is tiny
                                                                    // vs the clustering loss it removes).
-    private const int JpegAcContexts = 495 * JpegBlockClusters;    // 1485, matches the VarDCT context layout
     private const int JpegDcBuckets = 8;                           // DC residual conditioned on neighbour activity
-    private const int JpegDcContextBase = JpegAcContexts;          // DC contexts follow the AC ones
-    private const int JpegTotalContexts = JpegDcContextBase + (JpegBlockClusters * JpegDcBuckets);
+
+    // AC block clusters: one per component. (Conditioning the AC block context additionally on the block's DC
+    // magnitude was tried and measured worse — the flat/busy split is already captured by the non-zeros
+    // context, so the extra contexts only add histogram overhead.) Runtime so grayscale uses just 1 (not 3).
+    private static int JpegNbc(int componentCount) => componentCount;
+
+    private static int JpegDcContextBase(int nbc) => 495 * nbc;
+
+    private static int JpegTotalContexts(int nbc, int componentCount) => (495 * nbc) + (componentCount * JpegDcBuckets);
 
     private static int ClampGradient(int left, int above, int aboveLeft)
     {
@@ -31,7 +44,7 @@ internal static partial class JxlEncoder
 
     // Causal DC context: the local gradient activity predicts the residual magnitude (flat regions code
     // tighter than busy ones). left/above/aboveLeft are all previously decoded, so encoder and decoder agree.
-    private static int JpegDcContext(int ci, int left, int above, int aboveLeft)
+    private static int JpegDcContext(int nbc, int ci, int left, int above, int aboveLeft)
     {
         int activity = Math.Abs(left - aboveLeft) + Math.Abs(above - aboveLeft);
         int bucket = BitLen(activity);
@@ -40,7 +53,7 @@ internal static partial class JxlEncoder
             bucket = JpegDcBuckets - 1;
         }
 
-        return JpegDcContextBase + (ci * JpegDcBuckets) + bucket;
+        return JpegDcContextBase(nbc) + (ci * JpegDcBuckets) + bucket;
     }
 
     // Per-component AC scan order: position 0 is DC; positions 1..63 are the natural-order coefficient
@@ -92,12 +105,12 @@ internal static partial class JxlEncoder
     // the count for non-zeros); the caller hybrid-packs them (and optionally LZ77s the value stream).
     private static void BuildJpegTokens(Formats.JpegDctData d, int[][] orders, List<int> vals, List<int> ctxs)
     {
+        int nbc = JpegNbc(d.ComponentCount);
         for (int ci = 0; ci < d.ComponentCount; ci++)
         {
             Formats.JpegDctComponent comp = d.Components[ci];
             int[] order = orders[ci];
             int bpr = comp.BlocksPerRow, bpc = comp.BlocksPerCol;
-            int blockCtx = ci;
             var nonZerosGrid = new uint[bpr];
             for (int by = 0; by < bpc; by++)
             {
@@ -109,15 +122,17 @@ internal static partial class JxlEncoder
                     int left = bx > 0 ? comp.Blocks[(by * bpr) + bx - 1][0] : (by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : 0);
                     int above = by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : left;
                     int aboveLeft = bx > 0 && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx - 1][0] : above;
-                    ctxs.Add(JpegDcContext(ci, left, above, aboveLeft));
+                    ctxs.Add(JpegDcContext(nbc, ci, left, above, aboveLeft));
                     vals.Add(PackSigned(block[0] - ClampGradient(left, above, aboveLeft)));
+
+                    int blockCtx = ci; // per-component AC block context
 
                     // AC: non-zero count (predicted from neighbours), then coefficients in zigzag order.
                     uint predicted = by == 0
                         ? (bx == 0 ? 32u : nonZerosGrid[bx - 1])
                         : (bx == 0 ? nonZerosGrid[bx] : (nonZerosGrid[bx] + nonZerosGrid[bx - 1] + 1) >> 1);
                     uint nzIdx = predicted >= 8 ? 4 + (predicted / 2) : predicted;
-                    int nonZerosCtx = blockCtx + (int)(nzIdx * JpegBlockClusters);
+                    int nonZerosCtx = blockCtx + (int)(nzIdx * nbc);
 
                     int nonZeros = 0, lastNz = 0;
                     for (int oi = 1; oi < 64; oi++)
@@ -138,7 +153,7 @@ internal static partial class JxlEncoder
                     }
 
                     uint isPrevNonzero = nonZeros <= 4 ? 1u : 0u;
-                    int coeffCtxBase = (blockCtx * 458) + (37 * JpegBlockClusters);
+                    int coeffCtxBase = (blockCtx * 458) + (37 * nbc);
                     int rem = nonZeros;
                     for (int oi = 1; oi <= lastNz; oi++)
                     {
@@ -242,27 +257,28 @@ internal static partial class JxlEncoder
             }
         }
 
+        int totalContexts = JpegTotalContexts(JpegNbc(d.ComponentCount), d.ComponentCount);
         if (minLen > 0)
         {
-            EncodeEntropyLz77(w, vals, ctxs, minLen, lazy: true);
+            EncodeEntropyLz77(w, vals, ctxs, minLen, totalContexts, lazy: true);
         }
         else
         {
-            EncodeEntropyPlain(w, vals, ctxs);
+            EncodeEntropyPlain(w, vals, ctxs, totalContexts);
         }
 
         return w.ToArray();
     }
 
     // Plain per-context ANS: hybrid-pack each value, cluster the contexts, emit the standard entropy header.
-    private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs)
+    private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs, int totalContexts)
     {
         int n = vals.Length;
         var packed = new (int Tok, int NBits, int Bits)[n];
         int maxTok = 0;
         for (int i = 0; i < n; i++)
         {
-            packed[i] = PackHybridFull(LitSplit, LitMsb, LitLsb, vals[i]);
+            packed[i] = PackHybridFull(JLitSplit, JLitMsb, JLitLsb, vals[i]);
             if (packed[i].Tok > maxTok)
             {
                 maxTok = packed[i].Tok;
@@ -271,8 +287,8 @@ internal static partial class JxlEncoder
 
         int alphabet = maxTok + 1;
         int logAlpha = Math.Max(5, BitLen(maxTok));
-        var ctxHist = new long[JpegTotalContexts][];
-        for (int i = 0; i < JpegTotalContexts; i++)
+        var ctxHist = new long[totalContexts][];
+        for (int i = 0; i < totalContexts; i++)
         {
             ctxHist[i] = new long[alphabet];
         }
@@ -292,7 +308,7 @@ internal static partial class JxlEncoder
         w.WriteBits((uint)(logAlpha - 5), 2);
         for (int c = 0; c < k; c++)
         {
-            WriteUintConfig(w, LitSplit, LitMsb, LitLsb, logAlpha);
+            WriteUintConfig(w, JLitSplit, JLitMsb, JLitLsb, logAlpha);
         }
 
         for (int c = 0; c < k; c++)
@@ -427,7 +443,7 @@ internal static partial class JxlEncoder
     // ANS with LZ77 back-references over the value stream. Length markers live in the literal alphabet above
     // `threshold` (coded in the position's own context); distances use a dedicated extra cluster. The DECODER
     // (JxlAnsReader) handles the copies transparently, so DecodeJpegCoefficients needs no changes.
-    private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen, bool lazy)
+    private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen, int totalContexts, bool lazy)
     {
         List<Op> ops = lazy ? FindMatchesLazy(vals, minLen) : FindMatches(vals, minLen);
 
@@ -436,7 +452,7 @@ internal static partial class JxlEncoder
         {
             if (!op.Match)
             {
-                maxLitTok = Math.Max(maxLitTok, PackHybridFull(LitSplit, LitMsb, LitLsb, op.A).Token);
+                maxLitTok = Math.Max(maxLitTok, PackHybridFull(JLitSplit, JLitMsb, JLitLsb, op.A).Token);
             }
         }
 
@@ -452,8 +468,8 @@ internal static partial class JxlEncoder
         }
 
         int logAlpha = Math.Max(5, BitLen(Math.Max(gmaxLit, gmaxDist)));
-        var ctxHist = new long[JpegTotalContexts][];
-        for (int i = 0; i < JpegTotalContexts; i++)
+        var ctxHist = new long[totalContexts][];
+        for (int i = 0; i < totalContexts; i++)
         {
             ctxHist[i] = new long[gmaxLit + 1];
         }
@@ -465,7 +481,7 @@ internal static partial class JxlEncoder
             int ctx = ctxs[pos];
             if (!op.Match)
             {
-                ctxHist[ctx][PackHybridFull(LitSplit, LitMsb, LitLsb, op.A).Token]++;
+                ctxHist[ctx][PackHybridFull(JLitSplit, JLitMsb, JLitLsb, op.A).Token]++;
                 pos += 1;
             }
             else
@@ -479,9 +495,9 @@ internal static partial class JxlEncoder
         (int[] map, int[][] norm, int k) = ClusterContextsTotalCost(ctxHist, gmaxLit + 1, JpegMaxClusters, logAlpha);
 
         // Combined context map: N literal contexts -> their cluster, plus a final distance context -> cluster k.
-        var combinedMap = new int[JpegTotalContexts + 1];
-        Array.Copy(map, combinedMap, JpegTotalContexts);
-        combinedMap[JpegTotalContexts] = k;
+        var combinedMap = new int[totalContexts + 1];
+        Array.Copy(map, combinedMap, totalContexts);
+        combinedMap[totalContexts] = k;
 
         int[] distNorm = JxlEntropy.NormalizeCounts(distHist, JxlEntropy.HistShift);
         var norm2 = new int[k + 1][];
@@ -497,7 +513,7 @@ internal static partial class JxlEncoder
         w.WriteBits((uint)(logAlpha - 5), 2);
         for (int c = 0; c < k; c++)
         {
-            WriteUintConfig(w, LitSplit, LitMsb, LitLsb, logAlpha); // literal+length clusters
+            WriteUintConfig(w, JLitSplit, JLitMsb, JLitLsb, logAlpha); // literal+length clusters
         }
 
         WriteUintConfig(w, JpegSeDist, 0, 0, logAlpha); // distance cluster
@@ -514,7 +530,7 @@ internal static partial class JxlEncoder
             int ctx = ctxs[pos];
             if (!op.Match)
             {
-                (int tok, int nb, int bits) = PackHybridFull(LitSplit, LitMsb, LitLsb, op.A);
+                (int tok, int nb, int bits) = PackHybridFull(JLitSplit, JLitMsb, JLitLsb, op.A);
                 ansToks.Add(new AnsToken(map[ctx], tok, (uint)bits, nb));
                 pos += 1;
             }
@@ -552,8 +568,9 @@ internal static partial class JxlEncoder
             orders[ci] = order;
         }
 
+        int nbc = JpegNbc(d.ComponentCount);
         // DecodeHistograms reads the whole entropy header (lz77, context map, use_prefix, logAlpha, configs, histograms).
-        JxlAnsCode code = JxlEntropy.DecodeHistograms(JpegTotalContexts, br);
+        JxlAnsCode code = JxlEntropy.DecodeHistograms(JpegTotalContexts(nbc, d.ComponentCount), br);
         var rd = new JxlAnsReader(code, br);
 
         for (int ci = 0; ci < d.ComponentCount; ci++)
@@ -561,7 +578,6 @@ internal static partial class JxlEncoder
             Formats.JpegDctComponent comp = d.Components[ci];
             int[] order = orders[ci];
             int bpr = comp.BlocksPerRow, bpc = comp.BlocksPerCol;
-            int blockCtx = ci;
             comp.Blocks = new int[bpr * bpc][];
             for (int i = 0; i < comp.Blocks.Length; i++)
             {
@@ -578,14 +594,15 @@ internal static partial class JxlEncoder
                     int left = bx > 0 ? comp.Blocks[(by * bpr) + bx - 1][0] : (by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : 0);
                     int above = by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : left;
                     int aboveLeft = bx > 0 && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx - 1][0] : above;
-                    int dcRes = JxlBits.UnpackSigned(rd.ReadHybridUintCtx(JpegDcContext(ci, left, above, aboveLeft)));
+                    int dcRes = JxlBits.UnpackSigned(rd.ReadHybridUintCtx(JpegDcContext(nbc, ci, left, above, aboveLeft)));
                     block[0] = dcRes + ClampGradient(left, above, aboveLeft);
+                    int blockCtx = ci;
 
                     uint predicted = by == 0
                         ? (bx == 0 ? 32u : nonZerosGrid[bx - 1])
                         : (bx == 0 ? nonZerosGrid[bx] : (nonZerosGrid[bx] + nonZerosGrid[bx - 1] + 1) >> 1);
                     uint nzIdx = predicted >= 8 ? 4 + (predicted / 2) : predicted;
-                    int nonZerosCtx = blockCtx + (int)(nzIdx * JpegBlockClusters);
+                    int nonZerosCtx = blockCtx + (int)(nzIdx * nbc);
                     int nonZeros = (int)rd.ReadHybridUintCtx(nonZerosCtx);
                     nonZerosGrid[bx] = (uint)nonZeros;
                     if (nonZeros == 0)
@@ -594,7 +611,7 @@ internal static partial class JxlEncoder
                     }
 
                     uint isPrevNonzero = nonZeros <= 4 ? 1u : 0u;
-                    int coeffCtxBase = (blockCtx * 458) + (37 * JpegBlockClusters);
+                    int coeffCtxBase = (blockCtx * 458) + (37 * nbc);
                     int rem = nonZeros;
                     for (int oi = 1; oi < 64; oi++)
                     {
