@@ -192,15 +192,37 @@ internal static partial class JxlEncoder
     private const int JpegSeLen = 4;          // hybrid config split for LZ77 length
     private const int JpegSeDist = 4;         // hybrid config split for LZ77 distance
 
+    // Encode effort presets. Higher = try more candidate encodings (predictor / scan order / LZ77 length /
+    // entropy backend / refinement iterations), keeping the smallest — better ratio, more CPU. The best-of is
+    // pure ratio search: every tier is byte-exact (the container self-verifies), tiers only trade speed↔size.
+    internal const int JpegEffortFast = 2;      // ~single-pass: gradient DC, custom order, ANS, minimal refine
+    internal const int JpegEffortDefault = 5;   // balanced: both orders + {no-LZ77, LZ77} best-of, ANS
+    internal const int JpegEffortMax = 9;       // exhaustive: + weighted-DC predictor, +LZ77-32, +prefix codes
+
     /// <summary>Entropy-codes a JPEG's quantized DCT coefficients with the DCT-aware context model + ANS.</summary>
-    internal static byte[] EncodeJpegCoefficients(Formats.JpegDctData d)
+    internal static byte[] EncodeJpegCoefficients(Formats.JpegDctData d, int effort = JpegEffortDefault)
     {
-        // Independent choices, kept best-of: DC predictor (gradient vs weighted), scan order (custom tightens
-        // the model but costs a table), and LZ77 (catches repeated token runs but adds a small header).
-        byte[]? best = null;
-        foreach (bool useWp in new[] { false, true })
+        // Candidate breadth scales with effort. The per-encode cost is dominated by the clustering + per-cluster
+        // config refinement, so the biggest speed lever is simply how many (predictor × order × lz77 × backend)
+        // encodings we run — libjxl does one tuned pass; we approximate its config choice by trying a few.
+        // Both scan orders are always tried: natural (no table) is essential for tiny files, custom for large —
+        // dropping either badly hurts a whole content class for little speed. Likewise {no-LZ77, LZ77-16} is the
+        // floor (LZ77 is what crushes graphics/screenshots). Effort scales the knobs with diminishing payoff:
+        // the weighted-DC predictor, a second LZ77 length, prefix-code candidates, and refinement iterations.
+        bool[] predictors = effort >= 7 ? new[] { false, true } : new[] { false };
+        bool[] orderOpts = { true, false };
+        int[] lzModes = effort >= 7 ? new[] { 0, 16, 32 } : new[] { 0, 16 };
+        bool tryPrefix = effort >= 7;
+        int refineIters = effort >= 7 ? 5 : (effort >= 4 ? 3 : 1);
+
+        // Collect every independent candidate encoding as a job, then run them in parallel — the best-of is a
+        // pure size race with no shared mutable state, so this is an exact-ratio speedup that scales with cores
+        // (the dominant cost is the per-candidate clustering + ANS encode, not the token build). Token streams
+        // are built once per (predictor, order) and shared read-only by that group's LZ77/backend candidates.
+        var jobs = new List<(int[][] orders, bool custom, bool wp, int[] vals, int[] ctxs, int minLen, bool prefix)>();
+        foreach (bool useWp in predictors)
         {
-            foreach (bool useCustomOrder in new[] { true, false })
+            foreach (bool useCustomOrder in orderOpts)
             {
                 int[][] orders = useCustomOrder ? ComputeOrders(d) : NaturalOrders(d.ComponentCount);
                 var vals = new List<int>();
@@ -213,34 +235,37 @@ internal static partial class JxlEncoder
                     JpegStats(d, valArr, ctxArr);
                 }
 
-                byte[] plain = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, 0); // 0 = no LZ77
-                if (best == null || plain.Length < best.Length)
+                foreach (int minLen in lzModes)
                 {
-                    best = plain;
-                }
-
-                // Prefix (Huffman) codes: cheaper histogram description than ANS, so they win on small files
-                // where the per-cluster distribution transmission dominates. Same clustering + hybrid-uint
-                // configs; only the entropy backend differs. (libjxl picks whichever is smaller per histogram.)
-                byte[] plainPfx = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, 0, usePrefix: true);
-                if (plainPfx.Length < best.Length)
-                {
-                    best = plainPfx;
-                }
-
-                foreach (int minLen in JpegLz77MinLens)
-                {
-                    byte[] blob = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, minLen);
-                    if (blob.Length < best.Length)
+                    jobs.Add((orders, useCustomOrder, useWp, valArr, ctxArr, minLen, false));
+                    if (tryPrefix)
                     {
-                        best = blob;
+                        jobs.Add((orders, useCustomOrder, useWp, valArr, ctxArr, minLen, true));
                     }
+                }
+            }
+        }
 
-                    byte[] blobPfx = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, minLen, usePrefix: true);
-                    if (blobPfx.Length < best.Length)
-                    {
-                        best = blobPfx;
-                    }
+        byte[]? best = null;
+        if (jobs.Count == 1)
+        {
+            var j = jobs[0];
+            best = EncodeStream(d, j.orders, j.custom, j.wp, j.vals, j.ctxs, j.minLen, refineIters, j.prefix);
+        }
+        else
+        {
+            var blobs = new byte[jobs.Count][];
+            System.Threading.Tasks.Parallel.For(0, jobs.Count, i =>
+            {
+                var j = jobs[i];
+                blobs[i] = EncodeStream(d, j.orders, j.custom, j.wp, j.vals, j.ctxs, j.minLen, refineIters, j.prefix);
+            });
+
+            foreach (byte[] blob in blobs)
+            {
+                if (best == null || blob.Length < best.Length)
+                {
+                    best = blob;
                 }
             }
         }
@@ -323,7 +348,7 @@ internal static partial class JxlEncoder
 
     // Writes the container prefix (token count + optional scan-order table), then the entropy-coded value
     // stream — either plain per-context ANS or ANS with LZ77 back-references over the value stream.
-    private static byte[] EncodeStream(Formats.JpegDctData d, int[][] orders, bool useCustomOrder, bool useWp, int[] vals, int[] ctxs, int minLen, bool usePrefix = false)
+    private static byte[] EncodeStream(Formats.JpegDctData d, int[][] orders, bool useCustomOrder, bool useWp, int[] vals, int[] ctxs, int minLen, int refineIters, bool usePrefix = false)
     {
         var w = new JxlBitWriter();
         w.WriteBool(useWp);
@@ -343,11 +368,11 @@ internal static partial class JxlEncoder
         int totalContexts = JpegTotalContexts(JpegNbc(d.ComponentCount), d.ComponentCount);
         if (minLen > 0)
         {
-            EncodeEntropyLz77(w, vals, ctxs, minLen, totalContexts, lazy: true, usePrefix);
+            EncodeEntropyLz77(w, vals, ctxs, minLen, totalContexts, lazy: true, refineIters, usePrefix);
         }
         else
         {
-            EncodeEntropyPlain(w, vals, ctxs, totalContexts, usePrefix);
+            EncodeEntropyPlain(w, vals, ctxs, totalContexts, refineIters, usePrefix);
         }
 
         return w.ToArray();
@@ -365,13 +390,20 @@ internal static partial class JxlEncoder
         (7, 0, 0), (8, 0, 0),
     };
 
+    // A curated subset of the candidates that win the vast majority of the time on Laplacian JPEG coefficient
+    // clusters — used at low effort to cut OptimizeClusterConfig's inner search ~3x for a negligible ratio cost.
+    private static readonly (int S, int M, int L)[] JpegUintCandidatesFast =
+    {
+        (4, 2, 0), (4, 1, 0), (3, 2, 0), (5, 2, 0), (4, 2, 1), (0, 0, 0),
+    };
+
     private const int JpegMaxToken = 256; // keeps logAlpha <= 8 (fits the 2-bit logAlpha-5 field)
 
     // Picks the hybrid-uint config minimising ANS population cost + raw extra bits + config signalling for one
     // cluster's value histogram (libjxl ChooseUintConfigs). Returns the config, its normalized token histogram
     // and the max token produced. This is the key to matching libjxl: a cluster of small coefficients can
     // direct-code them (no extra bits), one with a heavy tail can spend extra bits — instead of one fixed config.
-    private static (int S, int M, int L, int[] Norm, int MaxTok) OptimizeClusterConfig(long[] valHist, int tokenCap = JpegMaxToken)
+    private static (int S, int M, int L, int[] Norm, int MaxTok) OptimizeClusterConfig(long[] valHist, int tokenCap, (int S, int M, int L)[] candidates)
     {
         int maxVal = valHist.Length - 1;
         while (maxVal > 0 && valHist[maxVal] == 0)
@@ -383,7 +415,7 @@ internal static partial class JxlEncoder
         (int S, int M, int L) bestCfg = (4, 2, 0);
         int[] bestNorm = new int[1];
         int bestMax = 0;
-        foreach ((int s, int m, int l) in JpegUintCandidates)
+        foreach ((int s, int m, int l) in candidates)
         {
             int maxTok = 0;
             long extra = 0;
@@ -448,8 +480,9 @@ internal static partial class JxlEncoder
     // optimize configs -> reassign each context to the cluster that codes its values cheapest -> repeat.
     // Mutates `map`; returns the final configs, normalized histograms and shared logAlpha.
     private static (int[] CfgS, int[] CfgM, int[] CfgL, int[][] Norm, int LogAlpha) RefineClusters(
-        Dictionary<int, long>[] ctxVH, int[] map, int k, int maxVal, int tokenCap = JpegMaxToken)
+        Dictionary<int, long>[] ctxVH, int[] map, int k, int maxVal, int refineIters, int tokenCap = JpegMaxToken)
     {
+        (int S, int M, int L)[] candidates = refineIters >= 3 ? JpegUintCandidates : JpegUintCandidatesFast;
         int n = ctxVH.Length;
         var cfgS = new int[k];
         var cfgM = new int[k];
@@ -479,14 +512,14 @@ internal static partial class JxlEncoder
 
             for (int c = 0; c < k; c++)
             {
-                (cfgS[c], cfgM[c], cfgL[c], norm[c], mtk[c]) = OptimizeClusterConfig(clHist[c], tokenCap);
+                (cfgS[c], cfgM[c], cfgL[c], norm[c], mtk[c]) = OptimizeClusterConfig(clHist[c], tokenCap, candidates);
             }
         }
 
         Optimize();
 
         double tableSum = JxlBits.AnsTabSize;
-        for (int iter = 0; iter < 5; iter++)
+        for (int iter = 0; iter < refineIters; iter++)
         {
             // Per-cluster per-token cost = -log2(p); a token absent from a cluster's histogram gets a high
             // fallback cost (the next Optimize adds it if a context actually moves there).
@@ -569,7 +602,7 @@ internal static partial class JxlEncoder
 
     // Plain per-context ANS: cluster the contexts (on the default config), then jointly refine the assignment
     // and per-cluster hybrid-uint configs, and emit the standard entropy header.
-    private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs, int totalContexts, bool usePrefix = false)
+    private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs, int totalContexts, int refineIters, bool usePrefix = false)
     {
         int n = vals.Length;
         int maxTokDefault = 0, maxVal = 0;
@@ -603,7 +636,7 @@ internal static partial class JxlEncoder
 
         // Jointly refine the assignment + per-cluster configs (Lloyd-style) starting from that clustering.
         Dictionary<int, long>[] ctxVH = BuildCtxValueHists(vals, ctxs, totalContexts);
-        (int[] cfgS, int[] cfgM, int[] cfgL, int[][] norm, int logAlpha) = RefineClusters(ctxVH, map, k, maxVal);
+        (int[] cfgS, int[] cfgM, int[] cfgL, int[][] norm, int logAlpha) = RefineClusters(ctxVH, map, k, maxVal, refineIters);
 
         if (usePrefix)
         {
@@ -806,7 +839,7 @@ internal static partial class JxlEncoder
     // ANS with LZ77 back-references over the value stream. Length markers live in the literal alphabet above
     // `threshold` (coded in the position's own context); distances use a dedicated extra cluster. The DECODER
     // (JxlAnsReader) handles the copies transparently, so DecodeJpegCoefficients needs no changes.
-    private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen, int totalContexts, bool lazy, bool usePrefix = false)
+    private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen, int totalContexts, bool lazy, int refineIters, bool usePrefix = false)
     {
         List<Op> ops = lazy ? FindMatchesLazy(vals, minLen) : FindMatches(vals, minLen);
 
@@ -884,7 +917,7 @@ internal static partial class JxlEncoder
             }
         }
 
-        (int[] cfgS, int[] cfgM, int[] cfgL, int[][] _3, int _4) = RefineClusters(ctxVH, map, k, maxVal, tokenCap: 220);
+        (int[] cfgS, int[] cfgM, int[] cfgL, int[][] _3, int _4) = RefineClusters(ctxVH, map, k, maxVal, refineIters, tokenCap: 220);
 
         int threshold = 8;
         pos = 0;

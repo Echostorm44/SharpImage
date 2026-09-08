@@ -26,8 +26,21 @@ public static class JpegXlLossless
     public static bool CanDecode(ReadOnlySpan<byte> data) =>
         data.Length >= 4 && BinaryPrimitives.ReadUInt32BigEndian(data) == Magic;
 
+    /// <summary>Effort presets for <see cref="Encode(byte[], int)"/> (speed vs compression; all byte-exact).</summary>
+    public const int EffortFast = Jxl.JxlEncoder.JpegEffortFast;
+    public const int EffortDefault = Jxl.JxlEncoder.JpegEffortDefault;
+    public const int EffortMax = Jxl.JxlEncoder.JpegEffortMax;
+
+    /// <summary>Losslessly transcodes a baseline JPEG to the SharpImage JXL-based recompression container
+    /// at the default effort. Use <see cref="Encode(byte[], int)"/> to trade speed against compression.</summary>
+    public static byte[] Encode(byte[] jpeg) => Encode(jpeg, EffortDefault);
+
     /// <summary>Losslessly transcodes a baseline JPEG to the SharpImage JXL-based recompression container.</summary>
-    public static byte[] Encode(byte[] jpeg)
+    /// <param name="jpeg">The source baseline/progressive JPEG bytes.</param>
+    /// <param name="effort">Compression effort 1-9 (see <see cref="EffortFast"/>/<see cref="EffortDefault"/>/
+    /// <see cref="EffortMax"/>): higher searches more coding candidates for a smaller container at more CPU.
+    /// Every effort level reconstructs the source byte-for-byte.</param>
+    public static byte[] Encode(byte[] jpeg, int effort)
     {
         JpegDctData d = JpegCoder.ReadDctData(new MemoryStream(jpeg));
 
@@ -79,7 +92,7 @@ public static class JpegXlLossless
         // neighbouring blocks + per-frequency-band contexts) and ANS — the same machinery the lossy VarDCT
         // encoder uses — which beats JPEG's per-block Huffman by exploiting inter-block correlation. It is the
         // last element, so it is written without a length prefix (Decode reads to end of stream).
-        byte[] coeff = Jxl.JxlEncoder.EncodeJpegCoefficients(d);
+        byte[] coeff = Jxl.JxlEncoder.EncodeJpegCoefficients(d, effort);
         w.Write(coeff);
         byte[] container = ms.ToArray();
 
