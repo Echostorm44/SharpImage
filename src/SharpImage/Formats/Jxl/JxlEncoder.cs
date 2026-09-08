@@ -282,7 +282,10 @@ internal static partial class JxlEncoder
         // sets the index values and thus how well the gradient predictor tracks region boundaries. Score
         // them by an actual trial encode and keep the smallest, since the residual-entropy proxy only
         // ranks candidates; the tree/entropy coder decides the real winner.
-        if (alpha == null && CollectPaletteColors(r, g, b, w * h, out int[] colors, out int[] counts))
+        // Palette is only tried for 8-bit content: BuildPaletteChannels/the palette meta-channel path stores
+        // entries at 8-bit precision, which would truncate a 16-bit palette (the high byte is lost). 16-bit
+        // few-colour images still compress well via the RCT + weighted-predictor path above.
+        if (alpha == null && bits <= 8 && CollectPaletteColors(r, g, b, w * h, out int[] colors, out int[] counts))
         {
             int nbColors = colors.Length;
             foreach (int[] ordered in PaletteOrderings(colors, counts, r, g, b, w, h))

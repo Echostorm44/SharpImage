@@ -155,14 +155,14 @@ public sealed class HuffmanTable
     /// </summary>
     public byte Decode(JpegBitReader reader)
     {
-        if (reader.EndOfData)
+        if (reader.NoMoreBits)
         {
             return 0;
         }
 
         // Try fast lookup first
         int peek = reader.PeekBits(MaxLookupBits);
-        if (reader.EndOfData)
+        if (reader.NoMoreBits)
         {
             return 0;
         }
@@ -178,7 +178,7 @@ public sealed class HuffmanTable
 
         // Slow path for long codes
         int code = reader.ReadBits(9);
-        if (reader.EndOfData)
+        if (reader.NoMoreBits)
         {
             return 0;
         }
@@ -191,7 +191,7 @@ public sealed class HuffmanTable
             }
 
             code = (code << 1) | reader.ReadBit();
-            if (reader.EndOfData)
+            if (reader.NoMoreBits)
             {
                 return 0;
             }
@@ -225,6 +225,14 @@ public sealed class JpegBitReader
     /// Whether the end of entropy-coded data has been reached.
     /// </summary>
     public bool EndOfData => endOfData;
+
+    /// <summary>
+    /// True only when the entropy stream is exhausted AND no buffered bits remain. <see cref="EndOfData"/>
+    /// alone becomes true as soon as FillBuffer reaches the terminating marker, while real bits from the last
+    /// entropy byte are still buffered — decoding must consume those (a Huffman code can live entirely in the
+    /// final byte), so symbol decoding gates on this, not on EndOfData.
+    /// </summary>
+    public bool NoMoreBits => endOfData && bitsRemaining == 0;
 
     /// <summary>
     /// Reads a single bit (MSB first).

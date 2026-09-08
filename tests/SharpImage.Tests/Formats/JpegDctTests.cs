@@ -140,6 +140,39 @@ public class JpegDctTests
         await Assert.That(rebuilt.AsSpan().SequenceEqual(original)).IsTrue();
     }
 
+    // End-to-end lossless JPEG -> JXL-recompression container -> JPEG reproduces the original JPEG byte-exact.
+    [Test]
+    [Arguments(64, 48, JpegSubsampling.Yuv444)]
+    [Arguments(80, 64, JpegSubsampling.Yuv420)]
+    [Arguments(48, 40, JpegSubsampling.Yuv422)]
+    public async Task Jpeg_LosslessTranscode_RoundTrips(int w, int h, JpegSubsampling ss)
+    {
+        var src = new ImageFrame();
+        src.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int y = 0; y < h; y++)
+        {
+            var row = src.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * src.NumberOfChannels;
+                row[o] = Quantum.ScaleFromByte((byte)((x * 7) ^ (y * 13)));
+                row[o + 1] = Quantum.ScaleFromByte((byte)((x * 11) + (y * 5)));
+                row[o + 2] = Quantum.ScaleFromByte((byte)(200 - (x * 3) - y));
+            }
+        }
+
+        using var ms = new System.IO.MemoryStream();
+        JpegCoder.Write(src, ms, quality: 82, subsampling: ss);
+        byte[] jpeg = ms.ToArray();
+
+        byte[] container = JpegXlLossless.Encode(jpeg);
+        await Assert.That(JpegXlLossless.CanDecode(container)).IsTrue();
+        byte[] restored = JpegXlLossless.Decode(container);
+
+        await Assert.That(restored.Length).IsEqualTo(jpeg.Length);
+        await Assert.That(restored.AsSpan().SequenceEqual(jpeg)).IsTrue();
+    }
+
     // Byte-exact round-trip of REAL third-party JPEGs (libjpeg/ffmpeg) from VARDCT_JBRD_DIR, which exercise
     // real Huffman tables, APPn/COM segments and restart markers.
     [Test]
