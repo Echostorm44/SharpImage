@@ -213,12 +213,27 @@ internal static partial class JxlEncoder
                     best = plain;
                 }
 
+                // Prefix (Huffman) codes: cheaper histogram description than ANS, so they win on small files
+                // where the per-cluster distribution transmission dominates. Same clustering + hybrid-uint
+                // configs; only the entropy backend differs. (libjxl picks whichever is smaller per histogram.)
+                byte[] plainPfx = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, 0, usePrefix: true);
+                if (plainPfx.Length < best.Length)
+                {
+                    best = plainPfx;
+                }
+
                 foreach (int minLen in JpegLz77MinLens)
                 {
                     byte[] blob = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, minLen);
                     if (blob.Length < best.Length)
                     {
                         best = blob;
+                    }
+
+                    byte[] blobPfx = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, minLen, usePrefix: true);
+                    if (blobPfx.Length < best.Length)
+                    {
+                        best = blobPfx;
                     }
                 }
             }
@@ -247,7 +262,7 @@ internal static partial class JxlEncoder
 
     // Writes the container prefix (token count + optional scan-order table), then the entropy-coded value
     // stream — either plain per-context ANS or ANS with LZ77 back-references over the value stream.
-    private static byte[] EncodeStream(Formats.JpegDctData d, int[][] orders, bool useCustomOrder, bool useWp, int[] vals, int[] ctxs, int minLen)
+    private static byte[] EncodeStream(Formats.JpegDctData d, int[][] orders, bool useCustomOrder, bool useWp, int[] vals, int[] ctxs, int minLen, bool usePrefix = false)
     {
         var w = new JxlBitWriter();
         w.WriteBool(useWp);
@@ -267,11 +282,11 @@ internal static partial class JxlEncoder
         int totalContexts = JpegTotalContexts(JpegNbc(d.ComponentCount), d.ComponentCount);
         if (minLen > 0)
         {
-            EncodeEntropyLz77(w, vals, ctxs, minLen, totalContexts, lazy: true);
+            EncodeEntropyLz77(w, vals, ctxs, minLen, totalContexts, lazy: true, usePrefix);
         }
         else
         {
-            EncodeEntropyPlain(w, vals, ctxs, totalContexts);
+            EncodeEntropyPlain(w, vals, ctxs, totalContexts, usePrefix);
         }
 
         return w.ToArray();
@@ -493,7 +508,7 @@ internal static partial class JxlEncoder
 
     // Plain per-context ANS: cluster the contexts (on the default config), then jointly refine the assignment
     // and per-cluster hybrid-uint configs, and emit the standard entropy header.
-    private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs, int totalContexts)
+    private static void EncodeEntropyPlain(JxlBitWriter w, int[] vals, int[] ctxs, int totalContexts, bool usePrefix = false)
     {
         int n = vals.Length;
         int maxTokDefault = 0, maxVal = 0;
@@ -528,6 +543,63 @@ internal static partial class JxlEncoder
         // Jointly refine the assignment + per-cluster configs (Lloyd-style) starting from that clustering.
         Dictionary<int, long>[] ctxVH = BuildCtxValueHists(vals, ctxs, totalContexts);
         (int[] cfgS, int[] cfgM, int[] cfgL, int[][] norm, int logAlpha) = RefineClusters(ctxVH, map, k, maxVal);
+
+        if (usePrefix)
+        {
+            // Prefix-code backend: fixed logAlpha (PrefixMaxBits), so no 2-bit logAlpha field. Per-cluster raw
+            // token histograms -> canonical prefix codes (much cheaper to transmit than ANS distributions).
+            var tokHist = new long[k][];
+            int[] pfxAlpha = new int[k];
+            for (int c = 0; c < k; c++)
+            {
+                tokHist[c] = new long[JpegMaxToken];
+            }
+
+            for (int i = 0; i < n; i++)
+            {
+                int c = map[ctxs[i]];
+                int tok = PackHybridFull(cfgS[c], cfgM[c], cfgL[c], vals[i]).Token;
+                tokHist[c][tok]++;
+                if (tok + 1 > pfxAlpha[c])
+                {
+                    pfxAlpha[c] = tok + 1;
+                }
+            }
+
+            var codes = new JxlPrefixCode[k];
+            for (int c = 0; c < k; c++)
+            {
+                codes[c] = new JxlPrefixCode(tokHist[c], Math.Max(1, pfxAlpha[c]));
+            }
+
+            w.WriteBool(false); // lz77 disabled
+            WriteContextMap(w, (int[])map.Clone(), k);
+            w.WriteBool(true); // use_prefix_code = true
+            for (int c = 0; c < k; c++)
+            {
+                WriteUintConfig(w, cfgS[c], cfgM[c], cfgL[c], JxlHuffman.PrefixMaxBits);
+            }
+
+            for (int c = 0; c < k; c++)
+            {
+                w.WriteVarLenUint16(codes[c].AlphabetSize - 1);
+            }
+
+            for (int c = 0; c < k; c++)
+            {
+                codes[c].WriteHeader(w);
+            }
+
+            for (int i = 0; i < n; i++)
+            {
+                int c = map[ctxs[i]];
+                (int tok, int nb, int bits) = PackHybridFull(cfgS[c], cfgM[c], cfgL[c], vals[i]);
+                codes[c].WriteSymbol(w, tok);
+                w.WriteBits((uint)bits, nb);
+            }
+
+            return;
+        }
 
         // Entropy header: lz77, context map, use_prefix, logAlpha, per-cluster uint configs, per-cluster histograms.
         w.WriteBool(false); // lz77 disabled
@@ -673,7 +745,7 @@ internal static partial class JxlEncoder
     // ANS with LZ77 back-references over the value stream. Length markers live in the literal alphabet above
     // `threshold` (coded in the position's own context); distances use a dedicated extra cluster. The DECODER
     // (JxlAnsReader) handles the copies transparently, so DecodeJpegCoefficients needs no changes.
-    private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen, int totalContexts, bool lazy)
+    private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen, int totalContexts, bool lazy, bool usePrefix = false)
     {
         List<Op> ops = lazy ? FindMatchesLazy(vals, minLen) : FindMatches(vals, minLen);
 
@@ -821,6 +893,76 @@ internal static partial class JxlEncoder
         var combinedMap = new int[totalContexts + 1];
         Array.Copy(map, combinedMap, totalContexts);
         combinedMap[totalContexts] = k;
+
+        if (usePrefix)
+        {
+            // Prefix-code backend for the LZ77 stream: k literal+length clusters + 1 distance cluster, each a
+            // canonical prefix code (cheaper header than ANS on small streams). No 2-bit logAlpha field.
+            var pcodes = new JxlPrefixCode[k + 1];
+            for (int c = 0; c < k; c++)
+            {
+                int alpha = 1;
+                for (int s = tokHist[c].Length - 1; s >= 0; s--)
+                {
+                    if (tokHist[c][s] > 0)
+                    {
+                        alpha = s + 1;
+                        break;
+                    }
+                }
+
+                pcodes[c] = new JxlPrefixCode(tokHist[c], alpha);
+            }
+
+            pcodes[k] = new JxlPrefixCode(distHist, gmaxDist + 1);
+
+            w.WriteBool(true); // lz77 enabled
+            w.WriteU32((uint)threshold, E.Val(224), E.Val(512), E.Val(4096), E.BitsOff(15, 8)); // min_symbol
+            w.WriteU32((uint)minLen, E.Val(3), E.Val(4), E.BitsOff(2, 5), E.BitsOff(8, 9));    // min_length
+            WriteUintConfig(w, JpegSeLen, 0, 0, 8);            // lz77 length config
+            WriteContextMap(w, combinedMap, k + 1);
+            w.WriteBool(true); // use_prefix_code = true
+            for (int c = 0; c < k; c++)
+            {
+                WriteUintConfig(w, cfgS[c], cfgM[c], cfgL[c], JxlHuffman.PrefixMaxBits);
+            }
+
+            WriteUintConfig(w, JpegSeDist, 0, 0, JxlHuffman.PrefixMaxBits);
+            for (int c = 0; c <= k; c++)
+            {
+                w.WriteVarLenUint16(pcodes[c].AlphabetSize - 1);
+            }
+
+            for (int c = 0; c <= k; c++)
+            {
+                pcodes[c].WriteHeader(w);
+            }
+
+            pos = 0;
+            foreach (Op op in ops)
+            {
+                int cl = map[ctxs[pos]];
+                if (!op.Match)
+                {
+                    (int tok, int nb, int bits) = PackHybridFull(cfgS[cl], cfgM[cl], cfgL[cl], op.A);
+                    pcodes[cl].WriteSymbol(w, tok);
+                    w.WriteBits((uint)bits, nb);
+                    pos += 1;
+                }
+                else
+                {
+                    (int lt, int ln, int lb) = PackHybridUint(JpegSeLen, op.A - minLen);
+                    pcodes[cl].WriteSymbol(w, threshold + lt);
+                    w.WriteBits((uint)lb, ln);
+                    (int dt, int dn, int db) = PackHybridUint(JpegSeDist, op.B - 1);
+                    pcodes[k].WriteSymbol(w, dt);
+                    w.WriteBits((uint)db, dn);
+                    pos += op.A;
+                }
+            }
+
+            return;
+        }
 
         w.WriteBool(true); // lz77 enabled
         w.WriteU32((uint)threshold, E.Val(224), E.Val(512), E.Val(4096), E.BitsOff(15, 8)); // min_symbol
