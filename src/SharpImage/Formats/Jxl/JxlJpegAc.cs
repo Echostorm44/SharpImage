@@ -34,12 +34,13 @@ internal static partial class JxlEncoder
         return Math.Clamp(g, lo, hi);
     }
 
-    // Causal DC context: the local gradient activity predicts the residual magnitude (flat regions code
-    // tighter than busy ones). left/above/aboveLeft are all previously decoded, so encoder and decoder agree.
-    private static int JpegDcContext(int nbc, int ci, int left, int above, int aboveLeft)
+    // Causal DC context: a bucket of the local predictor-error magnitude (flat regions code tighter than busy
+    // ones). `ctxMag` is the gradient activity (gradient predictor) or the WP self-correcting error property
+    // (weighted predictor) — both computed from previously-decoded neighbours, so encoder and decoder agree.
+    private static int JpegDcContext(int nbc, int ci, long ctxMag)
     {
-        int activity = Math.Abs(left - aboveLeft) + Math.Abs(above - aboveLeft);
-        int bucket = BitLen(activity);
+        long m = ctxMag < 0 ? -ctxMag : ctxMag;
+        int bucket = BitLen(m > int.MaxValue ? int.MaxValue : (int)m);
         if (bucket >= JpegDcBuckets)
         {
             bucket = JpegDcBuckets - 1;
@@ -105,6 +106,7 @@ internal static partial class JxlEncoder
             int bpr = comp.BlocksPerRow, bpc = comp.BlocksPerCol;
             var nonZerosGrid = new uint[bpr];
             var wp = new WpState(WpHeader.Default(), bpr);
+            var dcProps = new List<long>(1);
             for (int by = 0; by < bpc; by++)
             {
                 for (int bx = 0; bx < bpr; bx++)
@@ -119,9 +121,11 @@ internal static partial class JxlEncoder
                     int aboveLeft = bx > 0 && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx - 1][0] : above;
                     int aboveRight = bx + 1 < bpr && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx + 1][0] : above;
                     int aboveAbove = by > 1 ? comp.Blocks[((by - 2) * bpr) + bx][0] : above;
-                    long wpPred = wp.Predict(bx, by, above, left, aboveRight, aboveLeft, aboveAbove, null);
+                    dcProps.Clear();
+                    long wpPred = wp.Predict(bx, by, above, left, aboveRight, aboveLeft, aboveAbove, useWp ? dcProps : null);
                     long pred = useWp ? wpPred : ClampGradient(left, above, aboveLeft);
-                    ctxs.Add(JpegDcContext(nbc, ci, left, above, aboveLeft));
+                    long ctxMag = useWp ? dcProps[0] : (Math.Abs(left - aboveLeft) + Math.Abs(above - aboveLeft));
+                    ctxs.Add(JpegDcContext(nbc, ci, ctxMag));
                     vals.Add(PackSigned((int)(block[0] - pred)));
                     wp.Update(block[0], bx, by);
 
@@ -902,6 +906,7 @@ internal static partial class JxlEncoder
 
             var nonZerosGrid = new uint[bpr];
             var wp = new WpState(WpHeader.Default(), bpr);
+            var dcProps = new List<long>(1);
             for (int by = 0; by < bpc; by++)
             {
                 for (int bx = 0; bx < bpr; bx++)
@@ -913,9 +918,11 @@ internal static partial class JxlEncoder
                     int aboveLeft = bx > 0 && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx - 1][0] : above;
                     int aboveRight = bx + 1 < bpr && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx + 1][0] : above;
                     int aboveAbove = by > 1 ? comp.Blocks[((by - 2) * bpr) + bx][0] : above;
-                    long wpPred = wp.Predict(bx, by, above, left, aboveRight, aboveLeft, aboveAbove, null);
+                    dcProps.Clear();
+                    long wpPred = wp.Predict(bx, by, above, left, aboveRight, aboveLeft, aboveAbove, useWp ? dcProps : null);
                     long pred = useWp ? wpPred : ClampGradient(left, above, aboveLeft);
-                    int dcRes = JxlBits.UnpackSigned(rd.ReadHybridUintCtx(JpegDcContext(nbc, ci, left, above, aboveLeft)));
+                    long ctxMag = useWp ? dcProps[0] : (Math.Abs(left - aboveLeft) + Math.Abs(above - aboveLeft));
+                    int dcRes = JxlBits.UnpackSigned(rd.ReadHybridUintCtx(JpegDcContext(nbc, ci, ctxMag)));
                     block[0] = (int)(dcRes + pred);
                     wp.Update(block[0], bx, by);
                     int blockCtx = ci;
