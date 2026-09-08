@@ -35,8 +35,10 @@ public static class JpegXlLossless
         var w = new BinaryWriter(ms);
         w.Write(BinaryPrimitives.ReverseEndianness(Magic));
 
-        WriteBlob(w, d.HeaderBytes);
-        WriteBlob(w, d.TrailingBytes);
+        // Header/trailer are the verbatim JPEG marker segments (Huffman + quant tables, APPn) — highly
+        // structured and compressible; Brotli them so tiny JPEGs aren't dominated by a raw ~300-500B header.
+        WriteCompressedBlob(w, d.HeaderBytes);
+        WriteCompressedBlob(w, d.TrailingBytes);
         w.Write(d.Width);
         w.Write(d.Height);
         w.Write(d.MaxHSample);
@@ -77,7 +79,7 @@ public static class JpegXlLossless
                     w.Write(s.CompAcTable[i]);
                 }
 
-                WriteBlob(w, s.Prefix);
+                WriteCompressedBlob(w, s.Prefix);
             }
         }
 
@@ -110,8 +112,8 @@ public static class JpegXlLossless
 
         var d = new JpegDctData
         {
-            HeaderBytes = ReadBlob(r),
-            TrailingBytes = ReadBlob(r),
+            HeaderBytes = ReadCompressedBlob(r),
+            TrailingBytes = ReadCompressedBlob(r),
         };
         d.Width = r.ReadInt32();
         d.Height = r.ReadInt32();
@@ -162,7 +164,7 @@ public static class JpegXlLossless
                     s.CompAcTable[i] = r.ReadInt32();
                 }
 
-                s.Prefix = ReadBlob(r);
+                s.Prefix = ReadCompressedBlob(r);
                 d.Scans.Add(s);
             }
         }
@@ -181,5 +183,45 @@ public static class JpegXlLossless
     {
         int len = r.ReadInt32();
         return r.ReadBytes(len);
+    }
+
+    // Brotli-compressed blob: [origLen][payloadLen][payload]. Falls back to storing raw (origLen == -1 sentinel
+    // in the payload-length slot is avoided by comparing sizes) when compression doesn't help.
+    private static void WriteCompressedBlob(BinaryWriter w, byte[] data)
+    {
+        var buf = new byte[System.IO.Compression.BrotliEncoder.GetMaxCompressedLength(data.Length)];
+        bool ok = System.IO.Compression.BrotliEncoder.TryCompress(data, buf, out int written, quality: 11, window: 22);
+        if (ok && written < data.Length)
+        {
+            w.Write(data.Length);   // original length (>= 0)
+            w.Write(written);       // compressed length
+            w.Write(buf, 0, written);
+        }
+        else
+        {
+            w.Write(-1);            // sentinel: stored raw
+            w.Write(data.Length);
+            w.Write(data);
+        }
+    }
+
+    private static byte[] ReadCompressedBlob(BinaryReader r)
+    {
+        int origLen = r.ReadInt32();
+        int payloadLen = r.ReadInt32();
+        byte[] payload = r.ReadBytes(payloadLen);
+        if (origLen < 0)
+        {
+            return payload; // stored raw
+        }
+
+        var outBuf = new byte[origLen];
+        System.IO.Compression.BrotliDecoder.TryDecompress(payload, outBuf, out int decoded);
+        if (decoded != origLen)
+        {
+            throw new InvalidDataException("Corrupt compressed blob in SharpImage lossless-JPEG container.");
+        }
+
+        return outBuf;
     }
 }
