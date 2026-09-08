@@ -77,8 +77,10 @@ public static class JpegXlLossless
 
         // The coefficients are coded with the DCT-aware AC context model (non-zero-count prediction from
         // neighbouring blocks + per-frequency-band contexts) and ANS — the same machinery the lossy VarDCT
-        // encoder uses — which beats JPEG's per-block Huffman by exploiting inter-block correlation.
-        WriteBlob(w, Jxl.JxlEncoder.EncodeJpegCoefficients(d));
+        // encoder uses — which beats JPEG's per-block Huffman by exploiting inter-block correlation. It is the
+        // last element, so it is written without a length prefix (Decode reads to end of stream).
+        byte[] coeff = Jxl.JxlEncoder.EncodeJpegCoefficients(d);
+        w.Write(coeff);
         byte[] container = ms.ToArray();
 
         // Self-certify: only emit a container that reconstructs the source JPEG byte-for-byte. A source this
@@ -142,7 +144,8 @@ public static class JpegXlLossless
             }
         }
 
-        Jxl.JxlEncoder.DecodeJpegCoefficients(ReadBlob(r), d);
+        byte[] coeff = r.ReadBytes((int)(r.BaseStream.Length - r.BaseStream.Position)); // rest of the stream
+        Jxl.JxlEncoder.DecodeJpegCoefficients(coeff, d);
         return JpegCoder.RebuildJpeg(d);
     }
 
