@@ -55,10 +55,12 @@ public static class JpegXlLossless
             w.Write((byte)c.AcTableIndex);
             w.Write(c.BlocksPerRow);
             w.Write(c.BlocksPerCol);
-            byte[] frame = Jxl.JxlEncoder.EncodeLossless(PackComponent(c));
-            WriteBlob(w, frame);
         }
 
+        // All components' coefficients share ONE JXL codestream (avoids per-component metadata/tree/histogram
+        // overhead, which dominates small chroma planes): each is frequency-transposed and stacked vertically,
+        // padded to the widest component's block width.
+        WriteBlob(w, Jxl.JxlEncoder.EncodeLossless(PackAll(d)));
         return ms.ToArray();
     }
 
@@ -87,7 +89,7 @@ public static class JpegXlLossless
 
         for (int i = 0; i < d.ComponentCount; i++)
         {
-            var c = new JpegDctComponent
+            d.Components[i] = new JpegDctComponent
             {
                 Id = r.ReadByte(),
                 HSample = r.ReadByte(),
@@ -98,65 +100,84 @@ public static class JpegXlLossless
                 BlocksPerRow = r.ReadInt32(),
                 BlocksPerCol = r.ReadInt32(),
             };
-            byte[] frame = ReadBlob(r);
-            UnpackComponent(c, JxlCoder.Decode(frame));
-            d.Components[i] = c;
         }
 
+        UnpackAll(d, JxlCoder.Decode(ReadBlob(r)));
         return JpegCoder.RebuildJpeg(d);
     }
 
-    // One component's coefficients -> a 16-bit grayscale image, frequency-transposed: DCT position k occupies
-    // rows [k*bpc, (k+1)*bpc), so position 0 (DC) is a smooth low-resolution image and the higher, sparse
-    // positions cluster together — both of which the Modular predictors compress well.
-    private static ImageFrame PackComponent(JpegDctComponent c)
+    // Packs all components' coefficients into ONE 16-bit grayscale image. Each component is frequency-
+    // transposed (DCT position k occupies rows [k*bpc, (k+1)*bpc), so position 0 (DC) is a smooth low-res
+    // image and the sparse high positions cluster together) and the components are stacked vertically, padded
+    // to the widest component's block width (the pad is the zero-coefficient value, ~free to compress).
+    private static ImageFrame PackAll(JpegDctData d)
     {
-        int bpr = c.BlocksPerRow, bpc = c.BlocksPerCol;
-        var img = new ImageFrame();
-        img.Initialize(bpr, bpc * 64, ColorspaceType.Gray, false);
-        int nch = img.NumberOfChannels;
-        for (int k = 0; k < 64; k++)
+        int maxBpr = 0, totalRows = 0;
+        foreach (JpegDctComponent c in d.Components)
         {
-            for (int by = 0; by < bpc; by++)
+            maxBpr = Math.Max(maxBpr, c.BlocksPerRow);
+            totalRows += c.BlocksPerCol * 64;
+        }
+
+        var img = new ImageFrame();
+        img.Initialize(maxBpr, totalRows, ColorspaceType.Gray, false);
+        int nch = img.NumberOfChannels;
+        int rowBase = 0;
+        foreach (JpegDctComponent c in d.Components)
+        {
+            int bpr = c.BlocksPerRow, bpc = c.BlocksPerCol;
+            for (int k = 0; k < 64; k++)
             {
-                var row = img.GetPixelRowForWrite((k * bpc) + by);
-                int baseIdx = by * bpr;
-                for (int bx = 0; bx < bpr; bx++)
+                for (int by = 0; by < bpc; by++)
                 {
-                    var v = (ushort)(c.Blocks[baseIdx + bx][k] + CoeffOffset);
-                    int o = bx * nch;
-                    for (int ch = 0; ch < nch; ch++)
+                    var row = img.GetPixelRowForWrite(rowBase + (k * bpc) + by);
+                    int baseIdx = by * bpr;
+                    for (int bx = 0; bx < maxBpr; bx++)
                     {
-                        row[o + ch] = v; // fill all channels so the frame stays truly grayscale
+                        int coeff = bx < bpr ? c.Blocks[baseIdx + bx][k] : 0; // pad wider region with 0
+                        var v = (ushort)(coeff + CoeffOffset);
+                        int o = bx * nch;
+                        for (int ch = 0; ch < nch; ch++)
+                        {
+                            row[o + ch] = v; // fill all channels so the frame stays truly grayscale
+                        }
                     }
                 }
             }
+
+            rowBase += bpc * 64;
         }
 
         return img;
     }
 
-    private static void UnpackComponent(JpegDctComponent c, ImageFrame img)
+    private static void UnpackAll(JpegDctData d, ImageFrame img)
     {
-        int bpr = c.BlocksPerRow, bpc = c.BlocksPerCol;
         int nch = img.NumberOfChannels;
-        c.Blocks = new int[bpr * bpc][];
-        for (int i = 0; i < c.Blocks.Length; i++)
+        int rowBase = 0;
+        foreach (JpegDctComponent c in d.Components)
         {
-            c.Blocks[i] = new int[64];
-        }
-
-        for (int k = 0; k < 64; k++)
-        {
-            for (int by = 0; by < bpc; by++)
+            int bpr = c.BlocksPerRow, bpc = c.BlocksPerCol;
+            c.Blocks = new int[bpr * bpc][];
+            for (int i = 0; i < c.Blocks.Length; i++)
             {
-                var row = img.GetPixelRow((k * bpc) + by);
-                int baseIdx = by * bpr;
-                for (int bx = 0; bx < bpr; bx++)
+                c.Blocks[i] = new int[64];
+            }
+
+            for (int k = 0; k < 64; k++)
+            {
+                for (int by = 0; by < bpc; by++)
                 {
-                    c.Blocks[baseIdx + bx][k] = row[bx * nch] - CoeffOffset;
+                    var row = img.GetPixelRow(rowBase + (k * bpc) + by);
+                    int baseIdx = by * bpr;
+                    for (int bx = 0; bx < bpr; bx++)
+                    {
+                        c.Blocks[baseIdx + bx][k] = row[bx * nch] - CoeffOffset;
+                    }
                 }
             }
+
+            rowBase += bpc * 64;
         }
     }
 
