@@ -244,7 +244,7 @@ internal static partial class JxlEncoder
 
         if (minLen > 0)
         {
-            EncodeEntropyLz77(w, vals, ctxs, minLen);
+            EncodeEntropyLz77(w, vals, ctxs, minLen, lazy: true);
         }
         else
         {
@@ -310,12 +310,126 @@ internal static partial class JxlEncoder
         ans.Encode(w, ansToks);
     }
 
+    // Lazy LZ77 over the value stream: a hash-chain longest-match search with one-step lookahead — if the
+    // next position has a strictly longer match, emit a literal now and take the longer match there. This
+    // avoids the greedy matcher pre-empting a long match with a shorter one, which matters on graphics.
+    private static List<Op> FindMatchesLazy(int[] v, int minLen)
+    {
+        var ops = new List<Op>();
+        int n = v.Length;
+        if (minLen > n)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                ops.Add(new Op(false, v[i], 0));
+            }
+
+            return ops;
+        }
+
+        const int windowMask = (1 << 20) - 1;
+        var head = new Dictionary<int, int>();
+        var prev = new int[Math.Max(1, n)];
+
+        int Hash(int i)
+        {
+            unchecked
+            {
+                uint hh = (uint)v[i];
+                hh = (hh * 2654435761u) + (uint)v[i + 1];
+                hh = (hh * 2654435761u) + (uint)v[i + 2];
+                hh = (hh * 2654435761u) + (uint)v[i + 3];
+                return (int)(hh & 0x7FFFFFFF);
+            }
+        }
+
+        void Insert(int i)
+        {
+            if (i + 4 > n)
+            {
+                return;
+            }
+
+            int hh = Hash(i);
+            prev[i] = head.TryGetValue(hh, out int p) ? p : -1;
+            head[hh] = i;
+        }
+
+        (int Len, int Dist) BestMatch(int idx)
+        {
+            int bestLen = 0, bestDist = 0;
+            if (idx + 4 <= n && head.TryGetValue(Hash(idx), out int p))
+            {
+                int tries = 96;
+                while (p >= 0 && tries-- > 0)
+                {
+                    int dist = idx - p;
+                    if (dist > windowMask + 1)
+                    {
+                        break;
+                    }
+
+                    int maxl = n - idx, l = 0;
+                    while (l < maxl && v[p + l] == v[idx + l])
+                    {
+                        l++;
+                    }
+
+                    if (l > bestLen)
+                    {
+                        bestLen = l;
+                        bestDist = dist;
+                    }
+
+                    p = prev[p];
+                }
+            }
+
+            return (bestLen, bestDist);
+        }
+
+        int i2 = 0;
+        while (i2 < n)
+        {
+            (int len, int dist) = BestMatch(i2);
+            if (len >= minLen)
+            {
+                // Lookahead: if inserting i2 and matching at i2+1 yields a strictly longer match, defer.
+                Insert(i2);
+                (int nlen, int ndist) = i2 + 1 < n ? BestMatch(i2 + 1) : (0, 0);
+                if (nlen > len)
+                {
+                    ops.Add(new Op(false, v[i2], 0)); // literal at i2, take the longer match at i2+1
+                    i2++;
+                    (len, dist) = (nlen, ndist);
+                }
+
+                ops.Add(new Op(true, len, dist));
+                int end = i2 + len;
+                for (int j = i2 + 1; j < end; j++)
+                {
+                    Insert(j);
+                }
+
+                i2 = end;
+            }
+            else
+            {
+                ops.Add(new Op(false, v[i2], 0));
+                Insert(i2);
+                i2++;
+            }
+        }
+
+        return ops;
+    }
+
     // ANS with LZ77 back-references over the value stream. Length markers live in the literal alphabet above
     // `threshold` (coded in the position's own context); distances use a dedicated extra cluster. The DECODER
     // (JxlAnsReader) handles the copies transparently, so DecodeJpegCoefficients needs no changes.
-    private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen)
+    private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen, bool lazy)
     {
-        List<Op> ops = FindMatches(vals, minLen);
+        List<Op> ops = lazy ? FindMatchesLazy(vals, minLen) : FindMatches(vals, minLen);
 
         int maxLitTok = 0;
         foreach (Op op in ops)

@@ -467,6 +467,74 @@ public static partial class JpegCoder
         return dct;
     }
 
+    /// <summary>
+    /// Reconstructs the derivable metadata — dimensions, sampling factors, per-component sampling / quant-table
+    /// / Huffman-table indices, block grid and restart interval — from a captured JPEG header (SOI..SOS). A
+    /// recompression container need not store any of this alongside the verbatim header; it is re-parsed here.
+    /// </summary>
+    internal static void PopulateDctMetadata(JpegDctData d)
+    {
+        var stream = new MemoryStream(d.HeaderBytes);
+        if (stream.ReadByte() != 0xFF || stream.ReadByte() != SOI)
+        {
+            throw new InvalidDataException("SharpImage lossless-JPEG header missing SOI marker.");
+        }
+
+        int width = 0, height = 0, componentCount = 0, restartInterval = 0, maxH = 1, maxV = 1;
+        var comps = new JpegComponent[MaxComponents];
+        bool sawSos = false;
+        while (!sawSos)
+        {
+            int marker = ReadMarker(stream);
+            if (marker < 0)
+            {
+                break;
+            }
+
+            switch (marker)
+            {
+                case SOF0:
+                case SOF2:
+                    ReadSof(stream, ref width, ref height, ref componentCount, comps, ref maxH, ref maxV);
+                    break;
+                case DRI:
+                    ReadDri(stream, ref restartInterval);
+                    break;
+                case SOS:
+                    ReadSosHeader(stream, comps, componentCount); // sets each scan component's Dc/AcTableIndex
+                    sawSos = true;
+                    break;
+                default:
+                    SkipMarkerSegment(stream);
+                    break;
+            }
+        }
+
+        int mcuCols = (width + (maxH * BlockSize) - 1) / (maxH * BlockSize);
+        int mcuRows = (height + (maxV * BlockSize) - 1) / (maxV * BlockSize);
+        d.Width = width;
+        d.Height = height;
+        d.MaxHSample = maxH;
+        d.MaxVSample = maxV;
+        d.RestartInterval = restartInterval;
+        d.ComponentCount = componentCount;
+        d.Components = new JpegDctComponent[componentCount];
+        for (int i = 0; i < componentCount; i++)
+        {
+            d.Components[i] = new JpegDctComponent
+            {
+                Id = comps[i].Id,
+                HSample = comps[i].HSample,
+                VSample = comps[i].VSample,
+                QuantTableIndex = comps[i].QuantTableIndex,
+                DcTableIndex = comps[i].DcTableIndex,
+                AcTableIndex = comps[i].AcTableIndex,
+                BlocksPerRow = mcuCols * comps[i].HSample,
+                BlocksPerCol = mcuRows * comps[i].VSample,
+            };
+        }
+    }
+
     // Finds the byte offset of the marker that terminates the entropy-coded scan (EOI for baseline), skipping
     // byte-stuffed 0xFF00 and RSTn restart markers embedded in the data.
     private static int FindScanEnd(byte[] data, int start)

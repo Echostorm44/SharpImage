@@ -37,26 +37,10 @@ public static class JpegXlLossless
 
         // Header/trailer are the verbatim JPEG marker segments (Huffman + quant tables, APPn) — highly
         // structured and compressible; Brotli them so tiny JPEGs aren't dominated by a raw ~300-500B header.
+        // All the geometry/sampling/table-index/block-grid metadata is DERIVABLE from the header, so it is not
+        // stored here — Decode re-parses it via JpegCoder.PopulateDctMetadata (saves ~66 B per file).
         WriteCompressedBlob(w, d.HeaderBytes);
         WriteCompressedBlob(w, d.TrailingBytes);
-        w.Write(d.Width);
-        w.Write(d.Height);
-        w.Write(d.MaxHSample);
-        w.Write(d.MaxVSample);
-        w.Write(d.RestartInterval);
-        w.Write(d.ComponentCount);
-
-        foreach (JpegDctComponent c in d.Components)
-        {
-            w.Write((byte)c.Id);
-            w.Write((byte)c.HSample);
-            w.Write((byte)c.VSample);
-            w.Write((byte)c.QuantTableIndex);
-            w.Write((byte)c.DcTableIndex);
-            w.Write((byte)c.AcTableIndex);
-            w.Write(c.BlocksPerRow);
-            w.Write(c.BlocksPerCol);
-        }
 
         // Progressive scan script: each scan's band + approximation + restart interval, its participating
         // components (with their Huffman selectors), and the verbatim inter-scan bytes preceding its entropy.
@@ -115,28 +99,9 @@ public static class JpegXlLossless
             HeaderBytes = ReadCompressedBlob(r),
             TrailingBytes = ReadCompressedBlob(r),
         };
-        d.Width = r.ReadInt32();
-        d.Height = r.ReadInt32();
-        d.MaxHSample = r.ReadInt32();
-        d.MaxVSample = r.ReadInt32();
-        d.RestartInterval = r.ReadInt32();
-        d.ComponentCount = r.ReadInt32();
-        d.Components = new JpegDctComponent[d.ComponentCount];
 
-        for (int i = 0; i < d.ComponentCount; i++)
-        {
-            d.Components[i] = new JpegDctComponent
-            {
-                Id = r.ReadByte(),
-                HSample = r.ReadByte(),
-                VSample = r.ReadByte(),
-                QuantTableIndex = r.ReadByte(),
-                DcTableIndex = r.ReadByte(),
-                AcTableIndex = r.ReadByte(),
-                BlocksPerRow = r.ReadInt32(),
-                BlocksPerCol = r.ReadInt32(),
-            };
-        }
+        // Re-derive geometry / sampling / per-component sampling+table indices / block grid from the header.
+        JpegCoder.PopulateDctMetadata(d);
 
         d.Progressive = r.ReadBoolean();
         if (d.Progressive)
