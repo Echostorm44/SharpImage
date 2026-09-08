@@ -21,7 +21,6 @@ namespace SharpImage.Formats;
 public static class JpegXlLossless
 {
     private const uint Magic = 0x534A584C; // "SJXL"
-    private const int CoeffOffset = 32768;  // map signed coefficients into the 16-bit unsigned range
 
     /// <summary>Detects the SharpImage lossless-JPEG container.</summary>
     public static bool CanDecode(ReadOnlySpan<byte> data) =>
@@ -57,10 +56,10 @@ public static class JpegXlLossless
             w.Write(c.BlocksPerCol);
         }
 
-        // All components' coefficients share ONE JXL codestream (avoids per-component metadata/tree/histogram
-        // overhead, which dominates small chroma planes): each is frequency-transposed and stacked vertically,
-        // padded to the widest component's block width.
-        WriteBlob(w, Jxl.JxlEncoder.EncodeLossless(PackAll(d)));
+        // The coefficients are coded with the DCT-aware AC context model (non-zero-count prediction from
+        // neighbouring blocks + per-frequency-band contexts) and ANS — the same machinery the lossy VarDCT
+        // encoder uses — which beats JPEG's per-block Huffman by exploiting inter-block correlation.
+        WriteBlob(w, Jxl.JxlEncoder.EncodeJpegCoefficients(d));
         return ms.ToArray();
     }
 
@@ -102,83 +101,8 @@ public static class JpegXlLossless
             };
         }
 
-        UnpackAll(d, JxlCoder.Decode(ReadBlob(r)));
+        Jxl.JxlEncoder.DecodeJpegCoefficients(ReadBlob(r), d);
         return JpegCoder.RebuildJpeg(d);
-    }
-
-    // Packs all components' coefficients into ONE 16-bit grayscale image. Each component is frequency-
-    // transposed (DCT position k occupies rows [k*bpc, (k+1)*bpc), so position 0 (DC) is a smooth low-res
-    // image and the sparse high positions cluster together) and the components are stacked vertically, padded
-    // to the widest component's block width (the pad is the zero-coefficient value, ~free to compress).
-    private static ImageFrame PackAll(JpegDctData d)
-    {
-        int maxBpr = 0, totalRows = 0;
-        foreach (JpegDctComponent c in d.Components)
-        {
-            maxBpr = Math.Max(maxBpr, c.BlocksPerRow);
-            totalRows += c.BlocksPerCol * 64;
-        }
-
-        var img = new ImageFrame();
-        img.Initialize(maxBpr, totalRows, ColorspaceType.Gray, false);
-        int nch = img.NumberOfChannels;
-        int rowBase = 0;
-        foreach (JpegDctComponent c in d.Components)
-        {
-            int bpr = c.BlocksPerRow, bpc = c.BlocksPerCol;
-            for (int k = 0; k < 64; k++)
-            {
-                for (int by = 0; by < bpc; by++)
-                {
-                    var row = img.GetPixelRowForWrite(rowBase + (k * bpc) + by);
-                    int baseIdx = by * bpr;
-                    for (int bx = 0; bx < maxBpr; bx++)
-                    {
-                        int coeff = bx < bpr ? c.Blocks[baseIdx + bx][k] : 0; // pad wider region with 0
-                        var v = (ushort)(coeff + CoeffOffset);
-                        int o = bx * nch;
-                        for (int ch = 0; ch < nch; ch++)
-                        {
-                            row[o + ch] = v; // fill all channels so the frame stays truly grayscale
-                        }
-                    }
-                }
-            }
-
-            rowBase += bpc * 64;
-        }
-
-        return img;
-    }
-
-    private static void UnpackAll(JpegDctData d, ImageFrame img)
-    {
-        int nch = img.NumberOfChannels;
-        int rowBase = 0;
-        foreach (JpegDctComponent c in d.Components)
-        {
-            int bpr = c.BlocksPerRow, bpc = c.BlocksPerCol;
-            c.Blocks = new int[bpr * bpc][];
-            for (int i = 0; i < c.Blocks.Length; i++)
-            {
-                c.Blocks[i] = new int[64];
-            }
-
-            for (int k = 0; k < 64; k++)
-            {
-                for (int by = 0; by < bpc; by++)
-                {
-                    var row = img.GetPixelRow(rowBase + (k * bpc) + by);
-                    int baseIdx = by * bpr;
-                    for (int bx = 0; bx < bpr; bx++)
-                    {
-                        c.Blocks[baseIdx + bx][k] = row[bx * nch] - CoeffOffset;
-                    }
-                }
-            }
-
-            rowBase += bpc * 64;
-        }
     }
 
     private static void WriteBlob(BinaryWriter w, byte[] data)
