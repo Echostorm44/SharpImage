@@ -11,6 +11,11 @@ namespace SharpImage.Formats.Jxl;
 internal static partial class JxlEncoder
 {
     private const int JpegBlockClusters = 3;                       // one AC block-context per component
+    private const int JpegMaxClusters = 256;                       // JPEG coeffs have far more distinct
+                                                                   // per-band distributions than the lossy
+                                                                   // path — allow more ANS histograms than
+                                                                   // MaxHfClusters (context-map cost is tiny
+                                                                   // vs the clustering loss it removes).
     private const int JpegAcContexts = 495 * JpegBlockClusters;    // 1485, matches the VarDCT context layout
     private const int JpegDcBuckets = 8;                           // DC residual conditioned on neighbour activity
     private const int JpegDcContextBase = JpegAcContexts;          // DC contexts follow the AC ones
@@ -213,7 +218,7 @@ internal static partial class JxlEncoder
             ctxHist[ctxs[i]][toks[i].Sym]++;
         }
 
-        (int[] map, int[][] norm, int k) = ClusterContextsTotalCost(ctxHist, alphabet, MaxHfClusters, logAlpha);
+        (int[] map, int[][] norm, int k) = ClusterContextsTotalCost(ctxHist, alphabet, JpegMaxClusters, logAlpha);
 
         var w = new JxlBitWriter();
         w.WriteBits((uint)toks.Count, 32);
