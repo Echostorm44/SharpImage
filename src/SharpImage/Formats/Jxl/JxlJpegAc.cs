@@ -95,7 +95,7 @@ internal static partial class JxlEncoder
     // Builds the raw-value + per-position-context stream for one baseline JPEG's coefficients (all
     // components). Values are the pre-hybrid unsigned integers (PackSigned for signed coeffs/DC residuals,
     // the count for non-zeros); the caller hybrid-packs them (and optionally LZ77s the value stream).
-    private static void BuildJpegTokens(Formats.JpegDctData d, int[][] orders, List<int> vals, List<int> ctxs)
+    private static void BuildJpegTokens(Formats.JpegDctData d, int[][] orders, bool useWp, List<int> vals, List<int> ctxs)
     {
         int nbc = JpegNbc(d.ComponentCount);
         for (int ci = 0; ci < d.ComponentCount; ci++)
@@ -104,18 +104,26 @@ internal static partial class JxlEncoder
             int[] order = orders[ci];
             int bpr = comp.BlocksPerRow, bpc = comp.BlocksPerCol;
             var nonZerosGrid = new uint[bpr];
+            var wp = new WpState(WpHeader.Default(), bpr);
             for (int by = 0; by < bpc; by++)
             {
                 for (int bx = 0; bx < bpr; bx++)
                 {
                     int[] block = comp.Blocks[(by * bpr) + bx];
 
-                    // DC: clamped-gradient prediction over the block grid (the DC plane is smooth).
+                    // DC prediction: clamped-gradient (exact for smooth/linear planes, LZ77-friendly residuals)
+                    // or the libjxl self-correcting weighted predictor (better on edges/texture) — chosen
+                    // best-of per file via the transmitted useWp flag. Context stays the causal-activity bucket.
                     int left = bx > 0 ? comp.Blocks[(by * bpr) + bx - 1][0] : (by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : 0);
                     int above = by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : left;
                     int aboveLeft = bx > 0 && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx - 1][0] : above;
+                    int aboveRight = bx + 1 < bpr && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx + 1][0] : above;
+                    int aboveAbove = by > 1 ? comp.Blocks[((by - 2) * bpr) + bx][0] : above;
+                    long wpPred = wp.Predict(bx, by, above, left, aboveRight, aboveLeft, aboveAbove, null);
+                    long pred = useWp ? wpPred : ClampGradient(left, above, aboveLeft);
                     ctxs.Add(JpegDcContext(nbc, ci, left, above, aboveLeft));
-                    vals.Add(PackSigned(block[0] - ClampGradient(left, above, aboveLeft)));
+                    vals.Add(PackSigned((int)(block[0] - pred)));
+                    wp.Update(block[0], bx, by);
 
                     int blockCtx = ci; // per-component AC block context
 
@@ -182,29 +190,32 @@ internal static partial class JxlEncoder
     /// <summary>Entropy-codes a JPEG's quantized DCT coefficients with the DCT-aware context model + ANS.</summary>
     internal static byte[] EncodeJpegCoefficients(Formats.JpegDctData d)
     {
-        // Two independent choices, kept best-of: the scan order (custom tightens the model but costs a
-        // transmitted table) and LZ77 (catches repeated token runs in graphics but adds a small header).
+        // Independent choices, kept best-of: DC predictor (gradient vs weighted), scan order (custom tightens
+        // the model but costs a table), and LZ77 (catches repeated token runs but adds a small header).
         byte[]? best = null;
-        foreach (bool useCustomOrder in new[] { true, false })
+        foreach (bool useWp in new[] { false, true })
         {
-            int[][] orders = useCustomOrder ? ComputeOrders(d) : NaturalOrders(d.ComponentCount);
-            var vals = new List<int>();
-            var ctxs = new List<int>();
-            BuildJpegTokens(d, orders, vals, ctxs);
-            int[] valArr = vals.ToArray();
-            int[] ctxArr = ctxs.ToArray();
-            byte[] plain = EncodeStream(d, orders, useCustomOrder, valArr, ctxArr, 0); // 0 = no LZ77
-            if (best == null || plain.Length < best.Length)
+            foreach (bool useCustomOrder in new[] { true, false })
             {
-                best = plain;
-            }
-
-            foreach (int minLen in JpegLz77MinLens)
-            {
-                byte[] blob = EncodeStream(d, orders, useCustomOrder, valArr, ctxArr, minLen);
-                if (blob.Length < best.Length)
+                int[][] orders = useCustomOrder ? ComputeOrders(d) : NaturalOrders(d.ComponentCount);
+                var vals = new List<int>();
+                var ctxs = new List<int>();
+                BuildJpegTokens(d, orders, useWp, vals, ctxs);
+                int[] valArr = vals.ToArray();
+                int[] ctxArr = ctxs.ToArray();
+                byte[] plain = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, 0); // 0 = no LZ77
+                if (best == null || plain.Length < best.Length)
                 {
-                    best = blob;
+                    best = plain;
+                }
+
+                foreach (int minLen in JpegLz77MinLens)
+                {
+                    byte[] blob = EncodeStream(d, orders, useCustomOrder, useWp, valArr, ctxArr, minLen);
+                    if (blob.Length < best.Length)
+                    {
+                        best = blob;
+                    }
                 }
             }
         }
@@ -232,10 +243,11 @@ internal static partial class JxlEncoder
 
     // Writes the container prefix (token count + optional scan-order table), then the entropy-coded value
     // stream — either plain per-context ANS or ANS with LZ77 back-references over the value stream.
-    private static byte[] EncodeStream(Formats.JpegDctData d, int[][] orders, bool useCustomOrder, int[] vals, int[] ctxs, int minLen)
+    private static byte[] EncodeStream(Formats.JpegDctData d, int[][] orders, bool useCustomOrder, bool useWp, int[] vals, int[] ctxs, int minLen)
     {
         var w = new JxlBitWriter();
         w.WriteBits((uint)vals.Length, 32);
+        w.WriteBool(useWp);
         w.WriteBool(useCustomOrder);
         if (useCustomOrder)
         {
@@ -744,6 +756,7 @@ internal static partial class JxlEncoder
         var br = new JxlBitReader(data);
         int tokenCount = (int)br.ReadBits(32);
         _ = tokenCount; // blocks are walked by structure; the count is a stored sanity value only
+        bool useWp = br.ReadBool();
         bool useCustomOrder = br.ReadBool();
         var orders = new int[d.ComponentCount][];
         for (int ci = 0; ci < d.ComponentCount; ci++)
@@ -775,6 +788,7 @@ internal static partial class JxlEncoder
             }
 
             var nonZerosGrid = new uint[bpr];
+            var wp = new WpState(WpHeader.Default(), bpr);
             for (int by = 0; by < bpc; by++)
             {
                 for (int bx = 0; bx < bpr; bx++)
@@ -784,8 +798,13 @@ internal static partial class JxlEncoder
                     int left = bx > 0 ? comp.Blocks[(by * bpr) + bx - 1][0] : (by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : 0);
                     int above = by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : left;
                     int aboveLeft = bx > 0 && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx - 1][0] : above;
+                    int aboveRight = bx + 1 < bpr && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx + 1][0] : above;
+                    int aboveAbove = by > 1 ? comp.Blocks[((by - 2) * bpr) + bx][0] : above;
+                    long wpPred = wp.Predict(bx, by, above, left, aboveRight, aboveLeft, aboveAbove, null);
+                    long pred = useWp ? wpPred : ClampGradient(left, above, aboveLeft);
                     int dcRes = JxlBits.UnpackSigned(rd.ReadHybridUintCtx(JpegDcContext(nbc, ci, left, above, aboveLeft)));
-                    block[0] = dcRes + ClampGradient(left, above, aboveLeft);
+                    block[0] = (int)(dcRes + pred);
+                    wp.Update(block[0], bx, by);
                     int blockCtx = ci;
 
                     uint predicted = by == 0
