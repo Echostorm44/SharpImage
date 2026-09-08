@@ -12,14 +12,29 @@ internal static partial class JxlEncoder
 {
     private const int JpegBlockClusters = 3;                       // one AC block-context per component
     private const int JpegAcContexts = 495 * JpegBlockClusters;    // 1485, matches the VarDCT context layout
+    private const int JpegDcBuckets = 8;                           // DC residual conditioned on neighbour activity
     private const int JpegDcContextBase = JpegAcContexts;          // DC contexts follow the AC ones
-    private const int JpegTotalContexts = JpegDcContextBase + JpegBlockClusters;
+    private const int JpegTotalContexts = JpegDcContextBase + (JpegBlockClusters * JpegDcBuckets);
 
     private static int ClampGradient(int left, int above, int aboveLeft)
     {
         int g = left + above - aboveLeft;
         int lo = Math.Min(left, above), hi = Math.Max(left, above);
         return Math.Clamp(g, lo, hi);
+    }
+
+    // Causal DC context: the local gradient activity predicts the residual magnitude (flat regions code
+    // tighter than busy ones). left/above/aboveLeft are all previously decoded, so encoder and decoder agree.
+    private static int JpegDcContext(int ci, int left, int above, int aboveLeft)
+    {
+        int activity = Math.Abs(left - aboveLeft) + Math.Abs(above - aboveLeft);
+        int bucket = BitLen(activity);
+        if (bucket >= JpegDcBuckets)
+        {
+            bucket = JpegDcBuckets - 1;
+        }
+
+        return JpegDcContextBase + (ci * JpegDcBuckets) + bucket;
     }
 
     // Per-component AC scan order: position 0 is DC; positions 1..63 are the natural-order coefficient
@@ -86,7 +101,7 @@ internal static partial class JxlEncoder
                     int left = bx > 0 ? comp.Blocks[(by * bpr) + bx - 1][0] : (by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : 0);
                     int above = by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : left;
                     int aboveLeft = bx > 0 && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx - 1][0] : above;
-                    ctxs.Add(JpegDcContextBase + ci);
+                    ctxs.Add(JpegDcContext(ci, left, above, aboveLeft));
                     toks.Add(HybridToken(PackSigned(block[0] - ClampGradient(left, above, aboveLeft))));
 
                     // AC: non-zero count (predicted from neighbours), then coefficients in zigzag order.
@@ -290,7 +305,7 @@ internal static partial class JxlEncoder
                     int left = bx > 0 ? comp.Blocks[(by * bpr) + bx - 1][0] : (by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : 0);
                     int above = by > 0 ? comp.Blocks[((by - 1) * bpr) + bx][0] : left;
                     int aboveLeft = bx > 0 && by > 0 ? comp.Blocks[((by - 1) * bpr) + bx - 1][0] : above;
-                    int dcRes = JxlBits.UnpackSigned(rd.ReadHybridUintCtx(JpegDcContextBase + ci));
+                    int dcRes = JxlBits.UnpackSigned(rd.ReadHybridUintCtx(JpegDcContext(ci, left, above, aboveLeft)));
                     block[0] = dcRes + ClampGradient(left, above, aboveLeft);
 
                     uint predicted = by == 0
