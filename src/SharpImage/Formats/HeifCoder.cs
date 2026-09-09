@@ -441,8 +441,16 @@ public static class HeifCoder
         int channels = frame.NumberOfChannels;
         bool tenBit = yuv.Format is Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12;
         int shift = tenBit ? (yuv.Format == Av1.PixelFormat.Yuv420P12 ? 4 : 2) : 0;
-        ConvertYuvToRgb(yuv.YPlane.Span, yuv.UPlane.Span, yuv.VPlane.Span, yuv.YStride, yuv.UStride, yuv.VStride,
-            frame, w, h, channels, tenBit, shift, matrixCoeffs == 1, fullRange);
+        if (decoder.Monochrome)
+        {
+            // I400: no chroma. Replicate luma into every output channel (R=G=B=Y).
+            ConvertGrayToRgb(yuv.YPlane.Span, yuv.YStride, frame, w, h, channels, tenBit, shift);
+        }
+        else
+        {
+            ConvertYuvToRgb(yuv.YPlane.Span, yuv.UPlane.Span, yuv.VPlane.Span, yuv.YStride, yuv.UStride, yuv.VStride,
+                frame, w, h, channels, tenBit, shift, matrixCoeffs == 1, fullRange);
+        }
     }
 
     // Converts a decoded 8/10/12-bit planar YUV 4:2:0 frame to RGB, honouring the colour
@@ -505,6 +513,42 @@ public static class HeifCoder
                 if (channels > 2)
                 {
                     row[off + 2] = Quantum.ScaleFromByte(b);
+                }
+            }
+        }
+    }
+
+    // Monochrome (I400): the luma plane IS the image. Replicate it into each output channel. Luma is treated as
+    // full-range gray (no BT.601/709 chroma matrix applies).
+    private static void ConvertGrayToRgb(ReadOnlySpan<byte> y0, int yStride, ImageFrame frame, int w, int h, int channels, bool tenBit, int shift)
+    {
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int yv;
+                if (!tenBit)
+                {
+                    yv = y0[y * yStride + x];
+                }
+                else
+                {
+                    int idx = (y * yStride + x) * 2;
+                    yv = (y0[idx] | (y0[idx + 1] << 8)) >> shift;
+                }
+
+                ushort q = Quantum.ScaleFromByte(ClampByte(yv));
+                int off = x * channels;
+                row[off] = q;
+                if (channels > 1)
+                {
+                    row[off + 1] = q;
+                }
+
+                if (channels > 2)
+                {
+                    row[off + 2] = q;
                 }
             }
         }

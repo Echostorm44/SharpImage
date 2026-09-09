@@ -69,6 +69,9 @@ internal sealed class Av1Decoder
     public PixelFormat OutputFormat => PixelFormat.Yuv420P;
     public bool IsReady => isReady;
 
+    /// <summary>True when the decoded sequence is monochrome (I400) — chroma planes are not meaningful.</summary>
+    public bool Monochrome => seqHdr.Monochrome;
+
     public bool Initialize(ReadOnlySpan<byte> codecPrivate)
     {
         // AV1 config is in-band (sequence header OBU) — no codec private needed

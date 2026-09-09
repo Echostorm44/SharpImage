@@ -67,30 +67,7 @@ internal static class Av1StillImageEncoder
     /// forward-transforms and quantizes the residual, and codes the coefficients. Lossy — reconstruction fidelity
     /// depends on <paramref name="baseQIdx"/>. Returns the AV1 temporal unit.</summary>
     internal static byte[] EncodeMonochromeImage64(ReadOnlySpan<byte> pixels, int baseQIdx)
-    {
-        const int n = 64;
-        int dcDq = Av1Tables.DequantTable[0, baseQIdx, 0];
-        int acDq = Av1Tables.DequantTable[0, baseQIdx, 1];
-
-        // DC prediction for the first block (no neighbours) is 1<<(bitdepth-1) = 128.
-        var residual = new int[n * n];
-        for (int i = 0; i < n * n; i++)
-        {
-            residual[i] = pixels[i] - 128;
-        }
-
-        int rcCount = Av1Tables.Scans[Tx64x64].Length;
-        int[] coeffs = Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, rcCount);
-
-        // If quantization zeroed everything, code skip (flat 128 plane).
-        bool anyNonZero = false;
-        foreach (int c in coeffs)
-        {
-            if (c != 0) { anyNonZero = true; break; }
-        }
-
-        return EncodeMonochromeWithCoeffs(n, n, baseQIdx, anyNonZero ? coeffs : null);
-    }
+        => EncodeMonochromeWithCoeffs(64, 64, baseQIdx, QuantizeImage64(pixels, baseQIdx));
 
     private static byte[] EncodeSingleSuperblockTile(int baseQIdx, int[]? coeffs)
     {
@@ -123,9 +100,10 @@ internal static class Av1StillImageEncoder
         return w.Finish();
     }
 
-    /// <summary>Encodes a monochrome key frame whose single 64x64 luma block carries the given quantized
-    /// coefficients (rc-indexed, TX_64X64 layout). For exercising the full AC coefficient path.</summary>
-    internal static byte[] EncodeMonochromeWithCoeffs(int width, int height, int baseQIdx, int[]? coeffs)
+    /// <summary>Builds the sequence-header OBU and the OBU_FRAME (frame header + tile) for a monochrome key frame
+    /// carrying the given coefficients (null ⇒ skip). The two OBUs are the building blocks for both a raw
+    /// temporal unit and an AVIF container (seq OBU → av1C configOBUs, frame OBU → mdat).</summary>
+    internal static (byte[] SeqObu, byte[] FrameObu) BuildObus(int width, int height, int baseQIdx, int[]? coeffs)
     {
         if (width < 1 || width > 64 || height < 1 || height > 64)
         {
@@ -141,6 +119,14 @@ internal static class Av1StillImageEncoder
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
         byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
+        return (seqObu, frameObu);
+    }
+
+    /// <summary>Encodes a monochrome key frame whose single 64x64 luma block carries the given quantized
+    /// coefficients (rc-indexed, TX_64X64 layout). Returns a raw AV1 temporal unit (TD + seq + OBU_FRAME).</summary>
+    internal static byte[] EncodeMonochromeWithCoeffs(int width, int height, int baseQIdx, int[]? coeffs)
+    {
+        (byte[] seqObu, byte[] frameObu) = BuildObus(width, height, baseQIdx, coeffs);
         byte[] tdObu = Av1ObuWriter.WrapObu(Av1ObuType.TemporalDelimiter, ReadOnlySpan<byte>.Empty);
 
         var outBytes = new byte[tdObu.Length + seqObu.Length + frameObu.Length];
@@ -149,5 +135,41 @@ internal static class Av1StillImageEncoder
         seqObu.CopyTo(outBytes, o); o += seqObu.Length;
         frameObu.CopyTo(outBytes, o);
         return outBytes;
+    }
+
+    /// <summary>Encodes a real 64x64 monochrome image as a complete .avif file (ISOBMFF container + AV1
+    /// codestream). Lossy — fidelity depends on <paramref name="baseQIdx"/>.</summary>
+    internal static byte[] EncodeAvifMonochrome64(ReadOnlySpan<byte> pixels, int baseQIdx)
+    {
+        const int n = 64;
+        int[]? coeffs = QuantizeImage64(pixels, baseQIdx);
+        (byte[] seqObu, byte[] frameObu) = BuildObus(n, n, baseQIdx, coeffs);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, n, n, monochrome: true);
+    }
+
+    /// <summary>Forward-transforms and quantizes a 64x64 monochrome image (DC prediction = 128) into the
+    /// coefficient array, or null when quantization zeroes everything (⇒ skip / flat plane).</summary>
+    private static int[]? QuantizeImage64(ReadOnlySpan<byte> pixels, int baseQIdx)
+    {
+        const int n = 64;
+        int dcDq = Av1Tables.DequantTable[0, baseQIdx, 0];
+        int acDq = Av1Tables.DequantTable[0, baseQIdx, 1];
+
+        var residual = new int[n * n];
+        for (int i = 0; i < n * n; i++)
+        {
+            residual[i] = pixels[i] - 128; // DC prediction for the first block (no neighbours)
+        }
+
+        int[] coeffs = Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, Av1Tables.Scans[Tx64x64].Length);
+        foreach (int c in coeffs)
+        {
+            if (c != 0)
+            {
+                return coeffs;
+            }
+        }
+
+        return null;
     }
 }
