@@ -63,6 +63,35 @@ internal static class Av1StillImageEncoder
     /// non-adaptive Encode* calls against the same default CDF context.</summary>
     private const int Tx64x64 = 4;
 
+    /// <summary>Encodes a real 64x64 monochrome image: DC-predicts the single block (128, no neighbours),
+    /// forward-transforms and quantizes the residual, and codes the coefficients. Lossy — reconstruction fidelity
+    /// depends on <paramref name="baseQIdx"/>. Returns the AV1 temporal unit.</summary>
+    internal static byte[] EncodeMonochromeImage64(ReadOnlySpan<byte> pixels, int baseQIdx)
+    {
+        const int n = 64;
+        int dcDq = Av1Tables.DequantTable[0, baseQIdx, 0];
+        int acDq = Av1Tables.DequantTable[0, baseQIdx, 1];
+
+        // DC prediction for the first block (no neighbours) is 1<<(bitdepth-1) = 128.
+        var residual = new int[n * n];
+        for (int i = 0; i < n * n; i++)
+        {
+            residual[i] = pixels[i] - 128;
+        }
+
+        int rcCount = Av1Tables.Scans[Tx64x64].Length;
+        int[] coeffs = Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, rcCount);
+
+        // If quantization zeroed everything, code skip (flat 128 plane).
+        bool anyNonZero = false;
+        foreach (int c in coeffs)
+        {
+            if (c != 0) { anyNonZero = true; break; }
+        }
+
+        return EncodeMonochromeWithCoeffs(n, n, baseQIdx, anyNonZero ? coeffs : null);
+    }
+
     private static byte[] EncodeSingleSuperblockTile(int baseQIdx, int[]? coeffs)
     {
         // qcat selects the coefficient CDF set; must match the decoder's derivation from the segment q index.
@@ -96,7 +125,7 @@ internal static class Av1StillImageEncoder
 
     /// <summary>Encodes a monochrome key frame whose single 64x64 luma block carries the given quantized
     /// coefficients (rc-indexed, TX_64X64 layout). For exercising the full AC coefficient path.</summary>
-    internal static byte[] EncodeMonochromeWithCoeffs(int width, int height, int baseQIdx, int[] coeffs)
+    internal static byte[] EncodeMonochromeWithCoeffs(int width, int height, int baseQIdx, int[]? coeffs)
     {
         if (width < 1 || width > 64 || height < 1 || height > 64)
         {
