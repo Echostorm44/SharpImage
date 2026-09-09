@@ -32,8 +32,16 @@ internal static class Av1StillImageEncoder
         byte[] seqPayload = Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, seqPayload);
 
+        // Build the TX_64X64 coefficient array (rc-indexed) for a single DC coefficient.
+        int[]? coeffs = null;
+        if (dcLevel > 0)
+        {
+            coeffs = new int[Av1Tables.Scans[Tx64x64].Length];
+            coeffs[0] = dcNegative ? -dcLevel : dcLevel;
+        }
+
         byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true);
-        byte[] tile = EncodeSingleSuperblockTile(baseQIdx, dcLevel, dcNegative);
+        byte[] tile = EncodeSingleSuperblockTile(baseQIdx, coeffs);
 
         var framePayload = new byte[frameHdr.Length + tile.Length];
         frameHdr.CopyTo(framePayload, 0);
@@ -53,7 +61,9 @@ internal static class Av1StillImageEncoder
     /// <summary>Codes the single-block tile with the same CDFs and contexts the decoder uses. With
     /// disable_cdf_update=1 the decoder reads with static default CDFs and does not adapt, so we use the
     /// non-adaptive Encode* calls against the same default CDF context.</summary>
-    private static byte[] EncodeSingleSuperblockTile(int baseQIdx, int dcLevel, bool dcNegative)
+    private const int Tx64x64 = 4;
+
+    private static byte[] EncodeSingleSuperblockTile(int baseQIdx, int[]? coeffs)
     {
         // qcat selects the coefficient CDF set; must match the decoder's derivation from the segment q index.
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
@@ -68,7 +78,7 @@ internal static class Av1StillImageEncoder
 
         // Skip flag, ctx=0 (above/left skip = 0). skip=0 ⇒ residual coded; skip=1 ⇒ flat plane.
         // Decoder: DecodeBoolAdapt(Skip[0]). With CDEF disabled, skip=0 reads no CDEF bits (CdefBits=0).
-        int skip = dcLevel == 0 ? 1 : 0;
+        int skip = coeffs == null ? 1 : 0;
         w.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);
 
         // Keyframe Y mode, contexts from neighbour modes (DC ⇒ IntraModeContext[DC]=0 both). DC_PRED = 0.
@@ -77,36 +87,38 @@ internal static class Av1StillImageEncoder
 
         if (skip == 0)
         {
-            EncodeDcOnlyLumaCoeffs(w, cdf.Coef, dcLevel, dcNegative);
+            // Single 64x64 luma transform (TX_64X64, DctDct). First block ⇒ skip/dc-sign contexts are 0.
+            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, Tx64x64, chroma: 0, coeffs!);
         }
 
         return w.Finish();
     }
 
-    /// <summary>Codes a single-DC-coefficient luma transform block for the 64x64 intra block (TX_64X64, DctDct).
-    /// Mirrors Av1CoeffDecode.DecodeCoefs for the eob-bin-0 (DC-only) path. Contexts at the first block: skip
-    /// ctx 0 (block size == tx size), dc-sign ctx 0 (neighbour LCoef all 0x40). TX_64X64: Ctx=4, tx2dSzCtx=6
-    /// (EobBin1024), eobBaseTokIdx=32.</summary>
-    private static void EncodeDcOnlyLumaCoeffs(Av1MsacWriter w, Av1CdfCoefContext coef, int dcLevel, bool dcNegative)
+    /// <summary>Encodes a monochrome key frame whose single 64x64 luma block carries the given quantized
+    /// coefficients (rc-indexed, TX_64X64 layout). For exercising the full AC coefficient path.</summary>
+    internal static byte[] EncodeMonochromeWithCoeffs(int width, int height, int baseQIdx, int[] coeffs)
     {
-        const int txCtx = 4;              // TxfmDimensions[TX_64X64].Ctx
-        const int chroma = 0;
-        int cdfIdx = txCtx * 13 + 0;      // skip ctx 0
+        if (width < 1 || width > 64 || height < 1 || height > 64)
+        {
+            throw new ArgumentOutOfRangeException(nameof(width), "Single 64x64 superblock only (1..64).");
+        }
 
-        // all_zero (txb_skip) = 0 ⇒ block has coefficients. Decoder: DecodeBoolAdapt(CoefSkip[cdfIdx]).
-        w.EncodeBool(0, coef.CoefSkip[cdfIdx][0]);
+        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: true);
+        byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
+        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true);
+        byte[] tile = EncodeSingleSuperblockTile(baseQIdx, coeffs);
 
-        // Transform type is DctDct with no symbol (tDim.Max + intra >= TX_64X64).
+        var framePayload = new byte[frameHdr.Length + tile.Length];
+        frameHdr.CopyTo(framePayload, 0);
+        tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
+        byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
+        byte[] tdObu = Av1ObuWriter.WrapObu(Av1ObuType.TemporalDelimiter, ReadOnlySpan<byte>.Empty);
 
-        // EOB bin = 0 ⇒ DC-only (eob position 0). Decoder: DecodeSymbolAdapt16(EobBin1024[chroma], 10).
-        w.EncodeSymbol(coef.EobBin1024[chroma], 0, 10);
-
-        // Base token for the DC-only path: tokBr = dcLevel-1 ∈ {0,1}; dcTok = 1+tokBr.
-        // Decoder: DecodeSymbolAdapt4(EobBaseTok[eobBaseTokIdx+0], 2). tokBr==2 would trigger HiTok (unsupported).
-        int eobBaseTokIdx = txCtx * 2 * 4 + chroma * 4; // = 32
-        w.EncodeSymbol(coef.EobBaseTok[eobBaseTokIdx + 0], dcLevel - 1, 2);
-
-        // DC sign. Decoder: DecodeBoolAdapt(DcSign[chroma*3 + dcSignCtx=0]).
-        w.EncodeBool(dcNegative ? 1u : 0u, coef.DcSign[chroma * 3 + 0][0]);
+        var outBytes = new byte[tdObu.Length + seqObu.Length + frameObu.Length];
+        int o = 0;
+        tdObu.CopyTo(outBytes, o); o += tdObu.Length;
+        seqObu.CopyTo(outBytes, o); o += seqObu.Length;
+        frameObu.CopyTo(outBytes, o);
+        return outBytes;
     }
 }
