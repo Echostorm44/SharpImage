@@ -656,10 +656,20 @@ internal static partial class JxlEncoder
             }
         }
 
+        // Allocate a histogram row only for contexts that actually occur (most of the ~1500 contexts are empty
+        // on a small image); the clustering skips empty contexts before ever indexing their row, so unused ones
+        // share a single zero-length array. Saves the bulk of the per-candidate allocation on small files.
+        var used = new bool[totalContexts];
+        for (int i = 0; i < n; i++)
+        {
+            used[ctxs[i]] = true;
+        }
+
+        long[] emptyRow = Array.Empty<long>();
         var ctxHist = new long[totalContexts][];
         for (int i = 0; i < totalContexts; i++)
         {
-            ctxHist[i] = new long[maxTokDefault + 1];
+            ctxHist[i] = used[i] ? new long[maxTokDefault + 1] : emptyRow;
         }
 
         for (int i = 0; i < n; i++)
@@ -1001,10 +1011,21 @@ internal static partial class JxlEncoder
             }
         }
 
+        // Lazy histogram rows (see EncodeEntropyPlain): only contexts that actually occur get a row; the rest
+        // share a zero-length array and are skipped by the clustering. Big allocation saving on small images.
+        var used = new bool[totalContexts];
+        int uw = 0;
+        foreach (Op op in ops)
+        {
+            used[ctxs[uw]] = true;
+            uw += op.Match ? op.A : 1;
+        }
+
+        long[] emptyRow = Array.Empty<long>();
         var ctxHist = new long[totalContexts][];
         for (int i = 0; i < totalContexts; i++)
         {
-            ctxHist[i] = new long[gmaxDefault + 1];
+            ctxHist[i] = used[i] ? new long[gmaxDefault + 1] : emptyRow;
         }
 
         int pos = 0;
