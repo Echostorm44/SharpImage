@@ -640,8 +640,11 @@ internal static class Av1StillImageEncoder
             4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
     }
 
-    // Chooses the intra mode with the lowest residual sum-of-absolute-differences (a cheap rate proxy) and
-    // returns it plus its prediction (into predOut, n x n).
+    // Chooses the intra mode with the lowest residual SATD (sum of absolute Hadamard-transformed differences) —
+    // a frequency-domain cost proxy that tracks DCT coding cost far better than raw SAD, so smooth ramps and
+    // directional edges are scored the way the transform will actually code them. Returns the winning (mode,
+    // angle_delta) and writes its prediction into predOut (n x n). Purely an encoder decision: any candidate is
+    // a valid mode, so this can never desync the decoder.
     private static (Av1IntraPredMode Mode, int Delta) ChooseIntraMode(byte[] recon, int reconW, int bw4, int bh4,
         int bx4, int by4, int n, ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] predOut)
     {
@@ -651,24 +654,66 @@ internal static class Av1StillImageEncoder
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
             PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, tmp);
-            long sad = 0;
-            for (int y = 0; y < n; y++)
+            long cost = Satd8x8(src, srcW, srcBx, srcBy, tmp, n);
+            if (cost < best)
             {
-                for (int x = 0; x < n; x++)
-                {
-                    sad += Math.Abs(src[(srcBy + y) * srcW + (srcBx + x)] - tmp[y * n + x]);
-                }
-            }
-
-            if (sad < best)
-            {
-                best = sad;
+                best = cost;
                 bestCand = (mode, delta);
                 Array.Copy(tmp, predOut, n * n);
             }
         }
 
         return bestCand;
+    }
+
+    // Sum of 8x8 Hadamard-transformed absolute residuals (src - pred) tiled over an n x n block. SATD is the
+    // standard cheap frequency-domain proxy for transform coding cost.
+    private static long Satd8x8(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] pred, int n)
+    {
+        long total = 0;
+        var d = new int[64];
+        for (int by = 0; by < n; by += 8)
+        {
+            for (int bx = 0; bx < n; bx += 8)
+            {
+                for (int y = 0; y < 8; y++)
+                    for (int x = 0; x < 8; x++)
+                        d[y * 8 + x] = src[(srcBy + by + y) * srcW + (srcBx + bx + x)] - pred[(by + y) * n + (bx + x)];
+                total += Hadamard8x8Abs(d);
+            }
+        }
+
+        return total;
+    }
+
+    // In-place 8x8 Walsh–Hadamard transform (rows then columns) of d, returning the sum of absolute outputs.
+    private static long Hadamard8x8Abs(int[] d)
+    {
+        Span<int> t = stackalloc int[64];
+        for (int i = 0; i < 8; i++) Hadamard8(d, i * 8, 1, t, i * 8, 1);
+        for (int i = 0; i < 8; i++) Hadamard8(t, i, 8, d, i, 8);
+        long s = 0;
+        for (int i = 0; i < 64; i++) s += Math.Abs(d[i]);
+        return s;
+    }
+
+    // One 8-point Walsh–Hadamard butterfly from in[inOff + k*inStride] to out[outOff + k*outStride].
+    private static void Hadamard8(Span<int> input, int inOff, int inStride, Span<int> output, int outOff, int outStride)
+    {
+        int a0 = input[inOff], a1 = input[inOff + inStride], a2 = input[inOff + 2 * inStride], a3 = input[inOff + 3 * inStride];
+        int a4 = input[inOff + 4 * inStride], a5 = input[inOff + 5 * inStride], a6 = input[inOff + 6 * inStride], a7 = input[inOff + 7 * inStride];
+        int b0 = a0 + a4, b1 = a1 + a5, b2 = a2 + a6, b3 = a3 + a7;
+        int b4 = a0 - a4, b5 = a1 - a5, b6 = a2 - a6, b7 = a3 - a7;
+        int c0 = b0 + b2, c1 = b1 + b3, c2 = b0 - b2, c3 = b1 - b3;
+        int c4 = b4 + b6, c5 = b5 + b7, c6 = b4 - b6, c7 = b5 - b7;
+        output[outOff] = c0 + c1;
+        output[outOff + outStride] = c0 - c1;
+        output[outOff + 2 * outStride] = c2 + c3;
+        output[outOff + 3 * outStride] = c2 - c3;
+        output[outOff + 4 * outStride] = c4 + c5;
+        output[outOff + 5 * outStride] = c4 - c5;
+        output[outOff + 6 * outStride] = c6 + c7;
+        output[outOff + 7 * outStride] = c6 - c7;
     }
 
     // DC prediction for a 64x64 block from reconstructed neighbours, mirroring Av1IntraPred DC modes.
