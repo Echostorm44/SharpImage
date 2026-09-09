@@ -39,6 +39,8 @@ public sealed class Av1ColorTests
     [Arguments(24, 24)]    // 32 block covering 24x24, TX_16X16 chroma
     [Arguments(128, 64)]   // multi-SB colour, 2x1
     [Arguments(128, 128)]  // multi-SB colour, 2x2
+    [Arguments(256, 128)]  // multi-SB colour, 4x2
+    [Arguments(192, 192)]  // multi-SB colour, 3x3
     public async Task Color_RoundTrips(int w, int h)
     {
         ImageFrame src = ColorImage(w, h);

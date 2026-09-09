@@ -707,22 +707,9 @@ public static class Av1Reconstruction
                                         AvDbg.W($" {cf[ci]}");
                                     AvDbg.W();
                                 }
-                             // Debug: dump dq coefs for target blocks
-                            if (dbgTarget)
-                            {
-                                int pw = tDim.W * 4, ph = tDim.H * 4;
-                                var sb = new System.Text.StringBuilder();
-                                sb.AppendLine($"[DBG-COEF] #{DbgCoefCalls}: eob={eob} tx={b.Tx} txtp={txtp} bx={curBx} by={curBy} mode={b.YMode}");
-                                sb.Append("  dq:");
-                                for (int dy = 0; dy < ph; dy++)
-                                {
-                                    sb.Append("\n   ");
-                                    for (int dx = 0; dx < pw; dx++)
-                                        sb.Append($" {cf[dy * pw + dx],5}");
-                                }
-                                AvDbg.W(sb);
-                                AvDbg.W();
-                            }
+                             // (removed a leftover debug dump that indexed cf[dy*pw+dx] up to pw*ph=4096 on the
+                             // 1024-entry CfBuf — it crashed on TX_64X64 blocks at x>=128, i.e. frames wider than
+                             // two superblocks, which is why >128px decodes failed.)
 
                                 if (lossless)
                                 {
