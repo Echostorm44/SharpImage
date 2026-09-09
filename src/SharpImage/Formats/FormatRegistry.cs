@@ -38,6 +38,11 @@ public enum ImageFileFormat
     Dicom,
     Jpeg2000,
     JpegXl,
+
+    /// <summary>SharpImage's byte-exact lossless JPEG↔JXL recompression container (magic "SJXL"). Decodes back
+    /// to the exact source JPEG's pixels; written only by <see cref="JpegXlLossless.Encode(byte[])"/> from a
+    /// JPEG, so there is no pixel-to-SJXL encode path here.</summary>
+    JpegXlLossless,
     Avif,
     Heic,
     Exr,
@@ -159,6 +164,11 @@ public static class FormatRegistry
         if (Jpeg2000Coder.CanDecode(data))
         {
             return ImageFileFormat.Jpeg2000;
+        }
+
+        if (JpegXlLossless.CanDecode(data))
+        {
+            return ImageFileFormat.JpegXlLossless; // SharpImage's byte-exact JPEG recompression container
         }
 
         if (JxlCoder.CanDecode(data))
@@ -356,6 +366,7 @@ public static class FormatRegistry
             ImageFileFormat.Dicom => DicomCoder.Decode(data),
             ImageFileFormat.Jpeg2000 => Jpeg2000Coder.Decode(data),
             ImageFileFormat.JpegXl => JxlCoder.Decode(data),
+            ImageFileFormat.JpegXlLossless => JpegCoder.Read(new MemoryStream(JpegXlLossless.Decode(data))),
             ImageFileFormat.Avif or ImageFileFormat.Heic => HeifCoder.Decode(data),
             ImageFileFormat.Exr => ExrCoder.Decode(data),
             ImageFileFormat.Sgi => SgiCoder.Decode(data),

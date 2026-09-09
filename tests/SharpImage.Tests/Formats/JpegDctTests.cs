@@ -210,6 +210,51 @@ public class JpegDctTests
         await Assert.That((int)JpegRecompressionEffort.Balanced).IsNotEqualTo((int)JpegRecompressionEffort.Turbo);
     }
 
+    // The SJXL recompression container is auto-detected by FormatRegistry and decodes to the SAME pixels as
+    // the source JPEG — so a saved .jxl recompression loads transparently for further conversion/resizing.
+    [Test]
+    public async Task Jpeg_Sjxl_LoadsThroughFormatRegistry()
+    {
+        using var srcImg = new ImageFrame();
+        srcImg.Initialize(80, 64, ColorspaceType.SRGB, false);
+        for (int y = 0; y < 64; y++)
+        {
+            var row = srcImg.GetPixelRowForWrite(y);
+            for (int x = 0; x < 80; x++)
+            {
+                int o = x * srcImg.NumberOfChannels;
+                row[o] = Quantum.ScaleFromByte((byte)((x * 5) ^ (y * 9)));
+                row[o + 1] = Quantum.ScaleFromByte((byte)((x * 3) + (y * 7)));
+                row[o + 2] = Quantum.ScaleFromByte((byte)(180 - x - (y * 2)));
+            }
+        }
+
+        using var ms = new System.IO.MemoryStream();
+        JpegCoder.Write(srcImg, ms, quality: 88, subsampling: JpegSubsampling.Yuv420);
+        byte[] jpeg = ms.ToArray();
+        byte[] sjxl = JpegXlLossless.Encode(jpeg);
+
+        // FormatRegistry detects the container from its magic and routes it to the SJXL decode path.
+        await Assert.That(FormatRegistry.DetectFormat(sjxl)).IsEqualTo(ImageFileFormat.JpegXlLossless);
+
+        using ImageFrame fromSjxl = FormatRegistry.Read(sjxl);
+        using ImageFrame fromJpeg = FormatRegistry.Read(jpeg);
+        await Assert.That(fromSjxl.Columns).IsEqualTo(fromJpeg.Columns);
+        await Assert.That(fromSjxl.Rows).IsEqualTo(fromJpeg.Rows);
+
+        // Pixels are identical — SJXL reconstructs the exact JPEG, so decoding it gives the JPEG's own pixels.
+        bool pixelsMatch = true;
+        for (int y = 0; y < fromJpeg.Rows && pixelsMatch; y++)
+        {
+            if (!fromSjxl.GetPixelRow(y).SequenceEqual(fromJpeg.GetPixelRow(y)))
+            {
+                pixelsMatch = false;
+            }
+        }
+
+        await Assert.That(pixelsMatch).IsTrue();
+    }
+
     // A real PROGRESSIVE (SOF2) JPEG — multi-scan DC first/refine + AC first/refine with EOBRUN grouping —
     // must recompress and reconstruct byte-for-byte. This embeds a small libjpeg-family progressive JPEG so
     // the coverage runs everywhere (no external corpus needed). Guards the progressive scan re-encoder and the
