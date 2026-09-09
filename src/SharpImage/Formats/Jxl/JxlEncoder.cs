@@ -1870,10 +1870,49 @@ internal static partial class JxlEncoder
         return symbol;
     }
 
+    // Exact memoisation of Math.Log for small non-negative integers — the histogram counts fed to the entropy
+    // estimators are overwhelmingly small, and a table lookup replaces a transcendental call in the O(contexts
+    // x seeds x alphabet) clustering inner loop. Values >= the table size fall back to Math.Log, so results are
+    // BIT-IDENTICAL to calling Math.Log directly (a pure speedup, no effect on which clusters/configs win).
+    private const int LogLutSize = 1 << 14;
+    private static readonly double[] LogLut = BuildLogLut();
+
+    private static double[] BuildLogLut()
+    {
+        var t = new double[LogLutSize];
+        for (int i = 1; i < LogLutSize; i++)
+        {
+            t[i] = Math.Log(i);
+        }
+
+        return t;
+    }
+
+    internal static double LogOf(long v) => v < LogLutSize ? LogLut[v] : Math.Log(v);
+
+    // r = a + b, vectorised (histograms are same-length long[]). Used in the clustering merge-cost inner loop.
     private static long[] Sum(long[] a, long[] b)
     {
         long[] r = new long[a.Length];
-        for (int i = 0; i < a.Length; i++)
+        int i = 0;
+        if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+        {
+            int w = System.Runtime.Intrinsics.Vector256<long>.Count;
+            for (; i + w <= a.Length; i += w)
+            {
+                System.Runtime.Intrinsics.Vector256.StoreUnsafe(System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref a[i]) + System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref b[i]), ref r[i]);
+            }
+        }
+        else if (System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated)
+        {
+            int w = System.Runtime.Intrinsics.Vector128<long>.Count;
+            for (; i + w <= a.Length; i += w)
+            {
+                System.Runtime.Intrinsics.Vector128.StoreUnsafe(System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref a[i]) + System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref b[i]), ref r[i]);
+            }
+        }
+
+        for (; i < a.Length; i++)
         {
             r[i] = a[i] + b[i];
         }
@@ -1895,12 +1934,13 @@ internal static partial class JxlEncoder
         }
 
         double bits = 0;
-        double lg = Math.Log(total);
+        double lg = LogOf(total);
+        double log2 = Math.Log(2);
         foreach (long v in h)
         {
             if (v > 0)
             {
-                bits += v * ((lg - Math.Log(v)) / Math.Log(2));
+                bits += v * ((lg - LogOf(v)) / log2);
             }
         }
 

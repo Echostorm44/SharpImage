@@ -5,6 +5,7 @@
 // and controlled entirely by this repo, so byte-exact reconstruction is guaranteed by JpegCoder.RebuildJpeg.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using E = SharpImage.Formats.Jxl.JxlBitReader.U32Enc;
 
 namespace SharpImage.Formats.Jxl;
@@ -199,6 +200,20 @@ internal static partial class JxlEncoder
     internal const int JpegEffortDefault = 5;   // balanced: both orders + {no-LZ77, LZ77} best-of, ANS
     internal const int JpegEffortMax = 9;       // exhaustive: + weighted-DC predictor, +LZ77-32, +prefix codes
 
+    // Phase profiler (env JPEGAC_PROF): accumulates CPU-ticks per named phase across all parallel candidates.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> ProfTicks = new();
+    private static readonly bool ProfOn = Environment.GetEnvironmentVariable("JPEGAC_PROF") != null;
+
+    private static long ProfStart() => ProfOn ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+    private static void ProfEnd(string phase, long start)
+    {
+        if (ProfOn)
+        {
+            ProfTicks.AddOrUpdate(phase, System.Diagnostics.Stopwatch.GetTimestamp() - start, (_, v) => v + System.Diagnostics.Stopwatch.GetTimestamp() - start);
+        }
+    }
+
     /// <summary>Entropy-codes a JPEG's quantized DCT coefficients with the DCT-aware context model + ANS.</summary>
     internal static byte[] EncodeJpegCoefficients(Formats.JpegDctData d, int effort = JpegEffortDefault)
     {
@@ -261,13 +276,32 @@ internal static partial class JxlEncoder
                 blobs[i] = EncodeStream(d, j.orders, j.custom, j.wp, j.vals, j.ctxs, j.minLen, refineIters, j.prefix);
             });
 
-            foreach (byte[] blob in blobs)
+            int bi = 0;
+            for (int i = 0; i < blobs.Length; i++)
             {
-                if (best == null || blob.Length < best.Length)
+                if (best == null || blobs[i].Length < best.Length)
                 {
-                    best = blob;
+                    best = blobs[i];
+                    bi = i;
                 }
             }
+
+            if (ProfOn)
+            {
+                var jw = jobs[bi];
+                Console.Error.WriteLine($"  PROF winner: wp={jw.wp} custom={jw.custom} lz77={jw.minLen} prefix={jw.prefix} size={best!.Length}");
+            }
+        }
+
+        if (ProfOn)
+        {
+            double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            foreach (var kv in ProfTicks.OrderByDescending(x => x.Value))
+            {
+                Console.Error.WriteLine($"  PROF {kv.Key,-12} {kv.Value * f,9:F0} ms (CPU, summed over parallel candidates)");
+            }
+
+            ProfTicks.Clear();
         }
 
         return best!;
@@ -606,6 +640,7 @@ internal static partial class JxlEncoder
     {
         int n = vals.Length;
         int maxTokDefault = 0, maxVal = 0;
+        long t0 = ProfStart();
         var packedDefault = new int[n];
         for (int i = 0; i < n; i++)
         {
@@ -632,11 +667,18 @@ internal static partial class JxlEncoder
             ctxHist[ctxs[i]][packedDefault[i]]++;
         }
 
+        ProfEnd("tokenize", t0);
+        t0 = ProfStart();
         (int[] map, int[][] _, int k) = ClusterContextsTotalCost(ctxHist, maxTokDefault + 1, JpegMaxClusters, Math.Max(5, BitLen(maxTokDefault)));
+        ProfEnd("cluster", t0);
 
         // Jointly refine the assignment + per-cluster configs (Lloyd-style) starting from that clustering.
+        t0 = ProfStart();
         Dictionary<int, long>[] ctxVH = BuildCtxValueHists(vals, ctxs, totalContexts);
+        ProfEnd("buildVH", t0);
+        t0 = ProfStart();
         (int[] cfgS, int[] cfgM, int[] cfgL, int[][] norm, int logAlpha) = RefineClusters(ctxVH, map, k, maxVal, refineIters);
+        ProfEnd("refine", t0);
 
         if (usePrefix)
         {
@@ -710,6 +752,7 @@ internal static partial class JxlEncoder
             JxlEntropy.WriteHistogram(w, norm[c], JxlEntropy.HistShift);
         }
 
+        long te = ProfStart();
         var ans = new JxlAnsWriter(norm, logAlpha);
         var ansToks = new List<AnsToken>(n);
         for (int i = 0; i < n; i++)
@@ -720,11 +763,23 @@ internal static partial class JxlEncoder
         }
 
         ans.Encode(w, ansToks);
+        ProfEnd("ansEncode", te);
     }
+
+    // Length at which a match is "good enough" to stop searching the chain (zlib's nice_match) — caps the
+    // per-position work on highly-repetitive regions without measurably hurting ratio.
+    private const int Lz77NiceLen = 512;
+    private const int Lz77MaxChain = 96;
 
     // Lazy LZ77 over the value stream: a hash-chain longest-match search with one-step lookahead — if the
     // next position has a strictly longer match, emit a literal now and take the longer match there. This
     // avoids the greedy matcher pre-empting a long match with a shorter one, which matters on graphics.
+    //
+    // The hash chain uses a flat power-of-two table (not a Dictionary) and hashes are precomputed once for the
+    // whole stream, so each position costs an array read instead of a hash + dictionary probe. The match-length
+    // extension is vectorised (256-bit where available, else 128-bit, else scalar) — the dominant cost on
+    // repetitive content. The matcher only affects the ENCODED SIZE, never correctness (the decoder replays the
+    // emitted literal/copy ops), so any valid match set is safe; the container still self-verifies byte-exact.
     private static List<Op> FindMatchesLazy(int[] v, int minLen)
     {
         var ops = new List<Op>();
@@ -739,11 +794,17 @@ internal static partial class JxlEncoder
             return ops;
         }
 
-        const int windowMask = (1 << 20) - 1;
-        var head = new Dictionary<int, int>();
+        const int windowSize = 1 << 20;
+        int hashBits = Math.Clamp(BitLen(n), 15, 18);
+        int hashShift = 32 - hashBits;
+        var head = new int[1 << hashBits];
+        Array.Fill(head, -1);
         var prev = new int[Math.Max(1, n)];
 
-        int Hash(int i)
+        // Precompute a hash per 4-token window in one cache-friendly pass (removes all redundant hashing).
+        int hashN = Math.Max(0, n - 3);
+        var hashArr = new int[Math.Max(1, hashN)];
+        for (int i = 0; i < hashN; i++)
         {
             unchecked
             {
@@ -751,46 +812,61 @@ internal static partial class JxlEncoder
                 hh = (hh * 2654435761u) + (uint)v[i + 1];
                 hh = (hh * 2654435761u) + (uint)v[i + 2];
                 hh = (hh * 2654435761u) + (uint)v[i + 3];
-                return (int)(hh & 0x7FFFFFFF);
+                hashArr[i] = (int)((hh * 2654435761u) >> hashShift);
             }
         }
 
+        // Chain depth is self-tuning: it starts thorough, but if the stream turns out to have almost no matches
+        // (a photograph, where LZ77 never wins the best-of anyway) the depth collapses so the cache-missing
+        // chain walk stops dominating. Repetitive content (graphics/screenshots) keeps the full depth.
+        int chainLimit = Lz77MaxChain;
+
         void Insert(int i)
         {
-            if (i + 4 > n)
+            if (i >= hashN)
             {
                 return;
             }
 
-            int hh = Hash(i);
-            prev[i] = head.TryGetValue(hh, out int p) ? p : -1;
-            head[hh] = i;
+            int h = hashArr[i];
+            prev[i] = head[h];
+            head[h] = i;
         }
 
         (int Len, int Dist) BestMatch(int idx)
         {
             int bestLen = 0, bestDist = 0;
-            if (idx + 4 <= n && head.TryGetValue(Hash(idx), out int p))
+            if (idx < hashN)
             {
-                int tries = 96;
+                int p = head[hashArr[idx]];
+                int tries = chainLimit;
+                int maxl = n - idx;
                 while (p >= 0 && tries-- > 0)
                 {
                     int dist = idx - p;
-                    if (dist > windowMask + 1)
+                    if (dist >= windowSize)
                     {
                         break;
                     }
 
-                    int maxl = n - idx, l = 0;
-                    while (l < maxl && v[p + l] == v[idx + l])
+                    // Quick reject (zlib's key chain optimisation): a candidate can only beat the current best
+                    // if the token one past the current best length also matches — checking that one element
+                    // skips the full (vectorised) extension for the vast majority of chain nodes on real data.
+                    if (bestLen > 0 && v[p + bestLen] != v[idx + bestLen])
                     {
-                        l++;
+                        p = prev[p];
+                        continue;
                     }
 
+                    int l = MatchLen(v, p, idx, maxl);
                     if (l > bestLen)
                     {
                         bestLen = l;
                         bestDist = dist;
+                        if (l >= Lz77NiceLen || l >= maxl)
+                        {
+                            break;
+                        }
                     }
 
                     p = prev[p];
@@ -801,11 +877,23 @@ internal static partial class JxlEncoder
         }
 
         int i2 = 0;
+        long matchedTokens = 0;
+        int nextCheck = 1 << 14; // re-evaluate chain depth after a warmup window
         while (i2 < n)
         {
+            // After each warmup window, gauge how much of the stream LZ77 is actually covering. Near-zero
+            // coverage => collapse the chain depth (photo); healthy coverage => restore the full search.
+            if (i2 >= nextCheck)
+            {
+                double frac = (double)matchedTokens / i2;
+                chainLimit = frac < 0.005 ? 4 : (frac < 0.02 ? 24 : Lz77MaxChain);
+                nextCheck += 1 << 15;
+            }
+
             (int len, int dist) = BestMatch(i2);
             if (len >= minLen)
             {
+                matchedTokens += len;
                 // Lookahead: if inserting i2 and matching at i2+1 yields a strictly longer match, defer.
                 Insert(i2);
                 (int nlen, int ndist) = i2 + 1 < n ? BestMatch(i2 + 1) : (0, 0);
@@ -836,12 +924,62 @@ internal static partial class JxlEncoder
         return ops;
     }
 
+    // Length of the common prefix of v[a..] and v[b..], up to maxl elements. Vectorised: compares a lane-width
+    // of ints at a time (256-bit AVX2 where available, else 128-bit), locating the first differing lane via the
+    // equality mask; falls back to scalar for the remainder and on non-SIMD hardware.
+    private static int MatchLen(int[] v, int a, int b, int maxl)
+    {
+        ref int r = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(v);
+        int l = 0;
+        if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+        {
+            const int w = 8; // Vector256<int>.Count
+            while (l + w <= maxl)
+            {
+                var va = System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref r, (nuint)(a + l));
+                var vb = System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref r, (nuint)(b + l));
+                uint eq = System.Runtime.Intrinsics.Vector256.ExtractMostSignificantBits(System.Runtime.Intrinsics.Vector256.Equals(va, vb));
+                if (eq != 0xFF)
+                {
+                    return l + System.Numerics.BitOperations.TrailingZeroCount(~eq);
+                }
+
+                l += w;
+            }
+        }
+        else if (System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated)
+        {
+            const int w = 4; // Vector128<int>.Count
+            while (l + w <= maxl)
+            {
+                var va = System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref r, (nuint)(a + l));
+                var vb = System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref r, (nuint)(b + l));
+                uint eq = System.Runtime.Intrinsics.Vector128.ExtractMostSignificantBits(System.Runtime.Intrinsics.Vector128.Equals(va, vb));
+                if (eq != 0xF)
+                {
+                    return l + System.Numerics.BitOperations.TrailingZeroCount(~eq);
+                }
+
+                l += w;
+            }
+        }
+
+        while (l < maxl && System.Runtime.CompilerServices.Unsafe.Add(ref r, a + l) == System.Runtime.CompilerServices.Unsafe.Add(ref r, b + l))
+        {
+            l++;
+        }
+
+        return l;
+    }
+
     // ANS with LZ77 back-references over the value stream. Length markers live in the literal alphabet above
     // `threshold` (coded in the position's own context); distances use a dedicated extra cluster. The DECODER
     // (JxlAnsReader) handles the copies transparently, so DecodeJpegCoefficients needs no changes.
     private static void EncodeEntropyLz77(JxlBitWriter w, int[] vals, int[] ctxs, int minLen, int totalContexts, bool lazy, int refineIters, bool usePrefix = false)
     {
+        long tm = ProfStart();
         List<Op> ops = lazy ? FindMatchesLazy(vals, minLen) : FindMatches(vals, minLen);
+        ProfEnd("lz77match", tm);
 
         // --- Cluster on the default config (4,2,0) + a default threshold ---
         int maxLitDefault = 0;
