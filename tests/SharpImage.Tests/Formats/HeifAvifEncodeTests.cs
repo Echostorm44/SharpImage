@@ -80,15 +80,16 @@ public sealed class HeifAvifEncodeTests
     }
 
     [Test]
-    public async Task Avif_Colour_Throws()
+    public async Task Avif_Colour_NonSquare_Throws()
     {
+        // Colour is currently supported only at exactly 64x64; other sizes throw.
         var f = new ImageFrame();
-        f.Initialize(64, 64, ColorspaceType.SRGB, false);
-        for (long y = 0; y < 64; y++)
+        f.Initialize(48, 48, ColorspaceType.SRGB, false);
+        for (long y = 0; y < 48; y++)
         {
             var row = f.GetPixelRowForWrite(y);
             int ch = f.NumberOfChannels;
-            for (long x = 0; x < 64; x++)
+            for (long x = 0; x < 48; x++)
             {
                 int o = (int)x * ch;
                 row[o] = Quantum.ScaleFromByte(200);            // R

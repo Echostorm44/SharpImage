@@ -166,6 +166,83 @@ internal static class Av1StillImageEncoder
     }
 
     private const int Tx64x64 = 4;
+    private const int Tx32x32 = 3;
+
+    /// <summary>Encodes a single 64x64 I420 colour block as a complete .avif. <paramref name="y"/> is 64x64 luma;
+    /// <paramref name="u"/>/<paramref name="v"/> are 32x32 subsampled chroma. DC intra for luma and chroma.</summary>
+    internal static byte[] EncodeAvifColor64(ReadOnlySpan<byte> y, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v, int baseQIdx)
+    {
+        byte[] tile = EncodeColorTile64(y, u, v, baseQIdx);
+        var seqCfg = new Av1ObuWriter.SeqConfig(64, 64, monochrome: false);
+        byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
+        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, 1, 1, monochrome: false);
+        var framePayload = new byte[frameHdr.Length + tile.Length];
+        frameHdr.CopyTo(framePayload, 0);
+        tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
+        byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, 64, 64, monochrome: false);
+    }
+
+    private static byte[] EncodeColorTile64(ReadOnlySpan<byte> y, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v, int baseQIdx)
+    {
+        int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
+        var cdf = new Av1CdfContext();
+        Av1CdfDefaults.InitializeDefault(cdf, qcat);
+        int dcDq = Av1Tables.DequantTable[0, baseQIdx, 0];
+        int acDq = Av1Tables.DequantTable[0, baseQIdx, 1]; // U/V share Y's dq (no separate_uv_delta_q)
+
+        int[] yCoeffs = QuantizePlane(y, 64, Tx64x64, dcDq, acDq);
+        int[] uCoeffs = QuantizePlane(u, 32, Tx32x32, dcDq, acDq);
+        int[] vCoeffs = QuantizePlane(v, 32, Tx32x32, dcDq, acDq);
+        bool anyNz = HasNonZero(yCoeffs) || HasNonZero(uCoeffs) || HasNonZero(vCoeffs);
+        int skip = anyNz ? 0 : 1;
+
+        var w = new Av1MsacWriter();
+        w.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9); // PARTITION_NONE
+        w.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);                       // skip, ctx 0
+        w.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);                       // Y mode = DC
+        w.EncodeSymbol(cdf.GetUvModeCdf(cflAllowed: false, yMode: 0), 0, 12); // UV mode = DC (nsym 12)
+
+        if (skip == 0)
+        {
+            // Chroma coeff-skip context: GetSkipCtx for chroma returns 7 (+ neighbour terms, 0 here) — not 0.
+            var neutral = new byte[32];
+            Array.Fill(neutral, (byte)0x40);
+            ref readonly var uvtDim = ref Av1Tables.TxfmDimensions[Tx32x32];
+            int chromaSkipCtx = Av1CoeffDecode.GetSkipCtx(in uvtDim, (int)Av1BlockSize.Bs64x64,
+                neutral, neutral, chroma: 1, layout: (int)Av1PixelLayout.I420);
+
+            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, Tx64x64, chroma: 0, yMode: 0, yCoeffs);
+            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, Tx32x32, chroma: 1, yMode: 0, uCoeffs, skipCtx: chromaSkipCtx);
+            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, Tx32x32, chroma: 1, yMode: 0, vCoeffs, skipCtx: chromaSkipCtx);
+        }
+
+        return w.Finish();
+    }
+
+    private static int[] QuantizePlane(ReadOnlySpan<byte> plane, int n, int tx, int dcDq, int acDq)
+    {
+        var residual = new int[n * n];
+        for (int i = 0; i < n * n; i++)
+        {
+            residual[i] = plane[i] - 128; // DC prediction (first block, no neighbours)
+        }
+
+        return Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, Av1Tables.Scans[tx].Length);
+    }
+
+    private static bool HasNonZero(int[] a)
+    {
+        foreach (int c in a)
+        {
+            if (c != 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /// <summary>Encodes a monochrome image whose frame is a 1..2 by 1..2 grid of full 64x64 superblocks (width
     /// and height each 64 or 128) as a complete .avif. Unlike the single-block path this codes each superblock as

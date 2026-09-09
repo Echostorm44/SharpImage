@@ -381,9 +381,10 @@ public static class HeifCoder
 
         int channels = image.NumberOfChannels;
 
-        // Extract tightly-packed luma. Reject colour content (chroma not yet supported) rather than silently
-        // discarding it.
+        // Extract tightly-packed RGB and luma; detect whether the image has real colour.
+        var rgb = new byte[w * h * 3];
         var luma = new byte[w * h];
+        bool colour = false;
         for (int y = 0; y < h; y++)
         {
             ReadOnlySpan<ushort> row = image.GetPixelRow(y);
@@ -391,27 +392,73 @@ public static class HeifCoder
             {
                 int o = x * channels;
                 int r = Quantum.ScaleToByte(row[o]);
-                if (channels >= 3)
+                int g = channels >= 3 ? Quantum.ScaleToByte(row[o + 1]) : r;
+                int b = channels >= 3 ? Quantum.ScaleToByte(row[o + 2]) : r;
+                if (r != g || g != b)
                 {
-                    int g = Quantum.ScaleToByte(row[o + 1]);
-                    int b = Quantum.ScaleToByte(row[o + 2]);
-                    if (r != g || g != b)
-                    {
-                        throw new NotSupportedException(
-                            "AVIF encoding currently supports grayscale images only (colour chroma coding is " +
-                            "not yet implemented).");
-                    }
+                    colour = true;
                 }
 
+                int d = (y * w + x) * 3;
+                rgb[d] = (byte)r;
+                rgb[d + 1] = (byte)g;
+                rgb[d + 2] = (byte)b;
                 luma[y * w + x] = (byte)r;
             }
         }
 
         // Map the HEVC-style qp (0..51, lower = better) to an AV1 base_q_idx (1..255, lower = better).
         int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+
+        if (colour)
+        {
+            if (w != 64 || h != 64)
+            {
+                throw new NotSupportedException(
+                    $"AVIF colour encoding currently supports exactly 64x64 (got {w}x{h}); grayscale covers the " +
+                    "other sizes.");
+            }
+
+            RgbToI420_64(rgb, out byte[] yP, out byte[] uP, out byte[] vP);
+            return Av1.Av1StillImageEncoder.EncodeAvifColor64(yP, uP, vP, baseQIdx);
+        }
+
         return multiSb
             ? Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx)
             : Av1.Av1StillImageEncoder.EncodeAvifMonochrome(luma, w, h, baseQIdx);
+    }
+
+    // BT.601 full-range RGB→YUV (the inverse of ConvertYuvToRgb's full-range BT.601 path) with I420 chroma
+    // subsampling: 64x64 luma, 32x32 U and V (2x2 box average).
+    private static void RgbToI420_64(byte[] rgb, out byte[] y, out byte[] u, out byte[] v)
+    {
+        y = new byte[64 * 64];
+        u = new byte[32 * 32];
+        v = new byte[32 * 32];
+        var uf = new double[32 * 32];
+        var vf = new double[32 * 32];
+
+        for (int yy = 0; yy < 64; yy++)
+        {
+            for (int xx = 0; xx < 64; xx++)
+            {
+                int o = (yy * 64 + xx) * 3;
+                double r = rgb[o], g = rgb[o + 1], b = rgb[o + 2];
+                double luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                double cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0;
+                double cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0;
+                y[yy * 64 + xx] = (byte)Math.Clamp((int)Math.Round(luma), 0, 255);
+                int ci = (yy >> 1) * 32 + (xx >> 1);
+                uf[ci] += cb;
+                vf[ci] += cr;
+            }
+        }
+
+        for (int i = 0; i < 32 * 32; i++)
+        {
+            u[i] = (byte)Math.Clamp((int)Math.Round(uf[i] / 4.0), 0, 255);
+            v[i] = (byte)Math.Clamp((int)Math.Round(vf[i] / 4.0), 0, 255);
+        }
     }
 
     #region AV1 Intra Frame Codec

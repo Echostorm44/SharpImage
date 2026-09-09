@@ -32,8 +32,9 @@ internal static class Av1AvifWriter
         byte b0 = 0x81;                       // marker(1)=1 | version(7)=1
         byte b1 = 0x00;                       // seq_profile(3)=0 | seq_level_idx_0(5)=0
         int monoBit = monochrome ? 1 : 0;
-        int cssX = monochrome ? 1 : 0;        // AV1: monochrome sets subsampling 1,1
-        int cssY = monochrome ? 1 : 0;
+        // AV1 sets subsampling 1,1 for monochrome (I400); colour here is I420 (also 1,1).
+        int cssX = 1;
+        int cssY = 1;
         byte b2 = (byte)(
             (0 << 7) |                        // seq_tier_0
             (0 << 6) |                        // high_bitdepth (8-bit)

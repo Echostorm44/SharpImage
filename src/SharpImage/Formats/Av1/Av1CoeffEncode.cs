@@ -65,11 +65,12 @@ internal static class Av1CoeffEncode
         w.EncodeBool(0, coef.CoefSkip[cdfIdx][0]);
 
         // --- Transform type ---
-        // The decoder codes a tx-type symbol for intra luma when tDim.Max + intra < TX_64X64 (i.e. TX_16X16 and
-        // smaller) and segQIdx != 0; TX_32X32/TX_64X64 imply DctDct with no symbol. We always emit DctDct.
-        // With reduced_tx_set the symbol is TxtpIntra2[tDim.Min*13 + yMode], and DctDct is index 1 in that set.
+        // The decoder codes a tx-type symbol only for intra LUMA when tDim.Max + intra < TX_64X64 (i.e. TX_16X16
+        // and smaller) and segQIdx != 0; chroma derives its type from the UV mode (no symbol), and
+        // TX_32X32/TX_64X64 imply DctDct with no symbol. We always emit DctDct = index 1 in the reduced Intra2
+        // set (TxtpIntra2[tDim.Min*13 + yMode]).
         const int intra = 1;
-        if (tDim.Max + intra < (int)Av1TxSize.Tx64x64)
+        if (chroma == 0 && tDim.Max + intra < (int)Av1TxSize.Tx64x64)
         {
             w.EncodeSymbol(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], 1, 4);
         }

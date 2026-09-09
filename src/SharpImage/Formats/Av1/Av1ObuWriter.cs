@@ -101,7 +101,7 @@ internal static class Av1ObuWriter
         // color_config
         w.PutBit(0);              // high_bitdepth = 0 (8-bit, profile 0)
         w.PutBool(cfg.Monochrome); // mono_chrome (profile != 1)
-        w.PutBool(false);         // color_description_present_flag = 0
+        w.PutBool(false);         // color_description_present_flag = 0 (colours = Unspecified)
 
         if (cfg.Monochrome)
         {
@@ -110,13 +110,12 @@ internal static class Av1ObuWriter
         }
         else
         {
-            // Non-monochrome minimal path not used in step 2.
-            throw new NotSupportedException("Only monochrome sequence header is implemented in step 2.");
-        }
-
-        if (!cfg.Monochrome)
-        {
-            w.PutBool(false);     // separate_uv_delta_q
+            // Profile 0, colours Unspecified ⇒ the parser's "else" branch: color_range, then layout=I420
+            // (subsampling_x=subsampling_y=1 implied by profile 0), then chroma_sample_position (2 bits, read
+            // because subX & subY), then separate_uv_delta_q.
+            w.PutBit(1);          // color_range = 1 (full range)
+            w.PutBits(0, 2);      // chroma_sample_position = Unknown
+            w.PutBool(false);     // separate_uv_delta_q = 0
         }
 
         w.PutBool(false);         // film_grain_params_present = 0
@@ -134,11 +133,15 @@ internal static class Av1ObuWriter
     /// (tile data follows in the same OBU_FRAME); otherwise a trailing one-bit terminates a standalone
     /// OBU_FRAME_HEADER.</summary>
     internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame)
-        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, 1, 1);
+        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, 1, 1, true);
+
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows)
+        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, sbCols, sbRows, true);
 
     /// <summary>Frame header for a frame that is <paramref name="sbCols"/> x <paramref name="sbRows"/> 64x64
-    /// superblocks, coded as a single tile (uniform spacing, log2 tile dims 0).</summary>
-    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows)
+    /// superblocks, coded as a single tile (uniform spacing, log2 tile dims 0). <paramref name="monochrome"/>
+    /// selects whether the U/V quant-delta bits are emitted.</summary>
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome)
     {
         if (baseQIdx <= 0 || baseQIdx > 255)
         {
@@ -179,7 +182,14 @@ internal static class Av1ObuWriter
 
         // quantization_params
         w.PutBits((uint)baseQIdx, 8); // base_q_idx
-        w.PutBool(false);         // diff_uv_delta not reached (mono); y_dc: delta_coded = 0
+        w.PutBool(false);         // y_dc: delta_coded = 0
+        if (!monochrome)
+        {
+            // separate_uv_delta_q = 0 ⇒ no diff_uv_delta bit; U deltas not coded (V = U).
+            w.PutBool(false);     // u_dc_delta_coded = 0
+            w.PutBool(false);     // u_ac_delta_coded = 0
+        }
+
         w.PutBool(false);         // using_qmatrix = 0
 
         // segmentation_params
