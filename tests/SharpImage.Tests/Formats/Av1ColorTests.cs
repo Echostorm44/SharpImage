@@ -8,15 +8,15 @@ namespace SharpImage.Tests.Formats;
 // HeifCoder with reasonable fidelity (subsampled chroma ⇒ some loss, but hues preserved).
 public sealed class Av1ColorTests
 {
-    private static ImageFrame ColorImage()
+    private static ImageFrame ColorImage(int w, int h)
     {
         var f = new ImageFrame();
-        f.Initialize(64, 64, ColorspaceType.SRGB, false);
-        for (long y = 0; y < 64; y++)
+        f.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (long y = 0; y < h; y++)
         {
             var row = f.GetPixelRowForWrite(y);
             int ch = f.NumberOfChannels;
-            for (long x = 0; x < 64; x++)
+            for (long x = 0; x < w; x++)
             {
                 // Smooth colour field: R ramps with x, G with y, B constant-ish.
                 byte r = (byte)(20 + x * 3);
@@ -33,20 +33,24 @@ public sealed class Av1ColorTests
     }
 
     [Test]
-    public async Task Color_64x64_RoundTrips()
+    [Arguments(64, 64)]  // 64 block, TX_32X32 chroma
+    [Arguments(32, 32)]  // 32 block, TX_16X16 chroma, CfL-allowed
+    [Arguments(16, 16)]  // 16 block, TX_8X8 chroma
+    [Arguments(24, 24)]  // 32 block covering 24x24, TX_16X16 chroma
+    public async Task Color_RoundTrips(int w, int h)
     {
-        ImageFrame src = ColorImage();
+        ImageFrame src = ColorImage(w, h);
         byte[] avif = HeifCoder.Encode(src, HeifContainerType.Avif, qp: 8);
 
         await Assert.That(HeifCoder.IsAvif(avif)).IsTrue();
         ImageFrame dec = HeifCoder.Decode(avif);
-        await Assert.That((int)dec.Columns).IsEqualTo(64);
+        await Assert.That((int)dec.Columns).IsEqualTo(w);
 
         double sse = 0;
         int n = 0;
-        for (long y = 0; y < 64; y++)
+        for (long y = 0; y < h; y++)
         {
-            for (long x = 0; x < 64; x++)
+            for (long x = 0; x < w; x++)
             {
                 for (int c = 0; c < 3; c++)
                 {

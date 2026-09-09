@@ -76,17 +76,25 @@ internal static class Av1StillImageEncoder
     private readonly struct BlockPlan
     {
         public readonly Av1BlockLevel Bl;   // partition level of the coded block
+        public readonly int Bs;             // block size ordinal (Av1BlockSize)
         public readonly int Tx;             // luma transform size ordinal
         public readonly int NPart;          // partition symbol count at this level (PartitionTypeCount[bl])
         public readonly int BlockPx;        // block dimension in pixels (8/16/32/64)
 
-        public BlockPlan(Av1BlockLevel bl, int tx, int nPart, int blockPx)
+        public BlockPlan(Av1BlockLevel bl, int bs, int tx, int nPart, int blockPx)
         {
             Bl = bl;
+            Bs = bs;
             Tx = tx;
             NPart = nPart;
             BlockPx = blockPx;
         }
+
+        // Chroma transform ordinal for I420 (subsampled) — the largest chroma tx for this block size.
+        public int ChromaTxI420 => Av1Tables.MaxTxfmSizeForBlockSize[Bs, (int)Av1PixelLayout.I420];
+
+        // CfL is allowed for blocks <= 32x32.
+        public bool CflAllowed => ((Av1Tables.CflAllowedMask >> Bs) & 1) != 0;
     }
 
     // Resolves the single square block that covers a width x height frame, or false if the frame needs a
@@ -128,8 +136,7 @@ internal static class Av1StillImageEncoder
                 3 => (12 /*Bs16x16*/, 2),
                 _ => (17 /*Bs8x8*/, 1),
             };
-            _ = bs;
-            plan = new BlockPlan((Av1BlockLevel)bl, tx, Av1Tables.PartitionTypeCount[bl], blockPx);
+            plan = new BlockPlan((Av1BlockLevel)bl, bs, tx, Av1Tables.PartitionTypeCount[bl], blockPx);
             return true;
         }
 
@@ -168,22 +175,31 @@ internal static class Av1StillImageEncoder
     private const int Tx64x64 = 4;
     private const int Tx32x32 = 3;
 
-    /// <summary>Encodes a single 64x64 I420 colour block as a complete .avif. <paramref name="y"/> is 64x64 luma;
-    /// <paramref name="u"/>/<paramref name="v"/> are 32x32 subsampled chroma. DC intra for luma and chroma.</summary>
-    internal static byte[] EncodeAvifColor64(ReadOnlySpan<byte> y, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v, int baseQIdx)
+    /// <summary>Encodes a single-block I420 colour image (near-square even size, mapping to one square luma block
+    /// of 8/16/32/64) as a complete .avif. <paramref name="luma"/> is w x h; <paramref name="u"/>/<paramref
+    /// name="v"/> are (w/2) x (h/2) subsampled chroma. DC intra for luma and chroma.</summary>
+    internal static byte[] EncodeAvifColor(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
+        int width, int height, int baseQIdx)
     {
-        byte[] tile = EncodeColorTile64(y, u, v, baseQIdx);
-        var seqCfg = new Av1ObuWriter.SeqConfig(64, 64, monochrome: false);
+        if (width % 2 != 0 || height % 2 != 0 || !TryResolveSingleBlock(width, height, out BlockPlan plan))
+        {
+            throw new NotSupportedException(
+                $"Colour AVIF encode requires an even near-square size mapping to one square block (got {width}x{height}).");
+        }
+
+        byte[] tile = EncodeColorTile(luma, u, v, width, height, plan, baseQIdx);
+        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
         byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, 1, 1, monochrome: false);
         var framePayload = new byte[frameHdr.Length + tile.Length];
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
         byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, 64, 64, monochrome: false);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false);
     }
 
-    private static byte[] EncodeColorTile64(ReadOnlySpan<byte> y, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v, int baseQIdx)
+    private static byte[] EncodeColorTile(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
+        int width, int height, in BlockPlan plan, int baseQIdx)
     {
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
         var cdf = new Av1CdfContext();
@@ -191,41 +207,56 @@ internal static class Av1StillImageEncoder
         int dcDq = Av1Tables.DequantTable[0, baseQIdx, 0];
         int acDq = Av1Tables.DequantTable[0, baseQIdx, 1]; // U/V share Y's dq (no separate_uv_delta_q)
 
-        int[] yCoeffs = QuantizePlane(y, 64, Tx64x64, dcDq, acDq);
-        int[] uCoeffs = QuantizePlane(u, 32, Tx32x32, dcDq, acDq);
-        int[] vCoeffs = QuantizePlane(v, 32, Tx32x32, dcDq, acDq);
+        int n = plan.BlockPx;
+        int cn = n / 2;
+        int lumaTx = plan.Tx;
+        int chromaTx = plan.ChromaTxI420;
+        int cw = width / 2;
+        int ch = height / 2;
+
+        int[] yCoeffs = QuantizeResidualBlock(luma, width, height, n, lumaTx, dcDq, acDq);
+        int[] uCoeffs = QuantizeResidualBlock(u, cw, ch, cn, chromaTx, dcDq, acDq);
+        int[] vCoeffs = QuantizeResidualBlock(v, cw, ch, cn, chromaTx, dcDq, acDq);
         bool anyNz = HasNonZero(yCoeffs) || HasNonZero(uCoeffs) || HasNonZero(vCoeffs);
         int skip = anyNz ? 0 : 1;
 
+        int uvMaxSym = Av1Constants.NumUvIntraPredModes - 1 - (plan.CflAllowed ? 0 : 1);
+
         var w = new Av1MsacWriter();
-        w.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9); // PARTITION_NONE
-        w.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);                       // skip, ctx 0
-        w.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);                       // Y mode = DC
-        w.EncodeSymbol(cdf.GetUvModeCdf(cflAllowed: false, yMode: 0), 0, 12); // UV mode = DC (nsym 12)
+        w.EncodeSymbol(cdf.GetPartitionCdf(plan.Bl, 0), 0, plan.NPart);        // PARTITION_NONE
+        w.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);                        // skip, ctx 0
+        w.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);                        // Y mode = DC
+        w.EncodeSymbol(cdf.GetUvModeCdf(plan.CflAllowed, 0), 0, uvMaxSym);     // UV mode = DC
 
         if (skip == 0)
         {
-            // Chroma coeff-skip context: GetSkipCtx for chroma returns 7 (+ neighbour terms, 0 here) — not 0.
             var neutral = new byte[32];
             Array.Fill(neutral, (byte)0x40);
-            ref readonly var uvtDim = ref Av1Tables.TxfmDimensions[Tx32x32];
-            int chromaSkipCtx = Av1CoeffDecode.GetSkipCtx(in uvtDim, (int)Av1BlockSize.Bs64x64,
+            ref readonly var uvtDim = ref Av1Tables.TxfmDimensions[chromaTx];
+            int chromaSkipCtx = Av1CoeffDecode.GetSkipCtx(in uvtDim, plan.Bs,
                 neutral, neutral, chroma: 1, layout: (int)Av1PixelLayout.I420);
 
-            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, Tx64x64, chroma: 0, yMode: 0, yCoeffs);
-            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, Tx32x32, chroma: 1, yMode: 0, uCoeffs, skipCtx: chromaSkipCtx);
-            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, Tx32x32, chroma: 1, yMode: 0, vCoeffs, skipCtx: chromaSkipCtx);
+            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, lumaTx, chroma: 0, yMode: 0, yCoeffs);
+            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, chromaTx, chroma: 1, yMode: 0, uCoeffs, skipCtx: chromaSkipCtx);
+            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, chromaTx, chroma: 1, yMode: 0, vCoeffs, skipCtx: chromaSkipCtx);
         }
 
         return w.Finish();
     }
 
-    private static int[] QuantizePlane(ReadOnlySpan<byte> plane, int n, int tx, int dcDq, int acDq)
+    // Forward-transforms and quantizes an n x n block (DC prediction 128) built from a srcW x srcH plane with
+    // edge replication beyond the frame.
+    private static int[] QuantizeResidualBlock(ReadOnlySpan<byte> src, int srcW, int srcH, int n, int tx, int dcDq, int acDq)
     {
         var residual = new int[n * n];
-        for (int i = 0; i < n * n; i++)
+        for (int y = 0; y < n; y++)
         {
-            residual[i] = plane[i] - 128; // DC prediction (first block, no neighbours)
+            int sy = Math.Min(y, srcH - 1);
+            for (int x = 0; x < n; x++)
+            {
+                int sx = Math.Min(x, srcW - 1);
+                residual[y * n + x] = src[sy * srcW + sx] - 128;
+            }
         }
 
         return Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, Av1Tables.Scans[tx].Length);

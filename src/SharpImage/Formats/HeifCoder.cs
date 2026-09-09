@@ -412,15 +412,9 @@ public static class HeifCoder
 
         if (colour)
         {
-            if (w != 64 || h != 64)
-            {
-                throw new NotSupportedException(
-                    $"AVIF colour encoding currently supports exactly 64x64 (got {w}x{h}); grayscale covers the " +
-                    "other sizes.");
-            }
-
-            RgbToI420_64(rgb, out byte[] yP, out byte[] uP, out byte[] vP);
-            return Av1.Av1StillImageEncoder.EncodeAvifColor64(yP, uP, vP, baseQIdx);
+            // Colour uses the single-block I420 encoder (even, near-square size mapping to one 8..64 block).
+            RgbToI420(rgb, w, h, out byte[] yP, out byte[] uP, out byte[] vP);
+            return Av1.Av1StillImageEncoder.EncodeAvifColor(yP, uP, vP, w, h, baseQIdx);
         }
 
         return multiSb
@@ -429,32 +423,33 @@ public static class HeifCoder
     }
 
     // BT.601 full-range RGB→YUV (the inverse of ConvertYuvToRgb's full-range BT.601 path) with I420 chroma
-    // subsampling: 64x64 luma, 32x32 U and V (2x2 box average).
-    private static void RgbToI420_64(byte[] rgb, out byte[] y, out byte[] u, out byte[] v)
+    // subsampling: w x h luma, (w/2) x (h/2) U and V (2x2 box average). Requires even dimensions.
+    private static void RgbToI420(byte[] rgb, int w, int h, out byte[] y, out byte[] u, out byte[] v)
     {
-        y = new byte[64 * 64];
-        u = new byte[32 * 32];
-        v = new byte[32 * 32];
-        var uf = new double[32 * 32];
-        var vf = new double[32 * 32];
+        int cw = w / 2, chh = h / 2;
+        y = new byte[w * h];
+        u = new byte[cw * chh];
+        v = new byte[cw * chh];
+        var uf = new double[cw * chh];
+        var vf = new double[cw * chh];
 
-        for (int yy = 0; yy < 64; yy++)
+        for (int yy = 0; yy < h; yy++)
         {
-            for (int xx = 0; xx < 64; xx++)
+            for (int xx = 0; xx < w; xx++)
             {
-                int o = (yy * 64 + xx) * 3;
+                int o = (yy * w + xx) * 3;
                 double r = rgb[o], g = rgb[o + 1], b = rgb[o + 2];
                 double luma = 0.299 * r + 0.587 * g + 0.114 * b;
                 double cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0;
                 double cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0;
-                y[yy * 64 + xx] = (byte)Math.Clamp((int)Math.Round(luma), 0, 255);
-                int ci = (yy >> 1) * 32 + (xx >> 1);
+                y[yy * w + xx] = (byte)Math.Clamp((int)Math.Round(luma), 0, 255);
+                int ci = (yy >> 1) * cw + (xx >> 1);
                 uf[ci] += cb;
                 vf[ci] += cr;
             }
         }
 
-        for (int i = 0; i < 32 * 32; i++)
+        for (int i = 0; i < cw * chh; i++)
         {
             u[i] = (byte)Math.Clamp((int)Math.Round(uf[i] / 4.0), 0, 255);
             v[i] = (byte)Math.Clamp((int)Math.Round(vf[i] / 4.0), 0, 255);
