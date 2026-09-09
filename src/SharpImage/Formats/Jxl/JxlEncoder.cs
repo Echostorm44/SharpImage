@@ -1890,6 +1890,34 @@ internal static partial class JxlEncoder
 
     internal static double LogOf(long v) => v < LogLutSize ? LogLut[v] : Math.Log(v);
 
+    // dst[i] += src[i] over the whole array, vectorised (256/128-bit). Hot in the clustering K-search where
+    // cluster histograms are accumulated from member contexts. Exact integer add — no effect on output.
+    private static void AddInto(long[] dst, long[] src)
+    {
+        int i = 0, len = dst.Length;
+        if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+        {
+            int w = System.Runtime.Intrinsics.Vector256<long>.Count;
+            for (; i + w <= len; i += w)
+            {
+                System.Runtime.Intrinsics.Vector256.StoreUnsafe(System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref dst[i]) + System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref src[i]), ref dst[i]);
+            }
+        }
+        else if (System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated)
+        {
+            int w = System.Runtime.Intrinsics.Vector128<long>.Count;
+            for (; i + w <= len; i += w)
+            {
+                System.Runtime.Intrinsics.Vector128.StoreUnsafe(System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref dst[i]) + System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref src[i]), ref dst[i]);
+            }
+        }
+
+        for (; i < len; i++)
+        {
+            dst[i] += src[i];
+        }
+    }
+
     // r = a + b, vectorised (histograms are same-length long[]). Used in the clustering merge-cost inner loop.
     private static long[] Sum(long[] a, long[] b)
     {

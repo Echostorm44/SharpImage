@@ -1626,11 +1626,7 @@ internal static partial class JxlEncoder
                 }
 
                 assign[i] = best;
-                long[] src = ctxHist[i], dst = chist[best];
-                for (int a = 0; a < alphabet; a++)
-                {
-                    dst[a] += src[a];
-                }
+                AddInto(chist[best], ctxHist[i]);
             }
 
             ProfEnd("k-accum", tA);
@@ -1695,10 +1691,7 @@ internal static partial class JxlEncoder
             }
 
             map[i] = best;
-            for (int a = 0; a < alphabet; a++)
-            {
-                finalHist[best][a] += ctxHist[i][a];
-            }
+            AddInto(finalHist[best], ctxHist[i]);
         }
 
         var norm = new int[bestK][];
