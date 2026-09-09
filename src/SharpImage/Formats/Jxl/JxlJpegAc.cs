@@ -252,18 +252,8 @@ internal static partial class JxlEncoder
                     JpegStats(d, valArr, ctxArr);
                 }
 
-                // On a LARGE, clearly non-repetitive stream (a photograph) LZ77 cannot win the best-of, but its
-                // match search is the single most expensive phase — so skip the LZ77 candidates there. Only
-                // gate large streams, where the probe is reliable and the saving is real; small ones always try
-                // LZ77 (it is cheap and the probe is noisy on little data). Never changes the winning size.
-                bool tryLz = valArr.Length <= 50000 || LikelyRepetitive(valArr);
                 foreach (int minLen in lzModes)
                 {
-                    if (minLen > 0 && !tryLz)
-                    {
-                        continue;
-                    }
-
                     jobs.Add((orders, useCustomOrder, useWp, valArr, ctxArr, minLen, false));
                     if (tryPrefix)
                     {
@@ -372,48 +362,6 @@ internal static partial class JxlEncoder
         }
 
         Console.Error.WriteLine($"  (zeroth-order no-LZ77 estimate total = {gt:F0}B)");
-    }
-
-    // Cheap repetition probe: sample 4-token windows across the stream and measure how many hash to a bucket
-    // already seen. A photograph's coefficient stream is near-unique (low rate); graphics/screenshots repeat
-    // (glyphs, borders, flat runs). Deliberately conservative — the threshold is set low so anything that
-    // MIGHT benefit from LZ77 still runs it; it only prunes the clearly-incompressible-by-LZ77 case.
-    private static bool LikelyRepetitive(int[] v)
-    {
-        int n = v.Length;
-        if (n < 8)
-        {
-            return true;
-        }
-
-        const int tableBits = 16;
-        var seen = new bool[1 << tableBits];
-        int samples = 0, hits = 0;
-        int stride = Math.Max(1, (n - 3) / 8192); // ~8k samples regardless of size
-        for (int i = 0; i + 3 < n; i += stride)
-        {
-            unchecked
-            {
-                uint h = (uint)v[i];
-                h = (h * 2654435761u) + (uint)v[i + 1];
-                h = (h * 2654435761u) + (uint)v[i + 2];
-                h = (h * 2654435761u) + (uint)v[i + 3];
-                int slot = (int)((h * 2654435761u) >> (32 - tableBits));
-                if (seen[slot])
-                {
-                    hits++;
-                }
-                else
-                {
-                    seen[slot] = true;
-                }
-
-                samples++;
-            }
-        }
-
-        // >~4% of sampled windows recurring is well above the collision floor of near-unique data.
-        return samples > 0 && hits * 100L >= samples * 4L;
     }
 
     private static int[][] NaturalOrders(int componentCount)
