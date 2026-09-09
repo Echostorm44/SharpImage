@@ -108,6 +108,10 @@ internal static class Av1ObuWriter
 
         w.PutBool(false);         // film_grain_params_present = 0
 
+        // open_bitstream_unit() appends trailing_bits() to every OBU except TILE_GROUP/TILE_LIST/FRAME — a 1 bit
+        // then zero padding. Our own parser ignores it, but conformant parsers (ffmpeg/dav1d CBS) enforce it.
+        w.TrailingBits();
+
         return w.ToArray();
     }
 
