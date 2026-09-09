@@ -1120,20 +1120,6 @@ public static class Av1Decode
             ymodeCdf = ts.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
         }
         b.YMode = (byte)msac.DecodeSymbolAdapt16(ymodeCdf, Av1Constants.NumIntraPredModes - 1);
-        if (t.Bx == 12 && t.By == 0)
-        {
-            var sb = new System.Text.StringBuilder($"[MODE-CDF] bx={t.Bx} by={t.By} bs={(int)bs} aboveCtx={Av1Tables.IntraModeContext[t.Above.Mode[bx4]]} leftCtx={Av1Tables.IntraModeContext[t.Left.Mode[by4]]} aboveMode={t.Above.Mode[bx4]} leftMode={t.Left.Mode[by4]} cdf=[");
-            for (int i = 0; i < 13; i++) sb.Append($" {ymodeCdf[i]}");
-            sb.Append($"] result={b.YMode}");
-            AvDbg.W(sb.ToString());
-        }
-        // Also log all blocks at cols >= 8
-        if (t.Bx >= 8)
-            AvDbg.W($"[PART-BLOCK] bx={t.Bx} by={t.By} bs={(int)bs} bw={bw4} bh={bh4} y_mode={b.YMode} palSz={b.PalSzY} rng={msac.DebugRng}");
-        if (t.Bx < 8 && t.By < 4)
-            AvDbg.W($"[DEC-DBG] post-ymode={b.YMode} angle_cond={(bDimW + bDimH >= 2 && b.YMode >= (byte)Av1IntraPredMode.Vertical && b.YMode <= (byte)Av1IntraPredMode.VerticalLeft ? 1 : 0)} rng={msac.DebugRng}");
-        if (DbgFirstBlock && t.Bx == 0 && t.By == 0)
-            AvDbg.W($"[DBG-BLK] Post-ymode[{b.YMode}={((Av1IntraPredMode)b.YMode)}]: dif={msac.DebugDif:X16} rng={msac.DebugRng:X4}");
 
         // === Angle delta ===
         if (bDimW + bDimH >= 2 &&

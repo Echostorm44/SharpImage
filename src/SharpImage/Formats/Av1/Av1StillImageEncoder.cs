@@ -500,14 +500,18 @@ internal static class Av1StillImageEncoder
         // array; persists across SB rows. Left resets per SB row. This lifts the previous 2x2 (single-array) cap.
         int sb128Cols = (sbCols + 1) >> 1;
         var aboveLCoef = new byte[sb128Cols][];
+        var aboveMode = new byte[sb128Cols][];  // neighbour Y modes for the kf-y-mode context
         for (int i = 0; i < sb128Cols; i++)
         {
             aboveLCoef[i] = Filled(32);
+            aboveMode[i] = new byte[32]; // 0 = DC
         }
 
+        var pred = new byte[64 * 64];
         for (int sby = 0; sby < sbRows; sby++)
         {
             byte[] leftLCoef = Filled(32); // reset each SB row
+            var leftMode = new byte[32];   // 0 = DC
             int by = sby * 64;
             int by4 = (sby & 1) * 16;      // By & 31, By = sby*16 (4-units)
             for (int sbx = 0; sbx < sbCols; sbx++)
@@ -515,24 +519,20 @@ internal static class Av1StillImageEncoder
                 int bx = sbx * 64;
                 int bx4 = (sbx & 1) * 16;
                 byte[] above = aboveLCoef[sbx >> 1];
+                byte[] aMode = aboveMode[sbx >> 1];
 
                 // Partition NONE at BLOCK_64X64, ctx 0 (all full-64 SBs).
                 msac.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9);
 
-                int dcPred = DcPredict(recon, w, h, bx, by, 64, 64);
-                var residual = new int[64 * 64];
-                for (int y = 0; y < 64; y++)
-                {
-                    for (int x = 0; x < 64; x++)
-                    {
-                        residual[y * 64 + x] = luma[(by + y) * w + (bx + x)] - dcPred;
-                    }
-                }
-
-                int[] coeffs = Av1FwdTransform.ForwardQuantSquare(residual, 64, dcDq, acDq, scanLen);
+                // Choose the best non-directional intra mode (lowest residual SAD) and get its prediction.
+                Av1IntraPredMode yMode = ChooseIntraMode(recon, w, bw4, bh4, sbx * 16, sby * 16, 64, luma, w, bx, by, pred);
+                int[] coeffs = ForwardResidualPred(luma, w, bx, by, pred, 64, dcDq, acDq, scanLen);
                 int skip = HasNonZero(coeffs) ? 0 : 1;
+
                 msac.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);   // skip ctx 0
-                msac.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);   // DC mode
+                int aboveCtx = Av1Tables.IntraModeContext[aMode[bx4]];
+                int leftCtx = Av1Tables.IntraModeContext[leftMode[by4]];
+                msac.EncodeSymbol(cdf.GetKfYModeCdf(aboveCtx, leftCtx), (int)yMode, 12);
 
                 byte cfCtx;
                 if (skip == 0)
@@ -540,23 +540,86 @@ internal static class Av1StillImageEncoder
                     int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(Tx64x64, above.AsSpan(bx4), leftLCoef.AsSpan(by4));
                     Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx64x64, chroma: 0, yMode: 0, coeffs,
                         skipCtx: 0, dcSignCtx: dcSignCtx);
-                    cfCtx = DequantAndReconstruct(coeffs, dcDq, acDq, dcPred, recon, w, bx, by);
+                    cfCtx = DequantAndReconstructPred(coeffs, Tx64x64, 64, dcDq, acDq, pred, recon, w, bx, by);
                 }
                 else
                 {
                     cfCtx = 0x40;
-                    FillFlat(recon, w, bx, by, 64, dcPred);
+                    for (int y = 0; y < 64; y++)
+                    {
+                        Array.Copy(pred, y * 64, recon, (by + y) * w + bx, 64);
+                    }
                 }
 
                 // Context fills clip to the real frame (decoder: ctxW = min(tDim.W, Bw - curBx)).
                 int ctxW = Math.Min(16, bw4 - sbx * 16);
                 int ctxH = Math.Min(16, bh4 - sby * 16);
-                if (ctxW > 0) Array.Fill(above, cfCtx, bx4, ctxW);
-                if (ctxH > 0) Array.Fill(leftLCoef, cfCtx, by4, ctxH);
+                if (ctxW > 0) { Array.Fill(above, cfCtx, bx4, ctxW); Array.Fill(aMode, (byte)yMode, bx4, ctxW); }
+                if (ctxH > 0) { Array.Fill(leftLCoef, cfCtx, by4, ctxH); Array.Fill(leftMode, (byte)yMode, by4, ctxH); }
             }
         }
 
         return msac.Finish();
+    }
+
+    // Non-directional intra modes tried per block (no angle_delta symbol yet). All five are verified against
+    // libdav1d/ffmpeg. The kf-y-mode symbol is coded with nsym = NumIntraPredModes - 1 = 12, the dav1d convention
+    // for a 13-symbol alphabet (values 0..12), so Paeth (mode 12) round-trips like any other mode.
+    private static readonly Av1IntraPredMode[] CandidateModes =
+    {
+        Av1IntraPredMode.Dc, Av1IntraPredMode.Smooth, Av1IntraPredMode.SmoothV, Av1IntraPredMode.SmoothH,
+        Av1IntraPredMode.Paeth,
+    };
+
+    // Predicts an n x n luma block with the given intra mode into dst (stride n), reusing the decoder's own edge
+    // preparation + prediction so encoder and decoder agree bit-for-bit. recon is the reconstruction plane
+    // (stride reconW), bx4/by4 the block position in 4-unit units, bw4/bh4 the frame size in 4-unit units.
+    private static void PredictIntra(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4, int n,
+        Av1IntraPredMode mode, byte[] dst)
+    {
+        Span<byte> edge = stackalloc byte[257];
+        const int edgeCenter = 128;
+        int dstOff = (by4 * 4) * reconW + (bx4 * 4);
+        int tw4 = n >> 2;
+        bool haveTop = by4 > 0;
+        bool haveLeft = bx4 > 0;
+        int angle = 0;
+        int m = Av1Reconstruction.PrepareIntraEdges(
+            bx4, haveLeft, by4, haveTop, bw4, bh4, Av1EdgeFlags.None,
+            recon, dstOff, reconW, default, mode, ref angle, tw4, tw4, filterEdge: false, edge, edgeCenter, 8);
+        Av1IntraPred.Predict(m, dst, n, edge, edgeCenter, n, n, angle,
+            4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
+    }
+
+    // Chooses the intra mode with the lowest residual sum-of-absolute-differences (a cheap rate proxy) and
+    // returns it plus its prediction (into predOut, n x n).
+    private static Av1IntraPredMode ChooseIntraMode(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
+        int n, ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] predOut)
+    {
+        long best = long.MaxValue;
+        Av1IntraPredMode bestMode = Av1IntraPredMode.Dc;
+        var tmp = new byte[n * n];
+        foreach (Av1IntraPredMode mode in CandidateModes)
+        {
+            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, tmp);
+            long sad = 0;
+            for (int y = 0; y < n; y++)
+            {
+                for (int x = 0; x < n; x++)
+                {
+                    sad += Math.Abs(src[(srcBy + y) * srcW + (srcBx + x)] - tmp[y * n + x]);
+                }
+            }
+
+            if (sad < best)
+            {
+                best = sad;
+                bestMode = mode;
+                Array.Copy(tmp, predOut, n * n);
+            }
+        }
+
+        return bestMode;
     }
 
     // DC prediction for a 64x64 block from reconstructed neighbours, mirroring Av1IntraPred DC modes.
@@ -641,6 +704,67 @@ internal static class Av1StillImageEncoder
         }
 
         return cfCtx;
+    }
+
+    // Dequantizes and reconstructs an n x n block on top of an arbitrary intra prediction (predBlock, n x n),
+    // via the decoder's InvTxfmAdd, into recon. Returns the coefficient-context byte.
+    private static byte DequantAndReconstructPred(int[] levels, int tx, int n, int dcDq, int acDq,
+        byte[] predBlock, byte[] recon, int reconW, int bx, int by)
+    {
+        int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[tx].Ctx - 2);
+        const int cfMax = 32767;
+        var scan = Av1Tables.Scans[tx];
+        int eob = -1;
+        for (int i = scan.Length - 1; i >= 0; i--)
+        {
+            if (levels[scan[i]] != 0) { eob = i; break; }
+        }
+
+        var cf = new int[Math.Max(n * n, 32 * 32)];
+        int culLevel = 0;
+        for (int i = 0; i <= eob; i++)
+        {
+            int rc = scan[i];
+            int lvl = levels[rc];
+            if (lvl == 0) continue;
+            int mag = Math.Abs(lvl);
+            int sign = lvl < 0 ? 1 : 0;
+            int dq = ((rc == 0 ? dcDq : acDq) * mag) >> dqShift;
+            dq = Math.Min(dq, cfMax + sign);
+            cf[rc] = sign != 0 ? -dq : dq;
+            culLevel += mag;
+        }
+
+        int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
+        byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
+
+        var block = (byte[])predBlock.Clone();
+        Av1InvTransform.InvTxfmAdd(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], Av1TxType.DctDct, 8);
+        for (int y = 0; y < n; y++)
+        {
+            for (int x = 0; x < n; x++)
+            {
+                recon[(by + y) * reconW + (bx + x)] = block[y * n + x];
+            }
+        }
+
+        return cfCtx;
+    }
+
+    // Forward-transforms and quantizes (src block - prediction) for an n x n block.
+    private static int[] ForwardResidualPred(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy,
+        byte[] pred, int n, int dcDq, int acDq, int scanLen)
+    {
+        var residual = new int[n * n];
+        for (int y = 0; y < n; y++)
+        {
+            for (int x = 0; x < n; x++)
+            {
+                residual[y * n + x] = src[(srcBy + y) * srcW + (srcBx + x)] - pred[y * n + x];
+            }
+        }
+
+        return Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen);
     }
 
     /// <summary>Builds the sequence-header OBU and the OBU_FRAME (frame header + tile) for a monochrome key frame
