@@ -173,6 +173,43 @@ public class JpegDctTests
         await Assert.That(restored.AsSpan().SequenceEqual(jpeg)).IsTrue();
     }
 
+    // Every effort preset (Turbo..Maximum) must reconstruct the source byte-for-byte, and the parameterless
+    // default must equal Balanced (NOT Turbo) — the default favours compression; Turbo is an opt-in speed mode.
+    [Test]
+    public async Task Jpeg_EffortPresets_AllByteExact_DefaultIsBalanced()
+    {
+        using var src = new ImageFrame();
+        src.Initialize(96, 72, ColorspaceType.SRGB, false);
+        for (int y = 0; y < 72; y++)
+        {
+            var row = src.GetPixelRowForWrite(y);
+            for (int x = 0; x < 96; x++)
+            {
+                int o = x * src.NumberOfChannels;
+                row[o] = Quantum.ScaleFromByte((byte)((x * 7) ^ (y * 13)));
+                row[o + 1] = Quantum.ScaleFromByte((byte)((x * 11) + (y * 5)));
+                row[o + 2] = Quantum.ScaleFromByte((byte)(200 - (x * 3) - y));
+            }
+        }
+
+        using var ms = new System.IO.MemoryStream();
+        JpegCoder.Write(src, ms, quality: 85, subsampling: JpegSubsampling.Yuv420);
+        byte[] jpeg = ms.ToArray();
+
+        foreach (JpegRecompressionEffort effort in Enum.GetValues<JpegRecompressionEffort>())
+        {
+            byte[] container = JpegXlLossless.Encode(jpeg, effort);
+            byte[] restored = JpegXlLossless.Decode(container);
+            await Assert.That(restored.AsSpan().SequenceEqual(jpeg)).IsTrue();
+        }
+
+        byte[] def = JpegXlLossless.Encode(jpeg);
+        byte[] balanced = JpegXlLossless.Encode(jpeg, JpegRecompressionEffort.Balanced);
+        byte[] turbo = JpegXlLossless.Encode(jpeg, JpegRecompressionEffort.Turbo);
+        await Assert.That(def.AsSpan().SequenceEqual(balanced)).IsTrue();     // default == Balanced
+        await Assert.That((int)JpegRecompressionEffort.Balanced).IsNotEqualTo((int)JpegRecompressionEffort.Turbo);
+    }
+
     // A real PROGRESSIVE (SOF2) JPEG — multi-scan DC first/refine + AC first/refine with EOBRUN grouping —
     // must recompress and reconstruct byte-for-byte. This embeds a small libjpeg-family progressive JPEG so
     // the coverage runs everywhere (no external corpus needed). Guards the progressive scan re-encoder and the

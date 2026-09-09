@@ -18,6 +18,24 @@ using SharpImage.Image;
 
 namespace SharpImage.Formats;
 
+/// <summary>Speed vs compression presets for JPEG recompression. Every level is byte-exact; higher levels
+/// search more coding candidates for a smaller container at the cost of more CPU. <see cref="Balanced"/> is
+/// the recommended default; <see cref="Turbo"/> is a single pass at roughly libjxl's speed for a little size.</summary>
+public enum JpegRecompressionEffort
+{
+    /// <summary>Single pass — roughly libjxl's speed, a little larger than <see cref="Balanced"/>.</summary>
+    Turbo = Jxl.JxlEncoder.JpegEffortTurbo,
+
+    /// <summary>A quick best-of; between <see cref="Turbo"/> and <see cref="Balanced"/>.</summary>
+    Fast = Jxl.JxlEncoder.JpegEffortFast,
+
+    /// <summary>The recommended default: full best-of over predictors, scan orders and LZ77.</summary>
+    Balanced = Jxl.JxlEncoder.JpegEffortDefault,
+
+    /// <summary>Exhaustive: also tries the weighted-DC predictor, longer LZ77 and prefix codes.</summary>
+    Maximum = Jxl.JxlEncoder.JpegEffortMax,
+}
+
 public static class JpegXlLossless
 {
     private const uint Magic = 0x534A584C; // "SJXL"
@@ -26,22 +44,25 @@ public static class JpegXlLossless
     public static bool CanDecode(ReadOnlySpan<byte> data) =>
         data.Length >= 4 && BinaryPrimitives.ReadUInt32BigEndian(data) == Magic;
 
-    /// <summary>Effort presets for <see cref="Encode(byte[], int)"/> (speed vs compression; all byte-exact).</summary>
-    /// <summary>Single-pass mode: fastest (roughly libjxl's speed), at some compression cost.</summary>
+    /// <summary>Effort presets (speed vs compression) as raw levels; prefer <see cref="JpegRecompressionEffort"/>.</summary>
     public const int EffortTurbo = Jxl.JxlEncoder.JpegEffortTurbo;
     public const int EffortFast = Jxl.JxlEncoder.JpegEffortFast;
     public const int EffortDefault = Jxl.JxlEncoder.JpegEffortDefault;
     public const int EffortMax = Jxl.JxlEncoder.JpegEffortMax;
 
-    /// <summary>Losslessly transcodes a baseline JPEG to the SharpImage JXL-based recompression container
-    /// at the default effort. Use <see cref="Encode(byte[], int)"/> to trade speed against compression.</summary>
+    /// <summary>Losslessly transcodes a baseline/progressive JPEG to the SharpImage JXL-based recompression
+    /// container at the balanced default effort (favouring compression). Pass a
+    /// <see cref="JpegRecompressionEffort"/> to trade speed against size.</summary>
     public static byte[] Encode(byte[] jpeg) => Encode(jpeg, EffortDefault);
+
+    /// <summary>Losslessly transcodes a baseline/progressive JPEG to the SharpImage JXL-based recompression
+    /// container at the given effort. Every effort reconstructs the source JPEG byte-for-byte.</summary>
+    public static byte[] Encode(byte[] jpeg, JpegRecompressionEffort effort) => Encode(jpeg, (int)effort);
 
     /// <summary>Losslessly transcodes a baseline JPEG to the SharpImage JXL-based recompression container.</summary>
     /// <param name="jpeg">The source baseline/progressive JPEG bytes.</param>
-    /// <param name="effort">Compression effort 1-9 (see <see cref="EffortFast"/>/<see cref="EffortDefault"/>/
-    /// <see cref="EffortMax"/>): higher searches more coding candidates for a smaller container at more CPU.
-    /// Every effort level reconstructs the source byte-for-byte.</param>
+    /// <param name="effort">Compression effort 1-9 (see <see cref="JpegRecompressionEffort"/>): higher searches
+    /// more coding candidates for a smaller container at more CPU. Every level is byte-exact.</param>
     public static byte[] Encode(byte[] jpeg, int effort)
     {
         JpegDctData d = JpegCoder.ReadDctData(new MemoryStream(jpeg));
