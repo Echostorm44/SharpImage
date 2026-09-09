@@ -137,14 +137,26 @@ internal static class Av1StillImageEncoder
         return outBytes;
     }
 
-    /// <summary>Encodes a real 64x64 monochrome image as a complete .avif file (ISOBMFF container + AV1
-    /// codestream). Lossy — fidelity depends on <paramref name="baseQIdx"/>.</summary>
+    /// <summary>Encodes a real 64x64 monochrome image as a complete .avif file. Lossy — fidelity depends on
+    /// <paramref name="baseQIdx"/>.</summary>
     internal static byte[] EncodeAvifMonochrome64(ReadOnlySpan<byte> pixels, int baseQIdx)
+        => EncodeAvifMonochrome(pixels, 64, 64, baseQIdx);
+
+    /// <summary>Encodes a monochrome image of <paramref name="width"/>x<paramref name="height"/> (each in 33..64
+    /// — one 64x64 superblock coded as PARTITION_NONE; dims ≤32 would force a partition split we don't yet emit)
+    /// as a complete .avif. <paramref name="block64"/> is the full 64x64 luma superblock (frame content in the
+    /// top-left, edge-replicated beyond the frame).</summary>
+    internal static byte[] EncodeAvifMonochrome(ReadOnlySpan<byte> block64, int width, int height, int baseQIdx)
     {
-        const int n = 64;
-        int[]? coeffs = QuantizeImage64(pixels, baseQIdx);
-        (byte[] seqObu, byte[] frameObu) = BuildObus(n, n, baseQIdx, coeffs);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, n, n, monochrome: true);
+        if (width < 33 || width > 64 || height < 33 || height > 64)
+        {
+            throw new ArgumentOutOfRangeException(nameof(width),
+                $"Single-superblock AVIF encode requires width and height in 33..64 (got {width}x{height}).");
+        }
+
+        int[]? coeffs = QuantizeImage64(block64, baseQIdx);
+        (byte[] seqObu, byte[] frameObu) = BuildObus(width, height, baseQIdx, coeffs);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true);
     }
 
     /// <summary>Forward-transforms and quantizes a 64x64 monochrome image (DC prediction = 128) into the

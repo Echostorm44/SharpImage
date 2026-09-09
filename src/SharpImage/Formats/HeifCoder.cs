@@ -332,16 +332,16 @@ public static class HeifCoder
         => Encode(image, containerType, 20);
 
     /// <summary>
-    /// Encodes an image to HEIC (HEVC still image) at the given quantization parameter (0 = highest
-    /// quality/largest, ~51 = lowest). AVIF encoding is not supported (no AV1 encoder).
+    /// Encodes an image to HEIC (HEVC) or AVIF (AV1) still image at the given quantization parameter (0 = highest
+    /// quality/largest, ~51 = lowest). AVIF uses SharpImage's from-scratch AV1 intra encoder and currently
+    /// supports grayscale images up to 64x64 (a single superblock); larger or colour images are not yet
+    /// supported and throw <see cref="NotSupportedException"/>.
     /// </summary>
     public static byte[] Encode(ImageFrame image, HeifContainerType containerType, int qp)
     {
-        if (containerType != HeifContainerType.Heic)
+        if (containerType == HeifContainerType.Avif)
         {
-            throw new NotSupportedException(
-                "AVIF encoding is not implemented (no AV1 encoder). HEIC encoding and AVIF/HEIC " +
-                "decoding are supported.");
+            return EncodeAvif(image, qp);
         }
 
         int w = (int)image.Columns;
@@ -362,6 +362,53 @@ public static class HeifCoder
         }
 
         return Hevc.HeicEncoder.Encode(rgb, w, h, 3, Math.Clamp(qp, 0, 51), signDataHiding: true);
+    }
+
+    // AVIF encode via the from-scratch AV1 intra encoder. Current scope: grayscale, up to one 64x64 superblock.
+    private static byte[] EncodeAvif(ImageFrame image, int qp)
+    {
+        int w = (int)image.Columns;
+        int h = (int)image.Rows;
+        if (w < 33 || h < 33 || w > 64 || h > 64)
+        {
+            throw new NotSupportedException(
+                $"AVIF encoding currently supports images from 33x33 up to 64x64 (got {w}x{h}). Other sizes " +
+                "require the multi-superblock / sub-split partition encoder, which is not yet implemented.");
+        }
+
+        int channels = image.NumberOfChannels;
+
+        // Build a 64x64 luma block, edge-replicated beyond the frame. Reject colour content (chroma not yet
+        // supported) rather than silently discarding it.
+        var block = new byte[64 * 64];
+        for (int y = 0; y < 64; y++)
+        {
+            int sy = Math.Min(y, h - 1);
+            ReadOnlySpan<ushort> row = image.GetPixelRow(sy);
+            for (int x = 0; x < 64; x++)
+            {
+                int sx = Math.Min(x, w - 1);
+                int o = sx * channels;
+                int r = Quantum.ScaleToByte(row[o]);
+                if (channels >= 3)
+                {
+                    int g = Quantum.ScaleToByte(row[o + 1]);
+                    int b = Quantum.ScaleToByte(row[o + 2]);
+                    if (r != g || g != b)
+                    {
+                        throw new NotSupportedException(
+                            "AVIF encoding currently supports grayscale images only (colour chroma coding is " +
+                            "not yet implemented).");
+                    }
+                }
+
+                block[y * 64 + x] = (byte)r;
+            }
+        }
+
+        // Map the HEVC-style qp (0..51, lower = better) to an AV1 base_q_idx (1..255, lower = better).
+        int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        return Av1.Av1StillImageEncoder.EncodeAvifMonochrome(block, w, h, baseQIdx);
     }
 
     #region AV1 Intra Frame Codec

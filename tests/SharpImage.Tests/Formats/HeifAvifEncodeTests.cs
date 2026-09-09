@@ -1,0 +1,106 @@
+using SharpImage.Core;
+using SharpImage.Formats;
+using SharpImage.Image;
+
+namespace SharpImage.Tests.Formats;
+
+// Verifies the public AVIF encode entry point (HeifCoder.Encode → the from-scratch AV1 encoder) and that its
+// output round-trips back through HeifCoder.Decode. Covers a 64x64 and a non-64 (48x48) grayscale image, plus
+// the honest limitations (colour and out-of-range sizes throw).
+public sealed class HeifAvifEncodeTests
+{
+    private static ImageFrame GrayRamp(int w, int h)
+    {
+        var f = new ImageFrame();
+        f.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (long y = 0; y < h; y++)
+        {
+            var row = f.GetPixelRowForWrite(y);
+            int ch = f.NumberOfChannels;
+            for (long x = 0; x < w; x++)
+            {
+                byte v = (byte)(40 + (x + y) * 150 / (w + h));
+                ushort q = Quantum.ScaleFromByte(v);
+                int o = (int)x * ch;
+                for (int c = 0; c < ch; c++)
+                {
+                    row[o + c] = q;
+                }
+            }
+        }
+
+        return f;
+    }
+
+    private static (double rmse, int maxErr) RoundTrip(ImageFrame src, int qp)
+    {
+        byte[] avif = HeifCoder.Encode(src, HeifContainerType.Avif, qp);
+        int w = (int)src.Columns, h = (int)src.Rows;
+
+        // Must be a valid AVIF that our own decoder reads back.
+        if (!HeifCoder.IsAvif(avif))
+        {
+            return (999, 999);
+        }
+
+        ImageFrame dec = HeifCoder.Decode(avif);
+        double sse = 0; int maxErr = 0;
+        for (long y = 0; y < h; y++)
+        {
+            for (long x = 0; x < w; x++)
+            {
+                int a = (src.GetPixelChannel(x, y, 0) * 255 + 32767) / 65535;
+                int b = (dec.GetPixelChannel(x, y, 0) * 255 + 32767) / 65535;
+                int d = a - b;
+                sse += d * d;
+                maxErr = System.Math.Max(maxErr, System.Math.Abs(d));
+            }
+        }
+
+        return (System.Math.Sqrt(sse / (w * (double)h)), maxErr);
+    }
+
+    [Test]
+    public async Task Avif_64x64_Grayscale_RoundTrips()
+    {
+        (double rmse, int _) = RoundTrip(GrayRamp(64, 64), qp: 10);
+        await Assert.That(rmse).IsLessThan(3.0);
+    }
+
+    [Test]
+    public async Task Avif_48x48_Grayscale_RoundTrips()
+    {
+        // Non-64 frame: content in top-left of the 64x64 superblock, decoder crops to 48x48.
+        (double rmse, int _) = RoundTrip(GrayRamp(48, 48), qp: 10);
+        await Assert.That(rmse).IsLessThan(3.0);
+    }
+
+    [Test]
+    public async Task Avif_Colour_Throws()
+    {
+        var f = new ImageFrame();
+        f.Initialize(64, 64, ColorspaceType.SRGB, false);
+        for (long y = 0; y < 64; y++)
+        {
+            var row = f.GetPixelRowForWrite(y);
+            int ch = f.NumberOfChannels;
+            for (long x = 0; x < 64; x++)
+            {
+                int o = (int)x * ch;
+                row[o] = Quantum.ScaleFromByte(200);            // R
+                if (ch > 1) row[o + 1] = Quantum.ScaleFromByte(50); // G ≠ R ⇒ colour
+                if (ch > 2) row[o + 2] = Quantum.ScaleFromByte(50);
+            }
+        }
+
+        await Assert.That(() => HeifCoder.Encode(f, HeifContainerType.Avif, 10))
+            .Throws<System.NotSupportedException>();
+    }
+
+    [Test]
+    public async Task Avif_TooSmall_Throws()
+    {
+        await Assert.That(() => HeifCoder.Encode(GrayRamp(16, 16), HeifContainerType.Avif, 10))
+            .Throws<System.NotSupportedException>();
+    }
+}
