@@ -165,6 +165,191 @@ internal static class Av1StillImageEncoder
         return w.Finish();
     }
 
+    private const int Tx64x64 = 4;
+
+    /// <summary>Encodes a monochrome image whose frame is a 1..2 by 1..2 grid of full 64x64 superblocks (width
+    /// and height each 64 or 128) as a complete .avif. Unlike the single-block path this codes each superblock as
+    /// PARTITION_NONE with real DC prediction from reconstructed neighbours and neighbour DC-sign contexts,
+    /// reconstructing as it goes. Capped at 2x2 SBs because the decoder's above context holds only two SBs.</summary>
+    internal static byte[] EncodeAvifMonochromeMultiSb(ReadOnlySpan<byte> luma, int width, int height, int baseQIdx)
+    {
+        int sbCols = (((width + 3) >> 2) + 15) >> 4;
+        int sbRows = (((height + 3) >> 2) + 15) >> 4;
+        if (width % 64 != 0 || height % 64 != 0 || sbCols < 1 || sbCols > 2 || sbRows < 1 || sbRows > 2)
+        {
+            throw new NotSupportedException(
+                $"Multi-superblock AVIF encode currently supports 64 or 128 in each dimension (got {width}x{height}).");
+        }
+
+        byte[] tile = EncodeMultiSbTile(luma, width, height, sbCols, sbRows, baseQIdx);
+        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: true);
+        byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
+        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows);
+        var framePayload = new byte[frameHdr.Length + tile.Length];
+        frameHdr.CopyTo(framePayload, 0);
+        tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
+        byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true);
+    }
+
+    // Codes the whole tile: every 64x64 superblock as PARTITION_NONE/DC-intra, in raster order, reconstructing
+    // each block so later blocks predict from the same pixels the decoder will. Partition/skip/coeff-skip/y-mode
+    // contexts are all 0 for full-64 blocks; only DC prediction and the DC-sign context vary per block.
+    private static byte[] EncodeMultiSbTile(ReadOnlySpan<byte> luma, int w, int h, int sbCols, int sbRows, int baseQIdx)
+    {
+        int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
+        var cdf = new Av1CdfContext();
+        Av1CdfDefaults.InitializeDefault(cdf, qcat);
+        int dcDq = Av1Tables.DequantTable[0, baseQIdx, 0];
+        int acDq = Av1Tables.DequantTable[0, baseQIdx, 1];
+        int scanLen = Av1Tables.Scans[Tx64x64].Length;
+
+        var msac = new Av1MsacWriter();
+        var recon = new byte[w * h];
+        var aboveLCoef = new byte[32];   // frame-wide above (holds up to 2 SBs); persists across SB rows
+        Array.Fill(aboveLCoef, (byte)0x40);
+
+        for (int sby = 0; sby < sbRows; sby++)
+        {
+            var leftLCoef = new byte[32]; // reset each SB row
+            Array.Fill(leftLCoef, (byte)0x40);
+            int by = sby * 64;
+            for (int sbx = 0; sbx < sbCols; sbx++)
+            {
+                int bx = sbx * 64;
+                int bx4 = (bx >> 2) & 31;
+                int by4 = (by >> 2) & 31;
+
+                // Partition NONE at BLOCK_64X64, ctx 0 (all full-64 SBs).
+                msac.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9);
+
+                int dcPred = DcPredict(recon, w, h, bx, by, 64, 64);
+                var residual = new int[64 * 64];
+                for (int y = 0; y < 64; y++)
+                {
+                    for (int x = 0; x < 64; x++)
+                    {
+                        residual[y * 64 + x] = luma[(by + y) * w + (bx + x)] - dcPred;
+                    }
+                }
+
+                int[] coeffs = Av1FwdTransform.ForwardQuantSquare(residual, 64, dcDq, acDq, scanLen);
+                bool anyNz = false;
+                foreach (int c in coeffs)
+                {
+                    if (c != 0) { anyNz = true; break; }
+                }
+
+                int skip = anyNz ? 0 : 1;
+                msac.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);   // skip ctx 0
+                msac.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);   // DC mode
+
+                byte cfCtx;
+                if (skip == 0)
+                {
+                    int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(Tx64x64, aboveLCoef.AsSpan(bx4), leftLCoef.AsSpan(by4));
+                    Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx64x64, chroma: 0, yMode: 0, coeffs,
+                        skipCtx: 0, dcSignCtx: dcSignCtx);
+                    cfCtx = DequantAndReconstruct(coeffs, dcDq, acDq, dcPred, recon, w, bx, by);
+                }
+                else
+                {
+                    cfCtx = 0x40;
+                    for (int y = 0; y < 64; y++)
+                    {
+                        for (int x = 0; x < 64; x++)
+                        {
+                            recon[(by + y) * w + (bx + x)] = (byte)dcPred;
+                        }
+                    }
+                }
+
+                Array.Fill(aboveLCoef, cfCtx, bx4, 16);  // ctxW = tDim.W = 16 (full 64 block)
+                Array.Fill(leftLCoef, cfCtx, by4, 16);
+            }
+        }
+
+        return msac.Finish();
+    }
+
+    // DC prediction for a 64x64 block from reconstructed neighbours, mirroring Av1IntraPred DC modes.
+    private static int DcPredict(byte[] recon, int w, int h, int bx, int by, int bw, int bh)
+    {
+        bool haveTop = by > 0;
+        bool haveLeft = bx > 0;
+        if (haveTop && haveLeft)
+        {
+            int dc = (bw + bh) >> 1;
+            for (int x = 0; x < bw; x++) dc += recon[(by - 1) * w + bx + x];
+            for (int y = 0; y < bh; y++) dc += recon[(by + y) * w + bx - 1];
+            return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)(bw + bh));
+        }
+
+        if (haveTop)
+        {
+            int dc = bw >> 1;
+            for (int x = 0; x < bw; x++) dc += recon[(by - 1) * w + bx + x];
+            return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)bw);
+        }
+
+        if (haveLeft)
+        {
+            int dc = bh >> 1;
+            for (int y = 0; y < bh; y++) dc += recon[(by + y) * w + bx - 1];
+            return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)bh);
+        }
+
+        return 128;
+    }
+
+    // Dequantizes the quantized levels the way the decoder does, inverse-transforms onto the DC prediction (via
+    // the decoder's own InvTxfmAdd) to reconstruct the 64x64 block into `recon`, and returns the coefficient
+    // context byte (cul_level | dc-sign) that neighbours read.
+    private static byte DequantAndReconstruct(int[] levels, int dcDq, int acDq, int dcPred, byte[] recon, int w, int bx, int by)
+    {
+        const int tx = Tx64x64;
+        int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[tx].Ctx - 2);
+        const int cfMax = 32767; // ~(~127 << 8), 8-bit
+        var scan = Av1Tables.Scans[tx];
+
+        int eob = -1;
+        for (int i = scan.Length - 1; i >= 0; i--)
+        {
+            if (levels[scan[i]] != 0) { eob = i; break; }
+        }
+
+        var cf = new int[32 * 32];
+        int culLevel = 0;
+        for (int i = 0; i <= eob; i++)
+        {
+            int rc = scan[i];
+            int lvl = levels[rc];
+            if (lvl == 0) continue;
+            int mag = Math.Abs(lvl);
+            int sign = lvl < 0 ? 1 : 0;
+            int dq = ((rc == 0 ? dcDq : acDq) * mag) >> dqShift;
+            dq = Math.Min(dq, cfMax + sign);
+            cf[rc] = sign != 0 ? -dq : dq;
+            culLevel += mag;
+        }
+
+        int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
+        byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
+
+        var block = new byte[64 * 64];
+        Array.Fill(block, (byte)dcPred);
+        Av1InvTransform.InvTxfmAdd(block, 64, cf, eob, tx, Av1InvTransform.TxShift[tx], Av1TxType.DctDct, 8);
+        for (int y = 0; y < 64; y++)
+        {
+            for (int x = 0; x < 64; x++)
+            {
+                recon[(by + y) * w + (bx + x)] = block[y * 64 + x];
+            }
+        }
+
+        return cfCtx;
+    }
+
     /// <summary>Builds the sequence-header OBU and the OBU_FRAME (frame header + tile) for a monochrome key frame
     /// carrying the given coefficients (null ⇒ skip). The two OBUs are the building blocks for both a raw
     /// temporal unit and an AVIF container (seq OBU → av1C configOBUs, frame OBU → mdat).</summary>

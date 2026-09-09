@@ -369,11 +369,14 @@ public static class HeifCoder
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
-        if (w > 64 || h > 64)
+        // Single square block covers <=64px; the multi-superblock path covers 128px (a 1..2 x 1..2 grid of full
+        // 64x64 superblocks). Larger or in-between sizes are not yet supported.
+        bool multiSb = w > 64 || h > 64;
+        if (multiSb && (w > 128 || h > 128 || w % 64 != 0 || h % 64 != 0))
         {
             throw new NotSupportedException(
-                $"AVIF encoding currently supports images up to 64x64 (got {w}x{h}); larger frames require the " +
-                "multi-superblock encoder, which is not yet implemented.");
+                $"AVIF encoding supports up to 64x64 (any near-square size) or 128px multiples of 64 (got {w}x{h}); " +
+                "other larger sizes require the general multi-superblock encoder, not yet implemented.");
         }
 
         int channels = image.NumberOfChannels;
@@ -406,7 +409,9 @@ public static class HeifCoder
 
         // Map the HEVC-style qp (0..51, lower = better) to an AV1 base_q_idx (1..255, lower = better).
         int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
-        return Av1.Av1StillImageEncoder.EncodeAvifMonochrome(luma, w, h, baseQIdx);
+        return multiSb
+            ? Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx)
+            : Av1.Av1StillImageEncoder.EncodeAvifMonochrome(luma, w, h, baseQIdx);
     }
 
     #region AV1 Intra Frame Codec

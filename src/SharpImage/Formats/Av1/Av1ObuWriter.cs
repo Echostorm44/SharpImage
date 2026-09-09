@@ -42,6 +42,19 @@ internal static class Av1ObuWriter
         return outBytes;
     }
 
+    // TileMaxLog2 for one axis: smallest k with (1<<k) >= min(sb, MaxTiles=64) (mirrors TileLog2(1, min(sb,64))).
+    private static int TileMaxLog2(int sb)
+    {
+        int tgt = Math.Min(sb, 64);
+        int k = 0;
+        while ((1 << k) < tgt)
+        {
+            k++;
+        }
+
+        return k;
+    }
+
     /// <summary>Number of bits needed to hold (value) as an unsigned max field (frame_width_bits etc.).</summary>
     private static int BitsFor(int value)
     {
@@ -121,6 +134,11 @@ internal static class Av1ObuWriter
     /// (tile data follows in the same OBU_FRAME); otherwise a trailing one-bit terminates a standalone
     /// OBU_FRAME_HEADER.</summary>
     internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame)
+        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, 1, 1);
+
+    /// <summary>Frame header for a frame that is <paramref name="sbCols"/> x <paramref name="sbRows"/> 64x64
+    /// superblocks, coded as a single tile (uniform spacing, log2 tile dims 0).</summary>
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows)
     {
         if (baseQIdx <= 0 || baseQIdx > 255)
         {
@@ -142,8 +160,22 @@ internal static class Av1ObuWriter
         // allow_intra_bc skipped (screen content tools off).
         // refresh_context skipped (reduced still).
 
-        // tile_info: one 64x64 superblock ⇒ sbw=sbh=1 ⇒ only uniform_tile flag, no further bits.
+        // tile_info: a single tile (uniform spacing, log2 dims 0). The uniform loop reads an "increment" bit
+        // while TileLog2 < TileMaxLog2; a single 0 bit (per axis, only when the max is > 0) keeps it at 0 ⇒ one
+        // tile spanning the whole frame.
         w.PutBool(true);          // uniform_tile_spacing_flag
+        int maxLog2Cols = TileMaxLog2(sbCols);
+        int maxLog2Rows = TileMaxLog2(sbRows);
+        if (maxLog2Cols > 0)
+        {
+            w.PutBool(false);     // stop incrementing tile cols ⇒ TileLog2Cols = 0
+        }
+
+        if (maxLog2Rows > 0)
+        {
+            w.PutBool(false);     // stop incrementing tile rows ⇒ TileLog2Rows = 0
+        }
+        // TileLog2Cols == TileLog2Rows == 0 ⇒ no context_update_tile_id / tile_size_bytes fields.
 
         // quantization_params
         w.PutBits((uint)baseQIdx, 8); // base_q_idx

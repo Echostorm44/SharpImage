@@ -25,14 +25,15 @@ internal static class Av1CoeffEncode
         int tx,
         int chroma,
         int yMode,
-        ReadOnlySpan<int> signedLevels)
+        ReadOnlySpan<int> signedLevels,
+        int skipCtx = 0,
+        int dcSignCtx = 0)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
 
-        // Skip context for the first block (block size == tx size ⇒ 0). Kept explicit for clarity; callers that
-        // need real neighbour context should extend this.
-        int sctx = 0;
-        int cdfIdx = tDim.Ctx * 13 + sctx;
+        // Coefficient-skip (txb_skip) context. For a block whose size equals its transform (our single-block and
+        // full-64 superblock cases) this is 0; callers with sub-block transforms pass the real value.
+        int cdfIdx = tDim.Ctx * 13 + skipCtx;
 
         // Scan / level-buffer geometry (mirrors DecodeCoefs TwoD branch).
         int slw = Math.Min((int)tDim.Lw, (int)Av1TxSize.Tx32x32);
@@ -142,7 +143,7 @@ internal static class Av1CoeffEncode
             // DC sign first (only if DC nonzero), then AC nonzeros in increasing scan order (eob-position last).
             if (dcMag != 0)
             {
-                EncodeSignAndGolomb(w, coef.DcSign[chroma * 3 + 0][0], adaptSign: true, signedLevels[0], dcMag);
+                EncodeSignAndGolomb(w, coef.DcSign[chroma * 3 + dcSignCtx][0], adaptSign: true, signedLevels[0], dcMag);
             }
 
             for (int i = 1; i <= eob; i++)
@@ -166,7 +167,7 @@ internal static class Av1CoeffEncode
                 EncodeHiTok(w, coef.BrTok[brTokIdx + 0], dcMag);
             }
 
-            EncodeSignAndGolomb(w, coef.DcSign[chroma * 3 + 0][0], adaptSign: true, signedLevels[0], dcMag);
+            EncodeSignAndGolomb(w, coef.DcSign[chroma * 3 + dcSignCtx][0], adaptSign: true, signedLevels[0], dcMag);
         }
     }
 
