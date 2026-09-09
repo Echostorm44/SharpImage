@@ -41,6 +41,8 @@ public sealed class Av1ColorTests
     [Arguments(128, 128)]  // multi-SB colour, 2x2
     [Arguments(256, 128)]  // multi-SB colour, 4x2
     [Arguments(192, 192)]  // multi-SB colour, 3x3
+    [Arguments(100, 100)]  // non-multiple colour (even), edges padded/clipped
+    [Arguments(168, 104)]  // non-multiple colour
     public async Task Color_RoundTrips(int w, int h)
     {
         ImageFrame src = ColorImage(w, h);

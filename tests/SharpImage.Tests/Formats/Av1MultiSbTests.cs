@@ -49,6 +49,8 @@ public sealed class Av1MultiSbTests
     [Arguments(256, 128)]  // 4x2 SBs
     [Arguments(192, 192)]  // 3x3 SBs
     [Arguments(320, 64)]   // 5x1 SBs (odd SB128 count)
+    [Arguments(100, 100)]  // non-multiple: 2x2 SBs, edges padded/clipped
+    [Arguments(168, 104)]  // non-multiple, remainder > 32 both axes
     public async Task MultiSb_RoundTrips(int w, int h)
     {
         (double rmse, int _) = Roundtrip(w, h, baseQ: 32);

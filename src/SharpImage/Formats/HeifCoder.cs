@@ -369,14 +369,13 @@ public static class HeifCoder
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
-        // Single square block covers <=64px; the multi-superblock path covers any multiple of 64 (a grid of full
-        // 64x64 superblocks) up to 4096. In-between sizes (>64, not a multiple of 64) are not yet supported.
+        // Single square block covers <=64px; the multi-superblock path covers larger frames as a grid of 64x64
+        // superblocks (edges padded, output clipped), up to 4096. Sizes whose remainder mod 64 is 1..32 need a
+        // forced partition split that isn't implemented yet — the encoder throws for those.
         bool multiSb = w > 64 || h > 64;
-        if (multiSb && (w > 4096 || h > 4096 || w % 64 != 0 || h % 64 != 0))
+        if (multiSb && (w > 4096 || h > 4096))
         {
-            throw new NotSupportedException(
-                $"AVIF encoding supports up to 64x64 (any near-square size) or multiples of 64 up to 4096 (got {w}x{h}); " +
-                "other larger sizes need edge-clipped/rectangular partitions, not yet implemented.");
+            throw new NotSupportedException($"AVIF encoding supports up to 4096x4096 (got {w}x{h}).");
         }
 
         int channels = image.NumberOfChannels;
@@ -412,7 +411,12 @@ public static class HeifCoder
 
         if (colour)
         {
-            // Colour: single-block I420 for <=64px, multi-superblock I420 for 128px multiples of 64.
+            if ((w & 1) != 0 || (h & 1) != 0)
+            {
+                throw new NotSupportedException($"AVIF colour encoding requires even dimensions for I420 (got {w}x{h}).");
+            }
+
+            // Colour: single-block I420 for <=64px, multi-superblock I420 for larger frames.
             RgbToI420(rgb, w, h, out byte[] yP, out byte[] uP, out byte[] vP);
             return multiSb
                 ? Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx)

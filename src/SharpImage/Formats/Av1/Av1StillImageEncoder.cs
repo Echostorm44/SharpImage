@@ -281,15 +281,9 @@ internal static class Av1StillImageEncoder
     /// reconstructing as it goes. Capped at 2x2 SBs because the decoder's above context holds only two SBs.</summary>
     internal static byte[] EncodeAvifMonochromeMultiSb(ReadOnlySpan<byte> luma, int width, int height, int baseQIdx)
     {
-        int sbCols = (((width + 3) >> 2) + 15) >> 4;
-        int sbRows = (((height + 3) >> 2) + 15) >> 4;
-        if (width % 64 != 0 || height % 64 != 0 || width < 64 || height < 64 || width > 4096 || height > 4096)
-        {
-            throw new NotSupportedException(
-                $"Multi-superblock AVIF encode requires each dimension to be a multiple of 64 in 64..4096 (got {width}x{height}).");
-        }
-
-        byte[] tile = EncodeMultiSbTile(luma, width, height, sbCols, sbRows, baseQIdx);
+        ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
+        byte[] padded = PadPlane(luma, width, height, pw, ph);
+        byte[] tile = EncodeMultiSbTile(padded, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: true);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
         byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows);
@@ -306,15 +300,11 @@ internal static class Av1StillImageEncoder
     internal static byte[] EncodeAvifColorMultiSb(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
         int width, int height, int baseQIdx)
     {
-        int sbCols = (((width + 3) >> 2) + 15) >> 4;
-        int sbRows = (((height + 3) >> 2) + 15) >> 4;
-        if (width % 64 != 0 || height % 64 != 0 || width < 64 || height < 64 || width > 4096 || height > 4096)
-        {
-            throw new NotSupportedException(
-                $"Multi-superblock colour AVIF encode requires each dimension to be a multiple of 64 in 64..4096 (got {width}x{height}).");
-        }
-
-        byte[] tile = EncodeMultiSbColorTile(luma, u, v, width, height, sbCols, sbRows, baseQIdx);
+        ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
+        byte[] padY = PadPlane(luma, width, height, pw, ph);
+        byte[] padU = PadPlane(u, width / 2, height / 2, pw / 2, ph / 2);
+        byte[] padV = PadPlane(v, width / 2, height / 2, pw / 2, ph / 2);
+        byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
         byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome: false);
@@ -326,7 +316,7 @@ internal static class Av1StillImageEncoder
     }
 
     private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> uPlane, ReadOnlySpan<byte> vPlane,
-        int w, int h, int sbCols, int sbRows, int baseQIdx)
+        int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx)
     {
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
         var cdf = new Av1CdfContext();
@@ -396,9 +386,12 @@ internal static class Av1StillImageEncoder
                     FillFlat(reconV, cw, cbx, cby, 32, dcV);
                 }
 
-                Array.Fill(alY, cfY, bx4, 16); Array.Fill(lLY, cfY, by4, 16);   // luma ctxW = 16
-                Array.Fill(acU, cfU, cbx4, 8); Array.Fill(lCU, cfU, cby4, 8);   // chroma ctxW = uvtDim.W = 8
-                Array.Fill(acV, cfV, cbx4, 8); Array.Fill(lCV, cfV, cby4, 8);
+                // Context fills clip to the real frame; chroma uses (Bw-curBx+ssHor)>>ssHor (I420 ssHor=1).
+                int yW = Math.Min(16, bw4 - sbx * 16), yH = Math.Min(16, bh4 - sby * 16);
+                int cW = Math.Min(8, (bw4 - sbx * 16 + 1) >> 1), cH = Math.Min(8, (bh4 - sby * 16 + 1) >> 1);
+                if (yW > 0) { Array.Fill(alY, cfY, bx4, yW); Array.Fill(lLY, cfY, by4, yH); }
+                if (cW > 0) { Array.Fill(acU, cfU, cbx4, cW); Array.Fill(lCU, cfU, cby4, cH); }
+                if (cW > 0) { Array.Fill(acV, cfV, cbx4, cW); Array.Fill(lCV, cfV, cby4, cH); }
             }
         }
 
@@ -438,6 +431,46 @@ internal static class Av1StillImageEncoder
         return Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen);
     }
 
+    // Validates a multi-SB frame and returns the SB grid, real 4-unit dims (bw4/bh4, for context clipping) and
+    // padded pixel dims (pw/ph = SB-aligned). Every superblock must permit PARTITION_NONE (the edge SB's
+    // in-frame remainder must exceed 32px), i.e. a dimension's remainder mod 64 is 0 or >32.
+    private static void ValidateMultiSb(int w, int h, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph)
+    {
+        if (w < 64 || h < 64 || w > 4096 || h > 4096)
+        {
+            throw new NotSupportedException($"Multi-superblock AVIF encode supports 64..4096 per dimension (got {w}x{h}).");
+        }
+
+        bw4 = (w + 3) >> 2;
+        bh4 = (h + 3) >> 2;
+        sbCols = (bw4 + 15) >> 4;
+        sbRows = (bh4 + 15) >> 4;
+        pw = sbCols * 64;
+        ph = sbRows * 64;
+        if (bw4 <= (sbCols - 1) * 16 + 8 || bh4 <= (sbRows - 1) * 16 + 8)
+        {
+            throw new NotSupportedException(
+                $"Frame {w}x{h}: an edge superblock's in-frame remainder is <=32px, which needs a forced partition " +
+                "split not yet implemented (each dimension mod 64 must be 0 or >32).");
+        }
+    }
+
+    // Pads a plane to pw x ph by replicating the right/bottom edge.
+    private static byte[] PadPlane(ReadOnlySpan<byte> src, int w, int h, int pw, int ph)
+    {
+        var padded = new byte[pw * ph];
+        for (int y = 0; y < ph; y++)
+        {
+            int sy = Math.Min(y, h - 1);
+            for (int x = 0; x < pw; x++)
+            {
+                padded[y * pw + x] = src[sy * w + Math.Min(x, w - 1)];
+            }
+        }
+
+        return padded;
+    }
+
     private static void FillFlat(byte[] recon, int reconW, int bx, int by, int n, int value)
     {
         for (int y = 0; y < n; y++)
@@ -452,7 +485,7 @@ internal static class Av1StillImageEncoder
     // Codes the whole tile: every 64x64 superblock as PARTITION_NONE/DC-intra, in raster order, reconstructing
     // each block so later blocks predict from the same pixels the decoder will. Partition/skip/coeff-skip/y-mode
     // contexts are all 0 for full-64 blocks; only DC prediction and the DC-sign context vary per block.
-    private static byte[] EncodeMultiSbTile(ReadOnlySpan<byte> luma, int w, int h, int sbCols, int sbRows, int baseQIdx)
+    private static byte[] EncodeMultiSbTile(ReadOnlySpan<byte> luma, int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx)
     {
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
         var cdf = new Av1CdfContext();
@@ -515,8 +548,11 @@ internal static class Av1StillImageEncoder
                     FillFlat(recon, w, bx, by, 64, dcPred);
                 }
 
-                Array.Fill(above, cfCtx, bx4, 16);  // ctxW = tDim.W = 16 (full 64 block)
-                Array.Fill(leftLCoef, cfCtx, by4, 16);
+                // Context fills clip to the real frame (decoder: ctxW = min(tDim.W, Bw - curBx)).
+                int ctxW = Math.Min(16, bw4 - sbx * 16);
+                int ctxH = Math.Min(16, bh4 - sby * 16);
+                if (ctxW > 0) Array.Fill(above, cfCtx, bx4, ctxW);
+                if (ctxH > 0) Array.Fill(leftLCoef, cfCtx, by4, ctxH);
             }
         }
 
