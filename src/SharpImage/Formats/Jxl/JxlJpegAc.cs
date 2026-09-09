@@ -190,13 +190,17 @@ internal static partial class JxlEncoder
     // (short matches inflate the histograms and pre-empt better long matches), and 16 vs 32 win on different
     // content, so try both plus no-LZ77 and keep the smallest.
     private static readonly int[] JpegLz77MinLens = { 16, 32 };
+    private static readonly int[] TurboLargeLzModes = { 0 }; // turbo skips the LZ77 search on large streams
+    private const int TurboLzMaxTokens = 300000;             // ...above this token count (the search gets costly)
     private const int JpegSeLen = 4;          // hybrid config split for LZ77 length
     private const int JpegSeDist = 4;         // hybrid config split for LZ77 distance
 
     // Encode effort presets. Higher = try more candidate encodings (predictor / scan order / LZ77 length /
     // entropy backend / refinement iterations), keeping the smallest — better ratio, more CPU. The best-of is
     // pure ratio search: every tier is byte-exact (the container self-verifies), tiers only trade speed↔size.
-    internal const int JpegEffortFast = 2;      // ~single-pass: gradient DC, custom order, ANS, minimal refine
+    internal const int JpegEffortTurbo = 1;     // single pass: gradient DC, custom order, no LZ77, no refine —
+                                                // matches libjxl's approach (and roughly its speed)
+    internal const int JpegEffortFast = 2;      // gradient DC, both orders + {no-LZ77, LZ77}, minimal refine
     internal const int JpegEffortDefault = 5;   // balanced: both orders + {no-LZ77, LZ77} best-of, ANS
     internal const int JpegEffortMax = 9;       // exhaustive: + weighted-DC predictor, +LZ77-32, +prefix codes
 
@@ -224,11 +228,15 @@ internal static partial class JxlEncoder
         // dropping either badly hurts a whole content class for little speed. Likewise {no-LZ77, LZ77-16} is the
         // floor (LZ77 is what crushes graphics/screenshots). Effort scales the knobs with diminishing payoff:
         // the weighted-DC predictor, a second LZ77 length, prefix-code candidates, and refinement iterations.
+        // Turbo (effort 1) is a genuine single pass — one predictor, one order, no LZ77 match search and no
+        // Lloyd reassignment (just the initial per-cluster config optimization) — i.e. the same shape of work
+        // libjxl does, for roughly its speed, at some ratio cost on files where a non-default candidate wins.
+        bool turbo = effort <= 1;
         bool[] predictors = effort >= 7 ? new[] { false, true } : new[] { false };
         bool[] orderOpts = { true, false };
         int[] lzModes = effort >= 7 ? new[] { 0, 16, 32 } : new[] { 0, 16 };
         bool tryPrefix = effort >= 7;
-        int refineIters = effort >= 7 ? 5 : (effort >= 4 ? 3 : 1);
+        int refineIters = turbo ? 1 : (effort >= 7 ? 5 : (effort >= 4 ? 3 : 1));
 
         // Collect every independent candidate encoding as a job, then run them in parallel — the best-of is a
         // pure size race with no shared mutable state, so this is an exact-ratio speedup that scales with cores
@@ -252,7 +260,11 @@ internal static partial class JxlEncoder
                     JpegStats(d, valArr, ctxArr);
                 }
 
-                foreach (int minLen in lzModes)
+                // Turbo keeps LZ77 only on SMALL streams: there the match search is cheap and it carries the big
+                // wins on small graphics (icons, sprites), so the mean ratio holds; on large streams (a photo)
+                // it is the costly phase and rarely helps, so turbo drops it to stay near libjxl's speed.
+                int[] fileLzModes = (turbo && valArr.Length > TurboLzMaxTokens) ? TurboLargeLzModes : lzModes;
+                foreach (int minLen in fileLzModes)
                 {
                     jobs.Add((orders, useCustomOrder, useWp, valArr, ctxArr, minLen, false));
                     if (tryPrefix)

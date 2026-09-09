@@ -27,6 +27,8 @@ public static class JpegXlLossless
         data.Length >= 4 && BinaryPrimitives.ReadUInt32BigEndian(data) == Magic;
 
     /// <summary>Effort presets for <see cref="Encode(byte[], int)"/> (speed vs compression; all byte-exact).</summary>
+    /// <summary>Single-pass mode: fastest (roughly libjxl's speed), at some compression cost.</summary>
+    public const int EffortTurbo = Jxl.JxlEncoder.JpegEffortTurbo;
     public const int EffortFast = Jxl.JxlEncoder.JpegEffortFast;
     public const int EffortDefault = Jxl.JxlEncoder.JpegEffortDefault;
     public const int EffortMax = Jxl.JxlEncoder.JpegEffortMax;
