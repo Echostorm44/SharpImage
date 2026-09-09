@@ -412,9 +412,11 @@ public static class HeifCoder
 
         if (colour)
         {
-            // Colour uses the single-block I420 encoder (even, near-square size mapping to one 8..64 block).
+            // Colour: single-block I420 for <=64px, multi-superblock I420 for 128px multiples of 64.
             RgbToI420(rgb, w, h, out byte[] yP, out byte[] uP, out byte[] vP);
-            return Av1.Av1StillImageEncoder.EncodeAvifColor(yP, uP, vP, w, h, baseQIdx);
+            return multiSb
+                ? Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx)
+                : Av1.Av1StillImageEncoder.EncodeAvifColor(yP, uP, vP, w, h, baseQIdx);
         }
 
         return multiSb

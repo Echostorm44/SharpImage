@@ -18,9 +18,9 @@ public sealed class Av1ColorTests
             int ch = f.NumberOfChannels;
             for (long x = 0; x < w; x++)
             {
-                // Smooth colour field: R ramps with x, G with y, B constant-ish.
-                byte r = (byte)(20 + x * 3);
-                byte g = (byte)(20 + y * 3);
+                // Smooth colour field: R ramps with x, G with y, B constant (no byte overflow at any size).
+                byte r = (byte)(20 + x * 200 / w);
+                byte g = (byte)(20 + y * 200 / h);
                 byte b = (byte)(128);
                 int o = (int)x * ch;
                 row[o] = Quantum.ScaleFromByte(r);
@@ -33,10 +33,12 @@ public sealed class Av1ColorTests
     }
 
     [Test]
-    [Arguments(64, 64)]  // 64 block, TX_32X32 chroma
-    [Arguments(32, 32)]  // 32 block, TX_16X16 chroma, CfL-allowed
-    [Arguments(16, 16)]  // 16 block, TX_8X8 chroma
-    [Arguments(24, 24)]  // 32 block covering 24x24, TX_16X16 chroma
+    [Arguments(64, 64)]    // 64 block, TX_32X32 chroma
+    [Arguments(32, 32)]    // 32 block, TX_16X16 chroma, CfL-allowed
+    [Arguments(16, 16)]    // 16 block, TX_8X8 chroma
+    [Arguments(24, 24)]    // 32 block covering 24x24, TX_16X16 chroma
+    [Arguments(128, 64)]   // multi-SB colour, 2x1
+    [Arguments(128, 128)]  // multi-SB colour, 2x2
     public async Task Color_RoundTrips(int w, int h)
     {
         ImageFrame src = ColorImage(w, h);
