@@ -335,9 +335,11 @@ internal static class Av1StillImageEncoder
         int sb128Cols = (sbCols + 1) >> 1;
         var aLY = FilledArray(sb128Cols); var aCU = FilledArray(sb128Cols); var aCV = FilledArray(sb128Cols);
 
+        var aboveSkip = new byte[sbCols]; // block-skip context (see EncodeMultiSbTile)
         for (int sby = 0; sby < sbRows; sby++)
         {
             var lLY = Filled(32); var lCU = Filled(32); var lCV = Filled(32); // left (reset per SB row)
+            byte leftSkip = 0;
             int by = sby * 64, cby = sby * 32;
             int by4 = (sby & 1) * 16, cby4 = by4 >> 1;
             for (int sbx = 0; sbx < sbCols; sbx++)
@@ -357,7 +359,10 @@ internal static class Av1StillImageEncoder
                 int[] vC = ForwardResidual(vPlane, cw, cbx, cby, 32, dcV, dcDq, acDq, cScan);
                 int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
 
-                msac.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);                        // skip ctx 0
+                int skipCtx = aboveSkip[sbx] + leftSkip;
+                msac.EncodeBool((uint)skip, cdf.GetSkipCdf(skipCtx)[0]);
+                aboveSkip[sbx] = (byte)skip;
+                leftSkip = (byte)skip;
                 msac.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);                        // Y DC
                 msac.EncodeSymbol(cdf.GetUvModeCdf(cflAllowed: false, 0), 0, 12);         // UV DC (64 block)
 
@@ -507,11 +512,16 @@ internal static class Av1StillImageEncoder
             aboveMode[i] = new byte[32]; // 0 = DC
         }
 
+        // Block-skip context: the decoder derives it as Above.Skip[bx4] + Left.Skip[by4], so we track per-SB
+        // skip flags (above row persists across SB rows; left resets per row). Mode selection makes some blocks
+        // skippable, so this context is genuinely non-zero next to a skipped neighbour.
+        var aboveSkip = new byte[sbCols];
         var pred = new byte[64 * 64];
         for (int sby = 0; sby < sbRows; sby++)
         {
             byte[] leftLCoef = Filled(32); // reset each SB row
             var leftMode = new byte[32];   // 0 = DC
+            byte leftSkip = 0;             // left neighbour skip (reset per SB row; unavailable ⇒ 0)
             int by = sby * 64;
             int by4 = (sby & 1) * 16;      // By & 31, By = sby*16 (4-units)
             for (int sbx = 0; sbx < sbCols; sbx++)
@@ -524,15 +534,21 @@ internal static class Av1StillImageEncoder
                 // Partition NONE at BLOCK_64X64, ctx 0 (all full-64 SBs).
                 msac.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9);
 
-                // Choose the best non-directional intra mode (lowest residual SAD) and get its prediction.
-                Av1IntraPredMode yMode = ChooseIntraMode(recon, w, bw4, bh4, sbx * 16, sby * 16, 64, luma, w, bx, by, pred);
+                // Choose the best intra mode (lowest residual SAD) and get its prediction.
+                (Av1IntraPredMode yMode, int yDelta) = ChooseIntraMode(recon, w, bw4, bh4, sbx * 16, sby * 16, 64, luma, w, bx, by, pred);
                 int[] coeffs = ForwardResidualPred(luma, w, bx, by, pred, 64, dcDq, acDq, scanLen);
                 int skip = HasNonZero(coeffs) ? 0 : 1;
 
-                msac.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);   // skip ctx 0
+                int skipCtx = aboveSkip[sbx] + leftSkip;
+                msac.EncodeBool((uint)skip, cdf.GetSkipCdf(skipCtx)[0]);
+                aboveSkip[sbx] = (byte)skip;
+                leftSkip = (byte)skip;
                 int aboveCtx = Av1Tables.IntraModeContext[aMode[bx4]];
                 int leftCtx = Av1Tables.IntraModeContext[leftMode[by4]];
                 msac.EncodeSymbol(cdf.GetKfYModeCdf(aboveCtx, leftCtx), (int)yMode, 12);
+                // angle_delta for directional modes (block is 64x64 ≥ 8x8, so always coded).
+                if (IsDirectional(yMode))
+                    msac.EncodeSymbol(cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
 
                 byte cfCtx;
                 if (skip == 0)
@@ -562,20 +578,43 @@ internal static class Av1StillImageEncoder
         return msac.Finish();
     }
 
-    // Non-directional intra modes tried per block (no angle_delta symbol yet). All five are verified against
-    // libdav1d/ffmpeg. The kf-y-mode symbol is coded with nsym = NumIntraPredModes - 1 = 12, the dav1d convention
-    // for a 13-symbol alphabet (values 0..12), so Paeth (mode 12) round-trips like any other mode.
-    private static readonly Av1IntraPredMode[] CandidateModes =
+    // Intra modes tried per block, each as (mode, angle_delta). All are verified against libdav1d/ffmpeg.
+    // The kf-y-mode symbol is coded with nsym = NumIntraPredModes - 1 = 12 (dav1d convention for a 13-symbol
+    // alphabet, values 0..12), so Paeth (mode 12) round-trips like any other mode.
+    //
+    // Directional candidates are restricted to a "safe" subset whose prediction angle stays in [90,180], so the
+    // implementation mode is ImplVert / ImplHor / ImplZ2 — all of which need only top/left/top-left edges, never
+    // top-right or bottom-left. That makes the block's edge-availability flags (sbHasTr / sbHasBl, which depend on
+    // frame-level superblock ordering) irrelevant to the prediction, so the encoder reproduces the decoder's
+    // output bit-for-bit without replicating that logic. Directional prediction reuses the decoder's own
+    // PrepareIntraEdges (which folds angle_delta into the base angle) + Av1IntraPred.Predict. angle_delta ∈ [-3,3]
+    // is coded via AngleDeltaCdf[mode-Vertical], symbol = delta + 3, nsym 6 (7 symbols), for blocks ≥ 8x8.
+    private static readonly (Av1IntraPredMode Mode, int Delta)[] CandidateModes = BuildCandidates();
+
+    private static (Av1IntraPredMode, int)[] BuildCandidates()
     {
-        Av1IntraPredMode.Dc, Av1IntraPredMode.Smooth, Av1IntraPredMode.SmoothV, Av1IntraPredMode.SmoothH,
-        Av1IntraPredMode.Paeth,
-    };
+        var list = new List<(Av1IntraPredMode, int)>
+        {
+            (Av1IntraPredMode.Dc, 0), (Av1IntraPredMode.Smooth, 0),
+            (Av1IntraPredMode.SmoothV, 0), (Av1IntraPredMode.SmoothH, 0), (Av1IntraPredMode.Paeth, 0),
+        };
+        // Z2-base directional modes: full angle_delta range keeps angle in (90,180).
+        foreach (var m in new[] { Av1IntraPredMode.DiagDownRight, Av1IntraPredMode.VerticalRight, Av1IntraPredMode.HorizontalDown })
+            for (int d = -3; d <= 3; d++) list.Add((m, d));
+        for (int d = 0; d <= 3; d++) list.Add((Av1IntraPredMode.Vertical, d));    // angle 90..99 (delta≥0)
+        for (int d = -3; d <= 0; d++) list.Add((Av1IntraPredMode.Horizontal, d));  // angle 171..180 (delta≤0)
+        return list.ToArray();
+    }
+
+    // True for the 8 directional intra modes (Vertical..VerticalLeft) that carry an angle_delta symbol.
+    private static bool IsDirectional(Av1IntraPredMode m) =>
+        m >= Av1IntraPredMode.Vertical && m <= Av1IntraPredMode.VerticalLeft;
 
     // Predicts an n x n luma block with the given intra mode into dst (stride n), reusing the decoder's own edge
     // preparation + prediction so encoder and decoder agree bit-for-bit. recon is the reconstruction plane
     // (stride reconW), bx4/by4 the block position in 4-unit units, bw4/bh4 the frame size in 4-unit units.
     private static void PredictIntra(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4, int n,
-        Av1IntraPredMode mode, byte[] dst)
+        Av1IntraPredMode mode, int delta, byte[] dst)
     {
         Span<byte> edge = stackalloc byte[257];
         const int edgeCenter = 128;
@@ -583,7 +622,7 @@ internal static class Av1StillImageEncoder
         int tw4 = n >> 2;
         bool haveTop = by4 > 0;
         bool haveLeft = bx4 > 0;
-        int angle = 0;
+        int angle = delta; // PrepareIntraEdges folds this into the base angle for directional modes
         int m = Av1Reconstruction.PrepareIntraEdges(
             bx4, haveLeft, by4, haveTop, bw4, bh4, Av1EdgeFlags.None,
             recon, dstOff, reconW, default, mode, ref angle, tw4, tw4, filterEdge: false, edge, edgeCenter, 8);
@@ -593,15 +632,15 @@ internal static class Av1StillImageEncoder
 
     // Chooses the intra mode with the lowest residual sum-of-absolute-differences (a cheap rate proxy) and
     // returns it plus its prediction (into predOut, n x n).
-    private static Av1IntraPredMode ChooseIntraMode(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
-        int n, ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] predOut)
+    private static (Av1IntraPredMode Mode, int Delta) ChooseIntraMode(byte[] recon, int reconW, int bw4, int bh4,
+        int bx4, int by4, int n, ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] predOut)
     {
         long best = long.MaxValue;
-        Av1IntraPredMode bestMode = Av1IntraPredMode.Dc;
+        (Av1IntraPredMode Mode, int Delta) bestCand = (Av1IntraPredMode.Dc, 0);
         var tmp = new byte[n * n];
-        foreach (Av1IntraPredMode mode in CandidateModes)
+        foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
-            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, tmp);
+            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, tmp);
             long sad = 0;
             for (int y = 0; y < n; y++)
             {
@@ -614,12 +653,12 @@ internal static class Av1StillImageEncoder
             if (sad < best)
             {
                 best = sad;
-                bestMode = mode;
+                bestCand = (mode, delta);
                 Array.Copy(tmp, predOut, n * n);
             }
         }
 
-        return bestMode;
+        return bestCand;
     }
 
     // DC prediction for a 64x64 block from reconstructed neighbours, mirroring Av1IntraPred DC modes.

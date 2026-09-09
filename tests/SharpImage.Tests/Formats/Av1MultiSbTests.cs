@@ -56,4 +56,39 @@ public sealed class Av1MultiSbTests
         (double rmse, int _) = Roundtrip(w, h, baseQ: 32);
         await Assert.That(rmse).IsLessThan(4.0);
     }
+
+    // Structured content whose regions favour different intra modes (diagonal, vertical, horizontal) — this
+    // exercises directional intra-mode selection with angle_delta AND produces adjacent skipped/coded blocks,
+    // the combination that first exposed the block-skip-context bug. Verifies round-trip through our decoder;
+    // the same streams are byte-exact in ffmpeg/libdav1d.
+    [Test]
+    [Arguments(192, 128)]
+    [Arguments(128, 192)]
+    [Arguments(256, 128)]
+    public async Task MultiSb_Directional_RoundTrips(int w, int h)
+    {
+        var src = new byte[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int v = x < w / 3 ? 20 + (x + y) * 180 / (w + h)   // diagonal
+                      : x < 2 * w / 3 ? 20 + x * 180 / w            // vertical edges
+                      : 20 + y * 180 / h;                            // horizontal edges
+                src[y * w + x] = (byte)v;
+            }
+
+        byte[] avif = Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(src, w, h, 48);
+        ImageFrame frame = HeifCoder.Decode(avif);
+        double sse = 0;
+        for (long y = 0; y < h; y++)
+            for (long x = 0; x < w; x++)
+            {
+                int val = (frame.GetPixelChannel(x, y, 0) * 255 + 32767) / 65535;
+                int d = src[y * w + x] - val;
+                sse += d * d;
+            }
+
+        double rmse = System.Math.Sqrt(sse / (w * (double)h));
+        await Assert.That(rmse).IsLessThan(3.0);
+    }
 }
