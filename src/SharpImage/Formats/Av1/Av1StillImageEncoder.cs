@@ -334,11 +334,15 @@ internal static class Av1StillImageEncoder
         // Per-SB128-column above contexts for luma + both chroma planes (persist across SB rows).
         int sb128Cols = (sbCols + 1) >> 1;
         var aLY = FilledArray(sb128Cols); var aCU = FilledArray(sb128Cols); var aCV = FilledArray(sb128Cols);
+        var aboveModeY = new byte[sb128Cols][]; // luma mode context for kf-y-mode (0 = DC)
+        for (int i = 0; i < sb128Cols; i++) aboveModeY[i] = new byte[32];
 
         var aboveSkip = new byte[sbCols]; // block-skip context (see EncodeMultiSbTile)
+        var pred = new byte[64 * 64];
         for (int sby = 0; sby < sbRows; sby++)
         {
             var lLY = Filled(32); var lCU = Filled(32); var lCV = Filled(32); // left (reset per SB row)
+            var leftModeY = new byte[32];
             byte leftSkip = 0;
             int by = sby * 64, cby = sby * 32;
             int by4 = (sby & 1) * 16, cby4 = by4 >> 1;
@@ -348,13 +352,15 @@ internal static class Av1StillImageEncoder
                 int bx4 = (sbx & 1) * 16, cbx4 = bx4 >> 1;
                 int a128 = sbx >> 1;
                 byte[] alY = aLY[a128], acU = aCU[a128], acV = aCV[a128];
+                byte[] aModeY = aboveModeY[a128];
 
                 msac.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9); // PARTITION_NONE
 
-                int dcY = DcPredict(reconY, w, h, bx, by, 64, 64);
+                // Luma: full intra-mode selection (DC/Smooth/directional...). Chroma: DC prediction.
+                (Av1IntraPredMode yMode, int yDelta) = ChooseIntraMode(reconY, w, bw4, bh4, sbx * 16, sby * 16, 64, luma, w, bx, by, pred);
+                int[] yC = ForwardResidualPred(luma, w, bx, by, pred, 64, dcDq, acDq, yScan);
                 int dcU = DcPredict(reconU, cw, chh, cbx, cby, 32, 32);
                 int dcV = DcPredict(reconV, cw, chh, cbx, cby, 32, 32);
-                int[] yC = ForwardResidual(luma, w, bx, by, 64, dcY, dcDq, acDq, yScan);
                 int[] uC = ForwardResidual(uPlane, cw, cbx, cby, 32, dcU, dcDq, acDq, cScan);
                 int[] vC = ForwardResidual(vPlane, cw, cbx, cby, 32, dcV, dcDq, acDq, cScan);
                 int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
@@ -363,8 +369,12 @@ internal static class Av1StillImageEncoder
                 msac.EncodeBool((uint)skip, cdf.GetSkipCdf(skipCtx)[0]);
                 aboveSkip[sbx] = (byte)skip;
                 leftSkip = (byte)skip;
-                msac.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);                        // Y DC
-                msac.EncodeSymbol(cdf.GetUvModeCdf(cflAllowed: false, 0), 0, 12);         // UV DC (64 block)
+                int yAboveCtx = Av1Tables.IntraModeContext[aModeY[bx4]];
+                int yLeftCtx = Av1Tables.IntraModeContext[leftModeY[by4]];
+                msac.EncodeSymbol(cdf.GetKfYModeCdf(yAboveCtx, yLeftCtx), (int)yMode, 12);
+                if (IsDirectional(yMode))
+                    msac.EncodeSymbol(cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
+                msac.EncodeSymbol(cdf.GetUvModeCdf(cflAllowed: false, (int)yMode), 0, 12);  // UV DC (64 block, no CfL)
 
                 byte cfY = 0x40, cfU = 0x40, cfV = 0x40;
                 if (skip == 0)
@@ -380,13 +390,13 @@ internal static class Av1StillImageEncoder
                     Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx32x32, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
                     Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx32x32, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
 
-                    cfY = DequantAndReconstruct(yC, Tx64x64, 64, dcDq, acDq, dcY, reconY, w, bx, by);
+                    cfY = DequantAndReconstructPred(yC, Tx64x64, 64, dcDq, acDq, pred, reconY, w, bx, by);
                     cfU = DequantAndReconstruct(uC, Tx32x32, 32, dcDq, acDq, dcU, reconU, cw, cbx, cby);
                     cfV = DequantAndReconstruct(vC, Tx32x32, 32, dcDq, acDq, dcV, reconV, cw, cbx, cby);
                 }
                 else
                 {
-                    FillFlat(reconY, w, bx, by, 64, dcY);
+                    for (int yy = 0; yy < 64; yy++) Array.Copy(pred, yy * 64, reconY, (by + yy) * w + bx, 64);
                     FillFlat(reconU, cw, cbx, cby, 32, dcU);
                     FillFlat(reconV, cw, cbx, cby, 32, dcV);
                 }
@@ -394,7 +404,7 @@ internal static class Av1StillImageEncoder
                 // Context fills clip to the real frame; chroma uses (Bw-curBx+ssHor)>>ssHor (I420 ssHor=1).
                 int yW = Math.Min(16, bw4 - sbx * 16), yH = Math.Min(16, bh4 - sby * 16);
                 int cW = Math.Min(8, (bw4 - sbx * 16 + 1) >> 1), cH = Math.Min(8, (bh4 - sby * 16 + 1) >> 1);
-                if (yW > 0) { Array.Fill(alY, cfY, bx4, yW); Array.Fill(lLY, cfY, by4, yH); }
+                if (yW > 0) { Array.Fill(alY, cfY, bx4, yW); Array.Fill(lLY, cfY, by4, yH); Array.Fill(aModeY, (byte)yMode, bx4, yW); Array.Fill(leftModeY, (byte)yMode, by4, yH); }
                 if (cW > 0) { Array.Fill(acU, cfU, cbx4, cW); Array.Fill(lCU, cfU, cby4, cH); }
                 if (cW > 0) { Array.Fill(acV, cfV, cbx4, cW); Array.Fill(lCV, cfV, cby4, cH); }
             }
