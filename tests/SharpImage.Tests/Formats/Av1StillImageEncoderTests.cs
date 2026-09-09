@@ -39,4 +39,45 @@ public sealed class Av1StillImageEncoderTests
         await Assert.That(firstVal).IsEqualTo(128);
         await Assert.That(mismatches).IsEqualTo(0);
     }
+
+    [Test]
+    [Arguments(200, 2, false)]
+    [Arguments(200, 2, true)]
+    [Arguments(200, 1, false)]
+    public async Task DcResidual_64x64_DecodesToUniformNon128(int baseQ, int dcLevel, bool neg)
+    {
+        byte[] stream = Av1StillImageEncoder.EncodeFlatMonochrome(64, 64, baseQ, dcLevel, neg);
+
+        var decoder = new Av1Decoder();
+        decoder.Initialize(default);
+        DecodedVideoFrame? frame = decoder.Decode(stream, 0, isKeyframe: true);
+
+        await Assert.That(frame).IsNotNull();
+        var y = frame!.YPlane.Span;
+        int stride = frame.YStride;
+        int v0 = y[0];
+        int mismatches = 0;
+        for (int row = 0; row < 64; row++)
+        {
+            for (int col = 0; col < 64; col++)
+            {
+                if (y[row * stride + col] != v0)
+                {
+                    mismatches++;
+                }
+            }
+        }
+
+        System.Console.WriteLine($"[DC-RESIDUAL] baseQ={baseQ} dcLevel={dcLevel} neg={neg} => value={v0}");
+        await Assert.That(mismatches).IsEqualTo(0);      // uniform plane
+        await Assert.That(v0).IsNotEqualTo(128);          // residual actually applied
+        if (neg)
+        {
+            await Assert.That(v0).IsLessThan(128);
+        }
+        else
+        {
+            await Assert.That(v0).IsGreaterThan(128);
+        }
+    }
 }
