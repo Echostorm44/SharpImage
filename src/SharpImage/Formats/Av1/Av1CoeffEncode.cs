@@ -21,8 +21,10 @@ internal static class Av1CoeffEncode
     internal static void EncodeCoefs(
         Av1MsacWriter w,
         Av1CdfCoefContext coef,
+        Av1CdfModeContext modeCdf,
         int tx,
         int chroma,
+        int yMode,
         ReadOnlySpan<int> signedLevels)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
@@ -61,7 +63,15 @@ internal static class Av1CoeffEncode
 
         w.EncodeBool(0, coef.CoefSkip[cdfIdx][0]);
 
-        // Transform type is DctDct with no symbol for the sizes we allow (tDim.Max + intra >= TX_64X64).
+        // --- Transform type ---
+        // The decoder codes a tx-type symbol for intra luma when tDim.Max + intra < TX_64X64 (i.e. TX_16X16 and
+        // smaller) and segQIdx != 0; TX_32X32/TX_64X64 imply DctDct with no symbol. We always emit DctDct.
+        // With reduced_tx_set the symbol is TxtpIntra2[tDim.Min*13 + yMode], and DctDct is index 1 in that set.
+        const int intra = 1;
+        if (tDim.Max + intra < (int)Av1TxSize.Tx64x64)
+        {
+            w.EncodeSymbol(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], 1, 4);
+        }
 
         // --- EOB bin + extra bits ---
         EncodeEob(w, coef, chroma, tx2dSzCtx, tDim.Ctx, eob);

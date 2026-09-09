@@ -23,6 +23,9 @@ internal static class Av1FwdTransform
     /// <paramref name="dcDq"/>/<paramref name="acDq"/> are the decoder's DC/AC dequant values for this qindex.
     /// Returns levels indexed rc = kx*sh + ky (kx=horizontal freq, ky=vertical freq, sh=min(N,32)).</summary>
     internal static int[] ForwardQuantSquare(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount)
+        => ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, QuantScaleK);
+
+    internal static int[] ForwardQuantSquare(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, double k)
     {
         int kept = Math.Min(n, 32);
         int sh = kept;
@@ -57,7 +60,7 @@ internal static class Av1FwdTransform
                 }
 
                 int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
-                int q = (int)Math.Round(acc * QuantScaleK / dq, MidpointRounding.AwayFromZero);
+                int q = (int)Math.Round(acc * k / dq, MidpointRounding.AwayFromZero);
                 levels[kx * sh + ky] = q;
             }
         }

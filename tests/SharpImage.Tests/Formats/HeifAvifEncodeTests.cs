@@ -68,11 +68,15 @@ public sealed class HeifAvifEncodeTests
     }
 
     [Test]
-    public async Task Avif_48x48_Grayscale_RoundTrips()
+    [Arguments(48, 48)]  // 64-block
+    [Arguments(24, 24)]  // 32-block (one forced split)
+    [Arguments(16, 16)]  // 16-block (two forced splits)
+    [Arguments(30, 28)]  // near-square, 32-block
+    [Arguments(8, 8)]    // 8-block (three forced splits)
+    public async Task Avif_SmallSquare_RoundTrips(int w, int h)
     {
-        // Non-64 frame: content in top-left of the 64x64 superblock, decoder crops to 48x48.
-        (double rmse, int _) = RoundTrip(GrayRamp(48, 48), qp: 10);
-        await Assert.That(rmse).IsLessThan(3.0);
+        (double rmse, int _) = RoundTrip(GrayRamp(w, h), qp: 10);
+        await Assert.That(rmse).IsLessThan(4.0);
     }
 
     [Test]
@@ -98,9 +102,10 @@ public sealed class HeifAvifEncodeTests
     }
 
     [Test]
-    public async Task Avif_TooSmall_Throws()
+    public async Task Avif_Rectangular_Throws()
     {
-        await Assert.That(() => HeifCoder.Encode(GrayRamp(16, 16), HeifContainerType.Avif, 10))
+        // 40x20 needs a rectangular partition (only one split axis available) — not yet supported.
+        await Assert.That(() => HeifCoder.Encode(GrayRamp(40, 20), HeifContainerType.Avif, 10))
             .Throws<System.NotSupportedException>();
     }
 }

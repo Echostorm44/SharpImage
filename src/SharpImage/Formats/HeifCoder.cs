@@ -369,26 +369,24 @@ public static class HeifCoder
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
-        if (w < 33 || h < 33 || w > 64 || h > 64)
+        if (w > 64 || h > 64)
         {
             throw new NotSupportedException(
-                $"AVIF encoding currently supports images from 33x33 up to 64x64 (got {w}x{h}). Other sizes " +
-                "require the multi-superblock / sub-split partition encoder, which is not yet implemented.");
+                $"AVIF encoding currently supports images up to 64x64 (got {w}x{h}); larger frames require the " +
+                "multi-superblock encoder, which is not yet implemented.");
         }
 
         int channels = image.NumberOfChannels;
 
-        // Build a 64x64 luma block, edge-replicated beyond the frame. Reject colour content (chroma not yet
-        // supported) rather than silently discarding it.
-        var block = new byte[64 * 64];
-        for (int y = 0; y < 64; y++)
+        // Extract tightly-packed luma. Reject colour content (chroma not yet supported) rather than silently
+        // discarding it.
+        var luma = new byte[w * h];
+        for (int y = 0; y < h; y++)
         {
-            int sy = Math.Min(y, h - 1);
-            ReadOnlySpan<ushort> row = image.GetPixelRow(sy);
-            for (int x = 0; x < 64; x++)
+            ReadOnlySpan<ushort> row = image.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
             {
-                int sx = Math.Min(x, w - 1);
-                int o = sx * channels;
+                int o = x * channels;
                 int r = Quantum.ScaleToByte(row[o]);
                 if (channels >= 3)
                 {
@@ -402,13 +400,13 @@ public static class HeifCoder
                     }
                 }
 
-                block[y * 64 + x] = (byte)r;
+                luma[y * w + x] = (byte)r;
             }
         }
 
         // Map the HEVC-style qp (0..51, lower = better) to an AV1 base_q_idx (1..255, lower = better).
         int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
-        return Av1.Av1StillImageEncoder.EncodeAvifMonochrome(block, w, h, baseQIdx);
+        return Av1.Av1StillImageEncoder.EncodeAvifMonochrome(luma, w, h, baseQIdx);
     }
 
     #region AV1 Intra Frame Codec

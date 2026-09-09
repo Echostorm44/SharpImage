@@ -32,16 +32,21 @@ internal static class Av1StillImageEncoder
         byte[] seqPayload = Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, seqPayload);
 
-        // Build the TX_64X64 coefficient array (rc-indexed) for a single DC coefficient.
+        if (!TryResolveSingleBlock(width, height, out BlockPlan plan))
+        {
+            throw new ArgumentOutOfRangeException(nameof(width), $"Frame {width}x{height} is not a single square block.");
+        }
+
+        // Build the coefficient array (rc-indexed for the block's transform) for a single DC coefficient.
         int[]? coeffs = null;
         if (dcLevel > 0)
         {
-            coeffs = new int[Av1Tables.Scans[Tx64x64].Length];
+            coeffs = new int[Av1Tables.Scans[plan.Tx].Length];
             coeffs[0] = dcNegative ? -dcLevel : dcLevel;
         }
 
         byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true);
-        byte[] tile = EncodeSingleSuperblockTile(baseQIdx, coeffs);
+        byte[] tile = EncodeSingleBlockTile(baseQIdx, coeffs, plan);
 
         var framePayload = new byte[frameHdr.Length + tile.Length];
         frameHdr.CopyTo(framePayload, 0);
@@ -58,18 +63,80 @@ internal static class Av1StillImageEncoder
         return outBytes;
     }
 
-    /// <summary>Codes the single-block tile with the same CDFs and contexts the decoder uses. With
-    /// disable_cdf_update=1 the decoder reads with static default CDFs and does not adapt, so we use the
-    /// non-adaptive Encode* calls against the same default CDF context.</summary>
-    private const int Tx64x64 = 4;
-
-    /// <summary>Encodes a real 64x64 monochrome image: DC-predicts the single block (128, no neighbours),
-    /// forward-transforms and quantizes the residual, and codes the coefficients. Lossy — reconstruction fidelity
-    /// depends on <paramref name="baseQIdx"/>. Returns the AV1 temporal unit.</summary>
+    /// <summary>Encodes a tightly-packed 64x64 monochrome luma image as a raw AV1 temporal unit (TD + seq +
+    /// OBU_FRAME) — DC prediction, forward transform, quant, coefficient coding. Lossy.</summary>
     internal static byte[] EncodeMonochromeImage64(ReadOnlySpan<byte> pixels, int baseQIdx)
-        => EncodeMonochromeWithCoeffs(64, 64, baseQIdx, QuantizeImage64(pixels, baseQIdx));
+    {
+        TryResolveSingleBlock(64, 64, out BlockPlan plan);
+        return EncodeMonochromeWithCoeffs(64, 64, baseQIdx, QuantizeBlock(pixels, 64, 64, plan, baseQIdx));
+    }
 
-    private static byte[] EncodeSingleSuperblockTile(int baseQIdx, int[]? coeffs)
+    // A single square intra block covering the frame, reached from the 64x64 superblock via forced partition
+    // splits (which emit no symbols). Only PARTITION_NONE at the target level is coded.
+    private readonly struct BlockPlan
+    {
+        public readonly Av1BlockLevel Bl;   // partition level of the coded block
+        public readonly int Tx;             // luma transform size ordinal
+        public readonly int NPart;          // partition symbol count at this level (PartitionTypeCount[bl])
+        public readonly int BlockPx;        // block dimension in pixels (8/16/32/64)
+
+        public BlockPlan(Av1BlockLevel bl, int tx, int nPart, int blockPx)
+        {
+            Bl = bl;
+            Tx = tx;
+            NPart = nPart;
+            BlockPx = blockPx;
+        }
+    }
+
+    // Resolves the single square block that covers a width x height frame, or false if the frame needs a
+    // rectangular / multi-block partition we don't yet emit. Mirrors the decoder's forced-split rule at the
+    // superblock root: while neither dimension exceeds hsz the block is force-split to the next level.
+    private static bool TryResolveSingleBlock(int width, int height, out BlockPlan plan)
+    {
+        plan = default;
+        int width4 = (width + 3) >> 2;
+        int height4 = (height + 3) >> 2;
+
+        for (int bl = 1; bl <= 4; bl++)
+        {
+            int hsz = 16 >> bl;
+            bool haveH = width4 > hsz;
+            bool haveV = height4 > hsz;
+            if (!haveH && !haveV)
+            {
+                continue; // forced split to bl+1 (no symbol)
+            }
+
+            // First level with a real partition decision. We can code PARTITION_NONE only when the full range is
+            // available (both splits) and the block covers the whole frame.
+            if (!haveH || !haveV)
+            {
+                return false;
+            }
+
+            int blockPx = 64 >> (bl - 1);
+            if (width > blockPx || height > blockPx)
+            {
+                return false;
+            }
+
+            (int bs, int tx) = bl switch
+            {
+                1 => ((int)Av1BlockSize.Bs64x64, 4),
+                2 => (7 /*Bs32x32*/, 3),
+                3 => (12 /*Bs16x16*/, 2),
+                _ => (17 /*Bs8x8*/, 1),
+            };
+            _ = bs;
+            plan = new BlockPlan((Av1BlockLevel)bl, tx, Av1Tables.PartitionTypeCount[bl], blockPx);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static byte[] EncodeSingleBlockTile(int baseQIdx, int[]? coeffs, in BlockPlan plan)
     {
         // qcat selects the coefficient CDF set; must match the decoder's derivation from the segment q index.
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
@@ -78,23 +145,21 @@ internal static class Av1StillImageEncoder
 
         var w = new Av1MsacWriter();
 
-        // Partition at BLOCK_64X64 (bl=Bl64x64), ctx=0 (no neighbours; reset_context fills Partition=0).
-        // PARTITION_NONE = 0. Decoder: DecodeSymbolAdapt16(partCdf, PartitionTypeCount[Bl64x64]=9).
-        w.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9);
+        // Forced splits from the 64x64 root down to plan.Bl emit NO symbols. At plan.Bl, ctx=0 (no neighbours;
+        // reset_context fills Partition=0). PARTITION_NONE = 0. Decoder: DecodeSymbolAdapt(partCdf, NPart).
+        w.EncodeSymbol(cdf.GetPartitionCdf(plan.Bl, 0), 0, plan.NPart);
 
-        // Skip flag, ctx=0 (above/left skip = 0). skip=0 ⇒ residual coded; skip=1 ⇒ flat plane.
-        // Decoder: DecodeBoolAdapt(Skip[0]). With CDEF disabled, skip=0 reads no CDEF bits (CdefBits=0).
+        // Skip flag, ctx=0 (above/left skip = 0). skip=0 ⇒ residual coded. CDEF disabled ⇒ no CDEF bits.
         int skip = coeffs == null ? 1 : 0;
         w.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);
 
-        // Keyframe Y mode, contexts from neighbour modes (DC ⇒ IntraModeContext[DC]=0 both). DC_PRED = 0.
-        // Decoder: DecodeSymbolAdapt16(kfYModeCdf(0,0), NumIntraPredModes-1 = 12).
+        // Keyframe Y mode, contexts 0/0 (neighbour modes DC). DC_PRED = 0.
         w.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);
 
         if (skip == 0)
         {
-            // Single 64x64 luma transform (TX_64X64, DctDct). First block ⇒ skip/dc-sign contexts are 0.
-            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, Tx64x64, chroma: 0, coeffs!);
+            // Single square luma transform (DctDct), DC intra mode. First block ⇒ skip/dc-sign contexts are 0.
+            Av1CoeffEncode.EncodeCoefs(w, cdf.Coef, cdf.Mode, plan.Tx, chroma: 0, yMode: 0, coeffs!);
         }
 
         return w.Finish();
@@ -105,15 +170,16 @@ internal static class Av1StillImageEncoder
     /// temporal unit and an AVIF container (seq OBU → av1C configOBUs, frame OBU → mdat).</summary>
     internal static (byte[] SeqObu, byte[] FrameObu) BuildObus(int width, int height, int baseQIdx, int[]? coeffs)
     {
-        if (width < 1 || width > 64 || height < 1 || height > 64)
+        if (!TryResolveSingleBlock(width, height, out BlockPlan plan))
         {
-            throw new ArgumentOutOfRangeException(nameof(width), "Single 64x64 superblock only (1..64).");
+            throw new ArgumentOutOfRangeException(nameof(width),
+                $"Frame {width}x{height} does not map to a single square block (rectangular/multi-block not yet supported).");
         }
 
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: true);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
         byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true);
-        byte[] tile = EncodeSingleSuperblockTile(baseQIdx, coeffs);
+        byte[] tile = EncodeSingleBlockTile(baseQIdx, coeffs, plan);
 
         var framePayload = new byte[frameHdr.Length + tile.Length];
         frameHdr.CopyTo(framePayload, 0);
@@ -137,43 +203,49 @@ internal static class Av1StillImageEncoder
         return outBytes;
     }
 
-    /// <summary>Encodes a real 64x64 monochrome image as a complete .avif file. Lossy — fidelity depends on
-    /// <paramref name="baseQIdx"/>.</summary>
+    /// <summary>Encodes a tightly-packed 64x64 monochrome luma image as a complete .avif. Lossy.</summary>
     internal static byte[] EncodeAvifMonochrome64(ReadOnlySpan<byte> pixels, int baseQIdx)
         => EncodeAvifMonochrome(pixels, 64, 64, baseQIdx);
 
-    /// <summary>Encodes a monochrome image of <paramref name="width"/>x<paramref name="height"/> (each in 33..64
-    /// — one 64x64 superblock coded as PARTITION_NONE; dims ≤32 would force a partition split we don't yet emit)
-    /// as a complete .avif. <paramref name="block64"/> is the full 64x64 luma superblock (frame content in the
-    /// top-left, edge-replicated beyond the frame).</summary>
-    internal static byte[] EncodeAvifMonochrome(ReadOnlySpan<byte> block64, int width, int height, int baseQIdx)
+    /// <summary>Encodes a monochrome image (<paramref name="luma"/> tightly packed, <paramref name="width"/> x
+    /// <paramref name="height"/>) as a complete .avif. The frame must map to a single square block (both
+    /// dimensions within one of 5..8, 9..16, 17..32, 33..64 — coded at block sizes 8/16/32/64). The residual
+    /// block is the frame content in its top-left, edge-replicated to the block size.</summary>
+    internal static byte[] EncodeAvifMonochrome(ReadOnlySpan<byte> luma, int width, int height, int baseQIdx)
     {
-        if (width < 33 || width > 64 || height < 33 || height > 64)
+        if (!TryResolveSingleBlock(width, height, out BlockPlan plan))
         {
-            throw new ArgumentOutOfRangeException(nameof(width),
-                $"Single-superblock AVIF encode requires width and height in 33..64 (got {width}x{height}).");
+            throw new NotSupportedException(
+                $"Frame {width}x{height} does not map to a single square block (only near-square sizes with both " +
+                "dimensions in 5..8, 9..16, 17..32 or 33..64 are supported).");
         }
 
-        int[]? coeffs = QuantizeImage64(block64, baseQIdx);
+        int[]? coeffs = QuantizeBlock(luma, width, height, plan, baseQIdx);
         (byte[] seqObu, byte[] frameObu) = BuildObus(width, height, baseQIdx, coeffs);
         return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true);
     }
 
-    /// <summary>Forward-transforms and quantizes a 64x64 monochrome image (DC prediction = 128) into the
-    /// coefficient array, or null when quantization zeroes everything (⇒ skip / flat plane).</summary>
-    private static int[]? QuantizeImage64(ReadOnlySpan<byte> pixels, int baseQIdx)
+    /// <summary>Forward-transforms and quantizes a frame into its single block's coefficients (DC prediction =
+    /// 128), or null when quantization zeroes everything (⇒ skip / flat plane). The n x n residual block is built
+    /// from the frame luma with edge replication beyond the frame.</summary>
+    private static int[]? QuantizeBlock(ReadOnlySpan<byte> luma, int width, int height, in BlockPlan plan, int baseQIdx)
     {
-        const int n = 64;
+        int n = plan.BlockPx;
         int dcDq = Av1Tables.DequantTable[0, baseQIdx, 0];
         int acDq = Av1Tables.DequantTable[0, baseQIdx, 1];
 
         var residual = new int[n * n];
-        for (int i = 0; i < n * n; i++)
+        for (int y = 0; y < n; y++)
         {
-            residual[i] = pixels[i] - 128; // DC prediction for the first block (no neighbours)
+            int sy = Math.Min(y, height - 1);
+            for (int x = 0; x < n; x++)
+            {
+                int sx = Math.Min(x, width - 1);
+                residual[y * n + x] = luma[sy * width + sx] - 128; // DC prediction (first block, no neighbours)
+            }
         }
 
-        int[] coeffs = Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, Av1Tables.Scans[Tx64x64].Length);
+        int[] coeffs = Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, Av1Tables.Scans[plan.Tx].Length);
         foreach (int c in coeffs)
         {
             if (c != 0)
