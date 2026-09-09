@@ -369,14 +369,15 @@ public static class HeifCoder
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
-        // Single square block covers <=64px; the multi-superblock path covers 128px (a 1..2 x 1..2 grid of full
-        // 64x64 superblocks). Larger or in-between sizes are not yet supported.
+        // Single square block covers <=64px; the multi-superblock path covers 128px multiples of 64. The
+        // encoder itself is general (verified in dav1d up to larger sizes) but our decoder currently mis-decodes
+        // frames wider than two superblocks, so the round-trippable product path is capped at 128 for now.
         bool multiSb = w > 64 || h > 64;
         if (multiSb && (w > 128 || h > 128 || w % 64 != 0 || h % 64 != 0))
         {
             throw new NotSupportedException(
                 $"AVIF encoding supports up to 64x64 (any near-square size) or 128px multiples of 64 (got {w}x{h}); " +
-                "other larger sizes require the general multi-superblock encoder, not yet implemented.");
+                "larger sizes await a decoder wide-frame fix.");
         }
 
         int channels = image.NumberOfChannels;

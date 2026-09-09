@@ -283,10 +283,10 @@ internal static class Av1StillImageEncoder
     {
         int sbCols = (((width + 3) >> 2) + 15) >> 4;
         int sbRows = (((height + 3) >> 2) + 15) >> 4;
-        if (width % 64 != 0 || height % 64 != 0 || sbCols < 1 || sbCols > 2 || sbRows < 1 || sbRows > 2)
+        if (width % 64 != 0 || height % 64 != 0 || width < 64 || height < 64 || width > 4096 || height > 4096)
         {
             throw new NotSupportedException(
-                $"Multi-superblock AVIF encode currently supports 64 or 128 in each dimension (got {width}x{height}).");
+                $"Multi-superblock AVIF encode requires each dimension to be a multiple of 64 in 64..4096 (got {width}x{height}).");
         }
 
         byte[] tile = EncodeMultiSbTile(luma, width, height, sbCols, sbRows, baseQIdx);
@@ -308,10 +308,10 @@ internal static class Av1StillImageEncoder
     {
         int sbCols = (((width + 3) >> 2) + 15) >> 4;
         int sbRows = (((height + 3) >> 2) + 15) >> 4;
-        if (width % 64 != 0 || height % 64 != 0 || sbCols < 1 || sbCols > 2 || sbRows < 1 || sbRows > 2)
+        if (width % 64 != 0 || height % 64 != 0 || width < 64 || height < 64 || width > 4096 || height > 4096)
         {
             throw new NotSupportedException(
-                $"Multi-superblock colour AVIF encode supports 64 or 128 in each dimension (got {width}x{height}).");
+                $"Multi-superblock colour AVIF encode requires each dimension to be a multiple of 64 in 64..4096 (got {width}x{height}).");
         }
 
         byte[] tile = EncodeMultiSbColorTile(luma, u, v, width, height, sbCols, sbRows, baseQIdx);
@@ -341,17 +341,21 @@ internal static class Av1StillImageEncoder
         var reconY = new byte[w * h];
         var reconU = new byte[cw * chh];
         var reconV = new byte[cw * chh];
-        var aLY = Filled(32); var aCU = Filled(32); var aCV = Filled(32); // above (persist across SB rows)
+        // Per-SB128-column above contexts for luma + both chroma planes (persist across SB rows).
+        int sb128Cols = (sbCols + 1) >> 1;
+        var aLY = FilledArray(sb128Cols); var aCU = FilledArray(sb128Cols); var aCV = FilledArray(sb128Cols);
 
         for (int sby = 0; sby < sbRows; sby++)
         {
             var lLY = Filled(32); var lCU = Filled(32); var lCV = Filled(32); // left (reset per SB row)
             int by = sby * 64, cby = sby * 32;
+            int by4 = (sby & 1) * 16, cby4 = by4 >> 1;
             for (int sbx = 0; sbx < sbCols; sbx++)
             {
                 int bx = sbx * 64, cbx = sbx * 32;
-                int bx4 = (bx >> 2) & 31, by4 = (by >> 2) & 31;
-                int cbx4 = bx4 >> 1, cby4 = by4 >> 1;
+                int bx4 = (sbx & 1) * 16, cbx4 = bx4 >> 1;
+                int a128 = sbx >> 1;
+                byte[] alY = aLY[a128], acU = aCU[a128], acV = aCV[a128];
 
                 msac.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9); // PARTITION_NONE
 
@@ -371,11 +375,11 @@ internal static class Av1StillImageEncoder
                 if (skip == 0)
                 {
                     ref readonly var uvtDim = ref Av1Tables.TxfmDimensions[Tx32x32];
-                    int uSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, (int)Av1BlockSize.Bs64x64, aCU.AsSpan(cbx4), lCU.AsSpan(cby4), 1, (int)Av1PixelLayout.I420);
-                    int vSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, (int)Av1BlockSize.Bs64x64, aCV.AsSpan(cbx4), lCV.AsSpan(cby4), 1, (int)Av1PixelLayout.I420);
-                    int ySign = Av1CoeffDecode.GetDcSignCtx(Tx64x64, aLY.AsSpan(bx4), lLY.AsSpan(by4));
-                    int uSign = Av1CoeffDecode.GetDcSignCtx(Tx32x32, aCU.AsSpan(cbx4), lCU.AsSpan(cby4));
-                    int vSign = Av1CoeffDecode.GetDcSignCtx(Tx32x32, aCV.AsSpan(cbx4), lCV.AsSpan(cby4));
+                    int uSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, (int)Av1BlockSize.Bs64x64, acU.AsSpan(cbx4), lCU.AsSpan(cby4), 1, (int)Av1PixelLayout.I420);
+                    int vSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, (int)Av1BlockSize.Bs64x64, acV.AsSpan(cbx4), lCV.AsSpan(cby4), 1, (int)Av1PixelLayout.I420);
+                    int ySign = Av1CoeffDecode.GetDcSignCtx(Tx64x64, alY.AsSpan(bx4), lLY.AsSpan(by4));
+                    int uSign = Av1CoeffDecode.GetDcSignCtx(Tx32x32, acU.AsSpan(cbx4), lCU.AsSpan(cby4));
+                    int vSign = Av1CoeffDecode.GetDcSignCtx(Tx32x32, acV.AsSpan(cbx4), lCV.AsSpan(cby4));
 
                     Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx64x64, 0, 0, yC, dcSignCtx: ySign);
                     Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx32x32, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
@@ -392,9 +396,9 @@ internal static class Av1StillImageEncoder
                     FillFlat(reconV, cw, cbx, cby, 32, dcV);
                 }
 
-                Array.Fill(aLY, cfY, bx4, 16); Array.Fill(lLY, cfY, by4, 16);   // luma ctxW = 16
-                Array.Fill(aCU, cfU, cbx4, 8); Array.Fill(lCU, cfU, cby4, 8);   // chroma ctxW = uvtDim.W = 8
-                Array.Fill(aCV, cfV, cbx4, 8); Array.Fill(lCV, cfV, cby4, 8);
+                Array.Fill(alY, cfY, bx4, 16); Array.Fill(lLY, cfY, by4, 16);   // luma ctxW = 16
+                Array.Fill(acU, cfU, cbx4, 8); Array.Fill(lCU, cfU, cby4, 8);   // chroma ctxW = uvtDim.W = 8
+                Array.Fill(acV, cfV, cbx4, 8); Array.Fill(lCV, cfV, cby4, 8);
             }
         }
 
@@ -405,6 +409,17 @@ internal static class Av1StillImageEncoder
     {
         var a = new byte[n];
         Array.Fill(a, (byte)0x40);
+        return a;
+    }
+
+    private static byte[][] FilledArray(int count)
+    {
+        var a = new byte[count][];
+        for (int i = 0; i < count; i++)
+        {
+            a[i] = Filled(32);
+        }
+
         return a;
     }
 
@@ -448,19 +463,25 @@ internal static class Av1StillImageEncoder
 
         var msac = new Av1MsacWriter();
         var recon = new byte[w * h];
-        var aboveLCoef = new byte[32];   // frame-wide above (holds up to 2 SBs); persists across SB rows
-        Array.Fill(aboveLCoef, (byte)0x40);
+        // Above context is per-SB128 column (each byte[32] holds 2 SB64 cols), matching the decoder's aboveCtx[]
+        // array; persists across SB rows. Left resets per SB row. This lifts the previous 2x2 (single-array) cap.
+        int sb128Cols = (sbCols + 1) >> 1;
+        var aboveLCoef = new byte[sb128Cols][];
+        for (int i = 0; i < sb128Cols; i++)
+        {
+            aboveLCoef[i] = Filled(32);
+        }
 
         for (int sby = 0; sby < sbRows; sby++)
         {
-            var leftLCoef = new byte[32]; // reset each SB row
-            Array.Fill(leftLCoef, (byte)0x40);
+            byte[] leftLCoef = Filled(32); // reset each SB row
             int by = sby * 64;
+            int by4 = (sby & 1) * 16;      // By & 31, By = sby*16 (4-units)
             for (int sbx = 0; sbx < sbCols; sbx++)
             {
                 int bx = sbx * 64;
-                int bx4 = (bx >> 2) & 31;
-                int by4 = (by >> 2) & 31;
+                int bx4 = (sbx & 1) * 16;
+                byte[] above = aboveLCoef[sbx >> 1];
 
                 // Partition NONE at BLOCK_64X64, ctx 0 (all full-64 SBs).
                 msac.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9);
@@ -476,20 +497,14 @@ internal static class Av1StillImageEncoder
                 }
 
                 int[] coeffs = Av1FwdTransform.ForwardQuantSquare(residual, 64, dcDq, acDq, scanLen);
-                bool anyNz = false;
-                foreach (int c in coeffs)
-                {
-                    if (c != 0) { anyNz = true; break; }
-                }
-
-                int skip = anyNz ? 0 : 1;
+                int skip = HasNonZero(coeffs) ? 0 : 1;
                 msac.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);   // skip ctx 0
                 msac.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);   // DC mode
 
                 byte cfCtx;
                 if (skip == 0)
                 {
-                    int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(Tx64x64, aboveLCoef.AsSpan(bx4), leftLCoef.AsSpan(by4));
+                    int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(Tx64x64, above.AsSpan(bx4), leftLCoef.AsSpan(by4));
                     Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx64x64, chroma: 0, yMode: 0, coeffs,
                         skipCtx: 0, dcSignCtx: dcSignCtx);
                     cfCtx = DequantAndReconstruct(coeffs, dcDq, acDq, dcPred, recon, w, bx, by);
@@ -497,16 +512,10 @@ internal static class Av1StillImageEncoder
                 else
                 {
                     cfCtx = 0x40;
-                    for (int y = 0; y < 64; y++)
-                    {
-                        for (int x = 0; x < 64; x++)
-                        {
-                            recon[(by + y) * w + (bx + x)] = (byte)dcPred;
-                        }
-                    }
+                    FillFlat(recon, w, bx, by, 64, dcPred);
                 }
 
-                Array.Fill(aboveLCoef, cfCtx, bx4, 16);  // ctxW = tDim.W = 16 (full 64 block)
+                Array.Fill(above, cfCtx, bx4, 16);  // ctxW = tDim.W = 16 (full 64 block)
                 Array.Fill(leftLCoef, cfCtx, by4, 16);
             }
         }
