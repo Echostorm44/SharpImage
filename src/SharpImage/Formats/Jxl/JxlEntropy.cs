@@ -588,7 +588,7 @@ internal static class JxlEntropy
     // canonical code. Built once from Huff by finding the first table entry decoding to v.
     private static (int Nbits, int Bits)[]? logCodeCache;
 
-    private static void WriteLogCount(JxlBitWriter w, int v)
+    private static (int Nbits, int Bits)[] LogCodes()
     {
         if (logCodeCache == null)
         {
@@ -609,8 +609,111 @@ internal static class JxlEntropy
             logCodeCache = map;
         }
 
-        (int nb, int bits) = logCodeCache[v + 1];
+        return logCodeCache;
+    }
+
+    private static void WriteLogCount(JxlBitWriter w, int v)
+    {
+        (int nb, int bits) = LogCodes()[v + 1];
         w.WriteBits((uint)bits, nb);
+    }
+
+    // Exact number of bits WriteHistogram(counts, shift) emits, computed WITHOUT packing bits — lets the
+    // encoder's config/cluster cost search score a candidate distribution analytically instead of encoding it
+    // to a throwaway writer. MUST mirror WriteHistogram exactly (verified bit-for-bit by JxlEntropyTests).
+    public static long HistogramBitCost(int[] counts, int shift)
+    {
+        int alphabet = counts.Length;
+        int nz = 0, first = -1, second = -1;
+        for (int i = 0; i < alphabet; i++)
+        {
+            if (counts[i] > 0)
+            {
+                nz++;
+                if (first < 0)
+                {
+                    first = i;
+                }
+                else if (second < 0)
+                {
+                    second = i;
+                }
+            }
+        }
+
+        if (nz <= 2)
+        {
+            int num = Math.Max(1, nz);
+            long b = 1 + 1 + VarLenUint8Bits(first < 0 ? 0 : first);
+            if (num == 2)
+            {
+                b += VarLenUint8Bits(second) + JxlBits.AnsLogTabSize;
+            }
+
+            return b;
+        }
+
+        int last = alphabet - 1;
+        while (last > 0 && counts[last] == 0)
+        {
+            last--;
+        }
+
+        int length = Math.Max(3, last + 1);
+        (int Nbits, int Bits)[] logCodes = LogCodes();
+        long bits = 1 + 1 + ShiftBits(shift) + VarLenUint8Bits(length - 3);
+
+        int omit = 0, omitVal = counts[0] <= 0 ? -1 : JxlBits.FloorLog2(counts[0]);
+        for (int i = 0; i < length; i++)
+        {
+            int lc = counts[i] <= 0 ? -1 : JxlBits.FloorLog2(counts[i]);
+            if (i > 0 && lc > omitVal)
+            {
+                omitVal = lc;
+                omit = i;
+            }
+
+            bits += logCodes[lc + 1].Nbits;
+        }
+
+        for (int i = 0; i < length; i++)
+        {
+            if (i == omit || counts[i] <= 0)
+            {
+                continue;
+            }
+
+            int code = JxlBits.FloorLog2(counts[i]);
+            if (code == 0)
+            {
+                continue;
+            }
+
+            int bc = Gpcp(code, shift);
+            if (bc > 0)
+            {
+                bits += bc;
+            }
+        }
+
+        return bits;
+    }
+
+    private static int VarLenUint8Bits(int n)
+    {
+        if (n == 0)
+        {
+            return 1;
+        }
+
+        return n == 1 ? 4 : 4 + JxlBits.FloorLog2(n);
+    }
+
+    private static int ShiftBits(int shift)
+    {
+        int v = shift + 1; // v in [1, 15]
+        int log = JxlBits.FloorLog2(v);
+        return log + (log < 3 ? 1 : 0) + (log > 0 ? log : 0);
     }
 
     public static uint ReadHybridUintConfig(HybridUintConfig cfg, uint token, JxlBitReader br)

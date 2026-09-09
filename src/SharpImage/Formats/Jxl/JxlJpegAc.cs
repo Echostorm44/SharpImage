@@ -491,11 +491,12 @@ internal static partial class JxlEncoder
             }
 
             // Cost = ANS coding + raw extra bits + config signalling + HISTOGRAM TRANSMISSION (else a bigger
-            // token alphabet, e.g. direct coding, looks free when it actually costs more to transmit).
+            // token alphabet, e.g. direct coding, looks free when it actually costs more to transmit). The
+            // transmission cost is computed analytically (exact WriteHistogram bit count) rather than by
+            // encoding each candidate to a throwaway writer.
             int[] cand = JxlEntropy.NormalizeCounts(tokHist, JxlEntropy.HistShift);
-            var probe = new JxlBitWriter();
-            JxlEntropy.WriteHistogram(probe, cand, JxlEntropy.HistShift);
-            double cost = NormalizedCost(tokHist) + extra + JxlBits.CeilLog2(s + 1) + JxlBits.CeilLog2(s - m + 1) + probe.BitPosition;
+            long probeBits = JxlEntropy.HistogramBitCost(cand, JxlEntropy.HistShift);
+            double cost = NormalizedCost(tokHist) + extra + JxlBits.CeilLog2(s + 1) + JxlBits.CeilLog2(s - m + 1) + probeBits;
             if (cost < best)
             {
                 best = cost;

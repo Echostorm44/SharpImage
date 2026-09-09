@@ -1181,6 +1181,54 @@ public class JxlVarDctEncoderTests
         }
     }
 
+    // HistogramBitCost must return EXACTLY the number of bits WriteHistogram emits — the encoder's cost search
+    // relies on that equality to score candidate distributions analytically instead of encoding them. If
+    // WriteHistogram changes and this drifts, cluster/config selection silently degrades, so pin it here across
+    // simple (nz<=2), flat, skewed and dense histograms at every valid shift.
+    [Test]
+    public async Task JxlEntropy_HistogramBitCost_MatchesWriteHistogram()
+    {
+        var rng = new Random(1234);
+        int chec0 = 0;
+        for (int trial = 0; trial < 400; trial++)
+        {
+            int alphabet = 1 + rng.Next(300);
+            var counts = new int[alphabet];
+            int nz = rng.Next(4) switch { 0 => 1, 1 => 2, 2 => rng.Next(1, alphabet + 1), _ => alphabet };
+            // Place nz non-zero counts summing to the ANS table size (4096), as NormalizeCounts would produce.
+            var idx = new List<int>();
+            while (idx.Count < Math.Min(nz, alphabet))
+            {
+                int p = rng.Next(alphabet);
+                if (!idx.Contains(p))
+                {
+                    idx.Add(p);
+                }
+            }
+
+            int remaining = 4096;
+            for (int j = 0; j < idx.Count; j++)
+            {
+                int give = j == idx.Count - 1 ? remaining : 1 + rng.Next(Math.Max(1, remaining - (idx.Count - j - 1)));
+                counts[idx[j]] = give;
+                remaining -= give;
+            }
+
+            for (int shift = 0; shift <= 8; shift++)
+            {
+                int[] norm = JxlEntropy.NormalizeCounts((long[])System.Array.ConvertAll(counts, c => (long)c), shift);
+                var bw = new JxlBitWriter();
+                JxlEntropy.WriteHistogram(bw, norm, shift);
+                long actual = bw.BitPosition;
+                long predicted = JxlEntropy.HistogramBitCost(norm, shift);
+                await Assert.That(predicted).IsEqualTo(actual);
+                chec0++;
+            }
+        }
+
+        await Assert.That(chec0).IsGreaterThan(0);
+    }
+
     // Truncated preview is monotonic (non-garbling): as more bytes of a progressive file arrive, the preview
     // only improves. A fine truncation sweep must never show a material PSNR drop. (This guards the decision
     // to keep truncated decode SECTION-GRANULAR: partial byte-bounded decode of an incomplete progressive pass

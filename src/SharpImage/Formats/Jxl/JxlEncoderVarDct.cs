@@ -1605,6 +1605,7 @@ internal static partial class JxlEncoder
                 chist[c] = new long[alphabet];
             }
 
+            long tA = ProfStart();
             for (int i = 0; i < n; i++)
             {
                 if (total[i] == 0)
@@ -1632,6 +1633,8 @@ internal static partial class JxlEncoder
                 }
             }
 
+            ProfEnd("k-accum", tA);
+            long tC = ProfStart();
             double coding = 0;
             var candNorm = new int[k][];
             for (int c = 0; c < k; c++)
@@ -1640,10 +1643,21 @@ internal static partial class JxlEncoder
                 candNorm[c] = JxlEntropy.NormalizeCounts(chist[c], JxlEntropy.HistShift);
             }
 
-            // Real header bits for this K: encode the context map + the K histograms and measure.
-            var hw = new JxlBitWriter();
-            WriteHfPass(hw, (int[])assign.Clone(), candNorm, hfLogAlpha);
-            double headerBits = hw.ToArray().Length * 8.0;
+            ProfEnd("k-normcost", tC);
+
+            // Header bits for this K: the context map is still encoded (exact, and cheap), but the K histograms
+            // — the bulk — are scored analytically (exact WriteHistogram bit count) instead of encoded. The
+            // total is bit-identical to encoding the whole HfPass, so the chosen K is unchanged.
+            long tW = ProfStart();
+            long headerBitsExact = WriteHfPassHeaderBits((int[])assign.Clone(), k, hfLogAlpha);
+            for (int c = 0; c < k; c++)
+            {
+                headerBitsExact += JxlEntropy.HistogramBitCost(candNorm[c], JxlEntropy.HistShift);
+            }
+
+            // WriteHfPass is byte-aligned by ToArray(); match that padding so the chosen K is identical.
+            double headerBits = ((headerBitsExact + 7) / 8) * 8.0;
+            ProfEnd("k-writeprobe", tW);
 
             double cost = coding + headerBits;
             if (cost < bestCost)
@@ -1698,6 +1712,26 @@ internal static partial class JxlEncoder
 
     // One HF pass: used_orders = 0 (natural order), then the HfDist entropy code — a context map over the
     // 495*num_block_clusters contexts to `k` clustered ANS histograms.
+    // Exact bit count of everything WriteHfPass emits EXCEPT the K histograms (which the caller scores via
+    // HistogramBitCost): used_orders, the lz77/prefix flags, logAlpha, the context map, and the K uint configs.
+    // The context map is genuinely encoded (its MTF+ANS cost has no simple closed form) but that is cheap; the
+    // expensive part was the K histogram encodes, now analytical.
+    private static long WriteHfPassHeaderBits(int[] contextToCluster, int k, int hfLogAlpha)
+    {
+        var hw = new JxlBitWriter();
+        hw.WriteU32(0, E.Val(0x5F), E.Val(0x13), E.Val(0x00), E.BitsOff(13, 0)); // used_orders = 0
+        hw.WriteBool(false);   // lz77 disabled
+        WriteContextMap(hw, contextToCluster, k);
+        hw.WriteBool(false);   // use_prefix_code = false (ANS)
+        hw.WriteBits((uint)(hfLogAlpha - 5), 2);
+        for (int c = 0; c < k; c++)
+        {
+            WriteUintConfig(hw, LitSplit, LitMsb, LitLsb, hfLogAlpha);
+        }
+
+        return hw.BitPosition;
+    }
+
     private static void WriteHfPass(JxlBitWriter body, int[] contextToCluster, int[][] clusterNorm, int hfLogAlpha)
     {
         body.WriteU32(0, E.Val(0x5F), E.Val(0x13), E.Val(0x00), E.BitsOff(13, 0)); // used_orders = 0
