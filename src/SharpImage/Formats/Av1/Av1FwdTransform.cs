@@ -17,6 +17,11 @@ internal static class Av1FwdTransform
     // Universal forward-quant scale: 2^dqShift / G_dec == 8 for all square DCT sizes (see header).
     private const double QuantScaleK = 8.0;
 
+    // Deadzone quantization bias (AV1/libaom-style): shift the rounding threshold toward zero so marginal
+    // coefficients quantize to 0. This is a pure encoder rate-distortion choice — the decoder is unaffected and
+    // cannot desync. 0 = round-to-nearest; larger widens the dead zone (fewer, cheaper coefficients).
+    private const double DeadzoneBias = 0.20;
+
     /// <summary>Forward DCT + quantize a square residual block into the rc-indexed coefficient array the
     /// coefficient encoder consumes. <paramref name="residual"/> is row-major NxN (pixel - prediction). Only the
     /// lowest min(N,32) frequencies per axis are kept (AV1 codes at most 32x32 even for a 64x64 transform).
@@ -60,7 +65,10 @@ internal static class Av1FwdTransform
                 }
 
                 int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
-                int q = (int)Math.Round(acc * k / dq, MidpointRounding.AwayFromZero);
+                // Deadzone quantizer: |level| = floor(|qf| + 0.5 - bias), clamped at 0.
+                double qf = acc * k / dq;
+                double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
+                int q = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
                 levels[kx * sh + ky] = q;
             }
         }
