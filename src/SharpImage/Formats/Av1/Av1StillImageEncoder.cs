@@ -11,6 +11,9 @@ namespace SharpImage.Formats.Av1;
 
 internal static class Av1StillImageEncoder
 {
+    // A/B toggle: rate-distortion leaf decision (mode + tx-type via EstimateCoefBits) vs the SATD-only baseline.
+    internal static bool UseRd = true;
+
     /// <summary>Encodes a flat DC-only monochrome key frame at <paramref name="width"/>x<paramref name="height"/>
     /// (must fit in a single 64x64 superblock). Returns the AV1 temporal unit (temporal delimiter + sequence
     /// header + OBU_FRAME). <paramref name="dcLevel"/> is the quantized DC coefficient level: 0 codes skip=1
@@ -714,9 +717,21 @@ internal static class Av1StillImageEncoder
         int bxR = bx4 & 31, byR = by4 & 31;
         ref readonly var maxTDim = ref Av1Tables.TxfmDimensions[maxTx];
 
-        // Depth-0 (whole-block) coefficients decide the skip flag (matches the single-transform behaviour).
-        int[] residual0 = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n);
-        (int[] coeffs0, Av1TxType invTx0, int txIdx0) = ChooseTxType(residual0, n, maxTx, c.DcDq, c.AcDq);
+        // Rate-distortion mode + tx-type decision at the block-size transform (also fixes the skip flag and the
+        // prediction in c.Pred). Overrides the SATD mode passed from the partition search.
+        int[] coeffs0; Av1TxType invTx0; int txIdx0;
+        if (UseRd)
+        {
+            var rd = ChooseLeafRd(c, bx4, by4, n, maxTx);
+            yMode = rd.Mode; yDelta = rd.Delta;
+            coeffs0 = rd.Coeffs; invTx0 = rd.Inv; txIdx0 = rd.Idx;
+        }
+        else
+        {
+            PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, yMode, yDelta, c.Pred);
+            int[] res = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n);
+            (coeffs0, invTx0, txIdx0) = ChooseTxType(res, n, maxTx, c.DcDq, c.AcDq);
+        }
         int skip = HasNonZero(coeffs0) ? 0 : 1;
 
         // Choose tx depth (only when coding residual, block > 4x4, and fully inside the frame so every sub-tx block
@@ -754,7 +769,18 @@ internal static class Av1StillImageEncoder
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(maxTDim.Max - 1, txCtx), depth, nSym);
         }
 
-        if (skip == 0)
+        if (skip == 0 && depth == 0)
+        {
+            // Single transform (block size): use the RD-chosen coefficients/tx-type directly.
+            int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(maxTx, c.AboveLCoef.AsSpan(bxR), c.LeftLCoef.AsSpan(byR));
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, maxTx, chroma: 0, yMode: (int)yMode, coeffs0,
+                skipCtx: 0, dcSignCtx: dcSignCtx, txTypeIdx: txIdx0);
+            byte cfCtx0 = DequantAndReconstructPred(coeffs0, maxTx, n, c.DcDq, c.AcDq, c.Pred, c.Recon, c.W, bx4 * 4, by4 * 4, invTx0);
+            int cwl = Math.Min(blk4, c.Bw4 - bx4), chl = Math.Min(blk4, c.Bh4 - by4);
+            for (int i = 0; i < cwl && bxR + i < 32; i++) c.AboveLCoef[bxR + i] = cfCtx0;
+            for (int j = 0; j < chl && byR + j < 32; j++) c.LeftLCoef[byR + j] = cfCtx0;
+        }
+        else if (skip == 0)
         {
             int txN = tDim.W * 4;          // tx pixel size
             int txW4 = tDim.W;             // tx 4-unit size
@@ -1110,6 +1136,41 @@ internal static class Av1StillImageEncoder
         (Av1FwdTransform.FwdTxType.AdstDct,  Av1TxType.AdstDct,  3),
         (Av1FwdTransform.FwdTxType.DctAdst,  Av1TxType.DctAdst,  4),
     };
+    private static readonly (Av1FwdTransform.FwdTxType Fwd, Av1TxType Inv, int Idx)[] DctOnly =
+        { (Av1FwdTransform.FwdTxType.DctDct, Av1TxType.DctDct, 1) };
+
+    // Rate-distortion leaf decision: over all candidate (intra mode, tx type) pairs, pick the one with the lowest
+    // actual coded rate — coefficient bits (EstimateCoefBits, from the live CDFs) plus the mode/angle signalling
+    // bits. This replaces the SATD proxy: it directly minimises what the bitstream costs and lets the tx-type
+    // (ADST/DCT) choice compound with the mode choice. Writes the winning prediction into c.Pred.
+    private static (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx)
+        ChooseLeafRd(GrayPartCtx c, int bx4, int by4, int n, int tx)
+    {
+        int bxR = bx4 & 31, byR = by4 & 31;
+        int aboveCtx = Av1Tables.IntraModeContext[c.AboveMode[bxR]];
+        int leftCtx = Av1Tables.IntraModeContext[c.LeftMode[byR]];
+        Span<ushort> ymCdf = c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
+        int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, c.AboveLCoef.AsSpan(bxR), c.LeftLCoef.AsSpan(byR));
+        int scanLen = Av1Tables.Scans[tx].Length;
+        var predBuf = new byte[n * n];
+        double best = double.MaxValue;
+        (Av1IntraPredMode, int, int[], Av1TxType, int) bestCand = default;
+        foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
+        {
+            PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, mode, delta, predBuf);
+            int[] residual = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, predBuf, n);
+            double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
+                + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
+            foreach (var (fwd, inv, idx) in n <= 16 ? IntraTxTypes : DctOnly)
+            {
+                int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, c.DcDq, c.AcDq, scanLen, fwd);
+                double rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)mode, cf, 0, dcSignCtx, idx) + modeBits;
+                if (rate < best) { best = rate; bestCand = (mode, delta, cf, inv, idx); Array.Copy(predBuf, c.Pred, n * n); }
+            }
+        }
+
+        return bestCand;
+    }
 
 
     // Residual (src - prediction) for an n x n block.
