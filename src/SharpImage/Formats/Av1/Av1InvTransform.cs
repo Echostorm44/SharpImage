@@ -315,6 +315,16 @@ public static class Av1InvTransform
     // 1D transform dispatch
     // ========================================================================
 
+    // Transform-type constants for external callers (encoder forward-transform builder). Match the private
+    // Dct/Adst/FlipAdst/Identity values used by Apply1d.
+    public const int Type1dDct = Dct, Type1dAdst = Adst, Type1dFlipAdst = FlipAdst, Type1dIdentity = Identity;
+
+    /// <summary>Applies a single 1D inverse transform in place, with no clipping — used by the encoder to probe
+    /// the decoder's exact 1D inverse basis when building the matched forward transform. <paramref name="logSize"/>
+    /// is 0..4 for sizes 4..64; <paramref name="type"/> is one of the Type1d* constants.</summary>
+    public static void Probe1dInverse(Span<int> c, int logSize, int type)
+        => Apply1d(c, 1, int.MinValue >> 2, int.MaxValue >> 2, logSize, type);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Apply1d(Span<int> c, int stride, int min, int max, int logSize, int type)
     {
