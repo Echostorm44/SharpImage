@@ -429,9 +429,11 @@ internal static class Av1StillImageEncoder
         bool cflAllowed = bl >= 2;               // blocks <= 32x32
         int uvNsym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
 
-        // Luma mode + prediction (from reconstruction).
-        (Av1IntraPredMode yMode, int yDelta, _) = ChooseIntraMode(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, n, c.Luma, c.W, bx, by, c.Pred);
-        int[] yC = ForwardResidualPred(c.Luma, c.W, bx, by, c.Pred, n, c.DcDq, c.AcDq, Av1Tables.Scans[tx].Length);
+        // Luma: rate-distortion mode + tx-type decision (from reconstruction). Writes prediction into c.Pred.
+        var rd = ChooseLeafRdCore(c.ReconY, c.W, c.Bw4, c.Bh4, c.Luma, c.W, bx4, by4, n, tx, c.DcDq, c.AcDq,
+            c.Cdf, c.AModeY[bxR], c.LModeY[byR], c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR), c.Pred);
+        Av1IntraPredMode yMode = rd.Mode; int yDelta = rd.Delta;
+        int[] yC = rd.Coeffs; Av1TxType yInv = rd.Inv; int yTxIdx = rd.Idx;
         int dcU = DcPredict(c.ReconU, c.Cw, c.Chh, cbx, cby, cn, cn);
         int dcV = DcPredict(c.ReconV, c.Cw, c.Chh, cbx, cby, cn, cn);
         int[] uC = ForwardResidual(c.U, c.Cw, cbx, cby, cn, dcU, c.DcDq, c.AcDq, Av1Tables.Scans[ctx0].Length);
@@ -457,11 +459,11 @@ internal static class Av1StillImageEncoder
             int uSign = Av1CoeffDecode.GetDcSignCtx(ctx0, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
             int vSign = Av1CoeffDecode.GetDcSignCtx(ctx0, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
 
-            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, yC, dcSignCtx: ySign);
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, yC, dcSignCtx: ySign, txTypeIdx: yTxIdx);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
 
-            cfY = DequantAndReconstructPred(yC, tx, n, c.DcDq, c.AcDq, c.Pred, c.ReconY, c.W, bx, by);
+            cfY = DequantAndReconstructPred(yC, tx, n, c.DcDq, c.AcDq, c.Pred, c.ReconY, c.W, bx, by, yInv);
             cfU = DequantAndReconstruct(uC, ctx0, cn, c.DcDq, c.AcDq, dcU, c.ReconU, c.Cw, cbx, cby);
             cfV = DequantAndReconstruct(vC, ctx0, cn, c.DcDq, c.AcDq, dcV, c.ReconV, c.Cw, cbx, cby);
         }
@@ -1159,33 +1161,43 @@ internal static class Av1StillImageEncoder
     private static readonly (Av1FwdTransform.FwdTxType Fwd, Av1TxType Inv, int Idx)[] DctOnly =
         { (Av1FwdTransform.FwdTxType.DctDct, Av1TxType.DctDct, 1) };
 
-    // Rate-distortion leaf decision: over all candidate (intra mode, tx type) pairs, pick the one with the lowest
-    // actual coded rate — coefficient bits (EstimateCoefBits, from the live CDFs) plus the mode/angle signalling
-    // bits. This replaces the SATD proxy: it directly minimises what the bitstream costs and lets the tx-type
-    // (ADST/DCT) choice compound with the mode choice. Writes the winning prediction into c.Pred.
+    // Gray wrapper for the primitive-arg RD leaf decision.
     private static (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx)
         ChooseLeafRd(GrayPartCtx c, int bx4, int by4, int n, int tx)
     {
         int bxR = bx4 & 31, byR = by4 & 31;
-        int aboveCtx = Av1Tables.IntraModeContext[c.AboveMode[bxR]];
-        int leftCtx = Av1Tables.IntraModeContext[c.LeftMode[byR]];
-        Span<ushort> ymCdf = c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
-        int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, c.AboveLCoef.AsSpan(bxR), c.LeftLCoef.AsSpan(byR));
+        return ChooseLeafRdCore(c.Recon, c.W, c.Bw4, c.Bh4, c.Luma, c.W, bx4, by4, n, tx, c.DcDq, c.AcDq,
+            c.Cdf, c.AboveMode[bxR], c.LeftMode[byR], c.AboveLCoef.AsSpan(bxR), c.LeftLCoef.AsSpan(byR), c.Pred);
+    }
+
+    // Rate-distortion leaf decision: over all candidate (intra mode, tx type) pairs, pick the one with the lowest
+    // actual coded rate — coefficient bits (EstimateCoefBits, from the live CDFs) plus the mode/angle signalling
+    // bits. This replaces the SATD proxy: it directly minimises what the bitstream costs and lets the tx-type
+    // (ADST/DCT) choice compound with the mode choice. Writes the winning prediction into predOut.
+    private static (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx)
+        ChooseLeafRdCore(byte[] recon, int reconW, int bw4, int bh4, byte[] luma, int lumaW, int bx4, int by4,
+            int n, int tx, int dcDq, int acDq, Av1CdfContext cdf, byte aboveMode, byte leftMode,
+            ReadOnlySpan<byte> aboveLCoef, ReadOnlySpan<byte> leftLCoef, byte[] predOut)
+    {
+        int aboveCtx = Av1Tables.IntraModeContext[aboveMode];
+        int leftCtx = Av1Tables.IntraModeContext[leftMode];
+        Span<ushort> ymCdf = cdf.GetKfYModeCdf(aboveCtx, leftCtx);
+        int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, aboveLCoef, leftLCoef);
         int scanLen = Av1Tables.Scans[tx].Length;
         var predBuf = new byte[n * n];
         double best = double.MaxValue;
         (Av1IntraPredMode, int, int[], Av1TxType, int) bestCand = default;
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
-            PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, mode, delta, predBuf);
-            int[] residual = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, predBuf, n);
+            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf);
+            int[] residual = ComputeResidualPred(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
-                + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
+                + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
             foreach (var (fwd, inv, idx) in n <= 16 ? IntraTxTypes : DctOnly)
             {
-                int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, c.DcDq, c.AcDq, scanLen, fwd);
-                double rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)mode, cf, 0, dcSignCtx, idx) + modeBits;
-                if (rate < best) { best = rate; bestCand = (mode, delta, cf, inv, idx); Array.Copy(predBuf, c.Pred, n * n); }
+                int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, fwd);
+                double rate = Av1CoeffEncode.EstimateCoefBits(cdf.Coef, cdf.Mode, tx, 0, (int)mode, cf, 0, dcSignCtx, idx) + modeBits;
+                if (rate < best) { best = rate; bestCand = (mode, delta, cf, inv, idx); Array.Copy(predBuf, predOut, n * n); }
             }
         }
 
