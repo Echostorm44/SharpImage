@@ -74,4 +74,42 @@ public sealed class Av1ColorTests
         // Colour with I420 subsampling + matrix rounding: expect small but non-zero error.
         await Assert.That(rmse).IsLessThan(6.0);
     }
+
+    // Sharp colour steps aligned to the 32-column boundaries — exercises the colour recursive partitioner
+    // (luma splits, chroma follows to 4x4). Round-trips near-losslessly (only I420 subsampling error remains).
+    [Test]
+    [Arguments(128, 128)]
+    [Arguments(192, 128)]
+    public async Task Color_Partition_RoundTrips(int w, int h)
+    {
+        var f = new ImageFrame();
+        f.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (long y = 0; y < h; y++)
+        {
+            var row = f.GetPixelRowForWrite(y);
+            int ch = f.NumberOfChannels;
+            for (long x = 0; x < w; x++)
+            {
+                bool a = ((x / 32) & 1) == 0;
+                int o = (int)x * ch;
+                row[o] = Quantum.ScaleFromByte((byte)(a ? 40 : 200));
+                if (ch > 1) row[o + 1] = Quantum.ScaleFromByte((byte)(a ? 200 : 40));
+                if (ch > 2) row[o + 2] = Quantum.ScaleFromByte((byte)(a ? 90 : 150));
+            }
+        }
+
+        byte[] avif = HeifCoder.Encode(f, HeifContainerType.Avif, qp: 8);
+        ImageFrame dec = HeifCoder.Decode(avif);
+        double sse = 0; int n = 0;
+        for (long y = 0; y < h; y++)
+            for (long x = 0; x < w; x++)
+                for (int cc = 0; cc < 3; cc++)
+                {
+                    int a = (f.GetPixelChannel(x, y, cc) * 255 + 32767) / 65535;
+                    int b = (dec.GetPixelChannel(x, y, cc) * 255 + 32767) / 65535;
+                    int d = a - b; sse += d * d; n++;
+                }
+
+        await Assert.That(System.Math.Sqrt(sse / n)).IsLessThan(3.0);
+    }
 }

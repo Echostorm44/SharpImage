@@ -315,102 +315,166 @@ internal static class Av1StillImageEncoder
         return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false);
     }
 
+    // Per-superblock recursive-partition state for I420 colour. Extends the grayscale scheme with two chroma
+    // planes (half resolution): chroma follows the luma partition tree, each leaf coding U/V at half the luma
+    // block size (down to 4x4 chroma for an 8x8 luma leaf).
+    private sealed class ColorPartCtx
+    {
+        public Av1MsacWriter Msac = null!;
+        public Av1CdfContext Cdf = null!;
+        public byte[] Luma = null!, U = null!, V = null!;
+        public byte[] ReconY = null!, ReconU = null!, ReconV = null!;
+        public int W, Cw, Chh;         // luma stride, chroma stride, chroma height
+        public int Bw4, Bh4;           // REAL luma frame dims in 4-units
+        public int DcDq, AcDq;
+        public byte[] AbovePart = null!, ALY = null!, ACU = null!, ACV = null!, AModeY = null!, ASkip = null!;
+        public byte[] LeftPart = null!, LLY = null!, LCU = null!, LCV = null!, LModeY = null!, LSkip = null!;
+        public byte[] Pred = new byte[64 * 64];
+        public byte[] EstScratch = new byte[64 * 64];
+    }
+
     private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> uPlane, ReadOnlySpan<byte> vPlane,
         int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx)
     {
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
         var cdf = new Av1CdfContext();
         Av1CdfDefaults.InitializeDefault(cdf, qcat);
-        int dcDq = Av1Tables.DequantTable[0, baseQIdx, 0];
-        int acDq = Av1Tables.DequantTable[0, baseQIdx, 1];
         int cw = w / 2, chh = h / 2;
-        int yScan = Av1Tables.Scans[Tx64x64].Length;
-        int cScan = Av1Tables.Scans[Tx32x32].Length;
 
-        var msac = new Av1MsacWriter();
-        var reconY = new byte[w * h];
-        var reconU = new byte[cw * chh];
-        var reconV = new byte[cw * chh];
-        // Per-SB128-column above contexts for luma + both chroma planes (persist across SB rows).
         int sb128Cols = (sbCols + 1) >> 1;
+        var abovePart = new byte[sb128Cols][];
         var aLY = FilledArray(sb128Cols); var aCU = FilledArray(sb128Cols); var aCV = FilledArray(sb128Cols);
-        var aboveModeY = new byte[sb128Cols][]; // luma mode context for kf-y-mode (0 = DC)
-        for (int i = 0; i < sb128Cols; i++) aboveModeY[i] = new byte[32];
+        var aModeY = new byte[sb128Cols][]; var aSkip = new byte[sb128Cols][];
+        for (int i = 0; i < sb128Cols; i++) { abovePart[i] = new byte[16]; aModeY[i] = new byte[32]; aSkip[i] = new byte[32]; }
 
-        var aboveSkip = new byte[sbCols]; // block-skip context (see EncodeMultiSbTile)
-        var pred = new byte[64 * 64];
+        byte[] lumaArr = new byte[w * h]; luma.CopyTo(lumaArr);
+        byte[] uArr = new byte[cw * chh]; uPlane.CopyTo(uArr);
+        byte[] vArr = new byte[cw * chh]; vPlane.CopyTo(vArr);
+
+        var c = new ColorPartCtx
+        {
+            Msac = new Av1MsacWriter(), Cdf = cdf, Luma = lumaArr, U = uArr, V = vArr,
+            ReconY = new byte[w * h], ReconU = new byte[cw * chh], ReconV = new byte[cw * chh],
+            W = w, Cw = cw, Chh = chh, Bw4 = bw4, Bh4 = bh4,
+            DcDq = Av1Tables.DequantTable[0, baseQIdx, 0], AcDq = Av1Tables.DequantTable[0, baseQIdx, 1],
+        };
+
         for (int sby = 0; sby < sbRows; sby++)
         {
-            var lLY = Filled(32); var lCU = Filled(32); var lCV = Filled(32); // left (reset per SB row)
-            var leftModeY = new byte[32];
-            byte leftSkip = 0;
-            int by = sby * 64, cby = sby * 32;
-            int by4 = (sby & 1) * 16, cby4 = by4 >> 1;
+            c.LeftPart = new byte[16]; c.LLY = Filled(32); c.LCU = Filled(32); c.LCV = Filled(32);
+            c.LModeY = new byte[32]; c.LSkip = new byte[32];
             for (int sbx = 0; sbx < sbCols; sbx++)
             {
-                int bx = sbx * 64, cbx = sbx * 32;
-                int bx4 = (sbx & 1) * 16, cbx4 = bx4 >> 1;
-                int a128 = sbx >> 1;
-                byte[] alY = aLY[a128], acU = aCU[a128], acV = aCV[a128];
-                byte[] aModeY = aboveModeY[a128];
-
-                msac.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9); // PARTITION_NONE
-
-                // Luma: full intra-mode selection (DC/Smooth/directional...). Chroma: DC prediction.
-                (Av1IntraPredMode yMode, int yDelta, _) = ChooseIntraMode(reconY, w, bw4, bh4, sbx * 16, sby * 16, 64, luma, w, bx, by, pred);
-                int[] yC = ForwardResidualPred(luma, w, bx, by, pred, 64, dcDq, acDq, yScan);
-                int dcU = DcPredict(reconU, cw, chh, cbx, cby, 32, 32);
-                int dcV = DcPredict(reconV, cw, chh, cbx, cby, 32, 32);
-                int[] uC = ForwardResidual(uPlane, cw, cbx, cby, 32, dcU, dcDq, acDq, cScan);
-                int[] vC = ForwardResidual(vPlane, cw, cbx, cby, 32, dcV, dcDq, acDq, cScan);
-                int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
-
-                int skipCtx = aboveSkip[sbx] + leftSkip;
-                msac.EncodeBool((uint)skip, cdf.GetSkipCdf(skipCtx)[0]);
-                aboveSkip[sbx] = (byte)skip;
-                leftSkip = (byte)skip;
-                int yAboveCtx = Av1Tables.IntraModeContext[aModeY[bx4]];
-                int yLeftCtx = Av1Tables.IntraModeContext[leftModeY[by4]];
-                msac.EncodeSymbol(cdf.GetKfYModeCdf(yAboveCtx, yLeftCtx), (int)yMode, 12);
-                if (IsDirectional(yMode))
-                    msac.EncodeSymbol(cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
-                msac.EncodeSymbol(cdf.GetUvModeCdf(cflAllowed: false, (int)yMode), 0, 12);  // UV DC (64 block, no CfL)
-
-                byte cfY = 0x40, cfU = 0x40, cfV = 0x40;
-                if (skip == 0)
-                {
-                    ref readonly var uvtDim = ref Av1Tables.TxfmDimensions[Tx32x32];
-                    int uSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, (int)Av1BlockSize.Bs64x64, acU.AsSpan(cbx4), lCU.AsSpan(cby4), 1, (int)Av1PixelLayout.I420);
-                    int vSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, (int)Av1BlockSize.Bs64x64, acV.AsSpan(cbx4), lCV.AsSpan(cby4), 1, (int)Av1PixelLayout.I420);
-                    int ySign = Av1CoeffDecode.GetDcSignCtx(Tx64x64, alY.AsSpan(bx4), lLY.AsSpan(by4));
-                    int uSign = Av1CoeffDecode.GetDcSignCtx(Tx32x32, acU.AsSpan(cbx4), lCU.AsSpan(cby4));
-                    int vSign = Av1CoeffDecode.GetDcSignCtx(Tx32x32, acV.AsSpan(cbx4), lCV.AsSpan(cby4));
-
-                    Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx64x64, 0, 0, yC, dcSignCtx: ySign);
-                    Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx32x32, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
-                    Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx32x32, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
-
-                    cfY = DequantAndReconstructPred(yC, Tx64x64, 64, dcDq, acDq, pred, reconY, w, bx, by);
-                    cfU = DequantAndReconstruct(uC, Tx32x32, 32, dcDq, acDq, dcU, reconU, cw, cbx, cby);
-                    cfV = DequantAndReconstruct(vC, Tx32x32, 32, dcDq, acDq, dcV, reconV, cw, cbx, cby);
-                }
-                else
-                {
-                    for (int yy = 0; yy < 64; yy++) Array.Copy(pred, yy * 64, reconY, (by + yy) * w + bx, 64);
-                    FillFlat(reconU, cw, cbx, cby, 32, dcU);
-                    FillFlat(reconV, cw, cbx, cby, 32, dcV);
-                }
-
-                // Context fills clip to the real frame; chroma uses (Bw-curBx+ssHor)>>ssHor (I420 ssHor=1).
-                int yW = Math.Min(16, bw4 - sbx * 16), yH = Math.Min(16, bh4 - sby * 16);
-                int cW = Math.Min(8, (bw4 - sbx * 16 + 1) >> 1), cH = Math.Min(8, (bh4 - sby * 16 + 1) >> 1);
-                if (yW > 0) { Array.Fill(alY, cfY, bx4, yW); Array.Fill(lLY, cfY, by4, yH); Array.Fill(aModeY, (byte)yMode, bx4, yW); Array.Fill(leftModeY, (byte)yMode, by4, yH); }
-                if (cW > 0) { Array.Fill(acU, cfU, cbx4, cW); Array.Fill(lCU, cfU, cby4, cH); }
-                if (cW > 0) { Array.Fill(acV, cfV, cbx4, cW); Array.Fill(lCV, cfV, cby4, cH); }
+                int col = sbx >> 1;
+                c.AbovePart = abovePart[col]; c.ALY = aLY[col]; c.ACU = aCU[col]; c.ACV = aCV[col];
+                c.AModeY = aModeY[col]; c.ASkip = aSkip[col];
+                EncodePartitionColor(c, 1, sbx * 16, sby * 16);
             }
         }
 
-        return msac.Finish();
+        return c.Msac.Finish();
+    }
+
+    private static void EncodePartitionColor(ColorPartCtx c, int bl, int bx4, int by4)
+    {
+        int hsz = 16 >> bl, blk4 = 32 >> bl;
+        bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
+        bool canSplit = bl < 4 && fullyInside;
+
+        bool doSplit = false;
+        if (canSplit)
+        {
+            long costNone = EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl, bx4, by4);
+            long costSplit = 0;
+            foreach ((int dx, int dy) in new[] { (0, 0), (hsz, 0), (0, hsz), (hsz, hsz) })
+                costSplit += EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl + 1, bx4 + dx, by4 + dy);
+            doSplit = costSplit < costNone;
+        }
+
+        int bx8 = (bx4 & 31) >> 1, by8 = (by4 & 31) >> 1;
+        int partCtx = ((c.AbovePart[bx8] >> (4 - bl)) & 1) + (((c.LeftPart[by8] >> (4 - bl)) & 1) << 1);
+        int nPart = Av1Tables.PartitionTypeCount[bl];
+
+        if (doSplit)
+        {
+            c.Msac.EncodeSymbol(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.Split, nPart);
+            EncodePartitionColor(c, bl + 1, bx4, by4);
+            EncodePartitionColor(c, bl + 1, bx4 + hsz, by4);
+            EncodePartitionColor(c, bl + 1, bx4, by4 + hsz);
+            EncodePartitionColor(c, bl + 1, bx4 + hsz, by4 + hsz);
+            return;
+        }
+
+        c.Msac.EncodeSymbol(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.None, nPart);
+        EncodeLeafBlockColor(c, bl, bx4, by4, blk4);
+
+        byte aboveVal = Av1Tables.AboveLeftPartCtx[0, bl, (int)Av1BlockPartition.None];
+        byte leftVal = Av1Tables.AboveLeftPartCtx[1, bl, (int)Av1BlockPartition.None];
+        for (int i = 0; i < hsz && bx8 + i < 16; i++) c.AbovePart[bx8 + i] = aboveVal;
+        for (int j = 0; j < hsz && by8 + j < 16; j++) c.LeftPart[by8 + j] = leftVal;
+    }
+
+    private static void EncodeLeafBlockColor(ColorPartCtx c, int bl, int bx4, int by4, int blk4)
+    {
+        int n = blk4 * 4, cn = n / 2;
+        int tx = BlToTx(bl), ctx0 = tx - 1; // chroma tx = one size smaller (I420)
+        int bs = BlToBs(bl);
+        int bxR = bx4 & 31, byR = by4 & 31;
+        int cxR = bxR >> 1, cyR = byR >> 1;      // chroma context index (4-unit)
+        int cblk4 = Math.Max(1, blk4 >> 1);
+        int bx = bx4 * 4, by = by4 * 4, cbx = bx4 * 2, cby = by4 * 2; // pixel positions
+        bool cflAllowed = bl >= 2;               // blocks <= 32x32
+        int uvNsym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
+
+        // Luma mode + prediction (from reconstruction).
+        (Av1IntraPredMode yMode, int yDelta, _) = ChooseIntraMode(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, n, c.Luma, c.W, bx, by, c.Pred);
+        int[] yC = ForwardResidualPred(c.Luma, c.W, bx, by, c.Pred, n, c.DcDq, c.AcDq, Av1Tables.Scans[tx].Length);
+        int dcU = DcPredict(c.ReconU, c.Cw, c.Chh, cbx, cby, cn, cn);
+        int dcV = DcPredict(c.ReconV, c.Cw, c.Chh, cbx, cby, cn, cn);
+        int[] uC = ForwardResidual(c.U, c.Cw, cbx, cby, cn, dcU, c.DcDq, c.AcDq, Av1Tables.Scans[ctx0].Length);
+        int[] vC = ForwardResidual(c.V, c.Cw, cbx, cby, cn, dcV, c.DcDq, c.AcDq, Av1Tables.Scans[ctx0].Length);
+        int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
+
+        int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
+        c.Msac.EncodeBool((uint)skip, c.Cdf.GetSkipCdf(skipCtx)[0]);
+        int yAboveCtx = Av1Tables.IntraModeContext[c.AModeY[bxR]];
+        int yLeftCtx = Av1Tables.IntraModeContext[c.LModeY[byR]];
+        c.Msac.EncodeSymbol(c.Cdf.GetKfYModeCdf(yAboveCtx, yLeftCtx), (int)yMode, 12);
+        if (IsDirectional(yMode))
+            c.Msac.EncodeSymbol(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
+        c.Msac.EncodeSymbol(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), 0, uvNsym); // UV DC
+
+        byte cfY = 0x40, cfU = 0x40, cfV = 0x40;
+        if (skip == 0)
+        {
+            ref readonly var uvtDim = ref Av1Tables.TxfmDimensions[ctx0];
+            int uSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, bs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
+            int vSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, bs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
+            int ySign = Av1CoeffDecode.GetDcSignCtx(tx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
+            int uSign = Av1CoeffDecode.GetDcSignCtx(ctx0, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
+            int vSign = Av1CoeffDecode.GetDcSignCtx(ctx0, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
+
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, yC, dcSignCtx: ySign);
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
+
+            cfY = DequantAndReconstructPred(yC, tx, n, c.DcDq, c.AcDq, c.Pred, c.ReconY, c.W, bx, by);
+            cfU = DequantAndReconstruct(uC, ctx0, cn, c.DcDq, c.AcDq, dcU, c.ReconU, c.Cw, cbx, cby);
+            cfV = DequantAndReconstruct(vC, ctx0, cn, c.DcDq, c.AcDq, dcV, c.ReconV, c.Cw, cbx, cby);
+        }
+        else
+        {
+            for (int yy = 0; yy < n; yy++) Array.Copy(c.Pred, yy * n, c.ReconY, (by + yy) * c.W + bx, n);
+            FillFlat(c.ReconU, c.Cw, cbx, cby, cn, dcU);
+            FillFlat(c.ReconV, c.Cw, cbx, cby, cn, dcV);
+        }
+
+        int yW = Math.Min(blk4, c.Bw4 - bx4), yH = Math.Min(blk4, c.Bh4 - by4);
+        int cW = Math.Min(cblk4, (c.Bw4 - bx4 + 1) >> 1), cH = Math.Min(cblk4, (c.Bh4 - by4 + 1) >> 1);
+        for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; }
+        for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; }
+        for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; }
+        for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; }
     }
 
     private static byte[] Filled(int n)
@@ -681,11 +745,17 @@ internal static class Av1StillImageEncoder
     // reflects that a smooth block, though it has residual energy, quantizes to very few coefficients and is cheap.
     private const int HeaderCostBits = 22;   // partition + skip + y-mode (+ angle) symbols, amortized
     private static long EstimateCost(GrayPartCtx c, int bl, int bx4, int by4)
+        => EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl, bx4, by4);
+
+    // Coefficient-based coding-cost estimate for a luma block (see EncodePartition). Used for the NONE/SPLIT
+    // decision in both the grayscale and colour encoders (the tree is luma-driven; chroma follows).
+    private static long EstimateBlockCost(byte[] luma, int w, int bw4, int bh4, int dcDq, int acDq, byte[] scratch,
+        int bl, int bx4, int by4)
     {
         int n = (32 >> bl) * 4;
         int tx = BlToTx(bl);
-        (_, _, _) = ChooseIntraMode(c.Luma, c.W, c.Bw4, c.Bh4, bx4, by4, n, c.Luma, c.W, bx4 * 4, by4 * 4, c.EstScratch);
-        int[] coeffs = ForwardResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.EstScratch, n, c.DcDq, c.AcDq, Av1Tables.Scans[tx].Length);
+        ChooseIntraMode(luma, w, bw4, bh4, bx4, by4, n, luma, w, bx4 * 4, by4 * 4, scratch);
+        int[] coeffs = ForwardResidualPred(luma, w, bx4 * 4, by4 * 4, scratch, n, dcDq, acDq, Av1Tables.Scans[tx].Length);
         long bits = HeaderCostBits;
         foreach (int v in coeffs)
             if (v != 0) { int a = Math.Abs(v); bits += 5 + (a >= 15 ? 8 : a >> 1); } // base+sign ~5b, magnitude tail
