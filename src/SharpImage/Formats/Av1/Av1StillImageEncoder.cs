@@ -701,8 +701,8 @@ internal static class Av1StillImageEncoder
     {
         int tx = BlToTx(bl);
         int bxR = bx4 & 31, byR = by4 & 31;
-        int scanLen = Av1Tables.Scans[tx].Length;
-        int[] coeffs = ForwardResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n, c.DcDq, c.AcDq, scanLen);
+        int[] residual = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n);
+        (int[] coeffs, Av1TxType invTx, int txIdx) = ChooseTxType(residual, n, tx, c.DcDq, c.AcDq);
         int skip = HasNonZero(coeffs) ? 0 : 1;
 
         int skipCtx = c.AboveSkip[bxR] + c.LeftSkip[byR];
@@ -719,8 +719,8 @@ internal static class Av1StillImageEncoder
         {
             int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, c.AboveLCoef.AsSpan(bxR), c.LeftLCoef.AsSpan(byR));
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, chroma: 0, yMode: (int)yMode, coeffs,
-                skipCtx: 0, dcSignCtx: dcSignCtx);
-            cfCtx = DequantAndReconstructPred(coeffs, tx, n, c.DcDq, c.AcDq, c.Pred, c.Recon, c.W, bx4 * 4, by4 * 4);
+                skipCtx: 0, dcSignCtx: dcSignCtx, txTypeIdx: txIdx);
+            cfCtx = DequantAndReconstructPred(coeffs, tx, n, c.DcDq, c.AcDq, c.Pred, c.Recon, c.W, bx4 * 4, by4 * 4, invTx);
         }
         else
         {
@@ -977,7 +977,7 @@ internal static class Av1StillImageEncoder
     // Dequantizes and reconstructs an n x n block on top of an arbitrary intra prediction (predBlock, n x n),
     // via the decoder's InvTxfmAdd, into recon. Returns the coefficient-context byte.
     private static byte DequantAndReconstructPred(int[] levels, int tx, int n, int dcDq, int acDq,
-        byte[] predBlock, byte[] recon, int reconW, int bx, int by)
+        byte[] predBlock, byte[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct)
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[tx].Ctx - 2);
         const int cfMax = 32767;
@@ -1007,7 +1007,7 @@ internal static class Av1StillImageEncoder
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
         var block = (byte[])predBlock.Clone();
-        Av1InvTransform.InvTxfmAdd(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], Av1TxType.DctDct, 8);
+        Av1InvTransform.InvTxfmAdd(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], txType, 8);
         for (int y = 0; y < n; y++)
         {
             for (int x = 0; x < n; x++)
@@ -1020,6 +1020,56 @@ internal static class Av1StillImageEncoder
     }
 
     // Forward-transforms and quantizes (src block - prediction) for an n x n block.
+    // The reduced intra tx set (Intra2) types searched for luma tx ≤ 16x16 (where the type is signalled), as
+    // (forward type, inverse type, symbol index in TxTypesPerSet Intra2). DctDct is idx 1; ADST combos 2/3/4.
+    private static readonly (Av1FwdTransform.FwdTxType Fwd, Av1TxType Inv, int Idx)[] IntraTxTypes =
+    {
+        (Av1FwdTransform.FwdTxType.DctDct,   Av1TxType.DctDct,   1),
+        (Av1FwdTransform.FwdTxType.AdstAdst, Av1TxType.AdstAdst, 2),
+        (Av1FwdTransform.FwdTxType.AdstDct,  Av1TxType.AdstDct,  3),
+        (Av1FwdTransform.FwdTxType.DctAdst,  Av1TxType.DctAdst,  4),
+    };
+
+
+    // Residual (src - prediction) for an n x n block.
+    private static int[] ComputeResidualPred(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] pred, int n)
+    {
+        var r = new int[n * n];
+        for (int y = 0; y < n; y++)
+            for (int x = 0; x < n; x++)
+                r[y * n + x] = src[(srcBy + y) * srcW + (srcBx + x)] - pred[y * n + x];
+        return r;
+    }
+
+    // Coefficient coding-cost proxy (bit-ish): per nonzero base+sign + magnitude tail.
+    private static long CoeffCost(int[] coeffs)
+    {
+        long bits = 0;
+        foreach (int v in coeffs) if (v != 0) { int a = Math.Abs(v); bits += 5 + (a >= 15 ? 8 : a >> 1); }
+        return bits;
+    }
+
+    // Chooses the intra transform type minimizing coefficient cost for a residual. For luma tx ≤ 16x16 the type is
+    // signalled (Intra2 set: DctDct + ADST combos); for tx ≥ 32x32 DctDct is forced. Returns the quantized coeffs,
+    // the inverse type for reconstruction, and the Intra2 symbol index to code.
+    private static (int[] Coeffs, Av1TxType Inv, int Idx) ChooseTxType(int[] residual, int n, int tx, int dcDq, int acDq)
+    {
+        int scanLen = Av1Tables.Scans[tx].Length;
+        if (n > 16)
+            return (Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen), Av1TxType.DctDct, 1);
+
+        long best = long.MaxValue;
+        (int[], Av1TxType, int) bestCand = default;
+        foreach (var (fwd, inv, idx) in IntraTxTypes)
+        {
+            int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, fwd);
+            long cost = CoeffCost(cf);
+            if (cost < best) { best = cost; bestCand = (cf, inv, idx); }
+        }
+
+        return bestCand;
+    }
+
     private static int[] ForwardResidualPred(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy,
         byte[] pred, int n, int dcDq, int acDq, int scanLen)
     {

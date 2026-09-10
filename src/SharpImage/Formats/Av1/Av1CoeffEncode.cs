@@ -27,7 +27,8 @@ internal static class Av1CoeffEncode
         int yMode,
         ReadOnlySpan<int> signedLevels,
         int skipCtx = 0,
-        int dcSignCtx = 0)
+        int dcSignCtx = 0,
+        int txTypeIdx = 1)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
 
@@ -72,7 +73,7 @@ internal static class Av1CoeffEncode
         const int intra = 1;
         if (chroma == 0 && tDim.Max + intra < (int)Av1TxSize.Tx64x64)
         {
-            w.EncodeSymbolAdapt(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], 1, 4);
+            w.EncodeSymbolAdapt(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], txTypeIdx, 4);
         }
 
         // --- EOB bin + extra bits ---
