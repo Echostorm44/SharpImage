@@ -357,7 +357,7 @@ internal static class Av1StillImageEncoder
                 msac.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9); // PARTITION_NONE
 
                 // Luma: full intra-mode selection (DC/Smooth/directional...). Chroma: DC prediction.
-                (Av1IntraPredMode yMode, int yDelta) = ChooseIntraMode(reconY, w, bw4, bh4, sbx * 16, sby * 16, 64, luma, w, bx, by, pred);
+                (Av1IntraPredMode yMode, int yDelta, _) = ChooseIntraMode(reconY, w, bw4, bh4, sbx * 16, sby * 16, 64, luma, w, bx, by, pred);
                 int[] yC = ForwardResidualPred(luma, w, bx, by, pred, 64, dcDq, acDq, yScan);
                 int dcU = DcPredict(reconU, cw, chh, cbx, cby, 32, 32);
                 int dcV = DcPredict(reconV, cw, chh, cbx, cby, 32, 32);
@@ -497,95 +497,199 @@ internal static class Av1StillImageEncoder
         }
     }
 
-    // Codes the whole tile: every 64x64 superblock as PARTITION_NONE/DC-intra, in raster order, reconstructing
-    // each block so later blocks predict from the same pixels the decoder will. Partition/skip/coeff-skip/y-mode
-    // contexts are all 0 for full-64 blocks; only DC prediction and the DC-sign context vary per block.
+    // Per-superblock recursive-partition encoder state. All context arrays mirror the decoder's Above/Left
+    // block-context arrays: Above arrays are per-SB128 column (persist across SB rows), Left arrays reset per
+    // SB row. 4-unit arrays are indexed by Bx4&31 / By4&31; the 8-unit partition array by (Bx4&31)>>1.
+    private sealed class GrayPartCtx
+    {
+        public Av1MsacWriter Msac = null!;
+        public Av1CdfContext Cdf = null!;
+        public byte[] Luma = null!;   // padded plane
+        public byte[] Recon = null!;  // padded plane (SB-aligned), reconstructed as-we-go
+        public int W;                 // padded stride
+        public int Bw4, Bh4;          // REAL frame dims in 4-units (partition decisions use these)
+        public int DcDq, AcDq;
+        public long SplitLambda;      // rate bias for the split decision, in SATD units
+
+        // Above (per SB128 column), Left (per SB row).
+        public byte[] AbovePart = null!, AboveLCoef = null!, AboveMode = null!, AboveSkip = null!;
+        public byte[] LeftPart = null!, LeftLCoef = null!, LeftMode = null!, LeftSkip = null!;
+        public byte[] Pred = new byte[64 * 64];
+        public byte[] EstScratch = new byte[64 * 64];
+    }
+
+    private static int BlToTx(int bl) => bl switch { 1 => 4, 2 => 3, 3 => 2, _ => 1 };            // TX size ordinal
+    private static int BlToBs(int bl) => bl switch { 1 => 3, 2 => 7, 3 => 12, _ => 17 };          // Av1BlockSize ordinal
+
+    // Codes the whole tile with a recursive partition tree (PARTITION_NONE / PARTITION_SPLIT down to 8x8),
+    // reconstructing each leaf so later blocks predict from the pixels the decoder will produce. Only fully-inside
+    // blocks are split; edge superblocks (non-multiple-of-64 frames) stay a single PARTITION_NONE 64x64 block, so
+    // every partition decision is full-range and never needs the partial-edge bool path.
     private static byte[] EncodeMultiSbTile(ReadOnlySpan<byte> luma, int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx)
     {
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
         var cdf = new Av1CdfContext();
         Av1CdfDefaults.InitializeDefault(cdf, qcat);
-        int dcDq = Av1Tables.DequantTable[0, baseQIdx, 0];
         int acDq = Av1Tables.DequantTable[0, baseQIdx, 1];
-        int scanLen = Av1Tables.Scans[Tx64x64].Length;
 
-        var msac = new Av1MsacWriter();
-        var recon = new byte[w * h];
-        // Above context is per-SB128 column (each byte[32] holds 2 SB64 cols), matching the decoder's aboveCtx[]
-        // array; persists across SB rows. Left resets per SB row. This lifts the previous 2x2 (single-array) cap.
         int sb128Cols = (sbCols + 1) >> 1;
+        var abovePart = new byte[sb128Cols][];
         var aboveLCoef = new byte[sb128Cols][];
-        var aboveMode = new byte[sb128Cols][];  // neighbour Y modes for the kf-y-mode context
+        var aboveMode = new byte[sb128Cols][];
+        var aboveSkip = new byte[sb128Cols][];
         for (int i = 0; i < sb128Cols; i++)
         {
+            abovePart[i] = new byte[16];
             aboveLCoef[i] = Filled(32);
-            aboveMode[i] = new byte[32]; // 0 = DC
+            aboveMode[i] = new byte[32];
+            aboveSkip[i] = new byte[32];
         }
 
-        // Block-skip context: the decoder derives it as Above.Skip[bx4] + Left.Skip[by4], so we track per-SB
-        // skip flags (above row persists across SB rows; left resets per row). Mode selection makes some blocks
-        // skippable, so this context is genuinely non-zero next to a skipped neighbour.
-        var aboveSkip = new byte[sbCols];
-        var pred = new byte[64 * 64];
+        var ctx = new GrayPartCtx
+        {
+            Msac = new Av1MsacWriter(), Cdf = cdf, Luma = new byte[0], Recon = new byte[w * h], W = w,
+            Bw4 = bw4, Bh4 = bh4, DcDq = Av1Tables.DequantTable[0, baseQIdx, 0], AcDq = acDq,
+            // Extra split bias beyond the per-block header cost already in EstimateCost. Zero works well because
+            // that header term already penalises the four sub-block headers a split introduces.
+            SplitLambda = 0L,
+        };
+        // `Luma` is a ReadOnlySpan param; copy to a field-friendly array once.
+        var lumaArr = new byte[w * h];
+        luma.CopyTo(lumaArr);
+        ctx.Luma = lumaArr;
+
         for (int sby = 0; sby < sbRows; sby++)
         {
-            byte[] leftLCoef = Filled(32); // reset each SB row
-            var leftMode = new byte[32];   // 0 = DC
-            byte leftSkip = 0;             // left neighbour skip (reset per SB row; unavailable ⇒ 0)
-            int by = sby * 64;
-            int by4 = (sby & 1) * 16;      // By & 31, By = sby*16 (4-units)
+            ctx.LeftPart = new byte[16];
+            ctx.LeftLCoef = Filled(32);
+            ctx.LeftMode = new byte[32];
+            ctx.LeftSkip = new byte[32];
             for (int sbx = 0; sbx < sbCols; sbx++)
             {
-                int bx = sbx * 64;
-                int bx4 = (sbx & 1) * 16;
-                byte[] above = aboveLCoef[sbx >> 1];
-                byte[] aMode = aboveMode[sbx >> 1];
-
-                // Partition NONE at BLOCK_64X64, ctx 0 (all full-64 SBs).
-                msac.EncodeSymbol(cdf.GetPartitionCdf(Av1BlockLevel.Bl64x64, 0), 0, 9);
-
-                // Choose the best intra mode (lowest residual SAD) and get its prediction.
-                (Av1IntraPredMode yMode, int yDelta) = ChooseIntraMode(recon, w, bw4, bh4, sbx * 16, sby * 16, 64, luma, w, bx, by, pred);
-                int[] coeffs = ForwardResidualPred(luma, w, bx, by, pred, 64, dcDq, acDq, scanLen);
-                int skip = HasNonZero(coeffs) ? 0 : 1;
-
-                int skipCtx = aboveSkip[sbx] + leftSkip;
-                msac.EncodeBool((uint)skip, cdf.GetSkipCdf(skipCtx)[0]);
-                aboveSkip[sbx] = (byte)skip;
-                leftSkip = (byte)skip;
-                int aboveCtx = Av1Tables.IntraModeContext[aMode[bx4]];
-                int leftCtx = Av1Tables.IntraModeContext[leftMode[by4]];
-                msac.EncodeSymbol(cdf.GetKfYModeCdf(aboveCtx, leftCtx), (int)yMode, 12);
-                // angle_delta for directional modes (block is 64x64 ≥ 8x8, so always coded).
-                if (IsDirectional(yMode))
-                    msac.EncodeSymbol(cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
-
-                byte cfCtx;
-                if (skip == 0)
-                {
-                    int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(Tx64x64, above.AsSpan(bx4), leftLCoef.AsSpan(by4));
-                    Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, Tx64x64, chroma: 0, yMode: 0, coeffs,
-                        skipCtx: 0, dcSignCtx: dcSignCtx);
-                    cfCtx = DequantAndReconstructPred(coeffs, Tx64x64, 64, dcDq, acDq, pred, recon, w, bx, by);
-                }
-                else
-                {
-                    cfCtx = 0x40;
-                    for (int y = 0; y < 64; y++)
-                    {
-                        Array.Copy(pred, y * 64, recon, (by + y) * w + bx, 64);
-                    }
-                }
-
-                // Context fills clip to the real frame (decoder: ctxW = min(tDim.W, Bw - curBx)).
-                int ctxW = Math.Min(16, bw4 - sbx * 16);
-                int ctxH = Math.Min(16, bh4 - sby * 16);
-                if (ctxW > 0) { Array.Fill(above, cfCtx, bx4, ctxW); Array.Fill(aMode, (byte)yMode, bx4, ctxW); }
-                if (ctxH > 0) { Array.Fill(leftLCoef, cfCtx, by4, ctxH); Array.Fill(leftMode, (byte)yMode, by4, ctxH); }
+                int col = sbx >> 1;
+                ctx.AbovePart = abovePart[col];
+                ctx.AboveLCoef = aboveLCoef[col];
+                ctx.AboveMode = aboveMode[col];
+                ctx.AboveSkip = aboveSkip[col];
+                EncodePartition(ctx, 1 /*Bl64x64*/, sbx * 16, sby * 16);
             }
         }
 
-        return msac.Finish();
+        return ctx.Msac.Finish();
+    }
+
+    // Recursively encodes the partition tree for one block. bl is the Av1BlockLevel (1=64x64..4=8x8); bx4/by4 are
+    // the block's absolute 4-unit position. Chooses PARTITION_NONE vs PARTITION_SPLIT by comparing the whole-block
+    // residual SATD against the sum of the four quadrants' SATD (plus a rate bias).
+    private static void EncodePartition(GrayPartCtx c, int bl, int bx4, int by4)
+    {
+        int hsz = 16 >> bl;          // half block in 4-units
+        int blk4 = 32 >> bl;         // full block in 4-units
+        int n = blk4 * 4;            // block pixels
+        bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
+        bool canSplit = bl < 4 && fullyInside;
+
+        bool doSplit = false;
+        if (canSplit)
+        {
+            // Decision uses source-plane predictions (≈ what the reconstruction will be) so each quadrant is
+            // scored as it would predict AFTER splitting — the actual encode below still predicts from recon.
+            long costNone = EstimateCost(c, bl, bx4, by4);
+            long costSplit = c.SplitLambda;
+            foreach ((int dx, int dy) in new[] { (0, 0), (hsz, 0), (0, hsz), (hsz, hsz) })
+                costSplit += EstimateCost(c, bl + 1, bx4 + dx, by4 + dy);
+            doSplit = costSplit < costNone;
+        }
+
+        // Partition symbol (always full-range in our scheme — see method summary).
+        int bx8 = (bx4 & 31) >> 1, by8 = (by4 & 31) >> 1;
+        int partCtx = ((c.AbovePart[bx8] >> (4 - bl)) & 1) + (((c.LeftPart[by8] >> (4 - bl)) & 1) << 1);
+        int nPart = Av1Tables.PartitionTypeCount[bl];
+
+        if (doSplit)
+        {
+            c.Msac.EncodeSymbol(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.Split, nPart);
+            EncodePartition(c, bl + 1, bx4, by4);
+            EncodePartition(c, bl + 1, bx4 + hsz, by4);
+            EncodePartition(c, bl + 1, bx4, by4 + hsz);
+            EncodePartition(c, bl + 1, bx4 + hsz, by4 + hsz);
+            return; // SPLIT nodes (bl<8x8) do not update partition context
+        }
+
+        c.Msac.EncodeSymbol(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.None, nPart);
+        // Actual leaf: pick the best mode predicting from the real reconstruction, then code + reconstruct.
+        (Av1IntraPredMode yMode, int yDelta, _) =
+            ChooseIntraMode(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred);
+        EncodeLeafBlock(c, bl, bx4, by4, blk4, n, yMode, yDelta);
+
+        // Partition context fill for the NONE leaf (mirrors DecodeSuperblock's AboveLeftPartCtx update).
+        byte aboveVal = Av1Tables.AboveLeftPartCtx[0, bl, (int)Av1BlockPartition.None];
+        byte leftVal = Av1Tables.AboveLeftPartCtx[1, bl, (int)Av1BlockPartition.None];
+        int pcount = hsz; // = 1<<Ulog2(hsz), block width in 8-units
+        for (int i = 0; i < pcount && bx8 + i < 16; i++) c.AbovePart[bx8 + i] = aboveVal;
+        for (int j = 0; j < pcount && by8 + j < 16; j++) c.LeftPart[by8 + j] = leftVal;
+    }
+
+    // Encodes one PARTITION_NONE leaf: skip flag, Y mode (+ angle_delta), coefficients, reconstruction, and the
+    // above/left mode/skip/coeff context fills.
+    private static void EncodeLeafBlock(GrayPartCtx c, int bl, int bx4, int by4, int blk4, int n,
+        Av1IntraPredMode yMode, int yDelta)
+    {
+        int tx = BlToTx(bl);
+        int bxR = bx4 & 31, byR = by4 & 31;
+        int scanLen = Av1Tables.Scans[tx].Length;
+        int[] coeffs = ForwardResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n, c.DcDq, c.AcDq, scanLen);
+        int skip = HasNonZero(coeffs) ? 0 : 1;
+
+        int skipCtx = c.AboveSkip[bxR] + c.LeftSkip[byR];
+        c.Msac.EncodeBool((uint)skip, c.Cdf.GetSkipCdf(skipCtx)[0]);
+
+        int aboveCtx = Av1Tables.IntraModeContext[c.AboveMode[bxR]];
+        int leftCtx = Av1Tables.IntraModeContext[c.LeftMode[byR]];
+        c.Msac.EncodeSymbol(c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx), (int)yMode, 12);
+        if (IsDirectional(yMode))
+            c.Msac.EncodeSymbol(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
+
+        byte cfCtx;
+        if (skip == 0)
+        {
+            int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, c.AboveLCoef.AsSpan(bxR), c.LeftLCoef.AsSpan(byR));
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, chroma: 0, yMode: (int)yMode, coeffs,
+                skipCtx: 0, dcSignCtx: dcSignCtx);
+            cfCtx = DequantAndReconstructPred(coeffs, tx, n, c.DcDq, c.AcDq, c.Pred, c.Recon, c.W, bx4 * 4, by4 * 4);
+        }
+        else
+        {
+            cfCtx = 0x40;
+            for (int y = 0; y < n; y++)
+                Array.Copy(c.Pred, y * n, c.Recon, (by4 * 4 + y) * c.W + bx4 * 4, n);
+        }
+
+        // Context fills clip to the real frame and to the 32-wide context arrays.
+        int cw = Math.Min(blk4, c.Bw4 - bx4);
+        int ch = Math.Min(blk4, c.Bh4 - by4);
+        for (int i = 0; i < cw && bxR + i < 32; i++) { c.AboveLCoef[bxR + i] = cfCtx; c.AboveMode[bxR + i] = (byte)yMode; c.AboveSkip[bxR + i] = (byte)skip; }
+        for (int j = 0; j < ch && byR + j < 32; j++) { c.LeftLCoef[byR + j] = cfCtx; c.LeftMode[byR + j] = (byte)yMode; c.LeftSkip[byR + j] = (byte)skip; }
+    }
+
+    // Estimates a block's best-mode residual SATD for the split decision, predicting from the SOURCE plane so a
+    // quadrant is scored the way it would predict after splitting (its reconstructed neighbours ≈ source). Decision
+    // only — never affects the coded bitstream.
+    // Estimates the coding cost (in bit-like units) of a block coded PARTITION_NONE with its best mode, predicting
+    // from the SOURCE plane. Cost = a fixed per-block header + a coefficient term, so splitting is only chosen when
+    // the sum of quadrant costs (each carrying its own header) beats coding the parent whole. Unlike raw SATD this
+    // reflects that a smooth block, though it has residual energy, quantizes to very few coefficients and is cheap.
+    private const int HeaderCostBits = 22;   // partition + skip + y-mode (+ angle) symbols, amortized
+    private static long EstimateCost(GrayPartCtx c, int bl, int bx4, int by4)
+    {
+        int n = (32 >> bl) * 4;
+        int tx = BlToTx(bl);
+        (_, _, _) = ChooseIntraMode(c.Luma, c.W, c.Bw4, c.Bh4, bx4, by4, n, c.Luma, c.W, bx4 * 4, by4 * 4, c.EstScratch);
+        int[] coeffs = ForwardResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.EstScratch, n, c.DcDq, c.AcDq, Av1Tables.Scans[tx].Length);
+        long bits = HeaderCostBits;
+        foreach (int v in coeffs)
+            if (v != 0) { int a = Math.Abs(v); bits += 5 + (a >= 15 ? 8 : a >> 1); } // base+sign ~5b, magnitude tail
+        return bits;
     }
 
     // Intra modes tried per block, each as (mode, angle_delta). All are verified against libdav1d/ffmpeg.
@@ -645,7 +749,7 @@ internal static class Av1StillImageEncoder
     // directional edges are scored the way the transform will actually code them. Returns the winning (mode,
     // angle_delta) and writes its prediction into predOut (n x n). Purely an encoder decision: any candidate is
     // a valid mode, so this can never desync the decoder.
-    private static (Av1IntraPredMode Mode, int Delta) ChooseIntraMode(byte[] recon, int reconW, int bw4, int bh4,
+    private static (Av1IntraPredMode Mode, int Delta, long Cost) ChooseIntraMode(byte[] recon, int reconW, int bw4, int bh4,
         int bx4, int by4, int n, ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] predOut)
     {
         long best = long.MaxValue;
@@ -663,7 +767,7 @@ internal static class Av1StillImageEncoder
             }
         }
 
-        return bestCand;
+        return (bestCand.Mode, bestCand.Delta, best);
     }
 
     // Sum of 8x8 Hadamard-transformed absolute residuals (src - pred) tiled over an n x n block. SATD is the

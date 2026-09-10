@@ -91,4 +91,32 @@ public sealed class Av1MultiSbTests
         double rmse = System.Math.Sqrt(sse / (w * (double)h));
         await Assert.That(rmse).IsLessThan(3.0);
     }
+
+    // Sharp step edges aligned to the 32-column boundaries: a 64x64 transform rings across the step, but the
+    // recursive partitioner splits into flat 32-wide (or smaller) blocks that code losslessly. Verifies the
+    // partition tree round-trips (byte-exact in ffmpeg/libdav1d too) and that splitting engages where it helps.
+    [Test]
+    [Arguments(128, 128)]
+    [Arguments(192, 128)]
+    public async Task MultiSb_Partition_RoundTrips(int w, int h)
+    {
+        var src = new byte[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                src[y * w + x] = (byte)(((x / 32) & 1) == 0 ? 40 : 200);
+
+        byte[] avif = Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(src, w, h, 32);
+        ImageFrame frame = HeifCoder.Decode(avif);
+        double sse = 0;
+        for (long y = 0; y < h; y++)
+            for (long x = 0; x < w; x++)
+            {
+                int val = (frame.GetPixelChannel(x, y, 0) * 255 + 32767) / 65535;
+                int d = src[y * w + x] - val;
+                sse += d * d;
+            }
+
+        double rmse = System.Math.Sqrt(sse / (w * (double)h));
+        await Assert.That(rmse).IsLessThan(1.0); // flat blocks after split ⇒ near-lossless
+    }
 }
