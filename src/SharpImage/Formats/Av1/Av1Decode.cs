@@ -1296,7 +1296,10 @@ public static class Av1Decode
              b.Tx = Av1Tables.MaxTxfmSizeForBlockSize[(int)bs, 0];
             b.UvTx = Av1Tables.MaxTxfmSizeForBlockSize[(int)bs, (int)fh.PixelLayout];
             tDim = ref Av1Tables.TxfmDimensions[b.Tx];
-            if (fh.TxMode == Av1TxfmMode.Switchable && tDim.Max > (byte)Av1TxSize.Tx4x4)
+            // tx_depth is coded only for non-skip blocks (AV1 read_tx_size(allowSelect = !skip)); skip blocks use
+            // the max tx size. Previously this was read unconditionally — a latent bug, harmless under
+            // TX_MODE_LARGEST but wrong for TX_MODE_SELECT with skipped blocks.
+            if (fh.TxMode == Av1TxfmMode.Switchable && tDim.Max > (byte)Av1TxSize.Tx4x4 && b.Skip == 0)
             {
                 int tctx = GetTxCtx(t.Above, t.Left, tDim, by4, bx4);
                 var txCdf = ts.Cdf.GetTxSzCdf(tDim.Max - 1, tctx);

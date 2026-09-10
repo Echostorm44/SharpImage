@@ -133,15 +133,19 @@ internal static class Av1ObuWriter
     /// (tile data follows in the same OBU_FRAME); otherwise a trailing one-bit terminates a standalone
     /// OBU_FRAME_HEADER.</summary>
     internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame)
-        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, 1, 1, true);
+        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, 1, 1, true, false);
 
     internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows)
-        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, sbCols, sbRows, true);
+        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, sbCols, sbRows, true, false);
+
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome)
+        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, sbCols, sbRows, monochrome, false);
 
     /// <summary>Frame header for a frame that is <paramref name="sbCols"/> x <paramref name="sbRows"/> 64x64
     /// superblocks, coded as a single tile (uniform spacing, log2 tile dims 0). <paramref name="monochrome"/>
-    /// selects whether the U/V quant-delta bits are emitted.</summary>
-    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome)
+    /// selects whether the U/V quant-delta bits are emitted. <paramref name="txModeSelect"/> enables per-block
+    /// tx-size signalling (TX_MODE_SELECT) — the encoder must then code a tx_depth symbol per block.</summary>
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect)
     {
         if (baseQIdx <= 0 || baseQIdx > 255)
         {
@@ -208,7 +212,7 @@ internal static class Av1ObuWriter
         // cdef_params skipped (enable_cdef=0); lr_params skipped (enable_restoration=0)
 
         // read_tx_mode (not lossless)
-        w.PutBool(false);         // tx_mode_select = 0 ⇒ TX_MODE_LARGEST
+        w.PutBool(txModeSelect);  // tx_mode_select: 0 ⇒ TX_MODE_LARGEST, 1 ⇒ TX_MODE_SELECT
 
         // frame_reference_mode / skip_mode / warp skipped (intra)
         w.PutBool(true);          // reduced_tx_set = 1

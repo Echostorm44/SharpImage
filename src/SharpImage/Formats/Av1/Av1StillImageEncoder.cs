@@ -286,7 +286,7 @@ internal static class Av1StillImageEncoder
         byte[] tile = EncodeMultiSbTile(padded, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: true);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
-        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows);
+        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome: true, txModeSelect: true);
         var framePayload = new byte[frameHdr.Length + tile.Length];
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
@@ -578,9 +578,12 @@ internal static class Av1StillImageEncoder
         // Above (per SB128 column), Left (per SB row).
         public byte[] AbovePart = null!, AboveLCoef = null!, AboveMode = null!, AboveSkip = null!;
         public byte[] LeftPart = null!, LeftLCoef = null!, LeftMode = null!, LeftSkip = null!;
+        public sbyte[] AboveTxIntra = null!, LeftTxIntra = null!; // neighbour tx log-size, for the tx-depth context
         public byte[] Pred = new byte[64 * 64];
         public byte[] EstScratch = new byte[64 * 64];
     }
+
+    private static sbyte[] FilledSbyte(int n, sbyte v) { var a = new sbyte[n]; Array.Fill(a, v); return a; }
 
     private static int BlToTx(int bl) => bl switch { 1 => 4, 2 => 3, 3 => 2, _ => 1 };            // TX size ordinal
     private static int BlToBs(int bl) => bl switch { 1 => 3, 2 => 7, 3 => 12, _ => 17 };          // Av1BlockSize ordinal
@@ -601,12 +604,14 @@ internal static class Av1StillImageEncoder
         var aboveLCoef = new byte[sb128Cols][];
         var aboveMode = new byte[sb128Cols][];
         var aboveSkip = new byte[sb128Cols][];
+        var aboveTxIntra = new sbyte[sb128Cols][];
         for (int i = 0; i < sb128Cols; i++)
         {
             abovePart[i] = new byte[16];
             aboveLCoef[i] = Filled(32);
             aboveMode[i] = new byte[32];
             aboveSkip[i] = new byte[32];
+            aboveTxIntra[i] = FilledSbyte(32, -1);
         }
 
         var ctx = new GrayPartCtx
@@ -628,6 +633,7 @@ internal static class Av1StillImageEncoder
             ctx.LeftLCoef = Filled(32);
             ctx.LeftMode = new byte[32];
             ctx.LeftSkip = new byte[32];
+            ctx.LeftTxIntra = FilledSbyte(32, -1);
             for (int sbx = 0; sbx < sbCols; sbx++)
             {
                 int col = sbx >> 1;
@@ -635,6 +641,7 @@ internal static class Av1StillImageEncoder
                 ctx.AboveLCoef = aboveLCoef[col];
                 ctx.AboveMode = aboveMode[col];
                 ctx.AboveSkip = aboveSkip[col];
+                ctx.AboveTxIntra = aboveTxIntra[col];
                 EncodePartition(ctx, 1 /*Bl64x64*/, sbx * 16, sby * 16);
             }
         }
@@ -694,16 +701,40 @@ internal static class Av1StillImageEncoder
         for (int j = 0; j < pcount && by8 + j < 16; j++) c.LeftPart[by8 + j] = leftVal;
     }
 
-    // Encodes one PARTITION_NONE leaf: skip flag, Y mode (+ angle_delta), coefficients, reconstruction, and the
-    // above/left mode/skip/coeff context fills.
+    // Reduces a square tx size `depth` times (each step to the next-smaller square, via TxfmDimensions.Sub).
+    private static int ReduceTx(int tx, int depth) { for (int i = 0; i < depth; i++) tx = Av1Tables.TxfmDimensions[tx].Sub; return tx; }
+
+    // Encodes one PARTITION_NONE leaf: skip flag, Y mode (+ angle_delta), tx size (TX_MODE_SELECT), then the
+    // coefficients of each sub-transform block (with per-tx-block intra prediction + reconstruction), and the
+    // above/left context fills. Chooses a tx depth (0/1/2) that minimizes estimated coding cost.
     private static void EncodeLeafBlock(GrayPartCtx c, int bl, int bx4, int by4, int blk4, int n,
         Av1IntraPredMode yMode, int yDelta)
     {
-        int tx = BlToTx(bl);
+        int maxTx = BlToTx(bl);
         int bxR = bx4 & 31, byR = by4 & 31;
-        int[] residual = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n);
-        (int[] coeffs, Av1TxType invTx, int txIdx) = ChooseTxType(residual, n, tx, c.DcDq, c.AcDq);
-        int skip = HasNonZero(coeffs) ? 0 : 1;
+        ref readonly var maxTDim = ref Av1Tables.TxfmDimensions[maxTx];
+
+        // Depth-0 (whole-block) coefficients decide the skip flag (matches the single-transform behaviour).
+        int[] residual0 = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n);
+        (int[] coeffs0, Av1TxType invTx0, int txIdx0) = ChooseTxType(residual0, n, maxTx, c.DcDq, c.AcDq);
+        int skip = HasNonZero(coeffs0) ? 0 : 1;
+
+        // Choose tx depth (only when coding residual, block > 4x4, and fully inside the frame so every sub-tx block
+        // is in-bounds — edge blocks in non-multiple-of-64 frames keep the single block-size transform).
+        bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
+        int maxDepth = (skip == 0 && fullyInside) ? Math.Min((int)maxTDim.Max, 2) : 0;
+        int depth = 0;
+        if (maxDepth > 0)
+        {
+            long bestCost = EstimateTxDepthCost(c, bx4, by4, blk4, maxTx, yMode, yDelta);
+            for (int d = 1; d <= maxDepth; d++)
+            {
+                long cost = EstimateTxDepthCost(c, bx4, by4, blk4, ReduceTx(maxTx, d), yMode, yDelta);
+                if (cost < bestCost) { bestCost = cost; depth = d; }
+            }
+        }
+        int tx = ReduceTx(maxTx, depth);
+        ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
 
         int skipCtx = c.AboveSkip[bxR] + c.LeftSkip[byR];
         c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), (uint)skip);
@@ -714,26 +745,75 @@ internal static class Av1StillImageEncoder
         if (IsDirectional(yMode))
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
 
-        byte cfCtx;
+        // tx_depth, coded for non-skip blocks > 4x4.
+        if (skip == 0 && maxTDim.Max > (byte)Av1TxSize.Tx4x4)
+        {
+            int txCtx = (c.LeftTxIntra[byR] >= maxTDim.Lh ? 1 : 0) + (c.AboveTxIntra[bxR] >= maxTDim.Lw ? 1 : 0);
+            int nSym = Math.Min((int)maxTDim.Max, 2);
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(maxTDim.Max - 1, txCtx), depth, nSym);
+        }
+
         if (skip == 0)
         {
-            int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, c.AboveLCoef.AsSpan(bxR), c.LeftLCoef.AsSpan(byR));
-            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, chroma: 0, yMode: (int)yMode, coeffs,
-                skipCtx: 0, dcSignCtx: dcSignCtx, txTypeIdx: txIdx);
-            cfCtx = DequantAndReconstructPred(coeffs, tx, n, c.DcDq, c.AcDq, c.Pred, c.Recon, c.W, bx4 * 4, by4 * 4, invTx);
+            int txN = tDim.W * 4;          // tx pixel size
+            int txW4 = tDim.W;             // tx 4-unit size
+            var predBuf = new byte[txN * txN];
+            // Per-tx-block: predict from reconstruction, code coeffs, reconstruct — in raster order.
+            for (int iy = 0; iy < blk4; iy += txW4)
+                for (int ix = 0; ix < blk4; ix += txW4)
+                {
+                    int cbx4 = bx4 + ix, cby4 = by4 + iy;
+                    int cbxR = cbx4 & 31, cbyR = cby4 & 31;
+                    PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf);
+                    int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
+                    (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq);
+                    // Coeff-skip context is neighbour-based for sub-block transforms (0 only when tx == block size).
+                    int coefSkipCtx = Av1CoeffDecode.GetSkipCtx(in tDim, BlToBs(bl), c.AboveLCoef.AsSpan(cbxR), c.LeftLCoef.AsSpan(cbyR), 0, 0);
+                    int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, c.AboveLCoef.AsSpan(cbxR), c.LeftLCoef.AsSpan(cbyR));
+                    Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, chroma: 0, yMode: (int)yMode, cf,
+                        skipCtx: coefSkipCtx, dcSignCtx: dcSignCtx, txTypeIdx: idx);
+                    byte txCfCtx = DequantAndReconstructPred(cf, tx, txN, c.DcDq, c.AcDq, predBuf, c.Recon, c.W, cbx4 * 4, cby4 * 4, inv);
+                    // LCoef context fill per tx block (clip to frame + 32-wide array).
+                    int tcw = Math.Min(txW4, c.Bw4 - cbx4), tch = Math.Min(txW4, c.Bh4 - cby4);
+                    for (int i = 0; i < tcw && cbxR + i < 32; i++) c.AboveLCoef[cbxR + i] = txCfCtx;
+                    for (int j = 0; j < tch && cbyR + j < 32; j++) c.LeftLCoef[cbyR + j] = txCfCtx;
+                }
         }
         else
         {
-            cfCtx = 0x40;
             for (int y = 0; y < n; y++)
                 Array.Copy(c.Pred, y * n, c.Recon, (by4 * 4 + y) * c.W + bx4 * 4, n);
+            int cwz = Math.Min(blk4, c.Bw4 - bx4), chz = Math.Min(blk4, c.Bh4 - by4);
+            for (int i = 0; i < cwz && bxR + i < 32; i++) c.AboveLCoef[bxR + i] = 0x40;
+            for (int j = 0; j < chz && byR + j < 32; j++) c.LeftLCoef[byR + j] = 0x40;
         }
 
-        // Context fills clip to the real frame and to the 32-wide context arrays.
+        // Mode/skip/tx-size context fills over the whole coding block.
         int cw = Math.Min(blk4, c.Bw4 - bx4);
         int ch = Math.Min(blk4, c.Bh4 - by4);
-        for (int i = 0; i < cw && bxR + i < 32; i++) { c.AboveLCoef[bxR + i] = cfCtx; c.AboveMode[bxR + i] = (byte)yMode; c.AboveSkip[bxR + i] = (byte)skip; }
-        for (int j = 0; j < ch && byR + j < 32; j++) { c.LeftLCoef[byR + j] = cfCtx; c.LeftMode[byR + j] = (byte)yMode; c.LeftSkip[byR + j] = (byte)skip; }
+        sbyte txLw = (sbyte)tDim.Lw, txLh = (sbyte)tDim.Lh;
+        for (int i = 0; i < cw && bxR + i < 32; i++) { c.AboveMode[bxR + i] = (byte)yMode; c.AboveSkip[bxR + i] = (byte)skip; c.AboveTxIntra[bxR + i] = txLw; }
+        for (int j = 0; j < ch && byR + j < 32; j++) { c.LeftMode[byR + j] = (byte)yMode; c.LeftSkip[byR + j] = (byte)skip; c.LeftTxIntra[byR + j] = txLh; }
+    }
+
+    // Estimates the coding cost of a leaf at a given (uniform) tx size, predicting each tx block from the SOURCE
+    // plane (≈ what reconstruction will be). Used only for the tx-depth decision.
+    private static long EstimateTxDepthCost(GrayPartCtx c, int bx4, int by4, int blk4, int tx, Av1IntraPredMode yMode, int yDelta)
+    {
+        ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+        int txN = tDim.W * 4, txW4 = tDim.W;
+        long cost = 0;
+        for (int iy = 0; iy < blk4; iy += txW4)
+            for (int ix = 0; ix < blk4; ix += txW4)
+            {
+                int cbx4 = bx4 + ix, cby4 = by4 + iy;
+                PredictIntra(c.Luma, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, c.EstScratch);
+                int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, c.EstScratch, txN);
+                (int[] cf, _, _) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq);
+                cost += CoeffCost(cf) + 6; // per-tx-block overhead (all_zero + tx-type + eob)
+            }
+
+        return cost;
     }
 
     // Estimates a block's best-mode residual SATD for the split decision, predicting from the SOURCE plane so a
