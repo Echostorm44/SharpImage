@@ -58,11 +58,11 @@ internal static class Av1CoeffEncode
         // all_zero (txb_skip): 1 ⇒ no coefficients.
         if (eob < 0)
         {
-            w.EncodeBool(1, coef.CoefSkip[cdfIdx][0]);
+            w.EncodeBoolAdapt(coef.CoefSkip[cdfIdx], 1);
             return;
         }
 
-        w.EncodeBool(0, coef.CoefSkip[cdfIdx][0]);
+        w.EncodeBoolAdapt(coef.CoefSkip[cdfIdx], 0);
 
         // --- Transform type ---
         // The decoder codes a tx-type symbol only for intra LUMA when tDim.Max + intra < TX_64X64 (i.e. TX_16X16
@@ -72,7 +72,7 @@ internal static class Av1CoeffEncode
         const int intra = 1;
         if (chroma == 0 && tDim.Max + intra < (int)Av1TxSize.Tx64x64)
         {
-            w.EncodeSymbol(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], 1, 4);
+            w.EncodeSymbolAdapt(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], 1, 4);
         }
 
         // --- EOB bin + extra bits ---
@@ -96,7 +96,7 @@ internal static class Av1CoeffEncode
             // eob token: eobTok = min(mag,3)-1 ∈ {0,1,2}; tok==3 (eobTok==2) extends via HiTok.
             uint ctx = (uint)(1 + (eob > (2 << tx2dSzCtx) ? 1 : 0) + (eob > (4 << tx2dSzCtx) ? 1 : 0));
             int eobTok = Math.Min(magEob, 3) - 1;
-            w.EncodeSymbol(coef.EobBaseTok[eobBaseTokIdx + ctx], eobTok, 2);
+            w.EncodeSymbolAdapt(coef.EobBaseTok[eobBaseTokIdx + ctx], eobTok, 2);
             if (eobTok == 2)
             {
                 int hiCtx = ((xE | yE) > 1) ? 14 : 7;
@@ -117,7 +117,7 @@ internal static class Av1CoeffEncode
                     LoCtxOffsetsIdx(tx), x, y, stride);
 
                 int tok = Math.Min(mag, 3);
-                w.EncodeSymbol(coef.BaseTok[baseTokIdx + loCtx], tok, 3);
+                w.EncodeSymbolAdapt(coef.BaseTok[baseTokIdx + loCtx], tok, 3);
                 if (tok == 3)
                 {
                     uint yForCtx = (uint)(y | x);
@@ -132,7 +132,7 @@ internal static class Av1CoeffEncode
             // --- DC coefficient ---
             int dcMag = Math.Abs(signedLevels[0]);
             int dcTokBase = Math.Min(dcMag, 3);
-            w.EncodeSymbol(coef.BaseTok[baseTokIdx + 0], dcTokBase, 3); // dcCtx = 0 for TwoD
+            w.EncodeSymbolAdapt(coef.BaseTok[baseTokIdx + 0], dcTokBase, 3); // dcCtx = 0 for TwoD
             if (dcTokBase == 3)
             {
                 uint mag = (uint)(levels[0 * stride + 1] + levels[1 * stride + 0] + levels[1 * stride + 1]) & 63;
@@ -144,7 +144,7 @@ internal static class Av1CoeffEncode
             // DC sign first (only if DC nonzero), then AC nonzeros in increasing scan order (eob-position last).
             if (dcMag != 0)
             {
-                EncodeSignAndGolomb(w, coef.DcSign[chroma * 3 + dcSignCtx][0], adaptSign: true, signedLevels[0], dcMag);
+                EncodeSignAndGolomb(w, coef.DcSign[chroma * 3 + dcSignCtx], adaptSign: true, signedLevels[0], dcMag);
             }
 
             for (int i = 1; i <= eob; i++)
@@ -153,7 +153,7 @@ internal static class Av1CoeffEncode
                 int mag = Math.Abs(signedLevels[rcI]);
                 if (mag != 0)
                 {
-                    EncodeSignAndGolomb(w, 0, adaptSign: false, signedLevels[rcI], mag);
+                    EncodeSignAndGolomb(w, default, adaptSign: false, signedLevels[rcI], mag);
                 }
             }
         }
@@ -162,13 +162,13 @@ internal static class Av1CoeffEncode
             // DC-only (eob == 0).
             int dcMag = Math.Abs(signedLevels[0]);
             int tokBr = Math.Min(dcMag, 3) - 1; // dcMag >= 1 here
-            w.EncodeSymbol(coef.EobBaseTok[eobBaseTokIdx + 0], tokBr, 2);
+            w.EncodeSymbolAdapt(coef.EobBaseTok[eobBaseTokIdx + 0], tokBr, 2);
             if (tokBr == 2)
             {
                 EncodeHiTok(w, coef.BrTok[brTokIdx + 0], dcMag);
             }
 
-            EncodeSignAndGolomb(w, coef.DcSign[chroma * 3 + dcSignCtx][0], adaptSign: true, signedLevels[0], dcMag);
+            EncodeSignAndGolomb(w, coef.DcSign[chroma * 3 + dcSignCtx], adaptSign: true, signedLevels[0], dcMag);
         }
     }
 
@@ -209,13 +209,13 @@ internal static class Av1CoeffEncode
         int is1d = 0; // TwoD
         switch (tx2dSzCtx)
         {
-            case 0: w.EncodeSymbol(coef.EobBin16[chroma * 2 + is1d], eobPt, 4 + 0); break;
-            case 1: w.EncodeSymbol(coef.EobBin32[chroma * 2 + is1d], eobPt, 4 + 1); break;
-            case 2: w.EncodeSymbol(coef.EobBin64[chroma * 2 + is1d], eobPt, 4 + 2); break;
-            case 3: w.EncodeSymbol(coef.EobBin128[chroma * 2 + is1d], eobPt, 4 + 3); break;
-            case 4: w.EncodeSymbol(coef.EobBin256[chroma * 2 + is1d], eobPt, 4 + 4); break;
-            case 5: w.EncodeSymbol(coef.EobBin512[chroma], eobPt, 4 + 5); break;
-            default: w.EncodeSymbol(coef.EobBin1024[chroma], eobPt, 4 + 6); break;
+            case 0: w.EncodeSymbolAdapt(coef.EobBin16[chroma * 2 + is1d], eobPt, 4 + 0); break;
+            case 1: w.EncodeSymbolAdapt(coef.EobBin32[chroma * 2 + is1d], eobPt, 4 + 1); break;
+            case 2: w.EncodeSymbolAdapt(coef.EobBin64[chroma * 2 + is1d], eobPt, 4 + 2); break;
+            case 3: w.EncodeSymbolAdapt(coef.EobBin128[chroma * 2 + is1d], eobPt, 4 + 3); break;
+            case 4: w.EncodeSymbolAdapt(coef.EobBin256[chroma * 2 + is1d], eobPt, 4 + 4); break;
+            case 5: w.EncodeSymbolAdapt(coef.EobBin512[chroma], eobPt, 4 + 5); break;
+            default: w.EncodeSymbolAdapt(coef.EobBin1024[chroma], eobPt, 4 + 6); break;
         }
 
         if (eob > 1)
@@ -224,7 +224,7 @@ internal static class Av1CoeffEncode
             int hi = (eob >> eobBin) & 1;
             // EobHiBit CDF indexing matches DecodeCoefs exactly: [tDim.Ctx * 2 * 9 + chroma * 9 + eobBin].
             Span<ushort> hiCdf = coef.EobHiBit[txCtx * 2 * 9 + chroma * 9 + eobBin];
-            w.EncodeBool((uint)hi, hiCdf[0]);
+            w.EncodeBoolAdapt(hiCdf, (uint)hi);
             if (eobBin > 0)
             {
                 uint extra = (uint)(eob & ((1 << eobBin) - 1));
@@ -234,13 +234,13 @@ internal static class Av1CoeffEncode
     }
 
     /// <summary>HiTok base-range extension for magnitudes ≥ 3, inverse of Av1Msac.DecodeHiTok (max 4 symbols).</summary>
-    private static void EncodeHiTok(Av1MsacWriter w, ReadOnlySpan<ushort> brCdf, int mag)
+    private static void EncodeHiTok(Av1MsacWriter w, Span<ushort> brCdf, int mag)
     {
         int rem = Math.Min(mag, 15) - 3;
         for (int stage = 0; stage < 4; stage++)
         {
             int s = Math.Min(rem, 3);
-            w.EncodeSymbol(brCdf, s, 3);
+            w.EncodeSymbolAdapt(brCdf, s, 3);
             if (s < 3)
             {
                 break;
@@ -252,12 +252,12 @@ internal static class Av1CoeffEncode
 
     /// <summary>Encodes a coefficient's sign then, for |level| ≥ 15, the Golomb tail (level-15). The DC sign is
     /// adaptive (DcSign CDF prob f); AC signs are equiprobable.</summary>
-    private static void EncodeSignAndGolomb(Av1MsacWriter w, uint dcSignF, bool adaptSign, int signedLevel, int mag)
+    private static void EncodeSignAndGolomb(Av1MsacWriter w, Span<ushort> dcSignCdf, bool adaptSign, int signedLevel, int mag)
     {
         uint sign = signedLevel < 0 ? 1u : 0u;
         if (adaptSign)
         {
-            w.EncodeBool(sign, dcSignF);
+            w.EncodeBoolAdapt(dcSignCdf, sign);
         }
         else
         {

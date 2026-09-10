@@ -66,7 +66,7 @@ public sealed class Av1ObuWriterTests
         await Assert.That(result).IsEqualTo(Av1ObuParser.ParseResult.Ok);
         await Assert.That(frame.FrameType).IsEqualTo(Av1FrameType.Key);
         await Assert.That(frame.ShowFrame).IsTrue();
-        await Assert.That(frame.DisableCdfUpdate).IsTrue();
+        await Assert.That(frame.DisableCdfUpdate).IsFalse(); // adaptive CDFs enabled
         await Assert.That(frame.CodedWidth).IsEqualTo(64);
         await Assert.That(frame.Height).IsEqualTo(64);
         await Assert.That((int)frame.QuantBaseQIdx).IsEqualTo(baseQ);

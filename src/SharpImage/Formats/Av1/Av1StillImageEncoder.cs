@@ -154,14 +154,14 @@ internal static class Av1StillImageEncoder
 
         // Forced splits from the 64x64 root down to plan.Bl emit NO symbols. At plan.Bl, ctx=0 (no neighbours;
         // reset_context fills Partition=0). PARTITION_NONE = 0. Decoder: DecodeSymbolAdapt(partCdf, NPart).
-        w.EncodeSymbol(cdf.GetPartitionCdf(plan.Bl, 0), 0, plan.NPart);
+        w.EncodeSymbolAdapt(cdf.GetPartitionCdf(plan.Bl, 0), 0, plan.NPart);
 
         // Skip flag, ctx=0 (above/left skip = 0). skip=0 ⇒ residual coded. CDEF disabled ⇒ no CDEF bits.
         int skip = coeffs == null ? 1 : 0;
-        w.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);
+        w.EncodeBoolAdapt(cdf.GetSkipCdf(0), (uint)skip);
 
         // Keyframe Y mode, contexts 0/0 (neighbour modes DC). DC_PRED = 0.
-        w.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);
+        w.EncodeSymbolAdapt(cdf.GetKfYModeCdf(0, 0), 0, 12);
 
         if (skip == 0)
         {
@@ -223,10 +223,10 @@ internal static class Av1StillImageEncoder
         int uvMaxSym = Av1Constants.NumUvIntraPredModes - 1 - (plan.CflAllowed ? 0 : 1);
 
         var w = new Av1MsacWriter();
-        w.EncodeSymbol(cdf.GetPartitionCdf(plan.Bl, 0), 0, plan.NPart);        // PARTITION_NONE
-        w.EncodeBool((uint)skip, cdf.GetSkipCdf(0)[0]);                        // skip, ctx 0
-        w.EncodeSymbol(cdf.GetKfYModeCdf(0, 0), 0, 12);                        // Y mode = DC
-        w.EncodeSymbol(cdf.GetUvModeCdf(plan.CflAllowed, 0), 0, uvMaxSym);     // UV mode = DC
+        w.EncodeSymbolAdapt(cdf.GetPartitionCdf(plan.Bl, 0), 0, plan.NPart);        // PARTITION_NONE
+        w.EncodeBoolAdapt(cdf.GetSkipCdf(0), (uint)skip);                        // skip, ctx 0
+        w.EncodeSymbolAdapt(cdf.GetKfYModeCdf(0, 0), 0, 12);                        // Y mode = DC
+        w.EncodeSymbolAdapt(cdf.GetUvModeCdf(plan.CflAllowed, 0), 0, uvMaxSym);     // UV mode = DC
 
         if (skip == 0)
         {
@@ -397,7 +397,7 @@ internal static class Av1StillImageEncoder
 
         if (doSplit)
         {
-            c.Msac.EncodeSymbol(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.Split, nPart);
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.Split, nPart);
             EncodePartitionColor(c, bl + 1, bx4, by4);
             EncodePartitionColor(c, bl + 1, bx4 + hsz, by4);
             EncodePartitionColor(c, bl + 1, bx4, by4 + hsz);
@@ -405,7 +405,7 @@ internal static class Av1StillImageEncoder
             return;
         }
 
-        c.Msac.EncodeSymbol(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.None, nPart);
+        c.Msac.EncodeSymbolAdapt(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.None, nPart);
         EncodeLeafBlockColor(c, bl, bx4, by4, blk4);
 
         byte aboveVal = Av1Tables.AboveLeftPartCtx[0, bl, (int)Av1BlockPartition.None];
@@ -436,13 +436,13 @@ internal static class Av1StillImageEncoder
         int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
 
         int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
-        c.Msac.EncodeBool((uint)skip, c.Cdf.GetSkipCdf(skipCtx)[0]);
+        c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), (uint)skip);
         int yAboveCtx = Av1Tables.IntraModeContext[c.AModeY[bxR]];
         int yLeftCtx = Av1Tables.IntraModeContext[c.LModeY[byR]];
-        c.Msac.EncodeSymbol(c.Cdf.GetKfYModeCdf(yAboveCtx, yLeftCtx), (int)yMode, 12);
+        c.Msac.EncodeSymbolAdapt(c.Cdf.GetKfYModeCdf(yAboveCtx, yLeftCtx), (int)yMode, 12);
         if (IsDirectional(yMode))
-            c.Msac.EncodeSymbol(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
-        c.Msac.EncodeSymbol(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), 0, uvNsym); // UV DC
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
+        c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), 0, uvNsym); // UV DC
 
         byte cfY = 0x40, cfU = 0x40, cfV = 0x40;
         if (skip == 0)
@@ -672,7 +672,7 @@ internal static class Av1StillImageEncoder
 
         if (doSplit)
         {
-            c.Msac.EncodeSymbol(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.Split, nPart);
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.Split, nPart);
             EncodePartition(c, bl + 1, bx4, by4);
             EncodePartition(c, bl + 1, bx4 + hsz, by4);
             EncodePartition(c, bl + 1, bx4, by4 + hsz);
@@ -680,7 +680,7 @@ internal static class Av1StillImageEncoder
             return; // SPLIT nodes (bl<8x8) do not update partition context
         }
 
-        c.Msac.EncodeSymbol(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.None, nPart);
+        c.Msac.EncodeSymbolAdapt(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.None, nPart);
         // Actual leaf: pick the best mode predicting from the real reconstruction, then code + reconstruct.
         (Av1IntraPredMode yMode, int yDelta, _) =
             ChooseIntraMode(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred);
@@ -706,13 +706,13 @@ internal static class Av1StillImageEncoder
         int skip = HasNonZero(coeffs) ? 0 : 1;
 
         int skipCtx = c.AboveSkip[bxR] + c.LeftSkip[byR];
-        c.Msac.EncodeBool((uint)skip, c.Cdf.GetSkipCdf(skipCtx)[0]);
+        c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), (uint)skip);
 
         int aboveCtx = Av1Tables.IntraModeContext[c.AboveMode[bxR]];
         int leftCtx = Av1Tables.IntraModeContext[c.LeftMode[byR]];
-        c.Msac.EncodeSymbol(c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx), (int)yMode, 12);
+        c.Msac.EncodeSymbolAdapt(c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx), (int)yMode, 12);
         if (IsDirectional(yMode))
-            c.Msac.EncodeSymbol(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
 
         byte cfCtx;
         if (skip == 0)

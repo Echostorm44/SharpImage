@@ -152,7 +152,7 @@ internal static class Av1ObuWriter
 
         // reduced_still_picture_header ⇒ show_existing_frame / frame_type / show_frame / error_resilient are all
         // implied; nothing is written until here.
-        w.PutBool(true);          // disable_cdf_update = 1 (static default CDFs — no adaptation to mirror)
+        w.PutBool(false);         // disable_cdf_update = 0 (adaptive CDFs; disable_frame_end_update_cdf inferred 1 in reduced still picture)
         w.PutBool(false);         // allow_screen_content_tools = 0 (ScreenContentTools is Adaptive)
         // force_integer_mv implied (intra); frame_id absent; frame_size_override absent (reduced still).
         // primary_ref_frame implied NONE (intra); decoder model absent.

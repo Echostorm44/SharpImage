@@ -144,7 +144,10 @@ internal sealed class Av1MsacWriter
     /// trailing adaptation counter at cdf[nsyms]. Encodes symbol s and updates the CDF like DecodeSymbolAdapt.</summary>
     public void EncodeSymbolAdapt(Span<ushort> cdf, int s, int nsyms)
     {
-        EncodeSymbol(cdf.Slice(0, nsyms), s, nsyms);
+        // Pass the full cdf (not cdf[0..nsyms]) so the last symbol s==nsyms can read icdf[nsyms]. After adaptation
+        // that slot holds the counter (<=32), and counter>>6 == 0, so v computes to 0 exactly as the decoder's
+        // decode loop does (it likewise reads cdf[nsyms]) — the two stay in sync at the terminal symbol.
+        EncodeSymbol(cdf, s, nsyms);
 
         uint count = cdf[nsyms];
         int rate = 4 + (int)(count >> 4) + (nsyms > 2 ? 1 : 0);
