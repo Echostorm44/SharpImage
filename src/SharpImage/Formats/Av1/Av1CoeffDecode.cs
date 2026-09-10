@@ -127,10 +127,11 @@ public static class Av1CoeffDecode
                 v |= v >> 16;
                 v |= v >> 8;
                 break;
-            case 3: // TX_32X32 — 8 bytes
+            case 3: // TX_32X32 — 8 bytes, OR-fold to the low byte (mirrors cases 1/2)
                 ulong tmp = MemoryMarshal.Read<ulong>(ctx);
-                tmp |= MemoryMarshal.Read<ulong>(ctx.Slice(4));
-                v = (uint)(tmp >> 32) | (uint)tmp;
+                tmp |= tmp >> 32;
+                v = (uint)tmp;
+                v |= v >> 16;
                 v |= v >> 8;
                 break;
             default:

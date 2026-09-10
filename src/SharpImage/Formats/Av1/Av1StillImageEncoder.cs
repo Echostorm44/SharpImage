@@ -745,8 +745,9 @@ internal static class Av1StillImageEncoder
         if (IsDirectional(yMode))
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
 
-        // tx_depth, coded for non-skip blocks > 4x4.
-        if (skip == 0 && maxTDim.Max > (byte)Av1TxSize.Tx4x4)
+        // tx_depth is signalled for every intra block > 4x4 (read_tx_size allowSelect = !skip || !is_inter,
+        // and is_inter is false), so it is coded for skip blocks too (depth 0). Gating on skip==0 desynced dav1d.
+        if (maxTDim.Max > (byte)Av1TxSize.Tx4x4)
         {
             int txCtx = (c.LeftTxIntra[byR] >= maxTDim.Lh ? 1 : 0) + (c.AboveTxIntra[bxR] >= maxTDim.Lw ? 1 : 0);
             int nSym = Math.Min((int)maxTDim.Max, 2);
