@@ -854,8 +854,15 @@ internal static class Av1StillImageEncoder
     private static long EstimateCost(GrayPartCtx c, int bl, int bx4, int by4)
         => EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl, bx4, by4);
 
-    // Coefficient-based coding-cost estimate for a luma block (see EncodePartition). Used for the NONE/SPLIT
-    // decision in both the grayscale and colour encoders (the tree is luma-driven; chroma follows).
+    // RD lagrangian weight: J = SSE + λ·bits, with λ ∝ quant-step². Tunable for A/B; scaled so the NONE/SPLIT
+    // decision splits blocks whose transform cannot represent the detail (high distortion) but keeps large blocks
+    // for smooth content (splitting only adds rate for no distortion gain).
+    internal static double RdLambdaK = 0.02;
+
+    // Rate-DISTORTION coding-cost estimate for a luma block (see EncodePartition). Reconstructs the block through
+    // the decoder's own inverse and returns J = SSE + λ·rate — so a 64x64 (or 32x32) transform that drops the
+    // high-frequency detail of a sharp block is penalised by its reconstruction error, not just its (small) rate.
+    // Used for the NONE/SPLIT decision in both the grayscale and colour encoders (the tree is luma-driven).
     private static long EstimateBlockCost(byte[] luma, int w, int bw4, int bh4, int dcDq, int acDq, byte[] scratch,
         int bl, int bx4, int by4)
     {
@@ -866,7 +873,20 @@ internal static class Av1StillImageEncoder
         long bits = HeaderCostBits;
         foreach (int v in coeffs)
             if (v != 0) { int a = Math.Abs(v); bits += 5 + (a >= 15 ? 8 : a >> 1); } // base+sign ~5b, magnitude tail
-        return bits;
+
+        // Reconstruct through the decoder's inverse (from the same source-plane prediction) and measure SSE.
+        var reconTmp = new byte[n * n];
+        DequantAndReconstructPred(coeffs, tx, n, dcDq, acDq, scratch, reconTmp, n, 0, 0);
+        long sse = 0;
+        for (int y = 0; y < n; y++)
+            for (int x = 0; x < n; x++)
+            {
+                int d = reconTmp[y * n + x] - luma[(by4 * 4 + y) * w + (bx4 * 4 + x)];
+                sse += (long)d * d;
+            }
+
+        double lambda = RdLambdaK * acDq * acDq;
+        return sse + (long)(lambda * bits);
     }
 
     // Intra modes tried per block, each as (mode, angle_delta). All are verified against libdav1d/ffmpeg.
