@@ -76,20 +76,21 @@ internal static class Av1FwdTransform
         return levels;
     }
 
-    // Orthonormal DCT-II basis: basis[k, n] = a(k) * sqrt(2/N) * cos(pi*(2n+1)*k / (2N)), a(0)=1/sqrt2 else 1.
-    private static double[,] DctBasis(int n)
+    // Orthonormal DCT-II basis, cached per size (values depend only on n). basis[k, n] = a(k) * sqrt(2/N) *
+    // cos(pi*(2n+1)*k / (2N)), a(0)=1/sqrt2 else 1. Read-only after construction, so the cache is safe to share.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, double[,]> BasisCache = new();
+
+    private static double[,] DctBasis(int n) => BasisCache.GetOrAdd(n, static nn =>
     {
-        var b = new double[n, n];
-        double s = Math.Sqrt(2.0 / n);
-        for (int k = 0; k < n; k++)
+        var b = new double[nn, nn];
+        double s = Math.Sqrt(2.0 / nn);
+        for (int k = 0; k < nn; k++)
         {
             double ak = k == 0 ? 1.0 / Math.Sqrt(2.0) : 1.0;
-            for (int i = 0; i < n; i++)
-            {
-                b[k, i] = ak * s * Math.Cos(Math.PI * (2 * i + 1) * k / (2.0 * n));
-            }
+            for (int i = 0; i < nn; i++)
+                b[k, i] = ak * s * Math.Cos(Math.PI * (2 * i + 1) * k / (2.0 * nn));
         }
 
         return b;
-    }
+    });
 }
