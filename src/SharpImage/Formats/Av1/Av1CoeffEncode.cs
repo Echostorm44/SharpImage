@@ -299,6 +299,67 @@ internal static class Av1CoeffEncode
         return bits;
     }
 
+    /// <summary>Rate-distortion optimized quantization (encoder-only; the decoder is unaffected). Refines the
+    /// deadzone-quantized <paramref name="signedLevels"/> in place by weighing coded-rate savings against the
+    /// dequant distortion each level carries. Two levers the per-coefficient deadzone cannot see:
+    ///  * EOB shrink — dropping a small trailing coefficient moves the end-of-block to a cheaper bin (a global
+    ///    rate effect), so we greedily zero trailing coeffs while J = D + λ·R improves.
+    ///  * Level-down — lowering a coefficient toward zero trades a little distortion for fewer magnitude bits.
+    /// Distortion is measured in the pixel domain: level L on a coefficient with pre-quant float qf and step dq
+    /// contributes ((qf-L)·dq)². λ matches the partition RD (pixel SSE vs bits), so the whole pipe is consistent.
+    /// qf/signedLevels share the tx's rc indexing; dq is dcDq for rc 0 else acDq.</summary>
+    internal static void RdoqOptimize(Av1CdfCoefContext coef, Av1CdfModeContext modeCdf, int tx, int chroma,
+        int yMode, int[] signedLevels, double[] qf, int dcDq, int acDq, int skipCtx, int dcSignCtx, int txTypeIdx,
+        double lambda)
+    {
+        ushort[] scan = Av1Tables.Scans[tx];
+        int eob = -1;
+        for (int i = scan.Length - 1; i >= 0; i--) if (signedLevels[scan[i]] != 0) { eob = i; break; }
+        if (eob < 0) return; // all-zero: skip flag already optimal
+
+        double DistOf(int rc, int level)
+        {
+            double dq = rc == 0 ? dcDq : acDq;
+            double e = (qf[rc] - level) * dq;
+            return e * e;
+        }
+
+        double curBits = EstimateCoefBits(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx);
+
+        // --- EOB shrink: greedily drop trailing nonzero coefficients while it lowers J. ---
+        while (eob >= 0)
+        {
+            int rc = scan[eob];
+            int L = signedLevels[rc];
+            if (L == 0) { eob--; continue; }
+            double dDist = DistOf(rc, 0) - DistOf(rc, L);
+            signedLevels[rc] = 0;
+            double newBits = EstimateCoefBits(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx);
+            if (dDist + lambda * (newBits - curBits) < 0)
+            {
+                curBits = newBits;                 // accept the drop; move eob to the new last nonzero
+                do { eob--; } while (eob >= 0 && signedLevels[scan[eob]] == 0);
+            }
+            else { signedLevels[rc] = L; break; }  // no further trailing drop helps
+        }
+        if (eob < 0) return;
+
+        // --- Level-down: nudge each remaining coefficient one step toward zero when J improves. ---
+        for (int i = 0; i <= eob; i++)
+        {
+            int rc = scan[i];
+            int L = signedLevels[rc];
+            if (L == 0) continue;
+            int sign = L < 0 ? -1 : 1, mag = L < 0 ? -L : L;
+            int cand = sign * (mag - 1);           // mag-1 (may be 0 for interior coeffs)
+            double dDist = DistOf(rc, cand) - DistOf(rc, L);
+            signedLevels[rc] = cand;
+            double newBits = EstimateCoefBits(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx);
+            if (dDist + lambda * (newBits - curBits) < 0) curBits = newBits;
+            else signedLevels[rc] = L;
+        }
+    }
+
     /// <summary>Level byte stored for GetLoCtx neighbour magnitude, matching DecodeCoefs: mag 1..2 → mag*0x41;
     /// mag ≥ 3 → min(mag,15) + (3&lt;&lt;6).</summary>
     private static byte LevelByte(int mag)

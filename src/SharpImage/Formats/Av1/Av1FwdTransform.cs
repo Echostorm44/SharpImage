@@ -35,15 +35,23 @@ internal static class Av1FwdTransform
     /// matrix forward; 32/64 use the orthonormal DCT. rc layout: levels[kx*sh + ky], sh = min(N,32).</summary>
     internal static int[] ForwardQuantSquare(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount)
         => n <= 16
-            ? MatrixForward(residual, n, dcDq, acDq, rcCount, FwdTxType.DctDct)
-            : ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, QuantScaleK);
+            ? MatrixForward(residual, n, dcDq, acDq, rcCount, FwdTxType.DctDct, null)
+            : ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, QuantScaleK, null);
 
     /// <summary>Forward transform + quantize for a chosen 2D type. ADST types are only valid for sizes 4/8/16;
     /// for 32/64 this falls back to DCT_DCT (orthonormal).</summary>
     internal static int[] ForwardQuantTyped(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, FwdTxType txType)
         => n <= 16
-            ? MatrixForward(residual, n, dcDq, acDq, rcCount, txType)
-            : ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, QuantScaleK);
+            ? MatrixForward(residual, n, dcDq, acDq, rcCount, txType, null)
+            : ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, QuantScaleK, null);
+
+    /// <summary>Forward transform + quantize, additionally returning the pre-quant float coefficients (qfOut,
+    /// same rc indexing as the levels) so a caller can run rate-distortion optimized quantization. qfOut is in
+    /// dq-normalized units: the dequant reconstruction error of level L is (qfOut[rc] - L)·dq in pixel domain.</summary>
+    internal static int[] ForwardQuantTyped(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, FwdTxType txType, double[] qfOut)
+        => n <= 16
+            ? MatrixForward(residual, n, dcDq, acDq, rcCount, txType, qfOut)
+            : ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, QuantScaleK, qfOut);
 
     // (horizontal/row 1D type, vertical/col 1D type) for a 2D forward type — inverse of the decoder's row(width,
     // txtp0)/col(height, txtp1) split: txtp0 is horizontal, txtp1 is vertical.
@@ -101,7 +109,7 @@ internal static class Av1FwdTransform
     }
 
     // Matched forward for sizes 4/8/16: C[ky][kx] = Fv[ky][·] · res · Fh[kx][·], level = deadzone(C·S/dq), S = 4N.
-    private static int[] MatrixForward(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, FwdTxType txType)
+    private static int[] MatrixForward(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, FwdTxType txType, double[]? qfOut)
     {
         int logSize = System.Numerics.BitOperations.Log2((uint)n) - 2; // 4→0, 8→1, 16→2
         (int hType, int vType) = AxisTypes(txType);
@@ -128,6 +136,7 @@ internal static class Av1FwdTransform
                 for (int y = 0; y < n; y++) acc += fv[ky, y] * t[y, kx];
                 int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
                 double qf = acc * s / dq;
+                if (qfOut != null) qfOut[kx * n + ky] = qf;
                 double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
                 levels[kx * n + ky] = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
             }
@@ -136,6 +145,9 @@ internal static class Av1FwdTransform
     }
 
     internal static int[] ForwardQuantSquare(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, double k)
+        => ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, k, null);
+
+    internal static int[] ForwardQuantSquare(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, double k, double[]? qfOut)
     {
         int kept = Math.Min(n, 32);
         int sh = kept;
@@ -172,6 +184,7 @@ internal static class Av1FwdTransform
                 int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
                 // Deadzone quantizer: |level| = floor(|qf| + 0.5 - bias), clamped at 0.
                 double qf = acc * k / dq;
+                if (qfOut != null) qfOut[kx * sh + ky] = qf;
                 double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
                 int q = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
                 levels[kx * sh + ky] = q;

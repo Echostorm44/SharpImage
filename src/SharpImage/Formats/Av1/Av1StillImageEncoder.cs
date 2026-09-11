@@ -914,6 +914,12 @@ internal static class Av1StillImageEncoder
     // for smooth content (splitting only adds rate for no distortion gain).
     internal static double RdLambdaK = 0.02;
 
+    // Extra multiplier on the RDOQ lambda relative to the partition lambda. The partition lambda is tuned for
+    // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
+    // small distortion against its (EOB-inclusive) coding rate. 20 was the sweet spot on real-photo luma: it
+    // improves the RD curve (2-7% fewer bytes at matched RMSE, more at low quality) without hurting the floor.
+    internal static double RdoqLambdaScale = 20.0;
+
     // Rate-DISTORTION coding-cost estimate for a luma block (see EncodePartition). Reconstructs the block through
     // the decoder's own inverse and returns J = SSE + λ·rate — so a 64x64 (or 32x32) transform that drops the
     // high-frequency detail of a sharp block is penalised by its reconstruction error, not just its (small) rate.
@@ -1238,8 +1244,10 @@ internal static class Av1StillImageEncoder
         int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, aboveLCoef, leftLCoef);
         int scanLen = Av1Tables.Scans[tx].Length;
         var predBuf = new byte[n * n];
+        var qfCand = new double[scanLen];
+        var qfWin = new double[scanLen];
         double best = double.MaxValue;
-        (Av1IntraPredMode, int, int[], Av1TxType, int) bestCand = default;
+        (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx) bestCand = default;
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
             PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf);
@@ -1248,10 +1256,18 @@ internal static class Av1StillImageEncoder
                 + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
             foreach (var (fwd, inv, idx) in n <= 16 ? IntraTxTypes : DctOnly)
             {
-                int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, fwd);
+                int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, fwd, qfCand);
                 double rate = Av1CoeffEncode.EstimateCoefBits(cdf.Coef, cdf.Mode, tx, 0, (int)mode, cf, 0, dcSignCtx, idx) + modeBits;
-                if (rate < best) { best = rate; bestCand = (mode, delta, cf, inv, idx); Array.Copy(predBuf, predOut, n * n); }
+                if (rate < best) { best = rate; bestCand = (mode, delta, cf, inv, idx); Array.Copy(predBuf, predOut, n * n); Array.Copy(qfCand, qfWin, scanLen); }
             }
+        }
+
+        // RDOQ-refine the winning coefficients (encoder-only; decoder reconstructs from these same levels).
+        if (bestCand.Coeffs != null)
+        {
+            double lambda = RdoqLambdaScale * RdLambdaK * acDq * acDq;
+            Av1CoeffEncode.RdoqOptimize(cdf.Coef, cdf.Mode, tx, 0, (int)bestCand.Mode, bestCand.Coeffs, qfWin,
+                dcDq, acDq, 0, dcSignCtx, bestCand.Idx, lambda);
         }
 
         return bestCand;
