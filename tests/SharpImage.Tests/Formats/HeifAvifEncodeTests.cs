@@ -113,4 +113,45 @@ public sealed class HeifAvifEncodeTests
         await Assert.That((int)dec.Columns).IsEqualTo(40);
         await Assert.That((int)dec.Rows).IsEqualTo(20);
     }
+
+    [Test]
+    public async Task Avif_Alpha_RoundTrips()
+    {
+        // RGBA with a diagonal alpha gradient → 2-item AVIF (colour primary + monochrome alpha aux linked by
+        // auxl). Verify our decoder reads back the alpha channel faithfully.
+        const int w = 130, h = 97;
+        var f = new ImageFrame();
+        f.Initialize(w, h, ColorspaceType.SRGB, hasAlpha: true);
+        for (long y = 0; y < h; y++)
+        {
+            var row = f.GetPixelRowForWrite(y);
+            int ch = f.NumberOfChannels;
+            for (long x = 0; x < w; x++)
+            {
+                int o = (int)x * ch;
+                row[o] = Quantum.ScaleFromByte((byte)(x * 255 / w));
+                row[o + 1] = Quantum.ScaleFromByte((byte)(y * 255 / h));
+                row[o + 2] = Quantum.ScaleFromByte(128);
+                row[o + 3] = Quantum.ScaleFromByte((byte)((x + y) * 255 / (w + h)));
+            }
+        }
+
+        byte[] avif = HeifCoder.Encode(f, HeifContainerType.Avif, 15);
+        ImageFrame dec = HeifCoder.Decode(avif);
+        await Assert.That(dec.HasAlpha).IsTrue();
+
+        int aOff = dec.NumberOfChannels - 1;
+        double sse = 0;
+        for (long y = 0; y < h; y++)
+        {
+            for (long x = 0; x < w; x++)
+            {
+                int sa = (int)((x + y) * 255 / (w + h));
+                int da = (dec.GetPixelChannel(x, y, aOff) * 255 + 32767) / 65535;
+                sse += (sa - da) * (double)(sa - da);
+            }
+        }
+
+        await Assert.That(System.Math.Sqrt(sse / (w * (double)h))).IsLessThan(3.0);
+    }
 }

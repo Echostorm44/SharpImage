@@ -284,6 +284,14 @@ internal static class Av1StillImageEncoder
     /// reconstructing as it goes. Capped at 2x2 SBs because the decoder's above context holds only two SBs.</summary>
     internal static byte[] EncodeAvifMonochromeMultiSb(ReadOnlySpan<byte> luma, int width, int height, int baseQIdx)
     {
+        (byte[] seqObu, byte[] frameObu) = BuildMonochromeObus(luma, width, height, baseQIdx);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true);
+    }
+
+    /// <summary>Builds the sequence-header + OBU_FRAME for a monochrome (I400) multi-superblock key frame — the
+    /// shared core used both for a standalone grayscale AVIF and for an AVIF alpha auxiliary item.</summary>
+    internal static (byte[] SeqObu, byte[] FrameObu) BuildMonochromeObus(ReadOnlySpan<byte> luma, int width, int height, int baseQIdx)
+    {
         ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
         byte[] padded = PadPlane(luma, width, height, pw, ph);
         byte[] tile = EncodeMultiSbTile(padded, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
@@ -294,13 +302,21 @@ internal static class Av1StillImageEncoder
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
         byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true);
+        return (seqObu, frameObu);
     }
 
     /// <summary>Multi-superblock I420 COLOUR: a 1..2 x 1..2 grid of full 64x64 superblocks (64 or 128 each side),
     /// coding luma + subsampled chroma with cross-block DC prediction and reconstruct-as-you-go on all three
     /// planes.</summary>
     internal static byte[] EncodeAvifColorMultiSb(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
+        int width, int height, int baseQIdx)
+    {
+        (byte[] seqObu, byte[] frameObu) = BuildColorObus(luma, u, v, width, height, baseQIdx);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false);
+    }
+
+    /// <summary>Builds the sequence-header + OBU_FRAME for an I420 colour multi-superblock key frame.</summary>
+    internal static (byte[] SeqObu, byte[] FrameObu) BuildColorObus(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
         int width, int height, int baseQIdx)
     {
         ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
@@ -316,7 +332,18 @@ internal static class Av1StillImageEncoder
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
         byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false);
+        return (seqObu, frameObu);
+    }
+
+    /// <summary>Encodes an I420 colour image plus an 8-bit alpha plane into a 2-item AVIF: a primary colour
+    /// `av01` item and a monochrome alpha auxiliary item, linked by an `auxl` item reference. Alpha is coded as a
+    /// full-range monochrome AV1 image (the standard AVIF alpha representation).</summary>
+    internal static byte[] EncodeAvifColorWithAlpha(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
+        ReadOnlySpan<byte> alpha, int width, int height, int baseQIdx, int alphaQIdx)
+    {
+        (byte[] cSeq, byte[] cFrame) = BuildColorObus(luma, u, v, width, height, baseQIdx);
+        (byte[] aSeq, byte[] aFrame) = BuildMonochromeObus(alpha, width, height, alphaQIdx);
+        return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: false);
     }
 
     // Per-superblock recursive-partition state for I420 colour. Extends the grayscale scheme with two chroma

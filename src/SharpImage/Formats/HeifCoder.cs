@@ -124,6 +124,8 @@ public static class HeifCoder
         int primaryItemId = 1;
         int imageWidth = 0, imageHeight = 0;
         int itemDataOffset = -1, itemDataLength = 0;
+        var itemExtents = new Dictionary<int, (int Off, int Len)>(); // all items' first extent
+        int alphaItemId = -1;
 
         // Parse meta box hierarchy
         if (boxes.TryGetValue("meta", out var metaBox))
@@ -226,10 +228,44 @@ public static class HeifCoder
                         long extentLength = ReadVarInt(data, itemPos, lengthSize);
                         itemPos += lengthSize;
 
+                        int absOff = (int)(baseOffset + extentOffset);
+                        if (!itemExtents.ContainsKey(itemId))
+                        {
+                            itemExtents[itemId] = (absOff, (int)extentLength);
+                        }
+
                         if (itemId == primaryItemId && itemDataOffset < 0)
                         {
-                            itemDataOffset = (int)(baseOffset + extentOffset);
+                            itemDataOffset = absOff;
                             itemDataLength = (int)extentLength;
+                        }
+                    }
+                }
+            }
+
+            // iref → auxl: an auxiliary item (alpha) referencing the primary. from_item is the alpha item.
+            if (metaChildren.TryGetValue("iref", out var irefBox))
+            {
+                byte irefVersion = data[irefBox.DataOffset];
+                var irefChildren = ParseBoxes(data, irefBox.DataOffset + 4, irefBox.DataLength - 4);
+                if (irefChildren.TryGetValue("auxl", out var auxlBox))
+                {
+                    int p = auxlBox.DataOffset;
+                    int fromId = irefVersion == 0
+                        ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(p))
+                        : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p));
+                    p += irefVersion == 0 ? 2 : 4;
+                    int refCount = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(p));
+                    p += 2;
+                    for (int r = 0; r < refCount; r++)
+                    {
+                        int toId = irefVersion == 0
+                            ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(p))
+                            : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p));
+                        p += irefVersion == 0 ? 2 : 4;
+                        if (toId == primaryItemId)
+                        {
+                            alphaItemId = fromId;
                         }
                     }
                 }
@@ -273,6 +309,13 @@ public static class HeifCoder
         {
             DecodeAv1IntraFrame(data.AsSpan(itemDataOffset, Math.Min(itemDataLength, data.Length - itemDataOffset)),
                         frame, matrixCoeffs, fullRange);
+
+            // Auxiliary alpha item (monochrome AV1): decode it and merge into the frame's alpha channel.
+            if (alphaItemId >= 0 && itemExtents.TryGetValue(alphaItemId, out var ax) && ax.Len > 0
+                && ax.Off >= 0 && ax.Off + ax.Len <= data.Length)
+            {
+                ApplyAv1Alpha(data.AsSpan(ax.Off, ax.Len), frame, imageWidth, imageHeight);
+            }
         }
         else
         {
@@ -380,11 +423,15 @@ public static class HeifCoder
         bool multiSb = w > 64 || h > 64 || w != h || (w & 1) != 0 || (h & 1) != 0;
 
         int channels = image.NumberOfChannels;
+        bool hasAlpha = image.HasAlpha;
+        int alphaOff = channels - 1; // alpha is the last channel (idx 1 for gray+A, 3 for RGBA)
 
-        // Extract tightly-packed RGB and luma; detect whether the image has real colour.
+        // Extract tightly-packed RGB and luma; detect whether the image has real colour and non-opaque alpha.
         var rgb = new byte[w * h * 3];
         var luma = new byte[w * h];
+        var alpha = hasAlpha ? new byte[w * h] : null;
         bool colour = false;
+        bool nonOpaque = false;
         for (int y = 0; y < h; y++)
         {
             ReadOnlySpan<ushort> row = image.GetPixelRow(y);
@@ -404,11 +451,26 @@ public static class HeifCoder
                 rgb[d + 1] = (byte)g;
                 rgb[d + 2] = (byte)b;
                 luma[y * w + x] = (byte)r;
+                if (alpha != null)
+                {
+                    byte a = Quantum.ScaleToByte(row[o + alphaOff]);
+                    alpha[y * w + x] = a;
+                    if (a != 255) nonOpaque = true;
+                }
             }
         }
 
         // Map the HEVC-style qp (0..51, lower = better) to an AV1 base_q_idx (1..255, lower = better).
         int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+
+        // Non-opaque alpha ⇒ 2-item AVIF (colour primary + monochrome alpha aux). Alpha is coded at higher
+        // quality than colour (half the base_q_idx) since matte edges are visually unforgiving.
+        if (hasAlpha && nonOpaque && alpha != null)
+        {
+            int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
+            RgbToI420(rgb, w, h, out byte[] yA, out byte[] uA, out byte[] vA);
+            return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx);
+        }
 
         if (colour)
         {
@@ -524,6 +586,35 @@ public static class HeifCoder
             else
             {
                 break;
+            }
+        }
+    }
+
+    // Decodes a monochrome AV1 alpha auxiliary item and writes its luma samples into the frame's alpha channel
+    // (enabling alpha if needed). Full-range 8-bit is the standard AVIF alpha representation.
+    private static void ApplyAv1Alpha(ReadOnlySpan<byte> codedData, ImageFrame frame, int w, int h)
+    {
+        var decoder = new Av1.Av1Decoder();
+        using var yuv = decoder.Decode(codedData, 0, isKeyframe: true) ?? throw new InvalidDataException("AV1 alpha decode produced no frame.");
+        bool tenBit = yuv.Format is Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12;
+        int shift = tenBit ? (yuv.Format == Av1.PixelFormat.Yuv420P12 ? 4 : 2) : 0;
+        ReadOnlySpan<byte> y0 = yuv.YPlane.Span;
+        int stride = yuv.YStride;
+
+        if (!frame.HasAlpha)
+        {
+            frame.SetAlpha(true);
+        }
+
+        int alphaOff = frame.NumberOfChannels - 1;
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            int ch = frame.NumberOfChannels;
+            for (int x = 0; x < w; x++)
+            {
+                int a = tenBit ? ((y0[(y * stride + x) * 2] | (y0[(y * stride + x) * 2 + 1] << 8)) >> shift) : y0[y * stride + x];
+                row[x * ch + alphaOff] = Quantum.ScaleFromByte((byte)Math.Clamp(a, 0, 255));
             }
         }
     }

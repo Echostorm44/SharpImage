@@ -48,6 +48,87 @@ internal static class Av1AvifWriter
         return new[] { b0, b1, b2, b3 };
     }
 
+    /// <summary>Builds a 2-item AVIF: a primary colour `av01` item (item 1) and a monochrome alpha auxiliary
+    /// `av01` item (item 2) linked by an `auxl` item reference (item 2 → item 1) with the standard alpha aux URN.
+    /// Both items' OBUs share one mdat (colour first, then alpha) as two extents. Verified in ffmpeg/libavif.</summary>
+    internal static byte[] BuildAvifWithAlpha(byte[] colorSeq, byte[] colorFrame, byte[] alphaSeq, byte[] alphaFrame,
+        int width, int height, bool colorMonochrome)
+    {
+        var colorMdat = new byte[colorSeq.Length + colorFrame.Length];
+        colorSeq.CopyTo(colorMdat, 0);
+        colorFrame.CopyTo(colorMdat, colorSeq.Length);
+        var alphaMdat = new byte[alphaSeq.Length + alphaFrame.Length];
+        alphaSeq.CopyTo(alphaMdat, 0);
+        alphaFrame.CopyTo(alphaMdat, alphaSeq.Length);
+
+        byte[] av1CColor = Box("av1C", BuildAv1C(colorMonochrome));
+        byte[] av1CAlpha = Box("av1C", BuildAv1C(true));
+
+        // ipco properties (1-indexed): 1 ispe (shared), 2 pixi(colour), 3 av1C(colour), 4 colr,
+        // 5 av1C(alpha), 6 auxC(alpha URN), 7 pixi(alpha, 1ch).
+        byte[] ispe = FullBox("ispe", 0, 0, Concat(U32((uint)width), U32((uint)height)));
+        int cch = colorMonochrome ? 1 : 3;
+        var pixiC = new List<byte> { (byte)cch };
+        for (int i = 0; i < cch; i++) pixiC.Add(8);
+        byte[] pixiColor = FullBox("pixi", 0, 0, pixiC.ToArray());
+        byte[] colr = Box("colr", Concat(Fourcc("nclx"), U16(2), U16(2), U16(colorMonochrome ? 0 : 6), new byte[] { 0x80 }));
+        byte[] pixiAlpha = FullBox("pixi", 0, 0, new byte[] { 1, 8 });
+        // auxC: aux_type is a null-terminated URN string identifying the alpha plane.
+        byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
+        byte[] auxC = FullBox("auxC", 0, 0, auxUrn);
+        byte[] ipco = Box("ipco", Concat(ispe, pixiColor, av1CColor, colr, av1CAlpha, auxC, pixiAlpha));
+
+        // ipma: item 1 → ispe(1), pixi(2), av1C essential(3), colr(4); item 2 → ispe(1), av1C essential(5),
+        // auxC essential(6), pixi(7).
+        byte[] ipmaPayload = Concat(
+            U32(2),                              // entry_count
+            U16(1), new byte[] { 4 },            // item 1, 4 associations
+            new byte[] { 0x01, 0x02, 0x83, 0x04 },
+            U16(2), new byte[] { 4 },            // item 2, 4 associations
+            new byte[] { 0x01, 0x85, 0x86, 0x07 });
+        byte[] ipma = FullBox("ipma", 0, 0, ipmaPayload);
+        byte[] iprp = Box("iprp", Concat(ipco, ipma));
+
+        byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc("pict"), U32(0), U32(0), U32(0),
+            System.Text.Encoding.ASCII.GetBytes("PictureHandler\0")));
+        byte[] pitm = FullBox("pitm", 0, 0, U16(1));
+
+        byte[] infeColor = FullBox("infe", 2, 0, Concat(U16(1), U16(0), Fourcc("av01"), new byte[] { 0 }));
+        byte[] infeAlpha = FullBox("infe", 2, 0, Concat(U16(2), U16(0), Fourcc("av01"), new byte[] { 0 }));
+        byte[] iinf = FullBox("iinf", 0, 0, Concat(U16(2), infeColor, infeAlpha));
+
+        // iref (version 0): auxl from item 2 → item 1 (alpha references its master image).
+        byte[] auxl = Box("auxl", Concat(U16(2), U16(1), U16(1))); // from_ID, ref_count, to_ID
+        byte[] iref = FullBox("iref", 0, 0, auxl);
+
+        // iloc: version 0, offset_size=4/length_size=4/base_offset_size=0; two items, one extent each. Offsets are
+        // patched after the meta layout is known (meta length is invariant to the offset values).
+        byte[] BuildIloc(uint colorOff, uint alphaOff) => FullBox("iloc", 0, 0, Concat(
+            new byte[] { 0x44 }, new byte[] { 0x00 }, U16(2),
+            U16(1), U16(0), U16(1), U32(colorOff), U32((uint)colorMdat.Length),
+            U16(2), U16(0), U16(1), U32(alphaOff), U32((uint)alphaMdat.Length)));
+
+        byte[] MetaWith(uint colorOff, uint alphaOff)
+        {
+            byte[] metaPayload = Concat(hdlr, pitm, BuildIloc(colorOff, alphaOff), iinf, iref, iprp);
+            return FullBox("meta", 0, 0, metaPayload);
+        }
+
+        byte[] ftyp = Box("ftyp", Concat(Fourcc("avif"), U32(0),
+            Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"), Fourcc("MA1B")));
+
+        int metaLen = MetaWith(0, 0).Length;               // invariant to offset values
+        int mdatPayloadOffset = ftyp.Length + metaLen + 8; // +8 mdat box header
+        byte[] meta = MetaWith((uint)mdatPayloadOffset, (uint)(mdatPayloadOffset + colorMdat.Length));
+
+        var mdatPayload = new byte[colorMdat.Length + alphaMdat.Length];
+        colorMdat.CopyTo(mdatPayload, 0);
+        alphaMdat.CopyTo(mdatPayload, colorMdat.Length);
+        byte[] mdat = Box("mdat", mdatPayload);
+
+        return Concat(ftyp, meta, mdat);
+    }
+
     private static byte[] BuildIsoBmff(int width, int height, byte[] av1C, byte[] mdatPayload, bool monochrome)
     {
         // ftyp: major brand avif, compatible brands avif/mif1/miaf/MA1B.
