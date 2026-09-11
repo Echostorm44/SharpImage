@@ -26,7 +26,7 @@ internal static class Av1FwdTransform
 
     // Deadzone quantization bias (AV1/libaom-style): shift the rounding threshold toward zero so marginal
     // coefficients quantize to 0. Pure encoder rate-distortion choice — the decoder is unaffected.
-    private const double DeadzoneBias = 0.20;
+    internal static double DeadzoneBias = 0.55;
 
     // Cached forward 1D matrices F = M^-1 (M = decoder's integer 1D inverse), keyed by (logSize<<2 | type1d).
     private static readonly ConcurrentDictionary<int, double[,]> FwdMatrixCache = new();
