@@ -304,9 +304,10 @@ internal static class Av1StillImageEncoder
         int width, int height, int baseQIdx)
     {
         ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
+        int cwIn = (width + 1) >> 1, chIn = (height + 1) >> 1;   // ceil — matches RgbToI420's chroma size (odd dims)
         byte[] padY = PadPlane(luma, width, height, pw, ph);
-        byte[] padU = PadPlane(u, width / 2, height / 2, pw / 2, ph / 2);
-        byte[] padV = PadPlane(v, width / 2, height / 2, pw / 2, ph / 2);
+        byte[] padU = PadPlane(u, cwIn, chIn, pw / 2, ph / 2);
+        byte[] padV = PadPlane(v, cwIn, chIn, pw / 2, ph / 2);
         byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
@@ -546,9 +547,9 @@ internal static class Av1StillImageEncoder
     // in-frame remainder must exceed 32px), i.e. a dimension's remainder mod 64 is 0 or >32.
     private static void ValidateMultiSb(int w, int h, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph)
     {
-        if (w < 64 || h < 64 || w > 4096 || h > 4096)
+        if (w < 8 || h < 8 || w > 4096 || h > 4096)
         {
-            throw new NotSupportedException($"Multi-superblock AVIF encode supports 64..4096 per dimension (got {w}x{h}).");
+            throw new NotSupportedException($"AVIF encode supports 8..4096 per dimension (got {w}x{h}).");
         }
 
         // Frame dims in 4-unit MI units: MiCols = 2*ceil(w/8) (always even), matching dav1d's f->bw. Using ceil(w/4)

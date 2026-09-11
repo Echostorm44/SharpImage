@@ -105,10 +105,12 @@ public sealed class HeifAvifEncodeTests
     }
 
     [Test]
-    public async Task Avif_Rectangular_Throws()
+    public async Task Avif_Rectangular_RoundTrips()
     {
-        // 40x20 needs a rectangular partition (only one split axis available) — not yet supported.
-        await Assert.That(() => HeifCoder.Encode(GrayRamp(40, 20), HeifContainerType.Avif, 10))
-            .Throws<System.NotSupportedException>();
+        // 40x20 (non-square, one dim < 64) now routes through the multi-SB path with edge force-split.
+        byte[] avif = HeifCoder.Encode(GrayRamp(40, 20), HeifContainerType.Avif, 10);
+        ImageFrame dec = HeifCoder.Decode(avif);
+        await Assert.That((int)dec.Columns).IsEqualTo(40);
+        await Assert.That((int)dec.Rows).IsEqualTo(20);
     }
 }

@@ -369,14 +369,15 @@ public static class HeifCoder
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
-        // Single square block covers <=64px; the multi-superblock path covers larger frames as a grid of 64x64
-        // superblocks (edges padded, output clipped), up to 4096. Sizes whose remainder mod 64 is 1..32 need a
-        // forced partition split that isn't implemented yet — the encoder throws for those.
-        bool multiSb = w > 64 || h > 64;
-        if (multiSb && (w > 4096 || h > 4096))
+        if (w > 4096 || h > 4096 || w < 8 || h < 8)
         {
-            throw new NotSupportedException($"AVIF encoding supports up to 4096x4096 (got {w}x{h}).");
+            throw new NotSupportedException($"AVIF encoding supports 8..4096 per dimension (got {w}x{h}).");
         }
+
+        // The single-block path is a fast path for an even, square frame <=64px; the multi-superblock path (a grid
+        // of 64x64 superblocks with edge force-split partitioning) handles everything else — larger, non-square,
+        // odd, or mixed small/large dimensions.
+        bool multiSb = w > 64 || h > 64 || w != h || (w & 1) != 0 || (h & 1) != 0;
 
         int channels = image.NumberOfChannels;
 
@@ -411,16 +412,15 @@ public static class HeifCoder
 
         if (colour)
         {
-            if ((w & 1) != 0 || (h & 1) != 0)
-            {
-                throw new NotSupportedException($"AVIF colour encoding requires even dimensions for I420 (got {w}x{h}).");
-            }
-
-            // Colour: single-block I420 for <=64px, multi-superblock I420 for larger frames.
+            // Colour: single-block I420 for <=64px, multi-superblock I420 for larger frames. I420 chroma is
+            // ceil(w/2) x ceil(h/2) — odd luma dimensions are supported (the last chroma sample averages the
+            // partial 2x2 group at the edge).
             RgbToI420(rgb, w, h, out byte[] yP, out byte[] uP, out byte[] vP);
-            return multiSb
-                ? Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx)
-                : Av1.Av1StillImageEncoder.EncodeAvifColor(yP, uP, vP, w, h, baseQIdx);
+            if (multiSb)
+                return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx);
+            if ((w & 1) != 0 || (h & 1) != 0)
+                throw new NotSupportedException($"AVIF single-block colour needs even dimensions (got {w}x{h}); larger frames support odd.");
+            return Av1.Av1StillImageEncoder.EncodeAvifColor(yP, uP, vP, w, h, baseQIdx);
         }
 
         return multiSb
@@ -432,12 +432,13 @@ public static class HeifCoder
     // subsampling: w x h luma, (w/2) x (h/2) U and V (2x2 box average). Requires even dimensions.
     private static void RgbToI420(byte[] rgb, int w, int h, out byte[] y, out byte[] u, out byte[] v)
     {
-        int cw = w / 2, chh = h / 2;
+        int cw = (w + 1) >> 1, chh = (h + 1) >> 1;   // ceil — odd dims keep a partial edge chroma sample
         y = new byte[w * h];
         u = new byte[cw * chh];
         v = new byte[cw * chh];
         var uf = new double[cw * chh];
         var vf = new double[cw * chh];
+        var cnt = new int[cw * chh];
 
         for (int yy = 0; yy < h; yy++)
         {
@@ -452,13 +453,15 @@ public static class HeifCoder
                 int ci = (yy >> 1) * cw + (xx >> 1);
                 uf[ci] += cb;
                 vf[ci] += cr;
+                cnt[ci]++;
             }
         }
 
         for (int i = 0; i < cw * chh; i++)
         {
-            u[i] = (byte)Math.Clamp((int)Math.Round(uf[i] / 4.0), 0, 255);
-            v[i] = (byte)Math.Clamp((int)Math.Round(vf[i] / 4.0), 0, 255);
+            int n = cnt[i] > 0 ? cnt[i] : 1;   // edge groups may have 1 or 2 samples for odd dims
+            u[i] = (byte)Math.Clamp((int)Math.Round(uf[i] / n), 0, 255);
+            v[i] = (byte)Math.Clamp((int)Math.Round(vf[i] / n), 0, 255);
         }
     }
 
