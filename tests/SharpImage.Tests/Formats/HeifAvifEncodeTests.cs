@@ -80,10 +80,9 @@ public sealed class HeifAvifEncodeTests
     }
 
     [Test]
-    public async Task Avif_Colour_TooLarge_Throws()
+    public async Task Avif_Colour_NonMultipleOf64_RoundTrips()
     {
-        // Colour supports <=64 (single block) and 128 multiples of 64 (multi-SB); 96 (a non-64-multiple >64) is
-        // not yet supported.
+        // 96x96 colour (a non-64-multiple >64) now encodes via edge-split partitioning; verify it decodes.
         var f = new ImageFrame();
         f.Initialize(96, 96, ColorspaceType.SRGB, false);
         for (long y = 0; y < 96; y++)
@@ -99,8 +98,10 @@ public sealed class HeifAvifEncodeTests
             }
         }
 
-        await Assert.That(() => HeifCoder.Encode(f, HeifContainerType.Avif, 10))
-            .Throws<System.NotSupportedException>();
+        byte[] avif = HeifCoder.Encode(f, HeifContainerType.Avif, 10);
+        ImageFrame dec = HeifCoder.Decode(avif);
+        await Assert.That((int)dec.Columns).IsEqualTo(96);
+        await Assert.That((int)dec.Rows).IsEqualTo(96);
     }
 
     [Test]

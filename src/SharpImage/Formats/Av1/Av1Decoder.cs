@@ -326,8 +326,10 @@ internal sealed class Av1Decoder
         int sbShift = useSb128 ? 5 : 4;
         int sbStep = 1 << sbShift;
 
-        int bw = (fh.CodedWidth + 3) >> 2;   // width in 4px units
-        int bh = (fh.Height + 3) >> 2;       // height in 4px units
+        // MI grid dims: MiCols = 2*ceil(w/8) (always even), matching dav1d's f->bw. (Previously (w+3)>>2 = ceil(w/4),
+        // which is odd for non-multiple-of-8 sizes and disagrees with the bitstream's partition edge logic.)
+        int bw = ((fh.CodedWidth + 7) >> 3) << 1;   // width in 4px units (MiCols)
+        int bh = ((fh.Height + 7) >> 3) << 1;       // height in 4px units (MiRows)
         int sbw = (bw + sbStep - 1) >> sbShift;
         int sbh = (bh + sbStep - 1) >> sbShift;
         int sb128w = (bw + 31) >> 5;
@@ -493,9 +495,13 @@ internal sealed class Av1Decoder
         // Align strides to 64 for cache friendliness
         int yStride = (width + 63) & ~63;
         int uvStride = hasChroma ? (((width >> ssHor) + 63) & ~63) : 0;
-        int uvHeight = hasChroma ? ((height + (1 << ssVer) - 1) >> ssVer) : 0;
+        // Superblocks tile the MI grid (MiRows*4 rows), which for non-multiple-of-8 heights exceeds the displayed
+        // height — allocate to the SB-aligned height so edge blocks writing past `height` stay in-bounds. The
+        // output still reports/reads only `height` rows.
+        int allocHeight = (height + 63) & ~63;
+        int uvHeight = hasChroma ? ((allocHeight + (1 << ssVer) - 1) >> ssVer) : 0;
 
-        int ySize = yStride * height;
+        int ySize = yStride * allocHeight;
         int uvSize = uvStride * uvHeight;
 
         // Return old buffers

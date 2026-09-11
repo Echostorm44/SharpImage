@@ -381,11 +381,41 @@ internal static class Av1StillImageEncoder
     private static void EncodePartitionColor(ColorPartCtx c, int bl, int bx4, int by4)
     {
         int hsz = 16 >> bl, blk4 = 32 >> bl;
-        bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
-        bool canSplit = bl < 4 && fullyInside;
+        bool haveH = c.Bw4 > bx4 + hsz;
+        bool haveV = c.Bh4 > by4 + hsz;
 
+        int bx8 = (bx4 & 31) >> 1, by8 = (by4 & 31) >> 1;
+        int partCtx = ((c.AbovePart[bx8] >> (4 - bl)) & 1) + (((c.LeftPart[by8] >> (4 - bl)) & 1) << 1);
+        Span<ushort> partCdf = c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx);
+        int nPart = Av1Tables.PartitionTypeCount[bl];
+
+        // Edge handling mirrors the gray path (force SPLIT at edges; the tree is luma-driven, chroma follows).
+        if (!haveH && !haveV)
+        {
+            if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
+            EncodePartitionColor(c, bl + 1, bx4, by4);
+            return;
+        }
+        if (haveH && !haveV)
+        {
+            if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
+            c.Msac.EncodeBool(1, Av1Decode.GatherTopPartitionProb(partCdf, (Av1BlockLevel)bl));
+            EncodePartitionColor(c, bl + 1, bx4, by4);
+            EncodePartitionColor(c, bl + 1, bx4 + hsz, by4);
+            return;
+        }
+        if (!haveH && haveV)
+        {
+            if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
+            c.Msac.EncodeBool(1, Av1Decode.GatherLeftPartitionProb(partCdf, (Av1BlockLevel)bl));
+            EncodePartitionColor(c, bl + 1, bx4, by4);
+            EncodePartitionColor(c, bl + 1, bx4, by4 + hsz);
+            return;
+        }
+
+        bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
         bool doSplit = false;
-        if (canSplit)
+        if (bl < 4 && fullyInside)
         {
             long costNone = EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl, bx4, by4);
             long costSplit = 0;
@@ -394,13 +424,9 @@ internal static class Av1StillImageEncoder
             doSplit = costSplit < costNone;
         }
 
-        int bx8 = (bx4 & 31) >> 1, by8 = (by4 & 31) >> 1;
-        int partCtx = ((c.AbovePart[bx8] >> (4 - bl)) & 1) + (((c.LeftPart[by8] >> (4 - bl)) & 1) << 1);
-        int nPart = Av1Tables.PartitionTypeCount[bl];
-
         if (doSplit)
         {
-            c.Msac.EncodeSymbolAdapt(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.Split, nPart);
+            c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
             EncodePartitionColor(c, bl + 1, bx4, by4);
             EncodePartitionColor(c, bl + 1, bx4 + hsz, by4);
             EncodePartitionColor(c, bl + 1, bx4, by4 + hsz);
@@ -408,7 +434,7 @@ internal static class Av1StillImageEncoder
             return;
         }
 
-        c.Msac.EncodeSymbolAdapt(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.None, nPart);
+        c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.None, nPart);
         EncodeLeafBlockColor(c, bl, bx4, by4, blk4);
 
         byte aboveVal = Av1Tables.AboveLeftPartCtx[0, bl, (int)Av1BlockPartition.None];
@@ -525,18 +551,15 @@ internal static class Av1StillImageEncoder
             throw new NotSupportedException($"Multi-superblock AVIF encode supports 64..4096 per dimension (got {w}x{h}).");
         }
 
-        bw4 = (w + 3) >> 2;
-        bh4 = (h + 3) >> 2;
+        // Frame dims in 4-unit MI units: MiCols = 2*ceil(w/8) (always even), matching dav1d's f->bw. Using ceil(w/4)
+        // instead would be odd for non-multiple-of-8 sizes and disagree with dav1d — the even MI grid lets 8x8
+        // blocks tile the edges (no 4x4 needed) and is exactly what a conformant decoder derives from the header.
+        bw4 = ((w + 7) >> 3) << 1;
+        bh4 = ((h + 7) >> 3) << 1;
         sbCols = (bw4 + 15) >> 4;
         sbRows = (bh4 + 15) >> 4;
         pw = sbCols * 64;
         ph = sbRows * 64;
-        if (bw4 <= (sbCols - 1) * 16 + 8 || bh4 <= (sbRows - 1) * 16 + 8)
-        {
-            throw new NotSupportedException(
-                $"Frame {w}x{h}: an edge superblock's in-frame remainder is <=32px, which needs a forced partition " +
-                "split not yet implemented (each dimension mod 64 must be 0 or >32).");
-        }
     }
 
     // Pads a plane to pw x ph by replicating the right/bottom edge.
@@ -662,14 +685,48 @@ internal static class Av1StillImageEncoder
         int hsz = 16 >> bl;          // half block in 4-units
         int blk4 = 32 >> bl;         // full block in 4-units
         int n = blk4 * 4;            // block pixels
-        bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
-        bool canSplit = bl < 4 && fullyInside;
+        // Edge logic mirrors the decoder: haveH/haveV = there is room for the right/bottom half inside the frame.
+        bool haveH = c.Bw4 > bx4 + hsz;
+        bool haveV = c.Bh4 > by4 + hsz;
 
-        bool doSplit = false;
-        if (canSplit)
+        int bx8 = (bx4 & 31) >> 1, by8 = (by4 & 31) >> 1;
+        int partCtx = ((c.AbovePart[bx8] >> (4 - bl)) & 1) + (((c.LeftPart[by8] >> (4 - bl)) & 1) << 1);
+        Span<ushort> partCdf = c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx);
+        int nPart = Av1Tables.PartitionTypeCount[bl];
+
+        // Both halves off-frame: forced SPLIT (no symbol), only the top-left child has in-frame content.
+        if (!haveH && !haveV)
         {
-            // Decision uses source-plane predictions (≈ what the reconstruction will be) so each quadrant is
-            // scored as it would predict AFTER splitting — the actual encode below still predicts from recon.
+            if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size in 4-units) — not yet implemented.");
+            EncodePartition(c, bl + 1, bx4, by4);
+            return;
+        }
+
+        // Bottom edge (room across, none below): split_or_horz — we always force SPLIT (avoids rectangular blocks).
+        if (haveH && !haveV)
+        {
+            if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
+            c.Msac.EncodeBool(1, Av1Decode.GatherTopPartitionProb(partCdf, (Av1BlockLevel)bl));
+            EncodePartition(c, bl + 1, bx4, by4);
+            EncodePartition(c, bl + 1, bx4 + hsz, by4);
+            return;
+        }
+        // Right edge (room below, none across): split_or_vert — force SPLIT.
+        if (!haveH && haveV)
+        {
+            if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
+            c.Msac.EncodeBool(1, Av1Decode.GatherLeftPartitionProb(partCdf, (Av1BlockLevel)bl));
+            EncodePartition(c, bl + 1, bx4, by4);
+            EncodePartition(c, bl + 1, bx4, by4 + hsz);
+            return;
+        }
+
+        // Interior: full partition symbol. RD NONE-vs-SPLIT only for fully-inside blocks (a block that merely
+        // extends past the frame with its midpoint inside stays a single NONE, matching prior behaviour).
+        bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
+        bool doSplit = false;
+        if (bl < 4 && fullyInside)
+        {
             long costNone = EstimateCost(c, bl, bx4, by4);
             long costSplit = c.SplitLambda;
             foreach ((int dx, int dy) in new[] { (0, 0), (hsz, 0), (0, hsz), (hsz, hsz) })
@@ -677,14 +734,9 @@ internal static class Av1StillImageEncoder
             doSplit = costSplit < costNone;
         }
 
-        // Partition symbol (always full-range in our scheme — see method summary).
-        int bx8 = (bx4 & 31) >> 1, by8 = (by4 & 31) >> 1;
-        int partCtx = ((c.AbovePart[bx8] >> (4 - bl)) & 1) + (((c.LeftPart[by8] >> (4 - bl)) & 1) << 1);
-        int nPart = Av1Tables.PartitionTypeCount[bl];
-
         if (doSplit)
         {
-            c.Msac.EncodeSymbolAdapt(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.Split, nPart);
+            c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
             EncodePartition(c, bl + 1, bx4, by4);
             EncodePartition(c, bl + 1, bx4 + hsz, by4);
             EncodePartition(c, bl + 1, bx4, by4 + hsz);
@@ -692,7 +744,7 @@ internal static class Av1StillImageEncoder
             return; // SPLIT nodes (bl<8x8) do not update partition context
         }
 
-        c.Msac.EncodeSymbolAdapt(c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), (int)Av1BlockPartition.None, nPart);
+        c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.None, nPart);
         // Actual leaf: pick the best mode predicting from the real reconstruction, then code + reconstruct.
         (Av1IntraPredMode yMode, int yDelta, _) =
             ChooseIntraMode(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred);
