@@ -772,10 +772,10 @@ public static class Av1Decode
         // === CDEF index ===
         if (!Convert.ToBoolean(b.Skip))
         {
-            int cdefBit = seqHdr.Sb128 ? 1 : 0;
-            int idx = cdefBit != 0
-                ? ((t.Bx & 16) >> 4) + ((t.By & 16) >> 3)
-                : 0;
+            // Sub-index of this 64x64 within its SB128 lf-mask. For 64x64 superblocks (Sb128=0) two SB64
+            // columns/rows still share one SB128 mask, so the position must be encoded here (not forced to 0),
+            // matching the apply-side sb64_idx = ((by&16)>>3) + (sbx&1).
+            int idx = ((t.By & 16) >> 3) + ((t.Bx & 16) >> 4);
             if (t.CurSbCdefIdx[idx] == -1)
             {
                 Av1Msac.TraceLabel = "cdef";
@@ -1055,14 +1055,15 @@ public static class Av1Decode
         }
 
         // Fill CDEF noskip_mask for non-skip blocks (dav1d decode.c:1993-1999).
-        // Common to intra and inter blocks — gates which 8x8 blocks CDEF filters.
+        // Common to intra and inter blocks — gates which 8x8 blocks CDEF filters. The mask covers one SB128
+        // (16 8x8-row-pairs x 2 64px halves), so the row index is taken relative to the SB128 row (by4 & 31).
         if (b.Skip == 0 && t.LfMask != null)
         {
             uint mask = (0xFFFFFFFFu >> (32 - bw4)) << (bx4 & 15);
             int bxIdx = (bx4 & 16) >> 4;
             for (int y = 0; y < bh4; y += 2)
             {
-                int maskRow = (by4 + y) >> 1;
+                int maskRow = ((by4 + y) & 31) >> 1;
                 if (maskRow < 16)
                 {
                     t.LfMask.NoskipMask[maskRow, bxIdx] |= (ushort)mask;

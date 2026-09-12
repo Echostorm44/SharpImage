@@ -297,12 +297,89 @@ internal static class Av1StillImageEncoder
         byte[] tile = EncodeMultiSbTile(padded, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: true);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
-        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome: true, txModeSelect: true);
+
+        // CDEF strength search: the tile is CDEF-independent (cdef_bits=0), so try candidate strengths by decoding
+        // each and keeping the one with the lowest reconstruction SSE vs source (always incl. the no-op, so it can
+        // never hurt). The decoder applies CDEF as an output filter; intra prediction used pre-CDEF recon.
+        byte[] srcCopy = luma.ToArray();
+        Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
+            monochrome: true, srcCopy, null, null, 0, 0);
+        byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: true, tile, best);
+        return (seqObu, frameObu);
+    }
+
+    // Assembles the OBU_FRAME (frame header with the given CDEF params + tile) for a multi-SB key frame.
+    private static byte[] BuildFrameObu(int baseQIdx, int sbCols, int sbRows, bool monochrome, byte[] tile, Av1ObuWriter.CdefParams cdef)
+    {
+        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome, txModeSelect: monochrome, cdef);
         var framePayload = new byte[frameHdr.Length + tile.Length];
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
-        byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
-        return (seqObu, frameObu);
+        return Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
+    }
+
+    // Searches a single global CDEF strength set (cdef_bits=0) that minimises reconstruction SSE. Decodes each
+    // candidate through our own decoder (which matches libdav1d's CDEF), comparing the decoded planes to the
+    // source. srcY is width*height; srcU/srcV (cw*ch) are only used when !monochrome.
+    private static Av1ObuWriter.CdefParams SearchCdef(byte[] seqObu, byte[] tileRef, int baseQIdx, int sbCols, int sbRows,
+        int width, int height, bool monochrome, byte[] srcY, byte[]? srcU, byte[]? srcV, int cw, int ch)
+    {
+        int damping = Math.Clamp(3 + (baseQIdx >> 6), 3, 6);
+        long BestSse = long.MaxValue;
+        Av1ObuWriter.CdefParams bestParams = Av1ObuWriter.CdefParams.None;
+
+        long Evaluate(int yLvl, int uvLvl)
+        {
+            var cdef = new Av1ObuWriter.CdefParams(damping, 0, new[] { (byte)yLvl }, new[] { (byte)uvLvl });
+            byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome, tileRef, cdef);
+            var tu = new byte[seqObu.Length + frameObu.Length];
+            seqObu.CopyTo(tu, 0);
+            frameObu.CopyTo(tu, seqObu.Length);
+            var dec = new Av1Decoder();
+            using var yuv = dec.Decode(tu, 0, isKeyframe: true);
+            if (yuv == null) return long.MaxValue;
+            long sse = PlaneSse(yuv.YPlane.Span, yuv.YStride, srcY, width, height);
+            if (!monochrome && srcU != null && srcV != null)
+            {
+                sse += PlaneSse(yuv.UPlane.Span, yuv.UStride, srcU, cw, ch);
+                sse += PlaneSse(yuv.VPlane.Span, yuv.VStride, srcV, cw, ch);
+            }
+
+            return sse;
+        }
+
+        // CDEF's still-image payoff is modest (~1% RMSE) and its verification costs a full re-decode, so it is
+        // applied only where that trade is worth it: lossy quality (baseQIdx >= 64, below which CDEF risks
+        // blurring fine detail) and images small enough that 1-2 decodes are cheap. Large frames — where the
+        // re-decode is expensive and CDEF's gain on detailed content is near zero — skip it. Within that gate we
+        // evaluate the no-op plus one q-scaled heuristic strength and keep whichever decodes closer to the
+        // source, so it can never regress vs no CDEF.
+        if (baseQIdx < 64 || (long)width * height > 512 * 512) return Av1ObuWriter.CdefParams.None;
+
+        long noopSse = Evaluate(0, 0);
+        BestSse = noopSse;
+
+        int yPri = Math.Clamp(baseQIdx / 16, 1, 12);   // stronger deringing as quantisation coarsens
+        int ySec = baseQIdx >= 128 ? 2 : 1;
+        int yLvl = (yPri << 2) | ySec;
+        int uvLvl = monochrome ? 0 : ((Math.Clamp(baseQIdx / 24, 1, 8) << 2) | (baseQIdx >= 160 ? 1 : 0));
+        long sse = Evaluate(yLvl, uvLvl);
+        if (sse < BestSse) { BestSse = sse; bestParams = new Av1ObuWriter.CdefParams(damping, 0, new[] { (byte)yLvl }, new[] { (byte)uvLvl }); }
+
+        return bestParams;
+    }
+
+    private static long PlaneSse(ReadOnlySpan<byte> dec, int stride, byte[] src, int w, int h)
+    {
+        long sse = 0;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int d = dec[y * stride + x] - src[y * w + x];
+                sse += (long)d * d;
+            }
+
+        return sse;
     }
 
     /// <summary>Multi-superblock I420 COLOUR: a 1..2 x 1..2 grid of full 64x64 superblocks (64 or 128 each side),
@@ -327,11 +404,12 @@ internal static class Av1StillImageEncoder
         byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
-        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome: false);
-        var framePayload = new byte[frameHdr.Length + tile.Length];
-        frameHdr.CopyTo(framePayload, 0);
-        tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
-        byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
+
+        // CDEF strength search on Y + chroma (see BuildMonochromeObus).
+        byte[] srcY = luma.ToArray(), srcU = u.ToArray(), srcV = v.ToArray();
+        Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
+            monochrome: false, srcY, srcU, srcV, cwIn, chIn);
+        byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: false, tile, best);
         return (seqObu, frameObu);
     }
 

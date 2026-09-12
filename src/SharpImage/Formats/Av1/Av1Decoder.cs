@@ -702,9 +702,12 @@ internal sealed class Av1Decoder
                 // Save lfMask data for CDEF/LR (backup before next row overwrites)
                 if (ctx.LfMasksRows != null && ctx.LfMasks != null)
                 {
+                    // Back up per SB128 row (by>>5), matching ApplyCdef's index. For Sb128=0 the two SB64 rows of
+                    // an SB128 both map here; the later (bottom) row's copy carries the complete accumulated mask.
+                    int sb128Row = by >> 5;
                     for (int col = 0; col < sb128w && col < ctx.LfMasks.Length; col++)
                     {
-                        int idx = sby * sb128w + col;
+                        int idx = sb128Row * sb128w + col;
                         if (idx < ctx.LfMasksRows.Length)
                             ctx.LfMasksRows[idx].CopyFrom(ctx.LfMasks[col]);
                     }
@@ -1000,18 +1003,24 @@ internal sealed class Av1Decoder
             if (aboveIdx < aboveCtx!.Length)
                 t.Above = aboveCtx[aboveIdx];
 
-            // Reset CDEF indices for this superblock
-            t.CurSbCdefIdx[0] = -1;
-            t.CurSbCdefIdx[1] = -1;
-            t.CurSbCdefIdx[2] = -1;
-            t.CurSbCdefIdx[3] = -1;
-
-            // Point to the loop filter mask for this SB128 column
+            // Point to the loop filter mask for this SB128 column. For 64x64 superblocks (Sb128=0) up to four
+            // SB64s share one SB128 mask, so reset the mask + CDEF indices only at the first SB64 of the SB128
+            // (top-left). Resetting per-SB64 would wipe an earlier SB64's noskip/cdef data before CDEF reads it.
             int sb128Col = t.Bx >> 5;
+            bool firstOfSb128 = (t.Bx & 16) == 0 && (t.By & 16) == 0;
+            if (firstOfSb128)
+            {
+                t.CurSbCdefIdx[0] = -1;
+                t.CurSbCdefIdx[1] = -1;
+                t.CurSbCdefIdx[2] = -1;
+                t.CurSbCdefIdx[3] = -1;
+            }
+
             if (ctx.LfMasks != null && sb128Col < ctx.LfMasks.Length)
             {
                 t.LfMask = ctx.LfMasks[sb128Col];
-                t.LfMask.Reset();
+                if (firstOfSb128)
+                    t.LfMask.Reset();
             }
 
             // Read restoration info from MSAC before partition decode (dav1d order).

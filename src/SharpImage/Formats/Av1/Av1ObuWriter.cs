@@ -95,7 +95,7 @@ internal static class Av1ObuWriter
 
         // reduced still → inter tools block skipped; screen_content_tools/force_integer_mv default Adaptive.
         w.PutBool(false);         // enable_superres = 0
-        w.PutBool(false);         // enable_cdef = 0
+        w.PutBool(true);          // enable_cdef = 1 (frame header carries cdef_params; strengths may be 0 = no-op)
         w.PutBool(false);         // enable_restoration = 0
 
         // color_config
@@ -141,11 +141,22 @@ internal static class Av1ObuWriter
     internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome)
         => WriteFrameHeaderPayload(baseQIdx, isObuFrame, sbCols, sbRows, monochrome, false);
 
+    /// <summary>CDEF parameters for the frame header. Damping ∈ [3,6]; Bits ∈ [0,3] selects 1&lt;&lt;Bits strength
+    /// sets. Each 6-bit strength packs (pri&lt;&lt;2)|sec. All-zero strengths ⇒ the decoder applies no filtering
+    /// (a conformant no-op).</summary>
+    internal readonly record struct CdefParams(int Damping, int Bits, byte[] YStrengths, byte[] UvStrengths)
+    {
+        internal static CdefParams None => new(3, 0, new byte[] { 0 }, new byte[] { 0 });
+    }
+
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect)
+        => WriteFrameHeaderPayload(baseQIdx, isObuFrame, sbCols, sbRows, monochrome, txModeSelect, CdefParams.None);
+
     /// <summary>Frame header for a frame that is <paramref name="sbCols"/> x <paramref name="sbRows"/> 64x64
     /// superblocks, coded as a single tile (uniform spacing, log2 tile dims 0). <paramref name="monochrome"/>
     /// selects whether the U/V quant-delta bits are emitted. <paramref name="txModeSelect"/> enables per-block
     /// tx-size signalling (TX_MODE_SELECT) — the encoder must then code a tx_depth symbol per block.</summary>
-    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect)
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef)
     {
         if (baseQIdx <= 0 || baseQIdx > 255)
         {
@@ -209,7 +220,18 @@ internal static class Av1ObuWriter
         w.PutBits(0, 3);          // loop_filter_sharpness = 0
         w.PutBool(false);         // loop_filter_delta_enabled = 0
 
-        // cdef_params skipped (enable_cdef=0); lr_params skipped (enable_restoration=0)
+        // cdef_params (enable_cdef=1, not lossless, not intrabc). Strengths may all be 0 = no-op filter.
+        w.PutBits((uint)(cdef.Damping - 3), 2);   // cdef_damping_minus_3
+        w.PutBits((uint)cdef.Bits, 2);            // cdef_bits
+        for (int i = 0; i < (1 << cdef.Bits); i++)
+        {
+            w.PutBits(cdef.YStrengths[i], 6);     // cdef_y_strength (pri<<2 | sec)
+            if (!monochrome)
+            {
+                w.PutBits(cdef.UvStrengths[i], 6); // cdef_uv_strength
+            }
+        }
+        // lr_params skipped (enable_restoration=0)
 
         // read_tx_mode (not lossless)
         w.PutBool(txModeSelect);  // tx_mode_select: 0 ⇒ TX_MODE_LARGEST, 1 ⇒ TX_MODE_SELECT
