@@ -21,6 +21,36 @@ internal sealed class Av1MsacWriter
     private int cnt = -9;
     private readonly List<int> precarry = new(1024); // each entry: byte value in low 8 bits, +carry in bit 8
 
+    // Running entropy estimate (Σ -log2(prob)) of everything encoded, for rate-distortion measurement. Matches
+    // Av1CoeffEncode.SymBits/BoolBits, so a trial encode's MeasuredBits is a faithful coded-rate proxy. Only
+    // accumulated when Measure is set, so the real (committed) encode path pays nothing.
+    internal bool Measure;
+    internal double MeasuredBits;
+    private const double Log2_32768 = 15.0;
+
+    /// <summary>Opaque snapshot of the coder state, so a trial (measurement) encode can be rolled back. The
+    /// precarry buffer only grows during encoding, so restoring its length rewinds it exactly.</summary>
+    internal readonly struct State
+    {
+        internal readonly ulong Low; internal readonly uint Rng; internal readonly int Cnt;
+        internal readonly int PrecarryCount; internal readonly double Bits;
+        internal State(ulong low, uint rng, int cnt, int pc, double bits) { Low = low; Rng = rng; Cnt = cnt; PrecarryCount = pc; Bits = bits; }
+    }
+
+    internal State Save() => new(low, rng, cnt, precarry.Count, MeasuredBits);
+
+    internal void Restore(in State s)
+    {
+        low = s.Low; rng = s.Rng; cnt = s.Cnt; MeasuredBits = s.Bits;
+        if (precarry.Count > s.PrecarryCount) precarry.RemoveRange(s.PrecarryCount, precarry.Count - s.PrecarryCount);
+    }
+
+    // Precarry-buffer bytes emitted since index `start` (a trial's output tail), so a winning trial's committed
+    // state can be reconstructed without re-encoding. Used by true-RD to avoid re-running the winning subtree.
+    internal int[] PrecarryFrom(int start) => precarry.GetRange(start, precarry.Count - start).ToArray();
+
+    internal void AppendPrecarry(int[] tail) => precarry.AddRange(tail);
+
     internal uint DbgRng => rng;
     internal ulong DbgLow => low;
     internal int DbgCnt => cnt;
@@ -65,6 +95,7 @@ internal sealed class Av1MsacWriter
         uint r = rng;
         uint fl = s > 0 ? icdf[s - 1] : (uint)(1 << 15);
         uint fh = icdf[s];
+        if (Measure) MeasuredBits += Log2_32768 - Math.Log2(Math.Max((int)fl - (int)fh, 1));
         ulong l = low;
         if (fl < (1 << 15))
         {
@@ -86,6 +117,7 @@ internal sealed class Av1MsacWriter
     /// (matches the decoder's DecodeBool). Non-adaptive.</summary>
     public void EncodeBool(uint val, uint f)
     {
+        if (Measure) MeasuredBits += Log2_32768 - Math.Log2(Math.Max((int)(val == 0 ? f : 32768 - f), 1));
         uint r = rng;
         ulong l = low;
         uint v = (((r >> 8) * (f >> ProbShift)) >> (7 - ProbShift)) + MinProb;
@@ -105,6 +137,7 @@ internal sealed class Av1MsacWriter
     /// <summary>Encodes a 50/50 boolean (matches DecodeBoolEqui).</summary>
     public void EncodeBoolEqui(uint val)
     {
+        if (Measure) MeasuredBits += 1.0;
         uint r = rng;
         ulong l = low;
         uint v = ((r >> 8) << 7) + MinProb;

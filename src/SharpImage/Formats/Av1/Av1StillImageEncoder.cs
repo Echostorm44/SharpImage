@@ -520,6 +520,16 @@ internal static class Av1StillImageEncoder
         }
 
         bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
+
+        // True trial-encode RD: encode each candidate partition for real, measure its actual coded bits + SSE,
+        // and commit the one with the lowest J = SSE + λ·bits. Unlike the estimate path this uses the live CDFs
+        // and real reconstruction (incl. adaptation and recursive sub-decisions), so it picks partitions optimally.
+        if (UseTrueRd && (long)c.Bw4 * c.Bh4 * 16 <= TrueRdPixelBudget && fullyInside && bl >= 1 && bl < 4)
+        {
+            EncodePartitionColorTrueRd(c, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8);
+            return;
+        }
+
         // Partition choice: 0=NONE, 1=HORZ, 2=VERT, 3=SPLIT (rectangular HORZ/VERT only at 16x16, which yields
         // 16x8/8x16 luma + 8x4/4x8 chroma — both ≤16 per axis, so the matched rect transform applies and there is
         // no sub-8x8 chroma corner case).
@@ -566,6 +576,15 @@ internal static class Av1StillImageEncoder
             choice = (rectBest < (long)(sqBest * RectCostMargin)) ? rectChoice : sqChoice;
         }
 
+        EncodeChoiceColor(c, choice, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8);
+    }
+
+    // Encodes one specific partition choice (0=NONE,1=HORZ,2=VERT,3=SPLIT): the partition symbol, the leaf(s) or
+    // recursive children, and the partition-context fill. SPLIT recurses into EncodePartitionColor (which itself
+    // applies whatever decision mode is active).
+    private static void EncodeChoiceColor(ColorPartCtx c, int choice, int bl, int bx4, int by4, int hsz, int blk4,
+        Span<ushort> partCdf, int nPart, int bx8, int by8)
+    {
         if (choice == 3)
         {
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
@@ -599,6 +618,125 @@ internal static class Av1StillImageEncoder
         c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.None, nPart);
         EncodeLeafBlockColor(c, bl, bx4, by4, blk4);
         FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.None);
+    }
+
+    // Snapshot of all mutable encoder state a partition subtree touches, so trial encodes can be rolled back.
+    private sealed class RdSnapshot
+    {
+        public Av1MsacWriter.State Msac;
+        public Av1CdfContext Cdf = new();
+        public byte[] ReconY = null!, ReconU = null!, ReconV = null!;   // block regions
+        public byte[] AbovePart = null!, ALY = null!, ACU = null!, ACV = null!, AModeY = null!, ASkip = null!;
+        public byte[] LeftPart = null!, LLY = null!, LCU = null!, LCV = null!, LModeY = null!, LSkip = null!;
+    }
+
+    private static byte[] CopyRegion(byte[] plane, int stride, int px, int py, int w, int h)
+    {
+        var r = new byte[w * h];
+        for (int y = 0; y < h; y++) Array.Copy(plane, (py + y) * stride + px, r, y * w, w);
+        return r;
+    }
+
+    private static void PasteRegion(byte[] region, byte[] plane, int stride, int px, int py, int w, int h)
+    {
+        for (int y = 0; y < h; y++) Array.Copy(region, y * w, plane, (py + y) * stride + px, w);
+    }
+
+    private static RdSnapshot SnapshotRd(ColorPartCtx c, int bx4, int by4, int blk4)
+    {
+        int lpx = bx4 * 4, lpy = by4 * 4, ln = blk4 * 4;
+        int cpx = bx4 * 2, cpy = by4 * 2, cn = blk4 * 2;
+        var s = new RdSnapshot { Msac = c.Msac.Save() };
+        s.Cdf.CopyFrom(c.Cdf);
+        s.ReconY = CopyRegion(c.ReconY, c.W, lpx, lpy, ln, ln);
+        s.ReconU = CopyRegion(c.ReconU, c.Cw, cpx, cpy, cn, cn);
+        s.ReconV = CopyRegion(c.ReconV, c.Cw, cpx, cpy, cn, cn);
+        s.AbovePart = (byte[])c.AbovePart.Clone(); s.LeftPart = (byte[])c.LeftPart.Clone();
+        s.ALY = (byte[])c.ALY.Clone(); s.LLY = (byte[])c.LLY.Clone();
+        s.ACU = (byte[])c.ACU.Clone(); s.LCU = (byte[])c.LCU.Clone();
+        s.ACV = (byte[])c.ACV.Clone(); s.LCV = (byte[])c.LCV.Clone();
+        s.AModeY = (byte[])c.AModeY.Clone(); s.LModeY = (byte[])c.LModeY.Clone();
+        s.ASkip = (byte[])c.ASkip.Clone(); s.LSkip = (byte[])c.LSkip.Clone();
+        return s;
+    }
+
+    private static void RestoreRd(ColorPartCtx c, RdSnapshot s, int bx4, int by4, int blk4)
+    {
+        int lpx = bx4 * 4, lpy = by4 * 4, ln = blk4 * 4;
+        int cpx = bx4 * 2, cpy = by4 * 2, cn = blk4 * 2;
+        c.Msac.Restore(s.Msac);
+        c.Cdf.CopyFrom(s.Cdf);
+        PasteRegion(s.ReconY, c.ReconY, c.W, lpx, lpy, ln, ln);
+        PasteRegion(s.ReconU, c.ReconU, c.Cw, cpx, cpy, cn, cn);
+        PasteRegion(s.ReconV, c.ReconV, c.Cw, cpx, cpy, cn, cn);
+        Array.Copy(s.AbovePart, c.AbovePart, s.AbovePart.Length); Array.Copy(s.LeftPart, c.LeftPart, s.LeftPart.Length);
+        Array.Copy(s.ALY, c.ALY, s.ALY.Length); Array.Copy(s.LLY, c.LLY, s.LLY.Length);
+        Array.Copy(s.ACU, c.ACU, s.ACU.Length); Array.Copy(s.LCU, c.LCU, s.LCU.Length);
+        Array.Copy(s.ACV, c.ACV, s.ACV.Length); Array.Copy(s.LCV, c.LCV, s.LCV.Length);
+        Array.Copy(s.AModeY, c.AModeY, s.AModeY.Length); Array.Copy(s.LModeY, c.LModeY, s.LModeY.Length);
+        Array.Copy(s.ASkip, c.ASkip, s.ASkip.Length); Array.Copy(s.LSkip, c.LSkip, s.LSkip.Length);
+    }
+
+    // SSE of the reconstructed block (luma + chroma) vs the source planes — the distortion term for true-RD.
+    private static long BlockSseColor(ColorPartCtx c, int bx4, int by4, int blk4)
+    {
+        int lpx = bx4 * 4, lpy = by4 * 4, ln = blk4 * 4;
+        long sse = 0;
+        for (int y = 0; y < ln; y++)
+            for (int x = 0; x < ln; x++)
+            { int d = c.ReconY[(lpy + y) * c.W + lpx + x] - c.Luma[(lpy + y) * c.W + lpx + x]; sse += (long)d * d; }
+        int cpx = bx4 * 2, cpy = by4 * 2, cn = blk4 * 2;
+        for (int y = 0; y < cn; y++)
+            for (int x = 0; x < cn; x++)
+            {
+                int du = c.ReconU[(cpy + y) * c.Cw + cpx + x] - c.U[(cpy + y) * c.Cw + cpx + x];
+                int dv = c.ReconV[(cpy + y) * c.Cw + cpx + x] - c.V[(cpy + y) * c.Cw + cpx + x];
+                sse += (long)du * du + (long)dv * dv;
+            }
+
+        return sse;
+    }
+
+    private static void EncodePartitionColorTrueRd(ColorPartCtx c, int bl, int bx4, int by4, int hsz, int blk4,
+        Span<ushort> partCdf, int nPart, int bx8, int by8)
+    {
+        // Candidates: NONE and SPLIT always; HORZ/VERT at 32x32/16x16 when rect is enabled.
+        Span<int> cands = stackalloc int[4];
+        int nc = 0; cands[nc++] = 0; cands[nc++] = 3;
+        if ((bl == 2 || bl == 3) && UseRectPartition) { cands[nc++] = 1; cands[nc++] = 2; }
+
+        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        var snap0 = SnapshotRd(c, bx4, by4, blk4);
+        int baseCount = snap0.Msac.PrecarryCount;
+        bool measureWas = c.Msac.Measure;
+        c.Msac.Measure = true;
+        int partCtx = ((c.AbovePart[bx8] >> (4 - bl)) & 1) + (((c.LeftPart[by8] >> (4 - bl)) & 1) << 1);
+
+        // Encode each candidate once, capture its full post-state (recon/contexts/cdf + MSAC scalars + the coded
+        // byte tail), and commit the lowest-J one by restoring that post-state — no re-encode, so a SPLIT winner's
+        // subtree is not redone (that is where the exponential blow-up would otherwise come from).
+        double bestJ = double.MaxValue;
+        RdSnapshot? bestSnap = null;
+        int[] bestTail = System.Array.Empty<int>();
+        for (int i = 0; i < nc; i++)
+        {
+            if (i > 0) RestoreRd(c, snap0, bx4, by4, blk4);
+            double b0 = c.Msac.MeasuredBits;
+            EncodeChoiceColor(c, cands[i], bl, bx4, by4, hsz, blk4, c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), nPart, bx8, by8);
+            double j = BlockSseColor(c, bx4, by4, blk4) + lambda * (c.Msac.MeasuredBits - b0);
+            if (j < bestJ)
+            {
+                bestJ = j;
+                bestTail = c.Msac.PrecarryFrom(baseCount);
+                bestSnap = SnapshotRd(c, bx4, by4, blk4);
+            }
+        }
+
+        // Commit the winner: restore its recon/contexts/CDF, then re-apply its coded bytes onto the base stream.
+        RestoreRd(c, snap0, bx4, by4, blk4);
+        RestoreRd(c, bestSnap!, bx4, by4, blk4);
+        c.Msac.AppendPrecarry(bestTail);
+        c.Msac.Measure = measureWas;
     }
 
     // Rectangular tx-size ordinals (Av1TxSize / RectTxfmSize).
@@ -1295,6 +1433,12 @@ internal static class Av1StillImageEncoder
 
     // Rect is chosen only when its estimated cost is below this fraction of the best square (NONE/SPLIT) cost.
     internal static double RectCostMargin = 0.95;
+
+    // Enables true trial-encode RD for the colour partition decision (measure actual coded bits + SSE per
+    // candidate). Much more accurate than the cost estimate (e.g. peppers qp15 RMSE 7.6→6.2 at −2.7% size), but
+    // several times slower. Gated to TrueRdPixelBudget so large frames keep the fast estimate path.
+    internal static bool UseTrueRd = true;
+    internal static long TrueRdPixelBudget = 512 * 512;
 
     // Rate-DISTORTION coding-cost estimate for a luma block (see EncodePartition). Reconstructs the block through
     // the decoder's own inverse and returns J = SSE + λ·rate — so a 64x64 (or 32x32) transform that drops the
