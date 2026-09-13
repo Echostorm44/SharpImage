@@ -520,17 +520,53 @@ internal static class Av1StillImageEncoder
         }
 
         bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
-        bool doSplit = false;
+        // Partition choice: 0=NONE, 1=HORZ, 2=VERT, 3=SPLIT (rectangular HORZ/VERT only at 16x16, which yields
+        // 16x8/8x16 luma + 8x4/4x8 chroma — both ≤16 per axis, so the matched rect transform applies and there is
+        // no sub-8x8 chroma corner case).
+        int choice = 0;
         if (bl < 4 && fullyInside)
         {
             long costNone = EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl, bx4, by4);
             long costSplit = 0;
             foreach ((int dx, int dy) in new[] { (0, 0), (hsz, 0), (0, hsz), (hsz, hsz) })
                 costSplit += EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl + 1, bx4 + dx, by4 + dy);
-            doSplit = costSplit < costNone;
+            long costHorz = long.MaxValue, costVert = long.MaxValue;
+            if ((bl == 2 || bl == 3) && UseRectPartition)
+            {
+                // Rectangular HORZ/VERT at 32x32 (→32x16/16x32) and 16x16 (→16x8/8x16). Chroma-aware: a partition
+                // codes a chroma block per luma leaf, so include chroma coeff cost (λ·bits) in every candidate —
+                // otherwise HORZ/VERT (2 chroma blocks) look artificially cheap vs NONE (1).
+                double lambda = RdLambdaK * c.AcDq * c.AcDq;
+                int cbx = bx4 * 2, cby = by4 * 2;
+                int cBlk = blk4 * 2, cH = cBlk >> 1;    // chroma NONE size (px) and half (px)
+                // Per-level tx / block-size ordinals for the rect leaves and the chroma cost blocks.
+                (int lumaTxH, int lumaTxV, int chTxH, int chTxV, int lumaBsH, int lumaBsV, int noneChTx, int splitChTx) = bl == 2
+                    ? (TxIdx32x16, TxIdx16x32, TxIdx16x8, TxIdx8x16, (int)Av1BlockSize.Bs32x16, (int)Av1BlockSize.Bs16x32, 2, 1)
+                    : (TxIdx16x8, TxIdx8x16, TxIdx8x4, TxIdx4x8, (int)Av1BlockSize.Bs16x8, (int)Av1BlockSize.Bs8x16, 1, 0);
+
+                costNone += (long)(lambda * ChromaCostDc(c, cbx, cby, cBlk, cBlk, noneChTx));
+                costSplit += (long)(lambda * (ChromaCostDc(c, cbx, cby, cH, cH, splitChTx)
+                          + ChromaCostDc(c, cbx + cH, cby, cH, cH, splitChTx) + ChromaCostDc(c, cbx, cby + cH, cH, cH, splitChTx)
+                          + ChromaCostDc(c, cbx + cH, cby + cH, cH, cH, splitChTx)));
+                costHorz = EstimateRectCostColor(c, lumaTxH, bx4, by4, blk4, hsz)
+                         + EstimateRectCostColor(c, lumaTxH, bx4, by4 + hsz, blk4, hsz)
+                         + (long)(lambda * (ChromaCostDc(c, cbx, cby, cBlk, cH, chTxH) + ChromaCostDc(c, cbx, cby + cH, cBlk, cH, chTxH)));
+                costVert = EstimateRectCostColor(c, lumaTxV, bx4, by4, hsz, blk4)
+                         + EstimateRectCostColor(c, lumaTxV, bx4 + hsz, by4, hsz, blk4)
+                         + (long)(lambda * (ChromaCostDc(c, cbx, cby, cH, cBlk, chTxV) + ChromaCostDc(c, cbx + cH, cby, cH, cBlk, chTxV)));
+            }
+
+            // Square NONE/SPLIT decide normally; rect is only taken when it beats the best square option by a
+            // margin — the estimate (coeff-cost proxy, source prediction) is optimistic about rect, so a plain
+            // argmin over-picks it and loses at matched quality. The margin keeps rect to its clear wins.
+            long sqBest = Math.Min(costNone, costSplit);
+            int sqChoice = costNone <= costSplit ? 0 : 3;
+            long rectBest = Math.Min(costHorz, costVert);
+            int rectChoice = costHorz <= costVert ? 1 : 2;
+            choice = (rectBest < (long)(sqBest * RectCostMargin)) ? rectChoice : sqChoice;
         }
 
-        if (doSplit)
+        if (choice == 3)
         {
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
             EncodePartitionColor(c, bl + 1, bx4, by4);
@@ -540,11 +576,43 @@ internal static class Av1StillImageEncoder
             return;
         }
 
+        if (choice == 1) // PARTITION_HORZ: two stacked (blk4 x hsz) leaves
+        {
+            var rp = RectLeafParams(bl);
+            c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Horizontal, nPart);
+            EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4, blk4, hsz);
+            EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4 + hsz, blk4, hsz);
+            FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Horizontal);
+            return;
+        }
+
+        if (choice == 2) // PARTITION_VERT: two side-by-side (hsz x blk4) leaves
+        {
+            var rp = RectLeafParams(bl);
+            c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Vertical, nPart);
+            EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4, by4, hsz, blk4);
+            EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4 + hsz, by4, hsz, blk4);
+            FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Vertical);
+            return;
+        }
+
         c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.None, nPart);
         EncodeLeafBlockColor(c, bl, bx4, by4, blk4);
+        FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.None);
+    }
 
-        byte aboveVal = Av1Tables.AboveLeftPartCtx[0, bl, (int)Av1BlockPartition.None];
-        byte leftVal = Av1Tables.AboveLeftPartCtx[1, bl, (int)Av1BlockPartition.None];
+    // Rectangular tx-size ordinals (Av1TxSize / RectTxfmSize).
+    private const int TxIdx8x16 = 7, TxIdx16x8 = 8, TxIdx8x4 = 6, TxIdx4x8 = 5, TxIdx32x16 = 10, TxIdx16x32 = 9;
+
+    // Rect leaf tx/block-size ordinals per partition level (bl==2: 32x32→32x16/16x32; bl==3: 16x16→16x8/8x16).
+    private static (int LumaTxH, int LumaTxV, int ChTxH, int ChTxV, int BsH, int BsV) RectLeafParams(int bl) => bl == 2
+        ? (TxIdx32x16, TxIdx16x32, TxIdx16x8, TxIdx8x16, (int)Av1BlockSize.Bs32x16, (int)Av1BlockSize.Bs16x32)
+        : (TxIdx16x8, TxIdx8x16, TxIdx8x4, TxIdx4x8, (int)Av1BlockSize.Bs16x8, (int)Av1BlockSize.Bs8x16);
+
+    private static void FillPartCtx(ColorPartCtx c, int bl, int bx8, int by8, int hsz, Av1BlockPartition part)
+    {
+        byte aboveVal = Av1Tables.AboveLeftPartCtx[0, bl, (int)part];
+        byte leftVal = Av1Tables.AboveLeftPartCtx[1, bl, (int)part];
         for (int i = 0; i < hsz && bx8 + i < 16; i++) c.AbovePart[bx8 + i] = aboveVal;
         for (int j = 0; j < hsz && by8 + j < 16; j++) c.LeftPart[by8 + j] = leftVal;
     }
@@ -608,6 +676,203 @@ internal static class Av1StillImageEncoder
 
         int yW = Math.Min(blk4, c.Bw4 - bx4), yH = Math.Min(blk4, c.Bh4 - by4);
         int cW = Math.Min(cblk4, (c.Bw4 - bx4 + 1) >> 1), cH = Math.Min(cblk4, (c.Bh4 - by4 + 1) >> 1);
+        for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; }
+        for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; }
+        for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; }
+        for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; }
+    }
+
+    // Estimates the luma coding cost J = SSE + λ·bits of a single rectangular leaf, predicting from the SOURCE
+    // plane and reconstructing through the decoder's inverse — the same methodology as EstimateBlockCost, so the
+    // PARTITION_HORZ / PARTITION_VERT costs compare fairly against NONE / SPLIT.
+    private static long EstimateRectCostColor(ColorPartCtx c, int lumaTx, int bx4, int by4, int w4, int h4)
+    {
+        int w = w4 * 4, h = h4 * 4;
+        int lScan = Av1Tables.Scans[lumaTx].Length;
+        var pred = new byte[h * w];
+        var bestPred = new byte[h * w];
+        int[] bestCf = null!;
+        long bestBits = long.MaxValue;
+        foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
+        {
+            PredictIntraRect(c.Luma, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred);
+            int[] cf = ForwardResidualPredRect(c.Luma, c.W, bx4 * 4, by4 * 4, pred, w, h, lumaTx, c.DcDq, c.AcDq, lScan);
+            long bits = CoeffCost(cf);
+            if (bits < bestBits) { bestBits = bits; bestCf = cf; Array.Copy(pred, bestPred, h * w); }
+        }
+
+        var reconTmp = new byte[h * w];
+        DequantAndReconstructPredRect(bestCf, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, reconTmp, w, 0, 0);
+        long sse = 0;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int d = reconTmp[y * w + x] - c.Luma[(by4 * 4 + y) * c.W + (bx4 * 4 + x)];
+                sse += (long)d * d;
+            }
+
+        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        return sse + (long)(lambda * (bestBits + HeaderCostBits));
+    }
+
+    // DC intra prediction for a w x h block from reconstructed neighbours — matches the decoder's DcGenBoth/Top/
+    // Left (Av1IntraPred), INCLUDING the non-square reciprocal-multiplier correction (0x5556 for 1:2, 0x3334 for
+    // 1:4). Square DcPredict cannot be used for rect blocks (w+h isn't a power of two).
+    private static int DcPredictRect(byte[] recon, int reconW, int bx, int by, int w, int h)
+    {
+        bool haveTop = by > 0, haveLeft = bx > 0;
+        if (haveTop && haveLeft)
+        {
+            int dc = (w + h) >> 1;
+            for (int x = 0; x < w; x++) dc += recon[(by - 1) * reconW + bx + x];
+            for (int y = 0; y < h; y++) dc += recon[(by + y) * reconW + bx - 1];
+            dc >>= System.Numerics.BitOperations.TrailingZeroCount((uint)(w + h));
+            if (w != h)
+            {
+                int mult = (w > h * 2 || h > w * 2) ? 0x3334 : 0x5556;
+                dc = (int)(((uint)dc * (uint)mult) >> 16);
+            }
+
+            return dc;
+        }
+
+        if (haveTop)
+        {
+            int dc = w >> 1;
+            for (int x = 0; x < w; x++) dc += recon[(by - 1) * reconW + bx + x];
+            return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)w);
+        }
+
+        if (haveLeft)
+        {
+            int dc = h >> 1;
+            for (int y = 0; y < h; y++) dc += recon[(by + y) * reconW + bx - 1];
+            return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)h);
+        }
+
+        return 128;
+    }
+
+    private static void FillFlatRect(byte[] recon, int reconW, int bx, int by, int w, int h, int value)
+    {
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                recon[(by + y) * reconW + (bx + x)] = (byte)value;
+    }
+
+    // Estimated chroma coding cost (both planes, DC-predicted from the block mean) of an I420 chroma block of
+    // cw x ch pixels at chroma pixel position (cbx,cby), coded with transform chromaTx. Used to make the 16x16
+    // partition decision chroma-aware (a HORZ/VERT split codes two chroma blocks vs NONE's one).
+    private static long ChromaCostDc(ColorPartCtx c, int cbx, int cby, int cw, int ch, int chromaTx)
+    {
+        int scan = Av1Tables.Scans[chromaTx].Length;
+        long sU = 0, sV = 0;
+        for (int y = 0; y < ch; y++)
+            for (int x = 0; x < cw; x++) { sU += c.U[(cby + y) * c.Cw + cbx + x]; sV += c.V[(cby + y) * c.Cw + cbx + x]; }
+        int n = cw * ch, dcU = (int)((sU + n / 2) / n), dcV = (int)((sV + n / 2) / n);
+        return CoeffCost(ForwardResidualRectDc(c.U, c.Cw, cbx, cby, cw, ch, dcU, chromaTx, c.DcDq, c.AcDq, scan))
+             + CoeffCost(ForwardResidualRectDc(c.V, c.Cw, cbx, cby, cw, ch, dcV, chromaTx, c.DcDq, c.AcDq, scan));
+    }
+
+    private static int[] ForwardResidualRectDc(ReadOnlySpan<byte> plane, int planeW, int bx, int by, int w, int h,
+        int dc, int txIdx, int dcDq, int acDq, int rcCount)
+    {
+        var residual = new int[h * w];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) residual[y * w + x] = plane[(by + y) * planeW + (bx + x)] - dc;
+        return Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, Av1FwdTransform.FwdTxType.DctDct);
+    }
+
+    // Reconstructs a rect w x h block on top of a flat DC prediction, via the decoder's InvTxfmAdd.
+    private static byte DequantAndReconstructRectDc(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
+        int dc, byte[] recon, int reconW, int bx, int by)
+    {
+        var pred = new byte[h * w];
+        Array.Fill(pred, (byte)Math.Clamp(dc, 0, 255));
+        return DequantAndReconstructPredRect(levels, txIdx, w, h, dcDq, acDq, pred, recon, reconW, bx, by);
+    }
+
+    // Codes one rectangular luma leaf (PARTITION_HORZ/VERT half) plus its I420 chroma: skip, Y mode (+angle),
+    // UV mode (DC), then Y/U/V coefficients (rect transforms), and reconstructs all three planes. Chroma is DC-
+    // predicted (no CfL for rect yet). Mirrors EncodeLeafBlockColor for a w4 x h4 (in 4-units) rectangle.
+    private static void EncodeRectLeafColor(ColorPartCtx c, int lumaBs, int lumaTx, int chromaTx,
+        int bx4, int by4, int w4, int h4)
+    {
+        int w = w4 * 4, h = h4 * 4, cw = w >> 1, ch = h >> 1;
+        int bx = bx4 * 4, by = by4 * 4, cbx = bx4 * 2, cby = by4 * 2;
+        int bxR = bx4 & 31, byR = by4 & 31, cxR = bxR >> 1, cyR = byR >> 1;
+        int cw4 = Math.Max(1, w4 >> 1), ch4 = Math.Max(1, h4 >> 1);
+        ref readonly var cTDim = ref Av1Tables.TxfmDimensions[chromaTx];
+        int lScan = Av1Tables.Scans[lumaTx].Length, cScan = Av1Tables.Scans[chromaTx].Length;
+        bool cflAllowed = ((Av1Tables.CflAllowedMask >> lumaBs) & 1) != 0;
+        int uvNsym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
+
+        // Luma: rate-based mode search (safe modes, DCT_DCT rect transform), writing the best prediction.
+        int aboveCtx = Av1Tables.IntraModeContext[c.AModeY[bxR]];
+        int leftCtx = Av1Tables.IntraModeContext[c.LModeY[byR]];
+        var ymCdf = c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
+        int ySign = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
+        var pred = new byte[h * w];
+        var bestPred = new byte[h * w];
+        int[] yC = null!;
+        Av1IntraPredMode yMode = Av1IntraPredMode.Dc; int yDelta = 0;
+        double best = double.MaxValue;
+        foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
+        {
+            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred);
+            int[] cf = ForwardResidualPredRect(c.Luma, c.W, bx, by, pred, w, h, lumaTx, c.DcDq, c.AcDq, lScan);
+            double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
+                + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
+            double rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, 0, ySign, 1) + modeBits;
+            if (rate < best) { best = rate; yC = cf; yMode = mode; yDelta = delta; Array.Copy(pred, bestPred, h * w); }
+        }
+
+        // RDOQ-refine the winning luma coefficients (recompute with pre-quant floats, then optimise).
+        var qfWin = new double[lScan];
+        var resWin = new int[h * w];
+        for (int yy = 0; yy < h; yy++)
+            for (int xx = 0; xx < w; xx++)
+                resWin[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - bestPred[yy * w + xx];
+        yC = Av1FwdTransform.ForwardQuantRect(resWin, w, h, lumaTx, c.DcDq, c.AcDq, lScan, Av1FwdTransform.FwdTxType.DctDct, qfWin);
+        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, 1,
+            RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+
+        int dcU = DcPredictRect(c.ReconU, c.Cw, cbx, cby, cw, ch);
+        int dcV = DcPredictRect(c.ReconV, c.Cw, cbx, cby, cw, ch);
+        int[] uC = ForwardResidualRectDc(c.U, c.Cw, cbx, cby, cw, ch, dcU, chromaTx, c.DcDq, c.AcDq, cScan);
+        int[] vC = ForwardResidualRectDc(c.V, c.Cw, cbx, cby, cw, ch, dcV, chromaTx, c.DcDq, c.AcDq, cScan);
+        int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
+
+        int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
+        c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), (uint)skip);
+        c.Msac.EncodeSymbolAdapt(ymCdf, (int)yMode, 12);
+        if (IsDirectional(yMode))
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
+        c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), 0, uvNsym); // UV DC
+
+        byte cfY = 0x40, cfU = 0x40, cfV = 0x40;
+        if (skip == 0)
+        {
+            int uSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
+            int vSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
+            int uSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
+            int vSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: 1);
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
+            cfY = DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by);
+            cfU = DequantAndReconstructRectDc(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcU, c.ReconU, c.Cw, cbx, cby);
+            cfV = DequantAndReconstructRectDc(vC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcV, c.ReconV, c.Cw, cbx, cby);
+        }
+        else
+        {
+            for (int yy = 0; yy < h; yy++) Array.Copy(bestPred, yy * w, c.ReconY, (by + yy) * c.W + bx, w);
+            FillFlatRect(c.ReconU, c.Cw, cbx, cby, cw, ch, dcU);
+            FillFlatRect(c.ReconV, c.Cw, cbx, cby, cw, ch, dcV);
+        }
+
+        int yW = Math.Min(w4, c.Bw4 - bx4), yH = Math.Min(h4, c.Bh4 - by4);
+        int cW = Math.Min(cw4, (c.Bw4 - bx4 + 1) >> 1), cH = Math.Min(ch4, (c.Bh4 - by4 + 1) >> 1);
         for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; }
         for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; }
@@ -1025,6 +1290,12 @@ internal static class Av1StillImageEncoder
     // improves the RD curve (2-7% fewer bytes at matched RMSE, more at low quality) without hurting the floor.
     internal static double RdoqLambdaScale = 20.0;
 
+    // Enables PARTITION_HORZ / PARTITION_VERT rectangular leaves at 16x16 (colour path). Toggle for A/B testing.
+    internal static bool UseRectPartition = true;
+
+    // Rect is chosen only when its estimated cost is below this fraction of the best square (NONE/SPLIT) cost.
+    internal static double RectCostMargin = 0.95;
+
     // Rate-DISTORTION coding-cost estimate for a luma block (see EncodePartition). Reconstructs the block through
     // the decoder's own inverse and returns J = SSE + λ·rate — so a 64x64 (or 32x32) transform that drops the
     // high-frequency detail of a sharp block is penalised by its reconstruction error, not just its (small) rate.
@@ -1378,6 +1649,76 @@ internal static class Av1StillImageEncoder
         return bestCand;
     }
 
+
+    // === Rectangular block helpers (w x h, w != h) — mirror the square versions but keep width/height separate.
+    // Used by PARTITION_HORZ / PARTITION_VERT leaves. Prediction/reconstruction reuse the decoder's own
+    // PrepareIntraEdges + Av1IntraPred.Predict + InvTxfmAdd, so they are conformant by construction. ===
+
+    // Intra prediction for a w x h block into dst (h rows x w cols, stride w).
+    private static void PredictIntraRect(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
+        int w, int h, Av1IntraPredMode mode, int delta, byte[] dst)
+    {
+        Span<byte> edge = stackalloc byte[257];
+        const int edgeCenter = 128;
+        int dstOff = (by4 * 4) * reconW + (bx4 * 4);
+        int tw4 = w >> 2, th4 = h >> 2;
+        bool haveTop = by4 > 0, haveLeft = bx4 > 0;
+        int angle = delta;
+        int m = Av1Reconstruction.PrepareIntraEdges(
+            bx4, haveLeft, by4, haveTop, bw4, bh4, Av1EdgeFlags.None,
+            recon, dstOff, reconW, default, mode, ref angle, tw4, th4, filterEdge: false, edge, edgeCenter, 8);
+        Av1IntraPred.Predict(m, dst, w, edge, edgeCenter, w, h, angle, 4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
+    }
+
+    // Forward+quant of (src - pred) for a w x h block. pred is h x w row-major.
+    private static int[] ForwardResidualPredRect(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy,
+        byte[] pred, int w, int h, int txIdx, int dcDq, int acDq, int rcCount)
+    {
+        var residual = new int[h * w];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                residual[y * w + x] = src[(srcBy + y) * srcW + (srcBx + x)] - pred[y * w + x];
+        return Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, Av1FwdTransform.FwdTxType.DctDct);
+    }
+
+    // Dequantizes rect levels and reconstructs a w x h block onto predBlock (h x w) via the decoder's InvTxfmAdd,
+    // into recon. Returns the coefficient-context byte.
+    private static byte DequantAndReconstructPredRect(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
+        byte[] predBlock, byte[] recon, int reconW, int bx, int by)
+    {
+        int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[txIdx].Ctx - 2);
+        const int cfMax = 32767;
+        var scan = Av1Tables.Scans[txIdx];
+        int eob = -1;
+        for (int i = scan.Length - 1; i >= 0; i--)
+            if (levels[scan[i]] != 0) { eob = i; break; }
+
+        var cf = new int[32 * 32];
+        int culLevel = 0;
+        for (int i = 0; i <= eob; i++)
+        {
+            int rc = scan[i];
+            int lvl = levels[rc];
+            if (lvl == 0) continue;
+            int mag = Math.Abs(lvl);
+            int sign = lvl < 0 ? 1 : 0;
+            int dq = ((rc == 0 ? dcDq : acDq) * mag) >> dqShift;
+            dq = Math.Min(dq, cfMax + sign);
+            cf[rc] = sign != 0 ? -dq : dq;
+            culLevel += mag;
+        }
+
+        int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
+        byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
+
+        var block = (byte[])predBlock.Clone();
+        Av1InvTransform.InvTxfmAdd(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], Av1TxType.DctDct, 8);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                recon[(by + y) * reconW + (bx + x)] = block[y * w + x];
+
+        return cfCtx;
+    }
 
     // Residual (src - prediction) for an n x n block.
     private static int[] ComputeResidualPred(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] pred, int n)

@@ -108,6 +108,55 @@ internal static class Av1FwdTransform
         return inv;
     }
 
+    /// <summary>Matched forward transform + quantize for a RECTANGULAR tx (both axes ≤16, i.e. 4x8/8x4/8x16/16x8).
+    /// Residual is h rows x w cols (row-major). Coefficient layout matches the decoder: rc = ky + kx*sh, sh =
+    /// min(h,32), sw = min(w,32). The scale S = 2^(4+txShift+dqShift) / (isRect2 ? 181/256 : 1) — the same identity
+    /// that gives S = 4N for square, with the extra 256/181 undoing the decoder's isRect2 √2 coefficient read.
+    /// DCT_DCT only for now (chroma and the common luma case); ADST rect can be added later.</summary>
+    internal static int[] ForwardQuantRect(ReadOnlySpan<int> residual, int w, int h, int txSizeIdx,
+        int dcDq, int acDq, int rcCount, FwdTxType txType)
+        => ForwardQuantRect(residual, w, h, txSizeIdx, dcDq, acDq, rcCount, txType, null);
+
+    internal static int[] ForwardQuantRect(ReadOnlySpan<int> residual, int w, int h, int txSizeIdx,
+        int dcDq, int acDq, int rcCount, FwdTxType txType, double[]? qfOut)
+    {
+        ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[txSizeIdx];
+        int logW = tDim.Lw, logH = tDim.Lh;
+        (int hType, int vType) = AxisTypes(txType);
+        double[,] fh = ForwardMatrix(logW, hType);   // width (horizontal / row) forward
+        double[,] fv = ForwardMatrix(logH, vType);   // height (vertical / column) forward
+        int sw = Math.Min(w, 32), sh = Math.Min(h, 32);
+        bool isRect2 = w * 2 == h || h * 2 == w;
+        int dqShift = Math.Max(0, tDim.Ctx - 2);
+        double s = (1 << (4 + Av1InvTransform.TxShift[txSizeIdx] + dqShift)) * (isRect2 ? 256.0 / 181.0 : 1.0);
+
+        // Horizontal forward: t[y][kx] = sum_x Fh[kx][x] * res[y][x].
+        var t = new double[h, sw];
+        for (int y = 0; y < h; y++)
+            for (int kx = 0; kx < sw; kx++)
+            {
+                double acc = 0;
+                for (int x = 0; x < w; x++) acc += fh[kx, x] * residual[y * w + x];
+                t[y, kx] = acc;
+            }
+
+        // Vertical forward + quant: C[ky][kx] = sum_y Fv[ky][y] * t[y][kx]; level = deadzone(C·S/dq).
+        var levels = new int[rcCount];
+        for (int kx = 0; kx < sw; kx++)
+            for (int ky = 0; ky < sh; ky++)
+            {
+                double acc = 0;
+                for (int y = 0; y < h; y++) acc += fv[ky, y] * t[y, kx];
+                int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
+                double qf = acc * s / dq;
+                if (qfOut != null) qfOut[kx * sh + ky] = qf;
+                double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
+                levels[kx * sh + ky] = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
+            }
+
+        return levels;
+    }
+
     // Matched forward for sizes 4/8/16: C[ky][kx] = Fv[ky][·] · res · Fh[kx][·], level = deadzone(C·S/dq), S = 4N.
     private static int[] MatrixForward(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, FwdTxType txType, double[]? qfOut)
     {
