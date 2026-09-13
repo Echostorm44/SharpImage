@@ -1483,6 +1483,10 @@ internal static class Av1StillImageEncoder
     // is coded via AngleDeltaCdf[mode-Vertical], symbol = delta + 3, nsym 6 (7 symbols), for blocks ≥ 8x8.
     private static readonly (Av1IntraPredMode Mode, int Delta)[] CandidateModes = BuildCandidates();
 
+    // How many SATD-best modes the RD leaf search fully rate-evaluates (of ~34 candidates). 4 keeps essentially
+    // all of the quality while cutting the hot rate-search ~8x, which is what makes true-RD affordable.
+    private const int RdModeCandidates = 4;
+
     private static (Av1IntraPredMode, int)[] BuildCandidates()
     {
         var list = new List<(Av1IntraPredMode, int)>
@@ -1766,10 +1770,32 @@ internal static class Av1StillImageEncoder
         var predBuf = new byte[n * n];
         var qfCand = new double[scanLen];
         var qfWin = new double[scanLen];
+
+        // Pre-screen all candidate modes by cheap SATD and RD-evaluate only the best few — the full rate search
+        // (forward transform + EstimateCoefBits over every tx-type) is the encoder's hot loop, and SATD tracks the
+        // eventual coded cost closely enough that the top handful almost always contains the RD winner.
+        Span<int> topIdx = stackalloc int[RdModeCandidates];
+        Span<long> topCost = stackalloc long[RdModeCandidates];
+        topCost.Fill(long.MaxValue);
+        double satdLambda = Math.Sqrt(RdLambdaK) * acDq; // ~rate weight in SATD units
+        for (int ci = 0; ci < CandidateModes.Length; ci++)
+        {
+            (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
+            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf);
+            long satd = Satd8x8(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
+            long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
+                + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
+            long cost = satd + mb;
+            for (int k = 0; k < RdModeCandidates; k++)
+                if (cost < topCost[k]) { for (int j = RdModeCandidates - 1; j > k; j--) { topCost[j] = topCost[j - 1]; topIdx[j] = topIdx[j - 1]; } topCost[k] = cost; topIdx[k] = ci; break; }
+        }
+
         double best = double.MaxValue;
         (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx) bestCand = default;
-        foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
+        for (int t = 0; t < RdModeCandidates; t++)
         {
+            if (topCost[t] == long.MaxValue) break;
+            (Av1IntraPredMode mode, int delta) = CandidateModes[topIdx[t]];
             PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf);
             int[] residual = ComputeResidualPred(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
