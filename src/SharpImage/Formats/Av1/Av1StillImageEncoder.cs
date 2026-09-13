@@ -755,6 +755,74 @@ internal static class Av1StillImageEncoder
         for (int j = 0; j < hsz && by8 + j < 16; j++) c.LeftPart[by8 + j] = leftVal;
     }
 
+    // === Chroma-from-luma (CfL) — mirrors Av1Reconstruction.ComputeCflAc / ApplyCflAlpha exactly (I420). ===
+    private static void ComputeCflAcEnc(byte[] reconY, int yStride, int bx, int by, int cn, short[] ac)
+    {
+        int idx = 0;
+        for (int y = 0; y < cn; y++)
+        {
+            int yOff = (by + 2 * y) * yStride + bx;
+            for (int x = 0; x < cn; x++)
+            { int p = yOff + 2 * x; ac[idx + x] = (short)((reconY[p] + reconY[p + 1] + reconY[p + yStride] + reconY[p + 1 + yStride]) << 1); }
+            idx += cn;
+        }
+
+        int log2Sz = System.Numerics.BitOperations.TrailingZeroCount(cn) * 2;
+        int dc = (1 << log2Sz) >> 1;
+        for (int i = 0; i < cn * cn; i++) dc += ac[i];
+        dc >>= log2Sz;
+        for (int i = 0; i < cn * cn; i++) ac[i] = (short)(ac[i] - dc);
+    }
+
+    private static byte[] BuildCflPred(int dcPred, short[] ac, int cn, int alpha)
+    {
+        var pred = new byte[cn * cn];
+        for (int i = 0; i < cn * cn; i++)
+        {
+            int diff = ac[i] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6;
+            pred[i] = (byte)Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, 255);
+        }
+
+        return pred;
+    }
+
+    private static int BestCflAlpha(byte[] plane, int planeW, int cbx, int cby, int cn, int dcPred, short[] ac)
+    {
+        int bestAlpha = 0; long bestSse = long.MaxValue;
+        for (int alpha = -16; alpha <= 16; alpha++)
+        {
+            long sse = 0;
+            for (int y = 0; y < cn; y++)
+            {
+                int row = (cby + y) * planeW + cbx;
+                for (int x = 0; x < cn; x++)
+                {
+                    int diff = ac[y * cn + x] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6;
+                    int e = plane[row + x] - Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, 255);
+                    sse += (long)e * e;
+                }
+            }
+
+            if (sse < bestSse) { bestSse = sse; bestAlpha = alpha; }
+        }
+
+        return bestAlpha;
+    }
+
+    private static void EncodeCflAlphas(Av1MsacWriter w, Av1CdfContext cdf, int alphaU, int alphaV)
+    {
+        int signU = alphaU == 0 ? 0 : (alphaU < 0 ? 1 : 2);
+        int signV = alphaV == 0 ? 0 : (alphaV < 0 ? 1 : 2);
+        w.EncodeSymbolAdapt(cdf.GetCflSignCdf(), signU * 3 + signV - 1, 7);
+        if (signU != 0) w.EncodeSymbolAdapt(cdf.GetCflAlphaCdf((signU == 2 ? 3 : 0) + signV), Math.Abs(alphaU) - 1, 15);
+        if (signV != 0) w.EncodeSymbolAdapt(cdf.GetCflAlphaCdf((signV == 2 ? 3 : 0) + signU), Math.Abs(alphaV) - 1, 15);
+    }
+
+    private static void CopyPlaneBlock(byte[] src, int cn, byte[] recon, int reconW, int cbx, int cby)
+    {
+        for (int y = 0; y < cn; y++) Array.Copy(src, y * cn, recon, (cby + y) * reconW + cbx, cn);
+    }
+
     private static void EncodeLeafBlockColor(ColorPartCtx c, int bl, int bx4, int by4, int blk4)
     {
         int n = blk4 * 4, cn = n / 2;
@@ -772,10 +840,38 @@ internal static class Av1StillImageEncoder
             c.Cdf, c.AModeY[bxR], c.LModeY[byR], c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR), c.Pred);
         Av1IntraPredMode yMode = rd.Mode; int yDelta = rd.Delta;
         int[] yC = rd.Coeffs; Av1TxType yInv = rd.Inv; int yTxIdx = rd.Idx;
+
+        // Reconstruct luma now — CfL needs the reconstructed luma AC. Zero coeffs reduce to prediction, so this is
+        // valid whether or not the block ends up skipped (chroma reconstruction below mirrors that).
+        byte cfY = DequantAndReconstructPred(yC, tx, n, c.DcDq, c.AcDq, c.Pred, c.ReconY, c.W, bx, by, yInv);
+
         int dcU = DcPredict(c.ReconU, c.Cw, c.Chh, cbx, cby, cn, cn);
         int dcV = DcPredict(c.ReconV, c.Cw, c.Chh, cbx, cby, cn, cn);
-        int[] uC = ForwardResidual(c.U, c.Cw, cbx, cby, cn, dcU, c.DcDq, c.AcDq, Av1Tables.Scans[ctx0].Length);
-        int[] vC = ForwardResidual(c.V, c.Cw, cbx, cby, cn, dcV, c.DcDq, c.AcDq, Av1Tables.Scans[ctx0].Length);
+        int scanLenC = Av1Tables.Scans[ctx0].Length;
+        int[] uC = ForwardResidual(c.U, c.Cw, cbx, cby, cn, dcU, c.DcDq, c.AcDq, scanLenC);
+        int[] vC = ForwardResidual(c.V, c.Cw, cbx, cby, cn, dcV, c.DcDq, c.AcDq, scanLenC);
+
+        // Chroma-from-luma: predict chroma AC from reconstructed luma AC scaled by a signed per-plane alpha; keep
+        // CfL over DC only when it codes cheaper (incl. the alpha signalling). CfL-allowed sizes only.
+        bool useCfl = false; int alphaU = 0, alphaV = 0; byte[]? cflU = null, cflV = null;
+        if (cflAllowed && UseCfl)
+        {
+            var ac = new short[cn * cn];
+            ComputeCflAcEnc(c.ReconY, c.W, bx, by, cn, ac);
+            alphaU = BestCflAlpha(c.U, c.Cw, cbx, cby, cn, dcU, ac);
+            alphaV = BestCflAlpha(c.V, c.Cw, cbx, cby, cn, dcV, ac);
+            if (alphaU != 0 || alphaV != 0)
+            {
+                cflU = BuildCflPred(dcU, ac, cn, alphaU);
+                cflV = BuildCflPred(dcV, ac, cn, alphaV);
+                int[] uCcfl = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cflU, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC);
+                int[] vCcfl = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cflV, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC);
+                long cflBits = 8 + (alphaU != 0 ? 5 : 0) + (alphaV != 0 ? 5 : 0);
+                if (CoeffCost(uCcfl) + CoeffCost(vCcfl) + cflBits < CoeffCost(uC) + CoeffCost(vC))
+                { useCfl = true; uC = uCcfl; vC = vCcfl; }
+            }
+        }
+
         int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
 
         int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
@@ -785,9 +881,11 @@ internal static class Av1StillImageEncoder
         c.Msac.EncodeSymbolAdapt(c.Cdf.GetKfYModeCdf(yAboveCtx, yLeftCtx), (int)yMode, 12);
         if (IsDirectional(yMode))
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
-        c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), 0, uvNsym); // UV DC
+        int uvSym = useCfl ? (int)Av1IntraPredMode.ChromaFromLuma : 0;
+        c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), uvSym, uvNsym);
+        if (useCfl) EncodeCflAlphas(c.Msac, c.Cdf, alphaU, alphaV);
 
-        byte cfY = 0x40, cfU = 0x40, cfV = 0x40;
+        byte cfU = 0x40, cfV = 0x40;
         if (skip == 0)
         {
             ref readonly var uvtDim = ref Av1Tables.TxfmDimensions[ctx0];
@@ -801,13 +899,24 @@ internal static class Av1StillImageEncoder
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
 
-            cfY = DequantAndReconstructPred(yC, tx, n, c.DcDq, c.AcDq, c.Pred, c.ReconY, c.W, bx, by, yInv);
-            cfU = DequantAndReconstruct(uC, ctx0, cn, c.DcDq, c.AcDq, dcU, c.ReconU, c.Cw, cbx, cby);
-            cfV = DequantAndReconstruct(vC, ctx0, cn, c.DcDq, c.AcDq, dcV, c.ReconV, c.Cw, cbx, cby);
+            if (useCfl)
+            {
+                cfU = DequantAndReconstructPredRect(uC, ctx0, cn, cn, c.DcDq, c.AcDq, cflU!, c.ReconU, c.Cw, cbx, cby);
+                cfV = DequantAndReconstructPredRect(vC, ctx0, cn, cn, c.DcDq, c.AcDq, cflV!, c.ReconV, c.Cw, cbx, cby);
+            }
+            else
+            {
+                cfU = DequantAndReconstruct(uC, ctx0, cn, c.DcDq, c.AcDq, dcU, c.ReconU, c.Cw, cbx, cby);
+                cfV = DequantAndReconstruct(vC, ctx0, cn, c.DcDq, c.AcDq, dcV, c.ReconV, c.Cw, cbx, cby);
+            }
+        }
+        else if (useCfl)
+        {
+            CopyPlaneBlock(cflU!, cn, c.ReconU, c.Cw, cbx, cby);
+            CopyPlaneBlock(cflV!, cn, c.ReconV, c.Cw, cbx, cby);
         }
         else
         {
-            for (int yy = 0; yy < n; yy++) Array.Copy(c.Pred, yy * n, c.ReconY, (by + yy) * c.W + bx, n);
             FillFlat(c.ReconU, c.Cw, cbx, cby, cn, dcU);
             FillFlat(c.ReconV, c.Cw, cbx, cby, cn, dcV);
         }
@@ -1438,6 +1547,7 @@ internal static class Av1StillImageEncoder
     // candidate). Much more accurate than the cost estimate (e.g. peppers qp15 RMSE 7.6→6.2 at −2.7% size), but
     // several times slower. Gated to TrueRdPixelBudget so large frames keep the fast estimate path.
     internal static bool UseTrueRd = true;
+    internal static bool UseCfl = true;
     internal static long TrueRdPixelBudget = 512 * 512;
 
     // Rate-DISTORTION coding-cost estimate for a luma block (see EncodePartition). Reconstructs the block through
