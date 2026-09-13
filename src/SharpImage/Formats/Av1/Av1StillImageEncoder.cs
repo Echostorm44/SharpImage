@@ -723,13 +723,19 @@ internal static class Av1StillImageEncoder
             if (i > 0) RestoreRd(c, snap0, bx4, by4, blk4);
             double b0 = c.Msac.MeasuredBits;
             EncodeChoiceColor(c, cands[i], bl, bx4, by4, hsz, blk4, c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), nPart, bx8, by8);
-            double j = BlockSseColor(c, bx4, by4, blk4) + lambda * (c.Msac.MeasuredBits - b0);
+            double bits = c.Msac.MeasuredBits - b0;
+            double j = BlockSseColor(c, bx4, by4, blk4) + lambda * bits;
             if (j < bestJ)
             {
                 bestJ = j;
                 bestTail = c.Msac.PrecarryFrom(baseCount);
                 bestSnap = SnapshotRd(c, bx4, by4, blk4);
             }
+
+            // Early termination: NONE (cand 0) coded in very few bits ⇒ a flat/skip block, which SPLIT/rect can
+            // only make more expensive (more partition + header bits) for no distortion gain. Commit NONE and
+            // skip the costly subtree recursion — the dominant speedup on the smooth regions that fill photos.
+            if (i == 0 && bits <= EarlyTermBits) break;
         }
 
         // Commit the winner: restore its recon/contexts/CDF, then re-apply its coded bytes onto the base stream.
@@ -1574,6 +1580,7 @@ internal static class Av1StillImageEncoder
     internal static bool UseTrueRd = true;
     internal static bool UseCfl = true;
     internal static long TrueRdPixelBudget = 512 * 512;
+    internal static double EarlyTermBits = 24.0;
 
     // Rate-DISTORTION coding-cost estimate for a luma block (see EncodePartition). Reconstructs the block through
     // the decoder's own inverse and returns J = SSE + λ·rate — so a 64x64 (or 32x32) transform that drops the
