@@ -823,6 +823,23 @@ internal static class Av1StillImageEncoder
         for (int y = 0; y < cn; y++) Array.Copy(src, y * cn, recon, (cby + y) * reconW + cbx, cn);
     }
 
+    private static byte[] FlatPlane(int value, int cn)
+    {
+        var p = new byte[cn * cn]; Array.Fill(p, (byte)Math.Clamp(value, 0, 255)); return p;
+    }
+
+    // Reconstruction SSE of a chroma block coded with `coeffs` on prediction `predPlane` (cn x cn), vs the source.
+    private static long ChromaReconSse(int[] coeffs, int tx, int cn, int dcDq, int acDq, byte[] predPlane,
+        byte[] src, int srcW, int cbx, int cby)
+    {
+        var tmp = new byte[cn * cn];
+        DequantAndReconstructPredRect(coeffs, tx, cn, cn, dcDq, acDq, predPlane, tmp, cn, 0, 0);
+        long sse = 0;
+        for (int y = 0; y < cn; y++)
+            for (int x = 0; x < cn; x++) { int d = tmp[y * cn + x] - src[(cby + y) * srcW + cbx + x]; sse += (long)d * d; }
+        return sse;
+    }
+
     private static void EncodeLeafBlockColor(ColorPartCtx c, int bl, int bx4, int by4, int blk4)
     {
         int n = blk4 * 4, cn = n / 2;
@@ -866,9 +883,17 @@ internal static class Av1StillImageEncoder
                 cflV = BuildCflPred(dcV, ac, cn, alphaV);
                 int[] uCcfl = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cflU, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC);
                 int[] vCcfl = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cflV, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC);
-                long cflBits = 8 + (alphaU != 0 ? 5 : 0) + (alphaV != 0 ? 5 : 0);
-                if (CoeffCost(uCcfl) + CoeffCost(vCcfl) + cflBits < CoeffCost(uC) + CoeffCost(vC))
-                { useCfl = true; uC = uCcfl; vC = vCcfl; }
+                // RD choice (SSE + λ·bits), not bits alone: CfL trades chroma distortion for fewer bits, so a
+                // bits-only choice over-picks it and can raise chroma error. Reconstruct both and compare J.
+                double lam = RdLambdaK * c.AcDq * c.AcDq;
+                var dcuP = FlatPlane(dcU, cn); var dcvP = FlatPlane(dcV, cn);
+                double dcJ = ChromaReconSse(uC, ctx0, cn, c.DcDq, c.AcDq, dcuP, c.U, c.Cw, cbx, cby)
+                           + ChromaReconSse(vC, ctx0, cn, c.DcDq, c.AcDq, dcvP, c.V, c.Cw, cbx, cby)
+                           + lam * (CoeffCost(uC) + CoeffCost(vC));
+                double cflJ = ChromaReconSse(uCcfl, ctx0, cn, c.DcDq, c.AcDq, cflU, c.U, c.Cw, cbx, cby)
+                            + ChromaReconSse(vCcfl, ctx0, cn, c.DcDq, c.AcDq, cflV, c.V, c.Cw, cbx, cby)
+                            + lam * (CoeffCost(uCcfl) + CoeffCost(vCcfl) + 8 + (alphaU != 0 ? 5 : 0) + (alphaV != 0 ? 5 : 0));
+                if (cflJ < dcJ) { useCfl = true; uC = uCcfl; vC = vCcfl; }
             }
         }
 
