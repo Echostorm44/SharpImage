@@ -1262,9 +1262,13 @@ public static class Av1Decode
             }
             if (hasChroma && b.PalSzUv > 0)
             {
-                // Decode chroma palette indices (UV share indices in 4:2:0)
-                int uvW = (bw4 * 4 + 1) >> 1;
-                int uvH = (bh4 * 4 + 1) >> 1;
+                // Decode chroma palette indices over the CHROMA block, whose size is cbw4/cbh4
+                // (in 4-sample units). For sub-8x8 luma blocks the chroma is a shared reference
+                // block larger than the luma block's own subsampled size — e.g. stacked 16x4
+                // luma blocks share one 8x4 chroma block, so uvH must be cbh4*4 (=4), NOT the
+                // block's own (bh4*4)>>1 (=2), which under-reads the index map and desyncs MSAC.
+                int uvW = cbw4 * 4;
+                int uvH = cbh4 * 4;
                 Av1CoeffDecode.DecodePaletteIndices(ref msac, ts.Cdf.Mode, t,
                     b.PalSzUv, uvW, uvH, cbw4, cbh4, isLuma: false);
             }

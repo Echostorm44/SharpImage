@@ -1122,8 +1122,11 @@ public static class Av1Reconstruction
                 // UV palette prediction: fill U and V planes from decoded palette colors & indices
                 if (b.PalSzUv > 0)
                 {
-                    int cw = (bw4 * 4 + 1) >> 1;
-                    int ch = (bh4 * 4 + 1) >> 1;
+                    // Fill the CHROMA block (cbw4/cbh4 in 4-sample units). For sub-8x8 luma blocks
+                    // the chroma is a larger shared reference block (e.g. stacked 16x4 luma -> one
+                    // 8x4 chroma), so use cbh4*4 (=4), not the block's own (bh4*4)>>1 (=2).
+                    int cw = cbw4 * 4;
+                    int ch = cbh4 * 4;
                     int cbw4_pix = cbw4 * 4;
                     int uvDstOff = 4 * ((t.Bx >> 1) + (t.By >> 1) * uvStride);
 
