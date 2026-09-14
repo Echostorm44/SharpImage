@@ -1557,10 +1557,12 @@ internal static class Av1StillImageEncoder
     private static long EstimateCost(GrayPartCtx c, int bl, int bx4, int by4)
         => EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl, bx4, by4);
 
-    // RD lagrangian weight: J = SSE + λ·bits, with λ ∝ quant-step². Tunable for A/B; scaled so the NONE/SPLIT
-    // decision splits blocks whose transform cannot represent the detail (high distortion) but keeps large blocks
-    // for smooth content (splitting only adds rate for no distortion gain).
-    internal static double RdLambdaK = 0.02;
+    // RD lagrangian weight: J = SSE + λ·bits, with λ ∝ quant-step². Drives the NONE/SPLIT/mode decisions AND (via
+    // RdoqLambdaScale·RdLambdaK·Q²) the RDOQ coefficient trimming. A sweep at the tuned deadzone/RDOQ put the net
+    // optimum near 0.008 (from 0.02): scene ~-12%, peppers/landscape ~-5%, flattening below ~0.006 (so the RD
+    // machinery bottoms out rather than being counterproductive). 0.008 sits just above that floor and does not
+    // regress high-quality (low-q) content.
+    internal static double RdLambdaK = 0.008;
 
     // Extra multiplier on the RDOQ lambda relative to the partition lambda. The partition lambda is tuned for
     // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
