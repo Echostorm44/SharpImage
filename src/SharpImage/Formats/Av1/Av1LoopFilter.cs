@@ -206,7 +206,12 @@ public static class Av1LoopFilter
         for (uint y = 1; (vm & ~(y - 1)) != 0; y <<= 1, dstOffset += 4 * stride, levelOffset += b4Stride)
         {
             if ((vm & y) == 0) continue;
-            int L = level[levelOffset, 0] != 0 ? level[levelOffset, 0] : level[levelOffset - 1, 0];
+            // The filter mask can carry edge bits for MI rows past the frame bottom (seen with multi-tile streams,
+            // where the tile-boundary mask population over-sets the partial last SB band). Those rows do not exist
+            // in the level grid — stop rather than index out of bounds; skipping non-existent rows is correct.
+            if (levelOffset >= level.GetLength(0)) break;
+            int L = level[levelOffset, 0] != 0 ? level[levelOffset, 0]
+                  : (levelOffset >= 1 ? level[levelOffset - 1, 0] : 0);
             if (L == 0) continue;
             int H = L >> 4;
             int E2 = lut.E[L], I2 = lut.I[L];
