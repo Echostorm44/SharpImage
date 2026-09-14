@@ -42,6 +42,7 @@ internal sealed class Av1Decoder
     public static System.IO.StreamWriter? CdefDecisionWriter;
 
     // Tile data collected during OBU parsing for the current frame
+    internal static string? LastDecodeError;
     private readonly TileGroup[] tileGroups = new TileGroup[256];
     private int tileGroupCount;
     private int tilesCollected;
@@ -205,7 +206,7 @@ internal sealed class Av1Decoder
         {
             AvDbg.W($"[FRAME-DECODE] FrameOffset={frameHdr.FrameOffset} ShowFrame={frameHdr.ShowFrame} ShowExistingFrame={frameHdr.ShowExistingFrame} IsIntra={frameHdr.IsIntra} IsInterOrSwitch={frameHdr.IsInterOrSwitch}");
             try { DecodeFrame(data); }
-            catch (Exception ex) { AvDbg.W($"[DECODE-FRAME-ERROR] {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); return null; }
+            catch (Exception ex) { LastDecodeError = $"{ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"; AvDbg.W($"[DECODE-FRAME-ERROR] {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); return null; }
 
             // Update reference frame slots
             try { UpdateReferenceFrames(); }
