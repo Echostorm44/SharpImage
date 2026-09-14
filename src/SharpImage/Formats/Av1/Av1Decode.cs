@@ -54,13 +54,13 @@ public sealed class Av1TaskContext
     public byte[] PalCtx = new byte[64];
 
     // Palette color storage (current block)
-    public byte[] PalColorsY = new byte[8];   // Up to 8 palette colors for Y
-    public byte[] PalColorsU = new byte[8];   // Up to 8 palette colors for U
-    public byte[] PalColorsV = new byte[8];   // Up to 8 palette colors for V
+    public ushort[] PalColorsY = new ushort[8];   // Up to 8 palette colors for Y (ushort: 10/12-bit)
+    public ushort[] PalColorsU = new ushort[8];   // Up to 8 palette colors for U
+    public ushort[] PalColorsV = new ushort[8];   // Up to 8 palette colors for V
 
     // Previous frame palette colors for prediction (dav1d: al_pal[2][32][3][8])
     // [dir][pos][plane][color_idx]: dir=0 above (indexed by bx4), dir=1 left (indexed by by4)
-    public byte[,,] PalPrevY = new byte[2, 32, 3 * 8]; // flattened plane+color
+    public ushort[,,] PalPrevY = new ushort[2, 32, 3 * 8]; // flattened plane+color (ushort: 10/12-bit)
     public byte[,] PalPrevSz = new byte[2, 32]; // [dir][pos]: palette sizes (dav1d: pal_sz_uv[2][32])
 
     // Scratch buffers for inter prediction

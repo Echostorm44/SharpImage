@@ -247,6 +247,13 @@ public static class Av1Cdef
         int w, int h, EdgeFlags edges, int bitDepth = 8)
     {
         int bdMin8 = bitDepth - 8;
+        // High bit depth: pixel differences are in the full bit-depth domain, so the CDEF
+        // strengths and damping must be scaled up to match (dav1d cdef_apply: strengths
+        // <<= bitdepth_min_8, damping += bitdepth_min_8). The pri_tap parity below recovers
+        // the original low bit via >> bitdepth_min_8.
+        priStrength <<= bdMin8;
+        secStrength <<= bdMin8;
+        damping += bdMin8;
         const int tmpStride = 12;
         Span<short> tmpBuf = stackalloc short[144]; // 12*12
         int tmpCenter = 2 * tmpStride + 2;
@@ -358,7 +365,7 @@ public static class Av1Cdef
                         sum += secTap * Constrain(s2 - px, secStrength, secShift);
                         sum += secTap * Constrain(s3 - px, secStrength, secShift);
                     }
-                    dst[dOff + x] = (byte)(px + ((sum - (sum < 0 ? 1 : 0) + 8) >> 4));
+                    dst[dOff + x] = (ushort)(px + ((sum - (sum < 0 ? 1 : 0) + 8) >> 4));
                 }
                 dOff += dstStride;
                 tOff += tmpStride;

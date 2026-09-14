@@ -809,7 +809,8 @@ internal sealed class Av1Decoder
         }
 
         // === Loop Restoration ===
-        if (ctx.RestorePlanes != 0) {
+        if (ctx.RestorePlanes != 0 && System.Environment.GetEnvironmentVariable("AV1_NOLR") == "1" && ctx.BitDepth > 8) { AvDbg.W("[LR] skipped (probe)"); }
+        else if (ctx.RestorePlanes != 0) {
             AvDbg.W($"[LR-INFO] RestorePlanes={ctx.RestorePlanes} LRtypes=({fh.GetLrType(0)},{fh.GetLrType(1)},{fh.GetLrType(2)}) unitSizes=({fh.LrUnitSizeY},{fh.LrUnitSizeUv})");
             _lrRestored = 0;
             _lrSkipped = 0;

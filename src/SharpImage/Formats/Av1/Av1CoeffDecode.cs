@@ -1080,7 +1080,7 @@ public static class Av1CoeffDecode
 
         // Step 1: Build predictor cache from left and above neighbors
         int lCacheSz = 0;
-        Span<byte> lCache = stackalloc byte[8];
+        Span<ushort> lCache = stackalloc ushort[8];
         int bi4 = by4 < 32 ? by4 : 31;
         int leftPalSz = t.Left.PalSz[bi4];
         if (leftPalSz > 8) leftPalSz = 0; // safety
@@ -1088,7 +1088,7 @@ public static class Av1CoeffDecode
             lCache[lCacheSz++] = t.PalPrevY[1, bi4, 0 * 8 + ci];
 
         int aCacheSz = 0;
-        Span<byte> aCache = stackalloc byte[8];
+        Span<ushort> aCache = stackalloc ushort[8];
         int bj4 = bx4 < 32 ? bx4 : 31;
         int abovePalSz = t.Above.PalSz[bj4];
         if (abovePalSz > 8) abovePalSz = 0; // safety
@@ -1109,7 +1109,7 @@ public static class Av1CoeffDecode
         }
 
         // Merge into sorted, deduplicated cache
-        Span<byte> cache = stackalloc byte[8];
+        Span<ushort> cache = stackalloc ushort[8];
         int nCache = 0;
         int li2 = 0, ai2 = 0;
         while (li2 < lCacheSz && ai2 < aCacheSz)
@@ -1138,7 +1138,7 @@ public static class Av1CoeffDecode
         }
 
         // Step 2: Select which cache entries to reuse
-        Span<byte> usedCache = stackalloc byte[8];
+        Span<ushort> usedCache = stackalloc ushort[8];
         int nUsedCache = 0;
         for (int ci = 0; ci < nCache && nUsedCache < palSz; ci++)
         {
@@ -1164,7 +1164,7 @@ public static class Av1CoeffDecode
         }
 
         // Step 3: Decode new palette entries (delta coding)
-        Span<byte> newPal = stackalloc byte[8];
+        Span<ushort> newPal = stackalloc ushort[8];
         int nNew = 0;
         int cnt = nUsedCache;
 
@@ -1174,7 +1174,7 @@ public static class Av1CoeffDecode
             uint preFirstR = msac.DebugRng;
             int preFirstC = msac.Cnt;
             Av1Msac.TraceLabel = "pal-new";
-            newPal[nNew++] = (byte)msac.DecodeBools(bpc);
+            newPal[nNew++] = (ushort)msac.DecodeBools(bpc);
             Av1Msac.TraceLabel = null;
             if (dbgThis)
                 AvDbg.W($"[PAL-STEP]   firstNew pre: dif=0x{preFirstD:X16} rng=0x{preFirstR:X4} cnt={preFirstC} bpc={bpc} result=0x{newPal[0]:x2}");
@@ -1203,12 +1203,12 @@ public static class Av1CoeffDecode
                     if (dbgThis)
                         AvDbg.W($"[PAL-STEP]   delta#{nNew} pre: dif=0x{preDeltaD:X16} rng=0x{preDeltaR:X4} cnt={preDeltaC} bits={bits} delta={delta} prev={prev} -> {Math.Min(prev + delta + 1, maxVal)}");
                     prev = Math.Min(prev + delta + 1, maxVal);
-                    newPal[nNew++] = (byte)prev;
+                    newPal[nNew++] = (ushort)prev;
                     cnt++;
 
                     if (prev + 1 >= maxVal)
                     {
-                        while (cnt < palSz) newPal[nNew++] = (byte)maxVal;
+                        while (cnt < palSz) newPal[nNew++] = (ushort)maxVal;
                         cnt++;
                         break;
                     }
@@ -1292,14 +1292,14 @@ public static class Av1CoeffDecode
         // U plane
         {
             int lCacheSz = 0, aCacheSz = 0;
-            Span<byte> lCache = stackalloc byte[8];
-            Span<byte> aCache = stackalloc byte[8];
+            Span<ushort> lCache = stackalloc ushort[8];
+            Span<ushort> aCache = stackalloc ushort[8];
             int leftPalSz = t.PalSzUv[1, t.By & 31];
             int abovePalSz = t.PalSzUv[0, t.Bx & 31];
             for (int ci = 0; ci < leftPalSz && ci < 8; ci++) lCache[lCacheSz++] = t.PalPrevY[1, t.By & 31, 1 * 8 + ci];
             for (int ci = 0; ci < abovePalSz && ci < 8; ci++) aCache[aCacheSz++] = t.PalPrevY[0, t.Bx & 31, 1 * 8 + ci];
 
-            Span<byte> cache = stackalloc byte[8];
+            Span<ushort> cache = stackalloc ushort[8];
             int nCache = 0;
             int li2 = 0, ai2 = 0;
             while (li2 < lCacheSz && ai2 < aCacheSz)
@@ -1310,12 +1310,12 @@ public static class Av1CoeffDecode
             while (li2 < lCacheSz) { if (nCache == 0 || cache[nCache - 1] != lCache[li2]) cache[nCache++] = lCache[li2]; li2++; }
             while (ai2 < aCacheSz) { if (nCache == 0 || cache[nCache - 1] != aCache[ai2]) cache[nCache++] = aCache[ai2]; ai2++; }
 
-            Span<byte> usedCache = stackalloc byte[8];
+            Span<ushort> usedCache = stackalloc ushort[8];
             int nUsedCache = 0;
             for (int ci = 0; ci < nCache && nUsedCache < palSz; ci++)
                 if (msac.DecodeBoolEqui() != 0) usedCache[nUsedCache++] = cache[ci];
 
-            Span<byte> newPal = stackalloc byte[8];
+            Span<ushort> newPal = stackalloc ushort[8];
             int nNew = 0;
             int cnt = nUsedCache;
             if (cnt < palSz)
@@ -1323,7 +1323,7 @@ public static class Av1CoeffDecode
             ulong preFirstD = msac.DebugDif;
             uint preFirstR = msac.DebugRng;
             int preFirstC = msac.Cnt;
-            newPal[nNew++] = (byte)msac.DecodeBools(bpc);
+            newPal[nNew++] = (ushort)msac.DecodeBools(bpc);
             if (t.Bx == 0 && t.By == 0 && nUsedCache == 0)
                 AvDbg.W($"[FIRST-NEW-C] bx={t.Bx} by={t.By} palSz={palSz} nCache={nCache} pre: dif=0x{preFirstD:X16} rng=0x{preFirstR:X4} cnt={preFirstC} result=0x{newPal[0]:x2}");
                 cnt++;
@@ -1340,9 +1340,9 @@ public static class Av1CoeffDecode
                     {
                         int delta = (int)msac.DecodeBools(bits);
                         prev = Math.Min(prev + delta, maxVal);
-                        newPal[nNew++] = (byte)prev;
+                        newPal[nNew++] = (ushort)prev;
                         cnt++;
-                        if (prev >= maxVal) { while (cnt < palSz) newPal[nNew++] = (byte)maxVal; cnt++; break; }
+                        if (prev >= maxVal) { while (cnt < palSz) newPal[nNew++] = (ushort)maxVal; cnt++; break; }
                         int ulog2 = 0, tmp = maxVal - prev;
                         while (tmp > 1) { tmp >>= 1; ulog2++; }
                         bits = Math.Min(bits, 1 + ulog2);
@@ -1387,19 +1387,19 @@ public static class Av1CoeffDecode
             {
                 int bits = bpc - 4 + (int)msac.DecodeBools(2);
                 int prev = (int)msac.DecodeBools(bpc);
-                t.PalColorsV[0] = (byte)prev;
+                t.PalColorsV[0] = (ushort)prev;
                 for (int ci = 1; ci < palSz; ci++)
                 {
                     int delta = (int)msac.DecodeBools(bits);
                     if (delta != 0 && msac.DecodeBoolEqui() != 0) delta = -delta;
                     prev = (prev + delta) & maxVal;
-                    t.PalColorsV[ci] = (byte)prev;
+                    t.PalColorsV[ci] = (ushort)prev;
                 }
             }
             else
             {
                 for (int ci = 0; ci < palSz; ci++)
-                    t.PalColorsV[ci] = (byte)msac.DecodeBools(bpc);
+                    t.PalColorsV[ci] = (ushort)msac.DecodeBools(bpc);
             }
             // Store V-plane palette with propagation
             {

@@ -1101,7 +1101,7 @@ public static class Av1Reconstruction
                         // Apply CFL alpha scaling
                         int alpha = b.GetCflAlpha(pl);
                         ApplyCflAlpha(uvPlaneSrc.Slice(uvOff), uvStride, ac, alpha,
-                            cbw4 * 4, cbh4 * 4);
+                            cbw4 * 4, cbh4 * 4, ctx.BitDepth);
 
                         // DBG: dump after CFL alpha
                         if (DbgBlockCount <= 12)
