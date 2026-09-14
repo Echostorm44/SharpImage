@@ -1564,9 +1564,10 @@ internal static class Av1StillImageEncoder
 
     // Extra multiplier on the RDOQ lambda relative to the partition lambda. The partition lambda is tuned for
     // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
-    // small distortion against its (EOB-inclusive) coding rate. 20 was the sweet spot on real-photo luma: it
-    // improves the RD curve (2-7% fewer bytes at matched RMSE, more at low quality) without hurting the floor.
-    internal static double RdoqLambdaScale = 20.0;
+    // small distortion against its (EOB-inclusive) coding rate. A grid sweep (peppers/scene/landscape, matched
+    // RMSE) put the universally-safe optimum at 40: scene ~-2.5%, landscape ~-0.5%, peppers ~-0.5%, with none
+    // regressing. Higher (60-80) gains more on some content but regresses detailed real-photo luma (peppers).
+    internal static double RdoqLambdaScale = 40.0;
 
     // Enables PARTITION_HORZ / PARTITION_VERT rectangular leaves at 16x16 (colour path). Toggle for A/B testing.
     internal static bool UseRectPartition = true;
