@@ -91,7 +91,7 @@ internal static class Av1ObuWriter
         // reduced still → frame_id_numbers_present skipped.
         w.PutBool(false);         // use_128x128_superblock = 0 (64x64 SBs)
         w.PutBool(false);         // enable_filter_intra = 0
-        w.PutBool(false);         // enable_intra_edge_filter = 0
+        w.PutBool(Av1StillImageEncoder.UseIntraEdgeFilter);  // enable_intra_edge_filter
 
         // reduced still → inter tools block skipped; screen_content_tools/force_integer_mv default Adaptive.
         w.PutBool(false);         // enable_superres = 0

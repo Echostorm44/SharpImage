@@ -915,7 +915,7 @@ internal static class Av1StillImageEncoder
                     var localEdge =
                         (((iy > 0 || sbHasTr == 0) && (ix + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444TopHasRight) |
                         ((ix > 0 || (sbHasBl == 0 && iy + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
-                    PredictIntra(c.ReconY, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge);
+                    PredictIntra(c.ReconY, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]));
                     int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
                     (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, lumaTx, c.DcDq, c.AcDq);
                     int skc = Av1CoeffDecode.GetSkipCtx(in lTDim, bs, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR), 0, 0);
@@ -1209,7 +1209,7 @@ internal static class Av1StillImageEncoder
         double best = double.MaxValue;
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
-            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags);
+            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]));
             int[] cf = ForwardResidualPredRect(c.Luma, c.W, bx, by, pred, w, h, lumaTx, c.DcDq, c.AcDq, lScan);
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                 + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
@@ -1555,7 +1555,7 @@ internal static class Av1StillImageEncoder
         }
         else
         {
-            PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, yMode, yDelta, c.Pred, edgeFlags);
+            PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, yMode, yDelta, c.Pred, edgeFlags, IntraEdgeFlags(c.AboveMode[bxR], c.LeftMode[byR]));
             int[] res = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n);
             (coeffs0, invTx0, txIdx0) = ChooseTxType(res, n, maxTx, c.DcDq, c.AcDq);
         }
@@ -1623,7 +1623,7 @@ internal static class Av1StillImageEncoder
                     var localEdge =
                         (((iy > 0 || sbHasTr == 0) && (ix + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444TopHasRight) |
                         ((ix > 0 || (sbHasBl == 0 && iy + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
-                    PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge);
+                    PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge, IntraEdgeFlags(c.AboveMode[bxR], c.LeftMode[byR]));
                     int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
                     (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq);
                     // Coeff-skip context is neighbour-based for sub-block transforms (0 only when tx == block size).
@@ -1729,6 +1729,28 @@ internal static class Av1StillImageEncoder
     internal static long TrueRdPixelBudget = 1600 * 1600;
     internal static double EarlyTermBits = 24.0;
 
+    // Intra edge filtering + upsampling for directional prediction (AV1 enable_intra_edge_filter). The decoder
+    // already implements it fully (Av1IntraPred.PredZ1/Z2/Z3 do the filter/upsample, gated on bit 10 of `angle`;
+    // the Z2 corner filter on PrepareIntraEdges' filterEdge). Enabling it: set the seq-header flag and have the
+    // encoder OR the intra flags (bit 10 = enable, bit 9 = smooth-neighbour, mirroring the decoder's SmFlag) into
+    // the resolved angle + pass filterEdge:true. Improves the directional modes' prediction quality.
+    internal static bool UseIntraEdgeFilter = true;
+    private const int EdgeFilterEnableBit = 1 << 10;
+    private const int SmoothNeighbourBit = 1 << 9;
+
+    // Per-block intra flags OR'd into the prediction angle: the edge-filter-enable bit (when the seq flag is on)
+    // plus the smooth-neighbour bit if either the above or left neighbour used a SMOOTH mode (mirrors the decoder's
+    // SmFlag, which drives the filter-strength / upsample decision). Neighbours are intra on a key frame.
+    private static int IntraEdgeFlags(int aboveMode, int leftMode)
+    {
+        if (!UseIntraEdgeFilter) return 0;
+        int f = EdgeFilterEnableBit;
+        if (IsSmoothMode(aboveMode) || IsSmoothMode(leftMode)) f |= SmoothNeighbourBit;
+        return f;
+    }
+    private static bool IsSmoothMode(int m) =>
+        m == (int)Av1IntraPredMode.Smooth || m == (int)Av1IntraPredMode.SmoothV || m == (int)Av1IntraPredMode.SmoothH;
+
     // Rate-DISTORTION coding-cost estimate for a luma block (see EncodePartition). Reconstructs the block through
     // the decoder's own inverse and returns J = SSE + λ·rate — so a 64x64 (or 32x32) transform that drops the
     // high-frequency detail of a sharp block is penalised by its reconstruction error, not just its (small) rate.
@@ -1800,7 +1822,7 @@ internal static class Av1StillImageEncoder
     // preparation + prediction so encoder and decoder agree bit-for-bit. recon is the reconstruction plane
     // (stride reconW), bx4/by4 the block position in 4-unit units, bw4/bh4 the frame size in 4-unit units.
     private static void PredictIntra(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4, int n,
-        Av1IntraPredMode mode, int delta, byte[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
+        Av1IntraPredMode mode, int delta, byte[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
     {
         Span<byte> edge = stackalloc byte[257];
         const int edgeCenter = 128;
@@ -1811,8 +1833,9 @@ internal static class Av1StillImageEncoder
         int angle = delta; // PrepareIntraEdges folds this into the base angle for directional modes
         int m = Av1Reconstruction.PrepareIntraEdges(
             bx4, haveLeft, by4, haveTop, bw4, bh4, edgeFlags,
-            recon, dstOff, reconW, default, mode, ref angle, tw4, tw4, filterEdge: false, edge, edgeCenter, 8);
-        Av1IntraPred.Predict(m, dst, n, edge, edgeCenter, n, n, angle,
+            recon, dstOff, reconW, default, mode, ref angle, tw4, tw4,
+            filterEdge: (intraFlags & EdgeFilterEnableBit) != 0, edge, edgeCenter, 8);
+        Av1IntraPred.Predict(m, dst, n, edge, edgeCenter, n, n, angle | intraFlags,
             4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
     }
 
@@ -2058,6 +2081,7 @@ internal static class Av1StillImageEncoder
         int leftCtx = Av1Tables.IntraModeContext[leftMode];
         Span<ushort> ymCdf = cdf.GetKfYModeCdf(aboveCtx, leftCtx);
         int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, aboveLCoef, leftLCoef);
+        int intraFlags = IntraEdgeFlags(aboveMode, leftMode);
         int scanLen = Av1Tables.Scans[tx].Length;
         var predBuf = new byte[n * n];
         var qfCand = new double[scanLen];
@@ -2073,7 +2097,7 @@ internal static class Av1StillImageEncoder
         for (int ci = 0; ci < CandidateModes.Length; ci++)
         {
             (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
-            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf, edgeFlags);
+            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf, edgeFlags, intraFlags);
             long satd = Satd8x8(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
             long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                 + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
@@ -2088,7 +2112,7 @@ internal static class Av1StillImageEncoder
         {
             if (topCost[t] == long.MaxValue) break;
             (Av1IntraPredMode mode, int delta) = CandidateModes[topIdx[t]];
-            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf, edgeFlags);
+            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf, edgeFlags, intraFlags);
             int[] residual = ComputeResidualPred(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                 + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
@@ -2118,7 +2142,7 @@ internal static class Av1StillImageEncoder
 
     // Intra prediction for a w x h block into dst (h rows x w cols, stride w).
     private static void PredictIntraRect(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
-        int w, int h, Av1IntraPredMode mode, int delta, byte[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
+        int w, int h, Av1IntraPredMode mode, int delta, byte[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
     {
         Span<byte> edge = stackalloc byte[257];
         const int edgeCenter = 128;
@@ -2128,8 +2152,9 @@ internal static class Av1StillImageEncoder
         int angle = delta;
         int m = Av1Reconstruction.PrepareIntraEdges(
             bx4, haveLeft, by4, haveTop, bw4, bh4, edgeFlags,
-            recon, dstOff, reconW, default, mode, ref angle, tw4, th4, filterEdge: false, edge, edgeCenter, 8);
-        Av1IntraPred.Predict(m, dst, w, edge, edgeCenter, w, h, angle, 4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
+            recon, dstOff, reconW, default, mode, ref angle, tw4, th4,
+            filterEdge: (intraFlags & EdgeFilterEnableBit) != 0, edge, edgeCenter, 8);
+        Av1IntraPred.Predict(m, dst, w, edge, edgeCenter, w, h, angle | intraFlags, 4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
     }
 
     // Forward+quant of (src - pred) for a w x h block. pred is h x w row-major.
