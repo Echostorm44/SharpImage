@@ -1008,12 +1008,24 @@ internal sealed class Av1Decoder
             // (top-left). Resetting per-SB64 would wipe an earlier SB64's noskip/cdef data before CDEF reads it.
             int sb128Col = t.Bx >> 5;
             bool firstOfSb128 = (t.Bx & 16) == 0 && (t.By & 16) == 0;
+            // cdef_idx sub-slot of this SB64 within its shared SB128 mask (0=TL,1=TR,2=BL,3=BR).
+            int curCdefSlot = ((t.By & 16) >> 3) + ((t.Bx & 16) >> 4);
             if (firstOfSb128)
             {
+                // Start of a fresh SB128 (also every SB for Sb128=1): clear all four cdef_idx slots.
                 t.CurSbCdefIdx[0] = -1;
                 t.CurSbCdefIdx[1] = -1;
                 t.CurSbCdefIdx[2] = -1;
                 t.CurSbCdefIdx[3] = -1;
+            }
+            else if (!sh.Sb128)
+            {
+                // Sb128=0: each SB64 is its own cdef unit and must re-read its own cdef_idx. The array is shared
+                // across SB128 columns and reset only at the top-left SB64, so the other three slots persist stale
+                // (and, for By&16==16 rows, were never reset) — clear this SB64's slot so its cdef_idx IS read.
+                // Without this the per-block cdef_idx read (L(cdef_bits)) is skipped and the MSAC stream desyncs on
+                // any stream that uses cdef_bits>0 (multiple CDEF strengths — what libaom emits for larger frames).
+                t.CurSbCdefIdx[curCdefSlot] = -1;
             }
 
             if (ctx.LfMasks != null && sb128Col < ctx.LfMasks.Length)
@@ -1053,11 +1065,15 @@ internal sealed class Av1Decoder
                 return;
             }
 
-            // Store CDEF indices from this SB into the per-SB128 filter mask
+            // Store CDEF indices from this SB into the per-SB128 filter mask. For Sb128=1 the SB owns all four
+            // units; for Sb128=0 store only this SB64's slot (the other slots hold other columns' stale values,
+            // so storing all four would corrupt this column's mask).
             if (t.LfMask != null)
             {
-                for (int ci = 0; ci < 4; ci++)
-                    t.LfMask.SetCdefIdx(ci, t.CurSbCdefIdx[ci]);
+                if (sh.Sb128)
+                    for (int ci = 0; ci < 4; ci++) t.LfMask.SetCdefIdx(ci, t.CurSbCdefIdx[ci]);
+                else
+                    t.LfMask.SetCdefIdx(curCdefSlot, t.CurSbCdefIdx[curCdefSlot]);
             }
 
             // Advance above context (every 128px = every SB128, or every other SB64)
