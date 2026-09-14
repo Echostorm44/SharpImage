@@ -1576,10 +1576,13 @@ internal static class Av1StillImageEncoder
 
     // Enables true trial-encode RD for the colour partition decision (measure actual coded bits + SSE per
     // candidate). Much more accurate than the cost estimate (e.g. peppers qp15 RMSE 7.6→6.2 at −2.7% size), but
-    // several times slower. Gated to TrueRdPixelBudget so large frames keep the fast estimate path.
+    // several times slower. Gated to TrueRdPixelBudget so very large frames keep the fast estimate path. The
+    // budget covers typical photos (~2.5 MP): true-RD is a measured −1 to −2.8% on the 1.5 MP landscape test at
+    // the cost of ~15 s, and the payoff (partitions the estimate over-splits) grows with frame detail. The path
+    // is byte-identical to the small-frame one (ffmpeg/libdav1d-verified), just applied to more blocks.
     internal static bool UseTrueRd = true;
     internal static bool UseCfl = true;
-    internal static long TrueRdPixelBudget = 512 * 512;
+    internal static long TrueRdPixelBudget = 1600 * 1600;
     internal static double EarlyTermBits = 24.0;
 
     // Rate-DISTORTION coding-cost estimate for a luma block (see EncodePartition). Reconstructs the block through
