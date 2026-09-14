@@ -1109,7 +1109,7 @@ public static class Av1CoeffDecode
         }
 
         // Merge into sorted, deduplicated cache
-        Span<ushort> cache = stackalloc ushort[8];
+        Span<ushort> cache = stackalloc ushort[16]; // palette cache holds up to 2*8 entries (left+above), dav1d cache[2*8]
         int nCache = 0;
         int li2 = 0, ai2 = 0;
         while (li2 < lCacheSz && ai2 < aCacheSz)
@@ -1208,8 +1208,10 @@ public static class Av1CoeffDecode
 
                     if (prev + 1 >= maxVal)
                     {
-                        while (cnt < palSz) newPal[nNew++] = (ushort)maxVal;
-                        cnt++;
+                        // Fill remaining palette entries with maxVal (dav1d: for (; i<pal_sz; i++) pal[i]=max).
+                        // The cnt increment MUST be inside the loop — otherwise it never terminates and
+                        // overruns newPal (was masked at 8-bit where the max-value branch rarely fired).
+                        while (cnt < palSz) { newPal[nNew++] = (ushort)maxVal; cnt++; }
                         break;
                     }
                     int ulog2 = 0, tmp = maxVal - prev - 1;
@@ -1299,7 +1301,7 @@ public static class Av1CoeffDecode
             for (int ci = 0; ci < leftPalSz && ci < 8; ci++) lCache[lCacheSz++] = t.PalPrevY[1, t.By & 31, 1 * 8 + ci];
             for (int ci = 0; ci < abovePalSz && ci < 8; ci++) aCache[aCacheSz++] = t.PalPrevY[0, t.Bx & 31, 1 * 8 + ci];
 
-            Span<ushort> cache = stackalloc ushort[8];
+            Span<ushort> cache = stackalloc ushort[16]; // palette cache holds up to 2*8 entries (left+above), dav1d cache[2*8]
             int nCache = 0;
             int li2 = 0, ai2 = 0;
             while (li2 < lCacheSz && ai2 < aCacheSz)
@@ -1342,7 +1344,7 @@ public static class Av1CoeffDecode
                         prev = Math.Min(prev + delta, maxVal);
                         newPal[nNew++] = (ushort)prev;
                         cnt++;
-                        if (prev >= maxVal) { while (cnt < palSz) newPal[nNew++] = (ushort)maxVal; cnt++; break; }
+                        if (prev >= maxVal) { while (cnt < palSz) { newPal[nNew++] = (ushort)maxVal; cnt++; } break; }
                         int ulog2 = 0, tmp = maxVal - prev;
                         while (tmp > 1) { tmp >>= 1; ulog2++; }
                         bits = Math.Min(bits, 1 + ulog2);
