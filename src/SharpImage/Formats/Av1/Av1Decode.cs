@@ -1256,19 +1256,25 @@ public static class Av1Decode
         }
 
         // === Palette indices === (after palette colors AND filter_intra, per dav1d)
+        // The wavefront covers only the VISIBLE region (clipped to the frame), while the
+        // index buffer stride is the full block width — dav1d read_pal_indices(w4,h4,bw4,bh4)
+        // with w4/h4 = imin(bw4/bh4, frame - pos). Using the full block for edge-clipped
+        // blocks over-decodes color indices and desyncs MSAC.
+        int palW4 = Math.Min(bw4, ctx.Bw - t.Bx);
+        int palH4 = Math.Min(bh4, ctx.Bh - t.By);
         if (b.PalSzY > 0)
         {
             Av1CoeffDecode.DecodePaletteIndices(ref msac, ts.Cdf.Mode, t,
-                b.PalSzY, bw4 * 4, bh4 * 4, bw4, bh4, isLuma: true);
+                b.PalSzY, palW4 * 4, palH4 * 4, bw4, bh4, isLuma: true);
         }
         if (hasChroma && b.PalSzUv > 0)
         {
             // Chroma palette index map spans the CHROMA reference block (cbw4/cbh4 in 4-sample
-            // units), which for sub-8x8 luma is larger than the block's own subsampled size.
-            int uvW = cbw4 * 4;
-            int uvH = cbh4 * 4;
+            // units) for stride; the wavefront is the clipped visible chroma region.
+            int cw4 = (palW4 + ssHor) >> ssHor;
+            int ch4 = (palH4 + ssVer) >> ssVer;
             Av1CoeffDecode.DecodePaletteIndices(ref msac, ts.Cdf.Mode, t,
-                b.PalSzUv, uvW, uvH, cbw4, cbh4, isLuma: false);
+                b.PalSzUv, cw4 * 4, ch4 * 4, cbw4, cbh4, isLuma: false);
         }
 
         // === Transform size ===
