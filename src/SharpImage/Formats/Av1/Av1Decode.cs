@@ -65,10 +65,10 @@ public sealed class Av1TaskContext
 
     // Scratch buffers for inter prediction
     /// <summary>Edge buffer for intra-in-inter (interintra) prediction.</summary>
-    public byte[] EdgeBuf = new byte[257];
+    public ushort[] EdgeBuf = new ushort[257];
 
     /// <summary>Temporary buffer for interintra prediction.</summary>
-    public byte[] InterIntraBuf = new byte[128 * 128];
+    public ushort[] InterIntraBuf = new ushort[128 * 128];
 
     /// <summary>Compound prediction temporary buffers (2 × 128×128 int16).</summary>
     public short[][] CompInterBuf = { new short[128 * 128], new short[128 * 128] };
@@ -77,7 +77,7 @@ public sealed class Av1TaskContext
     public byte[] SegMask = new byte[128 * 128];
 
     /// <summary>Emulated edge buffer for out-of-frame motion compensation.</summary>
-    public byte[] EmuEdgeBuf = new byte[320 * 320];
+    public ushort[] EmuEdgeBuf = new ushort[320 * 320];
 
     /// <summary>Transform type map for inter blocks (32×32 entries for SB128).</summary>
     public byte[] TxtpMap = new byte[32 * 32];
@@ -884,10 +884,10 @@ public static class Av1Decode
             // Call intra reconstruction which does: prediction + coefficient decode + IDCT + residual add
             if (ctx.CurrentPlanes[0] != null)
             {
-                Span<byte> yPlane = ctx.CurrentPlanes[0].AsSpan();
+                Span<ushort> yPlane = ctx.CurrentPlanes[0].AsSpan();
 
-                Span<byte> uPlane = default;
-                Span<byte> vPlane = default;
+                Span<ushort> uPlane = default;
+                Span<ushort> vPlane = default;
                 if (hasChroma && ctx.CurrentPlanes[1] != null && ctx.CurrentPlanes[2] != null)
                 {
                     uPlane = ctx.CurrentPlanes[1].AsSpan();
@@ -959,8 +959,8 @@ public static class Av1Decode
 
             // Reconstruct inter block
             var yPlane = ctx.CurrentPlanes[0]!;
-            var uPlane = hasChroma ? ctx.CurrentPlanes[1]! : Array.Empty<byte>();
-            var vPlane = hasChroma ? ctx.CurrentPlanes[2]! : Array.Empty<byte>();
+            var uPlane = hasChroma ? ctx.CurrentPlanes[1]! : Array.Empty<ushort>();
+            var vPlane = hasChroma ? ctx.CurrentPlanes[2]! : Array.Empty<ushort>();
             Av1Reconstruction.ReconBlockInter(t, ref msac, ctx, (int)bs, ref b,
                 yPlane, ctx.YStride, uPlane, vPlane, ctx.UvStride);
 

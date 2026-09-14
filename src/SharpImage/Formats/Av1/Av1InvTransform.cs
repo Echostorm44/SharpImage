@@ -311,6 +311,34 @@ public static class Av1InvTransform
         }
     }
 
+    /// <summary>High bit depth 4x4 Walsh-Hadamard inverse add. See <see cref="InvWhtAdd"/>.</summary>
+    public static void InvWhtAdd16(
+        Span<ushort> dst, int dstStride,
+        Span<int> coeffs, int bitDepth)
+    {
+        int pixelMax = (1 << bitDepth) - 1;
+        Span<int> tmp = stackalloc int[16];
+        for (int y = 0; y < 4; y++)
+        {
+            var row = tmp.Slice(y * 4, 4);
+            for (int x = 0; x < 4; x++)
+                row[x] = coeffs[y + x * 4] >> 2;
+            InvWht4_1d(row, 1);
+        }
+        coeffs.Slice(0, 16).Clear();
+
+        for (int x = 0; x < 4; x++)
+            InvWht4_1dStrided(tmp, x, 4);
+
+        for (int y = 0; y < 4; y++)
+        {
+            var row = dst.Slice(y * dstStride, 4);
+            var tmpRow = tmp.Slice(y * 4, 4);
+            for (int x = 0; x < 4; x++)
+                row[x] = (ushort)Math.Clamp(row[x] + tmpRow[x], 0, pixelMax);
+        }
+    }
+
     // ========================================================================
     // 1D transform dispatch
     // ========================================================================

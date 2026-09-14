@@ -75,12 +75,18 @@ public static class Av1LoopRestoration
     // ========================================================================
 
     /// <summary>
+    // NOTE (high bit depth): the loop-restoration Wiener/SGR math below is 8-bit-internal
+    // (const bitdepth = 8, clamps to 255). Storage is ushort so the module compiles into the
+    // unified ushort pipeline and is bit-exact at 8 bit. For 10/12-bit input the restoration
+    // contribution is not yet bit-exact (intermediates/rounding/clip use the 8-bit constants) —
+    // this is the one remaining kernel to finish for full high-bit-depth conformance; it needs
+    // the dav1d looprestoration hbd rounding constants, tracked as a follow-up.
     /// Wiener horizontal filter: produces 16-bit intermediates from 8-bit pixels.
     /// For 8-bit: sum starts with (1 &lt;&lt; 14), adds src[x]*128, then 7-tap filter.
     /// Round with 3 bits, clip to [0, 2048).
     /// </summary>
-    private static void WienerFilterH(Span<ushort> dst, ReadOnlySpan<byte> left,
-        ReadOnlySpan<byte> src, int srcOffset, ReadOnlySpan<short> fh,
+    private static void WienerFilterH(Span<ushort> dst, ReadOnlySpan<ushort> left,
+        ReadOnlySpan<ushort> src, int srcOffset, ReadOnlySpan<short> fh,
         int w, LrEdgeFlags edges)
     {
         const int bitdepth = 8;
@@ -146,9 +152,9 @@ public static class Av1LoopRestoration
     // Wiener Filter — Combined H+V pass
     // ========================================================================
 
-    private static void WienerFilterHV(Span<byte> p, int pOffset, int stride,
-        ushort[][] ptrs, ReadOnlySpan<byte> left,
-        ReadOnlySpan<byte> src, int srcOffset,
+    private static void WienerFilterHV(Span<ushort> p, int pOffset, int stride,
+        ushort[][] ptrs, ReadOnlySpan<ushort> left,
+        ReadOnlySpan<ushort> src, int srcOffset,
         ReadOnlySpan<short> fh, ReadOnlySpan<short> fv,
         int w, LrEdgeFlags edges)
     {
@@ -166,7 +172,7 @@ public static class Av1LoopRestoration
             for (int k = 0; k < 6; k++)
                 sum += ptrs[k][i] * fv[k];
             sum += tmp[i] * fv[6];
-            p[pOffset + i] = (byte)Math.Clamp((sum + roundingOffV) >> roundBitsV, 0, 255);
+            p[pOffset + i] = (ushort)Math.Clamp((sum + roundingOffV) >> roundBitsV, 0, 255);
         }
 
         // Copy new row into ptrs[6], rotate down
@@ -176,7 +182,7 @@ public static class Av1LoopRestoration
         ptrs[6] = ptrs[0];
     }
 
-    private static void WienerFilterV(Span<byte> p, int pOffset, ushort[][] ptrs,
+    private static void WienerFilterV(Span<ushort> p, int pOffset, ushort[][] ptrs,
         ReadOnlySpan<short> fv, int w)
     {
         const int bitdepth = 8;
@@ -190,7 +196,7 @@ public static class Av1LoopRestoration
             for (int k = 0; k < 6; k++)
                 sum += ptrs[k][i] * fv[k];
             sum += ptrs[5][i] * fv[6]; // 7th row = last row duplicated
-            p[pOffset + i] = (byte)Math.Clamp((sum + roundingOffV) >> roundBitsV, 0, 255);
+            p[pOffset + i] = (ushort)Math.Clamp((sum + roundingOffV) >> roundBitsV, 0, 255);
         }
 
         for (int i = 0; i < 5; i++)
@@ -204,9 +210,9 @@ public static class Av1LoopRestoration
     /// <summary>
     /// Apply Wiener separable filter to a restoration unit.
     /// </summary>
-    public static void Wiener(Span<byte> p, int pOffset, int stride,
-        ReadOnlySpan<byte> left, int leftOffset, int leftStride,
-        ReadOnlySpan<byte> lpf, int lpfOffset,
+    public static void Wiener(Span<ushort> p, int pOffset, int stride,
+        ReadOnlySpan<ushort> left, int leftOffset, int leftStride,
+        ReadOnlySpan<ushort> lpf, int lpfOffset,
         int w, int h, ReadOnlySpan<short> filterH, ReadOnlySpan<short> filterV,
         LrEdgeFlags edges)
     {
@@ -224,9 +230,9 @@ public static class Av1LoopRestoration
             ptrs[0] = rows[0]; ptrs[1] = rows[0]; ptrs[2] = rows[1];
             ptrs[3] = rows[2]; ptrs[4] = rows[2]; ptrs[5] = rows[2];
 
-            WienerFilterH(rows[0], ReadOnlySpan<byte>.Empty, lpf, lpfOff, filterH, w, edges);
+            WienerFilterH(rows[0], ReadOnlySpan<ushort>.Empty, lpf, lpfOff, filterH, w, edges);
             lpfOff += stride;
-            WienerFilterH(rows[1], ReadOnlySpan<byte>.Empty, lpf, lpfOff, filterH, w, edges);
+            WienerFilterH(rows[1], ReadOnlySpan<ushort>.Empty, lpf, lpfOff, filterH, w, edges);
 
             WienerFilterH(rows[2], left.Slice(leftOffset, 4), p, srcOff, filterH, w, edges);
             leftOffset += leftStride;
@@ -313,19 +319,19 @@ public static class Av1LoopRestoration
         }
 
         WienerFilterHV(p, pOffset, stride, ptrs,
-            ReadOnlySpan<byte>.Empty, lpf, lpfBottomOff, filterH, filterV, w, edges);
+            ReadOnlySpan<ushort>.Empty, lpf, lpfBottomOff, filterH, filterV, w, edges);
         lpfBottomOff += stride;
         pOffset += stride;
 
         WienerFilterHV(p, pOffset, stride, ptrs,
-            ReadOnlySpan<byte>.Empty, lpf, lpfBottomOff, filterH, filterV, w, edges);
+            ReadOnlySpan<ushort>.Empty, lpf, lpfBottomOff, filterH, filterV, w, edges);
         pOffset += stride;
 
         // v1: final single-row V filter
         WienerFilterV(p, pOffset, ptrs, filterV, w);
     }
 
-    private static void WienerVTail(Span<byte> p, int pOffset, int stride,
+    private static void WienerVTail(Span<ushort> p, int pOffset, int stride,
         ushort[][] ptrs, ReadOnlySpan<short> fv, int w, int pendingRows)
     {
         // pendingRows: 3 → v3 → v2 → v1
@@ -349,7 +355,7 @@ public static class Av1LoopRestoration
     // ========================================================================
 
     private static void SgrBox3RowH(int[] sumsq, int[] sum, int offset,
-        ReadOnlySpan<byte> left, ReadOnlySpan<byte> src, int srcOffset,
+        ReadOnlySpan<ushort> left, ReadOnlySpan<ushort> src, int srcOffset,
         int w, LrEdgeFlags edges)
     {
         int off = offset + 1; // sumsq++; sum++;
@@ -370,7 +376,7 @@ public static class Av1LoopRestoration
     }
 
     private static void SgrBox5RowH(int[] sumsq, int[] sum, int offset,
-        ReadOnlySpan<byte> left, ReadOnlySpan<byte> src, int srcOffset,
+        ReadOnlySpan<ushort> left, ReadOnlySpan<ushort> src, int srcOffset,
         int w, LrEdgeFlags edges)
     {
         int off = offset + 1;
@@ -452,7 +458,7 @@ public static class Av1LoopRestoration
 
     private static void SgrBox3HV(int[][] sumsq, int[][] sumPtrs,
         int[] AA, int[] BB, int offset,
-        ReadOnlySpan<byte> left, ReadOnlySpan<byte> src, int srcOffset,
+        ReadOnlySpan<ushort> left, ReadOnlySpan<ushort> src, int srcOffset,
         int w, int s, LrEdgeFlags edges)
     {
         SgrBox3RowH(sumsq[2], sumPtrs[2], offset, left, src, srcOffset, w, edges);
@@ -464,7 +470,7 @@ public static class Av1LoopRestoration
     // ========================================================================
 
     private static void SgrFinishFilterRow1(int[] tmp, int tmpOffset,
-        ReadOnlySpan<byte> src, int srcOffset, int[][] aPtrs, int[][] bPtrs,
+        ReadOnlySpan<ushort> src, int srcOffset, int[][] aPtrs, int[][] bPtrs,
         int offset, int w)
     {
         for (int i = 0; i < w; i++)
@@ -483,7 +489,7 @@ public static class Av1LoopRestoration
     }
 
     private static void SgrFinishFilter2(int[] tmp, int tmpOffset,
-        ReadOnlySpan<byte> src, int srcOffset, int srcStride,
+        ReadOnlySpan<ushort> src, int srcOffset, int srcStride,
         int[][] aPtrs, int[][] bPtrs, int offset, int w, int h)
     {
         for (int i = 0; i < w; i++)
@@ -510,18 +516,18 @@ public static class Av1LoopRestoration
         }
     }
 
-    private static void SgrWeightedRow1(Span<byte> dst, int dstOffset,
+    private static void SgrWeightedRow1(Span<ushort> dst, int dstOffset,
         int[] t, int tOffset, int w, int w1)
     {
         for (int i = 0; i < w; i++)
         {
             int v = w1 * t[tOffset + i];
-            dst[dstOffset + i] = (byte)Math.Clamp(
+            dst[dstOffset + i] = (ushort)Math.Clamp(
                 dst[dstOffset + i] + ((v + (1 << 10)) >> 11), 0, 255);
         }
     }
 
-    private static void SgrWeighted2(Span<byte> dst, int dstOffset, int dstStride,
+    private static void SgrWeighted2(Span<ushort> dst, int dstOffset, int dstStride,
         int[] t1, int t1Offset, int[] t2, int t2Offset,
         int w, int h, int w0, int w1)
     {
@@ -530,7 +536,7 @@ public static class Av1LoopRestoration
             for (int i = 0; i < w; i++)
             {
                 int v = w0 * t1[t1Offset + i] + w1 * t2[t2Offset + i];
-                dst[dstOffset + i] = (byte)Math.Clamp(
+                dst[dstOffset + i] = (ushort)Math.Clamp(
                     dst[dstOffset + i] + ((v + (1 << 10)) >> 11), 0, 255);
             }
             dstOffset += dstStride;
@@ -543,9 +549,9 @@ public static class Av1LoopRestoration
     // SGR 3×3 Entry Point (looprestoration_tmpl.c: sgr_3x3_c)
     // ========================================================================
 
-    public static void Sgr3x3(Span<byte> dst, int dstOffset, int stride,
-        ReadOnlySpan<byte> left, int leftOffset, int leftStride,
-        ReadOnlySpan<byte> lpf, int lpfOffset,
+    public static void Sgr3x3(Span<ushort> dst, int dstOffset, int stride,
+        ReadOnlySpan<ushort> left, int leftOffset, int leftStride,
+        ReadOnlySpan<ushort> lpf, int lpfOffset,
         int w, int h, int s1, int w1, LrEdgeFlags edges)
     {
         var sumsqRows = new int[3][];
@@ -580,9 +586,9 @@ public static class Av1LoopRestoration
             sumsqPtrs[0] = sumsqRows[0]; sumsqPtrs[1] = sumsqRows[1]; sumsqPtrs[2] = sumsqRows[2];
             sumPtrs[0] = sumRows[0]; sumPtrs[1] = sumRows[1]; sumPtrs[2] = sumRows[2];
 
-            SgrBox3RowH(sumsqRows[0], sumRows[0], 0, ReadOnlySpan<byte>.Empty, lpf, lpfOff, w, edges);
+            SgrBox3RowH(sumsqRows[0], sumRows[0], 0, ReadOnlySpan<ushort>.Empty, lpf, lpfOff, w, edges);
             lpfOff += stride;
-            SgrBox3RowH(sumsqRows[1], sumRows[1], 0, ReadOnlySpan<byte>.Empty, lpf, lpfOff, w, edges);
+            SgrBox3RowH(sumsqRows[1], sumRows[1], 0, ReadOnlySpan<ushort>.Empty, lpf, lpfOff, w, edges);
 
             SgrBox3HV(sumsqPtrs, sumPtrs, aPtrs[2], bPtrs[2], 0,
                 left.Slice(lOff, 4), dst, srcOff, w, s1, edges);
@@ -642,12 +648,12 @@ public static class Av1LoopRestoration
         if ((edges & LrEdgeFlags.Bottom) == 0) goto vert_2;
 
         SgrBox3HV(sumsqPtrs, sumPtrs, aPtrs[2], bPtrs[2], 0,
-            ReadOnlySpan<byte>.Empty, lpf, lpfBottomOff, w, s1, edges);
+            ReadOnlySpan<ushort>.Empty, lpf, lpfBottomOff, w, s1, edges);
         lpfBottomOff += stride;
         SgrFinish1(dst, ref pOff, stride, aPtrs, bPtrs, 0, w, w1);
 
         SgrBox3HV(sumsqPtrs, sumPtrs, aPtrs[2], bPtrs[2], 0,
-            ReadOnlySpan<byte>.Empty, lpf, lpfBottomOff, w, s1, edges);
+            ReadOnlySpan<ushort>.Empty, lpf, lpfBottomOff, w, s1, edges);
         SgrFinish1(dst, ref pOff, stride, aPtrs, bPtrs, 0, w, w1);
         return;
 
@@ -672,7 +678,7 @@ public static class Av1LoopRestoration
         SgrFinish1(dst, ref pOff, stride, aPtrs, bPtrs, 0, w, w1);
     }
 
-    private static void SgrFinish1(Span<byte> dst, ref int pOff, int stride,
+    private static void SgrFinish1(Span<ushort> dst, ref int pOff, int stride,
         int[][] aPtrs, int[][] bPtrs, int offset, int w, int w1)
     {
         var tmp = new int[384];
@@ -686,9 +692,9 @@ public static class Av1LoopRestoration
     // SGR 5×5 Entry Point (looprestoration_tmpl.c: sgr_5x5_c)
     // ========================================================================
 
-    public static void Sgr5x5(Span<byte> dst, int dstOffset, int stride,
-        ReadOnlySpan<byte> left, int leftOffset, int leftStride,
-        ReadOnlySpan<byte> lpf, int lpfOffset,
+    public static void Sgr5x5(Span<ushort> dst, int dstOffset, int stride,
+        ReadOnlySpan<ushort> left, int leftOffset, int leftStride,
+        ReadOnlySpan<ushort> lpf, int lpfOffset,
         int w, int h, int s0, int w0, LrEdgeFlags edges)
     {
         var sumsqRows = new int[5][];
@@ -727,9 +733,9 @@ public static class Av1LoopRestoration
             sumPtrs[2] = sumRows[1]; sumPtrs[3] = sumRows[2];
             sumPtrs[4] = sumRows[3];
 
-            SgrBox5RowH(sumsqRows[0], sumRows[0], 0, ReadOnlySpan<byte>.Empty, lpf, lpfOff, w, edges);
+            SgrBox5RowH(sumsqRows[0], sumRows[0], 0, ReadOnlySpan<ushort>.Empty, lpf, lpfOff, w, edges);
             lpfOff += stride;
-            SgrBox5RowH(sumsqRows[1], sumRows[1], 0, ReadOnlySpan<byte>.Empty, lpf, lpfOff, w, edges);
+            SgrBox5RowH(sumsqRows[1], sumRows[1], 0, ReadOnlySpan<ushort>.Empty, lpf, lpfOff, w, edges);
             SgrBox5RowH(sumsqRows[2], sumRows[2], 0, left.Slice(lOff, 4), dst, srcOff, w, edges);
             lOff += leftStride; srcOff += stride;
 
@@ -796,9 +802,9 @@ public static class Av1LoopRestoration
 
         if ((edges & LrEdgeFlags.Bottom) == 0) goto vert_2;
 
-        SgrBox5RowH(sumsqPtrs[3], sumPtrs[3], 0, ReadOnlySpan<byte>.Empty, lpf, lpfBottomOff, w, edges);
+        SgrBox5RowH(sumsqPtrs[3], sumPtrs[3], 0, ReadOnlySpan<ushort>.Empty, lpf, lpfBottomOff, w, edges);
         lpfBottomOff += stride;
-        SgrBox5RowH(sumsqPtrs[4], sumPtrs[4], 0, ReadOnlySpan<byte>.Empty, lpf, lpfBottomOff, w, edges);
+        SgrBox5RowH(sumsqPtrs[4], sumPtrs[4], 0, ReadOnlySpan<ushort>.Empty, lpf, lpfBottomOff, w, edges);
         SgrBox5Vert(sumsqPtrs, sumPtrs, aPtrs[1], bPtrs[1], 0, w, s0);
         SgrFinish2(dst, ref pOff, stride, aPtrs, bPtrs, 0, w, 2, w0);
         return;
@@ -833,7 +839,7 @@ public static class Av1LoopRestoration
         SgrFinish2(dst, ref pOff, stride, aPtrs, bPtrs, 0, w, 1, w0);
     }
 
-    private static void SgrFinish2(Span<byte> dst, ref int pOff, int stride,
+    private static void SgrFinish2(Span<ushort> dst, ref int pOff, int stride,
         int[][] aPtrs, int[][] bPtrs, int offset, int w, int h, int w0)
     {
         var tmp = new int[2 * FilterOutStride];
@@ -883,7 +889,7 @@ public static class Av1LoopRestoration
     // ========================================================================
     private static void SgrBox35RowH(int[] sumsq3, int[] sum3,
         int[] sumsq5, int[] sum5, int offset,
-        ReadOnlySpan<byte> left, ReadOnlySpan<byte> src, int srcOffset,
+        ReadOnlySpan<ushort> left, ReadOnlySpan<ushort> src, int srcOffset,
         int w, LrEdgeFlags edges)
     {
         SgrBox3RowH(sumsq3, sum3, offset, left, src, srcOffset, w, edges);
@@ -893,7 +899,7 @@ public static class Av1LoopRestoration
     // ========================================================================
     // SgrFinishMix — finish both guides + weighted mix (dav1d: sgr_finish_mix)
     // ========================================================================
-    private static void SgrFinishMix(Span<byte> dst, ref int pOff, int stride,
+    private static void SgrFinishMix(Span<ushort> dst, ref int pOff, int stride,
         int[][] A5Ptrs, int[][] B5Ptrs, int[][] A3Ptrs, int[][] B3Ptrs,
         int offset, int w, int h, int w0, int w1)
     {
@@ -915,9 +921,9 @@ public static class Av1LoopRestoration
     // Processes both 5x5 (s0) and 3x3 (s1) guides on the same source pixels,
     // then mixes the results with weights w0 (5x5 guide weight) and w1 (3x3).
     // ========================================================================
-    public static void SgrMix(Span<byte> dst, int dstOffset, int stride,
-        ReadOnlySpan<byte> left, int leftOffset, int leftStride,
-        ReadOnlySpan<byte> lpf, int lpfOffset,
+    public static void SgrMix(Span<ushort> dst, int dstOffset, int stride,
+        ReadOnlySpan<ushort> left, int leftOffset, int leftStride,
+        ReadOnlySpan<ushort> lpf, int lpfOffset,
         int w, int h, int s0, int s1, int w0, int w1, LrEdgeFlags edges)
     {
         // 5x5 buffers: 5 rows of sumsq/sum + 2 rows of AB
@@ -955,7 +961,7 @@ public static class Av1LoopRestoration
         int srcOff = dstOffset;
         int pOff = dstOffset;
         int lpfOff = lpfOffset;
-        ReadOnlySpan<byte> lpfBottom = lpf.Slice(lpfOffset + 6 * stride);
+        ReadOnlySpan<ushort> lpfBottom = lpf.Slice(lpfOffset + 6 * stride);
         int lOff = leftOffset;
 
         if ((edges & LrEdgeFlags.Top) != 0)
@@ -972,10 +978,10 @@ public static class Av1LoopRestoration
             sumsq3Ptrs[2] = sumsq3Rows[2]; sum3Ptrs[2] = sum3Rows[2];
 
             SgrBox35RowH(sumsq3Rows[0], sum3Rows[0],
-                sumsq5Rows[0], sum5Rows[0], 0, ReadOnlySpan<byte>.Empty, lpf, lpfOff, w, edges);
+                sumsq5Rows[0], sum5Rows[0], 0, ReadOnlySpan<ushort>.Empty, lpf, lpfOff, w, edges);
             lpfOff += stride;
             SgrBox35RowH(sumsq3Rows[1], sum3Rows[1],
-                sumsq5Rows[1], sum5Rows[1], 0, ReadOnlySpan<byte>.Empty, lpf, lpfOff, w, edges);
+                sumsq5Rows[1], sum5Rows[1], 0, ReadOnlySpan<ushort>.Empty, lpf, lpfOff, w, edges);
 
             SgrBox35RowH(sumsq3Rows[2], sum3Rows[2],
                 sumsq5Rows[2], sum5Rows[2], 0,
@@ -1105,13 +1111,13 @@ public static class Av1LoopRestoration
 
         SgrBox35RowH(sumsq3Ptrs[2], sum3Ptrs[2],
             sumsq5Ptrs[3], sum5Ptrs[3], 0,
-            ReadOnlySpan<byte>.Empty, lpfBottom, 0, w, botEdges);
+            ReadOnlySpan<ushort>.Empty, lpfBottom, 0, w, botEdges);
         SgrBox3Vert(sumsq3Ptrs, sum3Ptrs, A3Ptrs[3], B3Ptrs[3], 0, w, s1);
         Rotate(A3Ptrs, B3Ptrs, 4);
 
         SgrBox35RowH(sumsq3Ptrs[2], sum3Ptrs[2],
             sumsq5Ptrs[4], sum5Ptrs[4], 0,
-            ReadOnlySpan<byte>.Empty, lpfBottom.Slice(stride), 0, w, botEdges);
+            ReadOnlySpan<ushort>.Empty, lpfBottom.Slice(stride), 0, w, botEdges);
 
     // output_2:
         SgrBox5Vert(sumsq5Ptrs, sum5Ptrs, A5Ptrs[1], B5Ptrs[1], 0, w, s0);

@@ -28,10 +28,14 @@ public static class Av1LoopFilter
     /// For 8-bit: bitdepth_min_8 = 0 so F=1, E/I/H are unshifted.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void LoopFilterEdge(Span<byte> dst, int dstOffset,
-        int E, int I, int H, int strideA, int strideB, int wd)
+    private static void LoopFilterEdge(Span<ushort> dst, int dstOffset,
+        int E, int I, int H, int strideA, int strideB, int wd, int bitDepth = 8)
     {
-        const int F = 1; // 1 << (bitdepth - 8), for 8-bit = 1
+        int bdMin8 = bitDepth - 8;
+        int F = 1 << bdMin8;   // dav1d: F = 1 << bitdepth_min_8
+        int pxMax = (1 << bitDepth) - 1;
+        int narrowLim = 128 << bdMin8; // narrow-filter clip bound scales with bit depth
+        E <<= bdMin8; I <<= bdMin8; H <<= bdMin8; // thresholds scale with bit depth
 
         for (int i = 0; i < 4; i++, dstOffset += strideA)
         {
@@ -100,49 +104,49 @@ public static class Av1LoopFilter
             {
                 if (dbg) AvDbg.W($"[DB-PATH] wd=16 flat-out+in");
                 // Wide flat filter (13-tap)
-                dst[dstOffset + strideB * -6] = (byte)((p6 + p6 + p6 + p6 + p6 + p6 * 2 + p5 * 2 +
+                dst[dstOffset + strideB * -6] = (ushort)((p6 + p6 + p6 + p6 + p6 + p6 * 2 + p5 * 2 +
                     p4 * 2 + p3 + p2 + p1 + p0 + q0 + 8) >> 4);
-                dst[dstOffset + strideB * -5] = (byte)((p6 + p6 + p6 + p6 + p6 + p5 * 2 + p4 * 2 +
+                dst[dstOffset + strideB * -5] = (ushort)((p6 + p6 + p6 + p6 + p6 + p5 * 2 + p4 * 2 +
                     p3 * 2 + p2 + p1 + p0 + q0 + q1 + 8) >> 4);
-                dst[dstOffset + strideB * -4] = (byte)((p6 + p6 + p6 + p6 + p5 + p4 * 2 + p3 * 2 +
+                dst[dstOffset + strideB * -4] = (ushort)((p6 + p6 + p6 + p6 + p5 + p4 * 2 + p3 * 2 +
                     p2 * 2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4);
-                dst[dstOffset + strideB * -3] = (byte)((p6 + p6 + p6 + p5 + p4 + p3 * 2 + p2 * 2 +
+                dst[dstOffset + strideB * -3] = (ushort)((p6 + p6 + p6 + p5 + p4 + p3 * 2 + p2 * 2 +
                     p1 * 2 + p0 + q0 + q1 + q2 + q3 + 8) >> 4);
-                dst[dstOffset + strideB * -2] = (byte)((p6 + p6 + p5 + p4 + p3 + p2 * 2 + p1 * 2 +
+                dst[dstOffset + strideB * -2] = (ushort)((p6 + p6 + p5 + p4 + p3 + p2 * 2 + p1 * 2 +
                     p0 * 2 + q0 + q1 + q2 + q3 + q4 + 8) >> 4);
-                dst[dstOffset + strideB * -1] = (byte)((p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 * 2 +
+                dst[dstOffset + strideB * -1] = (ushort)((p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 * 2 +
                     q0 * 2 + q1 + q2 + q3 + q4 + q5 + 8) >> 4);
-                dst[dstOffset + strideB * 0] = (byte)((p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 * 2 +
+                dst[dstOffset + strideB * 0] = (ushort)((p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 * 2 +
                     q1 * 2 + q2 + q3 + q4 + q5 + q6 + 8) >> 4);
-                dst[dstOffset + strideB * 1] = (byte)((p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 * 2 +
+                dst[dstOffset + strideB * 1] = (ushort)((p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 * 2 +
                     q2 * 2 + q3 + q4 + q5 + q6 + q6 + 8) >> 4);
-                dst[dstOffset + strideB * 2] = (byte)((p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 * 2 +
+                dst[dstOffset + strideB * 2] = (ushort)((p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 * 2 +
                     q3 * 2 + q4 + q5 + q6 + q6 + q6 + 8) >> 4);
-                dst[dstOffset + strideB * 3] = (byte)((p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 * 2 +
+                dst[dstOffset + strideB * 3] = (ushort)((p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 * 2 +
                     q4 * 2 + q5 + q6 + q6 + q6 + q6 + 8) >> 4);
-                dst[dstOffset + strideB * 4] = (byte)((p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 * 2 +
+                dst[dstOffset + strideB * 4] = (ushort)((p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 * 2 +
                     q5 * 2 + q6 + q6 + q6 + q6 + q6 + 8) >> 4);
-                dst[dstOffset + strideB * 5] = (byte)((p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 * 2 +
+                dst[dstOffset + strideB * 5] = (ushort)((p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 * 2 +
                     q6 * 2 + q6 + q6 + q6 + q6 + q6 + 8) >> 4);
             }
             else if (wd >= 8 && flat8in != 0)
             {
                 if (dbg) AvDbg.W($"[DB-PATH] wd=8 flat-in");
                 // 7-tap flat filter
-                dst[dstOffset + strideB * -3] = (byte)((p3 + p3 + p3 + 2 * p2 + p1 + p0 + q0 + 4) >> 3);
-                dst[dstOffset + strideB * -2] = (byte)((p3 + p3 + p2 + 2 * p1 + p0 + q0 + q1 + 4) >> 3);
-                dst[dstOffset + strideB * -1] = (byte)((p3 + p2 + p1 + 2 * p0 + q0 + q1 + q2 + 4) >> 3);
-                dst[dstOffset + strideB * 0] = (byte)((p2 + p1 + p0 + 2 * q0 + q1 + q2 + q3 + 4) >> 3);
-                dst[dstOffset + strideB * 1] = (byte)((p1 + p0 + q0 + 2 * q1 + q2 + q3 + q3 + 4) >> 3);
-                dst[dstOffset + strideB * 2] = (byte)((p0 + q0 + q1 + 2 * q2 + q3 + q3 + q3 + 4) >> 3);
+                dst[dstOffset + strideB * -3] = (ushort)((p3 + p3 + p3 + 2 * p2 + p1 + p0 + q0 + 4) >> 3);
+                dst[dstOffset + strideB * -2] = (ushort)((p3 + p3 + p2 + 2 * p1 + p0 + q0 + q1 + 4) >> 3);
+                dst[dstOffset + strideB * -1] = (ushort)((p3 + p2 + p1 + 2 * p0 + q0 + q1 + q2 + 4) >> 3);
+                dst[dstOffset + strideB * 0] = (ushort)((p2 + p1 + p0 + 2 * q0 + q1 + q2 + q3 + 4) >> 3);
+                dst[dstOffset + strideB * 1] = (ushort)((p1 + p0 + q0 + 2 * q1 + q2 + q3 + q3 + 4) >> 3);
+                dst[dstOffset + strideB * 2] = (ushort)((p0 + q0 + q1 + 2 * q2 + q3 + q3 + q3 + 4) >> 3);
             }
             else if (wd == 6 && flat8in != 0)
             {
                 // 5-tap flat filter (chroma 6-wide)
-                dst[dstOffset + strideB * -2] = (byte)((p2 + 2 * p2 + 2 * p1 + 2 * p0 + q0 + 4) >> 3);
-                dst[dstOffset + strideB * -1] = (byte)((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
-                dst[dstOffset + strideB * 0] = (byte)((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
-                dst[dstOffset + strideB * 1] = (byte)((p0 + 2 * q0 + 2 * q1 + 2 * q2 + q2 + 4) >> 3);
+                dst[dstOffset + strideB * -2] = (ushort)((p2 + 2 * p2 + 2 * p1 + 2 * p0 + q0 + 4) >> 3);
+                dst[dstOffset + strideB * -1] = (ushort)((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+                dst[dstOffset + strideB * 0] = (ushort)((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+                dst[dstOffset + strideB * 1] = (ushort)((p0 + 2 * q0 + 2 * q1 + 2 * q2 + q2 + 4) >> 3);
             }
             else
             {
@@ -152,23 +156,23 @@ public static class Av1LoopFilter
 
                 if (hev != 0)
                 {
-                    int f = Clip(p1 - q1, -128, 127);
-                    f = Clip(3 * (q0 - p0) + f, -128, 127);
-                    int f1 = Math.Min(f + 4, 127) >> 3;
-                    int f2 = Math.Min(f + 3, 127) >> 3;
-                    dst[dstOffset + strideB * -1] = ClipPixel(p0 + f2);
-                    dst[dstOffset + strideB * 0] = ClipPixel(q0 - f1);
+                    int f = Clip(p1 - q1, -narrowLim, narrowLim - 1);
+                    f = Clip(3 * (q0 - p0) + f, -narrowLim, narrowLim - 1);
+                    int f1 = Math.Min(f + 4, narrowLim - 1) >> 3;
+                    int f2 = Math.Min(f + 3, narrowLim - 1) >> 3;
+                    dst[dstOffset + strideB * -1] = ClipPixel(p0 + f2, pxMax);
+                    dst[dstOffset + strideB * 0] = ClipPixel(q0 - f1, pxMax);
                 }
                 else
                 {
-                    int f = Clip(3 * (q0 - p0), -128, 127);
-                    int f1 = Math.Min(f + 4, 127) >> 3;
-                    int f2 = Math.Min(f + 3, 127) >> 3;
-                    dst[dstOffset + strideB * -1] = ClipPixel(p0 + f2);
-                    dst[dstOffset + strideB * 0] = ClipPixel(q0 - f1);
+                    int f = Clip(3 * (q0 - p0), -narrowLim, narrowLim - 1);
+                    int f1 = Math.Min(f + 4, narrowLim - 1) >> 3;
+                    int f2 = Math.Min(f + 3, narrowLim - 1) >> 3;
+                    dst[dstOffset + strideB * -1] = ClipPixel(p0 + f2, pxMax);
+                    dst[dstOffset + strideB * 0] = ClipPixel(q0 - f1, pxMax);
                     f = (f1 + 1) >> 1;
-                    dst[dstOffset + strideB * -2] = ClipPixel(p1 + f);
-                    dst[dstOffset + strideB * 1] = ClipPixel(q1 - f);
+                    dst[dstOffset + strideB * -2] = ClipPixel(p1 + f, pxMax);
+                    dst[dstOffset + strideB * 1] = ClipPixel(q1 - f, pxMax);
                 }
             }
             if (dbg)
@@ -186,7 +190,7 @@ public static class Av1LoopFilter
     private static int Clip(int v, int min, int max) => v < min ? min : v > max ? max : v;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static byte ClipPixel(int v) => (byte)(v < 0 ? 0 : v > 255 ? 255 : v);
+    private static ushort ClipPixel(int v, int max = 255) => (ushort)(v < 0 ? 0 : v > max ? max : v);
 
     // ========================================================================
     // SB128 Filter Dispatchers (loopfilter_tmpl.c)
@@ -198,9 +202,9 @@ public static class Av1LoopFilter
     /// vmask[3] bitmask: vmask[0]=4-wide, vmask[1]=8-wide, vmask[2]=16-wide.
     /// l[y][4] = loop filter levels per 4x4 block.
     /// </summary>
-    public static void LoopFilterHSb128Y(Span<byte> dst, int dstOffset, int stride,
+    public static void LoopFilterHSb128Y(Span<ushort> dst, int dstOffset, int stride,
         ReadOnlySpan<uint> vmask, byte[,] level, int levelOffset, int b4Stride,
-        Av1FilterLut lut, int h)
+        Av1FilterLut lut, int h, int bitDepth = 8)
     {
         uint vm = vmask[0] | vmask[1] | vmask[2];
         for (uint y = 1; (vm & ~(y - 1)) != 0; y <<= 1, dstOffset += 4 * stride, levelOffset += b4Stride)
@@ -224,7 +228,7 @@ public static class Av1LoopFilter
                 int dbgP2pre = dst[dstOffset - 3], dbgP1pre = dst[dstOffset - 2];
                 int dbgP0pre = dst[dstOffset - 1], dbgQ0pre = dst[dstOffset];
                 int dbgQ1pre = dst[dstOffset + 1], dbgQ2pre = dst[dstOffset + 2];
-                LoopFilterEdge(dst, dstOffset, E2, I2, H, stride, 1, wd);
+                LoopFilterEdge(dst, dstOffset, E2, I2, H, stride, 1, wd, bitDepth);
                 int dbgP2 = dst[dstOffset - 3], dbgP1 = dst[dstOffset - 2];
                 int dbgP0 = dst[dstOffset - 1], dbgQ0 = dst[dstOffset];
                 int dbgQ1 = dst[dstOffset + 1], dbgQ2 = dst[dstOffset + 2];
@@ -233,7 +237,7 @@ public static class Av1LoopFilter
             }
             else
             {
-                LoopFilterEdge(dst, dstOffset, E2, I2, H, stride, 1, wd);
+                LoopFilterEdge(dst, dstOffset, E2, I2, H, stride, 1, wd, bitDepth);
             }
         }
     }
@@ -241,9 +245,9 @@ public static class Av1LoopFilter
     /// <summary>
     /// Vertical luma filter for one SB128 column. Filters row edges (top/bottom).
     /// </summary>
-    public static void LoopFilterVSb128Y(Span<byte> dst, int dstOffset, int stride,
+    public static void LoopFilterVSb128Y(Span<ushort> dst, int dstOffset, int stride,
         ReadOnlySpan<uint> vmask, byte[,] level, int levelOffset, int b4Stride,
-        Av1FilterLut lut, int w)
+        Av1FilterLut lut, int w, int bitDepth = 8)
     {
         uint vm = vmask[0] | vmask[1] | vmask[2];
         for (uint x = 1; (vm & ~(x - 1)) != 0; x <<= 1, dstOffset += 4, levelOffset++)
@@ -264,7 +268,7 @@ public static class Av1LoopFilter
                 dbgP0pre = dst[dstOffset + stride * -1]; dbgQ0pre = dst[dstOffset + stride * 0];
                 dbgQ1pre = dst[dstOffset + stride * 1]; dbgQ2pre = dst[dstOffset + stride * 2];
             }
-            LoopFilterEdge(dst, dstOffset, E2, I2, H, 1, stride, wd);
+            LoopFilterEdge(dst, dstOffset, E2, I2, H, 1, stride, wd, bitDepth);
             if (dbgTarget)
             {
                 int dbgP2 = dst[dstOffset + stride * -3], dbgP1 = dst[dstOffset + stride * -2];
@@ -278,9 +282,9 @@ public static class Av1LoopFilter
     /// <summary>
     /// Horizontal chroma filter for one SB128 column.
     /// </summary>
-    public static void LoopFilterHSb128Uv(Span<byte> dst, int dstOffset, int stride,
+    public static void LoopFilterHSb128Uv(Span<ushort> dst, int dstOffset, int stride,
         ReadOnlySpan<uint> vmask, byte[,] level, int levelOffset, int levelPlane,
-        int b4Stride, Av1FilterLut lut, int h)
+        int b4Stride, Av1FilterLut lut, int h, int bitDepth = 8)
     {
         uint vm = vmask[0] | vmask[1];
         for (uint y = 1; (vm & ~(y - 1)) != 0; y <<= 1, dstOffset += 4 * stride, levelOffset += b4Stride)
@@ -291,16 +295,16 @@ public static class Av1LoopFilter
             int H = L >> 4;
             int E2 = lut.E[L], I2 = lut.I[L];
             int idx = (vmask[1] & y) != 0 ? 1 : 0;
-            LoopFilterEdge(dst, dstOffset, E2, I2, H, stride, 1, 4 + 2 * idx);
+            LoopFilterEdge(dst, dstOffset, E2, I2, H, stride, 1, 4 + 2 * idx, bitDepth);
         }
     }
 
     /// <summary>
     /// Vertical chroma filter for one SB128 column.
     /// </summary>
-    public static void LoopFilterVSb128Uv(Span<byte> dst, int dstOffset, int stride,
+    public static void LoopFilterVSb128Uv(Span<ushort> dst, int dstOffset, int stride,
         ReadOnlySpan<uint> vmask, byte[,] level, int levelOffset, int levelPlane,
-        int b4Stride, Av1FilterLut lut, int w)
+        int b4Stride, Av1FilterLut lut, int w, int bitDepth = 8)
     {
         uint vm = vmask[0] | vmask[1];
         for (uint x = 1; (vm & ~(x - 1)) != 0; x <<= 1, dstOffset += 4, levelOffset++)
@@ -311,7 +315,7 @@ public static class Av1LoopFilter
             int H = L >> 4;
             int E2 = lut.E[L], I2 = lut.I[L];
             int idx = (vmask[1] & x) != 0 ? 1 : 0;
-            LoopFilterEdge(dst, dstOffset, E2, I2, H, 1, stride, 4 + 2 * idx);
+            LoopFilterEdge(dst, dstOffset, E2, I2, H, 1, stride, 4 + 2 * idx, bitDepth);
         }
     }
 
@@ -820,8 +824,8 @@ public static class Av1LoopFilter
     /// Filter luma columns for a plane within one SB128.
     /// </summary>
     public static void FilterPlaneColsY(byte[,] level, int levelOffset, int b4Stride,
-        Av1FilterMask lflvl, int maskIdx, Span<byte> dst, int dstOffset, int stride,
-        int w, int starty4, int endy4, Av1FilterLut lut, bool haveLeft)
+        Av1FilterMask lflvl, int maskIdx, Span<ushort> dst, int dstOffset, int stride,
+        int w, int starty4, int endy4, Av1FilterLut lut, bool haveLeft, int bitDepth = 8)
     {
         // Dump mask for first SB128 column at sby=0
         if (DumpEdges && dstOffset < 128 && starty4 == 0 && !haveLeft && maskIdx == 0)
@@ -867,7 +871,7 @@ public static class Av1LoopFilter
             // Debug: dump pre/post for first edge
             AvDbg.W($"[FILTER-COLS-Y] x={x} haveLeft={haveLeft} w={w} starty4={starty4} endy4={endy4} hmask=[{hmask[0]:X8},{hmask[1]:X8},{hmask[2]:X8}]");
             LoopFilterHSb128Y(dst, dstOffset + x * 4, stride, hmask,
-                level, levelOffset + x, b4Stride, lut, endy4 - starty4);
+                level, levelOffset + x, b4Stride, lut, endy4 - starty4, bitDepth);
         }
     }
 
@@ -875,8 +879,8 @@ public static class Av1LoopFilter
     /// Filter luma rows for a plane within one SB128.
     /// </summary>
     public static void FilterPlaneRowsY(byte[,] level, int levelOffset, int b4Stride,
-        Av1FilterMask lflvl, int maskIdx, Span<byte> dst, int dstOffset, int stride,
-        int w, int starty4, int endy4, Av1FilterLut lut, bool haveTop)
+        Av1FilterMask lflvl, int maskIdx, Span<ushort> dst, int dstOffset, int stride,
+        int w, int starty4, int endy4, Av1FilterLut lut, bool haveTop, int bitDepth = 8)
     {
         int off = dstOffset;
         int lvl = levelOffset;
@@ -890,7 +894,7 @@ public static class Av1LoopFilter
             vmask[3] = 0;
 
             LoopFilterVSb128Y(dst, off, stride, vmask,
-                level, lvl, b4Stride, lut, w);
+                level, lvl, b4Stride, lut, w, bitDepth);
         }
     }
 
@@ -898,9 +902,9 @@ public static class Av1LoopFilter
     /// Filter chroma columns for one SB128.
     /// </summary>
     public static void FilterPlaneColsUv(byte[,] level, int levelOffset, int b4Stride,
-        Av1FilterMask lflvl, int maskIdx, Span<byte> dstU, int uOffset,
-        Span<byte> dstV, int vOffset, int stride,
-        int w, int starty4, int endy4, int ssVer, Av1FilterLut lut, bool haveLeft)
+        Av1FilterMask lflvl, int maskIdx, Span<ushort> dstU, int uOffset,
+        Span<ushort> dstV, int vOffset, int stride,
+        int w, int starty4, int endy4, int ssVer, Av1FilterLut lut, bool haveLeft, int bitDepth = 8)
     {
         for (int x = 0; x < w; x++)
         {
@@ -923,8 +927,8 @@ public static class Av1LoopFilter
             }
             hmask[2] = 0;
 
-            LoopFilterHSb128Uv(dstU, uOffset + x * 4, stride, hmask, level, levelOffset + x, 2, b4Stride, lut, endy4 - starty4);
-            LoopFilterHSb128Uv(dstV, vOffset + x * 4, stride, hmask, level, levelOffset + x, 3, b4Stride, lut, endy4 - starty4);
+            LoopFilterHSb128Uv(dstU, uOffset + x * 4, stride, hmask, level, levelOffset + x, 2, b4Stride, lut, endy4 - starty4, bitDepth);
+            LoopFilterHSb128Uv(dstV, vOffset + x * 4, stride, hmask, level, levelOffset + x, 3, b4Stride, lut, endy4 - starty4, bitDepth);
         }
     }
 
@@ -932,9 +936,9 @@ public static class Av1LoopFilter
     /// Filter chroma rows for one SB128.
     /// </summary>
     public static void FilterPlaneRowsUv(byte[,] level, int levelOffset, int b4Stride,
-        Av1FilterMask lflvl, int maskIdx, Span<byte> dstU, int uOffset,
-        Span<byte> dstV, int vOffset, int stride,
-        int w, int starty4, int endy4, int ssHor, Av1FilterLut lut, bool haveTop)
+        Av1FilterMask lflvl, int maskIdx, Span<ushort> dstU, int uOffset,
+        Span<ushort> dstV, int vOffset, int stride,
+        int w, int starty4, int endy4, int ssHor, Av1FilterLut lut, bool haveTop, int bitDepth = 8)
     {
         int offU = uOffset, offV = vOffset;
         int lvl = levelOffset;
@@ -946,18 +950,19 @@ public static class Av1LoopFilter
             vmask[1] = (uint)(lflvl.FilterUv[1, y, 1, 0] | ((uint)lflvl.FilterUv[1, y, 1, 1] << (16 >> ssHor)));
             vmask[2] = 0;
 
-            LoopFilterVSb128Uv(dstU, offU, stride, vmask, level, lvl, 2, b4Stride, lut, w);
-            LoopFilterVSb128Uv(dstV, offV, stride, vmask, level, lvl, 3, b4Stride, lut, w);
+            LoopFilterVSb128Uv(dstU, offU, stride, vmask, level, lvl, 2, b4Stride, lut, w, bitDepth);
+            LoopFilterVSb128Uv(dstV, offV, stride, vmask, level, lvl, 3, b4Stride, lut, w, bitDepth);
         }
     }
 
     /// <summary>
     /// Apply loop filter column pass for one SB row. Maps to dav1d_loopfilter_sbrow_cols.
     /// </summary>
-    public static void LoopFilterSbRowCols(Av1DecoderContext ctx, Span<byte> yPlane,
-        Span<byte> uPlane, Span<byte> vPlane, int yOffset, int uOffset, int vOffset,
+    public static void LoopFilterSbRowCols(Av1DecoderContext ctx, Span<ushort> yPlane,
+        Span<ushort> uPlane, Span<ushort> vPlane, int yOffset, int uOffset, int vOffset,
         Av1FilterMask[] lflvl, int sby, bool startOfTileRow)
     {
+        int bitDepth = ctx.BitDepth;
         ref readonly var fh = ref ctx.FrameHeader;
         ref readonly var sh = ref ctx.SequenceHeader;
         int isSb64 = sh.Sb128 ? 0 : 1;
@@ -978,7 +983,7 @@ public static class Av1LoopFilter
         {
             FilterPlaneColsY(ctx.LfLevel, levelOff + x * 32, ctx.B4Stride,
                 lflvl[x], 0, yPlane, yOff, ctx.YStride,
-                Math.Min(32, ctx.W4 - x * 32), starty4, endy4, ctx.LfLimLut, haveLeft);
+                Math.Min(32, ctx.W4 - x * 32), starty4, endy4, ctx.LfLimLut, haveLeft, bitDepth);
         }
 
         if (fh.LfLevelU == 0 && fh.LfLevelV == 0) return;
@@ -993,17 +998,18 @@ public static class Av1LoopFilter
             FilterPlaneColsUv(ctx.LfLevel, uvLvlOff + (x * 32 >> ssHor), ctx.B4Stride,
                 lflvl[x], 0, uPlane, uvOff, vPlane, uvOff, ctx.UvStride,
                 (Math.Min(32, ctx.W4 - x * 32) + ssHor) >> ssHor,
-                starty4 >> ssVer, uvEndy4, ssVer, ctx.LfLimLut, haveLeft);
+                starty4 >> ssVer, uvEndy4, ssVer, ctx.LfLimLut, haveLeft, bitDepth);
         }
     }
 
     /// <summary>
     /// Apply loop filter row pass for one SB row. Maps to dav1d_loopfilter_sbrow_rows.
     /// </summary>
-    public static void LoopFilterSbRowRows(Av1DecoderContext ctx, Span<byte> yPlane,
-        Span<byte> uPlane, Span<byte> vPlane, int yOffset, int uOffset, int vOffset,
+    public static void LoopFilterSbRowRows(Av1DecoderContext ctx, Span<ushort> yPlane,
+        Span<ushort> uPlane, Span<ushort> vPlane, int yOffset, int uOffset, int vOffset,
         Av1FilterMask[] lflvl, int sby)
     {
+        int bitDepth = ctx.BitDepth;
         ref readonly var fh = ref ctx.FrameHeader;
         ref readonly var sh = ref ctx.SequenceHeader;
         bool haveTop = sby > 0;
@@ -1022,7 +1028,7 @@ public static class Av1LoopFilter
         {
             FilterPlaneRowsY(ctx.LfLevel, levelOff + x * 32, ctx.B4Stride,
                 lflvl[x], 0, yPlane, yOff, ctx.YStride,
-                Math.Min(32, ctx.W4 - x * 32), starty4, endy4, ctx.LfLimLut, haveTop);
+                Math.Min(32, ctx.W4 - x * 32), starty4, endy4, ctx.LfLimLut, haveTop, bitDepth);
         }
 
         if (fh.LfLevelU == 0 && fh.LfLevelV == 0) return;
@@ -1036,7 +1042,7 @@ public static class Av1LoopFilter
             FilterPlaneRowsUv(ctx.LfLevel, uvLvlOff + (x * 32 >> ssHor), ctx.B4Stride,
                 lflvl[x], 0, uPlane, uvOff, vPlane, uvOff, ctx.UvStride,
                 (Math.Min(32, ctx.W4 - x * 32) + ssHor) >> ssHor,
-                starty4 >> ssVer, uvEndy4, ssHor, ctx.LfLimLut, haveTop);
+                starty4 >> ssVer, uvEndy4, ssHor, ctx.LfLimLut, haveTop, bitDepth);
         }
     }
 }

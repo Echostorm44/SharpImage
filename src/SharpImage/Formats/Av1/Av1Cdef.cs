@@ -80,8 +80,9 @@ public static class Av1Cdef
     /// Find the dominant edge direction for an 8×8 block.
     /// Returns direction index (0-7) and sets variance.
     /// </summary>
-    public static int FindDirection(ReadOnlySpan<byte> img, int imgOffset, int stride, out uint variance)
+    public static int FindDirection(ReadOnlySpan<ushort> img, int imgOffset, int stride, out uint variance, int bitDepth = 8)
     {
+        int bdMin8 = bitDepth - 8;
         Span<int> partialSumHv0 = stackalloc int[8];
         Span<int> partialSumHv1 = stackalloc int[8];
         Span<int> partialSumDiag0 = stackalloc int[15];
@@ -95,7 +96,7 @@ public static class Av1Cdef
         {
             for (int x = 0; x < 8; x++)
             {
-                int px = img[imgOffset + x] - 128;
+                int px = (img[imgOffset + x] >> bdMin8) - 128;
                 partialSumDiag0[y + x] += px;
                 partialSumAlt0[y + (x >> 1)] += px;
                 partialSumHv0[y] += px;
@@ -157,10 +158,10 @@ public static class Av1Cdef
     /// tmp points to offset [2*stride+2] in a (h+4)×12 buffer.
     /// </summary>
     private static void Padding(Span<short> tmp, int tmpOffset, int tmpStride,
-        ReadOnlySpan<byte> src, int srcOffset, int srcStride,
-        ReadOnlySpan<byte> left, int leftOffset, int leftStride,
-        ReadOnlySpan<byte> top, int topOffset,
-        ReadOnlySpan<byte> bottom, int bottomOffset,
+        ReadOnlySpan<ushort> src, int srcOffset, int srcStride,
+        ReadOnlySpan<ushort> left, int leftOffset, int leftStride,
+        ReadOnlySpan<ushort> top, int topOffset,
+        ReadOnlySpan<ushort> bottom, int bottomOffset,
         int w, int h, EdgeFlags edges)
     {
         int xStart = -2, xEnd = w + 2, yStart = -2, yEnd = h + 2;
@@ -190,20 +191,20 @@ public static class Av1Cdef
         for (int y = yStart; y < 0; y++)
         {
             for (int x = xStart; x < xEnd; x++)
-                tmp[tmpOffset + x + y * tmpStride] = top[topOff + x];
+                tmp[tmpOffset + x + y * tmpStride] = (short)top[topOff + x];
             topOff += srcStride;
         }
 
         for (int y = 0; y < h; y++)
             for (int x = xStart; x < 0; x++)
-                tmp[tmpOffset + x + y * tmpStride] = left[leftOffset + y * leftStride + (2 + x)];
+                tmp[tmpOffset + x + y * tmpStride] = (short)left[leftOffset + y * leftStride + (2 + x)];
 
         int sOff = srcOffset;
         int tOff = tmpOffset;
         for (int y = 0; y < h; y++)
         {
             for (int x = 0; x < xEnd; x++)
-                tmp[tOff + x] = src[sOff + x];
+                tmp[tOff + x] = (short)src[sOff + x];
             sOff += srcStride;
             tOff += tmpStride;
         }
@@ -212,7 +213,7 @@ public static class Av1Cdef
         for (int y = h; y < yEnd; y++)
         {
             for (int x = xStart; x < xEnd; x++)
-                tmp[tOff + x] = bottom[bOff + x];
+                tmp[tOff + x] = (short)bottom[bOff + x];
             bOff += srcStride;
             tOff += tmpStride;
         }
@@ -238,13 +239,14 @@ public static class Av1Cdef
     /// dst is filtered in-place. left[y][2] provides the 2 left context pixels per row.
     /// top/bottom provide the 2 rows above/below for padding.
     /// </summary>
-    public static void FilterBlock(Span<byte> dst, int dstOffset, int dstStride,
-        ReadOnlySpan<byte> left, int leftOffset, int leftStride,
-        ReadOnlySpan<byte> top, int topOffset,
-        ReadOnlySpan<byte> bottom, int bottomOffset,
+    public static void FilterBlock(Span<ushort> dst, int dstOffset, int dstStride,
+        ReadOnlySpan<ushort> left, int leftOffset, int leftStride,
+        ReadOnlySpan<ushort> top, int topOffset,
+        ReadOnlySpan<ushort> bottom, int bottomOffset,
         int priStrength, int secStrength, int dir, int damping,
-        int w, int h, EdgeFlags edges)
+        int w, int h, EdgeFlags edges, int bitDepth = 8)
     {
+        int bdMin8 = bitDepth - 8;
         const int tmpStride = 12;
         Span<short> tmpBuf = stackalloc short[144]; // 12*12
         int tmpCenter = 2 * tmpStride + 2;
@@ -260,7 +262,7 @@ public static class Av1Cdef
 
         if (priStrength != 0)
         {
-            int priTap = 4 - ((priStrength) & 1); // for 8-bit, bitdepth_min_8=0
+            int priTap = 4 - ((priStrength >> bdMin8) & 1); // dav1d: pri_tap = 4 - ((pri_strength >> bitdepth_min_8) & 1)
             int priShift = Math.Max(0, damping - Log2(priStrength));
 
             if (secStrength != 0)
@@ -301,7 +303,7 @@ public static class Av1Cdef
                             min = MinU16(s2, min); max = Math.Max(s2, max);
                             min = MinU16(s3, min); max = Math.Max(s3, max);
                         }
-                        dst[dOff + x] = (byte)Math.Clamp(
+                        dst[dOff + x] = (ushort)Math.Clamp(
                             px + ((sum - (sum < 0 ? 1 : 0) + 8) >> 4), min, max);
                     }
                     dOff += dstStride;
@@ -326,7 +328,7 @@ public static class Av1Cdef
                             sum += priTapK * Constrain(p1 - px, priStrength, priShift);
                             priTapK = (priTapK & 3) | 2;
                         }
-                        dst[dOff + x] = (byte)(px + ((sum - (sum < 0 ? 1 : 0) + 8) >> 4));
+                        dst[dOff + x] = (ushort)(px + ((sum - (sum < 0 ? 1 : 0) + 8) >> 4));
                     }
                     dOff += dstStride;
                     tOff += tmpStride;

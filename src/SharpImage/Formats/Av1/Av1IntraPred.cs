@@ -1451,4 +1451,633 @@ public static class Av1IntraPred
         for (int y = 0; y < height; y++)
             dst.Slice(y * dstStride, width).Fill(dcVal);
     }
+
+    // ========================================================================
+    // High bit depth: edge preparation + dispatcher + directional/filter/CFL
+    // Mirrors the 8-bit path exactly; clamps that used 255 now use (1<<bd)-1.
+    // ========================================================================
+
+    /// <summary>High bit depth edge preparation. See <see cref="PrepareIntraEdges"/>.</summary>
+    public static ImplPredMode PrepareIntraEdges16(
+        int x, bool haveLeft, int y, bool haveTop,
+        int w, int h,
+        EdgeFlags edgeFlags,
+        ReadOnlySpan<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> prefilterTopEdge,
+        int mode, ref int angle,
+        int tw, int th, bool enableEdgeFilter,
+        Span<ushort> edgeBuf, int centerOffset,
+        int bitDepth)
+    {
+        var implMode = ResolveMode(mode, haveLeft, haveTop, ref angle);
+        int needs = EdgeNeeds[(int)implMode];
+
+        ReadOnlySpan<ushort> dstTop = default;
+        if (haveTop && ((needs & NeedsTop) != 0 || (needs & NeedsTopLeft) != 0 ||
+                        ((needs & NeedsLeft) != 0 && !haveLeft)))
+        {
+            dstTop = prefilterTopEdge.IsEmpty
+                ? dst.Slice(-dstStride)
+                : prefilterTopEdge.Slice(x * 4);
+        }
+
+        if ((needs & NeedsLeft) != 0)
+        {
+            int sz = th << 2;
+            int leftBase = centerOffset - sz;
+
+            if (haveLeft)
+            {
+                int pxHave = Math.Min(sz, (h - y) << 2);
+                for (int i = 0; i < pxHave; i++)
+                    edgeBuf[centerOffset - 1 - i] = dst[dstStride * i - 1];
+                if (pxHave < sz)
+                    edgeBuf.Slice(leftBase, sz - pxHave).Fill(edgeBuf[centerOffset - pxHave]);
+            }
+            else
+            {
+                ushort fill = haveTop ? dstTop[0] : (ushort)(((1 << bitDepth) >> 1) + 1);
+                edgeBuf.Slice(leftBase, sz).Fill(fill);
+            }
+
+            if ((needs & NeedsBottomLeft) != 0)
+            {
+                bool haveBottomLeft = haveLeft && (y + th < h) &&
+                                      (edgeFlags & EdgeFlags.LeftHasBottom) != 0;
+                if (haveBottomLeft)
+                {
+                    int pxHave = Math.Min(sz, (h - y - th) << 2);
+                    for (int i = 0; i < pxHave; i++)
+                        edgeBuf[leftBase - 1 - i] = dst[(sz + i) * dstStride - 1];
+                    if (pxHave < sz)
+                        edgeBuf.Slice(leftBase - sz, sz - pxHave).Fill(edgeBuf[leftBase - pxHave]);
+                }
+                else
+                {
+                    edgeBuf.Slice(leftBase - sz, sz).Fill(edgeBuf[leftBase]);
+                }
+            }
+        }
+
+        if ((needs & NeedsTop) != 0)
+        {
+            int sz = tw << 2;
+            int topBase = centerOffset + 1;
+
+            if (haveTop)
+            {
+                int pxHave = Math.Min(sz, (w - x) << 2);
+                dstTop.Slice(0, pxHave).CopyTo(edgeBuf.Slice(topBase, pxHave));
+                if (pxHave < sz)
+                    edgeBuf.Slice(topBase + pxHave, sz - pxHave).Fill(edgeBuf[topBase + pxHave - 1]);
+            }
+            else
+            {
+                ushort fill = haveLeft ? dst[-1] : (ushort)(((1 << bitDepth) >> 1) - 1);
+                edgeBuf.Slice(topBase, sz).Fill(fill);
+            }
+
+            if ((needs & NeedsTopRight) != 0)
+            {
+                bool haveTopRight = haveTop && (x + tw < w) &&
+                                    (edgeFlags & EdgeFlags.TopHasRight) != 0;
+                if (haveTopRight)
+                {
+                    int pxHave = Math.Min(sz, (w - x - tw) << 2);
+                    dstTop.Slice(sz, pxHave).CopyTo(edgeBuf.Slice(topBase + sz, pxHave));
+                    if (pxHave < sz)
+                        edgeBuf.Slice(topBase + sz + pxHave, sz - pxHave)
+                               .Fill(edgeBuf[topBase + sz + pxHave - 1]);
+                }
+                else
+                {
+                    edgeBuf.Slice(topBase + sz, sz).Fill(edgeBuf[topBase + sz - 1]);
+                }
+            }
+        }
+
+        if ((needs & NeedsTopLeft) != 0)
+        {
+            if (haveLeft)
+                edgeBuf[centerOffset] = haveTop ? dstTop[-1] : dst[-1];
+            else
+                edgeBuf[centerOffset] = haveTop ? dstTop[0] : (ushort)((1 << bitDepth) >> 1);
+
+            if (implMode == ImplPredMode.Z2 && tw + th >= 6 && enableEdgeFilter)
+            {
+                edgeBuf[centerOffset] = (ushort)(((edgeBuf[centerOffset - 1] +
+                    edgeBuf[centerOffset + 1]) * 5 + edgeBuf[centerOffset] * 6 + 8) >> 4);
+            }
+        }
+
+        return implMode;
+    }
+
+    /// <summary>High bit depth prediction dispatcher. See <see cref="Predict"/>.</summary>
+    public static void Predict16(int implMode,
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> edgeBuf, int center,
+        int width, int height, int angle,
+        int maxWidth, int maxHeight, int bitDepth)
+    {
+        bool enableEdgeFilter = (angle & (1 << 10)) != 0;
+        switch (implMode)
+        {
+            case 0: PredDc16(dst, dstStride, edgeBuf, center, width, height, bitDepth); break;
+            case 1: PredV16(dst, dstStride, edgeBuf, center, width, height); break;
+            case 2: PredH16(dst, dstStride, edgeBuf, center, width, height); break;
+            case 3: PredPaeth16(dst, dstStride, edgeBuf, center, width, height); break;
+            case 4: PredSmooth16(dst, dstStride, edgeBuf, center, width, height); break;
+            case 5: PredSmoothV16(dst, dstStride, edgeBuf, center, width, height); break;
+            case 6: PredSmoothH16(dst, dstStride, edgeBuf, center, width, height); break;
+            case 7: PredDcLeft16(dst, dstStride, edgeBuf, center, width, height); break;
+            case 8: PredDcTop16(dst, dstStride, edgeBuf, center, width, height); break;
+            case 9: PredDc12816(dst, dstStride, width, height, bitDepth); break;
+            case 10: PredZ1_16(dst, dstStride, edgeBuf, center, width, height, angle, enableEdgeFilter, bitDepth); break;
+            case 11: PredZ2_16(dst, dstStride, edgeBuf, center, width, height, angle, enableEdgeFilter, maxWidth, maxHeight, bitDepth); break;
+            case 12: PredZ3_16(dst, dstStride, edgeBuf, center, width, height, angle, enableEdgeFilter, bitDepth); break;
+            case 13: PredFilter16(dst, dstStride, edgeBuf, center, width, height, angle, bitDepth); break;
+        }
+    }
+
+    public static void PredZ1_16(
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> edgeBuf, int center,
+        int width, int height, int angle, bool enableEdgeFilter, int bitDepth)
+    {
+        bool isSm = ((angle >> 9) & 1) != 0;
+        angle &= 511;
+        int dx = Av1Tables.DrIntraDerivative[angle >> 1];
+        int maxBaseX;
+
+        Span<ushort> topBuf = stackalloc ushort[128];
+        bool upsample = enableEdgeFilter && GetUpsample(width + height, 90 - angle, isSm);
+        bool useTopBuf;
+        int topOffset = 0;
+
+        if (upsample)
+        {
+            UpsampleEdge16(topBuf, width + height,
+                         edgeBuf, center + 1, -1,
+                         width + Math.Min(width, height), bitDepth);
+            useTopBuf = true;
+            maxBaseX = 2 * (width + height) - 2;
+            dx <<= 1;
+        }
+        else
+        {
+            int filterStrength = enableEdgeFilter
+                ? GetFilterStrength(width + height, 90 - angle, isSm) : 0;
+
+            if (filterStrength > 0)
+            {
+                FilterEdge16(topBuf, width + height, 0, width + height,
+                           edgeBuf, center + 1, -1,
+                           width + Math.Min(width, height), filterStrength);
+                useTopBuf = true;
+                maxBaseX = width + height - 1;
+            }
+            else
+            {
+                useTopBuf = false;
+                topOffset = center + 1;
+                maxBaseX = width + Math.Min(width, height) - 1;
+            }
+        }
+
+        int baseInc = 1 + (upsample ? 1 : 0);
+        for (int y = 0, xpos = dx; y < height; y++, xpos += dx)
+        {
+            var row = dst.Slice(y * dstStride, width);
+            int frac = xpos & 0x3E;
+
+            for (int x = 0, @base = xpos >> 6; x < width; x++, @base += baseInc)
+            {
+                if (@base < maxBaseX)
+                {
+                    int s0 = useTopBuf ? topBuf[@base] : edgeBuf[topOffset + @base];
+                    int s1 = useTopBuf ? topBuf[@base + 1] : edgeBuf[topOffset + @base + 1];
+                    int v = s0 * (64 - frac) + s1 * frac;
+                    row[x] = (ushort)((v + 32) >> 6);
+                }
+                else
+                {
+                    ushort fill = useTopBuf ? topBuf[maxBaseX] : edgeBuf[topOffset + maxBaseX];
+                    row.Slice(x, width - x).Fill(fill);
+                    break;
+                }
+            }
+        }
+    }
+
+    public static void PredZ2_16(
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> edgeBuf, int center,
+        int width, int height, int angle, bool enableEdgeFilter,
+        int maxWidth, int maxHeight, int bitDepth)
+    {
+        bool isSm = ((angle >> 9) & 1) != 0;
+        angle &= 511;
+        int dy = Av1Tables.DrIntraDerivative[(angle - 90) >> 1];
+        int dx = Av1Tables.DrIntraDerivative[(180 - angle) >> 1];
+
+        bool upsampleLeft = enableEdgeFilter && GetUpsample(width + height, 180 - angle, isSm);
+        bool upsampleAbove = enableEdgeFilter && GetUpsample(width + height, angle - 90, isSm);
+
+        Span<ushort> edge = stackalloc ushort[129];
+        int edgeCenter = 64;
+
+        if (upsampleAbove)
+        {
+            UpsampleEdge16(edge.Slice(edgeCenter), width + 1,
+                         edgeBuf, center, 0, width + 1, bitDepth);
+            dx <<= 1;
+        }
+        else
+        {
+            int filterStrength = enableEdgeFilter
+                ? GetFilterStrength(width + height, angle - 90, isSm) : 0;
+            if (filterStrength > 0)
+            {
+                FilterEdge16(edge.Slice(edgeCenter + 1), width, 0, maxWidth,
+                           edgeBuf, center + 1, -1, width, filterStrength);
+            }
+            else
+            {
+                edgeBuf.Slice(center + 1, width).CopyTo(edge.Slice(edgeCenter + 1, width));
+            }
+        }
+
+        if (upsampleLeft)
+        {
+            UpsampleEdge16(edge.Slice(edgeCenter - height * 2), height + 1,
+                         edgeBuf, center - height, 0, height + 1, bitDepth);
+            dy <<= 1;
+        }
+        else
+        {
+            int filterStrength = enableEdgeFilter
+                ? GetFilterStrength(width + height, 180 - angle, isSm) : 0;
+            if (filterStrength > 0)
+            {
+                FilterEdge16(edge.Slice(edgeCenter - height), height,
+                           height - maxHeight, height,
+                           edgeBuf, center - height, 0, height + 1, filterStrength);
+            }
+            else
+            {
+                for (int i = 0; i < height; i++)
+                    edge[edgeCenter - height + i] = edgeBuf[center - height + i];
+            }
+        }
+
+        edge[edgeCenter] = edgeBuf[center];
+
+        int baseIncX = 1 + (upsampleAbove ? 1 : 0);
+        int leftStep = 1 + (upsampleLeft ? 1 : 0);
+
+        for (int y = 0, xpos = ((1 + (upsampleAbove ? 1 : 0)) << 6) - dx;
+             y < height; y++, xpos -= dx)
+        {
+            var row = dst.Slice(y * dstStride, width);
+            int baseX = xpos >> 6;
+            int fracX = xpos & 0x3E;
+
+            for (int x = 0, ypos = (y << (6 + (upsampleLeft ? 1 : 0))) - dy;
+                 x < width; x++, baseX += baseIncX, ypos -= dy)
+            {
+                int v;
+                if (baseX >= 0)
+                {
+                    v = edge[edgeCenter + baseX] * (64 - fracX) +
+                        edge[edgeCenter + baseX + 1] * fracX;
+                }
+                else
+                {
+                    int baseY = ypos >> 6;
+                    int fracY = ypos & 0x3E;
+                    v = edge[edgeCenter - leftStep - baseY] * (64 - fracY) +
+                        edge[edgeCenter - leftStep - baseY - 1] * fracY;
+                }
+                row[x] = (ushort)((v + 32) >> 6);
+            }
+        }
+    }
+
+    public static void PredZ3_16(
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> edgeBuf, int center,
+        int width, int height, int angle, bool enableEdgeFilter, int bitDepth)
+    {
+        bool isSm = ((angle >> 9) & 1) != 0;
+        angle &= 511;
+        int dy = Av1Tables.DrIntraDerivative[(270 - angle) >> 1];
+
+        Span<ushort> leftBuf = stackalloc ushort[128];
+        int maxBaseY;
+        bool upsample = enableEdgeFilter && GetUpsample(width + height, angle - 180, isSm);
+        bool useLeftBuf;
+        int leftOffset = 0;
+
+        if (upsample)
+        {
+            UpsampleEdge16(leftBuf, width + height,
+                         edgeBuf, center - (width + height),
+                         Math.Max(width - height, 0), width + height + 1, bitDepth);
+            useLeftBuf = true;
+            leftOffset = 2 * (width + height) - 2;
+            maxBaseY = 2 * (width + height) - 2;
+            dy <<= 1;
+        }
+        else
+        {
+            int filterStrength = enableEdgeFilter
+                ? GetFilterStrength(width + height, angle - 180, isSm) : 0;
+
+            if (filterStrength > 0)
+            {
+                FilterEdge16(leftBuf, width + height, 0, width + height,
+                           edgeBuf, center - (width + height),
+                           Math.Max(width - height, 0), width + height + 1, filterStrength);
+                useLeftBuf = true;
+                leftOffset = width + height - 1;
+                maxBaseY = width + height - 1;
+            }
+            else
+            {
+                useLeftBuf = false;
+                leftOffset = center - 1;
+                maxBaseY = height + Math.Min(width, height) - 1;
+            }
+        }
+
+        int baseInc = 1 + (upsample ? 1 : 0);
+        for (int x = 0, ypos = dy; x < width; x++, ypos += dy)
+        {
+            int frac = ypos & 0x3E;
+            for (int y = 0, @base = ypos >> 6; y < height; y++, @base += baseInc)
+            {
+                if (@base < maxBaseY)
+                {
+                    int s0 = useLeftBuf ? leftBuf[leftOffset - @base] : edgeBuf[leftOffset - @base];
+                    int s1 = useLeftBuf ? leftBuf[leftOffset - @base - 1] : edgeBuf[leftOffset - @base - 1];
+                    int v = s0 * (64 - frac) + s1 * frac;
+                    dst[y * dstStride + x] = (ushort)((v + 32) >> 6);
+                }
+                else
+                {
+                    ushort fill = useLeftBuf ? leftBuf[leftOffset - maxBaseY] : edgeBuf[leftOffset - maxBaseY];
+                    for (; y < height; y++)
+                        dst[y * dstStride + x] = fill;
+                    break;
+                }
+            }
+        }
+    }
+
+    private static void FilterEdge16(
+        Span<ushort> output, int sz,
+        int limFrom, int limTo,
+        ReadOnlySpan<ushort> input, int inputOffset,
+        int from, int to, int strength)
+    {
+        ReadOnlySpan<byte> kernel0 = stackalloc byte[] { 0, 4, 8, 4, 0 };
+        ReadOnlySpan<byte> kernel1 = stackalloc byte[] { 0, 5, 6, 5, 0 };
+        ReadOnlySpan<byte> kernel2 = stackalloc byte[] { 2, 4, 4, 4, 2 };
+        var kernel = strength switch
+        {
+            1 => kernel0,
+            2 => kernel1,
+            _ => kernel2
+        };
+
+        int i = 0;
+        for (; i < Math.Min(sz, limFrom); i++)
+            output[i] = input[inputOffset + Math.Clamp(i, from, to - 1)];
+        for (; i < Math.Min(limTo, sz); i++)
+        {
+            int s = 0;
+            for (int j = 0; j < 5; j++)
+                s += input[inputOffset + Math.Clamp(i - 2 + j, from, to - 1)] * kernel[j];
+            output[i] = (ushort)((s + 8) >> 4);
+        }
+        for (; i < sz; i++)
+            output[i] = input[inputOffset + Math.Clamp(i, from, to - 1)];
+    }
+
+    private static void UpsampleEdge16(
+        Span<ushort> output, int hsz,
+        ReadOnlySpan<ushort> input, int inputOffset,
+        int from, int to, int bitDepth)
+    {
+        ReadOnlySpan<sbyte> kernel = stackalloc sbyte[] { -1, 9, 9, -1 };
+        int max = (1 << bitDepth) - 1;
+        int i;
+        for (i = 0; i < hsz - 1; i++)
+        {
+            output[i * 2] = input[inputOffset + Math.Clamp(i, from, to - 1)];
+            int s = 0;
+            for (int j = 0; j < 4; j++)
+                s += input[inputOffset + Math.Clamp(i + j - 1, from, to - 1)] * kernel[j];
+            output[i * 2 + 1] = (ushort)Math.Clamp((s + 8) >> 4, 0, max);
+        }
+        output[i * 2] = input[inputOffset + Math.Clamp(i, from, to - 1)];
+    }
+
+    public static void PredFilter16(
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> edgeBuf, int center,
+        int width, int height, int filterIndex, int bitDepth)
+    {
+        filterIndex &= 511;
+        int max = (1 << bitDepth) - 1;
+        int topIdx = center + 1;
+        int dstOffset = 0;
+
+        for (int y = 0; y < height; y += 2)
+        {
+            int topleftEdgeIdx = center - y;
+            for (int x = 0; x < width; x += 4)
+            {
+                int p0, p1, p2, p3, p4, p5, p6;
+
+                if (y == 0)
+                    p0 = edgeBuf[topleftEdgeIdx];
+                else if (x == 0)
+                    p0 = edgeBuf[center - y];
+                else
+                    p0 = dst[dstOffset - dstStride + x - 1];
+
+                if (y == 0)
+                {
+                    p1 = edgeBuf[topIdx + x];
+                    p2 = edgeBuf[topIdx + x + 1];
+                    p3 = edgeBuf[topIdx + x + 2];
+                    p4 = edgeBuf[topIdx + x + 3];
+                }
+                else
+                {
+                    p1 = dst[dstOffset - dstStride + x];
+                    p2 = dst[dstOffset - dstStride + x + 1];
+                    p3 = dst[dstOffset - dstStride + x + 2];
+                    p4 = dst[dstOffset - dstStride + x + 3];
+                }
+
+                if (x == 0)
+                {
+                    p5 = edgeBuf[center - y - 1];
+                    p6 = edgeBuf[center - y - 2];
+                }
+                else
+                {
+                    p5 = dst[dstOffset + x - 1];
+                    p6 = dst[dstOffset + dstStride + x - 1];
+                }
+
+                int fltPos = 0;
+                for (int yy = 0; yy < 2; yy++)
+                {
+                    for (int xx = 0; xx < 4; xx++, fltPos++)
+                    {
+                        int acc = Av1Tables.FilterIntraTaps[filterIndex, fltPos] * p0 +
+                                  Av1Tables.FilterIntraTaps[filterIndex, fltPos + 8] * p1 +
+                                  Av1Tables.FilterIntraTaps[filterIndex, fltPos + 16] * p2 +
+                                  Av1Tables.FilterIntraTaps[filterIndex, fltPos + 24] * p3 +
+                                  Av1Tables.FilterIntraTaps[filterIndex, fltPos + 32] * p4 +
+                                  Av1Tables.FilterIntraTaps[filterIndex, fltPos + 40] * p5 +
+                                  Av1Tables.FilterIntraTaps[filterIndex, fltPos + 48] * p6;
+                        dst[dstOffset + yy * dstStride + x + xx] = (ushort)Math.Clamp((acc + 8) >> 4, 0, max);
+                    }
+                }
+
+                if (y == 0)
+                    topleftEdgeIdx = topIdx + x + 3;
+            }
+
+            dstOffset += dstStride * 2;
+        }
+    }
+
+    public static void PredCfl16(
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> edgeBuf, int center,
+        int width, int height,
+        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+    {
+        int dc = DcGenBoth16(edgeBuf, center, width, height, bitDepth);
+        CflPred16(dst, dstStride, width, height, dc, ac, alpha, bitDepth);
+    }
+
+    public static void PredCflTop16(
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> edgeBuf, int center,
+        int width, int height,
+        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+    {
+        int dc = DcGenTop16(edgeBuf, center, width);
+        CflPred16(dst, dstStride, width, height, dc, ac, alpha, bitDepth);
+    }
+
+    public static void PredCflLeft16(
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> edgeBuf, int center,
+        int width, int height,
+        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+    {
+        int dc = DcGenLeft16(edgeBuf, center, height);
+        CflPred16(dst, dstStride, width, height, dc, ac, alpha, bitDepth);
+    }
+
+    public static void PredCfl12816(
+        Span<ushort> dst, int dstStride,
+        int width, int height,
+        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+    {
+        int dc = (1 << bitDepth) >> 1;
+        CflPred16(dst, dstStride, width, height, dc, ac, alpha, bitDepth);
+    }
+
+    private static void CflPred16(
+        Span<ushort> dst, int dstStride,
+        int width, int height, int dc,
+        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+    {
+        int max = (1 << bitDepth) - 1;
+        for (int y = 0; y < height; y++)
+        {
+            var row = dst.Slice(y * dstStride, width);
+            var acRow = ac.Slice(y * width, width);
+            for (int x = 0; x < width; x++)
+            {
+                int diff = alpha * acRow[x];
+                int sign = diff >> 31;
+                int absDiff = (Math.Abs(diff) + 32) >> 6;
+                row[x] = (ushort)Math.Clamp(dc + (absDiff ^ sign) - sign, 0, max);
+            }
+        }
+    }
+
+    /// <summary>High bit depth CFL AC generation from ushort luma. See <see cref="CflAc"/>.</summary>
+    public static void CflAc16(
+        Span<short> ac,
+        ReadOnlySpan<ushort> luma, int lumaStride,
+        int wPad, int hPad,
+        int width, int height,
+        int ssHor, int ssVer)
+    {
+        int acIdx = 0;
+
+        for (int y = 0; y < height - 4 * hPad; y++)
+        {
+            int x;
+            for (x = 0; x < width - 4 * wPad; x++)
+            {
+                int sum = luma[y * (lumaStride << ssVer) + (x << ssHor)];
+                if (ssHor != 0) sum += luma[y * (lumaStride << ssVer) + x * 2 + 1];
+                if (ssVer != 0)
+                {
+                    sum += luma[(y * (lumaStride << ssVer)) + lumaStride + (x << ssHor)];
+                    if (ssHor != 0) sum += luma[(y * (lumaStride << ssVer)) + lumaStride + x * 2 + 1];
+                }
+                ac[acIdx + x] = (short)(sum << (1 + (ssVer == 0 ? 1 : 0) + (ssHor == 0 ? 1 : 0)));
+            }
+            for (; x < width; x++)
+                ac[acIdx + x] = ac[acIdx + x - 1];
+            acIdx += width;
+        }
+
+        for (int y = height - 4 * hPad; y < height; y++)
+        {
+            ac.Slice(acIdx - width, width).CopyTo(ac.Slice(acIdx, width));
+            acIdx += width;
+        }
+
+        int log2sz = BitOperations.TrailingZeroCount((uint)width) +
+                     BitOperations.TrailingZeroCount((uint)height);
+        int dcSum = (1 << log2sz) >> 1;
+        for (int i = 0; i < width * height; i++)
+            dcSum += ac[i];
+        dcSum >>= log2sz;
+        for (int i = 0; i < width * height; i++)
+            ac[i] -= (short)dcSum;
+    }
+
+    public static void PredPalette16(
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> palette,
+        ReadOnlySpan<byte> indices,
+        int width, int height)
+    {
+        int idxPos = 0;
+        for (int y = 0; y < height; y++)
+        {
+            var row = dst.Slice(y * dstStride, width);
+            for (int x = 0; x < width; x += 2)
+            {
+                byte packed = indices[idxPos++];
+                row[x] = palette[packed & 7];
+                row[x + 1] = palette[packed >> 4];
+            }
+        }
+    }
 }

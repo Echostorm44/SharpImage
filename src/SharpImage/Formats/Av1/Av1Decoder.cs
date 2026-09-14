@@ -515,19 +515,19 @@ internal sealed class Av1Decoder
         {
             if (ctx.CurrentPlanes[i] != null)
             {
-                ArrayPool<byte>.Shared.Return(ctx.CurrentPlanes[i]);
+                ArrayPool<ushort>.Shared.Return(ctx.CurrentPlanes[i]);
                 ctx.CurrentPlanes[i] = null;
             }
         }
 
-        ctx.CurrentPlanes[0] = ArrayPool<byte>.Shared.Rent(ySize);
+        ctx.CurrentPlanes[0] = ArrayPool<ushort>.Shared.Rent(ySize);
         ctx.CurrentStrides[0] = yStride;
         ctx.YStride = yStride;
 
         if (hasChroma)
         {
-            ctx.CurrentPlanes[1] = ArrayPool<byte>.Shared.Rent(uvSize);
-            ctx.CurrentPlanes[2] = ArrayPool<byte>.Shared.Rent(uvSize);
+            ctx.CurrentPlanes[1] = ArrayPool<ushort>.Shared.Rent(uvSize);
+            ctx.CurrentPlanes[2] = ArrayPool<ushort>.Shared.Rent(uvSize);
             ctx.CurrentStrides[1] = uvStride;
             ctx.CurrentStrides[2] = uvStride;
             ctx.UvStride = uvStride;
@@ -541,13 +541,13 @@ internal sealed class Av1Decoder
             int yLpfSize = yStride * numLines;
             int uvLpfSize = uvStride * numLines;
             if (ctx.LrLpfLine[0] == null || ctx.LrLpfLine[0].Length < yLpfSize)
-                ctx.LrLpfLine[0] = new byte[yLpfSize];
+                ctx.LrLpfLine[0] = new ushort[yLpfSize];
             if (hasChroma)
             {
                 if (ctx.LrLpfLine[1] == null || ctx.LrLpfLine[1].Length < uvLpfSize)
-                    ctx.LrLpfLine[1] = new byte[uvLpfSize];
+                    ctx.LrLpfLine[1] = new ushort[uvLpfSize];
                 if (ctx.LrLpfLine[2] == null || ctx.LrLpfLine[2].Length < uvLpfSize)
-                    ctx.LrLpfLine[2] = new byte[uvLpfSize];
+                    ctx.LrLpfLine[2] = new ushort[uvLpfSize];
             }
         }
 
@@ -801,7 +801,7 @@ internal sealed class Av1Decoder
                 for (int yy = 0; yy < h; yy++)
                 {
                     byte[] row = new byte[w];
-                    yPlane.AsSpan(yy * ctx.YStride, w).CopyTo(row);
+                    for (int c = 0; c < w; c++) row[c] = (byte)yPlane[yy * ctx.YStride + c];
                     fs.Write(row);
                 }
                 AvDbg.W($"[POST-CDEF] Dumped {w}x{h} Y plane to {dumpPath}");
@@ -829,7 +829,7 @@ internal sealed class Av1Decoder
                 for (int yy = 0; yy < h; yy++)
                 {
                     byte[] row = new byte[w];
-                    yPlane.AsSpan(yy * ctx.YStride, w).CopyTo(row);
+                    for (int c = 0; c < w; c++) row[c] = (byte)yPlane[yy * ctx.YStride + c];
                     fs.Write(row);
                 }
                 AvDbg.W($"[POST-LR] Dumped {w}x{h} Y plane to {dumpPath}");
@@ -1159,9 +1159,9 @@ internal sealed class Av1Decoder
             int yOff = yPixelRow * ctx.YStride;
             int uvOff = (yPixelRow >> ssVer) * ctx.UvStride;
 
-            Span<byte> yPlane = ctx.CurrentPlanes[0]!.AsSpan();
-            Span<byte> uPlane = hasChroma ? ctx.CurrentPlanes[1]!.AsSpan() : default;
-            Span<byte> vPlane = hasChroma ? ctx.CurrentPlanes[2]!.AsSpan() : default;
+            Span<ushort> yPlane = ctx.CurrentPlanes[0]!.AsSpan();
+            Span<ushort> uPlane = hasChroma ? ctx.CurrentPlanes[1]!.AsSpan() : default;
+            Span<ushort> vPlane = hasChroma ? ctx.CurrentPlanes[2]!.AsSpan() : default;
 
             // Debug: dump pre-deblocking Y plane (first SB row of each frame)
             AvDbg.W($"[PRE-DEBLOCK-CHK] DumpPreDeblockY={DumpPreDeblockY} sby={sby} fhFrameOffset={fh.FrameOffset}");
@@ -1174,7 +1174,7 @@ internal sealed class Av1Decoder
                 for (int yy = 0; yy < h; yy++)
                 {
                     byte[] row = new byte[w];
-                    yPlane.Slice(yy * ctx.YStride, w).CopyTo(row);
+                    for (int c = 0; c < w; c++) row[c] = (byte)yPlane[yy * ctx.YStride + c];
                     fs.Write(row);
                 }
                 AvDbg.W($"[PRE-DEBLOCK] Dumped F{fh.FrameOffset} {w}x{h} Y plane to {dumpPath}");
@@ -1193,7 +1193,7 @@ internal sealed class Av1Decoder
                 using var fs = new System.IO.FileStream(dumpPath, System.IO.FileMode.Create);
                 int w = ctx.Width4 * 4;
                 int h = Math.Min(ctx.Height4 * 4, 64);
-                for (int yy = 0; yy < h; yy++) { byte[] row = new byte[w]; yPlane.Slice(yy * ctx.YStride, w).CopyTo(row); fs.Write(row); }
+                for (int yy = 0; yy < h; yy++) { byte[] row = new byte[w]; for (int c = 0; c < w; c++) row[c] = (byte)yPlane[yy * ctx.YStride + c]; fs.Write(row); }
                 AvDbg.W($"[POST-DEBLOCK] Dumped Y {w}x{h} to {dumpPath}");
             }
         }
@@ -1216,19 +1216,19 @@ internal sealed class Av1Decoder
         int sb128 = seqHdr.Sb128 ? 1 : 0;
         int sbsz = 16; // 64x64 in 4x4 units
 
-        Span<byte> yPlane = ctx.CurrentPlanes[0]!.AsSpan();
-        Span<byte> uPlane = hasChroma ? ctx.CurrentPlanes[1]!.AsSpan() : default;
-        Span<byte> vPlane = hasChroma ? ctx.CurrentPlanes[2]!.AsSpan() : default;
+        Span<ushort> yPlane = ctx.CurrentPlanes[0]!.AsSpan();
+        Span<ushort> uPlane = hasChroma ? ctx.CurrentPlanes[1]!.AsSpan() : default;
+        Span<ushort> vPlane = hasChroma ? ctx.CurrentPlanes[2]!.AsSpan() : default;
 
         // Pre-CDEF copy for border reference (CDEF filter needs pre-filter neighbors)
-        byte[] yBak = ArrayPool<byte>.Shared.Rent(yPlane.Length);
+        ushort[] yBak = ArrayPool<ushort>.Shared.Rent(yPlane.Length);
         yPlane.CopyTo(yBak);
-        byte[]? uBak = null, vBak = null;
+        ushort[]? uBak = null, vBak = null;
         if (hasChroma)
         {
-            uBak = ArrayPool<byte>.Shared.Rent(uPlane.Length);
+            uBak = ArrayPool<ushort>.Shared.Rent(uPlane.Length);
             uPlane.CopyTo(uBak);
-            vBak = ArrayPool<byte>.Shared.Rent(vPlane.Length);
+            vBak = ArrayPool<ushort>.Shared.Rent(vPlane.Length);
             vPlane.CopyTo(vBak);
         }
 
@@ -1236,7 +1236,7 @@ internal sealed class Av1Decoder
         ReadOnlySpan<byte> uvDirI422 = stackalloc byte[] { 7, 0, 2, 4, 5, 6, 6, 6 };
 
         // Scratch buffers for left border (2 bytes per row, up to 8 rows)
-        Span<byte> leftBuf = stackalloc byte[16]; // 8 rows * 2 cols
+        Span<ushort> leftBuf = stackalloc ushort[16]; // 8 rows * 2 cols
 
         try
         {
@@ -1316,7 +1316,7 @@ internal sealed class Av1Decoder
                         if (yPriLvl != 0 || uvPriLvl != 0)
                         {
                             int yOff = py * yStride + px;
-                            dir = Av1Cdef.FindDirection(yBak, yOff, yStride, out variance);
+                            dir = Av1Cdef.FindDirection(yBak, yOff, yStride, out variance, ctx.BitDepth);
                         }
                         if (dbgCdef) CdefDecisionWriter?.WriteLine($"by={by} bx={bx} DIR={dir} var={variance} yPri={yPriLvl} ySec={ySecLvl} damping={damping}");
 
@@ -1342,7 +1342,7 @@ internal sealed class Av1Decoder
                                     leftBuf, 0, 2,
                                     yBak, topOff, yBak, botOff,
                                     adjYPriLvl, ySecLvl, lumaDir, damping,
-                                    8, 8, blockEdges);
+                                    8, 8, blockEdges, ctx.BitDepth);
                             }
                         }
 
@@ -1374,7 +1374,7 @@ internal sealed class Av1Decoder
                                     leftBuf, 0, 2,
                                     uvSrc, topOff, uvSrc, botOff,
                                     uvPriLvl, uvSecLvl, uvDir, damping - 1,
-                                    chW, chH, blockEdges);
+                                    chW, chH, blockEdges, ctx.BitDepth);
                             }
                         }
                     }
@@ -1383,9 +1383,9 @@ internal sealed class Av1Decoder
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(yBak);
-            if (uBak != null) ArrayPool<byte>.Shared.Return(uBak);
-            if (vBak != null) ArrayPool<byte>.Shared.Return(vBak);
+            ArrayPool<ushort>.Shared.Return(yBak);
+            if (uBak != null) ArrayPool<ushort>.Shared.Return(uBak);
+            if (vBak != null) ArrayPool<ushort>.Shared.Return(vBak);
         }
     }
 
@@ -1393,7 +1393,7 @@ internal sealed class Av1Decoder
     /// Prepare 2-column left border buffer for CDEF from the pre-filter copy.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void PrepareCdefLeft(Span<byte> leftBuf, byte[] src, int srcOffset, int stride,
+    private static void PrepareCdefLeft(Span<ushort> leftBuf, ushort[] src, int srcOffset, int stride,
         int h, Av1Cdef.EdgeFlags edges)
     {
         if ((edges & Av1Cdef.EdgeFlags.Left) != 0)
@@ -1461,8 +1461,8 @@ internal sealed class Av1Decoder
     /// Copy specific rows from source plane to LR LPF buffer at stripe boundaries.
     /// dav1d: backup_lpf (lf_apply_tmpl.c:41-101), simplified for no super-res, single-threaded.
     /// </summary>
-    private static void BackupLpf(byte[] dst, int dstStride,
-        byte[] src, int srcOffset, int srcStride,
+    private static void BackupLpf(ushort[] dst, int dstStride,
+        ushort[] src, int srcOffset, int srcStride,
         int ssVer, int sb128, int row, int rowH, int srcW, int h)
     {
         int dstOff = 0;
@@ -1554,8 +1554,8 @@ internal sealed class Av1Decoder
     /// Apply LR to one plane for one SB row, iterating left→right over restoration units.
     /// Ported from dav1d lr_sbrow (lr_apply_tmpl.c:107-166).
     /// </summary>
-    private void LrSbRow(byte[] plane, int pOff, int stride,
-        byte[] lpf, int y, int w, int h, int rowH,
+    private void LrSbRow(ushort[] plane, int pOff, int stride,
+        ushort[] lpf, int y, int w, int h, int rowH,
         int planeIdx, int ssHor, int sby)
     {
         var fh = frameHdr;
@@ -1572,9 +1572,9 @@ internal sealed class Av1Decoder
 
         // Pre-LR left border backup: alternating pair
         int borderH = rowH - y;
-        var preLrBorder = new byte[2][];
-        preLrBorder[0] = new byte[borderH * 4];
-        preLrBorder[1] = new byte[borderH * 4];
+        var preLrBorder = new ushort[2][];
+        preLrBorder[0] = new ushort[borderH * 4];
+        preLrBorder[1] = new ushort[borderH * 4];
 
         // Find the restoration unit indices
         int alignedUnitPos = rowY & ~(unitSize - 1);
@@ -1640,7 +1640,7 @@ internal sealed class Av1Decoder
     /// dav1d: backup4xU (lr_apply_tmpl.c:100-105).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Backup4xU(byte[] dst, byte[] src, int srcOff, int stride, int rows)
+    private static void Backup4xU(ushort[] dst, ushort[] src, int srcOff, int stride, int rows)
     {
         for (int i = 0; i < rows; i++)
         {
@@ -1656,8 +1656,8 @@ internal sealed class Av1Decoder
     /// Apply LR filter to one restoration unit across vertical stripes.
     /// Ported from dav1d lr_stripe (lr_apply_tmpl.c:36-98).
     /// </summary>
-    private void LrStripe(byte[] p, int pOff, int stride,
-        byte[] left, byte[] lpf,
+    private void LrStripe(ushort[] p, int pOff, int stride,
+        ushort[] left, ushort[] lpf,
         int x, int y, int plane, int unitW, int rowH,
         ref Av1RestorationUnit lr, Av1LoopRestoration.LrEdgeFlags edges,
         int sby, int ssVer)
@@ -1672,9 +1672,9 @@ internal sealed class Av1Decoder
         int stripeH = Math.Min((64 - 8 * (y == 0 ? 1 : 0)) >> ssVer, rowH - y);
 
         // Build filter params and pick the filter function
-        Span<byte> pSpan = p.AsSpan();
-        ReadOnlySpan<byte> lpfSpan = lpf.AsSpan();
-        ReadOnlySpan<byte> leftSpan = left.AsSpan();
+        Span<ushort> pSpan = p.AsSpan();
+        ReadOnlySpan<ushort> lpfSpan = lpf.AsSpan();
+        ReadOnlySpan<ushort> leftSpan = left.AsSpan();
 
         int leftOff = 0;
 
@@ -1816,7 +1816,7 @@ internal sealed class Av1Decoder
 
             int bufSize = stride * height;
             if (refFrame.Planes[plane] == null || refFrame.Planes[plane]!.Length < bufSize)
-                refFrame.Planes[plane] = new byte[bufSize];
+                refFrame.Planes[plane] = new ushort[bufSize];
 
             refFrame.Strides[plane] = stride;
 
@@ -1862,7 +1862,7 @@ internal sealed class Av1Decoder
                         int sz = refFrame.Strides[p] *
                             (p == 0 ? refFrame.Height : (refFrame.Height + 1) >> 1);
                         if (dst.Planes[p] == null || dst.Planes[p]!.Length < sz)
-                            dst.Planes[p] = new byte[sz];
+                            dst.Planes[p] = new ushort[sz];
                         refFrame.Planes[p].AsSpan(0, sz).CopyTo(dst.Planes[p]);
                         dst.Strides[p] = refFrame.Strides[p];
                     }
@@ -1893,28 +1893,40 @@ internal sealed class Av1Decoder
         byte[] outputBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
         int yOff = 0, uOff = ySize, vOff = ySize + uvSize;
 
+        // High-bit-depth samples are downshifted to 8-bit for the byte output buffer.
+        int bdShift = ctx.BitDepth - 8;
+
         // Copy Y
         if (refFrame.Planes[0] != null)
         {
+            var src = refFrame.Planes[0]!;
             for (int y = 0; y < h; y++)
-                refFrame.Planes[0].AsSpan(y * refFrame.Strides[0], w)
-                    .CopyTo(outputBuffer.AsSpan(yOff + y * w));
+            {
+                int so = y * refFrame.Strides[0], doff = yOff + y * w;
+                for (int x = 0; x < w; x++) outputBuffer[doff + x] = (byte)(src[so + x] >> bdShift);
+            }
         }
 
         // Copy U
         if (refFrame.Planes[1] != null)
         {
+            var src = refFrame.Planes[1]!;
             for (int y = 0; y < uvH; y++)
-                refFrame.Planes[1].AsSpan(y * refFrame.Strides[1], uvW)
-                    .CopyTo(outputBuffer.AsSpan(uOff + y * uvW));
+            {
+                int so = y * refFrame.Strides[1], doff = uOff + y * uvW;
+                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)(src[so + x] >> bdShift);
+            }
         }
 
         // Copy V
         if (refFrame.Planes[2] != null)
         {
+            var src = refFrame.Planes[2]!;
             for (int y = 0; y < uvH; y++)
-                refFrame.Planes[2].AsSpan(y * refFrame.Strides[2], uvW)
-                    .CopyTo(outputBuffer.AsSpan(vOff + y * uvW));
+            {
+                int so = y * refFrame.Strides[2], doff = vOff + y * uvW;
+                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)(src[so + x] >> bdShift);
+            }
         }
 
         isReady = true;
@@ -1961,25 +1973,34 @@ internal sealed class Av1Decoder
             return null;
         }
 
+        // High-bit-depth samples are downshifted to 8-bit for the byte output buffer.
+        int bdShift = ctx.BitDepth - 8;
+
         if (yPlane != null)
         {
             for (int y = 0; y < h; y++)
-                yPlane.AsSpan(y * ctx.CurrentStrides[0], w)
-                    .CopyTo(outputBuffer.AsSpan(yOff + y * w));
+            {
+                int so = y * ctx.CurrentStrides[0], doff = yOff + y * w;
+                for (int x = 0; x < w; x++) outputBuffer[doff + x] = (byte)(yPlane[so + x] >> bdShift);
+            }
         }
 
         if (uPlane != null)
         {
             for (int y = 0; y < uvH; y++)
-                uPlane.AsSpan(y * ctx.CurrentStrides[1], uvW)
-                    .CopyTo(outputBuffer.AsSpan(uOff + y * uvW));
+            {
+                int so = y * ctx.CurrentStrides[1], doff = uOff + y * uvW;
+                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)(uPlane[so + x] >> bdShift);
+            }
         }
 
         if (vPlane != null)
         {
             for (int y = 0; y < uvH; y++)
-                vPlane.AsSpan(y * ctx.CurrentStrides[2], uvW)
-                    .CopyTo(outputBuffer.AsSpan(vOff + y * uvW));
+            {
+                int so = y * ctx.CurrentStrides[2], doff = vOff + y * uvW;
+                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)(vPlane[so + x] >> bdShift);
+            }
         }
 
         var outFmt = ctx.PixelLayout switch

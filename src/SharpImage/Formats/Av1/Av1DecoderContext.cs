@@ -105,10 +105,11 @@ public sealed class Av1ReferenceFrame
     public byte[]? SegmentMap;
 
     /// <summary>
-    /// Decoded pixel data per plane. Format depends on bit depth:
-    /// 8-bit: byte[], 10/12-bit: ushort[] (stored as byte[] with 2 bytes per sample).
+    /// Decoded pixel data per plane. Samples are stored as ushort[] for all bit depths
+    /// (8-bit values occupy 0..255, 10-bit 0..1023, 12-bit 0..4095) so one code path
+    /// serves every bit depth. Output extraction downshifts high-bit-depth to 8-bit.
     /// </summary>
-    public byte[]?[] Planes = new byte[3][];
+    public ushort[]?[] Planes = new ushort[3][];
 
     /// <summary>Stride in bytes for each plane.</summary>
     public int[] Strides = new int[3];
@@ -210,13 +211,13 @@ public sealed class Av1DecoderContext : IDisposable
     // ──── Intra Prediction Edge Buffers ────
 
     /// <summary>Y plane edge buffer for intra prediction across SB boundaries.</summary>
-    public byte[] IpredEdgeY = Array.Empty<byte>();
+    public ushort[] IpredEdgeY = Array.Empty<ushort>();
 
     /// <summary>U plane edge buffer for intra prediction across SB boundaries.</summary>
-    public byte[] IpredEdgeU = Array.Empty<byte>();
+    public ushort[] IpredEdgeU = Array.Empty<ushort>();
 
     /// <summary>V plane edge buffer for intra prediction across SB boundaries.</summary>
-    public byte[] IpredEdgeV = Array.Empty<byte>();
+    public ushort[] IpredEdgeV = Array.Empty<ushort>();
 
     // ──── Inter Prediction State ────
 
@@ -282,7 +283,7 @@ public sealed class Av1DecoderContext : IDisposable
     /// <summary>Loop restoration LPF line buffers (post-deblock, pre-CDEF boundary rows).
     /// One buffer per plane. Used as context for LR filter stripe boundaries.
     /// dav1d: f->lf.lr_lpf_line[3].</summary>
-    public byte[]?[] LrLpfLine = new byte[3][];
+    public ushort[]?[] LrLpfLine = new ushort[3][];
 
     /// <summary>Width of the sr_sb128 row for LR mask indexing.
     /// dav1d: f->sr_sb128w.</summary>
@@ -296,8 +297,8 @@ public sealed class Av1DecoderContext : IDisposable
 
     // ──── Decoded Frame Output ────
 
-    /// <summary>Current frame pixel buffers (one per plane: Y, U, V).</summary>
-    public byte[]?[] CurrentPlanes = new byte[3][];
+    /// <summary>Current frame pixel buffers (one per plane: Y, U, V). ushort samples for all bit depths.</summary>
+    public ushort[]?[] CurrentPlanes = new ushort[3][];
 
     /// <summary>Stride in bytes per plane for the current frame.</summary>
     public int[] CurrentStrides = new int[3];
@@ -351,7 +352,7 @@ public sealed class Av1DecoderContext : IDisposable
         {
             if (CurrentPlanes[i] != null)
             {
-                ArrayPool<byte>.Shared.Return(CurrentPlanes[i]);
+                ArrayPool<ushort>.Shared.Return(CurrentPlanes[i]);
                 CurrentPlanes[i] = null;
             }
         }

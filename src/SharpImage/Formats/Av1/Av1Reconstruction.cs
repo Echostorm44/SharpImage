@@ -82,11 +82,11 @@ public static class Av1Reconstruction
         int y, bool haveTop,
         int w, int h,
         Av1EdgeFlags edgeFlags,
-        ReadOnlySpan<byte> dst, int dstOff, int dstStride,
-        ReadOnlySpan<byte> topSbEdge,
+        ReadOnlySpan<ushort> dst, int dstOff, int dstStride,
+        ReadOnlySpan<ushort> topSbEdge,
         Av1IntraPredMode mode, ref int angle,
         int tw, int th, bool filterEdge,
-        Span<byte> topleftOut, int topleftCenter,
+        Span<ushort> topleftOut, int topleftCenter,
         int bitdepth)
     {
         // Resolve to implementation mode
@@ -138,7 +138,7 @@ public static class Av1Reconstruction
         byte needs = EdgeNeeds[implMode];
 
         // Resolve top source pointer
-        ReadOnlySpan<byte> dstTop = default;
+        ReadOnlySpan<ushort> dstTop = default;
         int dstTopOffset = 0;
         if (haveTop && ((needs & (NeedsTop | NeedsTopleft)) != 0 ||
             ((needs & NeedsLeft) != 0 && !haveLeft)))
@@ -171,7 +171,7 @@ public static class Av1Reconstruction
             }
             else
             {
-                byte fillVal = haveTop ? dstTop[dstTopOffset] : (byte)(((1 << bitdepth) >> 1) + 1);
+                ushort fillVal = haveTop ? dstTop[dstTopOffset] : (ushort)(((1 << bitdepth) >> 1) + 1);
                 topleftOut.Slice(leftStart, sz).Fill(fillVal);
             }
 
@@ -211,7 +211,7 @@ public static class Av1Reconstruction
             }
             else
             {
-                byte fillVal = haveLeft ? dst[dstOff - 1] : (byte)(((1 << bitdepth) >> 1) - 1);
+                ushort fillVal = haveLeft ? dst[dstOff - 1] : (ushort)(((1 << bitdepth) >> 1) - 1);
                 topleftOut.Slice(topStart, sz).Fill(fillVal);
             }
 
@@ -242,9 +242,181 @@ public static class Av1Reconstruction
             if (haveLeft)
                 topleftOut[topleftCenter] = haveTop ? dstTop[dstTopOffset - 1] : dst[dstOff - 1];
             else
-                topleftOut[topleftCenter] = haveTop ? dstTop[dstTopOffset] : (byte)((1 << bitdepth) >> 1);
+                topleftOut[topleftCenter] = haveTop ? dstTop[dstTopOffset] : (ushort)((1 << bitdepth) >> 1);
 
             // Z2 corner filtering
+            if (implMode == ImplZ2 && tw + th >= 6 && filterEdge)
+            {
+                topleftOut[topleftCenter] = (ushort)(
+                    ((topleftOut[topleftCenter - 1] + topleftOut[topleftCenter + 1]) * 5 +
+                     topleftOut[topleftCenter] * 6 + 8) >> 4);
+            }
+        }
+
+        return implMode;
+    }
+
+    /// <summary>8-bit overload of <see cref="PrepareIntraEdges(int,bool,int,bool,int,int,Av1EdgeFlags,ReadOnlySpan{ushort},int,int,ReadOnlySpan{ushort},Av1IntraPredMode,ref int,int,int,bool,Span{ushort},int,int)"/>
+    /// retained for the encoder, whose reconstruction surfaces are 8-bit byte planes.</summary>
+    public static int PrepareIntraEdges(
+        int x, bool haveLeft,
+        int y, bool haveTop,
+        int w, int h,
+        Av1EdgeFlags edgeFlags,
+        ReadOnlySpan<byte> dst, int dstOff, int dstStride,
+        ReadOnlySpan<byte> topSbEdge,
+        Av1IntraPredMode mode, ref int angle,
+        int tw, int th, bool filterEdge,
+        Span<byte> topleftOut, int topleftCenter,
+        int bitdepth)
+    {
+        int implMode;
+        switch (mode)
+        {
+            case Av1IntraPredMode.Vertical:
+            case Av1IntraPredMode.Horizontal:
+            case Av1IntraPredMode.DiagDownLeft:
+            case Av1IntraPredMode.DiagDownRight:
+            case Av1IntraPredMode.VerticalRight:
+            case Av1IntraPredMode.HorizontalDown:
+            case Av1IntraPredMode.HorizontalUp:
+            case Av1IntraPredMode.VerticalLeft:
+            {
+                angle = ModeToAngleMap[(int)mode - (int)Av1IntraPredMode.Vertical] + 3 * angle;
+                if (angle <= 90)
+                    implMode = angle < 90 && haveTop ? ImplZ1 : ImplVert;
+                else if (angle < 180)
+                    implMode = ImplZ2;
+                else
+                    implMode = angle > 180 && haveLeft ? ImplZ3 : ImplHor;
+                break;
+            }
+            case Av1IntraPredMode.Dc:
+            {
+                if (!haveLeft && !haveTop) implMode = ImplDc128;
+                else if (!haveLeft) implMode = ImplTopDc;
+                else if (!haveTop) implMode = ImplLeftDc;
+                else implMode = ImplDc;
+                break;
+            }
+            case Av1IntraPredMode.Paeth:
+            {
+                if (!haveLeft && !haveTop) implMode = ImplDc128;
+                else if (!haveLeft) implMode = ImplVert;
+                else if (!haveTop) implMode = ImplHor;
+                else implMode = ImplPaeth;
+                break;
+            }
+            case Av1IntraPredMode.Smooth: implMode = ImplSmooth; break;
+            case Av1IntraPredMode.SmoothV: implMode = ImplSmoothV; break;
+            case Av1IntraPredMode.SmoothH: implMode = ImplSmoothH; break;
+            case (Av1IntraPredMode)13: implMode = ImplFilter; break;
+            default: implMode = ImplDc128; break;
+        }
+
+        byte needs = EdgeNeeds[implMode];
+
+        ReadOnlySpan<byte> dstTop = default;
+        int dstTopOffset = 0;
+        if (haveTop && ((needs & (NeedsTop | NeedsTopleft)) != 0 ||
+            ((needs & NeedsLeft) != 0 && !haveLeft)))
+        {
+            if (!topSbEdge.IsEmpty)
+            {
+                dstTop = topSbEdge;
+                dstTopOffset = x * 4;
+            }
+            else
+            {
+                dstTop = dst;
+                dstTopOffset = dstOff - dstStride;
+            }
+        }
+
+        if ((needs & NeedsLeft) != 0)
+        {
+            int sz = th * 4;
+            int leftStart = topleftCenter - sz;
+
+            if (haveLeft)
+            {
+                int pxHave = Math.Min(sz, (h - y) * 4);
+                for (int i = 0; i < pxHave; i++)
+                    topleftOut[leftStart + sz - 1 - i] = dst[dstOff + dstStride * i - 1];
+                if (pxHave < sz)
+                    topleftOut.Slice(leftStart, sz - pxHave).Fill(topleftOut[leftStart + sz - pxHave]);
+            }
+            else
+            {
+                byte fillVal = haveTop ? dstTop[dstTopOffset] : (byte)(((1 << bitdepth) >> 1) + 1);
+                topleftOut.Slice(leftStart, sz).Fill(fillVal);
+            }
+
+            if ((needs & NeedsBottomleft) != 0)
+            {
+                bool haveBottomLeft = (haveLeft && y + th < h) &&
+                    (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0;
+
+                if (haveBottomLeft)
+                {
+                    int pxHave = Math.Min(sz, (h - y - th) * 4);
+                    for (int i = 0; i < pxHave; i++)
+                        topleftOut[leftStart - (i + 1)] = dst[dstOff + (sz + i) * dstStride - 1];
+                    if (pxHave < sz)
+                        topleftOut.Slice(leftStart - sz, sz - pxHave).Fill(topleftOut[leftStart - pxHave]);
+                }
+                else
+                {
+                    topleftOut.Slice(leftStart - sz, sz).Fill(topleftOut[leftStart]);
+                }
+            }
+        }
+
+        if ((needs & NeedsTop) != 0)
+        {
+            int sz = tw * 4;
+            int topStart = topleftCenter + 1;
+
+            if (haveTop)
+            {
+                int pxHave = Math.Min(sz, (w - x) * 4);
+                dstTop.Slice(dstTopOffset, pxHave).CopyTo(topleftOut.Slice(topStart));
+                if (pxHave < sz)
+                    topleftOut.Slice(topStart + pxHave, sz - pxHave).Fill(topleftOut[topStart + pxHave - 1]);
+            }
+            else
+            {
+                byte fillVal = haveLeft ? dst[dstOff - 1] : (byte)(((1 << bitdepth) >> 1) - 1);
+                topleftOut.Slice(topStart, sz).Fill(fillVal);
+            }
+
+            if ((needs & NeedsTopright) != 0)
+            {
+                bool haveTopRight = (haveTop && x + tw < w) &&
+                    (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0;
+
+                if (haveTopRight)
+                {
+                    int pxHave = Math.Min(sz, (w - x - tw) * 4);
+                    dstTop.Slice(dstTopOffset + sz, pxHave).CopyTo(topleftOut.Slice(topStart + sz));
+                    if (pxHave < sz)
+                        topleftOut.Slice(topStart + sz + pxHave, sz - pxHave).Fill(
+                            topleftOut[topStart + sz + pxHave - 1]);
+                }
+                else
+                {
+                    topleftOut.Slice(topStart + sz, sz).Fill(topleftOut[topStart + sz - 1]);
+                }
+            }
+        }
+
+        if ((needs & NeedsTopleft) != 0)
+        {
+            if (haveLeft)
+                topleftOut[topleftCenter] = haveTop ? dstTop[dstTopOffset - 1] : dst[dstOff - 1];
+            else
+                topleftOut[topleftCenter] = haveTop ? dstTop[dstTopOffset] : (byte)((1 << bitdepth) >> 1);
+
             if (implMode == ImplZ2 && tw + th >= 6 && filterEdge)
             {
                 topleftOut[topleftCenter] = (byte)(
@@ -302,13 +474,13 @@ public static class Av1Reconstruction
     public static StreamWriter? Cf0DumpWriter;
     public static bool DumpPixelPred;
     public static StreamWriter? PixelDumpWriter;
-    private static byte _lastPixel14;
+    private static ushort _lastPixel14;
 
     public static void ReconBlockIntra(
         Av1TaskContext t, ref Av1Msac msac, Av1DecoderContext ctx,
         Av1BlockSize bs, Av1EdgeFlags intraEdgeFlags, ref Av1Block b,
-        Span<byte> yPlane, int yStride,
-        Span<byte> uPlane, Span<byte> vPlane, int uvStride)
+        Span<ushort> yPlane, int yStride,
+        Span<ushort> uPlane, Span<ushort> vPlane, int uvStride)
     {
         if (b.PalSzY > 0)
         {
@@ -369,8 +541,9 @@ public static class Av1Reconstruction
         }
 
         // Edge buffer: center at index 128, total size 257 (128 left + 1 topleft + 128 right)
-        Span<byte> edgeBuf = stackalloc byte[257];
+        Span<ushort> edgeBuf = stackalloc ushort[257];
         const int edgeCenter = 128;
+        int bd = ctx.BitDepth;
 
         if (Av1CoeffDecode.DbgReconCount <= 3)
             AvDbg.W($"[RECON-LOOP] w4={w4} h4={h4} tDim.W={tDim.W} tDim.H={tDim.H}");
@@ -410,7 +583,7 @@ public static class Av1Reconstruction
                         DbgBlockCount++;
                         // Watch pixel(14,0) — report who wrote what
                         {
-                            byte current14 = yPlane[14];
+                            ushort current14 = yPlane[14];
                             if (DbgBlockCount == 1 || current14 != _lastPixel14)
                             {
                                 AvDbg.W($"[P14-WATCH] Block#{DbgBlockCount} bx={curBx} by={curBy} xx={xx} yy={yy} palSzY={b.PalSzY} yPlane[14]=0x{current14:x2}({current14}) old=0x{_lastPixel14:x2}");
@@ -425,7 +598,7 @@ public static class Av1Reconstruction
                         bool dbgFirstErr = (130 >= blkX0w && 130 < blkX0w + tDim.W * 4 && 1 >= blkY0w && 1 < blkY0w + tDim.H * 4);
 
                         // Watchpoint: detect any write to pixel (32,104) = offset 12392
-                        byte watchBefore = 0;
+                        ushort watchBefore = 0;
                         if (12392 < yPlane.Length)
                             watchBefore = yPlane[12392];
 
@@ -438,7 +611,7 @@ public static class Av1Reconstruction
                                 ((xx > initX || (sbHasBl == 0 && yy + tDim.H >= subH4)) ?
                                      0 : Av1EdgeFlags.I444LeftHasBottom);
 
-                            ReadOnlySpan<byte> topSbEdge = default;
+                            ReadOnlySpan<ushort> topSbEdge = default;
                             if ((curBy & (ctx.SbStep - 1)) == 0 && curBy > 0 && ctx.IpredEdgeY.Length > 0)
                             {
                                 int sby = curBy >> ctx.SbShift;
@@ -458,7 +631,7 @@ public static class Av1Reconstruction
                                 topSbEdge, yMode, ref localAngle,
                                 tDim.W, tDim.H,
                                 seqHdr.IntraEdgeFilter,
-                                edgeBuf, edgeCenter, 8);
+                                edgeBuf, edgeCenter, bd);
 
                             // Set debug flag for Z2 dump
                             if (dbgFirstErr)
@@ -482,13 +655,13 @@ public static class Av1Reconstruction
                                 for (int z = 0; z < 16; z++) AvDbg.W($" {edgeBuf[z]}");
                                 AvDbg.W();
                             }
-                            Av1IntraPred.Predict(m,
+                            Av1IntraPred.Predict16(m,
                                 yPlane.Slice(dstOff), yStride,
                                 edgeBuf, edgeCenter,
                                 tDim.W * 4, tDim.H * 4,
                                 localAngle | intraFlags,
                                 4 * ctx.Bw - 4 * curBx,
-                                4 * ctx.Bh - 4 * curBy);
+                                4 * ctx.Bh - 4 * curBy, bd);
                             if (curBx == 15 && curBy == 2 && ctx.FrameHeader?.FrameOffset == 1)
                             {
                                 for (int r = 0; r < 8; r++)
@@ -713,7 +886,7 @@ public static class Av1Reconstruction
 
                                 if (lossless)
                                 {
-                                    Av1InvTransform.InvWhtAdd(
+                                    Av1InvTransform.InvWhtAdd16(
                                         yPlane.Slice(dstOff), yStride, cf, ctx.BitDepth);
                                 }
                                 else
@@ -721,7 +894,7 @@ public static class Av1Reconstruction
                                 Av1InvTransform.DbgTrace = (curBx == 2 && curBy == 0) || (eob >= 0 && DbgBlockCount <= 5);
                                 int shift = Av1InvTransform.TxShift[b.Tx];
                                     int pred0Val = DumpPixelPred ? yPlane[dstOff] : 0;
-                                    Av1InvTransform.InvTxfmAdd(
+                                    Av1InvTransform.InvTxfmAdd16(
                                         yPlane.Slice(dstOff), yStride, cf, eob,
                                         b.Tx, shift, txtp, ctx.BitDepth);
                                     if (DumpPixelPred)
@@ -804,7 +977,7 @@ public static class Av1Reconstruction
                         dstOff += 4 * tDim.W;
 
                         // Watchpoint: detect modification of pixel (32,104)
-                        byte watchAfter = 0;
+                        ushort watchAfter = 0;
                         if (12392 < yPlane.Length)
                             watchAfter = yPlane[12392];
                         if (watchAfter != watchBefore && DbgBlockCount > 1)
@@ -862,7 +1035,7 @@ public static class Av1Reconstruction
                         if (b.GetCflAlpha(pl) == 0) continue;
 
                         int localAngle = 0;
-                        ReadOnlySpan<byte> topSbEdge = default;
+                        ReadOnlySpan<ushort> topSbEdge = default;
                         if (((t.By & ~ssVer) & (ctx.SbStep - 1)) == 0 && ctx.IpredEdgeU.Length > 0)
                         {
                             int sby = t.By >> ctx.SbShift;
@@ -886,13 +1059,13 @@ public static class Av1Reconstruction
                             edgeBuf, edgeCenter, 8);
 
                         // CFL prediction: DC prediction + AC scaled component
-                        Av1IntraPred.Predict(m,
+                        Av1IntraPred.Predict16(m,
                             uvPlaneSrc.Slice(uvOff), uvStride,
                             edgeBuf, edgeCenter,
                             uvtDim.W * 4, uvtDim.H * 4,
                             0, // no angle
                             (4 * ctx.Bw + ssHor - 4 * (t.Bx & ~ssHor)) >> ssHor,
-                            (4 * ctx.Bh + ssVer - 4 * (t.By & ~ssVer)) >> ssVer);
+                            (4 * ctx.Bh + ssVer - 4 * (t.By & ~ssVer)) >> ssVer, bd);
 
                         // DBG: dump specific chroma region for block comparison
                         if (t.Bx == 8 && t.By == 0 && pl == 0)
@@ -1013,7 +1186,7 @@ public static class Av1Reconstruction
                                       (uvSbHasBl == 0 && yy + uvtDim.H >= subCh4)) ?
                                          0 : Av1EdgeFlags.I444LeftHasBottom);
 
-                                ReadOnlySpan<byte> topSbEdge = default;
+                                ReadOnlySpan<ushort> topSbEdge = default;
                                 if (((curBy & ~ssVer) & (ctx.SbStep - 1)) == 0)
                                 {
                                     var edgeArr = pl == 0 ? ctx.IpredEdgeU : ctx.IpredEdgeV;
@@ -1046,13 +1219,13 @@ public static class Av1Reconstruction
 
                                 localAngle |= intraEdgeFilterFlag;
 
-                                Av1IntraPred.Predict(m,
+                                Av1IntraPred.Predict16(m,
                                     uvPlane.Slice(uvDstOff), uvStride,
                                     edgeBuf, edgeCenter,
                                     uvtDim.W * 4, uvtDim.H * 4,
                                     localAngle | smUvFl,
                                     (4 * ctx.Bw + ssHor - 4 * (curBx & ~ssHor)) >> ssHor,
-                                    (4 * ctx.Bh + ssVer - 4 * (curBy & ~ssVer)) >> ssVer);
+                                    (4 * ctx.Bh + ssVer - 4 * (curBy & ~ssVer)) >> ssVer, bd);
 
                                 // DBG: dump prediction before transform for bx=6 D157
                                 if (t.Bx == 6 && t.By == 0 && pl == 0)
@@ -1142,13 +1315,13 @@ public static class Av1Reconstruction
                                     
                                     if (lossless)
                                     {
-                                        Av1InvTransform.InvWhtAdd(
+                                        Av1InvTransform.InvWhtAdd16(
                                             uvPlane.Slice(uvDstOff), uvStride, cf, ctx.BitDepth);
                                     }
                                     else
                                     {
                                         int shift = Av1InvTransform.TxShift[b.UvTx];
-                                        Av1InvTransform.InvTxfmAdd(
+                                        Av1InvTransform.InvTxfmAdd16(
                                             uvPlane.Slice(uvDstOff), uvStride, cf, eob,
                                             b.UvTx, shift, txtp, ctx.BitDepth);
                                     }
@@ -1231,7 +1404,7 @@ public static class Av1Reconstruction
     /// Port of dav1d cfl_ac_c (ipred_tmpl.c).
     /// </summary>
     private static void ComputeCflAc(
-        Span<short> ac, ReadOnlySpan<byte> ySrc, int yStride,
+        Span<short> ac, ReadOnlySpan<ushort> ySrc, int yStride,
         int cw, int ch, int ssHor, int ssVer,
         int wPad, int hPad)
     {
@@ -1280,10 +1453,11 @@ public static class Av1Reconstruction
     /// Applies CFL alpha scaling: dst[i] = clip(dst[i] + ((ac[i] * alpha + 32) >> 6)).
     /// </summary>
     private static void ApplyCflAlpha(
-        Span<byte> dst, int stride,
+        Span<ushort> dst, int stride,
         ReadOnlySpan<short> ac, int alpha,
-        int w, int h)
+        int w, int h, int bitDepth = 8)
     {
+        int pxMax = (1 << bitDepth) - 1;
         int acIdx = 0;
         for (int row = 0; row < h; row++)
         {
@@ -1296,7 +1470,7 @@ public static class Av1Reconstruction
                 int sign = diff >> 31;
                 int rounded = (Math.Abs(diff) + 32) >> 6;
                 int val = dst[rowOff + col] + ((rounded ^ sign) - sign);
-                dst[rowOff + col] = (byte)Math.Clamp(val, 0, 255);
+                dst[rowOff + col] = (ushort)Math.Clamp(val, 0, pxMax);
                 acIdx++;
             }
         }
@@ -1314,7 +1488,7 @@ public static class Av1Reconstruction
     /// </summary>
     private static void Mc(
         Av1TaskContext t, Av1DecoderContext ctx,
-        Span<byte> dstByte, Span<short> dstShort, int dstStride,
+        Span<ushort> dstByte, Span<short> dstShort, int dstStride,
         int bw4, int bh4, int bx, int by, int pl,
         Av1MotionVector mv, Av1ReferenceFrame refp, int refIdx,
         int filter2d)
@@ -1356,7 +1530,7 @@ public static class Av1Reconstruction
             int blockW = bw4 * hMul;
             int blockH = bh4 * vMul;
 
-            ReadOnlySpan<byte> refSrc;
+            ReadOnlySpan<ushort> refSrc;
             int refSrcStride;
 
             if (dx < 6 || dy < 6 ||
@@ -1436,7 +1610,7 @@ public static class Av1Reconstruction
             int w = (refp.Width + ssHor) >> ssHor;
             int h = (refp.Height + ssVer) >> ssVer;
 
-            ReadOnlySpan<byte> refSrc;
+            ReadOnlySpan<ushort> refSrc;
             int refSrcStride;
 
             if (left < 3 || top < 3 || right + 4 > w || bottom + 4 > h)
@@ -1491,7 +1665,7 @@ public static class Av1Reconstruction
     private static void ReadCoefTree(
         Av1TaskContext t, ref Av1Msac msac, Av1DecoderContext ctx,
         int bs, ref Av1Block b, int ytx, int depth, ReadOnlySpan<ushort> txSplit,
-        int xOff, int yOff, Span<byte> dst, int dstStride, int dstOffset)
+        int xOff, int yOff, Span<ushort> dst, int dstStride, int dstOffset)
     {
         ref readonly var tDim = ref Av1Tables.TxfmDimensions[ytx];
         int txw = tDim.W, txh = tDim.H;
@@ -1592,7 +1766,7 @@ public static class Av1Reconstruction
             if (eob >= 0)
             {
                 int shift = Av1InvTransform.TxShift[ytx];
-                Av1InvTransform.InvTxfmAdd(
+                Av1InvTransform.InvTxfmAdd16(
                     dst.Slice(dstOffset), dstStride, cf, eob,
                     ytx, shift, txtp, ctx.BitDepth);
                 if (t.Bx == 0 && t.By == 0)
@@ -1621,8 +1795,8 @@ public static class Av1Reconstruction
     public static void ReconBlockInter(
         Av1TaskContext t, ref Av1Msac msac, Av1DecoderContext ctx,
         int bs, ref Av1Block b,
-        Span<byte> yPlane, int yStride,
-        Span<byte> uPlane, Span<byte> vPlane, int uvStride)
+        Span<ushort> yPlane, int yStride,
+        Span<ushort> uPlane, Span<ushort> vPlane, int uvStride)
     {
         var ts = t.TileState!;
         var fh = ctx.FrameHeader!;
@@ -1651,7 +1825,7 @@ public static class Av1Reconstruction
         int yDstOff = 4 * (t.By * yStride + t.Bx);
         int uvDstOff = 4 * ((t.Bx >> ssHor) + (t.By >> ssVer) * uvStride);
 
-        Span<byte> dst = yPlane.Slice(yDstOff);
+        Span<ushort> dst = yPlane.Slice(yDstOff);
         int filter2d = b.Filter;
 
         // ────────────────────────────────────────────────────────────────────
@@ -1734,16 +1908,16 @@ public static class Av1Reconstruction
             // InterIntra blending (if applicable)
             if (b.InterIntraTypeField != 0)
             {
-                Span<byte> tlEdge = t.EdgeBuf.AsSpan();
+                Span<ushort> tlEdge = t.EdgeBuf.AsSpan();
                 int edgeCenter = 128;
-                Span<byte> tmp = t.InterIntraBuf.AsSpan();
+                Span<ushort> tmp = t.InterIntraBuf.AsSpan();
 
                 int iiMode = b.InterIntraMode == (byte)Av1InterIntraPredMode.Smooth
                     ? (int)Av1IntraPredMode.Smooth
                     : b.InterIntraMode;
 
                 int angle = 0;
-                ReadOnlySpan<byte> topSbEdge = ReadOnlySpan<byte>.Empty;
+                ReadOnlySpan<ushort> topSbEdge = ReadOnlySpan<ushort>.Empty;
                 if ((t.By & (ctx.SbStep - 1)) == 0)
                 {
                     int sby = t.By >> ctx.SbShift;
@@ -1759,7 +1933,7 @@ public static class Av1Reconstruction
                     (Av1IntraPredMode)iiMode, ref angle,
                     bw4, bh4, false, tlEdge, edgeCenter, ctx.BitDepth);
 
-                Av1IntraPred.Predict(implMode, tmp, bw4 * 4,
+                Av1IntraPred.Predict16(implMode, tmp, bw4 * 4,
                     tlEdge, edgeCenter, bw4 * 4, bh4 * 4, angle, 0, 0, ctx.BitDepth);
 
                 // Blend interintra prediction with inter prediction (dav1d: dsp->mc.blend, II_MASK(0, bs, b))
@@ -1773,7 +1947,7 @@ public static class Av1Reconstruction
                         {
                             int m = mask[y * mw + x];
                             int di = y * yStride + x;
-                            dst[di] = (byte)((dst[di] * (64 - m) + tmp[y * tmpStride + x] * m + 32) >> 6);
+                            dst[di] = (ushort)((dst[di] * (64 - m) + tmp[y * tmpStride + x] * m + 32) >> 6);
                         }
                     }
                 }
@@ -1900,8 +2074,8 @@ public static class Av1Reconstruction
                 {
                     for (int pl = 0; pl < 2; pl++)
                     {
-                        Span<byte> tmp = t.InterIntraBuf.AsSpan();
-                        Span<byte> tlEdge = t.EdgeBuf.AsSpan();
+                        Span<ushort> tmp = t.InterIntraBuf.AsSpan();
+                        Span<ushort> tlEdge = t.EdgeBuf.AsSpan();
                         int edgeCenter = 128;
 
                         int iiMode = b.InterIntraMode == (byte)Av1InterIntraPredMode.Smooth
@@ -1910,7 +2084,7 @@ public static class Av1Reconstruction
                         int angle = 0;
                         var uvPlaneFull = pl == 0 ? uPlane : vPlane;
 
-                        ReadOnlySpan<byte> topSbEdge = ReadOnlySpan<byte>.Empty;
+                        ReadOnlySpan<ushort> topSbEdge = ReadOnlySpan<ushort>.Empty;
                         if ((t.By & (ctx.SbStep - 1)) == 0)
                         {
                             var ipredEdge = pl == 0 ? ctx.IpredEdgeU : ctx.IpredEdgeV;
@@ -1927,7 +2101,7 @@ public static class Av1Reconstruction
                             (Av1IntraPredMode)iiMode, ref angle,
                             cbw4, cbh4, false, tlEdge, edgeCenter, ctx.BitDepth);
 
-                        Av1IntraPred.Predict(implMode, tmp, cbw4 * 4,
+                        Av1IntraPred.Predict16(implMode, tmp, cbw4 * 4,
                             tlEdge, edgeCenter, cbw4 * 4, cbh4 * 4, angle, 0, 0, ctx.BitDepth);
 
                         // Blend with ii_mask (dav1d: dsp->mc.blend, II_MASK(chr_layout_idx, bs, b))
@@ -1942,7 +2116,7 @@ public static class Av1Reconstruction
                                 {
                                     int m = mask[y * mw + x];
                                     int di = y * uvStride + x;
-                                    uvDst[di] = (byte)((uvDst[di] * (64 - m) + tmp[y * tmpStride + x] * m + 32) >> 6);
+                                    uvDst[di] = (ushort)((uvDst[di] * (64 - m) + tmp[y * tmpStride + x] * m + 32) >> 6);
                                 }
                             }
                         }
@@ -1969,12 +2143,12 @@ public static class Av1Reconstruction
                 if (b.InterMode == (byte)Av1CompInterPredMode.GlobalGlobal &&
                     ctx.GmvWarpAllowed[refIdx])
                 {
-                    WarpAffine(t, ctx, Span<byte>.Empty, tmpBuf, bw4 * 4,
+                    WarpAffine(t, ctx, Span<ushort>.Empty, tmpBuf, bw4 * 4,
                         bs, 0, refp, fh.Gmv[refIdx]);
                 }
                 else
                 {
-                    Mc(t, ctx, Span<byte>.Empty, tmpBuf, 0,
+                    Mc(t, ctx, Span<ushort>.Empty, tmpBuf, 0,
                         bw4, bh4, t.Bx, t.By, 0,
                         mv, refp, refIdx, filter2d);
                 }
@@ -2027,12 +2201,12 @@ public static class Av1Reconstruction
                         if (b.InterMode == (byte)Av1CompInterPredMode.GlobalGlobal &&
                             Math.Min(cbw4, cbh4) > 1 && ctx.GmvWarpAllowed[refIdx])
                         {
-                            WarpAffine(t, ctx, Span<byte>.Empty, tmpBuf, bw4 * 4 >> ssHor,
+                            WarpAffine(t, ctx, Span<ushort>.Empty, tmpBuf, bw4 * 4 >> ssHor,
                                 bs, 1 + pl, refp, fh.Gmv[refIdx]);
                         }
                         else
                         {
-                            Mc(t, ctx, Span<byte>.Empty, tmpBuf, 0,
+                            Mc(t, ctx, Span<ushort>.Empty, tmpBuf, 0,
                                 bw4, bh4, t.Bx, t.By, 1 + pl,
                                 mv, refp, refIdx, filter2d);
                         }
@@ -2165,7 +2339,7 @@ public static class Av1Reconstruction
                                 {
                                     int uvOff = uvDstOff + y * 4 * uvStride + x * 4;
                                     int shift = Av1InvTransform.TxShift[b.UvTx];
-                                    Av1InvTransform.InvTxfmAdd(
+                                    Av1InvTransform.InvTxfmAdd16(
                                         uvPlane.Slice(uvOff), uvStride, cf, eob,
                                         b.UvTx, shift, txtp, ctx.BitDepth);
                                 }
@@ -2193,7 +2367,7 @@ public static class Av1Reconstruction
     /// </summary>
     private static void WarpAffine(
         Av1TaskContext t, Av1DecoderContext ctx,
-        Span<byte> dst8, Span<short> dst16, int dstStride,
+        Span<ushort> dst8, Span<short> dst16, int dstStride,
         int bs, int pl, Av1ReferenceFrame refp,
         Av1WarpedMotionParams wmp)
     {
@@ -2232,7 +2406,7 @@ public static class Av1Reconstruction
                 int dy = (int)(mvy >> 16) - 4;
                 int my = (((int)mvy & 0xffff) - wmp.Gamma * 4 - wmp.Delta * 4) & ~0x3f;
 
-                ReadOnlySpan<byte> refSrc;
+                ReadOnlySpan<ushort> refSrc;
                 int refSrcStride;
 
                 if (dx < 3 || dx + 8 + 4 > width || dy < 3 || dy + 8 + 4 > height)
@@ -2281,7 +2455,7 @@ public static class Av1Reconstruction
     /// </summary>
     private static void Obmc(
         Av1TaskContext t, Av1DecoderContext ctx,
-        Span<byte> dst, int dstStride,
+        Span<ushort> dst, int dstStride,
         int bs, int pl, int bx4, int by4, int w4, int h4)
     {
         // Port of dav1d obmc (recon_tmpl.c lines 1062-1123).
@@ -2297,7 +2471,7 @@ public static class Av1Reconstruction
         int bwLog2 = Av1Tables.BlockDimensions[bs, 2];
         int bhLog2 = Av1Tables.BlockDimensions[bs, 3];
 
-        byte[] lapPool = System.Buffers.ArrayPool<byte>.Shared.Rent(4096);
+        ushort[] lapPool = System.Buffers.ArrayPool<ushort>.Shared.Rent(4096);
         try
         {
             // ── Above neighbor OBMC (dav1d recon_tmpl.c:1076-1099) ──
@@ -2319,7 +2493,7 @@ public static class Av1Reconstruction
                             int oh4 = Math.Min(bh4, 16) >> 1;
                             int mcH = (oh4 * 3 + 3) >> 2;
                             int lapW = ow4 * hMul, lapH = mcH * vMul;
-                            Span<byte> lap = lapPool.AsSpan(0, lapW * lapH);
+                            Span<ushort> lap = lapPool.AsSpan(0, lapW * lapH);
                             int filter2d = Av1Tables.Filter2d[t.Above.Filter1[bx4 + x + 1], t.Above.Filter0[bx4 + x + 1]];
                             var refp = ctx.RefFrames[aR.Ref.Ref0];
 
@@ -2337,7 +2511,7 @@ public static class Av1Reconstruction
                                     int di = dy * dstStride + x * hMul + dx;
                                     int s = lap[dy * lapW + dx];
                                     int d = dst[di];
-                                    dst[di] = (byte)((d * (64 - m) + s * m + 32) >> 6);
+                                    dst[di] = (ushort)((d * (64 - m) + s * m + 32) >> 6);
                                 }
                             }
                             i++;
@@ -2364,7 +2538,7 @@ public static class Av1Reconstruction
                         int ow4 = Math.Min(bw4, 16) >> 1;
                         int oh4 = Math.Min(step4, bh4);
                         int lapW = ow4 * hMul, lapH = oh4 * vMul;
-                        Span<byte> lap = lapPool.AsSpan(0, lapW * lapH);
+                        Span<ushort> lap = lapPool.AsSpan(0, lapW * lapH);
                         int filter2d = Av1Tables.Filter2d[t.Left.Filter1[by4 + y + 1], t.Left.Filter0[by4 + y + 1]];
                         var refp = ctx.RefFrames[lR.Ref.Ref0];
 
@@ -2381,7 +2555,7 @@ public static class Av1Reconstruction
                                 int di = (y * vMul + dy) * dstStride + dx;
                                 int s = lap[dy * lapW + dx];
                                 int d = dst[di];
-                                dst[di] = (byte)((d * (64 - m) + s * m + 32) >> 6);
+                                dst[di] = (ushort)((d * (64 - m) + s * m + 32) >> 6);
                             }
                         }
                         i++;
@@ -2392,7 +2566,7 @@ public static class Av1Reconstruction
         }
         finally
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(lapPool);
+            System.Buffers.ArrayPool<ushort>.Shared.Return(lapPool);
         }
     }
 

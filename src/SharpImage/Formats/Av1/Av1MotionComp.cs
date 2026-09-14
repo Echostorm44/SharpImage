@@ -28,8 +28,8 @@ public static class Av1MotionComp
     /// Simple pixel copy (no subpel filtering).
     /// </summary>
     public static void Put(
-        Span<byte> dst, int dstStride,
-        ReadOnlySpan<byte> src, int srcStride,
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> src, int srcStride,
         int w, int h)
     {
         for (int y = 0; y < h; y++)
@@ -42,7 +42,7 @@ public static class Av1MotionComp
     /// </summary>
     public static void Prep(
         Span<short> tmp,
-        ReadOnlySpan<byte> src, int srcStride,
+        ReadOnlySpan<ushort> src, int srcStride,
         int w, int h)
     {
         int tmpIdx = 0;
@@ -59,7 +59,7 @@ public static class Av1MotionComp
     // ========================================================================
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int Filter8Tap(ReadOnlySpan<byte> src, int x, int f0, int f1, int f2, int f3, int f4, int f5, int f6, int f7, int stride)
+    private static int Filter8Tap(ReadOnlySpan<ushort> src, int x, int f0, int f1, int f2, int f3, int f4, int f5, int f6, int f7, int stride)
     {
         return f0 * src[x - 3 * stride] + f1 * src[x - 2 * stride] +
                f2 * src[x - 1 * stride] + f3 * src[x] +
@@ -105,8 +105,8 @@ public static class Av1MotionComp
     /// </summary>
     /// <param name="filterType">Packed filter type: (hor_filter | ver_filter &lt;&lt; 2).</param>
     public static void Put8Tap(
-        Span<byte> dst, int dstStride,
-        ReadOnlySpan<byte> src, int srcStride,
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> src, int srcStride,
         int w, int h, int mx, int my, int filterType)
     {
         const int intermediateBits = IntermediateBits8;
@@ -263,7 +263,7 @@ public static class Av1MotionComp
     /// </summary>
     public static void Prep8Tap(
         Span<short> tmp,
-        ReadOnlySpan<byte> src, int srcStride,
+        ReadOnlySpan<ushort> src, int srcStride,
         int w, int h, int mx, int my, int filterType)
     {
         const int intermediateBits = IntermediateBits8;
@@ -382,7 +382,7 @@ public static class Av1MotionComp
     // ========================================================================
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int FilterBilin(ReadOnlySpan<byte> src, int x, int mxy, int stride)
+    private static int FilterBilin(ReadOnlySpan<ushort> src, int x, int mxy, int stride)
     {
         return 16 * src[x] + mxy * (src[x + stride] - src[x]);
     }
@@ -397,8 +397,8 @@ public static class Av1MotionComp
     /// Bilinear interpolation: write to pixel output.
     /// </summary>
     public static void PutBilin(
-        Span<byte> dst, int dstStride,
-        ReadOnlySpan<byte> src, int srcStride,
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> src, int srcStride,
         int w, int h, int mx, int my)
     {
         const int intermediateBits = IntermediateBits8;
@@ -465,7 +465,7 @@ public static class Av1MotionComp
     /// </summary>
     public static void PrepBilin(
         Span<short> tmp,
-        ReadOnlySpan<byte> src, int srcStride,
+        ReadOnlySpan<ushort> src, int srcStride,
         int w, int h, int mx, int my)
     {
         const int intermediateBits = IntermediateBits8;
@@ -536,7 +536,7 @@ public static class Av1MotionComp
     /// Simple average of two compound (intermediate) buffers.
     /// </summary>
     public static void Avg(
-        Span<byte> dst, int dstStride,
+        Span<ushort> dst, int dstStride,
         ReadOnlySpan<short> tmp1, ReadOnlySpan<short> tmp2,
         int w, int h)
     {
@@ -556,7 +556,7 @@ public static class Av1MotionComp
     /// Weight ranges from 0 to 16 (applied to tmp1, 16-weight to tmp2).
     /// </summary>
     public static void WeightedAvg(
-        Span<byte> dst, int dstStride,
+        Span<ushort> dst, int dstStride,
         ReadOnlySpan<short> tmp1, ReadOnlySpan<short> tmp2,
         int w, int h, int weight)
     {
@@ -577,7 +577,7 @@ public static class Av1MotionComp
     /// Mask values range 0..64.
     /// </summary>
     public static void Mask(
-        Span<byte> dst, int dstStride,
+        Span<ushort> dst, int dstStride,
         ReadOnlySpan<short> tmp1, ReadOnlySpan<short> tmp2,
         int w, int h, ReadOnlySpan<byte> mask)
     {
@@ -601,17 +601,17 @@ public static class Av1MotionComp
     // ========================================================================
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static byte BlendPx(int a, int b, int m)
+    private static ushort BlendPx(int a, int b, int m)
     {
-        return (byte)((a * (64 - m) + b * m + 32) >> 6);
+        return (ushort)((a * (64 - m) + b * m + 32) >> 6);
     }
 
     /// <summary>
     /// Blend with mask (generic, per-pixel mask).
     /// </summary>
     public static void Blend(
-        Span<byte> dst, int dstStride,
-        ReadOnlySpan<byte> tmp, int w, int h,
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> tmp, int w, int h,
         ReadOnlySpan<byte> mask)
     {
         int tmpIdx = 0;
@@ -629,8 +629,8 @@ public static class Av1MotionComp
     /// OBMC vertical blending: blend left ¾ of the block width using OBMC masks.
     /// </summary>
     public static void BlendV(
-        Span<byte> dst, int dstStride,
-        ReadOnlySpan<byte> tmp, int w, int h)
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> tmp, int w, int h)
     {
         var mask = Av1Tables.ObmcMasks.AsSpan(w);
         int tmpIdx = 0;
@@ -647,8 +647,8 @@ public static class Av1MotionComp
     /// OBMC horizontal blending: blend top ¾ of the block height using OBMC masks.
     /// </summary>
     public static void BlendH(
-        Span<byte> dst, int dstStride,
-        ReadOnlySpan<byte> tmp, int w, int h)
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> tmp, int w, int h)
     {
         var mask = Av1Tables.ObmcMasks.AsSpan(h);
         int blendH = (h * 3) >> 2;
@@ -672,7 +672,7 @@ public static class Av1MotionComp
     /// of two intermediate buffers and blends them.
     /// </summary>
     public static void WeightedMask(
-        Span<byte> dst, int dstStride,
+        Span<ushort> dst, int dstStride,
         ReadOnlySpan<short> tmp1, ReadOnlySpan<short> tmp2,
         int w, int h, Span<byte> mask, int sign,
         int ssHor, int ssVer)
@@ -727,8 +727,8 @@ public static class Av1MotionComp
     /// </summary>
     /// <param name="abcd">Warp parameters: [alpha, beta, gamma, delta].</param>
     public static void WarpAffine8x8(
-        Span<byte> dst, int dstStride,
-        ReadOnlySpan<byte> src, int srcStride,
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> src, int srcStride,
         ReadOnlySpan<short> abcd, int mx, int my)
     {
         const int intermediateBits = IntermediateBits8;
@@ -772,7 +772,7 @@ public static class Av1MotionComp
     /// </summary>
     public static void WarpAffine8x8t(
         Span<short> tmp, int tmpStride,
-        ReadOnlySpan<byte> src, int srcStride,
+        ReadOnlySpan<ushort> src, int srcStride,
         ReadOnlySpan<short> abcd, int mx, int my)
     {
         const int intermediateBits = IntermediateBits8;
@@ -823,8 +823,8 @@ public static class Av1MotionComp
     /// </summary>
     public static void EmuEdge(
         int bw, int bh, int iw, int ih, int x, int y,
-        Span<byte> dst, int dstStride,
-        ReadOnlySpan<byte> refBuf, int refStride)
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> refBuf, int refStride)
     {
         int refOff = Math.Clamp(y, 0, ih - 1) * refStride + Math.Clamp(x, 0, iw - 1);
 
@@ -868,8 +868,8 @@ public static class Av1MotionComp
     /// Super-resolution horizontal resize using 8-tap filter.
     /// </summary>
     public static void Resize(
-        Span<byte> dst, int dstStride,
-        ReadOnlySpan<byte> src, int srcStride,
+        Span<ushort> dst, int dstStride,
+        ReadOnlySpan<ushort> src, int srcStride,
         int dstW, int h, int srcW, int dx, int mx0)
     {
         for (int y = 0; y < h; y++)
@@ -896,5 +896,8 @@ public static class Av1MotionComp
     // ========================================================================
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static byte ClipPixel(int v) => (byte)Math.Clamp(v, 0, 255);
+    // NOTE: clamps to 8-bit. Motion compensation (inter prediction) is not used by
+    // still-image AVIF (all-intra), so this 8-bit clamp is exercised only at bd=8.
+    // High-bit-depth AV1 *video* inter would need a bitdepth-aware clamp here.
+    private static ushort ClipPixel(int v) => (ushort)Math.Clamp(v, 0, 255);
 }
