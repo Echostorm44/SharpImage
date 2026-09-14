@@ -977,6 +977,7 @@ public static class Av1LoopRestoration
         ReadOnlySpan<ushort> lpfBottom = lpf.Slice(lpfOffset + 6 * stride);
         int lOff = leftOffset;
 
+
         if ((edges & LrEdgeFlags.Top) != 0)
         {
             // === Top edge prologue ===
@@ -1119,18 +1120,20 @@ public static class Av1LoopRestoration
 
         if ((edges & LrEdgeFlags.Bottom) == 0) goto vert_2;
 
-        // Bottom border: mask out Left/Right since lpf_bottom has no left/right context
-        var botEdges = edges & ~(LrEdgeFlags.Left | LrEdgeFlags.Right);
-
+        // Bottom border rows come from the saved lpf_bottom line; dav1d keeps the full `edges`
+        // (HAVE_LEFT/RIGHT) here — the lpf buffer is full-width, so the box reads real
+        // left/right context (masking them out desyncs the box sums at the boundary). Pass the
+        // full lpf span with the bottom offset so the box's HAVE_LEFT path can read src[-3..-1].
+        int lpfBotOff = lpfOffset + 6 * stride;
         SgrBox35RowH(sumsq3Ptrs[2], sum3Ptrs[2],
             sumsq5Ptrs[3], sum5Ptrs[3], 0,
-            ReadOnlySpan<ushort>.Empty, lpfBottom, 0, w, botEdges);
+            ReadOnlySpan<ushort>.Empty, lpf, lpfBotOff, w, edges);
         SgrBox3Vert(sumsq3Ptrs, sum3Ptrs, A3Ptrs[3], B3Ptrs[3], 0, w, s1);
         Rotate(A3Ptrs, B3Ptrs, 4);
 
         SgrBox35RowH(sumsq3Ptrs[2], sum3Ptrs[2],
             sumsq5Ptrs[4], sum5Ptrs[4], 0,
-            ReadOnlySpan<ushort>.Empty, lpfBottom.Slice(stride), 0, w, botEdges);
+            ReadOnlySpan<ushort>.Empty, lpf, lpfBotOff + stride, w, edges);
 
     // output_2:
         SgrBox5Vert(sumsq5Ptrs, sum5Ptrs, A5Ptrs[1], B5Ptrs[1], 0, w, s0);

@@ -1538,14 +1538,17 @@ internal sealed class Av1Decoder
     {
         int dstOff = 0;
 
-        // Single-threaded: shift previous bottom→top and advance
+        // Single-threaded: shift previous bottom→top and advance. NOTE: these are ushort[]
+        // arrays and all offsets/counts are in ELEMENTS, so use Array.Copy (element-based) —
+        // Buffer.BlockCopy takes byte units and silently corrupts the layout (leaving the
+        // lpf_bottom rows at 6*stride zero, which desyncs the loop-restoration bottom edge).
         if (row > 0)
         {
             int top = (4 << sb128) * dstStride;
-            Buffer.BlockCopy(dst, top, dst, 0, dstStride);
-            Buffer.BlockCopy(dst, top + dstStride, dst, dstStride, dstStride);
-            Buffer.BlockCopy(dst, top + dstStride * 2, dst, dstStride * 2, dstStride);
-            Buffer.BlockCopy(dst, top + dstStride * 3, dst, dstStride * 3, dstStride);
+            Array.Copy(dst, top, dst, 0, dstStride);
+            Array.Copy(dst, top + dstStride, dst, dstStride, dstStride);
+            Array.Copy(dst, top + dstStride * 2, dst, dstStride * 2, dstStride);
+            Array.Copy(dst, top + dstStride * 3, dst, dstStride * 3, dstStride);
         }
         dstOff = 4 * dstStride;
 
@@ -1562,11 +1565,11 @@ internal sealed class Av1Decoder
                 if (i == nLines)
                 {
                     // Duplicate previous row
-                    Buffer.BlockCopy(dst, dstOff - dstStride, dst, dstOff, srcW);
+                    Array.Copy(dst, dstOff - dstStride, dst, dstOff, srcW);
                 }
                 else
                 {
-                    Buffer.BlockCopy(src, srcOff, dst, dstOff, srcW);
+                    Array.Copy(src, srcOff, dst, dstOff, srcW);
                     srcOff += srcStride;
                 }
                 dstOff += dstStride;
