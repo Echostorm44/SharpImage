@@ -1090,7 +1090,11 @@ public static class Av1CoeffDecode
         int aCacheSz = 0;
         Span<ushort> aCache = stackalloc ushort[8];
         int bj4 = bx4 < 32 ? bx4 : 31;
-        int abovePalSz = t.Above.PalSz[bj4];
+        // Spec get_palette_cache: the above palette cache is used only when the block is not at a
+        // 64-pixel row boundary ((MiRow*4) % 64 != 0). At a 64px-aligned row (e.g. the top row of
+        // each superblock row) the above palette is unavailable — using it reads extra cache-
+        // selection bits and desyncs the whole superblock row.
+        int abovePalSz = ((by4 & 15) != 0) ? t.Above.PalSz[bj4] : 0;
         if (abovePalSz > 8) abovePalSz = 0; // safety
         for (int ci = 0; ci < abovePalSz && ci < 8; ci++)
             aCache[aCacheSz++] = t.PalPrevY[0, bj4, 0 * 8 + ci];
@@ -1297,7 +1301,8 @@ public static class Av1CoeffDecode
             Span<ushort> lCache = stackalloc ushort[8];
             Span<ushort> aCache = stackalloc ushort[8];
             int leftPalSz = t.PalSzUv[1, t.By & 31];
-            int abovePalSz = t.PalSzUv[0, t.Bx & 31];
+            // Above palette cache unavailable at 64px row boundaries (spec get_palette_cache).
+            int abovePalSz = ((t.By & 15) != 0) ? t.PalSzUv[0, t.Bx & 31] : 0;
             for (int ci = 0; ci < leftPalSz && ci < 8; ci++) lCache[lCacheSz++] = t.PalPrevY[1, t.By & 31, 1 * 8 + ci];
             for (int ci = 0; ci < abovePalSz && ci < 8; ci++) aCache[aCacheSz++] = t.PalPrevY[0, t.Bx & 31, 1 * 8 + ci];
 
