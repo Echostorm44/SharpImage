@@ -895,9 +895,13 @@ public static class Av1MotionComp
     // Pixel clipping
     // ========================================================================
 
+    /// <summary>Pixel bit depth for motion compensation output clamping. The decoder sets this
+    /// per frame; the 8-bit encoder leaves it at 8. Used by intra block copy on 10/12-bit frames
+    /// (chroma displacement vectors are half-pel → bilinear interpolation → needs the real clamp).
+    /// The bilinear intermediate_bits are 4 for both 8- and 10-bit (dav1d get_intermediate_bits),
+    /// so only the clamp differs; 12-bit additionally needs intermediate_bits=2 (follow-up).</summary>
+    internal static int McBitDepth = 8;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    // NOTE: clamps to 8-bit. Motion compensation (inter prediction) is not used by
-    // still-image AVIF (all-intra), so this 8-bit clamp is exercised only at bd=8.
-    // High-bit-depth AV1 *video* inter would need a bitdepth-aware clamp here.
-    private static ushort ClipPixel(int v) => (ushort)Math.Clamp(v, 0, 255);
+    private static ushort ClipPixel(int v) => (ushort)Math.Clamp(v, 0, (1 << McBitDepth) - 1);
 }

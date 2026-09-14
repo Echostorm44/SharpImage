@@ -979,8 +979,10 @@ internal sealed class Av1Decoder
         t.Rt.TileRowStart = ts.RowStart;
         t.Rt.TileRowEnd = ts.RowEnd;
 
-        // Link tile R rows to frame R rows (dav1d: refmvs_init_tile_row)
-        if (!isIntra)
+        // Link tile R rows to frame R rows (dav1d: refmvs_init_tile_row). Also required on
+        // key/intra frames that allow intra block copy, so intraBC DV prediction can read the
+        // spatial MV grid.
+        if (!isIntra || fh.AllowIntraBc)
         {
             int sbSize = sbStep; // dav1d sbsz: 16 for SB64, 32 for SB128 (in 4x4 units)
             int sby = by >> sbShift;

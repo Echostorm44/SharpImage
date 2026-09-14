@@ -937,8 +937,9 @@ public static class Av1Decode
             UpdateIntraBlockContext(t, ctx, bs, ref b, bx4, by4, cbx4, cby4, cbw4, cbh4,
                 ssHor, ssVer, hasChroma, bp);
 
-            // dav1d decode.c:1294-1295 — splat INVALID_MV marker for intra blocks in inter frames
-            if (ctx.FrameHeader!.IsInterOrSwitch)
+            // dav1d decode.c: splat the intra-ref marker for intra blocks on inter frames AND on
+            // key/intra frames that allow intra block copy (so intraBC DV prediction sees them).
+            if (ctx.FrameHeader!.IsInterOrSwitch || ctx.FrameHeader!.AllowIntraBc)
             {
                 var intraTmpl = new Av1RefMvsBlock
                 {
@@ -949,6 +950,35 @@ public static class Av1Decode
                 };
                 Av1RefMvs.SplatMv(t.Rt.R, (t.By & 31) + 5, in intraTmpl, t.Bx, bw4, bh4);
             }
+        }
+        else if (fh.IsIntra)
+        {
+            // Intra block copy (screen content on a key/intra frame): decode the displacement
+            // vector + transform tree, then reconstruct via the self-reference copy path.
+            DecodeIntraBc(t, ref msac, ctx, ref b, bs, bx4, by4, bw4, bh4,
+                hasChroma, ssHor, ssVer, intraEdgeFlags);
+
+            if (ctx.CurrentPlanes[0] != null)
+            {
+                var yPlane = ctx.CurrentPlanes[0]!;
+                var uPlane = hasChroma ? ctx.CurrentPlanes[1]! : Array.Empty<ushort>();
+                var vPlane = hasChroma ? ctx.CurrentPlanes[2]! : Array.Empty<ushort>();
+                Av1Reconstruction.ReconBlockInter(t, ref msac, ctx, (int)bs, ref b,
+                    yPlane, ctx.YStride, uPlane, vPlane, ctx.UvStride);
+            }
+
+            // Splat this block's DV into the refmvs grid (dav1d splat_intrabc_mv) so later
+            // intraBC blocks can predict from it.
+            var ibcTmpl = new Av1RefMvsBlock
+            {
+                Ref = new Av1RefMvsRefPair { Ref0 = 0, Ref1 = -1 },
+                Mv = new Av1RefMvsMvPair { Mv0 = b.Mv0 },
+                Bs = (byte)bs,
+                Mf = 0,
+            };
+            Av1RefMvs.SplatMv(t.Rt.R, (t.By & 31) + 5, in ibcTmpl, t.Bx, bw4, bh4);
+
+            UpdateIntraBcContext(t, bs, ref b, bx4, by4, cbx4, cby4, cbw4, cbh4, bw4, bh4, hasChroma, bp);
         }
         else
         {
@@ -1442,6 +1472,146 @@ public static class Av1Decode
         return c4 == c5 ? 1 : c4 < c5 ? 0 : 2;
     }
 
+    /// <summary>Decode an intra block-copy (intraBC) block on a key/intra frame:
+    /// a displacement vector into the already-decoded part of the current frame, then the
+    /// variable-transform tree. Port of dav1d decode.c's `allow_intrabc` branch. Reconstruction
+    /// (bilinear self-reference copy + residual) is handled by ReconBlockInter's isKeyOrIntra
+    /// path. No inter mode/ref/filter/motion syntax is coded.</summary>
+    private static void DecodeIntraBc(
+        Av1TaskContext t, ref Av1Msac msac, Av1DecoderContext ctx, ref Av1Block b,
+        Av1BlockSize bs, int bx4, int by4, int bw4, int bh4,
+        bool hasChroma, int ssHor, int ssVer, Av1EdgeFlags intraEdgeFlags)
+    {
+        var ts = t.TileState!;
+        var fh = ctx.FrameHeader!;
+        int sb128 = ctx.SequenceHeader!.Sb128 ? 1 : 0;
+
+        // DV predictor candidates (ref = {0, -1}).
+        Span<Av1RefMvsCandidate> mvstack = stackalloc Av1RefMvsCandidate[8];
+        Av1RefMvs.FindRefMvs(t.Rt, mvstack, out int _, out int _, out int _,
+            new Av1RefMvsRefPair { Ref0 = 0, Ref1 = -1 },
+            (int)bs, intraEdgeFlags, t.By, t.Bx);
+
+        Av1MotionVector dv;
+        if (mvstack[0].Mv.Mv0.Raw != 0) dv = mvstack[0].Mv.Mv0;
+        else if (mvstack[1].Mv.Mv0.Raw != 0) dv = mvstack[1].Mv.Mv0;
+        else
+        {
+            dv = default;
+            if (t.By - (16 << sb128) < ts.RowStart)
+            { dv.Y = 0; dv.X = (short)(-(512 << sb128) - 2048); }
+            else
+            { dv.Y = (short)(-(512 << sb128)); dv.X = 0; }
+        }
+
+        ReadMvResidual(ts, ref msac, ref dv, -1); // integer displacement vectors
+
+        // Clip the DV to the decoded region of the current tile (dav1d decode.c).
+        int borderLeft = ts.ColStart * 4;
+        int borderTop = ts.RowStart * 4;
+        if (hasChroma)
+        {
+            if (bw4 < 2 && ssHor != 0) borderLeft += 4;
+            if (bh4 < 2 && ssVer != 0) borderTop += 4;
+        }
+        int srcLeft = t.Bx * 4 + (dv.X >> 3);
+        int srcTop = t.By * 4 + (dv.Y >> 3);
+        int srcRight = srcLeft + bw4 * 4;
+        int srcBottom = srcTop + bh4 * 4;
+        int borderRight = ((ts.ColEnd + (bw4 - 1)) & ~(bw4 - 1)) * 4;
+
+        if (srcLeft < borderLeft) { srcRight += borderLeft - srcLeft; srcLeft += borderLeft - srcLeft; }
+        else if (srcRight > borderRight) { srcLeft -= srcRight - borderRight; srcRight -= srcRight - borderRight; }
+        if (srcTop < borderTop) { srcBottom += borderTop - srcTop; srcTop += borderTop - srcTop; }
+
+        int sbx = (t.Bx >> (4 + sb128)) << (6 + sb128);
+        int sby = (t.By >> (4 + sb128)) << (6 + sb128);
+        int sbSize = 1 << (6 + sb128);
+        if (srcBottom > sby && srcRight > sbx)
+        {
+            if (srcTop - borderTop >= srcBottom - sby) { srcTop -= srcBottom - sby; srcBottom -= srcBottom - sby; }
+            else if (srcLeft - borderLeft >= srcRight - sbx) { srcLeft -= srcRight - sbx; srcRight -= srcRight - sbx; }
+        }
+        if (srcBottom > sby + sbSize) { srcTop -= srcBottom - (sby + sbSize); srcBottom -= srcBottom - (sby + sbSize); }
+
+        dv.X = (short)((srcLeft - t.Bx * 4) * 8);
+        dv.Y = (short)((srcTop - t.By * 4) * 8);
+        b.Mv0 = dv;
+
+
+        b.CompType = (byte)Av1CompInterType.None;
+        b.Ref0 = 0; b.Ref1 = -1;
+        b.InterMode = (byte)Av1InterPredMode.NewMv;
+        b.Motion = (byte)Av1MotionMode.Translation;
+        b.InterIntraTypeField = 0;
+        b.Filter = Av1Tables.Filter2d[0, 0];
+
+        // Variable transform tree (dav1d read_vartx_tree) — identical to the inter path.
+        b.MaxYTx = Av1Tables.MaxTxfmSizeForBlockSize[(int)bs, 0];
+        bool lossless = fh.SegmentationLossless[b.SegId];
+        if (b.Skip == 0 && (lossless || b.MaxYTx == (byte)Av1TxSize.Tx4x4))
+        {
+            b.MaxYTx = (byte)Av1TxSize.Tx4x4;
+            b.UvTx = (byte)Av1TxSize.Tx4x4;
+            if (fh.TxfmMode == Av1TxfmMode.Switchable)
+            {
+                Av1BlockContextManaged.Fill(t.Above.Tx, bx4, Av1Tables.BlockDimensions[(int)bs, 0], 0);
+                Av1BlockContextManaged.Fill(t.Left.Tx, by4, Av1Tables.BlockDimensions[(int)bs, 1], 0);
+            }
+        }
+        else if (fh.TxfmMode != Av1TxfmMode.Switchable || b.Skip != 0)
+        {
+            if (fh.TxfmMode == Av1TxfmMode.Switchable)
+            {
+                Av1BlockContextManaged.Fill(t.Above.Tx, bx4, Av1Tables.BlockDimensions[(int)bs, 0], (sbyte)Av1Tables.BlockDimensions[(int)bs, 2]);
+                Av1BlockContextManaged.Fill(t.Left.Tx, by4, Av1Tables.BlockDimensions[(int)bs, 1], (sbyte)Av1Tables.BlockDimensions[(int)bs, 3]);
+            }
+            b.UvTx = Av1Tables.MaxTxfmSizeForBlockSize[(int)bs, (int)fh.PixelLayout];
+        }
+        else
+        {
+            ReadVarTxTree(t, ctx, ref msac, ref b, bs, b.MaxYTx, bx4, by4, 0);
+            b.UvTx = Av1Tables.MaxTxfmSizeForBlockSize[(int)bs, (int)fh.PixelLayout];
+        }
+        b.Tx = b.MaxYTx;
+    }
+
+    /// <summary>Update above/left neighbour contexts for an intraBC block (dav1d set_ctx in the
+    /// allow_intrabc branch): mode=DC, intra=0, pal_sz=0, tx_intra=block dims, skip=b.Skip.</summary>
+    private static void UpdateIntraBcContext(
+        Av1TaskContext t, Av1BlockSize bs, ref Av1Block b,
+        int bx4, int by4, int cbx4, int cby4, int cbw4, int cbh4,
+        int bw4, int bh4, bool hasChroma, Av1BlockPartition bp)
+    {
+        for (int i = 0; i < bw4 >> 1; i++) t.Above.Partition[(bx4 >> 1) + i] = (byte)bp;
+        for (int j = 0; j < bh4 >> 1; j++) t.Left.Partition[(by4 >> 1) + j] = (byte)bp;
+        for (int i = 0; i < bw4; i++)
+        {
+            t.Above.Mode[bx4 + i] = (byte)Av1IntraPredMode.Dc;
+            t.Above.Intra[bx4 + i] = 0;
+            t.Above.Skip[bx4 + i] = b.Skip;
+            t.Above.SkipMode[bx4 + i] = 0;
+            t.Above.SegPred[bx4 + i] = 0;
+            t.Above.PalSz[bx4 + i] = 0;
+            t.Above.TxIntra[bx4 + i] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 2];
+        }
+        for (int j = 0; j < bh4; j++)
+        {
+            t.Left.Mode[by4 + j] = (byte)Av1IntraPredMode.Dc;
+            t.Left.Intra[by4 + j] = 0;
+            t.Left.Skip[by4 + j] = b.Skip;
+            t.Left.SkipMode[by4 + j] = 0;
+            t.Left.SegPred[by4 + j] = 0;
+            t.Left.PalSz[by4 + j] = 0;
+            t.Left.TxIntra[by4 + j] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 3];
+        }
+        if (hasChroma)
+        {
+            for (int i = 0; i < cbw4; i++) t.Above.UvMode[cbx4 + i] = (byte)Av1IntraPredMode.Dc;
+            for (int j = 0; j < cbh4; j++) t.Left.UvMode[cby4 + j] = (byte)Av1IntraPredMode.Dc;
+        }
+    }
+
     private static void DecodeBlockInter(
         Av1TaskContext t, ref Av1Msac msac, Av1DecoderContext ctx, ref Av1Block b,
         Av1BlockLevel bl, Av1BlockSize bs,
@@ -1835,8 +2005,12 @@ public static class Av1Decode
 
     /// <summary>Decode MV residual (port of dav1d read_mv_residual).</summary>
     private static void ReadMvResidual(Av1TileState ts, ref Av1Msac msac, ref Av1MotionVector refMv, Av1DecoderFrameHeader fh)
+        => ReadMvResidual(ts, ref msac, ref refMv, fh.ForceIntegerMv ? -1 : (fh.Hp ? 1 : 0));
+
+    /// <summary>Decode MV residual with an explicit precision (dav1d read_mv_residual);
+    /// intra block copy passes mvPrec = -1 (integer displacement vectors).</summary>
+    private static void ReadMvResidual(Av1TileState ts, ref Av1Msac msac, ref Av1MotionVector refMv, int mvPrec)
     {
-        int mvPrec = fh.ForceIntegerMv ? -1 : (fh.Hp ? 1 : 0);
         int mvJoint = (int)msac.DecodeSymbolAdapt4(ts.Cdf.Mv.Joint, 3);
         int baseY = refMv.Y, baseX = refMv.X;
         // dav1d: MV_JOINT_V(2) → Y += comp[0]; MV_JOINT_H(1) → X += comp[1]

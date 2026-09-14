@@ -1849,6 +1849,7 @@ public static class Av1Reconstruction
         if (isKeyOrIntra)
         {
             // IntraBC — uses block copy from same frame with bilinear filter
+            Av1MotionComp.McBitDepth = ctx.BitDepth;
             Mc(t, ctx, dst, Span<short>.Empty, yStride,
                 bw4, bh4, t.Bx, t.By, 0,
                 b.Mv0, GetSrCurRef(ctx), 0,
