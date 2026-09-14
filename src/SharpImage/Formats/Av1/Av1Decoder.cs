@@ -642,6 +642,19 @@ internal sealed class Av1Decoder
         for (int i = 0; i < sb128w * fh.TileRows; i++)
             aboveCtx![i].Reset(isIntra);
 
+        // Allocate the ipred-edge backup buffers (pre-deblock bottom row of each SB row,
+        // used as the top reference when predicting the first block-row of the next SB row).
+        // dav1d: f->ipred_edge, sized sbh * sb128w * 128 pixels per plane.
+        {
+            int ipredSz = ctx.SuperBlockRows * sb128w * 128;
+            if (ctx.IpredEdgeY.Length < ipredSz)
+            {
+                ctx.IpredEdgeY = new ushort[ipredSz];
+                ctx.IpredEdgeU = new ushort[ipredSz];
+                ctx.IpredEdgeV = new ushort[ipredSz];
+            }
+        }
+
         // Initialize refmvs frame for inter prediction (dav1d: dav1d_refmvs_init_frame)
         Span<byte> refPoc = stackalloc byte[7];
         Av1RefMvs.InitFrame(ctx.RefMvs, seqHdr, fh, refPoc,
@@ -702,6 +715,10 @@ internal sealed class Av1Decoder
                 //             0, by >> 1);
                 //     }
                 // }
+
+                // Back up pre-loopfilter pixels for intra prediction of the next SB row.
+                // MUST run before ApplyInLoopFilters (which deblocks in place).
+                BackupIpredEdge(sby, by, ssHor, ssVer, hasChroma);
 
                 // Apply in-loop filters for this superblock row
                 ApplyInLoopFilters(sby, ssHor, ssVer, hasChroma);
@@ -1137,6 +1154,57 @@ internal sealed class Av1Decoder
             {
                 Av1Decode.ReadRestorationInfo(ref msac, ts,
                     ref ctx.LrMasks[sbIdx].Lr[p, unitIdx], p, frameType);
+            }
+        }
+    }
+
+    // Copy the last (pre-deblock) reconstructed pixel row of this superblock row into the
+    // ipred-edge buffers, so the first block-row of the next SB row predicts from unfiltered
+    // pixels. Mirrors dav1d's dav1d_backup_ipred_edge (src/recon_tmpl.c).
+    private void BackupIpredEdge(int sby, int by, int ssHor, int ssVer, bool hasChroma)
+    {
+        if (ctx.IpredEdgeY.Length == 0) return;
+
+        int sbStep = ctx.SbStep;
+        int sb128w = ctx.Sb128w;
+        int sbyOff = sb128w * 128 * sby;
+
+        int hPix = ctx.Height4 * 4;
+        int yStride = ctx.YStride;
+        Span<ushort> yPlane = ctx.CurrentPlanes[0]!.AsSpan();
+
+        // dav1d reads row ((by + sb_step) * 4 - 1); clamp to the last real row (the final,
+        // partial SB row's edge is never consumed, so clamping is safe).
+        int yRow = Math.Min((by + sbStep) * 4 - 1, hPix - 1);
+
+        Span<ushort> edgeY = ctx.IpredEdgeY.AsSpan();
+
+        for (int tileRow = 0; tileRow < frameHdr.TileRows; tileRow++)
+        {
+            for (int tileCol = 0; tileCol < frameHdr.TileCols; tileCol++)
+            {
+                var ts = ctx.TileStates![tileRow * frameHdr.TileCols + tileCol];
+                int xOff = ts.ColStart;                 // 4px units
+                int nPix = 4 * (ts.ColEnd - xOff);       // luma pixels
+                if (nPix <= 0) continue;
+
+                int src = yRow * yStride + xOff * 4;
+                int dst = sbyOff + xOff * 4;
+                yPlane.Slice(src, nPix).CopyTo(edgeY.Slice(dst, nPix));
+
+                if (hasChroma)
+                {
+                    int uvStride = ctx.UvStride;
+                    int uvRow = Math.Min(((by + sbStep) * 4 >> ssVer) - 1, (hPix >> ssVer) - 1);
+                    int uvXOff = (xOff * 4) >> ssHor;    // chroma pixels
+                    int uvN = nPix >> ssHor;
+                    int uvSrc = uvRow * uvStride + uvXOff;
+                    int uvDst = sbyOff + uvXOff;
+                    ctx.CurrentPlanes[1]!.AsSpan().Slice(uvSrc, uvN)
+                        .CopyTo(ctx.IpredEdgeU.AsSpan().Slice(uvDst, uvN));
+                    ctx.CurrentPlanes[2]!.AsSpan().Slice(uvSrc, uvN)
+                        .CopyTo(ctx.IpredEdgeV.AsSpan().Slice(uvDst, uvN));
+                }
             }
         }
     }
@@ -1695,7 +1763,10 @@ internal sealed class Av1Decoder
                 filterH[0] = filterH[6] = lr.FilterH0;
                 filterH[1] = filterH[5] = lr.FilterH1;
                 filterH[2] = filterH[4] = lr.FilterH2;
-                filterH[3] = (short)(128 - (lr.FilterH0 + lr.FilterH1 + lr.FilterH2) * 2);
+                // 8-bit: the +128 DC term is added separately as src[x]*128 inside the
+                // horizontal Wiener pass, so the centre tap must NOT include it here
+                // (dav1d lr_apply_tmpl.c: filter[0][3] = -(h0+h1+h2)*2, +=128 only for hbd).
+                filterH[3] = (short)(-(lr.FilterH0 + lr.FilterH1 + lr.FilterH2) * 2);
                 filterH[7] = 0;
 
                 filterV[0] = filterV[6] = lr.FilterV0;
@@ -2003,6 +2074,17 @@ internal sealed class Av1Decoder
             {
                 int so = y * ctx.CurrentStrides[2], doff = vOff + y * uvW;
                 for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (vPlane[so + x] + bdRound) >> bdShift);
+            }
+        }
+
+        {
+            string? dumpPath = System.Environment.GetEnvironmentVariable("AV1_DUMPYUV");
+            if (!string.IsNullOrEmpty(dumpPath))
+            {
+                using var fs = new System.IO.FileStream(dumpPath, System.IO.FileMode.Create);
+                fs.Write(outputBuffer, yOff, ySize);
+                fs.Write(outputBuffer, uOff, uvSize);
+                fs.Write(outputBuffer, vOff, uvSize);
             }
         }
 

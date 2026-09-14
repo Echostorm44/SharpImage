@@ -1032,15 +1032,21 @@ public static class Av1Reconstruction
 
                     for (int pl = 0; pl < 2; pl++)
                     {
-                        if (b.GetCflAlpha(pl) == 0) continue;
+                        // CFL prediction is DC + alpha*AC for every plane. When alpha==0 the AC
+                        // term vanishes but the DC prediction must still be produced here — the
+                        // regular UV loop skips prediction for all CFL blocks (see below), so
+                        // skipping alpha==0 planes would leave them predicted by the wrong mode.
 
                         int localAngle = 0;
                         ReadOnlySpan<ushort> topSbEdge = default;
                         if (((t.By & ~ssVer) & (ctx.SbStep - 1)) == 0 && ctx.IpredEdgeU.Length > 0)
                         {
                             int sby = t.By >> ctx.SbShift;
-                            var edgeArr = pl == 0 ? ctx.IpredEdgeU : ctx.IpredEdgeV;
-                            topSbEdge = edgeArr.AsSpan(ctx.Sb128w * 128 * (sby - 1));
+                            if (sby > 0)
+                            {
+                                var edgeArr = pl == 0 ? ctx.IpredEdgeU : ctx.IpredEdgeV;
+                                topSbEdge = edgeArr.AsSpan(ctx.Sb128w * 128 * (sby - 1));
+                            }
                         }
 
                         int xpos = t.Bx >> ssHor, ypos = t.By >> ssVer;
@@ -1172,8 +1178,10 @@ public static class Av1Reconstruction
                             int curBx = t.Bx + (xx << ssHor);
                             int uvDstOff = uvDstBaseOff + xx * 4;
 
-                            // Skip if CFL or palette already predicted
-                            if ((b.UvMode == (byte)Av1IntraPredMode.ChromaFromLuma && b.GetCflAlpha(pl) != 0) ||
+                            // Skip if CFL or palette already predicted. CFL blocks are fully
+                            // predicted (DC + alpha*AC) in the CFL loop above for every plane —
+                            // including alpha==0 planes — so never re-predict them here.
+                            if (b.UvMode == (byte)Av1IntraPredMode.ChromaFromLuma ||
                                 b.PalSzUv > 0)
                             {
                                 goto skipUvPred;

@@ -1240,41 +1240,10 @@ public static class Av1Decode
                         AvDbg.W($"[PAL-DBG] UV palette palSzUv={b.PalSzUv}");
                 }
             }
-            // Decode palette indices AFTER both Y and UV palette colors
-            if (b.PalSzY > 0)
-            {
-                Av1CoeffDecode.DecodePaletteIndices(ref msac, ts.Cdf.Mode, t,
-                    b.PalSzY, bw4 * 4, bh4 * 4, bw4, bh4, isLuma: true);
-
-                if (t.Bx == 0 && t.By == 0)
-                {
-                    int stride = bw4 * 4;
-                    var sb = new System.Text.StringBuilder($"[IDX-DUMP] bx={t.Bx} by={t.By} palSz={b.PalSzY} indices:\n");
-                    for (int y = 0; y < bh4 * 4; y++)
-                    {
-                        sb.Append($"  row{y}:");
-                        for (int x = 0; x < bw4 * 4; x++)
-                            sb.Append($" {t.PalIdxY[y * stride + x]}");
-                        sb.AppendLine();
-                    }
-                    AvDbg.W(sb.ToString());
-                }
-            }
-            if (hasChroma && b.PalSzUv > 0)
-            {
-                // Decode chroma palette indices over the CHROMA block, whose size is cbw4/cbh4
-                // (in 4-sample units). For sub-8x8 luma blocks the chroma is a shared reference
-                // block larger than the luma block's own subsampled size — e.g. stacked 16x4
-                // luma blocks share one 8x4 chroma block, so uvH must be cbh4*4 (=4), NOT the
-                // block's own (bh4*4)>>1 (=2), which under-reads the index map and desyncs MSAC.
-                int uvW = cbw4 * 4;
-                int uvH = cbh4 * 4;
-                Av1CoeffDecode.DecodePaletteIndices(ref msac, ts.Cdf.Mode, t,
-                    b.PalSzUv, uvW, uvH, cbw4, cbh4, isLuma: false);
-            }
         }
 
         // === Filter intra ===
+        // Decoded AFTER palette colors but BEFORE palette indices (dav1d decode_b order).
         if (b.YMode == (byte)Av1IntraPredMode.Dc && b.PalSzY == 0 &&
             Math.Max(bDimW, bDimH) <= 3 && seqHdr.FilterIntra)
         {
@@ -1284,6 +1253,22 @@ public static class Av1Decode
                 b.YMode = (byte)Av1IntraPredMode.Filter;
                 b.YAngle = (sbyte)msac.DecodeSymbolAdapt8(ts.Cdf.GetFilterIntraModeCdf(), 4);
             }
+        }
+
+        // === Palette indices === (after palette colors AND filter_intra, per dav1d)
+        if (b.PalSzY > 0)
+        {
+            Av1CoeffDecode.DecodePaletteIndices(ref msac, ts.Cdf.Mode, t,
+                b.PalSzY, bw4 * 4, bh4 * 4, bw4, bh4, isLuma: true);
+        }
+        if (hasChroma && b.PalSzUv > 0)
+        {
+            // Chroma palette index map spans the CHROMA reference block (cbw4/cbh4 in 4-sample
+            // units), which for sub-8x8 luma is larger than the block's own subsampled size.
+            int uvW = cbw4 * 4;
+            int uvH = cbh4 * 4;
+            Av1CoeffDecode.DecodePaletteIndices(ref msac, ts.Cdf.Mode, t,
+                b.PalSzUv, uvW, uvH, cbw4, cbh4, isLuma: false);
         }
 
         // === Transform size ===
