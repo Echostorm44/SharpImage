@@ -74,14 +74,13 @@ public static class Av1LoopRestoration
     // Wiener Filter — Horizontal pass
     // ========================================================================
 
+    /// <summary>Bit depth for the Wiener/SGR kernels (8/10/12). The decoder sets this per
+    /// frame before applying loop restoration; the 8-bit encoder leaves it at 8. Mirrors
+    /// dav1d's HIGHBD_DECL_SUFFIX bitdepth threading (round bits, clip limits, +128 term).</summary>
+    internal static int WienerBitDepth = 8;
+
     /// <summary>
-    // NOTE (high bit depth): the loop-restoration Wiener/SGR math below is 8-bit-internal
-    // (const bitdepth = 8, clamps to 255). Storage is ushort so the module compiles into the
-    // unified ushort pipeline and is bit-exact at 8 bit. For 10/12-bit input the restoration
-    // contribution is not yet bit-exact (intermediates/rounding/clip use the 8-bit constants) —
-    // this is the one remaining kernel to finish for full high-bit-depth conformance; it needs
-    // the dav1d looprestoration hbd rounding constants, tracked as a follow-up.
-    /// Wiener horizontal filter: produces 16-bit intermediates from 8-bit pixels.
+    /// Wiener horizontal filter: produces 16-bit intermediates from source pixels.
     /// For 8-bit: sum starts with (1 &lt;&lt; 14), adds src[x]*128, then 7-tap filter.
     /// Round with 3 bits, clip to [0, 2048).
     /// </summary>
@@ -89,17 +88,20 @@ public static class Av1LoopRestoration
         ReadOnlySpan<ushort> src, int srcOffset, ReadOnlySpan<short> fh,
         int w, LrEdgeFlags edges)
     {
-        const int bitdepth = 8;
-        const int roundBitsH = 3;
-        const int roundingOffH = 1 << (roundBitsH - 1);
-        const int clipLimit = 1 << (bitdepth + 1 + 7 - roundBitsH);
+        int bitdepth = WienerBitDepth;
+        int roundBitsH = 3 + (bitdepth == 12 ? 2 : 0);
+        int roundingOffH = 1 << (roundBitsH - 1);
+        int clipLimit = 1 << (bitdepth + 1 + 7 - roundBitsH);
+        // The +128 DC term is folded into the centre tap for high bit depth (fh[3] carries it);
+        // only 8-bit adds it separately here (dav1d wiener_filter_h #if BITDEPTH==8).
+        int dcTap = bitdepth == 8 ? 128 : 0;
 
         int start = 3;
         if ((edges & LrEdgeFlags.Left) == 0)
         {
             for (int x = 0; x < 3; x++)
             {
-                int sum = (1 << (bitdepth + 6)) + src[srcOffset + x] * 128;
+                int sum = (1 << (bitdepth + 6)) + src[srcOffset + x] * dcTap;
                 for (int i = 0; i < 7; i++)
                 {
                     int idx = x + i - 3;
@@ -112,7 +114,7 @@ public static class Av1LoopRestoration
         {
             for (int x = 0; x < 3; x++)
             {
-                int sum = (1 << (bitdepth + 6)) + src[srcOffset + x] * 128;
+                int sum = (1 << (bitdepth + 6)) + src[srcOffset + x] * dcTap;
                 for (int i = 0; i < 7; i++)
                 {
                     int idx = x + i - 3;
@@ -130,7 +132,7 @@ public static class Av1LoopRestoration
 
         for (int x = start; x < end; x++)
         {
-            int sum = (1 << (bitdepth + 6)) + src[srcOffset + x] * 128;
+            int sum = (1 << (bitdepth + 6)) + src[srcOffset + x] * dcTap;
             for (int i = 0; i < 7; i++)
                 sum += src[srcOffset + x + i - 3] * fh[i];
             dst[x] = (ushort)Math.Clamp((sum + roundingOffH) >> roundBitsH, 0, clipLimit - 1);
@@ -138,7 +140,7 @@ public static class Av1LoopRestoration
 
         for (int x = end; x < w; x++)
         {
-            int sum = (1 << (bitdepth + 6)) + src[srcOffset + x] * 128;
+            int sum = (1 << (bitdepth + 6)) + src[srcOffset + x] * dcTap;
             for (int i = 0; i < 7; i++)
             {
                 int idx = x + i - 3;
@@ -158,10 +160,11 @@ public static class Av1LoopRestoration
         ReadOnlySpan<short> fh, ReadOnlySpan<short> fv,
         int w, LrEdgeFlags edges)
     {
-        const int bitdepth = 8;
-        const int roundBitsV = 11;
-        const int roundingOffV = 1 << (roundBitsV - 1);
-        const int roundOffset = 1 << (bitdepth + (roundBitsV - 1));
+        int bitdepth = WienerBitDepth;
+        int roundBitsV = 11 - (bitdepth == 12 ? 2 : 0);
+        int roundingOffV = 1 << (roundBitsV - 1);
+        int roundOffset = 1 << (bitdepth + (roundBitsV - 1));
+        int pxMax = (1 << bitdepth) - 1;
 
         Span<ushort> tmp = stackalloc ushort[RestUnitStride];
         WienerFilterH(tmp, left, src, srcOffset, fh, w, edges);
@@ -172,7 +175,7 @@ public static class Av1LoopRestoration
             for (int k = 0; k < 6; k++)
                 sum += ptrs[k][i] * fv[k];
             sum += tmp[i] * fv[6];
-            p[pOffset + i] = (ushort)Math.Clamp((sum + roundingOffV) >> roundBitsV, 0, 255);
+            p[pOffset + i] = (ushort)Math.Clamp((sum + roundingOffV) >> roundBitsV, 0, pxMax);
         }
 
         // Copy new row into ptrs[6], rotate down
@@ -185,10 +188,11 @@ public static class Av1LoopRestoration
     private static void WienerFilterV(Span<ushort> p, int pOffset, ushort[][] ptrs,
         ReadOnlySpan<short> fv, int w)
     {
-        const int bitdepth = 8;
-        const int roundBitsV = 11;
-        const int roundingOffV = 1 << (roundBitsV - 1);
-        const int roundOffset = 1 << (bitdepth + (roundBitsV - 1));
+        int bitdepth = WienerBitDepth;
+        int roundBitsV = 11 - (bitdepth == 12 ? 2 : 0);
+        int roundingOffV = 1 << (roundBitsV - 1);
+        int roundOffset = 1 << (bitdepth + (roundBitsV - 1));
+        int pxMax = (1 << bitdepth) - 1;
 
         for (int i = 0; i < w; i++)
         {
@@ -196,7 +200,7 @@ public static class Av1LoopRestoration
             for (int k = 0; k < 6; k++)
                 sum += ptrs[k][i] * fv[k];
             sum += ptrs[5][i] * fv[6]; // 7th row = last row duplicated
-            p[pOffset + i] = (ushort)Math.Clamp((sum + roundingOffV) >> roundBitsV, 0, 255);
+            p[pOffset + i] = (ushort)Math.Clamp((sum + roundingOffV) >> roundBitsV, 0, pxMax);
         }
 
         for (int i = 0; i < 5; i++)
@@ -422,17 +426,24 @@ public static class Av1LoopRestoration
     private static void SgrCalcRowAB(int[] AA, int[] BB, int offset, int w,
         int s, int n, int sgrOneByX)
     {
-        // For 8-bit: bitdepth_min_8 = 0, so rounding terms simplify
+        // dav1d sgr_calc_row_ab: for high bit depth the box sums are downscaled to the
+        // 8-bit-equivalent range before computing p/z (2*bitdepth_min_8 for sumsq, bitdepth_min_8
+        // for sum); the A-invert uses the ORIGINAL sum. bitdepth_min_8=0 for 8-bit (no-op).
+        int bdMin8 = WienerBitDepth - 8;
         for (int i = 0; i < w + 2; i++)
         {
-            int a = AA[offset + i];
-            int b = BB[offset + i];
+            int aFull = AA[offset + i];
+            int bFull = BB[offset + i];
+            int a = bdMin8 == 0 ? aFull
+                : (aFull + ((1 << (2 * bdMin8)) >> 1)) >> (2 * bdMin8);
+            int b = bdMin8 == 0 ? bFull
+                : (bFull + ((1 << bdMin8) >> 1)) >> bdMin8;
             int p = Math.Max(a * n - b * b, 0);
             int z = (int)(((uint)p * (uint)s + (1 << 19)) >> 20);
             int x = SgrXByX[Math.Min(z, 255)];
 
             BB[offset + i] = x;
-            AA[offset + i] = (x * b * sgrOneByX + (1 << 11)) >> 12;
+            AA[offset + i] = (x * bFull * sgrOneByX + (1 << 11)) >> 12;
         }
     }
 
@@ -519,11 +530,12 @@ public static class Av1LoopRestoration
     private static void SgrWeightedRow1(Span<ushort> dst, int dstOffset,
         int[] t, int tOffset, int w, int w1)
     {
+        int pxMax = (1 << WienerBitDepth) - 1;
         for (int i = 0; i < w; i++)
         {
             int v = w1 * t[tOffset + i];
             dst[dstOffset + i] = (ushort)Math.Clamp(
-                dst[dstOffset + i] + ((v + (1 << 10)) >> 11), 0, 255);
+                dst[dstOffset + i] + ((v + (1 << 10)) >> 11), 0, pxMax);
         }
     }
 
@@ -531,13 +543,14 @@ public static class Av1LoopRestoration
         int[] t1, int t1Offset, int[] t2, int t2Offset,
         int w, int h, int w0, int w1)
     {
+        int pxMax = (1 << WienerBitDepth) - 1;
         for (int j = 0; j < h; j++)
         {
             for (int i = 0; i < w; i++)
             {
                 int v = w0 * t1[t1Offset + i] + w1 * t2[t2Offset + i];
                 dst[dstOffset + i] = (ushort)Math.Clamp(
-                    dst[dstOffset + i] + ((v + (1 << 10)) >> 11), 0, 255);
+                    dst[dstOffset + i] + ((v + (1 << 10)) >> 11), 0, pxMax);
             }
             dstOffset += dstStride;
             t1Offset += FilterOutStride;

@@ -1733,6 +1733,8 @@ internal sealed class Av1Decoder
     {
         int sb128 = seqHdr.Sb128 ? 1 : 0;
         int sbh = (ctx.Bh + (seqHdr.Sb128 ? 31 : 15)) >> (seqHdr.Sb128 ? 5 : 4);
+        // Bit depth for the Wiener/SGR kernels (round bits, clip limits, box-sum downscale).
+        Av1LoopRestoration.WienerBitDepth = ctx.BitDepth;
 
         // lpf offset: for single-threaded (have_tt=0), just add x
         int lpfOff = x;
@@ -1763,10 +1765,12 @@ internal sealed class Av1Decoder
                 filterH[0] = filterH[6] = lr.FilterH0;
                 filterH[1] = filterH[5] = lr.FilterH1;
                 filterH[2] = filterH[4] = lr.FilterH2;
-                // 8-bit: the +128 DC term is added separately as src[x]*128 inside the
-                // horizontal Wiener pass, so the centre tap must NOT include it here
-                // (dav1d lr_apply_tmpl.c: filter[0][3] = -(h0+h1+h2)*2, +=128 only for hbd).
-                filterH[3] = (short)(-(lr.FilterH0 + lr.FilterH1 + lr.FilterH2) * 2);
+                // The +128 DC term is added separately as src[x]*128 inside the horizontal
+                // Wiener pass ONLY for 8-bit, so the centre tap excludes it at 8-bit and
+                // folds it in for high bit depth (dav1d lr_apply_tmpl.c: filter[0][3] =
+                // -(h0+h1+h2)*2, then += 128 for BITDEPTH != 8).
+                filterH[3] = (short)(-(lr.FilterH0 + lr.FilterH1 + lr.FilterH2) * 2
+                                     + (ctx.BitDepth == 8 ? 0 : 128));
                 filterH[7] = 0;
 
                 filterV[0] = filterV[6] = lr.FilterV0;
