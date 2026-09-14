@@ -1896,6 +1896,7 @@ internal sealed class Av1Decoder
 
         // High-bit-depth samples are downshifted to 8-bit for the byte output buffer.
         int bdShift = ctx.BitDepth - 8;
+        int bdRound = bdShift > 0 ? (1 << (bdShift - 1)) : 0; // round on high-bit-depth->8 downshift (matches reference)
 
         // Copy Y
         if (refFrame.Planes[0] != null)
@@ -1904,7 +1905,7 @@ internal sealed class Av1Decoder
             for (int y = 0; y < h; y++)
             {
                 int so = y * refFrame.Strides[0], doff = yOff + y * w;
-                for (int x = 0; x < w; x++) outputBuffer[doff + x] = (byte)(src[so + x] >> bdShift);
+                for (int x = 0; x < w; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (src[so + x] + bdRound) >> bdShift);
             }
         }
 
@@ -1915,7 +1916,7 @@ internal sealed class Av1Decoder
             for (int y = 0; y < uvH; y++)
             {
                 int so = y * refFrame.Strides[1], doff = uOff + y * uvW;
-                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)(src[so + x] >> bdShift);
+                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (src[so + x] + bdRound) >> bdShift);
             }
         }
 
@@ -1926,7 +1927,7 @@ internal sealed class Av1Decoder
             for (int y = 0; y < uvH; y++)
             {
                 int so = y * refFrame.Strides[2], doff = vOff + y * uvW;
-                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)(src[so + x] >> bdShift);
+                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (src[so + x] + bdRound) >> bdShift);
             }
         }
 
@@ -1976,13 +1977,14 @@ internal sealed class Av1Decoder
 
         // High-bit-depth samples are downshifted to 8-bit for the byte output buffer.
         int bdShift = ctx.BitDepth - 8;
+        int bdRound = bdShift > 0 ? (1 << (bdShift - 1)) : 0; // round on high-bit-depth->8 downshift (matches reference)
 
         if (yPlane != null)
         {
             for (int y = 0; y < h; y++)
             {
                 int so = y * ctx.CurrentStrides[0], doff = yOff + y * w;
-                for (int x = 0; x < w; x++) outputBuffer[doff + x] = (byte)(yPlane[so + x] >> bdShift);
+                for (int x = 0; x < w; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (yPlane[so + x] + bdRound) >> bdShift);
             }
         }
 
@@ -1991,7 +1993,7 @@ internal sealed class Av1Decoder
             for (int y = 0; y < uvH; y++)
             {
                 int so = y * ctx.CurrentStrides[1], doff = uOff + y * uvW;
-                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)(uPlane[so + x] >> bdShift);
+                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (uPlane[so + x] + bdRound) >> bdShift);
             }
         }
 
@@ -2000,7 +2002,7 @@ internal sealed class Av1Decoder
             for (int y = 0; y < uvH; y++)
             {
                 int so = y * ctx.CurrentStrides[2], doff = vOff + y * uvW;
-                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)(vPlane[so + x] >> bdShift);
+                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (vPlane[so + x] + bdRound) >> bdShift);
             }
         }
 
