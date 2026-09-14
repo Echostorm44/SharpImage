@@ -271,12 +271,17 @@ internal sealed class Av1Decoder
         // Parse tile group header (§5.11.1)
         // NOTE: For OBU_FRAME, there is NO tile_group_obu() wrapper —
         // tile data (tile_size fields) starts immediately after frame header bytes.
+        // For BOTH OBU_TILE_GROUP and OBU_FRAME, the tile_group_obu() carries a header when NumTiles > 1:
+        // tile_start_and_end_present_flag (1 bit), optional tg_start/tg_end, then byte_alignment before the tile
+        // data. Only single-tile (NumTiles==1) has no such flag. Previously this was gated on !isObuFrame, so a
+        // multi-tile OBU_FRAME (what libaom emits for larger frames) skipped the flag + byte-alignment and read the
+        // tile data one byte early -> MSAC desync -> whole-frame garbage. Read it whenever there are multiple tiles.
         int totalTiles = frameHdr.TileCols * frameHdr.TileRows;
         int tileStart = 0;
         int tileEnd = totalTiles - 1;
         int headerBits = 0;
 
-        if (!isObuFrame && totalTiles > 1)
+        if (totalTiles > 1)
         {
             var gb = new Av1GetBits(payload);
             bool haveTilePos = gb.GetBool();
