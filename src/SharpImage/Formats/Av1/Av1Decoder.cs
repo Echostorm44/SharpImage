@@ -1939,9 +1939,12 @@ internal sealed class Av1Decoder
             return null;
         }
 
+        // Chroma subsampling from the actual pixel layout (was hardcoded to 4:2:0, corrupting 4:4:4 / 4:2:2 output).
+        int ssHor = ctx.PixelLayout != Av1PixelLayout.I444 ? 1 : 0;
+        int ssVer = ctx.PixelLayout == Av1PixelLayout.I420 ? 1 : 0;
         int ySize = w * h;
-        int uvW = (w + 1) >> 1;
-        int uvH = (h + 1) >> 1;
+        int uvW = (w + ssHor) >> ssHor;
+        int uvH = (h + ssVer) >> ssVer;
         int uvSize = uvW * uvH;
         int totalSize = ySize + uvSize * 2;
 
@@ -1979,8 +1982,14 @@ internal sealed class Av1Decoder
                     .CopyTo(outputBuffer.AsSpan(vOff + y * uvW));
         }
 
+        var outFmt = ctx.PixelLayout switch
+        {
+            Av1PixelLayout.I444 => PixelFormat.Yuv444P,
+            Av1PixelLayout.I422 => PixelFormat.Yuv422P,
+            _ => PixelFormat.Yuv420P,
+        };
         return new DecodedVideoFrame(
-            w, h, PixelFormat.Yuv420P, presentationTimeTicks,
+            w, h, outFmt, presentationTimeTicks,
             outputBuffer,
             yOff, w,
             uOff, uvW,

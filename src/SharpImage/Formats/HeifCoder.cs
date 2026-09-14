@@ -640,15 +640,19 @@ public static class HeifCoder
         }
         else
         {
+            bool is444 = yuv.Format is Av1.PixelFormat.Yuv444P or Av1.PixelFormat.Yuv444P10;
+            bool is422 = yuv.Format is Av1.PixelFormat.Yuv422P or Av1.PixelFormat.Yuv422P10;
+            int ssHor = is444 ? 0 : 1;
+            int ssVer = (is444 || is422) ? 0 : 1;
             ConvertYuvToRgb(yuv.YPlane.Span, yuv.UPlane.Span, yuv.VPlane.Span, yuv.YStride, yuv.UStride, yuv.VStride,
-                frame, w, h, channels, tenBit, shift, matrixCoeffs == 1, fullRange);
+                frame, w, h, channels, tenBit, shift, matrixCoeffs == 1, fullRange, ssHor, ssVer);
         }
     }
 
     // Converts a decoded 8/10/12-bit planar YUV 4:2:0 frame to RGB, honouring the colour
     // matrix (BT.709 vs BT.601) and range (full vs limited) signalled by the container.
     // Shared by the AVIF (AV1) and HEIC (HEVC) paths.
-    private static void ConvertYuvToRgb(ReadOnlySpan<byte> y0, ReadOnlySpan<byte> u0, ReadOnlySpan<byte> v0, int yStride, int uStride, int vStride, ImageFrame frame, int w, int h, int channels, bool tenBit, int shift, bool bt709, bool fullRange)
+    private static void ConvertYuvToRgb(ReadOnlySpan<byte> y0, ReadOnlySpan<byte> u0, ReadOnlySpan<byte> v0, int yStride, int uStride, int vStride, ImageFrame frame, int w, int h, int channels, bool tenBit, int shift, bool bt709, bool fullRange, int ssHor = 1, int ssVer = 1)
     {
         int Sample(ReadOnlySpan<byte> plane, int stride, int x, int y)
         {
@@ -665,10 +669,10 @@ public static class HeifCoder
         for (int y = 0; y < h; y++)
         {
             var row = frame.GetPixelRowForWrite(y);
-            int cy = y >> 1;
+            int cy = y >> ssVer;
             for (int x = 0; x < w; x++)
             {
-                int cx = x >> 1;
+                int cx = x >> ssHor;
                 int yv = Sample(y0, yStride, x, y);
                 int d = Sample(u0, uStride, cx, cy) - 128;
                 int e = Sample(v0, vStride, cx, cy) - 128;
