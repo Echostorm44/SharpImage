@@ -485,7 +485,7 @@ internal static class Av1StillImageEncoder
         return c.Msac.Finish();
     }
 
-    private static void EncodePartitionColor(ColorPartCtx c, int bl, int bx4, int by4)
+    private static void EncodePartitionColor(ColorPartCtx c, int bl, int bx4, int by4, int edgeIdx = 0)
     {
         int hsz = 16 >> bl, blk4 = 32 >> bl;
         bool haveH = c.Bw4 > bx4 + hsz;
@@ -496,27 +496,28 @@ internal static class Av1StillImageEncoder
         Span<ushort> partCdf = c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx);
         int nPart = Av1Tables.PartitionTypeCount[bl];
 
-        // Edge handling mirrors the gray path (force SPLIT at edges; the tree is luma-driven, chroma follows).
+        // Edge handling mirrors the gray path (force SPLIT at edges; the tree is luma-driven, chroma follows). The
+        // forced-split children take the same intra-edge tree children as a coded SPLIT (0=TL,1=TR,2=BL,3=BR).
         if (!haveH && !haveV)
         {
             if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
-            EncodePartitionColor(c, bl + 1, bx4, by4);
+            EncodePartitionColor(c, bl + 1, bx4, by4, Av1IntraEdgeTree.GetSplitChild(Av1IntraEdgeTree.Tree64[edgeIdx], 0));
             return;
         }
         if (haveH && !haveV)
         {
             if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
             c.Msac.EncodeBool(1, Av1Decode.GatherTopPartitionProb(partCdf, (Av1BlockLevel)bl));
-            EncodePartitionColor(c, bl + 1, bx4, by4);
-            EncodePartitionColor(c, bl + 1, bx4 + hsz, by4);
+            EncodePartitionColor(c, bl + 1, bx4, by4, Av1IntraEdgeTree.GetSplitChild(Av1IntraEdgeTree.Tree64[edgeIdx], 0));
+            EncodePartitionColor(c, bl + 1, bx4 + hsz, by4, Av1IntraEdgeTree.GetSplitChild(Av1IntraEdgeTree.Tree64[edgeIdx], 1));
             return;
         }
         if (!haveH && haveV)
         {
             if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
             c.Msac.EncodeBool(1, Av1Decode.GatherLeftPartitionProb(partCdf, (Av1BlockLevel)bl));
-            EncodePartitionColor(c, bl + 1, bx4, by4);
-            EncodePartitionColor(c, bl + 1, bx4, by4 + hsz);
+            EncodePartitionColor(c, bl + 1, bx4, by4, Av1IntraEdgeTree.GetSplitChild(Av1IntraEdgeTree.Tree64[edgeIdx], 0));
+            EncodePartitionColor(c, bl + 1, bx4, by4 + hsz, Av1IntraEdgeTree.GetSplitChild(Av1IntraEdgeTree.Tree64[edgeIdx], 2));
             return;
         }
 
@@ -527,7 +528,7 @@ internal static class Av1StillImageEncoder
         // and real reconstruction (incl. adaptation and recursive sub-decisions), so it picks partitions optimally.
         if (UseTrueRd && (long)c.Bw4 * c.Bh4 * 16 <= TrueRdPixelBudget && fullyInside && bl >= 1 && bl < 4)
         {
-            EncodePartitionColorTrueRd(c, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8);
+            EncodePartitionColorTrueRd(c, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8, edgeIdx);
             return;
         }
 
@@ -577,22 +578,25 @@ internal static class Av1StillImageEncoder
             choice = (rectBest < (long)(sqBest * RectCostMargin)) ? rectChoice : sqChoice;
         }
 
-        EncodeChoiceColor(c, choice, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8);
+        EncodeChoiceColor(c, choice, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8, edgeIdx);
     }
 
     // Encodes one specific partition choice (0=NONE,1=HORZ,2=VERT,3=SPLIT): the partition symbol, the leaf(s) or
     // recursive children, and the partition-context fill. SPLIT recurses into EncodePartitionColor (which itself
     // applies whatever decision mode is active).
     private static void EncodeChoiceColor(ColorPartCtx c, int choice, int bl, int bx4, int by4, int hsz, int blk4,
-        Span<ushort> partCdf, int nPart, int bx8, int by8)
+        Span<ushort> partCdf, int nPart, int bx8, int by8, int edgeIdx)
     {
+        ref readonly var node = ref Av1IntraEdgeTree.Tree64[edgeIdx];
         if (choice == 3)
         {
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
-            EncodePartitionColor(c, bl + 1, bx4, by4);
-            EncodePartitionColor(c, bl + 1, bx4 + hsz, by4);
-            EncodePartitionColor(c, bl + 1, bx4, by4 + hsz);
-            EncodePartitionColor(c, bl + 1, bx4 + hsz, by4 + hsz);
+            int c0 = Av1IntraEdgeTree.GetSplitChild(node, 0), c1 = Av1IntraEdgeTree.GetSplitChild(node, 1);
+            int c2 = Av1IntraEdgeTree.GetSplitChild(node, 2), c3 = Av1IntraEdgeTree.GetSplitChild(node, 3);
+            EncodePartitionColor(c, bl + 1, bx4, by4, c0);
+            EncodePartitionColor(c, bl + 1, bx4 + hsz, by4, c1);
+            EncodePartitionColor(c, bl + 1, bx4, by4 + hsz, c2);
+            EncodePartitionColor(c, bl + 1, bx4 + hsz, by4 + hsz, c3);
             return;
         }
 
@@ -600,8 +604,8 @@ internal static class Av1StillImageEncoder
         {
             var rp = RectLeafParams(bl);
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Horizontal, nPart);
-            EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4, blk4, hsz);
-            EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4 + hsz, blk4, hsz);
+            EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4, blk4, hsz, node.H0);
+            EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4 + hsz, blk4, hsz, node.H1);
             FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Horizontal);
             return;
         }
@@ -610,14 +614,14 @@ internal static class Av1StillImageEncoder
         {
             var rp = RectLeafParams(bl);
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Vertical, nPart);
-            EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4, by4, hsz, blk4);
-            EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4 + hsz, by4, hsz, blk4);
+            EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4, by4, hsz, blk4, node.V0);
+            EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4 + hsz, by4, hsz, blk4, node.V1);
             FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Vertical);
             return;
         }
 
         c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.None, nPart);
-        EncodeLeafBlockColor(c, bl, bx4, by4, blk4);
+        EncodeLeafBlockColor(c, bl, bx4, by4, blk4, node.O);
         FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.None);
     }
 
@@ -702,7 +706,7 @@ internal static class Av1StillImageEncoder
     }
 
     private static void EncodePartitionColorTrueRd(ColorPartCtx c, int bl, int bx4, int by4, int hsz, int blk4,
-        Span<ushort> partCdf, int nPart, int bx8, int by8)
+        Span<ushort> partCdf, int nPart, int bx8, int by8, int edgeIdx)
     {
         // Candidates: NONE and SPLIT always; HORZ/VERT at 32x32/16x16 when rect is enabled.
         Span<int> cands = stackalloc int[4];
@@ -726,7 +730,7 @@ internal static class Av1StillImageEncoder
         {
             if (i > 0) RestoreRd(c, snap0, bx4, by4, blk4);
             double b0 = c.Msac.MeasuredBits;
-            EncodeChoiceColor(c, cands[i], bl, bx4, by4, hsz, blk4, c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), nPart, bx8, by8);
+            EncodeChoiceColor(c, cands[i], bl, bx4, by4, hsz, blk4, c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), nPart, bx8, by8, edgeIdx);
             double bits = c.Msac.MeasuredBits - b0;
             double j = BlockSseColor(c, bx4, by4, blk4) + lambda * bits;
             if (j < bestJ)
@@ -850,7 +854,7 @@ internal static class Av1StillImageEncoder
         return sse;
     }
 
-    private static void EncodeLeafBlockColor(ColorPartCtx c, int bl, int bx4, int by4, int blk4)
+    private static void EncodeLeafBlockColor(ColorPartCtx c, int bl, int bx4, int by4, int blk4, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
     {
         int n = blk4 * 4, cn = n / 2;
         int tx = BlToTx(bl), ctx0 = tx - 1; // chroma tx = one size smaller (I420)
@@ -865,7 +869,7 @@ internal static class Av1StillImageEncoder
 
         // Luma: rate-distortion mode + tx-type decision (from reconstruction). Writes prediction into c.Pred.
         var rd = ChooseLeafRdCore(c.ReconY, c.W, c.Bw4, c.Bh4, c.Luma, c.W, bx4, by4, n, tx, c.DcDq, c.AcDq,
-            c.Cdf, c.AModeY[bxR], c.LModeY[byR], c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR), c.Pred);
+            c.Cdf, c.AModeY[bxR], c.LModeY[byR], c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR), c.Pred, edgeFlags);
         Av1IntraPredMode yMode = rd.Mode; int yDelta = rd.Delta;
         int[] yC = rd.Coeffs; Av1TxType yInv = rd.Inv; int yTxIdx = rd.Idx;
 
@@ -900,11 +904,18 @@ internal static class Av1StillImageEncoder
             lumaTxb = new();
             int txN = lTDim.W * 4, txW4 = lTDim.W;
             var predBuf = new byte[txN * txN];
+            // Per-tx-block intra-edge availability within this coding block (blk4 <= 16, so one 64-region: initX=
+            // initY=0, subW4=blk4, subH4=blk4). Mirrors Av1Reconstruction's localEdgeFlags for tx_depth > 0.
+            int sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0 ? 1 : 0;
+            int sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0 ? 1 : 0;
             for (int iy = 0; iy < blk4; iy += txW4)
                 for (int ix = 0; ix < blk4; ix += txW4)
                 {
                     int cbx4 = bx4 + ix, cby4 = by4 + iy, cbxR = cbx4 & 31, cbyR = cby4 & 31;
-                    PredictIntra(c.ReconY, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf);
+                    var localEdge =
+                        (((iy > 0 || sbHasTr == 0) && (ix + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444TopHasRight) |
+                        ((ix > 0 || (sbHasBl == 0 && iy + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
+                    PredictIntra(c.ReconY, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge);
                     int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
                     (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, lumaTx, c.DcDq, c.AcDq);
                     int skc = Av1CoeffDecode.GetSkipCtx(in lTDim, bs, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR), 0, 0);
@@ -1175,7 +1186,7 @@ internal static class Av1StillImageEncoder
     // UV mode (DC), then Y/U/V coefficients (rect transforms), and reconstructs all three planes. Chroma is DC-
     // predicted (no CfL for rect yet). Mirrors EncodeLeafBlockColor for a w4 x h4 (in 4-units) rectangle.
     private static void EncodeRectLeafColor(ColorPartCtx c, int lumaBs, int lumaTx, int chromaTx,
-        int bx4, int by4, int w4, int h4)
+        int bx4, int by4, int w4, int h4, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
     {
         int w = w4 * 4, h = h4 * 4, cw = w >> 1, ch = h >> 1;
         int bx = bx4 * 4, by = by4 * 4, cbx = bx4 * 2, cby = by4 * 2;
@@ -1198,7 +1209,7 @@ internal static class Av1StillImageEncoder
         double best = double.MaxValue;
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
-            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred);
+            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags);
             int[] cf = ForwardResidualPredRect(c.Luma, c.W, bx, by, pred, w, h, lumaTx, c.DcDq, c.AcDq, lScan);
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                 + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
@@ -1440,11 +1451,12 @@ internal static class Av1StillImageEncoder
     // Recursively encodes the partition tree for one block. bl is the Av1BlockLevel (1=64x64..4=8x8); bx4/by4 are
     // the block's absolute 4-unit position. Chooses PARTITION_NONE vs PARTITION_SPLIT by comparing the whole-block
     // residual SATD against the sum of the four quadrants' SATD (plus a rate bias).
-    private static void EncodePartition(GrayPartCtx c, int bl, int bx4, int by4)
+    private static void EncodePartition(GrayPartCtx c, int bl, int bx4, int by4, int edgeIdx = 0)
     {
         int hsz = 16 >> bl;          // half block in 4-units
         int blk4 = 32 >> bl;         // full block in 4-units
         int n = blk4 * 4;            // block pixels
+        int SplitCh(int q) => Av1IntraEdgeTree.GetSplitChild(Av1IntraEdgeTree.Tree64[edgeIdx], q);
         // Edge logic mirrors the decoder: haveH/haveV = there is room for the right/bottom half inside the frame.
         bool haveH = c.Bw4 > bx4 + hsz;
         bool haveV = c.Bh4 > by4 + hsz;
@@ -1458,7 +1470,7 @@ internal static class Av1StillImageEncoder
         if (!haveH && !haveV)
         {
             if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size in 4-units) — not yet implemented.");
-            EncodePartition(c, bl + 1, bx4, by4);
+            EncodePartition(c, bl + 1, bx4, by4, SplitCh(0));
             return;
         }
 
@@ -1467,8 +1479,8 @@ internal static class Av1StillImageEncoder
         {
             if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
             c.Msac.EncodeBool(1, Av1Decode.GatherTopPartitionProb(partCdf, (Av1BlockLevel)bl));
-            EncodePartition(c, bl + 1, bx4, by4);
-            EncodePartition(c, bl + 1, bx4 + hsz, by4);
+            EncodePartition(c, bl + 1, bx4, by4, SplitCh(0));
+            EncodePartition(c, bl + 1, bx4 + hsz, by4, SplitCh(1));
             return;
         }
         // Right edge (room below, none across): split_or_vert — force SPLIT.
@@ -1476,8 +1488,8 @@ internal static class Av1StillImageEncoder
         {
             if (bl >= 4) throw new NotSupportedException("Edge block needs 4x4 split (odd frame size) — not yet implemented.");
             c.Msac.EncodeBool(1, Av1Decode.GatherLeftPartitionProb(partCdf, (Av1BlockLevel)bl));
-            EncodePartition(c, bl + 1, bx4, by4);
-            EncodePartition(c, bl + 1, bx4, by4 + hsz);
+            EncodePartition(c, bl + 1, bx4, by4, SplitCh(0));
+            EncodePartition(c, bl + 1, bx4, by4 + hsz, SplitCh(2));
             return;
         }
 
@@ -1497,18 +1509,19 @@ internal static class Av1StillImageEncoder
         if (doSplit)
         {
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
-            EncodePartition(c, bl + 1, bx4, by4);
-            EncodePartition(c, bl + 1, bx4 + hsz, by4);
-            EncodePartition(c, bl + 1, bx4, by4 + hsz);
-            EncodePartition(c, bl + 1, bx4 + hsz, by4 + hsz);
+            EncodePartition(c, bl + 1, bx4, by4, SplitCh(0));
+            EncodePartition(c, bl + 1, bx4 + hsz, by4, SplitCh(1));
+            EncodePartition(c, bl + 1, bx4, by4 + hsz, SplitCh(2));
+            EncodePartition(c, bl + 1, bx4 + hsz, by4 + hsz, SplitCh(3));
             return; // SPLIT nodes (bl<8x8) do not update partition context
         }
 
         c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.None, nPart);
         // Actual leaf: pick the best mode predicting from the real reconstruction, then code + reconstruct.
+        Av1EdgeFlags leafEdge = Av1IntraEdgeTree.Tree64[edgeIdx].O;
         (Av1IntraPredMode yMode, int yDelta, _) =
-            ChooseIntraMode(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred);
-        EncodeLeafBlock(c, bl, bx4, by4, blk4, n, yMode, yDelta);
+            ChooseIntraMode(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, leafEdge);
+        EncodeLeafBlock(c, bl, bx4, by4, blk4, n, yMode, yDelta, leafEdge);
 
         // Partition context fill for the NONE leaf (mirrors DecodeSuperblock's AboveLeftPartCtx update).
         byte aboveVal = Av1Tables.AboveLeftPartCtx[0, bl, (int)Av1BlockPartition.None];
@@ -1525,7 +1538,7 @@ internal static class Av1StillImageEncoder
     // coefficients of each sub-transform block (with per-tx-block intra prediction + reconstruction), and the
     // above/left context fills. Chooses a tx depth (0/1/2) that minimizes estimated coding cost.
     private static void EncodeLeafBlock(GrayPartCtx c, int bl, int bx4, int by4, int blk4, int n,
-        Av1IntraPredMode yMode, int yDelta)
+        Av1IntraPredMode yMode, int yDelta, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
     {
         int maxTx = BlToTx(bl);
         int bxR = bx4 & 31, byR = by4 & 31;
@@ -1536,13 +1549,13 @@ internal static class Av1StillImageEncoder
         int[] coeffs0; Av1TxType invTx0; int txIdx0;
         if (UseRd)
         {
-            var rd = ChooseLeafRd(c, bx4, by4, n, maxTx);
+            var rd = ChooseLeafRd(c, bx4, by4, n, maxTx, edgeFlags);
             yMode = rd.Mode; yDelta = rd.Delta;
             coeffs0 = rd.Coeffs; invTx0 = rd.Inv; txIdx0 = rd.Idx;
         }
         else
         {
-            PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, yMode, yDelta, c.Pred);
+            PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, yMode, yDelta, c.Pred, edgeFlags);
             int[] res = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n);
             (coeffs0, invTx0, txIdx0) = ChooseTxType(res, n, maxTx, c.DcDq, c.AcDq);
         }
@@ -1599,13 +1612,18 @@ internal static class Av1StillImageEncoder
             int txN = tDim.W * 4;          // tx pixel size
             int txW4 = tDim.W;             // tx 4-unit size
             var predBuf = new byte[txN * txN];
+            int sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0 ? 1 : 0;
+            int sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0 ? 1 : 0;
             // Per-tx-block: predict from reconstruction, code coeffs, reconstruct — in raster order.
             for (int iy = 0; iy < blk4; iy += txW4)
                 for (int ix = 0; ix < blk4; ix += txW4)
                 {
                     int cbx4 = bx4 + ix, cby4 = by4 + iy;
                     int cbxR = cbx4 & 31, cbyR = cby4 & 31;
-                    PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf);
+                    var localEdge =
+                        (((iy > 0 || sbHasTr == 0) && (ix + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444TopHasRight) |
+                        ((ix > 0 || (sbHasBl == 0 && iy + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
+                    PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge);
                     int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
                     (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq);
                     // Coeff-skip context is neighbour-based for sub-block transforms (0 only when tx == block size).
@@ -1754,6 +1772,7 @@ internal static class Av1StillImageEncoder
     // is coded via AngleDeltaCdf[mode-Vertical], symbol = delta + 3, nsym 6 (7 symbols), for blocks ≥ 8x8.
     private static readonly (Av1IntraPredMode Mode, int Delta)[] CandidateModes = BuildCandidates();
 
+
     // How many SATD-best modes the RD leaf search fully rate-evaluates (of ~34 candidates). 4 keeps essentially
     // all of the quality while cutting the hot rate-search ~8x, which is what makes true-RD affordable.
     private const int RdModeCandidates = 4;
@@ -1765,11 +1784,11 @@ internal static class Av1StillImageEncoder
             (Av1IntraPredMode.Dc, 0), (Av1IntraPredMode.Smooth, 0),
             (Av1IntraPredMode.SmoothV, 0), (Av1IntraPredMode.SmoothH, 0), (Av1IntraPredMode.Paeth, 0),
         };
-        // Z2-base directional modes: full angle_delta range keeps angle in (90,180).
-        foreach (var m in new[] { Av1IntraPredMode.DiagDownRight, Av1IntraPredMode.VerticalRight, Av1IntraPredMode.HorizontalDown })
-            for (int d = -3; d <= 3; d++) list.Add((m, d));
-        for (int d = 0; d <= 3; d++) list.Add((Av1IntraPredMode.Vertical, d));    // angle 90..99 (delta≥0)
-        for (int d = -3; d <= 0; d++) list.Add((Av1IntraPredMode.Horizontal, d));  // angle 171..180 (delta≤0)
+        // Full directional set: all 8 directional modes with the complete angle_delta range. Modes whose angle
+        // needs the top-right / bottom-left edge are now correct because the leaf threads the real intra-edge
+        // availability flags (from Av1IntraEdgeTree, mirroring the decoder) into PrepareIntraEdges.
+        for (int m = (int)Av1IntraPredMode.Vertical; m <= (int)Av1IntraPredMode.VerticalLeft; m++)
+            for (int d = -3; d <= 3; d++) list.Add(((Av1IntraPredMode)m, d));
         return list.ToArray();
     }
 
@@ -1781,7 +1800,7 @@ internal static class Av1StillImageEncoder
     // preparation + prediction so encoder and decoder agree bit-for-bit. recon is the reconstruction plane
     // (stride reconW), bx4/by4 the block position in 4-unit units, bw4/bh4 the frame size in 4-unit units.
     private static void PredictIntra(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4, int n,
-        Av1IntraPredMode mode, int delta, byte[] dst)
+        Av1IntraPredMode mode, int delta, byte[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
     {
         Span<byte> edge = stackalloc byte[257];
         const int edgeCenter = 128;
@@ -1791,7 +1810,7 @@ internal static class Av1StillImageEncoder
         bool haveLeft = bx4 > 0;
         int angle = delta; // PrepareIntraEdges folds this into the base angle for directional modes
         int m = Av1Reconstruction.PrepareIntraEdges(
-            bx4, haveLeft, by4, haveTop, bw4, bh4, Av1EdgeFlags.None,
+            bx4, haveLeft, by4, haveTop, bw4, bh4, edgeFlags,
             recon, dstOff, reconW, default, mode, ref angle, tw4, tw4, filterEdge: false, edge, edgeCenter, 8);
         Av1IntraPred.Predict(m, dst, n, edge, edgeCenter, n, n, angle,
             4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
@@ -1803,14 +1822,15 @@ internal static class Av1StillImageEncoder
     // angle_delta) and writes its prediction into predOut (n x n). Purely an encoder decision: any candidate is
     // a valid mode, so this can never desync the decoder.
     private static (Av1IntraPredMode Mode, int Delta, long Cost) ChooseIntraMode(byte[] recon, int reconW, int bw4, int bh4,
-        int bx4, int by4, int n, ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] predOut)
+        int bx4, int by4, int n, ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] predOut,
+        Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
     {
         long best = long.MaxValue;
         (Av1IntraPredMode Mode, int Delta) bestCand = (Av1IntraPredMode.Dc, 0);
         var tmp = new byte[n * n];
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
-            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, tmp);
+            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, tmp, edgeFlags);
             long cost = Satd8x8(src, srcW, srcBx, srcBy, tmp, n);
             if (cost < best)
             {
@@ -2017,11 +2037,11 @@ internal static class Av1StillImageEncoder
 
     // Gray wrapper for the primitive-arg RD leaf decision.
     private static (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx)
-        ChooseLeafRd(GrayPartCtx c, int bx4, int by4, int n, int tx)
+        ChooseLeafRd(GrayPartCtx c, int bx4, int by4, int n, int tx, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
     {
         int bxR = bx4 & 31, byR = by4 & 31;
         return ChooseLeafRdCore(c.Recon, c.W, c.Bw4, c.Bh4, c.Luma, c.W, bx4, by4, n, tx, c.DcDq, c.AcDq,
-            c.Cdf, c.AboveMode[bxR], c.LeftMode[byR], c.AboveLCoef.AsSpan(bxR), c.LeftLCoef.AsSpan(byR), c.Pred);
+            c.Cdf, c.AboveMode[bxR], c.LeftMode[byR], c.AboveLCoef.AsSpan(bxR), c.LeftLCoef.AsSpan(byR), c.Pred, edgeFlags);
     }
 
     // Rate-distortion leaf decision: over all candidate (intra mode, tx type) pairs, pick the one with the lowest
@@ -2031,7 +2051,8 @@ internal static class Av1StillImageEncoder
     private static (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx)
         ChooseLeafRdCore(byte[] recon, int reconW, int bw4, int bh4, byte[] luma, int lumaW, int bx4, int by4,
             int n, int tx, int dcDq, int acDq, Av1CdfContext cdf, byte aboveMode, byte leftMode,
-            ReadOnlySpan<byte> aboveLCoef, ReadOnlySpan<byte> leftLCoef, byte[] predOut)
+            ReadOnlySpan<byte> aboveLCoef, ReadOnlySpan<byte> leftLCoef, byte[] predOut,
+            Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
     {
         int aboveCtx = Av1Tables.IntraModeContext[aboveMode];
         int leftCtx = Av1Tables.IntraModeContext[leftMode];
@@ -2052,7 +2073,7 @@ internal static class Av1StillImageEncoder
         for (int ci = 0; ci < CandidateModes.Length; ci++)
         {
             (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
-            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf);
+            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf, edgeFlags);
             long satd = Satd8x8(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
             long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                 + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
@@ -2067,7 +2088,7 @@ internal static class Av1StillImageEncoder
         {
             if (topCost[t] == long.MaxValue) break;
             (Av1IntraPredMode mode, int delta) = CandidateModes[topIdx[t]];
-            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf);
+            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf, edgeFlags);
             int[] residual = ComputeResidualPred(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                 + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
@@ -2097,7 +2118,7 @@ internal static class Av1StillImageEncoder
 
     // Intra prediction for a w x h block into dst (h rows x w cols, stride w).
     private static void PredictIntraRect(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
-        int w, int h, Av1IntraPredMode mode, int delta, byte[] dst)
+        int w, int h, Av1IntraPredMode mode, int delta, byte[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
     {
         Span<byte> edge = stackalloc byte[257];
         const int edgeCenter = 128;
@@ -2106,7 +2127,7 @@ internal static class Av1StillImageEncoder
         bool haveTop = by4 > 0, haveLeft = bx4 > 0;
         int angle = delta;
         int m = Av1Reconstruction.PrepareIntraEdges(
-            bx4, haveLeft, by4, haveTop, bw4, bh4, Av1EdgeFlags.None,
+            bx4, haveLeft, by4, haveTop, bw4, bh4, edgeFlags,
             recon, dstOff, reconW, default, mode, ref angle, tw4, th4, filterEdge: false, edge, edgeCenter, 8);
         Av1IntraPred.Predict(m, dst, w, edge, edgeCenter, w, h, angle, 4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
     }
