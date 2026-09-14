@@ -24,9 +24,13 @@ internal static class Av1FwdTransform
     // Universal forward-quant scale for the orthonormal path: 2^dqShift / G_dec == 8 for all square DCT sizes.
     private const double QuantScaleK = 8.0;
 
-    // Deadzone quantization bias (AV1/libaom-style): shift the rounding threshold toward zero so marginal
-    // coefficients quantize to 0. Pure encoder rate-distortion choice — the decoder is unaffected.
-    internal static double DeadzoneBias = 0.55;
+    // Quantization rounding bias: mag = |qf| + 0.5 - DeadzoneBias, so 0.5 is round-to-nearest and lower values
+    // round away from zero (keep more coefficient energy). Pure encoder rate-distortion choice — decoder is
+    // unaffected. With strong RDOQ (RdoqLambdaScale=40) doing the optimal level trimming, a *low* bias wins: a
+    // hard deadzone here pre-empts RDOQ's rate-distortion decision suboptimally. A sweep (peppers/scene/landscape,
+    // matched RMSE) improved monotonically from 0.55 down to ~0.15-0.20 (scene ~-8%, peppers/landscape ~-4-5%),
+    // with 0.20 clear of the high-quality instability seen at 0.05. Below ~0.15 high-quality (low-q) content regresses.
+    internal static double DeadzoneBias = 0.20;
 
     // Cached forward 1D matrices F = M^-1 (M = decoder's integer 1D inverse), keyed by (logSize<<2 | type1d).
     private static readonly ConcurrentDictionary<int, double[,]> FwdMatrixCache = new();
