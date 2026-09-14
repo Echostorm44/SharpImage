@@ -526,9 +526,13 @@ internal static class Av1StillImageEncoder
         // True trial-encode RD: encode each candidate partition for real, measure its actual coded bits + SSE,
         // and commit the one with the lowest J = SSE + λ·bits. Unlike the estimate path this uses the live CDFs
         // and real reconstruction (incl. adaptation and recursive sub-decisions), so it picks partitions optimally.
-        if (UseTrueRd && (long)c.Bw4 * c.Bh4 * 16 <= TrueRdPixelBudget && fullyInside && bl >= 1 && bl < 4)
+        // Also runs for PARTIAL blocks (extend past the frame but their centre is in-frame, i.e. haveH && haveV):
+        // those were previously forced to a single large NONE, wasting bits on the padded region — RD now splits
+        // them. The SPLIT recursion terminates cleanly at 8x8 (bw4/bh4 are always even, so 8x8 tiles edges exactly;
+        // the 4x4 forced-split throw is unreachable). Rect HORZ/VERT candidates are only offered when fully inside.
+        if (UseTrueRd && (long)c.Bw4 * c.Bh4 * 16 <= TrueRdPixelBudget && bl >= 1 && bl < 4)
         {
-            EncodePartitionColorTrueRd(c, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8, edgeIdx);
+            EncodePartitionColorTrueRd(c, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8, edgeIdx, fullyInside);
             return;
         }
 
@@ -706,12 +710,13 @@ internal static class Av1StillImageEncoder
     }
 
     private static void EncodePartitionColorTrueRd(ColorPartCtx c, int bl, int bx4, int by4, int hsz, int blk4,
-        Span<ushort> partCdf, int nPart, int bx8, int by8, int edgeIdx)
+        Span<ushort> partCdf, int nPart, int bx8, int by8, int edgeIdx, bool fullyInside)
     {
-        // Candidates: NONE and SPLIT always; HORZ/VERT at 32x32/16x16 when rect is enabled.
+        // Candidates: NONE and SPLIT always; HORZ/VERT at 32x32/16x16 when rect is enabled AND the block is fully
+        // inside the frame (the rect leaves assume in-frame dimensions). For partial blocks only NONE vs SPLIT.
         Span<int> cands = stackalloc int[4];
         int nc = 0; cands[nc++] = 0; cands[nc++] = 3;
-        if ((bl == 2 || bl == 3) && UseRectPartition) { cands[nc++] = 1; cands[nc++] = 2; }
+        if (fullyInside && (bl == 2 || bl == 3) && UseRectPartition) { cands[nc++] = 1; cands[nc++] = 2; }
 
         double lambda = RdLambdaK * c.AcDq * c.AcDq;
         var snap0 = SnapshotRd(c, bx4, by4, blk4);
