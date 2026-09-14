@@ -311,7 +311,7 @@ internal static class Av1StillImageEncoder
     // Assembles the OBU_FRAME (frame header with the given CDEF params + tile) for a multi-SB key frame.
     private static byte[] BuildFrameObu(int baseQIdx, int sbCols, int sbRows, bool monochrome, byte[] tile, Av1ObuWriter.CdefParams cdef)
     {
-        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome, txModeSelect: monochrome, cdef);
+        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome, txModeSelect: monochrome || (!monochrome && UseColorTxDepth), cdef);
         var framePayload = new byte[frameHdr.Length + tile.Length];
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
@@ -438,6 +438,7 @@ internal static class Av1StillImageEncoder
         public int DcDq, AcDq;
         public byte[] AbovePart = null!, ALY = null!, ACU = null!, ACV = null!, AModeY = null!, ASkip = null!;
         public byte[] LeftPart = null!, LLY = null!, LCU = null!, LCV = null!, LModeY = null!, LSkip = null!;
+        public sbyte[] ATxY = null!, LTxY = null!;   // neighbour luma tx log-size, for the tx-depth context (UseColorTxDepth)
         public byte[] Pred = new byte[64 * 64];
         public byte[] EstScratch = new byte[64 * 64];
     }
@@ -453,8 +454,8 @@ internal static class Av1StillImageEncoder
         int sb128Cols = (sbCols + 1) >> 1;
         var abovePart = new byte[sb128Cols][];
         var aLY = FilledArray(sb128Cols); var aCU = FilledArray(sb128Cols); var aCV = FilledArray(sb128Cols);
-        var aModeY = new byte[sb128Cols][]; var aSkip = new byte[sb128Cols][];
-        for (int i = 0; i < sb128Cols; i++) { abovePart[i] = new byte[16]; aModeY[i] = new byte[32]; aSkip[i] = new byte[32]; }
+        var aModeY = new byte[sb128Cols][]; var aSkip = new byte[sb128Cols][]; var aTxY = new sbyte[sb128Cols][];
+        for (int i = 0; i < sb128Cols; i++) { abovePart[i] = new byte[16]; aModeY[i] = new byte[32]; aSkip[i] = new byte[32]; aTxY[i] = FilledSbyte(32, -1); }
 
         byte[] lumaArr = new byte[w * h]; luma.CopyTo(lumaArr);
         byte[] uArr = new byte[cw * chh]; uPlane.CopyTo(uArr);
@@ -471,12 +472,12 @@ internal static class Av1StillImageEncoder
         for (int sby = 0; sby < sbRows; sby++)
         {
             c.LeftPart = new byte[16]; c.LLY = Filled(32); c.LCU = Filled(32); c.LCV = Filled(32);
-            c.LModeY = new byte[32]; c.LSkip = new byte[32];
+            c.LModeY = new byte[32]; c.LSkip = new byte[32]; c.LTxY = FilledSbyte(32, -1);
             for (int sbx = 0; sbx < sbCols; sbx++)
             {
                 int col = sbx >> 1;
                 c.AbovePart = abovePart[col]; c.ALY = aLY[col]; c.ACU = aCU[col]; c.ACV = aCV[col];
-                c.AModeY = aModeY[col]; c.ASkip = aSkip[col];
+                c.AModeY = aModeY[col]; c.ASkip = aSkip[col]; c.ATxY = aTxY[col];
                 EncodePartitionColor(c, 1, sbx * 16, sby * 16);
             }
         }
@@ -628,6 +629,7 @@ internal static class Av1StillImageEncoder
         public byte[] ReconY = null!, ReconU = null!, ReconV = null!;   // block regions
         public byte[] AbovePart = null!, ALY = null!, ACU = null!, ACV = null!, AModeY = null!, ASkip = null!;
         public byte[] LeftPart = null!, LLY = null!, LCU = null!, LCV = null!, LModeY = null!, LSkip = null!;
+        public sbyte[] ATxY = null!, LTxY = null!;
     }
 
     private static byte[] CopyRegion(byte[] plane, int stride, int px, int py, int w, int h)
@@ -657,6 +659,7 @@ internal static class Av1StillImageEncoder
         s.ACV = (byte[])c.ACV.Clone(); s.LCV = (byte[])c.LCV.Clone();
         s.AModeY = (byte[])c.AModeY.Clone(); s.LModeY = (byte[])c.LModeY.Clone();
         s.ASkip = (byte[])c.ASkip.Clone(); s.LSkip = (byte[])c.LSkip.Clone();
+        s.ATxY = (sbyte[])c.ATxY.Clone(); s.LTxY = (sbyte[])c.LTxY.Clone();
         return s;
     }
 
@@ -675,6 +678,7 @@ internal static class Av1StillImageEncoder
         Array.Copy(s.ACV, c.ACV, s.ACV.Length); Array.Copy(s.LCV, c.LCV, s.LCV.Length);
         Array.Copy(s.AModeY, c.AModeY, s.AModeY.Length); Array.Copy(s.LModeY, c.LModeY, s.LModeY.Length);
         Array.Copy(s.ASkip, c.ASkip, s.ASkip.Length); Array.Copy(s.LSkip, c.LSkip, s.LSkip.Length);
+        Array.Copy(s.ATxY, c.ATxY, s.ATxY.Length); Array.Copy(s.LTxY, c.LTxY, s.LTxY.Length);
     }
 
     // SSE of the reconstructed block (luma + chroma) vs the source planes — the distortion term for true-RD.
@@ -857,6 +861,7 @@ internal static class Av1StillImageEncoder
         int bx = bx4 * 4, by = by4 * 4, cbx = bx4 * 2, cby = by4 * 2; // pixel positions
         bool cflAllowed = bl >= 2;               // blocks <= 32x32
         int uvNsym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
+        ref readonly var maxTDim = ref Av1Tables.TxfmDimensions[tx];
 
         // Luma: rate-distortion mode + tx-type decision (from reconstruction). Writes prediction into c.Pred.
         var rd = ChooseLeafRdCore(c.ReconY, c.W, c.Bw4, c.Bh4, c.Luma, c.W, bx4, by4, n, tx, c.DcDq, c.AcDq,
@@ -864,9 +869,54 @@ internal static class Av1StillImageEncoder
         Av1IntraPredMode yMode = rd.Mode; int yDelta = rd.Delta;
         int[] yC = rd.Coeffs; Av1TxType yInv = rd.Inv; int yTxIdx = rd.Idx;
 
-        // Reconstruct luma now — CfL needs the reconstructed luma AC. Zero coeffs reduce to prediction, so this is
-        // valid whether or not the block ends up skipped (chroma reconstruction below mirrors that).
-        byte cfY = DequantAndReconstructPred(yC, tx, n, c.DcDq, c.AcDq, c.Pred, c.ReconY, c.W, bx, by, yInv);
+        // Transform-size (tx_depth) search for luma. Only when residual is coded (depth-0 not all-zero) and the block
+        // is fully inside the frame. depth 0 keeps rd's single block-size transform; depth>0 splits into a quadtree
+        // of smaller transforms, each predicted from reconstruction in raster order (mirrors the grayscale path).
+        bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
+        int maxDepth = (UseColorTxDepth && HasNonZero(yC) && fullyInside) ? Math.Min((int)maxTDim.Max, 2) : 0;
+        int depth = 0;
+        if (maxDepth > 0)
+        {
+            long best = EstimateTxDepthCostColor(c, bx4, by4, blk4, tx, yMode, yDelta);
+            for (int d = 1; d <= maxDepth; d++)
+            {
+                long cost = EstimateTxDepthCostColor(c, bx4, by4, blk4, ReduceTx(tx, d), yMode, yDelta);
+                if (cost < best) { best = cost; depth = d; }
+            }
+        }
+        int lumaTx = ReduceTx(tx, depth);
+        ref readonly var lTDim = ref Av1Tables.TxfmDimensions[lumaTx];
+
+        // Reconstruct luma at the chosen depth into ReconY (CfL needs the reconstructed luma AC). For depth 0 this is
+        // the single transform; for depth>0 the per-tx-block records are captured for emission after the tx_size symbol.
+        byte cfY = 0x40;
+        List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? lumaTxb = null;
+        if (depth == 0)
+        {
+            cfY = DequantAndReconstructPred(yC, tx, n, c.DcDq, c.AcDq, c.Pred, c.ReconY, c.W, bx, by, yInv);
+        }
+        else
+        {
+            lumaTxb = new();
+            int txN = lTDim.W * 4, txW4 = lTDim.W;
+            var predBuf = new byte[txN * txN];
+            for (int iy = 0; iy < blk4; iy += txW4)
+                for (int ix = 0; ix < blk4; ix += txW4)
+                {
+                    int cbx4 = bx4 + ix, cby4 = by4 + iy, cbxR = cbx4 & 31, cbyR = cby4 & 31;
+                    PredictIntra(c.ReconY, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf);
+                    int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
+                    (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, lumaTx, c.DcDq, c.AcDq);
+                    int skc = Av1CoeffDecode.GetSkipCtx(in lTDim, bs, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR), 0, 0);
+                    int snc = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR));
+                    lumaTxb.Add((cf, inv, idx, skc, snc, cbx4 * 4, cby4 * 4));
+                    byte txCfCtx = DequantAndReconstructPred(cf, lumaTx, txN, c.DcDq, c.AcDq, predBuf, c.ReconY, c.W, cbx4 * 4, cby4 * 4, inv);
+                    int tcw = Math.Min(txW4, c.Bw4 - cbx4), tch = Math.Min(txW4, c.Bh4 - cby4);
+                    for (int i = 0; i < tcw && cbxR + i < 32; i++) c.ALY[cbxR + i] = txCfCtx;
+                    for (int j = 0; j < tch && cbyR + j < 32; j++) c.LLY[cbyR + j] = txCfCtx;
+                }
+        }
+        bool lumaAllZero = depth == 0 ? !HasNonZero(yC) : lumaTxb!.TrueForAll(t => !HasNonZero(t.Cf));
 
         int dcU = DcPredict(c.ReconU, c.Cw, c.Chh, cbx, cby, cn, cn);
         int dcV = DcPredict(c.ReconV, c.Cw, c.Chh, cbx, cby, cn, cn);
@@ -903,7 +953,7 @@ internal static class Av1StillImageEncoder
             }
         }
 
-        int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
+        int skip = (!lumaAllZero || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
 
         int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
         c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), (uint)skip);
@@ -916,17 +966,34 @@ internal static class Av1StillImageEncoder
         c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), uvSym, uvNsym);
         if (useCfl) EncodeCflAlphas(c.Msac, c.Cdf, alphaU, alphaV);
 
+        // tx_size (read_tx_size): coded for every intra block > 4x4 when tx_mode=SELECT — including skip blocks
+        // (depth 0). Comes after all mode info, before residual, mirroring the decoder + grayscale path.
+        if (UseColorTxDepth && maxTDim.Max > (byte)Av1TxSize.Tx4x4)
+        {
+            int txCtx = (c.LTxY[byR] >= maxTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= maxTDim.Lw ? 1 : 0);
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(maxTDim.Max - 1, txCtx), depth, Math.Min((int)maxTDim.Max, 2));
+        }
+
         byte cfU = 0x40, cfV = 0x40;
         if (skip == 0)
         {
             ref readonly var uvtDim = ref Av1Tables.TxfmDimensions[ctx0];
             int uSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, bs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
             int vSkip = Av1CoeffDecode.GetSkipCtx(in uvtDim, bs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
-            int ySign = Av1CoeffDecode.GetDcSignCtx(tx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
             int uSign = Av1CoeffDecode.GetDcSignCtx(ctx0, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
             int vSign = Av1CoeffDecode.GetDcSignCtx(ctx0, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
 
-            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, yC, dcSignCtx: ySign, txTypeIdx: yTxIdx);
+            if (depth == 0)
+            {
+                int ySign = Av1CoeffDecode.GetDcSignCtx(tx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
+                Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, yC, dcSignCtx: ySign, txTypeIdx: yTxIdx);
+            }
+            else
+            {
+                foreach (var t in lumaTxb!)
+                    Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, t.Cf,
+                        skipCtx: t.SkipCtx, dcSignCtx: t.SignCtx, txTypeIdx: t.Idx);
+            }
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
 
@@ -954,10 +1021,44 @@ internal static class Av1StillImageEncoder
 
         int yW = Math.Min(blk4, c.Bw4 - bx4), yH = Math.Min(blk4, c.Bh4 - by4);
         int cW = Math.Min(cblk4, (c.Bw4 - bx4 + 1) >> 1), cH = Math.Min(cblk4, (c.Bh4 - by4 + 1) >> 1);
-        for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; }
-        for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; }
+        sbyte txLw = (sbyte)lTDim.Lw, txLh = (sbyte)lTDim.Lh;
+        // Luma LCoef context: for depth>0 it was already filled per-tx-block during reconstruction, so only fill it
+        // here (with the single-transform cfY) at depth 0. Mode/skip/tx-size context is filled over the whole block.
+        for (int i = 0; i < yW && bxR + i < 32; i++) { if (depth == 0) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
+        for (int j = 0; j < yH && byR + j < 32; j++) { if (depth == 0) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; }
+    }
+
+    // Rate-DISTORTION cost J = SSE + λ·bits of a colour leaf's luma coded at a given (uniform) tx size. Each tx
+    // block is predicted from the SOURCE plane (≈ reconstruction) and reconstructed through the decoder's inverse,
+    // so the distortion term reflects what the transform can actually represent. Used for the colour tx-depth
+    // decision: a pure rate estimate over-splits smooth content (splitting barely changes SSE but the estimate
+    // undercounts the per-tx-block overhead), so the SSE term is essential to keep large blocks whole.
+    private static long EstimateTxDepthCostColor(ColorPartCtx c, int bx4, int by4, int blk4, int tx,
+        Av1IntraPredMode yMode, int yDelta)
+    {
+        ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+        int txN = tDim.W * 4, txW4 = tDim.W;
+        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        long sse = 0; double rate = 0;
+        var predBuf = new byte[txN * txN];
+        var reconBuf = new byte[txN * txN];
+        for (int iy = 0; iy < blk4; iy += txW4)
+            for (int ix = 0; ix < blk4; ix += txW4)
+            {
+                int cbx4 = bx4 + ix, cby4 = by4 + iy, px = cbx4 * 4, py = cby4 * 4;
+                PredictIntra(c.Luma, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf);
+                int[] res = ComputeResidualPred(c.Luma, c.W, px, py, predBuf, txN);
+                (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq);
+                DequantAndReconstructPred(cf, tx, txN, c.DcDq, c.AcDq, predBuf, reconBuf, txN, 0, 0, inv);
+                for (int yy = 0; yy < txN; yy++)
+                    for (int xx = 0; xx < txN; xx++)
+                    { int d = reconBuf[yy * txN + xx] - c.Luma[(py + yy) * c.W + px + xx]; sse += (long)d * d; }
+                rate += Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, cf, 0, 0, idx) + 2;
+            }
+
+        return sse + (long)(lambda * rate);
     }
 
     // Estimates the luma coding cost J = SSE + λ·bits of a single rectangular leaf, predicting from the SOURCE
@@ -1128,6 +1229,15 @@ internal static class Av1StillImageEncoder
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
         c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), 0, uvNsym); // UV DC
 
+        // tx_size: a rect leaf keeps its single rect transform (depth 0), but the symbol is still coded under
+        // tx_mode=SELECT for every intra block > 4x4 — using the rect tx's own dimension table, matching the decoder.
+        ref readonly var lTDim = ref Av1Tables.TxfmDimensions[lumaTx];
+        if (UseColorTxDepth && lTDim.Max > (byte)Av1TxSize.Tx4x4)
+        {
+            int txCtx = (c.LTxY[byR] >= lTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= lTDim.Lw ? 1 : 0);
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(lTDim.Max - 1, txCtx), 0, Math.Min((int)lTDim.Max, 2));
+        }
+
         byte cfY = 0x40, cfU = 0x40, cfV = 0x40;
         if (skip == 0)
         {
@@ -1151,8 +1261,9 @@ internal static class Av1StillImageEncoder
 
         int yW = Math.Min(w4, c.Bw4 - bx4), yH = Math.Min(h4, c.Bh4 - by4);
         int cW = Math.Min(cw4, (c.Bw4 - bx4 + 1) >> 1), cH = Math.Min(ch4, (c.Bh4 - by4 + 1) >> 1);
-        for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; }
-        for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; }
+        sbyte txLw = (sbyte)lTDim.Lw, txLh = (sbyte)lTDim.Lh;
+        for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
+        for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; }
     }
@@ -1587,6 +1698,16 @@ internal static class Av1StillImageEncoder
     // is byte-identical to the small-frame one (ffmpeg/libdav1d-verified), just applied to more blocks.
     internal static bool UseTrueRd = true;
     internal static bool UseCfl = true;
+
+    // Transform-size selection (tx_depth) in the COLOUR luma path — the grayscale path already does this. When on,
+    // the colour frame header sets tx_mode=SELECT and every colour luma block codes a tx_size symbol (square leaves
+    // search depth 0..2 by SSE+λ·bits; rect leaves keep their single rect transform = depth 0). Verified byte-exact
+    // in dav1d/ffmpeg (peppers qp10, 1300+ depth>0 blocks). DEFAULT OFF: measured net-neutral-to-slightly-negative
+    // on natural photos (peppers ~0%, scene +3% at low quality, landscape +0.6%) because our true-RD PARTITION
+    // search already adapts block/transform size, so tx_depth mostly just adds the per-block tx_size signalling
+    // overhead. Kept as a conformant capability (helps localised-detail / graphics content; validates the decoder
+    // path). To make it a net win generally it needs a true-RD (real coded-bits) depth decision, not the estimate.
+    internal static bool UseColorTxDepth = false;
     internal static long TrueRdPixelBudget = 1600 * 1600;
     internal static double EarlyTermBits = 24.0;
 
