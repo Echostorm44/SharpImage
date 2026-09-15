@@ -32,6 +32,7 @@ public sealed class Av1CorpusTune
         Av1StillImageEncoder.RdoqLambdaScale = rdoq;
         Av1StillImageEncoder.ChromaRdoqLambdaScale = crdoq;
         Av1FwdTransform.DeadzoneBias = dz;
+        if (p.Length >= 6) Av1StillImageEncoder.UseColorTxDepth = p[5] == "1"; // optional tx-depth toggle
 
         int cw = W / 2, ch = H / 2, ysz = W * H, csz = cw * ch;
         string outDir = Path.Combine(Corpus, "out", label);

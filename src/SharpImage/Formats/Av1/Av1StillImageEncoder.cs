@@ -925,6 +925,16 @@ internal static class Av1StillImageEncoder
                     (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, lumaTx, c.DcDq, c.AcDq);
                     int skc = Av1CoeffDecode.GetSkipCtx(in lTDim, bs, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR), 0, 0);
                     int snc = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR));
+                    // RDOQ this tx-split block (depth-0 luma is RDOQ'd in ChooseLeafRdCore; the quadtree path was
+                    // round-to-nearest). Re-derive qf for the picked tx type, then trim with the real neighbour
+                    // contexts. Reconstruction below uses the trimmed cf, matching the decoder + feeding later blocks.
+                    if (HasNonZero(cf))
+                    {
+                        var qfTx = new double[Av1Tables.Scans[lumaTx].Length];
+                        Av1FwdTransform.ForwardQuantTyped(res, txN, c.DcDq, c.AcDq, qfTx.Length, FwdTypeForIdx(idx), qfTx);
+                        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, cf, qfTx,
+                            c.DcDq, c.AcDq, skc, snc, idx, RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                    }
                     lumaTxb.Add((cf, inv, idx, skc, snc, cbx4 * 4, cby4 * 4));
                     byte txCfCtx = DequantAndReconstructPred(cf, lumaTx, txN, c.DcDq, c.AcDq, predBuf, c.ReconY, c.W, cbx4 * 4, cby4 * 4, inv);
                     int tcw = Math.Min(txW4, c.Bw4 - cbx4), tch = Math.Min(txW4, c.Bh4 - cby4);
@@ -1085,6 +1095,16 @@ internal static class Av1StillImageEncoder
                 PredictIntra(c.Luma, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf);
                 int[] res = ComputeResidualPred(c.Luma, c.W, px, py, predBuf, txN);
                 (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq);
+                // RDOQ the coefficients so this per-depth cost matches the actual RDOQ'd encode (both the depth-0
+                // ChooseLeafRdCore path and the depth>0 emit RDOQ). Without this the estimate under-credits the
+                // large transform, over-splitting smooth/natural content.
+                if (HasNonZero(cf))
+                {
+                    var qfTx = new double[Av1Tables.Scans[tx].Length];
+                    Av1FwdTransform.ForwardQuantTyped(res, txN, c.DcDq, c.AcDq, qfTx.Length, FwdTypeForIdx(idx), qfTx);
+                    Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, cf, qfTx,
+                        c.DcDq, c.AcDq, 0, 0, idx, RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                }
                 DequantAndReconstructPred(cf, tx, txN, c.DcDq, c.AcDq, predBuf, reconBuf, txN, 0, 0, inv);
                 for (int yy = 0; yy < txN; yy++)
                     for (int xx = 0; xx < txN; xx++)
@@ -1750,11 +1770,13 @@ internal static class Av1StillImageEncoder
     // the colour frame header sets tx_mode=SELECT and every colour luma block codes a tx_size symbol (square leaves
     // search depth 0..2 by SSE+λ·bits; rect leaves keep their single rect transform = depth 0). Verified byte-exact
     // in dav1d/ffmpeg (peppers qp10, 1300+ depth>0 blocks). DEFAULT OFF: measured net-neutral-to-slightly-negative
-    // on natural photos (peppers ~0%, scene +3% at low quality, landscape +0.6%) because our true-RD PARTITION
-    // search already adapts block/transform size, so tx_depth mostly just adds the per-block tx_size signalling
-    // overhead. Kept as a conformant capability (helps localised-detail / graphics content; validates the decoder
-    // path). To make it a net win generally it needs a true-RD (real coded-bits) depth decision, not the estimate.
-    internal static bool UseColorTxDepth = false;
+    // overhead. ENABLED 2026-09 after two fixes made it a net win: (1) the depth>0 tx-split blocks are now RDOQ'd
+    // (was round-to-nearest), and (2) the tx-depth decision (EstimateTxDepthCostColor) RDOQs its per-depth trial
+    // coefficients so it compares fairly against the RDOQ'd large transform instead of over-splitting. On the
+    // 6-image corpus (with the retuned lambdas): -3.4% BD-rate average — big on graphics/screen content
+    // (logo/piechart ~-8.8%, wizard -3%), neutral on natural photos (mountains -0.2%, bluebells/granite ~+0.1%
+    // noise). tx_size bitstream verified byte-exact in dav1d/ffmpeg.
+    internal static bool UseColorTxDepth = true;
     internal static long TrueRdPixelBudget = 1600 * 1600;
     internal static double EarlyTermBits = 24.0;
 
@@ -2086,6 +2108,16 @@ internal static class Av1StillImageEncoder
     };
     private static readonly (Av1FwdTransform.FwdTxType Fwd, Av1TxType Inv, int Idx)[] DctOnly =
         { (Av1FwdTransform.FwdTxType.DctDct, Av1TxType.DctDct, 1) };
+
+    // Forward transform type for a chosen intra tx-type index (1=Dct_Dct, 2=Adst_Adst, 3=Adst_Dct, 4=Dct_Adst),
+    // used to re-derive the pre-quant floats (qf) for RDOQ of a tx-block whose type ChooseTxType already picked.
+    private static Av1FwdTransform.FwdTxType FwdTypeForIdx(int idx) => idx switch
+    {
+        2 => Av1FwdTransform.FwdTxType.AdstAdst,
+        3 => Av1FwdTransform.FwdTxType.AdstDct,
+        4 => Av1FwdTransform.FwdTxType.DctAdst,
+        _ => Av1FwdTransform.FwdTxType.DctDct,
+    };
 
     // Gray wrapper for the primitive-arg RD leaf decision.
     private static (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx)
