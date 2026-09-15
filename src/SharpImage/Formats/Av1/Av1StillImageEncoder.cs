@@ -1735,21 +1735,24 @@ internal static class Av1StillImageEncoder
     // RdoqLambdaScale·RdLambdaK·Q²) the RDOQ coefficient trimming. Retuned 2026-09 on a 6-image BD-rate corpus
     // (photo/graphics/text/texture) jointly with RdoqLambdaScale=20 and DeadzoneBias=0.04 after chroma RDOQ was
     // added: 0.004 wins over the prior 0.008 (which had been tuned before chroma RDOQ existed) — the combined
-    // retune is -6.2% BD-rate, improving on all six images. The optimum is a broad basin (0.004-0.005).
-    internal static double RdLambdaK = 0.004;
+    // retune is -6.2% BD-rate, improving on all six images. Re-swept AFTER tx_depth was enabled (which shifts the
+    // joint optimum): 0.004->0.003 with RdoqLambdaScale 20->25 adds a further -1.15% BD-rate (clean across the
+    // corpus). Note DeadzoneBias then wants to STAY at 0.04 — with tx_depth on, dropping it to 0.02 regresses all
+    // six images (+3.7%; many small transforms over-keep coefficients at a low deadzone).
+    internal static double RdLambdaK = 0.003;
 
     // Extra multiplier on the RDOQ lambda relative to the partition lambda. The partition lambda is tuned for
     // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
     // small distortion against its (EOB-inclusive) coding rate. Retuned to 20 (from 30) in the 2026-09 corpus
-    // sweep jointly with RdLambdaK=0.004 / DeadzoneBias=0.04; RDOQ=20 beat 15 and 30-45 (over-trimming hurts once
-    // the deadzone is nearly off and chroma is also RDOQ'd). Chroma uses the same scale (ChromaRdoqLambdaScale).
-    internal static double RdoqLambdaScale = 20.0;
+    // sweep jointly with RdLambdaK=0.004 / DeadzoneBias=0.04; then raised 20->25 in the tx_depth-on re-sweep
+    // (jointly with RdLambdaK=0.003). Chroma uses the same scale (ChromaRdoqLambdaScale).
+    internal static double RdoqLambdaScale = 25.0;
 
     // Chroma coefficient RDOQ in the square colour leaf (EncodeLeafBlockColor). Chroma was previously coded at
     // round-to-nearest with no rate-distortion trimming, running measurably richer than luma at matched rate;
     // this applies the same RDOQ to U/V. Scale kept equal to luma initially, tuned against the RD benchmark.
     internal static bool UseChromaRdoq = true;
-    internal static double ChromaRdoqLambdaScale = 20.0;
+    internal static double ChromaRdoqLambdaScale = 25.0;
 
     // Enables PARTITION_HORZ / PARTITION_VERT rectangular leaves at 16x16 (colour path). Toggle for A/B testing.
     internal static bool UseRectPartition = true;
