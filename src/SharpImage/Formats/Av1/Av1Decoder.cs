@@ -1824,7 +1824,9 @@ internal sealed class Av1Decoder
                 int s1 = Av1LoopRestoration.SgrParams[sgrIdx, 1];
                 int ew0 = lr.SgrWeight0;
                 int ew1 = lr.SgrWeight1;
-                int w = 128 - ew0 - ew1;  // dav1d: params.sgr.w1 used by both sgr_5x5_c and sgr_3x3_c
+                // dav1d (lr_apply): sgr.w0 = weights[0]; sgr.w1 = 128 - (weights[0]+weights[1]).
+                // sgr_5x5 uses sgr.w0, sgr_3x3 uses sgr.w1, sgr_mix uses (w0, w1).
+                int w = 128 - ew0 - ew1;
 
                 if (s0 != 0 && s1 != 0)
                 {
@@ -1838,7 +1840,7 @@ internal sealed class Av1Decoder
                     Av1LoopRestoration.Sgr5x5(pSpan, pOff, stride,
                         leftSpan, leftOff, 4,
                         lpfSpan, lpfOff,
-                        unitW, stripeH, s0, w, curEdges);
+                        unitW, stripeH, s0, ew0, curEdges);
                 }
                 else
                 {
