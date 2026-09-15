@@ -247,13 +247,10 @@ public static class Av1Cdef
         int w, int h, EdgeFlags edges, int bitDepth = 8)
     {
         int bdMin8 = bitDepth - 8;
-        // High bit depth: pixel differences are in the full bit-depth domain, so the CDEF
-        // strengths and damping must be scaled up to match (dav1d cdef_apply: strengths
-        // <<= bitdepth_min_8, damping += bitdepth_min_8). The pri_tap parity below recovers
-        // the original low bit via >> bitdepth_min_8.
-        priStrength <<= bdMin8;
-        secStrength <<= bdMin8;
-        damping += bdMin8;
+        // Strengths and damping arrive already scaled for the bit depth by the caller
+        // (dav1d cdef_apply: strengths <<= bitdepth_min_8, damping += bitdepth_min_8, and
+        // adjust_strength is applied to the *shifted* luma strength). The filter itself does
+        // no further scaling; the pri_tap parity below recovers the original low bit.
         const int tmpStride = 12;
         Span<short> tmpBuf = stackalloc short[144]; // 12*12
         int tmpCenter = 2 * tmpStride + 2;

@@ -826,7 +826,8 @@ internal sealed class Av1Decoder
         // === CDEF (Constrained Directional Enhancement Filter) ===
         // Applied once after all deblocking is complete
         AvDbg.W($"[CDEF-ENTRY] CdefBits={fh.CdefBits} LfMasksNull={ctx.LfMasks == null} Damping={fh.CdefDamping} y0={fh.CdefYStrength0}");
-        if (fh.CdefNBits > 0 || fh.CdefYStrength0 != 0)  // CDEF enabled if any strength > 0
+        if ((fh.CdefNBits > 0 || fh.CdefYStrength0 != 0)  // CDEF enabled if any strength > 0
+            && System.Environment.GetEnvironmentVariable("AV1_NOCDEF") != "1")
         {
             ApplyCdef(ssHor, ssVer, hasChroma);
 
@@ -1302,7 +1303,7 @@ internal sealed class Av1Decoder
     private void ApplyCdef(int ssHor, int ssVer, bool hasChroma)
     {
         var fh = frameHdr;
-        int damping = fh.CdefDamping; // bitdepth_min_8 = 0 for 8-bit
+        int damping = fh.CdefDamping + (ctx.BitDepth - 8); // dav1d: cdef.damping + bitdepth_min_8
         int yStride = ctx.YStride;
         int uvStride = ctx.UvStride;
         int w4 = ctx.W4;
@@ -1372,13 +1373,19 @@ internal sealed class Av1Decoder
                         continue;
                     }
 
-                    int yPriLvl = yLvl >> 2;
+                    // dav1d cdef_apply: strengths are scaled by bitdepth_min_8 HERE, and
+                    // adjust_strength (luma only) then operates on the shifted value —
+                    // scaling after adjust would differ because adjust_strength is nonlinear.
+                    int bdMin8 = ctx.BitDepth - 8;
+                    int yPriLvl = (yLvl >> 2) << bdMin8;
                     int ySecLvl = yLvl & 3;
                     ySecLvl += ySecLvl == 3 ? 1 : 0;
+                    ySecLvl <<= bdMin8;
 
-                    int uvPriLvl = uvLvl >> 2;
+                    int uvPriLvl = (uvLvl >> 2) << bdMin8;
                     int uvSecLvl = uvLvl & 3;
                     uvSecLvl += uvSecLvl == 3 ? 1 : 0;
+                    uvSecLvl <<= bdMin8;
 
                     // Noskip mask for this 8x8 row pair
                     // by is the global row; mask row within this SB128 = (by & 31) >> 1
@@ -2123,6 +2130,22 @@ internal sealed class Av1Decoder
                 fs.Write(outputBuffer, yOff, ySize);
                 fs.Write(outputBuffer, uOff, uvSize);
                 fs.Write(outputBuffer, vOff, uvSize);
+            }
+            // Raw native-bit-depth planes (little-endian u16), for byte-exact 10/12-bit checks.
+            string? dump10 = System.Environment.GetEnvironmentVariable("AV1_DUMP10");
+            if (!string.IsNullOrEmpty(dump10))
+            {
+                using var fs = new System.IO.FileStream(dump10, System.IO.FileMode.Create);
+                using var bw = new System.IO.BinaryWriter(fs);
+                void WritePlane(ushort[]? pl, int stride, int pw, int ph)
+                {
+                    if (pl == null) return;
+                    for (int yy = 0; yy < ph; yy++)
+                        for (int xx = 0; xx < pw; xx++) bw.Write(pl[yy * stride + xx]);
+                }
+                WritePlane(yPlane, ctx.CurrentStrides[0], w, h);
+                WritePlane(uPlane, ctx.CurrentStrides[1], uvW, uvH);
+                WritePlane(vPlane, ctx.CurrentStrides[2], uvW, uvH);
             }
         }
 
