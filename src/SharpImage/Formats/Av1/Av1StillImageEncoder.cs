@@ -937,8 +937,9 @@ internal static class Av1StillImageEncoder
         int dcU = DcPredict(c.ReconU, c.Cw, c.Chh, cbx, cby, cn, cn);
         int dcV = DcPredict(c.ReconV, c.Cw, c.Chh, cbx, cby, cn, cn);
         int scanLenC = Av1Tables.Scans[ctx0].Length;
-        int[] uC = ForwardResidual(c.U, c.Cw, cbx, cby, cn, dcU, c.DcDq, c.AcDq, scanLenC);
-        int[] vC = ForwardResidual(c.V, c.Cw, cbx, cby, cn, dcV, c.DcDq, c.AcDq, scanLenC);
+        var qfU = new double[scanLenC]; var qfV = new double[scanLenC];
+        int[] uC = ForwardResidual(c.U, c.Cw, cbx, cby, cn, dcU, c.DcDq, c.AcDq, scanLenC, qfU);
+        int[] vC = ForwardResidual(c.V, c.Cw, cbx, cby, cn, dcV, c.DcDq, c.AcDq, scanLenC, qfV);
 
         // Chroma-from-luma: predict chroma AC from reconstructed luma AC scaled by a signed per-plane alpha; keep
         // CfL over DC only when it codes cheaper (incl. the alpha signalling). CfL-allowed sizes only.
@@ -953,8 +954,9 @@ internal static class Av1StillImageEncoder
             {
                 cflU = BuildCflPred(dcU, ac, cn, alphaU);
                 cflV = BuildCflPred(dcV, ac, cn, alphaV);
-                int[] uCcfl = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cflU, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC);
-                int[] vCcfl = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cflV, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC);
+                var qfUcfl = new double[scanLenC]; var qfVcfl = new double[scanLenC];
+                int[] uCcfl = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cflU, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qfUcfl);
+                int[] vCcfl = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cflV, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qfVcfl);
                 // RD choice (SSE + λ·bits), not bits alone: CfL trades chroma distortion for fewer bits, so a
                 // bits-only choice over-picks it and can raise chroma error. Reconstruct both and compare J.
                 double lam = RdLambdaK * c.AcDq * c.AcDq;
@@ -965,8 +967,24 @@ internal static class Av1StillImageEncoder
                 double cflJ = ChromaReconSse(uCcfl, ctx0, cn, c.DcDq, c.AcDq, cflU, c.U, c.Cw, cbx, cby)
                             + ChromaReconSse(vCcfl, ctx0, cn, c.DcDq, c.AcDq, cflV, c.V, c.Cw, cbx, cby)
                             + lam * (CoeffCost(uCcfl) + CoeffCost(vCcfl) + 8 + (alphaU != 0 ? 5 : 0) + (alphaV != 0 ? 5 : 0));
-                if (cflJ < dcJ) { useCfl = true; uC = uCcfl; vC = vCcfl; }
+                if (cflJ < dcJ) { useCfl = true; uC = uCcfl; vC = vCcfl; qfU = qfUcfl; qfV = qfVcfl; }
             }
+        }
+
+        // Chroma RDOQ: trim coefficients whose coding rate outweighs their (dq-scaled) distortion, the same
+        // rate-distortion coefficient optimisation luma gets in the rect leaf. Chroma was previously left at
+        // round-to-nearest quantisation, which over-codes it (measured 2-6 dB above luma at matched rate). Must
+        // run before the skip/txb_skip decision below so an all-zeroed plane is coded as skipped.
+        if (UseChromaRdoq)
+        {
+            double clam = ChromaRdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq;
+            ref readonly var uvtd0 = ref Av1Tables.TxfmDimensions[ctx0];
+            int ruSkip = Av1CoeffDecode.GetSkipCtx(in uvtd0, bs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
+            int rvSkip = Av1CoeffDecode.GetSkipCtx(in uvtd0, bs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
+            int ruSign = Av1CoeffDecode.GetDcSignCtx(ctx0, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
+            int rvSign = Av1CoeffDecode.GetDcSignCtx(ctx0, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
+            Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, uC, qfU, c.DcDq, c.AcDq, ruSkip, ruSign, 0, clam);
+            Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, vC, qfV, c.DcDq, c.AcDq, rvSkip, rvSign, 0, clam);
         }
 
         int skip = (!lumaAllZero || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
@@ -1303,7 +1321,7 @@ internal static class Av1StillImageEncoder
     }
 
     private static int[] ForwardResidual(ReadOnlySpan<byte> plane, int planeW, int bx, int by, int n, int dcPred,
-        int dcDq, int acDq, int scanLen)
+        int dcDq, int acDq, int scanLen, double[]? qfOut = null)
     {
         var residual = new int[n * n];
         for (int y = 0; y < n; y++)
@@ -1314,7 +1332,9 @@ internal static class Av1StillImageEncoder
             }
         }
 
-        return Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen);
+        return qfOut == null
+            ? Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen)
+            : Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, Av1FwdTransform.FwdTxType.DctDct, qfOut);
     }
 
     // Validates a multi-SB frame and returns the SB grid, real 4-unit dims (bw4/bh4, for context clipping) and
@@ -1706,6 +1726,12 @@ internal static class Av1StillImageEncoder
     // helps low-quality scene/landscape but regresses detailed real-photo luma (peppers) — so 30 is the robust
     // single-scalar operating point.
     internal static double RdoqLambdaScale = 30.0;
+
+    // Chroma coefficient RDOQ in the square colour leaf (EncodeLeafBlockColor). Chroma was previously coded at
+    // round-to-nearest with no rate-distortion trimming, running measurably richer than luma at matched rate;
+    // this applies the same RDOQ to U/V. Scale kept equal to luma initially, tuned against the RD benchmark.
+    internal static bool UseChromaRdoq = true;
+    internal static double ChromaRdoqLambdaScale = 30.0;
 
     // Enables PARTITION_HORZ / PARTITION_VERT rectangular leaves at 16x16 (colour path). Toggle for A/B testing.
     internal static bool UseRectPartition = true;
@@ -2164,13 +2190,13 @@ internal static class Av1StillImageEncoder
 
     // Forward+quant of (src - pred) for a w x h block. pred is h x w row-major.
     private static int[] ForwardResidualPredRect(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy,
-        byte[] pred, int w, int h, int txIdx, int dcDq, int acDq, int rcCount)
+        byte[] pred, int w, int h, int txIdx, int dcDq, int acDq, int rcCount, double[]? qfOut = null)
     {
         var residual = new int[h * w];
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 residual[y * w + x] = src[(srcBy + y) * srcW + (srcBx + x)] - pred[y * w + x];
-        return Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, Av1FwdTransform.FwdTxType.DctDct);
+        return Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, Av1FwdTransform.FwdTxType.DctDct, qfOut);
     }
 
     // Dequantizes rect levels and reconstructs a w x h block onto predBlock (h x w) via the decoder's InvTxfmAdd,
