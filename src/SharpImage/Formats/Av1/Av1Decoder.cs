@@ -796,8 +796,31 @@ internal sealed class Av1Decoder
         if (ctx.RestorePlanes != 0)
         {
             int sbh = seqHdr.Sb128 ? (ctx.Bh + 31) >> 5 : (ctx.Bh + 15) >> 4;
+            // The rolling LrLpfLine buffer is overwritten each SB row, but LR runs as a
+            // later whole-frame pass. Snapshot each SB row's boundary rows so LR reads the
+            // correct per-SB-row lpf (dav1d does copy_lpf(sby) then lr(sby) back to back).
+            int numLines = seqHdr.Sb128 ? 24 : 12;
+            ctx.LrLpfNumLines = numLines;
+            for (int p = 0; p < 3; p++)
+            {
+                var line = ctx.LrLpfLine[p];
+                if (line == null) { ctx.LrLpfSnap[p] = null; continue; }
+                int snapSize = sbh * numLines * (p == 0 ? ctx.YStride : ctx.UvStride);
+                if (ctx.LrLpfSnap[p] == null || ctx.LrLpfSnap[p]!.Length < snapSize)
+                    ctx.LrLpfSnap[p] = new ushort[snapSize];
+            }
             for (int sby = 0; sby < sbh; sby++)
+            {
                 CopyLpf(sby, ssHor, ssVer, hasChroma);
+                for (int p = 0; p < 3; p++)
+                {
+                    var line = ctx.LrLpfLine[p];
+                    var snap = ctx.LrLpfSnap[p];
+                    if (line == null || snap == null) continue;
+                    int stride = p == 0 ? ctx.YStride : ctx.UvStride;
+                    Array.Copy(line, 0, snap, sby * numLines * stride, numLines * stride);
+                }
+            }
         }
 
         // === CDEF (Constrained Directional Enhancement Filter) ===
@@ -1504,8 +1527,9 @@ internal sealed class Av1Decoder
             int rowH = Math.Min((sby + 1) << (6 + sb128), h - 1);
             int yStripe = (sby << (6 + sb128)) - offset;
 
+            // dav1d copy_lpf src = plane advanced to SB-row top, minus offset = y_stripe.
             BackupLpf(ctx.LrLpfLine[0]!, yStride,
-                ctx.CurrentPlanes[0]!, offset * yStride, yStride,
+                ctx.CurrentPlanes[0]!, yStripe * yStride, yStride,
                 ssVer: 0, sb128, yStripe, rowH, w, h);
         }
 
@@ -1519,11 +1543,11 @@ internal sealed class Av1Decoder
 
             if ((restorePlanes & 2) != 0)
                 BackupLpf(ctx.LrLpfLine[1]!, uvStride,
-                    ctx.CurrentPlanes[1]!, offsetUv * uvStride, uvStride,
+                    ctx.CurrentPlanes[1]!, yStripe * uvStride, uvStride,
                     ssVer, sb128, yStripe, rowH, w, h);
             if ((restorePlanes & 4) != 0)
                 BackupLpf(ctx.LrLpfLine[2]!, uvStride,
-                    ctx.CurrentPlanes[2]!, offsetUv * uvStride, uvStride,
+                    ctx.CurrentPlanes[2]!, yStripe * uvStride, uvStride,
                     ssVer, sb128, yStripe, rowH, w, h);
         }
     }
@@ -1592,6 +1616,7 @@ internal sealed class Av1Decoder
         int sbStep = seqHdr.Sb128 ? 32 : 16;
         int notLast = sby + 1 < ((ctx.Bh + sbStep - 1) / sbStep) ? 1 : 0;
         int offsetY = 8 * (sby > 0 ? 1 : 0);
+        int numLines = ctx.LrLpfNumLines;
 
         if ((restorePlanes & 1) != 0)
         {
@@ -1601,8 +1626,10 @@ internal sealed class Av1Decoder
             int rowH = Math.Min(nextRowY - 8 * notLast, h);
             int yStripe = (sby << (6 + sb128)) - offsetY;
 
-            LrSbRow(ctx.CurrentPlanes[0]!, offsetY * ctx.YStride, ctx.YStride,
-                ctx.LrLpfLine[0]!, yStripe, w, h, rowH, 0, 0, sby);
+            // Plane pointer must be at the stripe's first row (dav1d: dst - offset_y,
+            // where dst is already advanced to the SB-row top → net y_stripe*stride).
+            LrSbRow(ctx.CurrentPlanes[0]!, yStripe * ctx.YStride, ctx.YStride,
+                ctx.LrLpfSnap[0]!, sby * numLines * ctx.YStride, yStripe, w, h, rowH, 0, 0, sby);
         }
 
         if (hasChroma && (restorePlanes & 6) != 0)
@@ -1615,12 +1642,12 @@ internal sealed class Av1Decoder
             int yStripe = (sby << ((6 - ssVer) + sb128)) - offsetUv;
 
             if ((restorePlanes & 2) != 0)
-                LrSbRow(ctx.CurrentPlanes[1]!, offsetUv * ctx.UvStride, ctx.UvStride,
-                    ctx.LrLpfLine[1]!, yStripe, w, h, rowH, 1, ssHor, sby);
+                LrSbRow(ctx.CurrentPlanes[1]!, yStripe * ctx.UvStride, ctx.UvStride,
+                    ctx.LrLpfSnap[1]!, sby * numLines * ctx.UvStride, yStripe, w, h, rowH, 1, ssHor, sby);
 
             if ((restorePlanes & 4) != 0)
-                LrSbRow(ctx.CurrentPlanes[2]!, offsetUv * ctx.UvStride, ctx.UvStride,
-                    ctx.LrLpfLine[2]!, yStripe, w, h, rowH, 2, ssHor, sby);
+                LrSbRow(ctx.CurrentPlanes[2]!, yStripe * ctx.UvStride, ctx.UvStride,
+                    ctx.LrLpfSnap[2]!, sby * numLines * ctx.UvStride, yStripe, w, h, rowH, 2, ssHor, sby);
         }
     }
 
@@ -1629,7 +1656,7 @@ internal sealed class Av1Decoder
     /// Ported from dav1d lr_sbrow (lr_apply_tmpl.c:107-166).
     /// </summary>
     private void LrSbRow(ushort[] plane, int pOff, int stride,
-        ushort[] lpf, int y, int w, int h, int rowH,
+        ushort[] lpf, int lpfBase, int y, int w, int h, int rowH,
         int planeIdx, int ssHor, int sby)
     {
         var fh = frameHdr;
@@ -1684,7 +1711,7 @@ internal sealed class Av1Decoder
                 Backup4xU(preLrBorder[bit], plane, pBase + unitSize - 4, stride, borderH);
 
             if (restore)
-                LrStripe(plane, pBase, stride, preLrBorder[1 - bit], lpf,
+                LrStripe(plane, pBase, stride, preLrBorder[1 - bit], lpf, lpfBase,
                     x, y, planeIdx, unitSize, rowH,
                     ref ctx.LrMasks[curSbIdx].Lr[planeIdx, curUnitIdx], edges, sby, ssVer);
 
@@ -1703,7 +1730,7 @@ internal sealed class Av1Decoder
         {
             edges &= ~Av1LoopRestoration.LrEdgeFlags.Right;
             int unitW = w - x;
-            LrStripe(plane, pBase, stride, preLrBorder[1 - bit], lpf,
+            LrStripe(plane, pBase, stride, preLrBorder[1 - bit], lpf, lpfBase,
                 x, y, planeIdx, unitW, rowH,
                 ref ctx.LrMasks[curSbIdx].Lr[planeIdx, curUnitIdx], edges, sby, ssVer);
         }
@@ -1731,7 +1758,7 @@ internal sealed class Av1Decoder
     /// Ported from dav1d lr_stripe (lr_apply_tmpl.c:36-98).
     /// </summary>
     private void LrStripe(ushort[] p, int pOff, int stride,
-        ushort[] left, ushort[] lpf,
+        ushort[] left, ushort[] lpf, int lpfBase,
         int x, int y, int plane, int unitW, int rowH,
         ref Av1RestorationUnit lr, Av1LoopRestoration.LrEdgeFlags edges,
         int sby, int ssVer)
@@ -1741,8 +1768,8 @@ internal sealed class Av1Decoder
         // Bit depth for the Wiener/SGR kernels (round bits, clip limits, box-sum downscale).
         Av1LoopRestoration.WienerBitDepth = ctx.BitDepth;
 
-        // lpf offset: for single-threaded (have_tt=0), just add x
-        int lpfOff = x;
+        // lpf offset: base into this SB row's snapshot, then add x (single-threaded).
+        int lpfOff = lpfBase + x;
 
         // First stripe is shorter by 8 luma rows (→ fewer for chroma)
         int stripeH = Math.Min((64 - 8 * (y == 0 ? 1 : 0)) >> ssVer, rowH - y);

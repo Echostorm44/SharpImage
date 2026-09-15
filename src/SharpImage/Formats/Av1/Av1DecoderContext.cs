@@ -285,6 +285,13 @@ public sealed class Av1DecoderContext : IDisposable
     /// dav1d: f->lf.lr_lpf_line[3].</summary>
     public ushort[]?[] LrLpfLine = new ushort[3][];
 
+    /// <summary>Per-SB-row snapshot of the LPF line buffer. The whole-frame CopyLpf pass
+    /// fills the rolling LrLpfLine which is then overwritten each SB row; LR runs as a
+    /// later whole-frame pass, so each SB row's boundary rows are snapshotted here (indexed
+    /// by sby*NumLines*stride) and read back by ApplyLoopRestoration.</summary>
+    public ushort[]?[] LrLpfSnap = new ushort[3][];
+    public int LrLpfNumLines;
+
     /// <summary>Width of the sr_sb128 row for LR mask indexing.
     /// dav1d: f->sr_sb128w.</summary>
     public int SrSb128W;

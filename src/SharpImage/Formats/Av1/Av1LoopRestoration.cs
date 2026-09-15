@@ -482,19 +482,23 @@ public static class Av1LoopRestoration
 
     private static void SgrFinishFilterRow1(int[] tmp, int tmpOffset,
         ReadOnlySpan<ushort> src, int srcOffset, int[][] aPtrs, int[][] bPtrs,
-        int offset, int w)
+        int offset, int w, int pBase = 0)
     {
+        // pBase selects the 3-row window {pBase, pBase+1, pBase+2}. dav1d filters the
+        // second output row of a pair with &A_ptrs[1] (a shifted pointer array), so its
+        // window is rows 1,2,3 rather than 0,1,2 — pBase=1 replicates that shift.
+        int p0 = pBase, p1 = pBase + 1, p2 = pBase + 2;
         for (int i = 0; i < w; i++)
         {
             int idx = offset + i + 1;
-            int a = (bPtrs[1][idx] + bPtrs[1][idx - 1] + bPtrs[1][idx + 1] +
-                     bPtrs[0][idx] + bPtrs[2][idx]) * 4 +
-                    (bPtrs[0][idx - 1] + bPtrs[2][idx - 1] +
-                     bPtrs[0][idx + 1] + bPtrs[2][idx + 1]) * 3;
-            int b = (aPtrs[1][idx] + aPtrs[1][idx - 1] + aPtrs[1][idx + 1] +
-                     aPtrs[0][idx] + aPtrs[2][idx]) * 4 +
-                    (aPtrs[0][idx - 1] + aPtrs[2][idx - 1] +
-                     aPtrs[0][idx + 1] + aPtrs[2][idx + 1]) * 3;
+            int a = (bPtrs[p1][idx] + bPtrs[p1][idx - 1] + bPtrs[p1][idx + 1] +
+                     bPtrs[p0][idx] + bPtrs[p2][idx]) * 4 +
+                    (bPtrs[p0][idx - 1] + bPtrs[p2][idx - 1] +
+                     bPtrs[p0][idx + 1] + bPtrs[p2][idx + 1]) * 3;
+            int b = (aPtrs[p1][idx] + aPtrs[p1][idx - 1] + aPtrs[p1][idx + 1] +
+                     aPtrs[p0][idx] + aPtrs[p2][idx]) * 4 +
+                    (aPtrs[p0][idx - 1] + aPtrs[p2][idx - 1] +
+                     aPtrs[p0][idx + 1] + aPtrs[p2][idx + 1]) * 3;
             tmp[tmpOffset + i] = (b - a * src[srcOffset + i] + (1 << 8)) >> 9;
         }
     }
@@ -922,7 +926,7 @@ public static class Av1LoopRestoration
         SgrFinishFilter2(tmp5, 0, dst, pOff, stride, A5Ptrs, B5Ptrs, offset, w, h);
         SgrFinishFilterRow1(tmp3, 0, dst, pOff, A3Ptrs, B3Ptrs, offset, w);
         if (h > 1)
-            SgrFinishFilterRow1(tmp3, FilterOutStride, dst, pOff + stride, A3Ptrs, B3Ptrs, offset, w);
+            SgrFinishFilterRow1(tmp3, FilterOutStride, dst, pOff + stride, A3Ptrs, B3Ptrs, offset, w, pBase: 1);
         SgrWeighted2(dst, pOff, stride, tmp5, 0, tmp3, 0, w, h, w0, w1);
         pOff += h * stride;
         Rotate(A5Ptrs, B5Ptrs, 2);
