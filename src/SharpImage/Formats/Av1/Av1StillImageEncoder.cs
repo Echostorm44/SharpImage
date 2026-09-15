@@ -1712,26 +1712,24 @@ internal static class Av1StillImageEncoder
         => EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl, bx4, by4);
 
     // RD lagrangian weight: J = SSE + λ·bits, with λ ∝ quant-step². Drives the NONE/SPLIT/mode decisions AND (via
-    // RdoqLambdaScale·RdLambdaK·Q²) the RDOQ coefficient trimming. A sweep at the tuned deadzone/RDOQ put the net
-    // optimum near 0.008 (from 0.02): scene ~-12%, peppers/landscape ~-5%, flattening below ~0.006 (so the RD
-    // machinery bottoms out rather than being counterproductive). 0.008 sits just above that floor and does not
-    // regress high-quality (low-q) content.
-    internal static double RdLambdaK = 0.008;
+    // RdoqLambdaScale·RdLambdaK·Q²) the RDOQ coefficient trimming. Retuned 2026-09 on a 6-image BD-rate corpus
+    // (photo/graphics/text/texture) jointly with RdoqLambdaScale=20 and DeadzoneBias=0.04 after chroma RDOQ was
+    // added: 0.004 wins over the prior 0.008 (which had been tuned before chroma RDOQ existed) — the combined
+    // retune is -6.2% BD-rate, improving on all six images. The optimum is a broad basin (0.004-0.005).
+    internal static double RdLambdaK = 0.004;
 
     // Extra multiplier on the RDOQ lambda relative to the partition lambda. The partition lambda is tuned for
     // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
-    // small distortion against its (EOB-inclusive) coding rate. Coupled with DeadzoneBias: once the deadzone was
-    // lowered to 0.20 (keep more coefficient energy), the joint optimum for this scale dropped from 40 to ~30
-    // (peppers ~-2%, landscape ~-4.5%, scene ~neutral vs 40). Below 30 the optimum is quality-dependent — lower
-    // helps low-quality scene/landscape but regresses detailed real-photo luma (peppers) — so 30 is the robust
-    // single-scalar operating point.
-    internal static double RdoqLambdaScale = 30.0;
+    // small distortion against its (EOB-inclusive) coding rate. Retuned to 20 (from 30) in the 2026-09 corpus
+    // sweep jointly with RdLambdaK=0.004 / DeadzoneBias=0.04; RDOQ=20 beat 15 and 30-45 (over-trimming hurts once
+    // the deadzone is nearly off and chroma is also RDOQ'd). Chroma uses the same scale (ChromaRdoqLambdaScale).
+    internal static double RdoqLambdaScale = 20.0;
 
     // Chroma coefficient RDOQ in the square colour leaf (EncodeLeafBlockColor). Chroma was previously coded at
     // round-to-nearest with no rate-distortion trimming, running measurably richer than luma at matched rate;
     // this applies the same RDOQ to U/V. Scale kept equal to luma initially, tuned against the RD benchmark.
     internal static bool UseChromaRdoq = true;
-    internal static double ChromaRdoqLambdaScale = 30.0;
+    internal static double ChromaRdoqLambdaScale = 20.0;
 
     // Enables PARTITION_HORZ / PARTITION_VERT rectangular leaves at 16x16 (colour path). Toggle for A/B testing.
     internal static bool UseRectPartition = true;

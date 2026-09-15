@@ -26,11 +26,12 @@ internal static class Av1FwdTransform
 
     // Quantization rounding bias: mag = |qf| + 0.5 - DeadzoneBias, so 0.5 is round-to-nearest and lower values
     // round away from zero (keep more coefficient energy). Pure encoder rate-distortion choice — decoder is
-    // unaffected. With strong RDOQ (RdoqLambdaScale=40) doing the optimal level trimming, a *low* bias wins: a
-    // hard deadzone here pre-empts RDOQ's rate-distortion decision suboptimally. A sweep (peppers/scene/landscape,
-    // matched RMSE) improved monotonically from 0.55 down to ~0.15-0.20 (scene ~-8%, peppers/landscape ~-4-5%),
-    // with 0.20 clear of the high-quality instability seen at 0.05. Below ~0.15 high-quality (low-q) content regresses.
-    internal static double DeadzoneBias = 0.20;
+    // unaffected. With RDOQ doing the optimal level trimming, a *low* bias wins: a hard deadzone here pre-empts
+    // RDOQ's rate-distortion decision suboptimally. Retuned 2026-09 on a 6-image BD-rate corpus (photo/graphics/
+    // text/texture) jointly with RdLambdaK=0.004 and RdoqLambdaScale=20 after chroma RDOQ was added: the joint
+    // optimum is a broad basin at bias 0.02-0.04 (0.04 best, -6.2% BD-rate vs the prior 0.008/30/0.20 tuning; all
+    // six images improved). Bias 0.00 (pure round-to-nearest) slightly overshoots (-5.9%) — a hair of deadzone helps.
+    internal static double DeadzoneBias = 0.04;
 
     // Cached forward 1D matrices F = M^-1 (M = decoder's integer 1D inverse), keyed by (logSize<<2 | type1d).
     private static readonly ConcurrentDictionary<int, double[,]> FwdMatrixCache = new();
