@@ -18,8 +18,8 @@ namespace SharpImage.Formats.Av1;
 internal static class Av1FwdTransform
 {
     // Which 1D transform each axis of a 2D type uses, as (horizontal/row, vertical/col) — mirrors the decoder's
-    // Tx1dTypes. Only the reduced intra set's ADST/DCT combinations are needed (no FlipAdst / Identity here).
-    internal enum FwdTxType { DctDct, AdstAdst, AdstDct, DctAdst }
+    // Tx1dTypes. The reduced intra set is {Identity(IDTX), DctDct, AdstAdst, AdstDct, DctAdst} (no FlipAdst).
+    internal enum FwdTxType { DctDct, AdstAdst, AdstDct, DctAdst, Identity }
 
     // Universal forward-quant scale for the orthonormal path: 2^dqShift / G_dec == 8 for all square DCT sizes.
     private const double QuantScaleK = 8.0;
@@ -65,7 +65,8 @@ internal static class Av1FwdTransform
         FwdTxType.DctDct => (Av1InvTransform.Type1dDct, Av1InvTransform.Type1dDct),
         FwdTxType.AdstAdst => (Av1InvTransform.Type1dAdst, Av1InvTransform.Type1dAdst),
         FwdTxType.AdstDct => (Av1InvTransform.Type1dDct, Av1InvTransform.Type1dAdst),   // ADST_DCT: H=Dct, V=Adst
-        _ => (Av1InvTransform.Type1dAdst, Av1InvTransform.Type1dDct),                    // DCT_ADST: H=Adst, V=Dct
+        FwdTxType.DctAdst => (Av1InvTransform.Type1dAdst, Av1InvTransform.Type1dDct),   // DCT_ADST: H=Adst, V=Dct
+        _ => (Av1InvTransform.Type1dIdentity, Av1InvTransform.Type1dIdentity),          // IDTX: identity both axes
     };
 
     // Forward 1D matrix F = (decoder's integer 1D inverse)^-1 for a given size and type, cached.

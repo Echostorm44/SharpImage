@@ -989,7 +989,8 @@ internal static class Av1StillImageEncoder
                         ((ix > 0 || (sbHasBl == 0 && iy + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
                     PredictIntra(c.ReconY, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]));
                     int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
-                    (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, lumaTx, c.DcDq, c.AcDq);
+                    (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, lumaTx, c.DcDq, c.AcDq,
+                        predBuf, c.Luma, c.W, cbx4 * 4, cby4 * 4, RdLambdaK * c.AcDq * c.AcDq);
                     int skc = Av1CoeffDecode.GetSkipCtx(in lTDim, bs, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR), 0, 0);
                     int snc = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR));
                     // RDOQ this tx-split block (depth-0 luma is RDOQ'd in ChooseLeafRdCore; the quadtree path was
@@ -1318,7 +1319,7 @@ internal static class Av1StillImageEncoder
                 int cbx4 = bx4 + ix, cby4 = by4 + iy, px = cbx4 * 4, py = cby4 * 4;
                 PredictIntra(c.Luma, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf);
                 int[] res = ComputeResidualPred(c.Luma, c.W, px, py, predBuf, txN);
-                (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq);
+                (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq, predBuf, c.Luma, c.W, px, py, RdLambdaK * c.AcDq * c.AcDq);
                 // RDOQ the coefficients so this per-depth cost matches the actual RDOQ'd encode (both the depth-0
                 // ChooseLeafRdCore path and the depth>0 emit RDOQ). Without this the estimate under-credits the
                 // large transform, over-splitting smooth/natural content.
@@ -1826,7 +1827,7 @@ internal static class Av1StillImageEncoder
         {
             PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, yMode, yDelta, c.Pred, edgeFlags, IntraEdgeFlags(c.AboveMode[bxR], c.LeftMode[byR]));
             int[] res = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n);
-            (coeffs0, invTx0, txIdx0) = ChooseTxType(res, n, maxTx, c.DcDq, c.AcDq);
+            (coeffs0, invTx0, txIdx0) = ChooseTxType(res, n, maxTx, c.DcDq, c.AcDq, c.Pred, c.Luma, c.W, bx4 * 4, by4 * 4, RdLambdaK * c.AcDq * c.AcDq);
         }
         int skip = HasNonZero(coeffs0) ? 0 : 1;
 
@@ -1894,7 +1895,7 @@ internal static class Av1StillImageEncoder
                         ((ix > 0 || (sbHasBl == 0 && iy + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
                     PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge, IntraEdgeFlags(c.AboveMode[bxR], c.LeftMode[byR]));
                     int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
-                    (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq);
+                    (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq, predBuf, c.Luma, c.W, cbx4 * 4, cby4 * 4, RdLambdaK * c.AcDq * c.AcDq);
                     // Coeff-skip context is neighbour-based for sub-block transforms (0 only when tx == block size).
                     int coefSkipCtx = Av1CoeffDecode.GetSkipCtx(in tDim, BlToBs(bl), c.AboveLCoef.AsSpan(cbxR), c.LeftLCoef.AsSpan(cbyR), 0, 0);
                     int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, c.AboveLCoef.AsSpan(cbxR), c.LeftLCoef.AsSpan(cbyR));
@@ -1937,7 +1938,7 @@ internal static class Av1StillImageEncoder
                 int cbx4 = bx4 + ix, cby4 = by4 + iy;
                 PredictIntra(c.Luma, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, c.EstScratch);
                 int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, c.EstScratch, txN);
-                (int[] cf, _, _) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq);
+                (int[] cf, _, _) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq, c.EstScratch, c.Luma, c.W, cbx4 * 4, cby4 * 4, RdLambdaK * c.AcDq * c.AcDq);
                 cost += CoeffCost(cf) + 6; // per-tx-block overhead (all_zero + tx-type + eob)
             }
 
@@ -2323,11 +2324,41 @@ internal static class Av1StillImageEncoder
         return cfCtx;
     }
 
+    // Reconstruction SSE of an n x n luma candidate: dequant `levels` (mirrors the decoder), inverse-transform onto
+    // `predBlock`, and sum squared error vs the source. Used to score tx-type / mode candidates by true RD (D + λR)
+    // rather than rate alone — necessary because IDTX changes the reconstruction distortion at a matched quantizer
+    // (unlike the DCT/ADST family), so a rate-only comparison over-selects it on smooth content.
+    private static long ReconSseCand(int[] levels, int tx, int n, int dcDq, int acDq, byte[] predBlock,
+        byte[] src, int srcW, int srcBx, int srcBy, Av1TxType txType)
+    {
+        int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[tx].Ctx - 2);
+        const int cfMax = 32767;
+        var scan = Av1Tables.Scans[tx];
+        int eob = -1;
+        for (int i = scan.Length - 1; i >= 0; i--) if (levels[scan[i]] != 0) { eob = i; break; }
+        var cf = new int[Math.Max(n * n, 32 * 32)];
+        for (int i = 0; i <= eob; i++)
+        {
+            int rc = scan[i], lvl = levels[rc];
+            if (lvl == 0) continue;
+            int mag = Math.Abs(lvl), sign = lvl < 0 ? 1 : 0;
+            int dq = Math.Min(((rc == 0 ? dcDq : acDq) * mag) >> dqShift, cfMax + sign);
+            cf[rc] = sign != 0 ? -dq : dq;
+        }
+        var block = (byte[])predBlock.Clone();
+        Av1InvTransform.InvTxfmAdd(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], txType, 8);
+        long sse = 0;
+        for (int y = 0; y < n; y++)
+            for (int x = 0; x < n; x++) { int d = block[y * n + x] - src[(srcBy + y) * srcW + (srcBx + x)]; sse += (long)d * d; }
+        return sse;
+    }
+
     // Forward-transforms and quantizes (src block - prediction) for an n x n block.
     // The reduced intra tx set (Intra2) types searched for luma tx ≤ 16x16 (where the type is signalled), as
     // (forward type, inverse type, symbol index in TxTypesPerSet Intra2). DctDct is idx 1; ADST combos 2/3/4.
     private static readonly (Av1FwdTransform.FwdTxType Fwd, Av1TxType Inv, int Idx)[] IntraTxTypes =
     {
+        (Av1FwdTransform.FwdTxType.Identity, Av1TxType.Identity, 0),
         (Av1FwdTransform.FwdTxType.DctDct,   Av1TxType.DctDct,   1),
         (Av1FwdTransform.FwdTxType.AdstAdst, Av1TxType.AdstAdst, 2),
         (Av1FwdTransform.FwdTxType.AdstDct,  Av1TxType.AdstDct,  3),
@@ -2340,6 +2371,7 @@ internal static class Av1StillImageEncoder
     // used to re-derive the pre-quant floats (qf) for RDOQ of a tx-block whose type ChooseTxType already picked.
     private static Av1FwdTransform.FwdTxType FwdTypeForIdx(int idx) => idx switch
     {
+        0 => Av1FwdTransform.FwdTxType.Identity,
         2 => Av1FwdTransform.FwdTxType.AdstAdst,
         3 => Av1FwdTransform.FwdTxType.AdstDct,
         4 => Av1FwdTransform.FwdTxType.DctAdst,
@@ -2395,6 +2427,7 @@ internal static class Av1StillImageEncoder
         }
 
         double best = double.MaxValue;
+        double rdLambda = RdLambdaK * acDq * acDq;   // pixel-SSE units per bit (same λ as the palette RD gate)
         (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx) bestCand = default;
         for (int t = 0; t < RdModeCandidates; t++)
         {
@@ -2408,7 +2441,9 @@ internal static class Av1StillImageEncoder
             {
                 int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, fwd, qfCand);
                 double rate = Av1CoeffEncode.EstimateCoefBits(cdf.Coef, cdf.Mode, tx, 0, (int)mode, cf, 0, dcSignCtx, idx) + modeBits;
-                if (rate < best) { best = rate; bestCand = (mode, delta, cf, inv, idx); Array.Copy(predBuf, predOut, n * n); Array.Copy(qfCand, qfWin, scanLen); }
+                long sse = ReconSseCand(cf, tx, n, dcDq, acDq, predBuf, luma, lumaW, bx4 * 4, by4 * 4, inv);
+                double j = sse + rdLambda * rate;   // true RD: distortion + λ·rate (IDTX changes distortion, so rate alone misranks it)
+                if (j < best) { best = j; bestCand = (mode, delta, cf, inv, idx); Array.Copy(predBuf, predOut, n * n); Array.Copy(qfCand, qfWin, scanLen); }
             }
         }
 
@@ -2516,19 +2551,21 @@ internal static class Av1StillImageEncoder
     // Chooses the intra transform type minimizing coefficient cost for a residual. For luma tx ≤ 16x16 the type is
     // signalled (Intra2 set: DctDct + ADST combos); for tx ≥ 32x32 DctDct is forced. Returns the quantized coeffs,
     // the inverse type for reconstruction, and the Intra2 symbol index to code.
-    private static (int[] Coeffs, Av1TxType Inv, int Idx) ChooseTxType(int[] residual, int n, int tx, int dcDq, int acDq)
+    private static (int[] Coeffs, Av1TxType Inv, int Idx) ChooseTxType(int[] residual, int n, int tx, int dcDq, int acDq,
+        byte[] predBlock, byte[] src, int srcW, int srcBx, int srcBy, double rdLambda)
     {
         int scanLen = Av1Tables.Scans[tx].Length;
         if (n > 16)
             return (Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen), Av1TxType.DctDct, 1);
 
-        long best = long.MaxValue;
+        double best = double.MaxValue;
         (int[], Av1TxType, int) bestCand = default;
         foreach (var (fwd, inv, idx) in IntraTxTypes)
         {
             int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, fwd);
-            long cost = CoeffCost(cf);
-            if (cost < best) { best = cost; bestCand = (cf, inv, idx); }
+            // True RD: distortion + λ·rate. Rate alone over-selects IDTX on smooth content (see ChooseLeafRdCore).
+            double j = ReconSseCand(cf, tx, n, dcDq, acDq, predBlock, src, srcW, srcBx, srcBy, inv) + rdLambda * CoeffCost(cf);
+            if (j < best) { best = j; bestCand = (cf, inv, idx); }
         }
 
         return bestCand;
