@@ -458,6 +458,124 @@ internal static class Av1CoeffEncode
         }
     }
 
+    /// <summary>Encodes the luma palette COLOURS for a block — the exact inverse of DecodeLumaPalette. Given the
+    /// final sorted (ascending, distinct) palette in <paramref name="colors"/>, it rebuilds the neighbour cache
+    /// the decoder will build, signals which cache entries are reused (equi bits), delta-codes the remaining
+    /// "new" colours, and updates the palette-prediction neighbour state (PalPrevY/PalPrevSz) exactly as the
+    /// decoder does so the next block's cache matches. Verified by round-tripping through DecodeLumaPalette.</summary>
+    public static void EncodeLumaPaletteColors(Av1MsacWriter w, Av1TaskContext t, ref Av1Block b,
+        ushort[] colors, int palSz, int bx4, int by4, int bitDepth)
+    {
+        if (palSz < 2 || palSz > 8) throw new ArgumentOutOfRangeException(nameof(palSz));
+        int bpc = bitDepth, maxVal = (1 << bpc) - 1;
+
+        // --- Rebuild the same left/above cache the decoder builds. ---
+        Span<ushort> lCache = stackalloc ushort[8]; int lCacheSz = 0;
+        int bi4 = by4 < 32 ? by4 : 31;
+        int leftPalSz = t.Left.PalSz[bi4]; if (leftPalSz > 8) leftPalSz = 0;
+        for (int ci = 0; ci < leftPalSz; ci++) lCache[lCacheSz++] = t.PalPrevY[1, bi4, ci];
+
+        Span<ushort> aCache = stackalloc ushort[8]; int aCacheSz = 0;
+        int bj4 = bx4 < 32 ? bx4 : 31;
+        int abovePalSz = ((by4 & 15) != 0) ? t.Above.PalSz[bj4] : 0; if (abovePalSz > 8) abovePalSz = 0;
+        for (int ci = 0; ci < abovePalSz; ci++) aCache[aCacheSz++] = t.PalPrevY[0, bj4, ci];
+
+        Span<ushort> cache = stackalloc ushort[16]; int nCache = 0;
+        int li = 0, ai = 0;
+        while (li < lCacheSz && ai < aCacheSz)
+        {
+            if (lCache[li] < aCache[ai])
+            { if (nCache == 0 || cache[nCache - 1] != lCache[li]) cache[nCache++] = lCache[li]; li++; }
+            else
+            { if (aCache[ai] == lCache[li]) li++; if (nCache == 0 || cache[nCache - 1] != aCache[ai]) cache[nCache++] = aCache[ai]; ai++; }
+        }
+        while (li < lCacheSz) { if (nCache == 0 || cache[nCache - 1] != lCache[li]) cache[nCache++] = lCache[li]; li++; }
+        while (ai < aCacheSz) { if (nCache == 0 || cache[nCache - 1] != aCache[ai]) cache[nCache++] = aCache[ai]; ai++; }
+
+        // --- Cache selection: a bit per cache entry (until palSz reached), set iff that colour is in the palette.
+        int nUsedCache = 0;
+        for (int ci = 0; ci < nCache && nUsedCache < palSz; ci++)
+        {
+            bool inPal = Contains(colors, palSz, cache[ci]);
+            w.EncodeBoolEqui(inPal ? 1u : 0u);
+            if (inPal) nUsedCache++;
+        }
+
+        // --- New colours = palette colours not taken from the cache, in ascending order. ---
+        Span<ushort> newPal = stackalloc ushort[8]; int nNew = 0;
+        for (int ci = 0; ci < palSz; ci++)
+            if (!InCache(cache, nCache, colors[ci], nUsedCache > 0)) newPal[nNew++] = colors[ci];
+        // (Colours present in the cache were signalled above; everything else is coded here.)
+
+        if (nNew > 0)
+        {
+            w.EncodeLiteral(newPal[0], bpc);
+            if (nNew > 1)
+            {
+                // Pick the smallest 2-bit selector b2 (bits = bpc-3+b2) for which every delta fits its narrowed
+                // width, matching the decoder's per-entry narrowing. b2=3 (bits=bpc) always fits.
+                int b2 = ChooseDeltaBits(newPal, nNew, bpc, maxVal);
+                w.EncodeLiteral((uint)b2, 2);
+                int bits = bpc - 3 + b2, prev = newPal[0];
+                for (int i = 1; i < nNew; i++)
+                {
+                    int delta = newPal[i] - prev - 1;
+                    w.EncodeLiteral((uint)delta, bits);
+                    prev = Math.Min(prev + delta + 1, maxVal);
+                    if (prev + 1 >= maxVal) break;   // decoder fills the rest with maxVal (no more distinct colours)
+                    int ulog2 = 0, tmp = maxVal - prev - 1;
+                    while (tmp > 1) { tmp >>= 1; ulog2++; }
+                    bits = Math.Min(bits, 1 + ulog2);
+                }
+            }
+        }
+
+        // --- Update palette-prediction neighbour state (mirror DecodeLumaPalette's store). ---
+        for (int ci = 0; ci < palSz; ci++) t.PalColorsY[ci] = colors[ci];
+        int bw = Av1Tables.BlockDimensions[b.BlockSize, 0];
+        int bh = Av1Tables.BlockDimensions[b.BlockSize, 1];
+        for (int dx = 0; dx < bw && bj4 + dx < 32; dx++)
+        {
+            int col = bj4 + dx;
+            for (int ci = 0; ci < palSz; ci++) t.PalPrevY[0, col, ci] = colors[ci];
+            t.PalPrevSz[0, col] = (byte)palSz;
+        }
+        for (int dy = 0; dy < bh && bi4 + dy < 32; dy++)
+        {
+            int row = bi4 + dy;
+            for (int ci = 0; ci < palSz; ci++) t.PalPrevY[1, row, ci] = colors[ci];
+            t.PalPrevSz[1, row] = (byte)palSz;
+        }
+    }
+
+    private static bool Contains(ushort[] colors, int n, ushort v)
+    { for (int i = 0; i < n; i++) if (colors[i] == v) return true; return false; }
+
+    // A palette colour was signalled via the cache iff it equals some cache entry (cache holds distinct values).
+    private static bool InCache(ReadOnlySpan<ushort> cache, int nCache, ushort v, bool anyUsed)
+    { for (int i = 0; i < nCache; i++) if (cache[i] == v) return true; return false; }
+
+    // Smallest 2-bit delta-width selector for which all new-colour deltas fit their (narrowed) widths.
+    private static int ChooseDeltaBits(ReadOnlySpan<ushort> newPal, int nNew, int bpc, int maxVal)
+    {
+        for (int b2 = 0; b2 <= 3; b2++)
+        {
+            int bits = bpc - 3 + b2, prev = newPal[0]; bool ok = true;
+            for (int i = 1; i < nNew; i++)
+            {
+                int delta = newPal[i] - prev - 1;
+                if (bits < 0 || delta >= (1 << bits)) { ok = false; break; }
+                prev = Math.Min(prev + delta + 1, maxVal);
+                if (prev + 1 >= maxVal) break;
+                int ulog2 = 0, tmp = maxVal - prev - 1;
+                while (tmp > 1) { tmp >>= 1; ulog2++; }
+                bits = Math.Min(bits, 1 + ulog2);
+            }
+            if (ok) return b2;
+        }
+        return 3;
+    }
+
     /// <summary>Exp-Golomb, inverse of Av1CoeffDecode.ReadGolomb: for value g, emit len zeros, a one, then the
     /// low len bits of (g+1) MSB-first, where len = floor(log2(g+1)).</summary>
     private static void EncodeGolomb(Av1MsacWriter w, uint g)
