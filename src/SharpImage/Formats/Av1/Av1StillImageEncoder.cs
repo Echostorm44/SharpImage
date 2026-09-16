@@ -2078,9 +2078,12 @@ internal static class Av1StillImageEncoder
     private static readonly (Av1IntraPredMode Mode, int Delta)[] CandidateModes = BuildCandidates();
 
 
-    // How many SATD-best modes the RD leaf search fully rate-evaluates (of ~34 candidates). 4 keeps essentially
-    // all of the quality while cutting the hot rate-search ~8x, which is what makes true-RD affordable.
-    private const int RdModeCandidates = 4;
+    // How many SATD-best modes the RD leaf search fully rate-evaluates (of ~61 candidates: DC/Smooth/SmoothV/
+    // SmoothH/Paeth + 8 directional × 7 angle_deltas). The SATD prescreen is an imperfect proxy, so it discards
+    // true-RD winners at small counts: a corpus sweep (2026-09-16) found 4→8 = -0.31%, 8→16 = -0.74%, 16→32 =
+    // -0.79% (saturated) BD-rate. 16 is the knee — essentially all the quality for ~1/4 the RD cost of an
+    // exhaustive search. Higher trades encode time for <0.1%.
+    internal static int RdModeCandidates = 16;
 
     private static (Av1IntraPredMode, int)[] BuildCandidates()
     {
