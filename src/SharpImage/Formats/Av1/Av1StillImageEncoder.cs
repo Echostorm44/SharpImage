@@ -2009,14 +2009,17 @@ internal static class Av1StillImageEncoder
     // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
     // small distortion against its (EOB-inclusive) coding rate. Retuned to 20 (from 30) in the 2026-09 corpus
     // sweep jointly with RdLambdaK=0.004 / DeadzoneBias=0.04; then raised 20->25 in the tx_depth-on re-sweep
-    // (jointly with RdLambdaK=0.003). Chroma uses the same scale (ChromaRdoqLambdaScale).
-    internal static double RdoqLambdaScale = 25.0;
+    // (jointly with RdLambdaK=0.003). Chroma uses the same scale (ChromaRdoqLambdaScale). Raised 25->40 in the
+    // filter-intra re-sweep (2026-09-16): filter improves prediction, so residuals are smaller and more aggressive
+    // coefficient trimming wins (-0.46% BD-rate, clean 5/6; the knee — 36=-0.44, 40=-0.46, 45=-0.41 vs 25).
+    // RdLambdaK stayed 0.002 and DeadzoneBias stayed 0.04 (both re-confirmed optimal in the same sweep).
+    internal static double RdoqLambdaScale = 40.0;
 
     // Chroma coefficient RDOQ in the square colour leaf (EncodeLeafBlockColor). Chroma was previously coded at
     // round-to-nearest with no rate-distortion trimming, running measurably richer than luma at matched rate;
     // this applies the same RDOQ to U/V. Scale kept equal to luma initially, tuned against the RD benchmark.
     internal static bool UseChromaRdoq = true;
-    internal static double ChromaRdoqLambdaScale = 25.0;
+    internal static double ChromaRdoqLambdaScale = 40.0;   // raised 25->40 with luma in the filter-intra re-sweep
 
     // Enables PARTITION_HORZ / PARTITION_VERT rectangular leaves at 16x16 (colour path). Toggle for A/B testing.
     internal static bool UseRectPartition = true;
