@@ -17,12 +17,14 @@ internal static class Av1ObuWriter
         public readonly int Width;
         public readonly int Height;
         public readonly bool Monochrome;
+        public readonly bool EnableFilterIntra;
 
-        public SeqConfig(int width, int height, bool monochrome)
+        public SeqConfig(int width, int height, bool monochrome, bool enableFilterIntra = false)
         {
             Width = width;
             Height = height;
             Monochrome = monochrome;
+            EnableFilterIntra = enableFilterIntra;
         }
     }
 
@@ -90,7 +92,7 @@ internal static class Av1ObuWriter
 
         // reduced still → frame_id_numbers_present skipped.
         w.PutBool(false);         // use_128x128_superblock = 0 (64x64 SBs)
-        w.PutBool(false);         // enable_filter_intra = 0
+        w.PutBool(cfg.EnableFilterIntra);  // enable_filter_intra (set only on the multi-SB colour path that emits it)
         w.PutBool(Av1StillImageEncoder.UseIntraEdgeFilter);  // enable_intra_edge_filter
 
         // reduced still → inter tools block skipped; screen_content_tools/force_integer_mv default Adaptive.

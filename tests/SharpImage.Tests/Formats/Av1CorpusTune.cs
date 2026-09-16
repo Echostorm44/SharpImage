@@ -36,6 +36,7 @@ public sealed class Av1CorpusTune
         if (p.Length >= 7) Av1StillImageEncoder.UseDeblockSearch = p[6] == "1"; // optional deblock-search toggle
         if (p.Length >= 8) Av1StillImageEncoder.UsePalette = p[7] == "1";       // optional palette toggle
         if (p.Length >= 9) Av1StillImageEncoder.RdModeCandidates = int.Parse(p[8], ci); // optional mode-search breadth
+        if (p.Length >= 10) Av1StillImageEncoder.UseFilterIntra = p[9] == "1";          // optional filter-intra toggle
 
         int cw = W / 2, ch = H / 2, ysz = W * H, csz = cw * ch;
         string outDir = Path.Combine(Corpus, "out", label);

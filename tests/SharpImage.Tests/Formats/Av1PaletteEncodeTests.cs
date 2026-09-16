@@ -35,8 +35,10 @@ public sealed class Av1PaletteEncodeTests
     {
         bool prev = Av1StillImageEncoder.UsePalette;
         bool prevTx = Av1StillImageEncoder.UseColorTxDepth;
+        bool prevFi = Av1StillImageEncoder.UseFilterIntra;
         Av1StillImageEncoder.UsePalette = true;
         Av1StillImageEncoder.UseColorTxDepth = Environment.GetEnvironmentVariable("PAL_TXDEPTH") == "1";
+        Av1StillImageEncoder.UseFilterIntra = false;   // isolate palette (palette+filter coexistence is out of scope)
         try
         {
             var (y, u, v) = FewColorImage();
@@ -57,6 +59,6 @@ public sealed class Av1PaletteEncodeTests
             await Assert.That((int)img.Columns).IsEqualTo(W);
             await Assert.That((int)img.Rows).IsEqualTo(H);
         }
-        finally { Av1StillImageEncoder.UsePalette = prev; Av1StillImageEncoder.UseColorTxDepth = prevTx; }
+        finally { Av1StillImageEncoder.UsePalette = prev; Av1StillImageEncoder.UseColorTxDepth = prevTx; Av1StillImageEncoder.UseFilterIntra = prevFi; }
     }
 }

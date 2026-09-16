@@ -382,6 +382,12 @@ internal static class Av1StillImageEncoder
     // DC luma blocks may be coded as palette; rect partitions are disabled to keep palette to the square leaf.
     internal static bool UsePalette = false;
     internal static int PaletteMaxColors = 8;   // AV1 caps luma palette at 8
+    // Filter-intra: the recursive 4x2 filter predictor (5 modes) for DC-eligible luma blocks <=32x32. Colour-only.
+    // A filter block codes y_mode=DC + use_filter_intra + filter_mode. THREE distinct "mode" values result (all
+    // verified against dav1d): the coded y_mode SYMBOL = DC; the tx-type coefficient context = FilterModeToYMode[fm]
+    // (dav1d recon_tmpl.c: filter_mode_to_y_mode); the NEIGHBOUR mode context = DC (dav1d decode.c: FILTER_PRED->DC).
+    // -0.33% BD-rate (clean on 5/6 corpus images), byte-exact vs ffmpeg/libdav1d.
+    internal static bool UseFilterIntra = true;
 
     private static int SearchDeblock(byte[] seqObu, byte[] tileRef, int baseQIdx, int sbCols, int sbRows,
         int width, int height, bool monochrome, byte[] srcY, byte[]? srcU, byte[]? srcV, int cw, int ch)
@@ -454,7 +460,7 @@ internal static class Av1StillImageEncoder
         byte[] padU = PadPlane(u, cwIn, chIn, pw / 2, ph / 2);
         byte[] padV = PadPlane(v, cwIn, chIn, pw / 2, ph / 2);
         byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
-        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false);
+        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false, enableFilterIntra: UseFilterIntra);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
 
         // In-loop filter search (deblock first, then CDEF with the chosen level; see BuildMonochromeObus).
@@ -939,11 +945,22 @@ internal static class Av1StillImageEncoder
         int uvNsym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
         ref readonly var maxTDim = ref Av1Tables.TxfmDimensions[tx];
 
+        // Filter-intra: signalled for DC-eligible luma blocks <= 32x32 (max block dim <= 3 in log2-of-4units). The
+        // decoder reads use_filter_intra for EVERY such DC block, so the flag is emitted for all of them (0 when
+        // filter is not chosen). This is the emission gate; selection uses the same set here.
+        bool filterEligible = UseFilterIntra && Math.Max(Av1Tables.BlockDimensions[bs, 2], Av1Tables.BlockDimensions[bs, 3]) <= 3;
+
         // Luma: rate-distortion mode + tx-type decision (from reconstruction). Writes prediction into c.Pred.
         var rd = ChooseLeafRdCore(c.ReconY, c.W, c.Bw4, c.Bh4, c.Luma, c.W, bx4, by4, n, tx, c.DcDq, c.AcDq,
-            c.Cdf, c.AModeY[bxR], c.LModeY[byR], c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR), c.Pred, edgeFlags);
+            c.Cdf, c.AModeY[bxR], c.LModeY[byR], c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR), c.Pred, edgeFlags, filterEligible, bs);
         Av1IntraPredMode yMode = rd.Mode; int yDelta = rd.Delta;
         int[] yC = rd.Coeffs; Av1TxType yInv = rd.Inv; int yTxIdx = rd.Idx;
+        // A filter winner is coded as y_mode=DC; the Filter predictor uses (yMode==Filter, yDelta==filter mode).
+        // THREE mode values (all verified vs dav1d): coded y_mode SYMBOL + uv context + NEIGHBOUR mode ctx = DC
+        // (yModeSym); tx-type coefficient context = FilterModeToYMode (yModeNoFilt).
+        bool isFilter = yMode == Av1IntraPredMode.Filter;
+        int yModeSym = isFilter ? (int)Av1IntraPredMode.Dc : (int)yMode;
+        int yModeNoFilt = isFilter ? Av1Tables.FilterModeToYMode[yDelta] : (int)yMode;
 
         // Transform-size (tx_depth) search for luma. Only when residual is coded (depth-0 not all-zero) and the block
         // is fully inside the frame. depth 0 keeps rd's single block-size transform; depth>0 splits into a quadtree
@@ -953,10 +970,10 @@ internal static class Av1StillImageEncoder
         int depth = 0;
         if (maxDepth > 0)
         {
-            long best = EstimateTxDepthCostColor(c, bx4, by4, blk4, tx, yMode, yDelta);
+            long best = EstimateTxDepthCostColor(c, bx4, by4, blk4, tx, yMode, yDelta, yModeNoFilt);
             for (int d = 1; d <= maxDepth; d++)
             {
-                long cost = EstimateTxDepthCostColor(c, bx4, by4, blk4, ReduceTx(tx, d), yMode, yDelta);
+                long cost = EstimateTxDepthCostColor(c, bx4, by4, blk4, ReduceTx(tx, d), yMode, yDelta, yModeNoFilt);
                 if (cost < best) { best = cost; depth = d; }
             }
         }
@@ -1000,7 +1017,7 @@ internal static class Av1StillImageEncoder
                     {
                         var qfTx = new double[Av1Tables.Scans[lumaTx].Length];
                         Av1FwdTransform.ForwardQuantTyped(res, txN, c.DcDq, c.AcDq, qfTx.Length, FwdTypeForIdx(idx), qfTx);
-                        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, cf, qfTx,
+                        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, cf, qfTx,
                             c.DcDq, c.AcDq, skc, snc, idx, RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
                     }
                     lumaTxb.Add((cf, inv, idx, skc, snc, cbx4 * 4, cby4 * 4));
@@ -1127,11 +1144,13 @@ internal static class Av1StillImageEncoder
         c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), (uint)skip);
         int yAboveCtx = Av1Tables.IntraModeContext[c.AModeY[bxR]];
         int yLeftCtx = Av1Tables.IntraModeContext[c.LModeY[byR]];
-        c.Msac.EncodeSymbolAdapt(c.Cdf.GetKfYModeCdf(yAboveCtx, yLeftCtx), (int)yMode, 12);
+        // Filter blocks code the Y-mode SYMBOL as DC (real mode Filter is signalled by use_filter_intra below); the
+        // uv-mode context also sees DC. DC/Filter carry no angle_delta.
+        c.Msac.EncodeSymbolAdapt(c.Cdf.GetKfYModeCdf(yAboveCtx, yLeftCtx), yModeSym, 12);
         if (IsDirectional(yMode))
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
         int uvSym = useCfl ? (int)Av1IntraPredMode.ChromaFromLuma : 0;
-        c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), uvSym, uvNsym);
+        c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, yModeSym), uvSym, uvNsym);
         if (useCfl) EncodeCflAlphas(c.Msac, c.Cdf, alphaU, alphaV);
 
         // has_palette flags (this non-palette block emits 0). When screen-content tools are on the decoder reads
@@ -1147,6 +1166,14 @@ internal static class Av1StillImageEncoder
                 c.Msac.EncodeBoolAdapt(c.Cdf.GetPalYCdf(pSzCtx, pCtx), 0);
             }
             if (!useCfl) c.Msac.EncodeBoolAdapt(c.Cdf.GetPalUvCdf(0), 0);   // UvMode==DC
+        }
+
+        // filter_intra: for DC-coded eligible blocks (no palette — always true on this non-palette leaf), emit
+        // use_filter_intra + the filter mode, in the exact decode_b position (after palette flags, before tx_size).
+        if (filterEligible && (yMode == Av1IntraPredMode.Dc || isFilter))
+        {
+            c.Msac.EncodeBoolAdapt(c.Cdf.GetFilterIntraCdf((Av1BlockSize)bs), (uint)(isFilter ? 1 : 0));
+            if (isFilter) c.Msac.EncodeSymbolAdapt(c.Cdf.GetFilterIntraModeCdf(), yDelta, 4);
         }
 
         // tx_size (read_tx_size): coded for every intra block > 4x4 when tx_mode=SELECT — including skip blocks
@@ -1169,12 +1196,12 @@ internal static class Av1StillImageEncoder
             if (depth == 0)
             {
                 int ySign = Av1CoeffDecode.GetDcSignCtx(tx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
-                Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, yC, dcSignCtx: ySign, txTypeIdx: yTxIdx);
+                Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, 0, yModeNoFilt, yC, dcSignCtx: ySign, txTypeIdx: yTxIdx);
             }
             else
             {
                 foreach (var t in lumaTxb!)
-                    Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, t.Cf,
+                    Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, t.Cf,
                         skipCtx: t.SkipCtx, dcSignCtx: t.SignCtx, txTypeIdx: t.Idx);
             }
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
@@ -1207,8 +1234,10 @@ internal static class Av1StillImageEncoder
         sbyte txLw = (sbyte)lTDim.Lw, txLh = (sbyte)lTDim.Lh;
         // Luma LCoef context: for depth>0 it was already filled per-tx-block during reconstruction, so only fill it
         // here (with the single-transform cfY) at depth 0. Mode/skip/tx-size context is filled over the whole block.
-        for (int i = 0; i < yW && bxR + i < 32; i++) { if (depth == 0) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; c.APalSz[bxR + i] = 0; }
-        for (int j = 0; j < yH && byR + j < 32; j++) { if (depth == 0) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; c.LPalSz[byR + j] = 0; }
+        // Neighbour mode context stores DC for filter blocks (yModeSym), NOT FilterModeToYMode — matches the decoder
+        // (dav1d decode.c: FILTER_PRED -> DC_PRED). This is distinct from the tx-type context (yModeNoFilt) above.
+        for (int i = 0; i < yW && bxR + i < 32; i++) { if (depth == 0) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; c.APalSz[bxR + i] = 0; }
+        for (int j = 0; j < yH && byR + j < 32; j++) { if (depth == 0) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; c.LPalSz[byR + j] = 0; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; }
     }
@@ -1305,7 +1334,7 @@ internal static class Av1StillImageEncoder
     // decision: a pure rate estimate over-splits smooth content (splitting barely changes SSE but the estimate
     // undercounts the per-tx-block overhead), so the SSE term is essential to keep large blocks whole.
     private static long EstimateTxDepthCostColor(ColorPartCtx c, int bx4, int by4, int blk4, int tx,
-        Av1IntraPredMode yMode, int yDelta)
+        Av1IntraPredMode yMode, int yDelta, int yModeNoFilt)
     {
         ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
         int txN = tDim.W * 4, txW4 = tDim.W;
@@ -1327,14 +1356,14 @@ internal static class Av1StillImageEncoder
                 {
                     var qfTx = new double[Av1Tables.Scans[tx].Length];
                     Av1FwdTransform.ForwardQuantTyped(res, txN, c.DcDq, c.AcDq, qfTx.Length, FwdTypeForIdx(idx), qfTx);
-                    Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, cf, qfTx,
+                    Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, tx, 0, yModeNoFilt, cf, qfTx,
                         c.DcDq, c.AcDq, 0, 0, idx, RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
                 }
                 DequantAndReconstructPred(cf, tx, txN, c.DcDq, c.AcDq, predBuf, reconBuf, txN, 0, 0, inv);
                 for (int yy = 0; yy < txN; yy++)
                     for (int xx = 0; xx < txN; xx++)
                     { int d = reconBuf[yy * txN + xx] - c.Luma[(py + yy) * c.W + px + xx]; sse += (long)d * d; }
-                rate += Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, cf, 0, 0, idx) + 2;
+                rate += Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, tx, 0, yModeNoFilt, cf, 0, 0, idx) + 2;
             }
 
         return sse + (long)(lambda * rate);
@@ -1507,6 +1536,12 @@ internal static class Av1StillImageEncoder
         if (IsDirectional(yMode))
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
         c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), 0, uvNsym); // UV DC
+
+        // filter_intra: rect leaves are all <=32x32, so a DC rect block must emit use_filter_intra (the decoder reads
+        // it for every eligible DC block). This path never selects filter, so it always codes 0.
+        if (UseFilterIntra && yMode == Av1IntraPredMode.Dc &&
+            Math.Max(Av1Tables.BlockDimensions[lumaBs, 2], Av1Tables.BlockDimensions[lumaBs, 3]) <= 3)
+            c.Msac.EncodeBoolAdapt(c.Cdf.GetFilterIntraCdf((Av1BlockSize)lumaBs), 0);
 
         // tx_size: a rect leaf keeps its single rect transform (depth 0), but the symbol is still coded under
         // tx_mode=SELECT for every intra block > 4x4 — using the rect tx's own dimension table, matching the decoder.
@@ -2402,7 +2437,7 @@ internal static class Av1StillImageEncoder
         ChooseLeafRdCore(byte[] recon, int reconW, int bw4, int bh4, byte[] luma, int lumaW, int bx4, int by4,
             int n, int tx, int dcDq, int acDq, Av1CdfContext cdf, byte aboveMode, byte leftMode,
             ReadOnlySpan<byte> aboveLCoef, ReadOnlySpan<byte> leftLCoef, byte[] predOut,
-            Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
+            Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, bool filterEligible = false, int bs = 0)
     {
         int aboveCtx = Av1Tables.IntraModeContext[aboveMode];
         int leftCtx = Av1Tables.IntraModeContext[leftMode];
@@ -2444,6 +2479,9 @@ internal static class Av1StillImageEncoder
             int[] residual = ComputeResidualPred(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                 + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
+            // A DC-coded block also emits use_filter_intra=0 when filter is enabled — charge that bit for fairness.
+            if (filterEligible && mode == Av1IntraPredMode.Dc)
+                modeBits += Av1CoeffEncode.SymBits(cdf.GetFilterIntraCdf((Av1BlockSize)bs), 0);
             foreach (var (fwd, inv, idx) in n <= 16 ? IntraTxTypes : DctOnly)
             {
                 int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, fwd, qfCand);
@@ -2454,11 +2492,36 @@ internal static class Av1StillImageEncoder
             }
         }
 
+        // Filter-intra candidates: the 5 recursive-filter predictors, coded as y_mode=DC + use_filter_intra=1 +
+        // filter_mode. The tx-type coefficient context uses FilterModeToYMode (dav1d recon_tmpl); a filter winner
+        // sets Mode=Filter and the caller stores DC for the neighbour mode context (dav1d decode.c).
+        if (filterEligible)
+        {
+            Span<ushort> fiCdf = cdf.GetFilterIntraCdf((Av1BlockSize)bs);
+            double flagBits = Av1CoeffEncode.SymBits(fiCdf, 1) + Av1CoeffEncode.SymBits(ymCdf, (int)Av1IntraPredMode.Dc);
+            for (int fm = 0; fm < 5; fm++)
+            {
+                PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, Av1IntraPredMode.Filter, fm, predBuf, edgeFlags, intraFlags);
+                int[] residual = ComputeResidualPred(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
+                int ymnf = Av1Tables.FilterModeToYMode[fm];
+                double modeBits = flagBits + Av1CoeffEncode.SymBits(cdf.GetFilterIntraModeCdf(), fm);
+                foreach (var (fwd, inv, idx) in n <= 16 ? IntraTxTypes : DctOnly)
+                {
+                    int[] cf = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, fwd, qfCand);
+                    double rate = Av1CoeffEncode.EstimateCoefBits(cdf.Coef, cdf.Mode, tx, 0, ymnf, cf, 0, dcSignCtx, idx) + modeBits;
+                    long sse = ReconSseCand(cf, tx, n, dcDq, acDq, predBuf, luma, lumaW, bx4 * 4, by4 * 4, inv);
+                    double j = sse + rdLambda * rate;
+                    if (j < best) { best = j; bestCand = (Av1IntraPredMode.Filter, fm, cf, inv, idx); Array.Copy(predBuf, predOut, n * n); Array.Copy(qfCand, qfWin, scanLen); }
+                }
+            }
+        }
+
         // RDOQ-refine the winning coefficients (encoder-only; decoder reconstructs from these same levels).
         if (bestCand.Coeffs != null)
         {
             double lambda = RdoqLambdaScale * RdLambdaK * acDq * acDq;
-            Av1CoeffEncode.RdoqOptimize(cdf.Coef, cdf.Mode, tx, 0, (int)bestCand.Mode, bestCand.Coeffs, qfWin,
+            int rdoqMode = bestCand.Mode == Av1IntraPredMode.Filter ? Av1Tables.FilterModeToYMode[bestCand.Delta] : (int)bestCand.Mode;
+            Av1CoeffEncode.RdoqOptimize(cdf.Coef, cdf.Mode, tx, 0, rdoqMode, bestCand.Coeffs, qfWin,
                 dcDq, acDq, 0, dcSignCtx, bestCand.Idx, lambda);
         }
 
