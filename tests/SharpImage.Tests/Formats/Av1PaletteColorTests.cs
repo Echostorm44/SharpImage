@@ -97,6 +97,52 @@ public sealed class Av1PaletteColorTests
         await Assert.That(outC).IsEquivalentTo(colors);
     }
 
+    // Encode a palette index map, decode it back through DecodePaletteIndices, and compare the width x height
+    // region. Uses fresh default CDF contexts on both sides (they adapt identically walking the same wavefront).
+    private static byte[] RoundTripIndices(byte[] idxMap, int palSize, int width, int height, int bw4, int bh4)
+    {
+        int stride = bw4 * 4;
+        var w = new Av1MsacWriter();
+        Av1CoeffEncode.EncodePaletteIndices(w, DefaultCdf().Mode, idxMap, palSize, width, height, bw4, bh4, isLuma: true);
+        byte[] bytes = w.Finish();
+
+        var t = new Av1TaskContext();
+        var msac = new Av1Msac(bytes, disableCdfUpdate: false);
+        Av1CoeffDecode.DecodePaletteIndices(ref msac, DefaultCdf().Mode, t, palSize, width, height, bw4, bh4, isLuma: true);
+        var outMap = new byte[width * height];
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                outMap[y * width + x] = t.PalIdxY[y * stride + x];
+        return outMap;
+    }
+
+    [Test]
+    public async Task IndexMap_RoundTrips()
+    {
+        var rng = new Random(999);
+        // (bw4, bh4, width, height): full 16x16, clipped width, clipped height, 8x8, 32x32.
+        var shapes = new (int bw4, int bh4, int w, int h)[]
+        {
+            (4, 4, 16, 16), (4, 4, 12, 16), (4, 4, 16, 10), (2, 2, 8, 8), (8, 8, 32, 32), (4, 2, 16, 8),
+        };
+        foreach (var (bw4, bh4, width, height) in shapes)
+            for (int palSize = 2; palSize <= 8; palSize++)
+            {
+                int stride = bw4 * 4;
+                var idx = new byte[stride * bh4 * 4];
+                for (int y = 0; y < height; y++)
+                    for (int x = 0; x < width; x++)
+                        idx[y * stride + x] = (byte)rng.Next(palSize);
+                var expected = new byte[width * height];
+                for (int y = 0; y < height; y++)
+                    for (int x = 0; x < width; x++)
+                        expected[y * width + x] = idx[y * stride + x];
+
+                var outMap = RoundTripIndices(idx, palSize, width, height, bw4, bh4);
+                await Assert.That(outMap).IsEquivalentTo(expected);
+            }
+    }
+
     [Test]
     public async Task Random_RoundTrips()
     {

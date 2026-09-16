@@ -207,6 +207,22 @@ internal sealed class Av1MsacWriter
         }
     }
 
+    /// <summary>Inverse of Av1Msac.DecodeUniform: codes a value in [0,n) with a truncated-binary scheme —
+    /// l = floor(log2 n)+1 bits, the first m = 2^l - n values in l-1 bits, the rest as (value+m) in l bits.</summary>
+    public void EncodeUniform(uint value, uint n)
+    {
+        int l = 32 - System.Numerics.BitOperations.LeadingZeroCount(n);   // floor(log2 n)+1
+        uint m = (1u << l) - n;
+        if (value < m)
+        {
+            EncodeLiteral(value, l - 1);
+        }
+        else
+        {
+            EncodeLiteral(value + m, l);
+        }
+    }
+
     /// <summary>Flushes the coder and returns the finished byte stream (carries resolved).</summary>
     public byte[] Finish()
     {

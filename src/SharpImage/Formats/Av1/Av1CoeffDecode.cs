@@ -1608,7 +1608,7 @@ public static class Av1CoeffDecode
     /// Build the color order array based on spatial neighbor context.
     /// Ported from order_palette() in dav1d decode.c.
     /// </summary>
-    private static int BuildColorOrder(Span<byte> order, int palSize, int l, int t, int tl)
+    internal static int BuildColorOrder(Span<byte> order, int palSize, int l, int t, int tl)
     {
         int ctx;
         int oIdx = 0;

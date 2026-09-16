@@ -548,6 +548,46 @@ internal static class Av1CoeffEncode
         }
     }
 
+    /// <summary>Encodes a palette colour-index map — the exact inverse of DecodePaletteIndices. `idxMap` holds the
+    /// per-pixel palette indices (row-major, stride = blockWidth4*4, same buffer layout the decoder writes). The
+    /// top-left is coded with a uniform distribution; every other pixel is coded on the wavefront diagonals: its
+    /// neighbour context selects a colour ORDER (BuildColorOrder, shared with the decoder) and we emit the RANK of
+    /// the pixel's index within that order through the adaptive ColorMap CDF. The CDF adapts in lockstep with the
+    /// decoder because both walk the pixels in identical order with identical symbols.</summary>
+    public static void EncodePaletteIndices(Av1MsacWriter w, Av1CdfModeContext modeCdf, byte[] idxMap,
+        int palSize, int width, int height, int blockWidth4, int blockHeight4, bool isLuma)
+    {
+        if (palSize <= 1) return;
+        int stride = blockWidth4 * 4;
+        int plane = isLuma ? 0 : 1;
+
+        w.EncodeUniform(idxMap[0], (uint)palSize);   // top-left, uniform
+
+        Span<byte> order = stackalloc byte[8];
+        int maxDiag = 4 * (blockWidth4 + blockHeight4) - 1;
+        for (int diag = 1; diag < maxDiag; diag++)
+        {
+            int first = Math.Min(diag, width - 1);
+            int last = Math.Max(0, diag - height + 1);
+            for (int x = first; x >= last; x--)
+            {
+                int y = diag - x;
+                int idx = y * stride + x;
+                int l = x > 0 ? idxMap[y * stride + x - 1] : 0xFF;
+                int tt = y > 0 ? idxMap[(y - 1) * stride + x] : 0xFF;
+                int tl = (x > 0 && y > 0) ? idxMap[(y - 1) * stride + x - 1] : 0xFF;
+
+                int ctx = Av1CoeffDecode.BuildColorOrder(order, palSize, l, tt, tl);
+                int target = idxMap[idx];
+                int colorIdx = 0;
+                while (colorIdx < palSize && order[colorIdx] != target) colorIdx++;
+                // order is a full permutation of [0,palSize), so target is always found.
+                int cdfIdx = plane * 35 + (palSize - 2) * 5 + ctx;
+                w.EncodeSymbolAdapt(modeCdf.ColorMap[cdfIdx], colorIdx, palSize - 1);
+            }
+        }
+    }
+
     private static bool Contains(ushort[] colors, int n, ushort v)
     { for (int i = 0; i < n; i++) if (colors[i] == v) return true; return false; }
 
