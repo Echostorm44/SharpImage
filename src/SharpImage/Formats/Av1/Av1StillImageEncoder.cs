@@ -1964,7 +1964,11 @@ internal static class Av1StillImageEncoder
     // joint optimum): 0.004->0.003 with RdoqLambdaScale 20->25 adds a further -1.15% BD-rate (clean across the
     // corpus). Note DeadzoneBias then wants to STAY at 0.04 — with tx_depth on, dropping it to 0.02 regresses all
     // six images (+3.7%; many small transforms over-keep coefficients at a low deadzone).
-    internal static double RdLambdaK = 0.003;
+    // Re-swept AGAIN 2026-09-16 after tx/mode selection became full RD (D+λR, which added a λ=RdLambdaK·Q² term to
+    // the candidate decision, so RdLambdaK now serves triple duty: SATD prescreen √λ, candidate selection λ, and
+    // RDOQ scale·λ): 0.003->0.002 adds -0.39% BD-rate (piechart/mountains/logo win; granite +1.6% but we already
+    // beat libaom there by 2.6%). RdoqLambdaScale stays 25 (dropping to 20 regressed +0.64%).
+    internal static double RdLambdaK = 0.002;
 
     // Extra multiplier on the RDOQ lambda relative to the partition lambda. The partition lambda is tuned for
     // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
