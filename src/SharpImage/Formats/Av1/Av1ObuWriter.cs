@@ -156,7 +156,7 @@ internal static class Av1ObuWriter
     /// superblocks, coded as a single tile (uniform spacing, log2 tile dims 0). <paramref name="monochrome"/>
     /// selects whether the U/V quant-delta bits are emitted. <paramref name="txModeSelect"/> enables per-block
     /// tx-size signalling (TX_MODE_SELECT) — the encoder must then code a tx_depth symbol per block.</summary>
-    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef)
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef, int lfLevel = 0)
     {
         if (baseQIdx <= 0 || baseQIdx > 255)
         {
@@ -213,10 +213,17 @@ internal static class Av1ObuWriter
         // delta_q_params (base_q_idx != 0)
         w.PutBool(false);         // delta_q_present = 0
 
-        // loop_filter_params (not lossless, not intrabc)
-        w.PutBits(0, 6);          // loop_filter_level[0] = 0
-        w.PutBits(0, 6);          // loop_filter_level[1] = 0
-        // mono ⇒ no U/V levels
+        // loop_filter_params (not lossless, not intrabc). A single deblocking level is applied to both Y edges
+        // (and, for colour, to U/V); level 0 = filter off. Deblocking is post-reconstruction and does not feed
+        // intra prediction, so signalling a level never changes the coded tile — only the decoded output.
+        uint lf = (uint)Math.Clamp(lfLevel, 0, 63);
+        w.PutBits(lf, 6);         // loop_filter_level[0]
+        w.PutBits(lf, 6);         // loop_filter_level[1]
+        if (lf != 0 && !monochrome)
+        {
+            w.PutBits(lf, 6);     // loop_filter_level[2] (U) — read only when level[0]|level[1] and NumPlanes>1
+            w.PutBits(lf, 6);     // loop_filter_level[3] (V)
+        }
         w.PutBits(0, 3);          // loop_filter_sharpness = 0
         w.PutBool(false);         // loop_filter_delta_enabled = 0
 

@@ -302,16 +302,18 @@ internal static class Av1StillImageEncoder
         // each and keeping the one with the lowest reconstruction SSE vs source (always incl. the no-op, so it can
         // never hurt). The decoder applies CDEF as an output filter; intra prediction used pre-CDEF recon.
         byte[] srcCopy = luma.ToArray();
-        Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
+        int lfLevel = SearchDeblock(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
             monochrome: true, srcCopy, null, null, 0, 0);
-        byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: true, tile, best);
+        Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
+            monochrome: true, srcCopy, null, null, 0, 0, lfLevel);
+        byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: true, tile, best, lfLevel);
         return (seqObu, frameObu);
     }
 
     // Assembles the OBU_FRAME (frame header with the given CDEF params + tile) for a multi-SB key frame.
-    private static byte[] BuildFrameObu(int baseQIdx, int sbCols, int sbRows, bool monochrome, byte[] tile, Av1ObuWriter.CdefParams cdef)
+    private static byte[] BuildFrameObu(int baseQIdx, int sbCols, int sbRows, bool monochrome, byte[] tile, Av1ObuWriter.CdefParams cdef, int lfLevel = 0)
     {
-        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome, txModeSelect: monochrome || (!monochrome && UseColorTxDepth), cdef);
+        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome, txModeSelect: monochrome || (!monochrome && UseColorTxDepth), cdef, lfLevel);
         var framePayload = new byte[frameHdr.Length + tile.Length];
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
@@ -322,7 +324,7 @@ internal static class Av1StillImageEncoder
     // candidate through our own decoder (which matches libdav1d's CDEF), comparing the decoded planes to the
     // source. srcY is width*height; srcU/srcV (cw*ch) are only used when !monochrome.
     private static Av1ObuWriter.CdefParams SearchCdef(byte[] seqObu, byte[] tileRef, int baseQIdx, int sbCols, int sbRows,
-        int width, int height, bool monochrome, byte[] srcY, byte[]? srcU, byte[]? srcV, int cw, int ch)
+        int width, int height, bool monochrome, byte[] srcY, byte[]? srcU, byte[]? srcV, int cw, int ch, int lfLevel = 0)
     {
         int damping = Math.Clamp(3 + (baseQIdx >> 6), 3, 6);
         long BestSse = long.MaxValue;
@@ -331,7 +333,7 @@ internal static class Av1StillImageEncoder
         long Evaluate(int yLvl, int uvLvl)
         {
             var cdef = new Av1ObuWriter.CdefParams(damping, 0, new[] { (byte)yLvl }, new[] { (byte)uvLvl });
-            byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome, tileRef, cdef);
+            byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome, tileRef, cdef, lfLevel);
             var tu = new byte[seqObu.Length + frameObu.Length];
             seqObu.CopyTo(tu, 0);
             frameObu.CopyTo(tu, seqObu.Length);
@@ -367,6 +369,51 @@ internal static class Av1StillImageEncoder
         if (sse < BestSse) { BestSse = sse; bestParams = new Av1ObuWriter.CdefParams(damping, 0, new[] { (byte)yLvl }, new[] { (byte)uvLvl }); }
 
         return bestParams;
+    }
+
+    // Searches a single global deblocking loop_filter_level that minimises reconstruction SSE, the same
+    // decode-based way as SearchCdef. Deblocking is post-reconstruction (it does not feed intra prediction), so
+    // the coded tile is unchanged across candidates — only the frame-header level differs. Searched with CDEF off
+    // (SearchCdef then runs with the chosen level), mirroring libaom's deblock-before-CDEF ordering. Returns the
+    // level (0 = off) that decoded closest to the source, so it can never regress vs no deblocking.
+    internal static bool UseDeblockSearch = true;   // toggle the deblock loop_filter_level RD search (A/B)
+
+    private static int SearchDeblock(byte[] seqObu, byte[] tileRef, int baseQIdx, int sbCols, int sbRows,
+        int width, int height, bool monochrome, byte[] srcY, byte[]? srcU, byte[]? srcV, int cw, int ch)
+    {
+        // Deblocking's still-image payoff is largest at coarse quantisation; skip the extra decodes when tiny.
+        if (!UseDeblockSearch || (long)width * height > 512 * 512) return 0;
+
+        long Evaluate(int lvl)
+        {
+            byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome, tileRef, Av1ObuWriter.CdefParams.None, lvl);
+            var tu = new byte[seqObu.Length + frameObu.Length];
+            seqObu.CopyTo(tu, 0);
+            frameObu.CopyTo(tu, seqObu.Length);
+            var dec = new Av1Decoder();
+            using var yuv = dec.Decode(tu, 0, isKeyframe: true);
+            if (yuv == null) return long.MaxValue;
+            long sse = PlaneSse(yuv.YPlane.Span, yuv.YStride, srcY, width, height);
+            if (!monochrome && srcU != null && srcV != null)
+            {
+                sse += PlaneSse(yuv.UPlane.Span, yuv.UStride, srcU, cw, ch);
+                sse += PlaneSse(yuv.VPlane.Span, yuv.VStride, srcV, cw, ch);
+            }
+            return sse;
+        }
+
+        int bestLvl = 0;
+        long bestSse = Evaluate(0);   // no deblocking baseline
+        // Candidate levels around a q-scaled guess (AV1 levels are 0..63; deblock strength grows with q).
+        int guess = Math.Clamp(baseQIdx / 8, 1, 40);
+        Span<int> cands = stackalloc int[] { guess / 2, guess, Math.Min(guess * 3 / 2, 63) };
+        foreach (int lvl in cands)
+        {
+            if (lvl <= 0) continue;
+            long sse = Evaluate(lvl);
+            if (sse < bestSse) { bestSse = sse; bestLvl = lvl; }
+        }
+        return bestLvl;
     }
 
     private static long PlaneSse(ReadOnlySpan<byte> dec, int stride, byte[] src, int w, int h)
@@ -405,11 +452,13 @@ internal static class Av1StillImageEncoder
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
 
-        // CDEF strength search on Y + chroma (see BuildMonochromeObus).
+        // In-loop filter search (deblock first, then CDEF with the chosen level; see BuildMonochromeObus).
         byte[] srcY = luma.ToArray(), srcU = u.ToArray(), srcV = v.ToArray();
-        Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
+        int lfLevel = SearchDeblock(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
             monochrome: false, srcY, srcU, srcV, cwIn, chIn);
-        byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: false, tile, best);
+        Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
+            monochrome: false, srcY, srcU, srcV, cwIn, chIn, lfLevel);
+        byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: false, tile, best, lfLevel);
         return (seqObu, frameObu);
     }
 
