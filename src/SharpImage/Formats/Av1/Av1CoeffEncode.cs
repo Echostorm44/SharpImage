@@ -466,19 +466,45 @@ internal static class Av1CoeffEncode
     public static void EncodeLumaPaletteColors(Av1MsacWriter w, Av1TaskContext t, ref Av1Block b,
         ushort[] colors, int palSz, int bx4, int by4, int bitDepth)
     {
+        // Rebuild the same left/above neighbour cache the decoder reads from the task context, then delegate to
+        // the core; finally update the task-context prediction state (used by the standalone round-trip test).
+        int bi4 = by4 < 32 ? by4 : 31, bj4 = bx4 < 32 ? bx4 : 31;
+        int leftPalSz = t.Left.PalSz[bi4]; if (leftPalSz > 8) leftPalSz = 0;
+        int abovePalSz = ((by4 & 15) != 0) ? t.Above.PalSz[bj4] : 0; if (abovePalSz > 8) abovePalSz = 0;
+        Span<ushort> lCol = stackalloc ushort[8]; Span<ushort> aCol = stackalloc ushort[8];
+        for (int ci = 0; ci < leftPalSz; ci++) lCol[ci] = t.PalPrevY[1, bi4, ci];
+        for (int ci = 0; ci < abovePalSz; ci++) aCol[ci] = t.PalPrevY[0, bj4, ci];
+
+        EncodeLumaPaletteColorsCore(w, colors, palSz, lCol, leftPalSz, aCol, abovePalSz, bitDepth);
+
+        int bw = Av1Tables.BlockDimensions[b.BlockSize, 0], bh = Av1Tables.BlockDimensions[b.BlockSize, 1];
+        for (int ci = 0; ci < palSz; ci++) t.PalColorsY[ci] = colors[ci];
+        for (int dx = 0; dx < bw && bj4 + dx < 32; dx++)
+        {
+            for (int ci = 0; ci < palSz; ci++) t.PalPrevY[0, bj4 + dx, ci] = colors[ci];
+            t.PalPrevSz[0, bj4 + dx] = (byte)palSz;
+        }
+        for (int dy = 0; dy < bh && bi4 + dy < 32; dy++)
+        {
+            for (int ci = 0; ci < palSz; ci++) t.PalPrevY[1, bi4 + dy, ci] = colors[ci];
+            t.PalPrevSz[1, bi4 + dy] = (byte)palSz;
+        }
+    }
+
+    /// <summary>Core of the luma palette colour coder: given the block's palette and its already-resolved left and
+    /// above neighbour palettes (colours + sizes; the caller applies the 64px-row above-cache gating), it merges
+    /// the sorted/dedup cache, emits cache-selection bits, and delta-codes the new colours. Neighbour-state
+    /// storage is the caller's responsibility (task-context test vs. encoder block loop store differently).</summary>
+    public static void EncodeLumaPaletteColorsCore(Av1MsacWriter w, ushort[] colors, int palSz,
+        ReadOnlySpan<ushort> leftColors, int leftPalSz, ReadOnlySpan<ushort> aboveColors, int abovePalSz, int bitDepth)
+    {
         if (palSz < 2 || palSz > 8) throw new ArgumentOutOfRangeException(nameof(palSz));
         int bpc = bitDepth, maxVal = (1 << bpc) - 1;
 
-        // --- Rebuild the same left/above cache the decoder builds. ---
         Span<ushort> lCache = stackalloc ushort[8]; int lCacheSz = 0;
-        int bi4 = by4 < 32 ? by4 : 31;
-        int leftPalSz = t.Left.PalSz[bi4]; if (leftPalSz > 8) leftPalSz = 0;
-        for (int ci = 0; ci < leftPalSz; ci++) lCache[lCacheSz++] = t.PalPrevY[1, bi4, ci];
-
+        for (int ci = 0; ci < leftPalSz && ci < 8; ci++) lCache[lCacheSz++] = leftColors[ci];
         Span<ushort> aCache = stackalloc ushort[8]; int aCacheSz = 0;
-        int bj4 = bx4 < 32 ? bx4 : 31;
-        int abovePalSz = ((by4 & 15) != 0) ? t.Above.PalSz[bj4] : 0; if (abovePalSz > 8) abovePalSz = 0;
-        for (int ci = 0; ci < abovePalSz; ci++) aCache[aCacheSz++] = t.PalPrevY[0, bj4, ci];
+        for (int ci = 0; ci < abovePalSz && ci < 8; ci++) aCache[aCacheSz++] = aboveColors[ci];
 
         Span<ushort> cache = stackalloc ushort[16]; int nCache = 0;
         int li = 0, ai = 0;
@@ -530,22 +556,6 @@ internal static class Av1CoeffEncode
             }
         }
 
-        // --- Update palette-prediction neighbour state (mirror DecodeLumaPalette's store). ---
-        for (int ci = 0; ci < palSz; ci++) t.PalColorsY[ci] = colors[ci];
-        int bw = Av1Tables.BlockDimensions[b.BlockSize, 0];
-        int bh = Av1Tables.BlockDimensions[b.BlockSize, 1];
-        for (int dx = 0; dx < bw && bj4 + dx < 32; dx++)
-        {
-            int col = bj4 + dx;
-            for (int ci = 0; ci < palSz; ci++) t.PalPrevY[0, col, ci] = colors[ci];
-            t.PalPrevSz[0, col] = (byte)palSz;
-        }
-        for (int dy = 0; dy < bh && bi4 + dy < 32; dy++)
-        {
-            int row = bi4 + dy;
-            for (int ci = 0; ci < palSz; ci++) t.PalPrevY[1, row, ci] = colors[ci];
-            t.PalPrevSz[1, row] = (byte)palSz;
-        }
     }
 
     /// <summary>Encodes a palette colour-index map — the exact inverse of DecodePaletteIndices. `idxMap` holds the

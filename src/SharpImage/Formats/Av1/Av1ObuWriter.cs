@@ -156,7 +156,7 @@ internal static class Av1ObuWriter
     /// superblocks, coded as a single tile (uniform spacing, log2 tile dims 0). <paramref name="monochrome"/>
     /// selects whether the U/V quant-delta bits are emitted. <paramref name="txModeSelect"/> enables per-block
     /// tx-size signalling (TX_MODE_SELECT) — the encoder must then code a tx_depth symbol per block.</summary>
-    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef, int lfLevel = 0)
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef, int lfLevel = 0, bool screenContentTools = false)
     {
         if (baseQIdx <= 0 || baseQIdx > 255)
         {
@@ -168,14 +168,18 @@ internal static class Av1ObuWriter
         // reduced_still_picture_header ⇒ show_existing_frame / frame_type / show_frame / error_resilient are all
         // implied; nothing is written until here.
         w.PutBool(false);         // disable_cdf_update = 0 (adaptive CDFs; disable_frame_end_update_cdf inferred 1 in reduced still picture)
-        w.PutBool(false);         // allow_screen_content_tools = 0 (ScreenContentTools is Adaptive)
-        // force_integer_mv implied (intra); frame_id absent; frame_size_override absent (reduced still).
+        w.PutBool(screenContentTools);  // allow_screen_content_tools (ScreenContentTools is Adaptive)
+        if (screenContentTools)
+            w.PutBool(false);     // force_integer_mv: seq force_integer_mv is Adaptive so the bit is read even
+                                  // for intra (the decoder then overrides the value to 1); write 0.
+        // frame_id absent; frame_size_override absent (reduced still).
         // primary_ref_frame implied NONE (intra); decoder model absent.
         // refresh_frame_flags = 0xFF implied (key + show_frame).
 
         // read_frame_size (useRef=false): frame_size_override=0 ⇒ dims from seq; superres off ⇒ no bit.
         w.PutBool(false);         // have_render_size = 0 (render size = frame size)
-        // allow_intra_bc skipped (screen content tools off).
+        if (screenContentTools)
+            w.PutBool(false);     // allow_intra_bc = 0 (read for intra when screen tools on & !superres)
         // refresh_context skipped (reduced still).
 
         // tile_info: a single tile (uniform spacing, log2 dims 0). The uniform loop reads an "increment" bit
