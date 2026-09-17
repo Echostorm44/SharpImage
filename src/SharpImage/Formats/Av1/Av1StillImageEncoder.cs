@@ -1511,9 +1511,31 @@ internal static class Av1StillImageEncoder
         double rectLambda = RdLambdaK * c.AcDq * c.AcDq;   // true RD: D + λ·rate (rect edges want IDTX; DctDct-only misranks)
         // The tx-type symbol is coded for rect luma only when max tx dim <= 16 (16x8/8x16); 32x16/16x32 force DctDct.
         var txSet = Av1Tables.TxfmDimensions[lumaTx].Max <= (byte)Av1TxSize.Tx16x16 ? IntraTxTypes : DctOnly;
-        foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
+        int intraFlags = IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]);
+
+        // Prescreen modes by cheap SATD (as the square leaf does) and RD-evaluate only the best few — the full
+        // tx-type search is the hot loop; SATD tracks coded cost closely enough that the top handful holds the winner.
+        Span<int> topIdx = stackalloc int[RdModeCandidates];
+        Span<long> topCost = stackalloc long[RdModeCandidates];
+        topCost.Fill(long.MaxValue);
+        double satdLambda = Math.Sqrt(RdLambdaK) * c.AcDq;
+        for (int ci = 0; ci < CandidateModes.Length; ci++)
         {
-            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]));
+            (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
+            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, intraFlags);
+            long satd = Satd8x8Rect(c.Luma, c.W, bx, by, pred, w, h);
+            long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
+                + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
+            long cost = satd + mb;
+            for (int k = 0; k < RdModeCandidates; k++)
+                if (cost < topCost[k]) { for (int j = RdModeCandidates - 1; j > k; j--) { topCost[j] = topCost[j - 1]; topIdx[j] = topIdx[j - 1]; } topCost[k] = cost; topIdx[k] = ci; break; }
+        }
+
+        for (int t = 0; t < RdModeCandidates; t++)
+        {
+            if (topCost[t] == long.MaxValue) break;
+            (Av1IntraPredMode mode, int delta) = CandidateModes[topIdx[t]];
+            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, intraFlags);
             for (int yy = 0; yy < h; yy++)
                 for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
@@ -2215,6 +2237,23 @@ internal static class Av1StillImageEncoder
             }
         }
 
+        return total;
+    }
+
+    // SATD over a w x h rectangular block (pred stride = w). Rect leaf sizes are all multiples of 8, so the 8x8
+    // Hadamard tiling is exact. Used to prescreen rect intra modes cheaply before the full RD tx-type search.
+    private static long Satd8x8Rect(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] pred, int w, int h)
+    {
+        long total = 0;
+        var d = new int[64];
+        for (int by = 0; by < h; by += 8)
+            for (int bx = 0; bx < w; bx += 8)
+            {
+                for (int y = 0; y < 8; y++)
+                    for (int x = 0; x < 8; x++)
+                        d[y * 8 + x] = src[(srcBy + by + y) * srcW + (srcBx + bx + x)] - pred[(by + y) * w + (bx + x)];
+                total += Hadamard8x8Abs(d);
+            }
         return total;
     }
 
