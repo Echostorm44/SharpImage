@@ -1680,29 +1680,88 @@ internal static class Av1StillImageEncoder
         int dcV = DcPredictRect(c.ReconV, c.Cw, cbx, cby, cw, ch);
         int[] uC = ForwardResidualRectDc(c.U, c.Cw, cbx, cby, cw, ch, dcU, chromaTx, c.DcDq, c.AcDq, cScan);
         int[] vC = ForwardResidualRectDc(c.V, c.Cw, cbx, cby, cw, ch, dcV, chromaTx, c.DcDq, c.AcDq, cScan);
-        // Chroma-from-luma vs DC (RD): CfL cuts chroma residual on correlated content — the profiled chroma-coef gap
-        // (rect leaves were DC-only). CfL AC comes from this block's just-reconstructed luma.
-        bool useCfl = false; int alphaU = 0, alphaV = 0; byte[]? cflU = null, cflV = null;
+        double clam0 = RdLambdaK * c.AcDq * c.AcDq;
+        var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode);
+        var dcuP = new byte[cw * ch]; Array.Fill(dcuP, (byte)Math.Clamp(dcU, 0, 255));
+        var dcvP = new byte[cw * ch]; Array.Fill(dcvP, (byte)Math.Clamp(dcV, 0, 255));
+
+        int uvMode = 0, uvDelta = 0; bool useCfl = false;
+        byte[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
+        double bestJ = ReconSseCandRect(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcuP, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
+                     + ReconSseCandRect(vC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcvP, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
+                     + clam0 * (CoeffCost(uC) + CoeffCost(vC) + Av1CoeffEncode.SymBits(uvModeCdf, 0));
+
+        // Directional/Smooth/Paeth UV chroma modes (see EncodeLeafBlockColor): rect chroma is a single tx block too,
+        // so the same edge derivation + UV-mode-derived tx-type (TxTypeFromUvMode) applies.
+        if (UseUvModeSearch)
+        {
+            var chromaEdge =
+                ((edgeFlags & Av1EdgeFlags.I420TopHasRight) != 0 ? Av1EdgeFlags.I444TopHasRight : 0) |
+                ((edgeFlags & Av1EdgeFlags.I420LeftHasBottom) != 0 ? Av1EdgeFlags.I444LeftHasBottom : 0);
+            int cIntraFlags = IntraEdgeFlags(c.AModeUv[cxR], c.LModeUv[cyR]);
+            int cbw4 = c.Bw4 >> 1, cbh4 = c.Bh4 >> 1, cbx4 = bx4 >> 1, cby4 = by4 >> 1;
+            int bDimW = Av1Tables.BlockDimensions[lumaBs, 2], bDimH = Av1Tables.BlockDimensions[lumaBs, 3];
+            bool uvAngleOk = bDimW + bDimH >= 2;
+            var pu = new byte[cw * ch]; var pv = new byte[cw * ch];
+            Span<int> uvTopIdx = stackalloc int[RdUvCandidates];
+            Span<long> uvTopCost = stackalloc long[RdUvCandidates];
+            uvTopCost.Fill(long.MaxValue);
+            for (int ci = 0; ci < CandidateModes.Length; ci++)
+            {
+                (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
+                if (mode == Av1IntraPredMode.Dc) continue;
+                if (delta != 0 && !uvAngleOk) continue;
+                PredictIntraRect(c.ReconU, c.Cw, cbw4, cbh4, cbx4, cby4, cw, ch, mode, delta, pu, chromaEdge, cIntraFlags);
+                long sad = 0;
+                for (int yy = 0; yy < ch; yy++) { int r = (cby + yy) * c.Cw + cbx; for (int xx = 0; xx < cw; xx++) sad += Math.Abs(c.U[r + xx] - pu[yy * cw + xx]); }
+                for (int k = 0; k < RdUvCandidates; k++)
+                    if (sad < uvTopCost[k]) { for (int j = RdUvCandidates - 1; j > k; j--) { uvTopCost[j] = uvTopCost[j - 1]; uvTopIdx[j] = uvTopIdx[j - 1]; } uvTopCost[k] = sad; uvTopIdx[k] = ci; break; }
+            }
+            for (int t = 0; t < RdUvCandidates; t++)
+            {
+                if (uvTopCost[t] == long.MaxValue) break;
+                (Av1IntraPredMode mode, int delta) = CandidateModes[uvTopIdx[t]];
+                PredictIntraRect(c.ReconU, c.Cw, cbw4, cbh4, cbx4, cby4, cw, ch, mode, delta, pu, chromaEdge, cIntraFlags);
+                PredictIntraRect(c.ReconV, c.Cw, cbw4, cbh4, cbx4, cby4, cw, ch, mode, delta, pv, chromaEdge, cIntraFlags);
+                var uvTx = (Av1TxType)Av1Tables.TxTypeFromUvMode[(int)mode];
+                var uvFwd = FwdTypeForTxType(uvTx);
+                int[] uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, pu, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, null, uvFwd);
+                int[] vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, pv, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, null, uvFwd);
+                double modeBits = Av1CoeffEncode.SymBits(uvModeCdf, (int)mode)
+                    + (IsDirectional(mode) && uvAngleOk ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
+                double j = ReconSseCandRect(uu, chromaTx, cw, ch, c.DcDq, c.AcDq, pu, c.U, c.Cw, cbx, cby, uvTx)
+                         + ReconSseCandRect(vv, chromaTx, cw, ch, c.DcDq, c.AcDq, pv, c.V, c.Cw, cbx, cby, uvTx)
+                         + clam0 * (CoeffCost(uu) + CoeffCost(vv) + modeBits);
+                if (j < bestJ)
+                {
+                    bestJ = j; uvMode = (int)mode; uvDelta = delta; useCfl = false;
+                    uC = uu; vC = vv; predU = (byte[])pu.Clone(); predV = (byte[])pv.Clone();
+                }
+            }
+        }
+
+        // Chroma-from-luma vs the running best.
         if (cflAllowed && UseCfl)
         {
             var acc = new short[cw * ch];
             ComputeCflAcEncRect(c.ReconY, c.W, bx, by, cw, ch, acc);
-            alphaU = BestCflAlphaRect(c.U, c.Cw, cbx, cby, cw, ch, dcU, acc);
-            alphaV = BestCflAlphaRect(c.V, c.Cw, cbx, cby, cw, ch, dcV, acc);
-            cflU = BuildCflPredRect(dcU, acc, cw, ch, alphaU);
-            cflV = BuildCflPredRect(dcV, acc, cw, ch, alphaV);
-            int[] uCc = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cflU, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
-            int[] vCc = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cflV, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
-            var dcuP = new byte[cw * ch]; Array.Fill(dcuP, (byte)Math.Clamp(dcU, 0, 255));
-            var dcvP = new byte[cw * ch]; Array.Fill(dcvP, (byte)Math.Clamp(dcV, 0, 255));
-            double lam = RdLambdaK * c.AcDq * c.AcDq;
-            double dcJ = ReconSseCandRect(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcuP, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
-                       + ReconSseCandRect(vC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcvP, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
-                       + lam * (CoeffCost(uC) + CoeffCost(vC));
-            double cflJ = ReconSseCandRect(uCc, chromaTx, cw, ch, c.DcDq, c.AcDq, cflU, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
-                        + ReconSseCandRect(vCc, chromaTx, cw, ch, c.DcDq, c.AcDq, cflV, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
-                        + lam * (CoeffCost(uCc) + CoeffCost(vCc) + 8 + (alphaU != 0 ? 5 : 0) + (alphaV != 0 ? 5 : 0));
-            if (cflJ < dcJ) { useCfl = true; uC = uCc; vC = vCc; }
+            int aU = BestCflAlphaRect(c.U, c.Cw, cbx, cby, cw, ch, dcU, acc);
+            int aV = BestCflAlphaRect(c.V, c.Cw, cbx, cby, cw, ch, dcV, acc);
+            if (aU != 0 || aV != 0)
+            {
+                var pcflU = BuildCflPredRect(dcU, acc, cw, ch, aU);
+                var pcflV = BuildCflPredRect(dcV, acc, cw, ch, aV);
+                int[] uCc = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, pcflU, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
+                int[] vCc = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, pcflV, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
+                double cflJ = ReconSseCandRect(uCc, chromaTx, cw, ch, c.DcDq, c.AcDq, pcflU, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
+                            + ReconSseCandRect(vCc, chromaTx, cw, ch, c.DcDq, c.AcDq, pcflV, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
+                            + clam0 * (CoeffCost(uCc) + CoeffCost(vCc) + Av1CoeffEncode.SymBits(uvModeCdf, (int)Av1IntraPredMode.ChromaFromLuma) + (aU != 0 ? 5 : 0) + (aV != 0 ? 5 : 0));
+                if (cflJ < bestJ)
+                {
+                    bestJ = cflJ; useCfl = true; uvMode = (int)Av1IntraPredMode.ChromaFromLuma;
+                    alphaU = aU; alphaV = aV; uC = uCc; vC = vCc; predU = pcflU; predV = pcflV;
+                }
+            }
         }
         int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
 
@@ -1711,9 +1770,12 @@ internal static class Av1StillImageEncoder
         c.Msac.EncodeSymbolAdapt(ymCdf, (int)yMode, 12);
         if (IsDirectional(yMode))
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
-        int uvSym = useCfl ? (int)Av1IntraPredMode.ChromaFromLuma : 0;
-        c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), uvSym, uvNsym);
+        int uvSym = useCfl ? (int)Av1IntraPredMode.ChromaFromLuma : uvMode;
+        c.Msac.EncodeSymbolAdapt(uvModeCdf, uvSym, uvNsym);
         if (useCfl) EncodeCflAlphas(c.Msac, c.Cdf, alphaU, alphaV);
+        else if (IsDirectional((Av1IntraPredMode)uvMode) &&
+                 Av1Tables.BlockDimensions[lumaBs, 2] + Av1Tables.BlockDimensions[lumaBs, 3] >= 2)
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf(uvMode - (int)Av1IntraPredMode.Vertical), uvDelta + 3, 6);
 
         // filter_intra: rect leaves are all <=32x32, so a DC rect block must emit use_filter_intra (0 here).
         if (UseFilterIntra && yMode == Av1IntraPredMode.Dc &&
@@ -1737,26 +1799,14 @@ internal static class Av1StillImageEncoder
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
-            if (useCfl)
-            {
-                cfU = DequantAndReconstructPredRect(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, cflU!, c.ReconU, c.Cw, cbx, cby);
-                cfV = DequantAndReconstructPredRect(vC, chromaTx, cw, ch, c.DcDq, c.AcDq, cflV!, c.ReconV, c.Cw, cbx, cby);
-            }
-            else
-            {
-                cfU = DequantAndReconstructRectDc(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcU, c.ReconU, c.Cw, cbx, cby);
-                cfV = DequantAndReconstructRectDc(vC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcV, c.ReconV, c.Cw, cbx, cby);
-            }
-        }
-        else if (useCfl)
-        {
-            for (int yy = 0; yy < ch; yy++) Array.Copy(cflU!, yy * cw, c.ReconU, (cby + yy) * c.Cw + cbx, cw);
-            for (int yy = 0; yy < ch; yy++) Array.Copy(cflV!, yy * cw, c.ReconV, (cby + yy) * c.Cw + cbx, cw);
+            var uvTxR = (Av1TxType)Av1Tables.TxTypeFromUvMode[uvSym];
+            cfU = DequantAndReconstructPredRect(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, predU, c.ReconU, c.Cw, cbx, cby, uvTxR);
+            cfV = DequantAndReconstructPredRect(vC, chromaTx, cw, ch, c.DcDq, c.AcDq, predV, c.ReconV, c.Cw, cbx, cby, uvTxR);
         }
         else
         {
-            FillFlatRect(c.ReconU, c.Cw, cbx, cby, cw, ch, dcU);
-            FillFlatRect(c.ReconV, c.Cw, cbx, cby, cw, ch, dcV);
+            for (int yy = 0; yy < ch; yy++) Array.Copy(predU, yy * cw, c.ReconU, (cby + yy) * c.Cw + cbx, cw);
+            for (int yy = 0; yy < ch; yy++) Array.Copy(predV, yy * cw, c.ReconV, (cby + yy) * c.Cw + cbx, cw);
         }
 
         int yW = Math.Min(w4, c.Bw4 - bx4), yH = Math.Min(h4, c.Bh4 - by4);
@@ -1764,9 +1814,8 @@ internal static class Av1StillImageEncoder
         sbyte txLw = (sbyte)lTDim.Lw, txLh = (sbyte)lTDim.Lh;
         for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
         for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
-        byte rectUvSym = (byte)(useCfl ? (int)Av1IntraPredMode.ChromaFromLuma : 0);
-        for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; c.AModeUv[cxR + i] = rectUvSym; }
-        for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; c.LModeUv[cyR + j] = rectUvSym; }
+        for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; c.AModeUv[cxR + i] = (byte)uvSym; }
+        for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; c.LModeUv[cyR + j] = (byte)uvSym; }
     }
 
     // Codes PARTITION_HORZ/VERT at the 8x8 level -> two 8x4 (horz) or 4x8 (vert) luma sub-blocks. AV1 shared-chroma:
