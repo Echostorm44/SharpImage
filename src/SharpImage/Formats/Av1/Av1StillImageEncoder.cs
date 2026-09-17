@@ -1501,27 +1501,35 @@ internal static class Av1StillImageEncoder
         int ySign = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
         var pred = new byte[h * w];
         var bestPred = new byte[h * w];
+        var resBuf = new int[h * w];
+        var qfCand = new double[lScan];
+        var qfWin = new double[lScan];
         int[] yC = null!;
         Av1IntraPredMode yMode = Av1IntraPredMode.Dc; int yDelta = 0;
+        Av1TxType yInv = Av1TxType.DctDct; int yTxIdx = 1;
         double best = double.MaxValue;
+        double rectLambda = RdLambdaK * c.AcDq * c.AcDq;   // true RD: D + λ·rate (rect edges want IDTX; DctDct-only misranks)
+        // The tx-type symbol is coded for rect luma only when max tx dim <= 16 (16x8/8x16); 32x16/16x32 force DctDct.
+        var txSet = Av1Tables.TxfmDimensions[lumaTx].Max <= (byte)Av1TxSize.Tx16x16 ? IntraTxTypes : DctOnly;
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
             PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]));
-            int[] cf = ForwardResidualPredRect(c.Luma, c.W, bx, by, pred, w, h, lumaTx, c.DcDq, c.AcDq, lScan);
+            for (int yy = 0; yy < h; yy++)
+                for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                 + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
-            double rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, 0, ySign, 1) + modeBits;
-            if (rate < best) { best = rate; yC = cf; yMode = mode; yDelta = delta; Array.Copy(pred, bestPred, h * w); }
+            foreach (var (fwd, inv, idx) in txSet)
+            {
+                int[] cf = Av1FwdTransform.ForwardQuantRect(resBuf, w, h, lumaTx, c.DcDq, c.AcDq, lScan, fwd, qfCand);
+                double rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, 0, ySign, idx) + modeBits;
+                long sse = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, pred, c.Luma, c.W, bx, by, inv);
+                double j = sse + rectLambda * rate;
+                if (j < best) { best = j; yC = cf; yMode = mode; yDelta = delta; yInv = inv; yTxIdx = idx; Array.Copy(pred, bestPred, h * w); Array.Copy(qfCand, qfWin, lScan); }
+            }
         }
 
-        // RDOQ-refine the winning luma coefficients (recompute with pre-quant floats, then optimise).
-        var qfWin = new double[lScan];
-        var resWin = new int[h * w];
-        for (int yy = 0; yy < h; yy++)
-            for (int xx = 0; xx < w; xx++)
-                resWin[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - bestPred[yy * w + xx];
-        yC = Av1FwdTransform.ForwardQuantRect(resWin, w, h, lumaTx, c.DcDq, c.AcDq, lScan, Av1FwdTransform.FwdTxType.DctDct, qfWin);
-        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, 1,
+        // RDOQ-refine the winning luma coefficients (in-place on the winning qf/levels).
+        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, yTxIdx,
             RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
 
         int dcU = DcPredictRect(c.ReconU, c.Cw, cbx, cby, cw, ch);
@@ -1559,10 +1567,10 @@ internal static class Av1StillImageEncoder
             int vSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
             int uSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
             int vSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
-            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: 1);
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
-            cfY = DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by);
+            cfY = DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by, yInv);
             cfU = DequantAndReconstructRectDc(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcU, c.ReconU, c.Cw, cbx, cby);
             cfV = DequantAndReconstructRectDc(vC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcV, c.ReconV, c.Cw, cbx, cby);
         }
@@ -2567,7 +2575,7 @@ internal static class Av1StillImageEncoder
     // Dequantizes rect levels and reconstructs a w x h block onto predBlock (h x w) via the decoder's InvTxfmAdd,
     // into recon. Returns the coefficient-context byte.
     private static byte DequantAndReconstructPredRect(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
-        byte[] predBlock, byte[] recon, int reconW, int bx, int by)
+        byte[] predBlock, byte[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct)
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[txIdx].Ctx - 2);
         const int cfMax = 32767;
@@ -2595,12 +2603,39 @@ internal static class Av1StillImageEncoder
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
         var block = (byte[])predBlock.Clone();
-        Av1InvTransform.InvTxfmAdd(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], Av1TxType.DctDct, 8);
+        Av1InvTransform.InvTxfmAdd(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, 8);
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 recon[(by + y) * reconW + (bx + x)] = block[y * w + x];
 
         return cfCtx;
+    }
+
+    // Reconstruction SSE of a w x h rectangular candidate (dequant + inverse onto predBlock) vs the source — the
+    // distortion term for true-RD rect leaf selection (mirrors ReconSseCand for the square path).
+    private static long ReconSseCandRect(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
+        byte[] predBlock, byte[] src, int srcW, int srcBx, int srcBy, Av1TxType txType)
+    {
+        int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[txIdx].Ctx - 2);
+        const int cfMax = 32767;
+        var scan = Av1Tables.Scans[txIdx];
+        int eob = -1;
+        for (int i = scan.Length - 1; i >= 0; i--) if (levels[scan[i]] != 0) { eob = i; break; }
+        var cf = new int[32 * 32];
+        for (int i = 0; i <= eob; i++)
+        {
+            int rc = scan[i], lvl = levels[rc];
+            if (lvl == 0) continue;
+            int mag = Math.Abs(lvl), sign = lvl < 0 ? 1 : 0;
+            int dq = Math.Min(((rc == 0 ? dcDq : acDq) * mag) >> dqShift, cfMax + sign);
+            cf[rc] = sign != 0 ? -dq : dq;
+        }
+        var block = (byte[])predBlock.Clone();
+        Av1InvTransform.InvTxfmAdd(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, 8);
+        long sse = 0;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) { int d = block[y * w + x] - src[(srcBy + y) * srcW + (srcBx + x)]; sse += (long)d * d; }
+        return sse;
     }
 
     // Residual (src - prediction) for an n x n block.
