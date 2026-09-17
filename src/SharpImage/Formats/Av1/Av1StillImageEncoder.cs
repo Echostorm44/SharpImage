@@ -598,7 +598,7 @@ internal static class Av1StillImageEncoder
         // those were previously forced to a single large NONE, wasting bits on the padded region — RD now splits
         // them. The SPLIT recursion terminates cleanly at 8x8 (bw4/bh4 are always even, so 8x8 tiles edges exactly;
         // the 4x4 forced-split throw is unreachable). Rect HORZ/VERT candidates are only offered when fully inside.
-        if (UseTrueRd && (long)c.Bw4 * c.Bh4 * 16 <= TrueRdPixelBudget && bl >= 1 && bl < 4)
+        if (UseTrueRd && (long)c.Bw4 * c.Bh4 * 16 <= TrueRdPixelBudget && bl >= 1 && (bl < 4 || (bl == 4 && UseSub8Partition && fullyInside)))
         {
             EncodePartitionColorTrueRd(c, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8, edgeIdx, fullyInside);
             return;
@@ -672,8 +672,9 @@ internal static class Av1StillImageEncoder
             return;
         }
 
-        if (choice == 1) // PARTITION_HORZ: two stacked (blk4 x hsz) leaves
+        if (choice == 1) // PARTITION_HORZ: two stacked leaves
         {
+            if (bl == 4) { EncodeSub8Pair(c, horz: true, bx4, by4, partCdf, nPart, bx8, by8, node); return; }
             var rp = RectLeafParams(bl);
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Horizontal, nPart);
             EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4, blk4, hsz, node.H0);
@@ -682,8 +683,9 @@ internal static class Av1StillImageEncoder
             return;
         }
 
-        if (choice == 2) // PARTITION_VERT: two side-by-side (hsz x blk4) leaves
+        if (choice == 2) // PARTITION_VERT: two side-by-side leaves
         {
+            if (bl == 4) { EncodeSub8Pair(c, horz: false, bx4, by4, partCdf, nPart, bx8, by8, node); return; }
             var rp = RectLeafParams(bl);
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Vertical, nPart);
             EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4, by4, hsz, blk4, node.V0);
@@ -788,8 +790,10 @@ internal static class Av1StillImageEncoder
         // Candidates: NONE and SPLIT always; HORZ/VERT at 32x32/16x16 when rect is enabled AND the block is fully
         // inside the frame (the rect leaves assume in-frame dimensions). For partial blocks only NONE vs SPLIT.
         Span<int> cands = stackalloc int[4];
-        int nc = 0; cands[nc++] = 0; cands[nc++] = 3;
-        if (fullyInside && (bl == 2 || bl == 3) && UseRectPartition && !UsePalette) { cands[nc++] = 1; cands[nc++] = 2; }
+        int nc = 0; cands[nc++] = 0;
+        if (bl < 4) cands[nc++] = 3;   // SPLIT — not at 8x8 (that would be 4x4, unsupported); 8x8 offers NONE/HORZ/VERT
+        if (fullyInside && !UsePalette && (((bl == 2 || bl == 3) && UseRectPartition) || (bl == 4 && UseSub8Partition)))
+        { cands[nc++] = 1; cands[nc++] = 2; }
 
         double lambda = RdLambdaK * c.AcDq * c.AcDq;
         var snap0 = SnapshotRd(c, bx4, by4, blk4);
@@ -1612,6 +1616,123 @@ internal static class Av1StillImageEncoder
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; }
     }
 
+    // Codes PARTITION_HORZ/VERT at the 8x8 level -> two 8x4 (horz) or 4x8 (vert) luma sub-blocks. AV1 shared-chroma:
+    // the chroma (4x4, covering the 8x8) is coded once on the SECOND (odd-position) sub-block. partCdf/nPart are the
+    // 8x8 partition CDF (PartitionTypeCount[4]=3). Mirrors the decoder's HORZ/VERT recursion at Bl8x8.
+    private static void EncodeSub8Pair(ColorPartCtx c, bool horz, int bx4, int by4, Span<ushort> partCdf, int nPart, int bx8, int by8, Av1EdgeNode node)
+    {
+        c.Msac.EncodeSymbolAdapt(partCdf, (int)(horz ? Av1BlockPartition.Horizontal : Av1BlockPartition.Vertical), nPart);
+        if (horz)
+        {
+            // two 8x4: top (by4, no chroma), bottom (by4+1, chroma over the 8x8)
+            EncodeSub8Leaf(c, (int)Av1BlockSize.Bs8x4, TxIdx8x4, bx4, by4, 2, 1, false, node.H0);
+            EncodeSub8Leaf(c, (int)Av1BlockSize.Bs8x4, TxIdx8x4, bx4, by4 + 1, 2, 1, true, node.H1);
+        }
+        else
+        {
+            // two 4x8: left (bx4, no chroma), right (bx4+1, chroma over the 8x8)
+            EncodeSub8Leaf(c, (int)Av1BlockSize.Bs4x8, TxIdx4x8, bx4, by4, 1, 2, false, node.V0);
+            EncodeSub8Leaf(c, (int)Av1BlockSize.Bs4x8, TxIdx4x8, bx4 + 1, by4, 1, 2, true, node.V1);
+        }
+        FillPartCtx(c, 4, bx8, by8, 1, horz ? Av1BlockPartition.Horizontal : Av1BlockPartition.Vertical);
+    }
+
+    // One sub-8x8 luma leaf (8x4 or 4x8): skip, y_mode (NO angle_delta for these sizes), use_filter_intra (eligible,
+    // always 0 here), tx_size, luma coeffs. When hasChroma (the odd-position sub-block) it additionally codes uv_mode
+    // (DC) + a 4x4 chroma over the 8x8-aligned region. Luma tx-type is Dct_Dct (the symbol is still coded = idx 1).
+    private static void EncodeSub8Leaf(ColorPartCtx c, int lumaBs, int lumaTx, int bx4, int by4, int w4, int h4, bool hasChroma, Av1EdgeFlags edge)
+    {
+        int w = w4 * 4, h = h4 * 4, bx = bx4 * 4, by = by4 * 4;
+        int bxR = bx4 & 31, byR = by4 & 31;
+        int lScan = Av1Tables.Scans[lumaTx].Length;
+        ref readonly var lTDim = ref Av1Tables.TxfmDimensions[lumaTx];
+        int aboveCtx = Av1Tables.IntraModeContext[c.AModeY[bxR]], leftCtx = Av1Tables.IntraModeContext[c.LModeY[byR]];
+        var ymCdf = c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
+        int ySign = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
+        int intraFlags = IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]);
+
+        // Luma mode search (no angle_delta at these sizes, so only the ~13 base modes — all RD-evaluated directly,
+        // no SATD prescreen needed since that is already <= RdModeCandidates). DctDct (the tx-type symbol = idx 1).
+        var pred = new byte[h * w]; var bestPred = new byte[h * w]; var resBuf = new int[h * w];
+        var qfCand = new double[lScan]; var qfWin = new double[lScan];
+        double rectLambda = RdLambdaK * c.AcDq * c.AcDq;
+        int[] yC = null!; Av1IntraPredMode yMode = Av1IntraPredMode.Dc; double best = double.MaxValue;
+        for (int ci = 0; ci < CandidateModes.Length; ci++)
+        {
+            (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
+            if (delta != 0) continue;   // no angle_delta at 8x4/4x8: only the base (delta 0) mode
+            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, 0, pred, edge, intraFlags);
+            for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
+            int[] cf = Av1FwdTransform.ForwardQuantRect(resBuf, w, h, lumaTx, c.DcDq, c.AcDq, lScan, Av1FwdTransform.FwdTxType.DctDct, qfCand);
+            double j = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, pred, c.Luma, c.W, bx, by, Av1TxType.DctDct)
+                     + rectLambda * (Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, 0, ySign, 1) + Av1CoeffEncode.SymBits(ymCdf, (int)mode));
+            if (j < best) { best = j; yC = cf; yMode = mode; Array.Copy(pred, bestPred, h * w); Array.Copy(qfCand, qfWin, lScan); }
+        }
+        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, 1,
+            RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+
+        // Chroma (deferred to the has_chroma sub-block): 4x4 over the 8x8-aligned region, DC-predicted.
+        int c8x4 = bx4 & ~1, c8y4 = by4 & ~1, cbx = c8x4 * 2, cby = c8y4 * 2, cxR = (c8x4 & 31) >> 1, cyR = (c8y4 & 31) >> 1;
+        const int chromaTx = (int)Av1TxSize.Tx4x4; int cScan = Av1Tables.Scans[chromaTx].Length;
+        int dcU = 0, dcV = 0; int[] uC = System.Array.Empty<int>(), vC = System.Array.Empty<int>();
+        bool cflAllowed = ((Av1Tables.CflAllowedMask >> lumaBs) & 1) != 0;
+        int uvNsym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
+        if (hasChroma)
+        {
+            dcU = DcPredictRect(c.ReconU, c.Cw, cbx, cby, 4, 4);
+            dcV = DcPredictRect(c.ReconV, c.Cw, cbx, cby, 4, 4);
+            uC = ForwardResidualRectDc(c.U, c.Cw, cbx, cby, 4, 4, dcU, chromaTx, c.DcDq, c.AcDq, cScan);
+            vC = ForwardResidualRectDc(c.V, c.Cw, cbx, cby, 4, 4, dcV, chromaTx, c.DcDq, c.AcDq, cScan);
+        }
+        int skip = (HasNonZero(yC) || (hasChroma && (HasNonZero(uC) || HasNonZero(vC)))) ? 0 : 1;
+
+        int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
+        c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), (uint)skip);
+        c.Msac.EncodeSymbolAdapt(ymCdf, (int)yMode, 12);   // no angle_delta for 8x4/4x8
+        if (hasChroma)
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode), 0, uvNsym);   // UV DC
+        if (UseFilterIntra && yMode == Av1IntraPredMode.Dc &&
+            Math.Max(Av1Tables.BlockDimensions[lumaBs, 2], Av1Tables.BlockDimensions[lumaBs, 3]) <= 3)
+            c.Msac.EncodeBoolAdapt(c.Cdf.GetFilterIntraCdf((Av1BlockSize)lumaBs), 0);
+        if (UseColorTxDepth && lTDim.Max > (byte)Av1TxSize.Tx4x4)
+        {
+            int txCtx = (c.LTxY[byR] >= lTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= lTDim.Lw ? 1 : 0);
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(lTDim.Max - 1, txCtx), 0, Math.Min((int)lTDim.Max, 2));
+        }
+
+        byte cfY = 0x40, cfU = 0x40, cfV = 0x40;
+        ref readonly var cTDim = ref Av1Tables.TxfmDimensions[chromaTx];
+        if (skip == 0)
+        {
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: 1);
+            if (hasChroma)
+            {
+                int uSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
+                int vSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
+                int uSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
+                int vSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
+                Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
+                Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
+            }
+            cfY = DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by, Av1TxType.DctDct);
+            if (hasChroma)
+            {
+                cfU = DequantAndReconstructRectDc(uC, chromaTx, 4, 4, c.DcDq, c.AcDq, dcU, c.ReconU, c.Cw, cbx, cby);
+                cfV = DequantAndReconstructRectDc(vC, chromaTx, 4, 4, c.DcDq, c.AcDq, dcV, c.ReconV, c.Cw, cbx, cby);
+            }
+        }
+        else
+        {
+            for (int yy = 0; yy < h; yy++) Array.Copy(bestPred, yy * w, c.ReconY, (by + yy) * c.W + bx, w);
+            if (hasChroma) { FillFlatRect(c.ReconU, c.Cw, cbx, cby, 4, 4, dcU); FillFlatRect(c.ReconV, c.Cw, cbx, cby, 4, 4, dcV); }
+        }
+
+        sbyte txLw = (sbyte)lTDim.Lw, txLh = (sbyte)lTDim.Lh;
+        for (int i = 0; i < w4 && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; c.APalSz[bxR + i] = 0; }
+        for (int j = 0; j < h4 && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; c.LPalSz[byR + j] = 0; }
+        if (hasChroma) { c.ACU[cxR] = cfU; c.ACV[cxR] = cfV; c.LCU[cyR] = cfU; c.LCV[cyR] = cfV; }
+    }
+
     private static byte[] Filled(int n)
     {
         var a = new byte[n];
@@ -2053,6 +2174,13 @@ internal static class Av1StillImageEncoder
 
     // Enables PARTITION_HORZ / PARTITION_VERT rectangular leaves at 16x16 (colour path). Toggle for A/B testing.
     internal static bool UseRectPartition = true;
+
+    // Sub-8x8 rectangular partitions: PARTITION_HORZ/VERT at the 8x8 level -> two 8x4 or 4x8 luma sub-blocks with
+    // AV1 shared-chroma (chroma coded once per 8x8, on the odd-position sub-block, over 4x4). -0.93% BD-rate (clean
+    // on all 6 corpus images), byte-exact vs ffmpeg/libdav1d. Directly attacks piechart over-splitting (the profile
+    // showed libaom fits wedge edges with 8x4/4x8 where we full-SPLIT to 8x8). Adds encode cost (every 8x8 RD-trials
+    // NONE/HORZ/VERT with sub-block coding).
+    internal static bool UseSub8Partition = true;
 
     // Rect is chosen only when its estimated cost is below this fraction of the best square (NONE/SPLIT) cost.
     internal static double RectCostMargin = 0.95;
