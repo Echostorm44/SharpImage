@@ -1022,71 +1022,39 @@ internal static class Av1StillImageEncoder
         int yModeSym = isFilter ? (int)Av1IntraPredMode.Dc : (int)yMode;
         int yModeNoFilt = isFilter ? Av1Tables.FilterModeToYMode[yDelta] : (int)yMode;
 
-        // Transform-size (tx_depth) search for luma. Only when residual is coded (depth-0 not all-zero) and the block
-        // is fully inside the frame. depth 0 keeps rd's single block-size transform; depth>0 splits into a quadtree
-        // of smaller transforms, each predicted from reconstruction in raster order (mirrors the grayscale path).
+        // Transform-size (tx_depth) TRUE-RD search for luma. Only when residual is coded (depth-0 not all-zero) and
+        // the block is fully inside the frame. Each depth is scored by its ACTUAL reconstruction (ReconstructLumaAtDepth
+        // — depth 0 = the RDOQ'd single transform, depth>0 = the raster recon cascade) under SnapshotRd/RestoreRd:
+        // J = real recon SSE + λ·(real coef bits + tx_size symbol bits). The winner is then reconstructed for keeps.
+        // (Replaces the old source-predicted estimate, which mismatched the recon-predicted coding path.)
         bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
         int maxDepth = (UseColorTxDepth && HasNonZero(yC) && fullyInside) ? Math.Min((int)maxTDim.Max, 2) : 0;
         int depth = 0;
         if (maxDepth > 0)
         {
-            long best = EstimateTxDepthCostColor(c, bx4, by4, blk4, tx, yMode, yDelta, yModeNoFilt);
-            for (int d = 1; d <= maxDepth; d++)
+            double lambda = RdLambdaK * c.AcDq * c.AcDq;
+            int txCtx = (c.LTxY[byR] >= maxTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= maxTDim.Lw ? 1 : 0);
+            var txSzCdf = c.Cdf.GetTxSzCdf(maxTDim.Max - 1, txCtx);
+            int txNsym = Math.Min((int)maxTDim.Max, 2);
+            var snap = SnapshotRd(c, bx4, by4, blk4);
+            long txBestJ = long.MaxValue;
+            for (int d = 0; d <= maxDepth; d++)
             {
-                long cost = EstimateTxDepthCostColor(c, bx4, by4, blk4, ReduceTx(tx, d), yMode, yDelta, yModeNoFilt);
-                if (cost < best) { best = cost; depth = d; }
+                var (_, _, bitsT) = ReconstructLumaAtDepth(c, bx4, by4, blk4, n, tx, ReduceTx(tx, d), d,
+                    yMode, yDelta, yModeNoFilt, yC, yInv, yTxIdx, edgeFlags, bs);
+                double txSizeBits = Av1CoeffEncode.SymBits(txSzCdf, Math.Min(d, txNsym));
+                long j = LumaBlockSse(c, bx, by, n) + (long)(lambda * (bitsT + txSizeBits));
+                if (j < txBestJ) { txBestJ = j; depth = d; }
+                RestoreRd(c, snap, bx4, by4, blk4);
             }
         }
         int lumaTx = ReduceTx(tx, depth);
         ref readonly var lTDim = ref Av1Tables.TxfmDimensions[lumaTx];
 
-        // Reconstruct luma at the chosen depth into ReconY (CfL needs the reconstructed luma AC). For depth 0 this is
-        // the single transform; for depth>0 the per-tx-block records are captured for emission after the tx_size symbol.
-        byte cfY = 0x40;
-        List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? lumaTxb = null;
-        if (depth == 0)
-        {
-            cfY = DequantAndReconstructPred(yC, tx, n, c.DcDq, c.AcDq, c.Pred, c.ReconY, c.W, bx, by, yInv);
-        }
-        else
-        {
-            lumaTxb = new();
-            int txN = lTDim.W * 4, txW4 = lTDim.W;
-            var predBuf = new byte[txN * txN];
-            // Per-tx-block intra-edge availability within this coding block (blk4 <= 16, so one 64-region: initX=
-            // initY=0, subW4=blk4, subH4=blk4). Mirrors Av1Reconstruction's localEdgeFlags for tx_depth > 0.
-            int sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0 ? 1 : 0;
-            int sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0 ? 1 : 0;
-            for (int iy = 0; iy < blk4; iy += txW4)
-                for (int ix = 0; ix < blk4; ix += txW4)
-                {
-                    int cbx4 = bx4 + ix, cby4 = by4 + iy, cbxR = cbx4 & 31, cbyR = cby4 & 31;
-                    var localEdge =
-                        (((iy > 0 || sbHasTr == 0) && (ix + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444TopHasRight) |
-                        ((ix > 0 || (sbHasBl == 0 && iy + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
-                    PredictIntra(c.ReconY, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]));
-                    int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
-                    (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, lumaTx, c.DcDq, c.AcDq,
-                        predBuf, c.Luma, c.W, cbx4 * 4, cby4 * 4, RdLambdaK * c.AcDq * c.AcDq);
-                    int skc = Av1CoeffDecode.GetSkipCtx(in lTDim, bs, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR), 0, 0);
-                    int snc = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR));
-                    // RDOQ this tx-split block (depth-0 luma is RDOQ'd in ChooseLeafRdCore; the quadtree path was
-                    // round-to-nearest). Re-derive qf for the picked tx type, then trim with the real neighbour
-                    // contexts. Reconstruction below uses the trimmed cf, matching the decoder + feeding later blocks.
-                    if (HasNonZero(cf))
-                    {
-                        var qfTx = new double[Av1Tables.Scans[lumaTx].Length];
-                        Av1FwdTransform.ForwardQuantTyped(res, txN, c.DcDq, c.AcDq, qfTx.Length, FwdTypeForIdx(idx), qfTx);
-                        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, cf, qfTx,
-                            c.DcDq, c.AcDq, skc, snc, idx, RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
-                    }
-                    lumaTxb.Add((cf, inv, idx, skc, snc, cbx4 * 4, cby4 * 4));
-                    byte txCfCtx = DequantAndReconstructPred(cf, lumaTx, txN, c.DcDq, c.AcDq, predBuf, c.ReconY, c.W, cbx4 * 4, cby4 * 4, inv);
-                    int tcw = Math.Min(txW4, c.Bw4 - cbx4), tch = Math.Min(txW4, c.Bh4 - cby4);
-                    for (int i = 0; i < tcw && cbxR + i < 32; i++) c.ALY[cbxR + i] = txCfCtx;
-                    for (int j = 0; j < tch && cbyR + j < 32; j++) c.LLY[cbyR + j] = txCfCtx;
-                }
-        }
+        // Reconstruct luma at the chosen depth into ReconY for keeps (CfL needs the reconstructed luma AC; depth>0
+        // records the per-tx-block coeffs for emission after the tx_size symbol).
+        var (cfY, lumaTxb, _) = ReconstructLumaAtDepth(c, bx4, by4, blk4, n, tx, lumaTx, depth,
+            yMode, yDelta, yModeNoFilt, yC, yInv, yTxIdx, edgeFlags, bs);
         bool lumaAllZero = depth == 0 ? !HasNonZero(yC) : lumaTxb!.TrueForAll(t => !HasNonZero(t.Cf));
 
         // --- Palette (screen content): code this block as a luma palette when it wins RD. Eligible DC-sized
@@ -1451,40 +1419,69 @@ internal static class Av1StillImageEncoder
     // so the distortion term reflects what the transform can actually represent. Used for the colour tx-depth
     // decision: a pure rate estimate over-splits smooth content (splitting barely changes SSE but the estimate
     // undercounts the per-tx-block overhead), so the SSE term is essential to keep large blocks whole.
-    private static long EstimateTxDepthCostColor(ColorPartCtx c, int bx4, int by4, int blk4, int tx,
-        Av1IntraPredMode yMode, int yDelta, int yModeNoFilt)
+    // Reconstructs luma at a given tx_depth EXACTLY as the emit path does (depth 0 = the single block-size transform
+    // from the RDOQ'd yC; depth>0 = the quadtree cascade, each sub-block predicted from reconstruction in raster
+    // order, tx-type chosen + RDOQ'd), writing pixels into c.ReconY and, for depth>0, the per-tx neighbour coef
+    // context into c.ALY/c.LLY. Returns the coef-context byte (depth 0), the per-tx records (depth>0), and the total
+    // coefficient-bit estimate. Used both to TRIAL each depth (under SnapshotRd/RestoreRd) and to commit the winner,
+    // so the tx_depth decision is true-RD: it compares the real reconstruction + real coded cost of each depth.
+    private static (byte CfY, List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? LumaTxb, double CoefBits)
+        ReconstructLumaAtDepth(ColorPartCtx c, int bx4, int by4, int blk4, int n, int tx, int lumaTx, int depth,
+            Av1IntraPredMode yMode, int yDelta, int yModeNoFilt, int[] yC, Av1TxType yInv, int yTxIdx,
+            Av1EdgeFlags edgeFlags, int bs)
     {
-        ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
-        int txN = tDim.W * 4, txW4 = tDim.W;
-        double lambda = RdLambdaK * c.AcDq * c.AcDq;
-        long sse = 0; double rate = 0;
+        int bxR = bx4 & 31, byR = by4 & 31, bx = bx4 * 4, by = by4 * 4;
+        ref readonly var lTDim = ref Av1Tables.TxfmDimensions[lumaTx];
+        if (depth == 0)
+        {
+            int ySign = Av1CoeffDecode.GetDcSignCtx(tx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
+            byte cfY = DequantAndReconstructPred(yC, tx, n, c.DcDq, c.AcDq, c.Pred, c.ReconY, c.W, bx, by, yInv);
+            double bits = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, tx, 0, yModeNoFilt, yC, 0, ySign, yTxIdx);
+            return (cfY, null, bits);
+        }
+        var lumaTxb = new List<(int[], Av1TxType, int, int, int, int, int)>();
+        double coefBits = 0;
+        int txN = lTDim.W * 4, txW4 = lTDim.W;
         var predBuf = new byte[txN * txN];
-        var reconBuf = new byte[txN * txN];
+        int sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0 ? 1 : 0;
+        int sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0 ? 1 : 0;
         for (int iy = 0; iy < blk4; iy += txW4)
             for (int ix = 0; ix < blk4; ix += txW4)
             {
-                int cbx4 = bx4 + ix, cby4 = by4 + iy, px = cbx4 * 4, py = cby4 * 4;
-                PredictIntra(c.Luma, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf);
-                int[] res = ComputeResidualPred(c.Luma, c.W, px, py, predBuf, txN);
-                (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq, predBuf, c.Luma, c.W, px, py, RdLambdaK * c.AcDq * c.AcDq);
-                // RDOQ the coefficients so this per-depth cost matches the actual RDOQ'd encode (both the depth-0
-                // ChooseLeafRdCore path and the depth>0 emit RDOQ). Without this the estimate under-credits the
-                // large transform, over-splitting smooth/natural content.
+                int cbx4 = bx4 + ix, cby4 = by4 + iy, cbxR = cbx4 & 31, cbyR = cby4 & 31;
+                var localEdge =
+                    (((iy > 0 || sbHasTr == 0) && (ix + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444TopHasRight) |
+                    ((ix > 0 || (sbHasBl == 0 && iy + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
+                PredictIntra(c.ReconY, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]));
+                int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
+                (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, lumaTx, c.DcDq, c.AcDq,
+                    predBuf, c.Luma, c.W, cbx4 * 4, cby4 * 4, RdLambdaK * c.AcDq * c.AcDq);
+                int skc = Av1CoeffDecode.GetSkipCtx(in lTDim, bs, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR), 0, 0);
+                int snc = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR));
                 if (HasNonZero(cf))
                 {
-                    var qfTx = new double[Av1Tables.Scans[tx].Length];
+                    var qfTx = new double[Av1Tables.Scans[lumaTx].Length];
                     Av1FwdTransform.ForwardQuantTyped(res, txN, c.DcDq, c.AcDq, qfTx.Length, FwdTypeForIdx(idx), qfTx);
-                    Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, tx, 0, yModeNoFilt, cf, qfTx,
-                        c.DcDq, c.AcDq, 0, 0, idx, RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                    Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, cf, qfTx,
+                        c.DcDq, c.AcDq, skc, snc, idx, RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
                 }
-                DequantAndReconstructPred(cf, tx, txN, c.DcDq, c.AcDq, predBuf, reconBuf, txN, 0, 0, inv);
-                for (int yy = 0; yy < txN; yy++)
-                    for (int xx = 0; xx < txN; xx++)
-                    { int d = reconBuf[yy * txN + xx] - c.Luma[(py + yy) * c.W + px + xx]; sse += (long)d * d; }
-                rate += Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, tx, 0, yModeNoFilt, cf, 0, 0, idx) + 2;
+                coefBits += Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, cf, skc, snc, idx);
+                lumaTxb.Add((cf, inv, idx, skc, snc, cbx4 * 4, cby4 * 4));
+                byte txCfCtx = DequantAndReconstructPred(cf, lumaTx, txN, c.DcDq, c.AcDq, predBuf, c.ReconY, c.W, cbx4 * 4, cby4 * 4, inv);
+                int tcw = Math.Min(txW4, c.Bw4 - cbx4), tch = Math.Min(txW4, c.Bh4 - cby4);
+                for (int i = 0; i < tcw && cbxR + i < 32; i++) c.ALY[cbxR + i] = txCfCtx;
+                for (int j = 0; j < tch && cbyR + j < 32; j++) c.LLY[cbyR + j] = txCfCtx;
             }
+        return (0x40, lumaTxb, coefBits);
+    }
 
-        return sse + (long)(lambda * rate);
+    // Luma block SSE (reconstruction vs source) over an n x n region at pixel (bx,by).
+    private static long LumaBlockSse(ColorPartCtx c, int bx, int by, int n)
+    {
+        long sse = 0;
+        for (int yy = 0; yy < n; yy++)
+            for (int xx = 0; xx < n; xx++) { int d = c.ReconY[(by + yy) * c.W + bx + xx] - c.Luma[(by + yy) * c.W + bx + xx]; sse += (long)d * d; }
+        return sse;
     }
 
     // Estimates the luma coding cost J = SSE + λ·bits of a single rectangular leaf, predicting from the SOURCE
