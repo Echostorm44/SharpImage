@@ -371,6 +371,7 @@ public static class Av1Decode
                     AvDbg.W($"[PART-CDF-VERIFY] Partition[4][0]={ts.Cdf.Mode.Partition[4][0]} cnt={ts.Cdf.Mode.Partition[4][9]} Partition[8][0]={ts.Cdf.Mode.Partition[8][0]} Partition[12][0]={ts.Cdf.Mode.Partition[12][0]}");
             }
 
+            Av1Msac.Phase = 0;
             bp = (Av1BlockPartition)msac.DecodeSymbolAdapt16(
                 partCdf, Av1Tables.PartitionTypeCount[(int)bl]);
 
@@ -763,6 +764,7 @@ public static class Av1Decode
             // Key/intra frames: read skip
             int sctx = t.Above.Skip[bx4] + t.Left.Skip[by4];
             Av1Msac.TraceLabel = "b-skip";
+            Av1Msac.Phase = 2;
             b.Skip = (byte)(msac.DecodeBoolAdapt(ts.Cdf.GetSkipCdf(sctx)) != 0 ? 1 : 0);
             Av1Msac.TraceLabel = null;
             if (DbgFirstBlock && t.Bx == 0 && t.By == 0)
@@ -1150,6 +1152,7 @@ public static class Av1Decode
             int leftCtx = Av1Tables.IntraModeContext[t.Left.Mode[by4]];
             ymodeCdf = ts.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
         }
+        Av1Msac.Phase = 1;
         b.YMode = (byte)msac.DecodeSymbolAdapt16(ymodeCdf, Av1Constants.NumIntraPredModes - 1);
 
         // === Angle delta ===
@@ -1277,6 +1280,7 @@ public static class Av1Decode
         if (b.YMode == (byte)Av1IntraPredMode.Dc && b.PalSzY == 0 &&
             Math.Max(bDimW, bDimH) <= 3 && seqHdr.FilterIntra)
         {
+            Av1Msac.Phase = 4;
             bool isFilter = msac.DecodeBoolAdapt(ts.Cdf.GetFilterIntraCdf(bs)) != 0;
             if (isFilter)
             {
@@ -1328,6 +1332,7 @@ public static class Av1Decode
             if (fh.TxMode == Av1TxfmMode.Switchable && tDim.Max > (byte)Av1TxSize.Tx4x4)
             {
                 int tctx = GetTxCtx(t.Above, t.Left, tDim, by4, bx4);
+                Av1Msac.Phase = 3;
                 var txCdf = ts.Cdf.GetTxSzCdf(tDim.Max - 1, tctx);
                 int nSym = Math.Min((int)tDim.Max, 2);
                 if (t.Bx < 8 && t.By < 4)

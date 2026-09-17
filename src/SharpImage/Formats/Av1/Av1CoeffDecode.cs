@@ -457,6 +457,7 @@ public static class Av1CoeffDecode
         uint preRng = msac.DebugRng;
         ushort preCdf0 = coefCdf.CoefSkip[cdfIdx][0];
         Av1Msac.DbgLabel = $"allskip_tx{tx}_pl{plane}";
+        Av1Msac.Phase = plane == 0 ? 5 : 6;   // 5=luma coef, 6=chroma coef (reuse the cdef slot for chroma coef here)
         int allSkip = (int)msac.DecodeBoolAdapt(coefCdf.CoefSkip[cdfIdx]);
 
         if (DbgCoefDecCount < 100)

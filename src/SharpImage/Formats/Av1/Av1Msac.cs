@@ -30,6 +30,13 @@ public ref struct Av1Msac
     /// <summary>Debug label for tracking which code path called DecodeBoolAdapt.</summary>
     public static string? DbgLabel;
 
+    // Per-phase bit accounting (dev): when AcctOn, every symbol's exact range-coder cost (-log2(subrange/rng)) is
+    // added to PhaseBits[Phase]. The decoder sets Phase around each symbol group (0=part,1=mode,2=skip,3=tx,
+    // 4=filter,5=coef,6=cdef,7=other). Works on ANY valid AV1 stream, so it profiles libaom's bit split too.
+    public static bool AcctOn;
+    public static readonly double[] PhaseBits = new double[8];
+    public static int Phase = 7;
+
     /// <summary>Label attached to trace entries for code path identification.</summary>
     public static string? TraceLabel;
 
@@ -665,6 +672,7 @@ public ref struct Av1Msac
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Normalize(ulong d, uint r)
     {
+        if (AcctOn && r > 0 && rng > 0) PhaseBits[Phase] += -System.Math.Log2((double)r / rng);
         int shift = 15 ^ (31 ^ BitOperations.LeadingZeroCount(r));
         int c = cnt;
         
