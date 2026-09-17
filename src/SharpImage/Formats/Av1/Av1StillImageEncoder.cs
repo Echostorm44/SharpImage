@@ -1652,23 +1652,29 @@ internal static class Av1StillImageEncoder
         int intraFlags = IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]);
 
         // Luma mode search (no angle_delta at these sizes, so only the ~13 base modes — all RD-evaluated directly,
-        // no SATD prescreen needed since that is already <= RdModeCandidates). DctDct (the tx-type symbol = idx 1).
+        // no SATD prescreen). Full reduced tx-type set (IDTX+DCT/ADST): the symbol is coded for 8x4/4x8 (max tx
+        // dim <= 16), and IDTX helps these tiny edge sub-blocks — same win as the square/rect leaves.
         var pred = new byte[h * w]; var bestPred = new byte[h * w]; var resBuf = new int[h * w];
         var qfCand = new double[lScan]; var qfWin = new double[lScan];
         double rectLambda = RdLambdaK * c.AcDq * c.AcDq;
-        int[] yC = null!; Av1IntraPredMode yMode = Av1IntraPredMode.Dc; double best = double.MaxValue;
+        int[] yC = null!; Av1IntraPredMode yMode = Av1IntraPredMode.Dc; Av1TxType yInv = Av1TxType.DctDct; int yTxIdx = 1;
+        double best = double.MaxValue;
         for (int ci = 0; ci < CandidateModes.Length; ci++)
         {
             (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
             if (delta != 0) continue;   // no angle_delta at 8x4/4x8: only the base (delta 0) mode
             PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, 0, pred, edge, intraFlags);
             for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
-            int[] cf = Av1FwdTransform.ForwardQuantRect(resBuf, w, h, lumaTx, c.DcDq, c.AcDq, lScan, Av1FwdTransform.FwdTxType.DctDct, qfCand);
-            double j = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, pred, c.Luma, c.W, bx, by, Av1TxType.DctDct)
-                     + rectLambda * (Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, 0, ySign, 1) + Av1CoeffEncode.SymBits(ymCdf, (int)mode));
-            if (j < best) { best = j; yC = cf; yMode = mode; Array.Copy(pred, bestPred, h * w); Array.Copy(qfCand, qfWin, lScan); }
+            double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode);
+            foreach (var (fwd, inv, idx) in IntraTxTypes)
+            {
+                int[] cf = Av1FwdTransform.ForwardQuantRect(resBuf, w, h, lumaTx, c.DcDq, c.AcDq, lScan, fwd, qfCand);
+                double j = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, pred, c.Luma, c.W, bx, by, inv)
+                         + rectLambda * (Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, 0, ySign, idx) + modeBits);
+                if (j < best) { best = j; yC = cf; yMode = mode; yInv = inv; yTxIdx = idx; Array.Copy(pred, bestPred, h * w); Array.Copy(qfCand, qfWin, lScan); }
+            }
         }
-        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, 1,
+        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, yTxIdx,
             RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
 
         // Chroma (deferred to the has_chroma sub-block): 4x4 over the 8x8-aligned region, DC-predicted.
@@ -1704,7 +1710,7 @@ internal static class Av1StillImageEncoder
         ref readonly var cTDim = ref Av1Tables.TxfmDimensions[chromaTx];
         if (skip == 0)
         {
-            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: 1);
+            Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx);
             if (hasChroma)
             {
                 int uSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
@@ -1714,7 +1720,7 @@ internal static class Av1StillImageEncoder
                 Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
                 Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
             }
-            cfY = DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by, Av1TxType.DctDct);
+            cfY = DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by, yInv);
             if (hasChroma)
             {
                 cfU = DequantAndReconstructRectDc(uC, chromaTx, 4, 4, c.DcDq, c.AcDq, dcU, c.ReconU, c.Cw, cbx, cby);
