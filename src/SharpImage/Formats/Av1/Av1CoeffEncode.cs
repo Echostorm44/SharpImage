@@ -173,6 +173,115 @@ internal static class Av1CoeffEncode
         }
     }
 
+    // Index of a 1D-DCT tx type within the full Intra1 set (TxTypesPerSet offset 5:
+    // {Identity,DctDct,VDct,HDct,AdstAdst,AdstDct,DctAdst}). Only VDct/HDct reach this path.
+    private static int Intra1Index(Av1TxType t) => t switch
+    {
+        Av1TxType.Identity => 0, Av1TxType.DctDct => 1, Av1TxType.VDct => 2, Av1TxType.HDct => 3,
+        Av1TxType.AdstAdst => 4, Av1TxType.AdstDct => 5, Av1TxType.DctAdst => 6, _ => 1,
+    };
+
+    // cf[] index for scan position i under a 1D tx class (mirrors DecodeCoefs): Horizontal rc=i; Vertical
+    // rc=(x<<shift2)|y with x=i&mask, y=i>>shift.
+    private static int Rc1d(int i, Av1TxClass cls, int shift, int shift2, int mask)
+        => cls == Av1TxClass.Horizontal ? i : (((i & mask) << shift2) | (i >> shift));
+
+    /// <summary>Encodes one 1D-class (V_DCT / H_DCT) intra luma transform block — the write-side of DecodeCoefs'
+    /// Horizontal/Vertical branches. Emits all_zero, the full-set (Intra1) tx-type symbol, EOB (is1d=1), the
+    /// eob/AC/DC tokens with the 1D geometry + class contexts, then DC + AC signs (increasing natural scan order).
+    /// signedLevels is indexed by the class rc (same as cf[]). Scoped to square tx (4x4/8x8) for now.</summary>
+    internal static void EncodeCoefs1D(
+        Av1MsacWriter w, Av1CdfCoefContext coef, Av1CdfModeContext modeCdf,
+        int tx, int yMode, Av1TxType txtp, ReadOnlySpan<int> signedLevels,
+        int skipCtx = 0, int dcSignCtx = 0)
+    {
+        ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
+        var cls = (Av1TxClass)Av1Tables.TxTypeClass[(int)txtp]; // 1 = Horizontal, 2 = Vertical
+        int cdfIdx = tDim.Ctx * 13 + skipCtx;
+        int slw = Math.Min((int)tDim.Lw, (int)Av1TxSize.Tx32x32);
+        int slh = Math.Min((int)tDim.Lh, (int)Av1TxSize.Tx32x32);
+        int tx2dSzCtx = slw + slh;
+
+        const int stride = 16;
+        int shift, shift2 = 0, mask;
+        if (cls == Av1TxClass.Horizontal) { shift = slh + 2; mask = (4 << slh) - 1; }
+        else { shift = slw + 2; shift2 = slh + 2; mask = (4 << slw) - 1; }
+        int area = (4 << slw) * (4 << slh);
+
+        int eob = -1;
+        for (int i = area - 1; i >= 0; i--)
+            if (signedLevels[Rc1d(i, cls, shift, shift2, mask)] != 0) { eob = i; break; }
+
+        if (eob < 0) { w.EncodeBoolAdapt(coef.CoefSkip[cdfIdx], 1); return; }
+        w.EncodeBoolAdapt(coef.CoefSkip[cdfIdx], 0);
+
+        // tx-type symbol from the full Intra1 set (7 syms) — only reached for tDim.Min < 16x16 intra luma.
+        w.EncodeSymbolAdapt(modeCdf.TxtpIntra1[tDim.Min * 13 + yMode], Intra1Index(txtp), 6);
+
+        EncodeEob(w, coef, 0, tx2dSzCtx, tDim.Ctx, eob, is1d: 1);
+
+        int eobBaseTokIdx = tDim.Ctx * 2 * 4;
+        int baseTokIdx = tDim.Ctx * 2 * 41;
+        int brTokIdx = Math.Min((int)tDim.Ctx, 3) * 2 * 21;
+        var levels = new byte[stride * 20];
+
+        if (eob != 0)
+        {
+            int xE = eob & mask, yE = eob >> shift;
+            int rcEob = Rc1d(eob, cls, shift, shift2, mask);
+            int magEob = Math.Abs(signedLevels[rcEob]);
+            uint ctx = (uint)(1 + (eob > (2 << tx2dSzCtx) ? 1 : 0) + (eob > (4 << tx2dSzCtx) ? 1 : 0));
+            int eobTok = Math.Min(magEob, 3) - 1;
+            w.EncodeSymbolAdapt(coef.EobBaseTok[eobBaseTokIdx + ctx], eobTok, 2);
+            if (eobTok == 2)
+                EncodeHiTok(w, coef.BrTok[brTokIdx + (yE != 0 ? 14 : 7)], magEob);
+            levels[xE * stride + yE] = LevelByte(magEob);
+
+            for (int i = eob - 1; i > 0; i--)
+            {
+                int x = i & mask, y = i >> shift, levelIdx = x * stride + y;
+                int mag = Math.Abs(signedLevels[Rc1d(i, cls, shift, shift2, mask)]);
+                int loCtx = Av1CoeffDecode.GetLoCtx(levels.AsSpan(levelIdx), cls, out uint hiMag, -1, x, y, stride);
+                int tok = Math.Min(mag, 3);
+                w.EncodeSymbolAdapt(coef.BaseTok[baseTokIdx + loCtx], tok, 3);
+                if (tok == 3)
+                {
+                    hiMag &= 63;
+                    int hiCtx = (int)((y > 0 ? 14u : 7u) + (hiMag > 12 ? 6u : (uint)(hiMag + 1) >> 1));
+                    EncodeHiTok(w, coef.BrTok[brTokIdx + hiCtx], mag);
+                }
+                levels[levelIdx] = LevelByte(mag);
+            }
+
+            int dcMag = Math.Abs(signedLevels[0]);
+            int dcCtx = Av1CoeffDecode.GetLoCtx(levels, cls, out uint dcHiMag, -1, 0, 0, stride);
+            int dcTokBase = Math.Min(dcMag, 3);
+            w.EncodeSymbolAdapt(coef.BaseTok[baseTokIdx + dcCtx], dcTokBase, 3);
+            if (dcTokBase == 3)
+            {
+                uint mg = dcHiMag & 63;
+                EncodeHiTok(w, coef.BrTok[brTokIdx + (int)(mg > 12 ? 6u : (mg + 1) >> 1)], dcMag);
+            }
+
+            if (dcMag != 0)
+                EncodeSignAndGolomb(w, coef.DcSign[dcSignCtx], adaptSign: true, signedLevels[0], dcMag);
+            for (int i = 1; i <= eob; i++)
+            {
+                int rcI = Rc1d(i, cls, shift, shift2, mask);
+                int mag = Math.Abs(signedLevels[rcI]);
+                if (mag != 0) EncodeSignAndGolomb(w, default, adaptSign: false, signedLevels[rcI], mag);
+            }
+        }
+        else
+        {
+            int dcMag = Math.Abs(signedLevels[0]);
+            int tokBr = Math.Min(dcMag, 3) - 1;
+            w.EncodeSymbolAdapt(coef.EobBaseTok[eobBaseTokIdx + 0], tokBr, 2);
+            if (tokBr == 2) EncodeHiTok(w, coef.BrTok[brTokIdx + 0], dcMag);
+            EncodeSignAndGolomb(w, coef.DcSign[dcSignCtx], adaptSign: true, signedLevels[0], dcMag);
+        }
+    }
+
     // ---- Rate estimation: bit cost of coding a coefficient block from the CURRENT CDF probabilities, without
     // encoding or adapting. A faithful mirror of EncodeCoefs used by the encoder's rate-distortion decisions.
 
@@ -380,7 +489,7 @@ internal static class Av1CoeffEncode
 
     /// <summary>Encodes the EOB bin symbol (size-dependent CDF) plus the hi-bit and extra bits for eob ≥ 2.
     /// Inverse of DecodeEobBin + the reconstruction block in DecodeCoefs.</summary>
-    private static void EncodeEob(Av1MsacWriter w, Av1CdfCoefContext coef, int chroma, int tx2dSzCtx, int txCtx, int eob)
+    private static void EncodeEob(Av1MsacWriter w, Av1CdfCoefContext coef, int chroma, int tx2dSzCtx, int txCtx, int eob, int is1d = 0)
     {
         // eob (scan index of last nonzero) → eob_pt bin.
         int eobPt;
@@ -394,7 +503,6 @@ internal static class Av1CoeffEncode
             eobPt = eobBin + 2;
         }
 
-        int is1d = 0; // TwoD
         switch (tx2dSzCtx)
         {
             case 0: w.EncodeSymbolAdapt(coef.EobBin16[chroma * 2 + is1d], eobPt, 4 + 0); break;
