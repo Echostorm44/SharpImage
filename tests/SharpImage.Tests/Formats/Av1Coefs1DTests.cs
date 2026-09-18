@@ -13,13 +13,17 @@ public sealed class Av1Coefs1DTests
     [Test]
     [Arguments(0)] // TX_4X4
     [Arguments(1)] // TX_8X8
+    [Arguments(5)] // TX_4X8
+    [Arguments(6)] // TX_8X4
+    [Arguments(7)] // TX_8X16
+    [Arguments(8)] // TX_16X8
     public async Task VDct_HDct_CoeffRoundTrip(int tx)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
         int slw = Math.Min((int)tDim.Lw, 5), slh = Math.Min((int)tDim.Lh, 5);
         int area = (4 << slw) * (4 << slh);
         int cfLen = Av1Tables.Scans[tx].Length;
-        int bs = tx == 0 ? (int)Av1BlockSize.Bs4x4 : (int)Av1BlockSize.Bs8x8;
+        int bs = (int)Av1BlockSize.Bs16x16; // any block whose skip ctx is computed identically on both sides
         int shiftH = slh + 2, maskH = (4 << slh) - 1;                 // Horizontal geometry
         int shiftV = slw + 2, shift2V = slh + 2, maskV = (4 << slw) - 1; // Vertical geometry
         var dq = new ushort[] { 1, 1 };
