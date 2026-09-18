@@ -19,7 +19,7 @@ internal static class Av1FwdTransform
 {
     // Which 1D transform each axis of a 2D type uses, as (horizontal/row, vertical/col) — mirrors the decoder's
     // Tx1dTypes. The reduced intra set is {Identity(IDTX), DctDct, AdstAdst, AdstDct, DctAdst} (no FlipAdst).
-    internal enum FwdTxType { DctDct, AdstAdst, AdstDct, DctAdst, Identity }
+    internal enum FwdTxType { DctDct, AdstAdst, AdstDct, DctAdst, Identity, VDct, HDct }
 
     // Universal forward-quant scale for the orthonormal path: 2^dqShift / G_dec == 8 for all square DCT sizes.
     private const double QuantScaleK = 8.0;
@@ -66,6 +66,8 @@ internal static class Av1FwdTransform
         FwdTxType.AdstAdst => (Av1InvTransform.Type1dAdst, Av1InvTransform.Type1dAdst),
         FwdTxType.AdstDct => (Av1InvTransform.Type1dDct, Av1InvTransform.Type1dAdst),   // ADST_DCT: H=Dct, V=Adst
         FwdTxType.DctAdst => (Av1InvTransform.Type1dAdst, Av1InvTransform.Type1dDct),   // DCT_ADST: H=Adst, V=Dct
+        FwdTxType.VDct => (Av1InvTransform.Type1dIdentity, Av1InvTransform.Type1dDct), // V_DCT: col=Dct, row=Identity
+        FwdTxType.HDct => (Av1InvTransform.Type1dDct, Av1InvTransform.Type1dIdentity), // H_DCT: row=Dct, col=Identity
         _ => (Av1InvTransform.Type1dIdentity, Av1InvTransform.Type1dIdentity),          // IDTX: identity both axes
     };
 
