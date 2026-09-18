@@ -28,7 +28,8 @@ internal static class Av1CoeffEncode
         ReadOnlySpan<int> signedLevels,
         int skipCtx = 0,
         int dcSignCtx = 0,
-        int txTypeIdx = 1)
+        int txTypeIdx = 1,
+        bool fullSet = false)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
 
@@ -73,7 +74,12 @@ internal static class Av1CoeffEncode
         const int intra = 1;
         if (chroma == 0 && tDim.Max + intra < (int)Av1TxSize.Tx64x64)
         {
-            w.EncodeSymbolAdapt(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], txTypeIdx, 4);
+            // Full intra set (reduced_tx_set=0): sub-16x16 luma codes the 7-type Intra1 symbol; larger tx and the
+            // reduced set code the 5-type Intra2 symbol. The caller passes the Intra2 index; map it to Intra1 here.
+            if (fullSet && tDim.Min < (int)Av1TxSize.Tx16x16)
+                w.EncodeSymbolAdapt(modeCdf.TxtpIntra1[tDim.Min * 13 + yMode], Intra2ToIntra1(txTypeIdx), 6);
+            else
+                w.EncodeSymbolAdapt(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], txTypeIdx, 4);
         }
 
         // --- EOB bin + extra bits ---
@@ -172,6 +178,10 @@ internal static class Av1CoeffEncode
             EncodeSignAndGolomb(w, coef.DcSign[chroma * 3 + dcSignCtx], adaptSign: true, signedLevels[0], dcMag);
         }
     }
+
+    // Map a reduced-set (Intra2) tx-type index to its full-set (Intra1) index.
+    // Intra2 {Identity,DctDct,AdstAdst,AdstDct,DctAdst}=0..4 -> Intra1 {..,VDct,HDct,..}=0,1,4,5,6.
+    private static int Intra2ToIntra1(int idx) => idx switch { 0 => 0, 1 => 1, 2 => 4, 3 => 5, 4 => 6, _ => 1 };
 
     // Index of a 1D-DCT tx type within the full Intra1 set (TxTypesPerSet offset 5:
     // {Identity,DctDct,VDct,HDct,AdstAdst,AdstDct,DctAdst}). Only VDct/HDct reach this path.
@@ -282,6 +292,98 @@ internal static class Av1CoeffEncode
         }
     }
 
+    /// <summary>Estimated bit cost of a 1D-class (V_DCT/H_DCT) block — the no-side-effect mirror of EncodeCoefs1D,
+    /// for the tx-type RD search. Scoped to square tx (4x4/8x8) as EncodeCoefs1D.</summary>
+    internal static double EstimateCoefBits1D(Av1CdfCoefContext coef, Av1CdfModeContext modeCdf,
+        int tx, int yMode, Av1TxType txtp, ReadOnlySpan<int> signedLevels, int skipCtx, int dcSignCtx)
+    {
+        ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
+        var cls = (Av1TxClass)Av1Tables.TxTypeClass[(int)txtp];
+        int cdfIdx = tDim.Ctx * 13 + skipCtx;
+        int slw = Math.Min((int)tDim.Lw, (int)Av1TxSize.Tx32x32);
+        int slh = Math.Min((int)tDim.Lh, (int)Av1TxSize.Tx32x32);
+        int tx2dSzCtx = slw + slh;
+        const int stride = 16;
+        int shift, shift2 = 0, mask;
+        if (cls == Av1TxClass.Horizontal) { shift = slh + 2; mask = (4 << slh) - 1; }
+        else { shift = slw + 2; shift2 = slh + 2; mask = (4 << slw) - 1; }
+        int area = (4 << slw) * (4 << slh);
+
+        int eob = -1;
+        for (int i = area - 1; i >= 0; i--)
+            if (signedLevels[Rc1d(i, cls, shift, shift2, mask)] != 0) { eob = i; break; }
+
+        if (eob < 0) return BoolBits(coef.CoefSkip[cdfIdx][0], 1);
+        double bits = BoolBits(coef.CoefSkip[cdfIdx][0], 0);
+        bits += SymBits(modeCdf.TxtpIntra1[tDim.Min * 13 + yMode], Intra1Index(txtp));
+
+        // EOB (is1d=1)
+        int eobPt = eob <= 1 ? eob : (31 - BitOperations.LeadingZeroCount((uint)eob) - 1) + 2;
+        ReadOnlySpan<ushort> eobCdf = tx2dSzCtx switch
+        {
+            0 => coef.EobBin16[1], 1 => coef.EobBin32[1], 2 => coef.EobBin64[1],
+            3 => coef.EobBin128[1], 4 => coef.EobBin256[1], 5 => coef.EobBin512[0], _ => coef.EobBin1024[0],
+        };
+        bits += SymBits(eobCdf, eobPt);
+        if (eob > 1)
+        {
+            int eb = eobPt - 2, hi = (eob >> eb) & 1;
+            bits += BoolBits(coef.EobHiBit[tDim.Ctx * 2 * 9 + eb][0], (uint)hi);
+            if (eb > 0) bits += eb;
+        }
+
+        int eobBaseTokIdx = tDim.Ctx * 2 * 4;
+        int baseTokIdx = tDim.Ctx * 2 * 41;
+        int brTokIdx = Math.Min((int)tDim.Ctx, 3) * 2 * 21;
+        var levels = new byte[stride * 20];
+
+        if (eob != 0)
+        {
+            int xE = eob & mask, yE = eob >> shift, rcEob = Rc1d(eob, cls, shift, shift2, mask), magEob = Math.Abs(signedLevels[rcEob]);
+            uint ctx = (uint)(1 + (eob > (2 << tx2dSzCtx) ? 1 : 0) + (eob > (4 << tx2dSzCtx) ? 1 : 0));
+            bits += SymBits(coef.EobBaseTok[eobBaseTokIdx + ctx], Math.Min(magEob, 3) - 1);
+            if (Math.Min(magEob, 3) - 1 == 2) bits += HiTokBits(coef.BrTok[brTokIdx + (yE != 0 ? 14 : 7)], magEob);
+            levels[xE * stride + yE] = LevelByte(magEob);
+
+            for (int i = eob - 1; i > 0; i--)
+            {
+                int x = i & mask, y = i >> shift, levelIdx = x * stride + y, mag = Math.Abs(signedLevels[Rc1d(i, cls, shift, shift2, mask)]);
+                int loCtx = Av1CoeffDecode.GetLoCtx(levels.AsSpan(levelIdx), cls, out uint hiMag, -1, x, y, stride);
+                int tok = Math.Min(mag, 3);
+                bits += SymBits(coef.BaseTok[baseTokIdx + loCtx], tok);
+                if (tok == 3)
+                {
+                    hiMag &= 63;
+                    int hiCtx = (int)((y > 0 ? 14u : 7u) + (hiMag > 12 ? 6u : (uint)(hiMag + 1) >> 1));
+                    bits += HiTokBits(coef.BrTok[brTokIdx + hiCtx], mag);
+                }
+                levels[levelIdx] = LevelByte(mag);
+            }
+
+            int dcMag = Math.Abs(signedLevels[0]);
+            int dcCtx = Av1CoeffDecode.GetLoCtx(levels, cls, out uint dcHiMag, -1, 0, 0, stride);
+            int dcTokBase = Math.Min(dcMag, 3);
+            bits += SymBits(coef.BaseTok[baseTokIdx + dcCtx], dcTokBase);
+            if (dcTokBase == 3) { uint mg = dcHiMag & 63; bits += HiTokBits(coef.BrTok[brTokIdx + (int)(mg > 12 ? 6u : (mg + 1) >> 1)], dcMag); }
+
+            if (dcMag != 0) { bits += BoolBits(coef.DcSign[dcSignCtx][0], signedLevels[0] < 0 ? 1u : 0u); if (dcMag >= 15) bits += GolombBits((uint)(dcMag - 15)); }
+            for (int i = 1; i <= eob; i++)
+            {
+                int mag = Math.Abs(signedLevels[Rc1d(i, cls, shift, shift2, mask)]);
+                if (mag != 0) { bits += 1; if (mag >= 15) bits += GolombBits((uint)(mag - 15)); }
+            }
+        }
+        else
+        {
+            int dcMag = Math.Abs(signedLevels[0]);
+            bits += SymBits(coef.EobBaseTok[eobBaseTokIdx + 0], Math.Min(dcMag, 3) - 1);
+            if (Math.Min(dcMag, 3) - 1 == 2) bits += HiTokBits(coef.BrTok[brTokIdx + 0], dcMag);
+            bits += BoolBits(coef.DcSign[dcSignCtx][0], signedLevels[0] < 0 ? 1u : 0u);
+            if (dcMag >= 15) bits += GolombBits((uint)(dcMag - 15));
+        }
+        return bits;
+    }
+
     // ---- Rate estimation: bit cost of coding a coefficient block from the CURRENT CDF probabilities, without
     // encoding or adapting. A faithful mirror of EncodeCoefs used by the encoder's rate-distortion decisions.
 
@@ -308,7 +410,7 @@ internal static class Av1CoeffEncode
     /// <summary>Estimated bit cost of coding one 2D transform block's coefficients with the given contexts, from
     /// the current CDF probabilities (no side effects). Mirrors EncodeCoefs symbol-for-symbol.</summary>
     internal static double EstimateCoefBits(Av1CdfCoefContext coef, Av1CdfModeContext modeCdf, int tx, int chroma,
-        int yMode, ReadOnlySpan<int> signedLevels, int skipCtx, int dcSignCtx, int txTypeIdx)
+        int yMode, ReadOnlySpan<int> signedLevels, int skipCtx, int dcSignCtx, int txTypeIdx, bool fullSet = false)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
         int cdfIdx = tDim.Ctx * 13 + skipCtx;
@@ -326,7 +428,9 @@ internal static class Av1CoeffEncode
 
         const int intra = 1;
         if (chroma == 0 && tDim.Max + intra < (int)Av1TxSize.Tx64x64)
-            bits += SymBits(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], txTypeIdx);
+            bits += (fullSet && tDim.Min < (int)Av1TxSize.Tx16x16)
+                ? SymBits(modeCdf.TxtpIntra1[tDim.Min * 13 + yMode], Intra2ToIntra1(txTypeIdx))
+                : SymBits(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], txTypeIdx);
 
         // EOB bin + hi-bit + extra bits
         {

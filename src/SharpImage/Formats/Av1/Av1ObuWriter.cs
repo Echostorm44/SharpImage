@@ -158,7 +158,7 @@ internal static class Av1ObuWriter
     /// superblocks, coded as a single tile (uniform spacing, log2 tile dims 0). <paramref name="monochrome"/>
     /// selects whether the U/V quant-delta bits are emitted. <paramref name="txModeSelect"/> enables per-block
     /// tx-size signalling (TX_MODE_SELECT) — the encoder must then code a tx_depth symbol per block.</summary>
-    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef, int lfLevel = 0, bool screenContentTools = false)
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef, int lfLevel = 0, bool screenContentTools = false, bool reducedTxSet = true)
     {
         if (baseQIdx <= 0 || baseQIdx > 255)
         {
@@ -250,7 +250,7 @@ internal static class Av1ObuWriter
         w.PutBool(txModeSelect);  // tx_mode_select: 0 ⇒ TX_MODE_LARGEST, 1 ⇒ TX_MODE_SELECT
 
         // frame_reference_mode / skip_mode / warp skipped (intra)
-        w.PutBool(true);          // reduced_tx_set = 1
+        w.PutBool(reducedTxSet);  // reduced_tx_set (0 = full Intra1 set with V_DCT/H_DCT for sub-16x16 luma)
 
         // global_motion skipped (intra); film_grain skipped (not present)
 
