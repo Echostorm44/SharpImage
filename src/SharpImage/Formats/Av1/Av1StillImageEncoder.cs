@@ -2431,13 +2431,13 @@ internal static class Av1StillImageEncoder
     // filter-intra re-sweep (2026-09-16): filter improves prediction, so residuals are smaller and more aggressive
     // coefficient trimming wins (-0.46% BD-rate, clean 5/6; the knee — 36=-0.44, 40=-0.46, 45=-0.41 vs 25).
     // RdLambdaK stayed 0.002 and DeadzoneBias stayed 0.04 (both re-confirmed optimal in the same sweep).
-    internal static double RdoqLambdaScale = 40.0;
+    internal static double RdoqLambdaScale = 50.0;
 
     // Chroma coefficient RDOQ in the square colour leaf (EncodeLeafBlockColor). Chroma was previously coded at
     // round-to-nearest with no rate-distortion trimming, running measurably richer than luma at matched rate;
     // this applies the same RDOQ to U/V. Scale kept equal to luma initially, tuned against the RD benchmark.
     internal static bool UseChromaRdoq = true;
-    internal static double ChromaRdoqLambdaScale = 40.0;   // raised 25->40 with luma in the filter-intra re-sweep
+    internal static double ChromaRdoqLambdaScale = 50.0;   // 25->40 (filter-intra re-sweep) ->50 (re-swept after UV modes + full tx set: gap -0.85%)
 
     // Enables PARTITION_HORZ / PARTITION_VERT rectangular leaves at 16x16 (colour path). Toggle for A/B testing.
     internal static bool UseRectPartition = true;
