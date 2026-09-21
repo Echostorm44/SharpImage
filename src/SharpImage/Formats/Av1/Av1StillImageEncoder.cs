@@ -2421,7 +2421,11 @@ internal static class Av1StillImageEncoder
     // the candidate decision, so RdLambdaK now serves triple duty: SATD prescreen √λ, candidate selection λ, and
     // RDOQ scale·λ): 0.003->0.002 adds -0.39% BD-rate (piechart/mountains/logo win; granite +1.6% but we already
     // beat libaom there by 2.6%). RdoqLambdaScale stays 25 (dropping to 20 regressed +0.64%).
-    internal static double RdLambdaK = 0.002;
+    // Re-swept AGAIN 2026-09-21 after this session's prediction gains (CfL, directional UV modes, full intra tx set):
+    // the residual statistics shifted the base-λ optimum DOWN, 0.002->0.00125 = -1.02% BD-rate (clean minimum:
+    // 0.0011->+7.84, 0.00125->+7.59, 0.00135->+8.01; RdoqLambdaScale 50 re-confirmed, 65/80 worse). Better
+    // prediction ⇒ keeping more residual detail (lower λ) wins.
+    internal static double RdLambdaK = 0.00125;
 
     // Extra multiplier on the RDOQ lambda relative to the partition lambda. The partition lambda is tuned for
     // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
