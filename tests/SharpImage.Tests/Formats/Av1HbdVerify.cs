@@ -62,6 +62,46 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
     }
 
+    // Chroma-layout verification (trigger hbd_layout.txt): 4:4:4 and 4:2:2 at 8/10/12-bit, same dumps as Run().
+    [Test, NotInParallel]
+    public void Layouts()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_layout.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string outDir = Path.Combine(Scratch, "hbd_layout");
+        Directory.CreateDirectory(outDir);
+        string assets = Path.Combine(AppContext.BaseDirectory, "TestAssets");
+        var sources = new System.Collections.Generic.List<(string Name, ImageFrame Img)>();
+        foreach (var (file, name) in new[] { ("sample1.dng", "dng"), ("RAW_SONY_A700.ARW", "arw") })
+        {
+            var full = FormatRegistry.Read(Path.Combine(assets, file));
+            int cw = Math.Min(384, (int)full.Columns), ch = Math.Min(256, (int)full.Rows);
+            sources.Add((name, Geometry.Crop(full, ((int)full.Columns - cw) / 2, ((int)full.Rows - ch) / 2, cw, ch)));
+        }
+        sources.Add(("grad", Gradient(257, 131, alpha: false, gray: false)));
+        sources.Add(("rgba", Gradient(160, 96, alpha: true, gray: false)));
+        var log = new System.Text.StringBuilder();
+        foreach (var (name, img) in sources)
+        {
+            File.WriteAllBytes(Path.Combine(outDir, $"{name}.src.rgb48"), Rgb48(img));
+            foreach (var (lay, tag) in new[] { (AvifChromaSubsampling.Yuv444, "444"), (AvifChromaSubsampling.Yuv422, "422") })
+                foreach (int bd in new[] { 8, 10, 12 })
+                    foreach (int qp in new[] { 10, 28 })
+                    {
+                        string stem = $"{name}_{tag}_b{bd}_q{qp}";
+                        byte[] avif = HeifCoder.EncodeAvif(img, new AvifEncodeOptions { Qp = qp, BitDepth = bd, ChromaSubsampling = lay });
+                        File.WriteAllBytes(Path.Combine(outDir, stem + ".avif"), avif);
+                        if (!img.HasAlpha) Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(outDir, stem + ".ours.yuv"));
+                        var dec = HeifCoder.Decode(avif);
+                        Environment.SetEnvironmentVariable("AV1_DUMP10", null);
+                        File.WriteAllBytes(Path.Combine(outDir, stem + ".ours.rgb48"), Rgb48(dec));
+                        log.AppendLine($"{stem} {img.Columns}x{img.Rows} bytes={avif.Length}");
+                    }
+        }
+        File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
+    }
+
     // Decodes externally produced AVIFs (e.g. libavif references) listed one path per line in hbd_decode.txt,
     // writing our HeifCoder 16-bit RGB(A) (.ours.rgb48) and our decoder's native planes (.ours.yuv) beside each.
     [Test, NotInParallel]

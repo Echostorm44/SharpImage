@@ -128,6 +128,10 @@ internal static class Av1FwdTransform
     internal static int[] ForwardQuantRect(ReadOnlySpan<int> residual, int w, int h, int txSizeIdx,
         int dcDq, int acDq, int rcCount, FwdTxType txType, double[]? qfOut)
     {
+        // 64-point axes zero their upper 32 inputs, so the probed matrix is singular — TX_64X64 uses the square
+        // orthonormal path (DCT_DCT is the only type there).
+        if (w == 64 && h == 64)
+            return ForwardQuantSquare(residual, 64, dcDq, acDq, rcCount, QuantScaleK, qfOut);
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[txSizeIdx];
         int logW = tDim.Lw, logH = tDim.Lh;
         (int hType, int vType) = AxisTypes(txType);

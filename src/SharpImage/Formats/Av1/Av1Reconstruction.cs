@@ -1424,7 +1424,7 @@ public static class Av1Reconstruction
     /// Computes AC component from reconstructed luma for CFL prediction.
     /// Port of dav1d cfl_ac_c (ipred_tmpl.c).
     /// </summary>
-    private static void ComputeCflAc(
+    internal static void ComputeCflAc(
         Span<short> ac, ReadOnlySpan<ushort> ySrc, int yStride,
         int cw, int ch, int ssHor, int ssVer,
         int wPad, int hPad)

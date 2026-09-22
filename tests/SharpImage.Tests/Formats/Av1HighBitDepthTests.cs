@@ -109,6 +109,65 @@ public sealed class Av1HighBitDepthTests
         await Assert.That(eh).IsLessThan(e8);
     }
 
+    // 4:4:4 (High profile; Professional at 12-bit) and 4:2:2 (Professional): av1C profile + subsampling bits,
+    // the AVIF profile brand (MA1A only for High), and a round trip that keeps full-resolution chroma.
+    [Test]
+    [Arguments(AvifChromaSubsampling.Yuv444, 8)]
+    [Arguments(AvifChromaSubsampling.Yuv444, 10)]
+    [Arguments(AvifChromaSubsampling.Yuv444, 12)]
+    [Arguments(AvifChromaSubsampling.Yuv422, 8)]
+    [Arguments(AvifChromaSubsampling.Yuv422, 10)]
+    [Arguments(AvifChromaSubsampling.Yuv422, 12)]
+    public async Task ChromaLayouts_SignalledAndRoundTrip(AvifChromaSubsampling layout, int bd)
+    {
+        var src = ChromaStripes(131, 70, alpha: bd == 10);   // odd dims; alpha exercises the 2-item path
+        byte[] avif = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = 4, BitDepth = bd, ChromaSubsampling = layout });
+        bool i444 = layout == AvifChromaSubsampling.Yuv444;
+        int b = Av1CByte2(avif);
+        await Assert.That((b & 0x08) != 0).IsEqualTo(!i444);   // chroma_subsampling_x
+        await Assert.That((b & 0x04) != 0).IsFalse();          // chroma_subsampling_y (4:2:0 only)
+        await Assert.That(Av1C(avif).Profile).IsEqualTo(i444 && bd < 12 ? 1 : 2);
+        await Assert.That(HasBrand(avif, "MA1A")).IsEqualTo(i444 && bd < 12);
+        await Assert.That(HasBrand(avif, "MA1B")).IsFalse();
+
+        var dec = HeifCoder.Decode(avif);
+        await Assert.That((int)dec.Columns).IsEqualTo(131);
+        await Assert.That(dec.HasAlpha).IsEqualTo(bd == 10);
+        double e = Rmse16(src, dec, 3) / 257.0;
+        System.Console.WriteLine($"[Layout] {layout} bd={bd} rmse8={e:F2}");
+        // 1-px colour rows: 4:2:0 halves chroma vertically and loses them; 4:2:2 and 4:4:4 keep full chroma rows.
+        var d420 = HeifCoder.Decode(HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = 4, BitDepth = bd }));
+        await Assert.That(e).IsLessThan(Rmse16(src, d420, 3) / 257.0 * 0.5);
+    }
+
+    // Alternating red/blue rows (plus a slow horizontal ramp) — chroma detail at 1-px vertical pitch.
+    private static ImageFrame ChromaStripes(int w, int h, bool alpha)
+    {
+        var f = new ImageFrame();
+        f.Initialize(w, h, ColorspaceType.SRGB, alpha);
+        int ch = f.NumberOfChannels;
+        for (int y = 0; y < h; y++)
+        {
+            var row = f.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                bool cy = (y & 1) != 0;
+                row[x * ch] = (ushort)(cy ? 52000 : 14000);
+                row[x * ch + 1] = (ushort)(30000 + x * 100);
+                row[x * ch + 2] = (ushort)(cy ? 14000 : 52000);
+                if (alpha) row[x * ch + 3] = (ushort)(65535 - x * 200);
+            }
+        }
+        return f;
+    }
+
+    private static int Av1CByte2(byte[] avif)
+    {
+        for (int i = 0; i + 8 < avif.Length; i++)
+            if (avif[i] == 'a' && avif[i + 1] == 'v' && avif[i + 2] == '1' && avif[i + 3] == 'C') return avif[i + 6];
+        throw new System.InvalidOperationException("no av1C");
+    }
+
     [Test]
     public async Task HighBitDepth_Gray_And_Alpha()
     {

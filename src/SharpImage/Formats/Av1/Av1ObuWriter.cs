@@ -19,14 +19,17 @@ internal static class Av1ObuWriter
         public readonly bool Monochrome;
         public readonly bool EnableFilterIntra;
         public readonly int BitDepth;   // 8, 10 or 12
+        public readonly Av1PixelLayout Layout; // chroma layout of a colour stream (ignored when Monochrome)
 
-        public SeqConfig(int width, int height, bool monochrome, bool enableFilterIntra = false, int bitDepth = 8)
+        public SeqConfig(int width, int height, bool monochrome, bool enableFilterIntra = false, int bitDepth = 8,
+            Av1PixelLayout layout = Av1PixelLayout.I420)
         {
             Width = width;
             Height = height;
             Monochrome = monochrome;
             EnableFilterIntra = enableFilterIntra;
             BitDepth = bitDepth;
+            Layout = monochrome ? Av1PixelLayout.I400 : layout;
         }
     }
 
@@ -71,9 +74,12 @@ internal static class Av1ObuWriter
         return n < 1 ? 1 : n;
     }
 
-    /// <summary>AV1 seq_profile for a configuration: 12-bit requires Professional (2); 8/10-bit 4:2:0 and
-    /// monochrome are Main (0).</summary>
-    internal static int SeqProfile(in SeqConfig cfg) => cfg.BitDepth == 12 ? 2 : 0;
+    /// <summary>AV1 seq_profile (spec Annex A): Main (0) = 8/10-bit 4:2:0 + monochrome; High (1) = 8/10-bit 4:4:4;
+    /// Professional (2) = 4:2:2 at any depth and every 12-bit format.</summary>
+    internal static int SeqProfile(in SeqConfig cfg) => SeqProfile(cfg.BitDepth, cfg.Layout);
+
+    internal static int SeqProfile(int bitDepth, Av1PixelLayout layout) =>
+        bitDepth == 12 || layout == Av1PixelLayout.I422 ? 2 : layout == Av1PixelLayout.I444 ? 1 : 0;
 
     /// <summary>Writes the sequence header OBU payload (no OBU framing). Mirrors Av1ObuParser.ParseSequenceHeader
     /// for the reduced_still_picture_header path.</summary>
@@ -112,7 +118,8 @@ internal static class Av1ObuWriter
         w.PutBool(cfg.BitDepth > 8);                      // high_bitdepth
         if (seqProfile == 2 && cfg.BitDepth > 8)
             w.PutBool(cfg.BitDepth == 12);                // twelve_bit
-        w.PutBool(cfg.Monochrome); // mono_chrome (profile != 1)
+        if (seqProfile != 1)
+            w.PutBool(cfg.Monochrome); // mono_chrome (profile 1 is always colour 4:4:4)
         w.PutBool(false);         // color_description_present_flag = 0 (colours = Unspecified)
 
         if (cfg.Monochrome)
@@ -125,16 +132,19 @@ internal static class Av1ObuWriter
         }
         else
         {
-            // Profile 0, colours Unspecified ⇒ the parser's "else" branch: color_range, then layout=I420
-            // (subsampling_x=subsampling_y=1 implied by profile 0), then chroma_sample_position (2 bits, read
-            // because subX & subY), then separate_uv_delta_q.
+            // Colours Unspecified ⇒ the parser's "else" branch: color_range, then the subsampling (implied 1,1 by
+            // profile 0 and 0,0 by profile 1; profile 2 codes subsampling_x/_y only at 12-bit, else implies 4:2:2),
+            // then chroma_sample_position when subX && subY, then separate_uv_delta_q.
             w.PutBit(1);          // color_range = 1 (full range)
+            int ssX = cfg.Layout == Av1PixelLayout.I444 ? 0 : 1;
+            int ssY = cfg.Layout == Av1PixelLayout.I420 ? 1 : 0;
             if (seqProfile == 2 && cfg.BitDepth == 12)
             {
-                w.PutBit(1);      // subsampling_x = 1 (4:2:0)
-                w.PutBit(1);      // subsampling_y = 1
+                w.PutBit((uint)ssX);                 // subsampling_x
+                if (ssX != 0) w.PutBit((uint)ssY);   // subsampling_y
             }
-            w.PutBits(0, 2);      // chroma_sample_position = Unknown
+            if (ssX != 0 && ssY != 0)
+                w.PutBits(0, 2);  // chroma_sample_position = Unknown
             w.PutBool(false);     // separate_uv_delta_q = 0
         }
 

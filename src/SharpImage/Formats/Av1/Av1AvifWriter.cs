@@ -13,30 +13,32 @@ internal static class Av1AvifWriter
     /// form); it is placed both in av1C configOBUs (for decoders that configure from it) and in-band at the head
     /// of the mdat item data (for decoders that decode the item as a self-contained temporal unit — including
     /// SharpImage's own). <paramref name="frameObu"/> is the OBU_FRAME.</summary>
-    internal static byte[] BuildAvif(byte[] seqObu, byte[] frameObu, int width, int height, bool monochrome, int bitDepth = 8)
+    internal static byte[] BuildAvif(byte[] seqObu, byte[] frameObu, int width, int height, bool monochrome, int bitDepth = 8,
+        Av1PixelLayout layout = Av1PixelLayout.I420)
     {
-        byte[] av1C = BuildAv1C(monochrome, bitDepth);
+        if (monochrome) layout = Av1PixelLayout.I400;
+        byte[] av1C = BuildAv1C(layout, bitDepth);
         // Sequence header + frame OBUs go in-band in mdat (matches libaom/ffmpeg AVIF output and lets any AV1
         // decoder treat the item as a self-contained temporal unit).
         var mdat = new byte[seqObu.Length + frameObu.Length];
         seqObu.CopyTo(mdat, 0);
         frameObu.CopyTo(mdat, seqObu.Length);
-        return BuildIsoBmff(width, height, av1C, mdat, monochrome, bitDepth);
+        return BuildIsoBmff(width, height, av1C, mdat, monochrome, bitDepth, layout);
     }
 
     // AV1CodecConfigurationRecord (av1C payload): the fixed 4-byte record only (configOBUs omitted, as libaom's
     // AVIF output does — the sequence header travels in-band in mdat).
-    private static byte[] BuildAv1C(bool monochrome, int bitDepth)
+    private static byte[] BuildAv1C(Av1PixelLayout layout, int bitDepth)
     {
         // seq_level_idx_0 = 0 (matches Av1ObuWriter's reduced-still header), tier 0. seq_profile / high_bitdepth /
-        // twelve_bit mirror the sequence header's color_config (profile 2 for 12-bit, else 0).
-        int profile = bitDepth == 12 ? 2 : 0;
+        // twelve_bit / subsampling mirror the sequence header's color_config.
+        int profile = Av1ObuWriter.SeqProfile(bitDepth, layout);
         byte b0 = 0x81;                       // marker(1)=1 | version(7)=1
         byte b1 = (byte)(profile << 5);       // seq_profile(3) | seq_level_idx_0(5)=0
-        int monoBit = monochrome ? 1 : 0;
-        // AV1 sets subsampling 1,1 for monochrome (I400); colour here is I420 (also 1,1).
-        int cssX = 1;
-        int cssY = 1;
+        int monoBit = layout == Av1PixelLayout.I400 ? 1 : 0;
+        // AV1 sets subsampling 1,1 for monochrome (I400) and 4:2:0; 4:2:2 is 1,0; 4:4:4 is 0,0.
+        int cssX = layout == Av1PixelLayout.I444 ? 0 : 1;
+        int cssY = layout == Av1PixelLayout.I422 || layout == Av1PixelLayout.I444 ? 0 : 1;
         byte b2 = (byte)(
             (0 << 7) |                        // seq_tier_0
             ((bitDepth > 8 ? 1 : 0) << 6) |   // high_bitdepth
@@ -54,8 +56,9 @@ internal static class Av1AvifWriter
     /// `av01` item (item 2) linked by an `auxl` item reference (item 2 → item 1) with the standard alpha aux URN.
     /// Both items' OBUs share one mdat (colour first, then alpha) as two extents. Verified in ffmpeg/libavif.</summary>
     internal static byte[] BuildAvifWithAlpha(byte[] colorSeq, byte[] colorFrame, byte[] alphaSeq, byte[] alphaFrame,
-        int width, int height, bool colorMonochrome, int bitDepth = 8)
+        int width, int height, bool colorMonochrome, int bitDepth = 8, Av1PixelLayout layout = Av1PixelLayout.I420)
     {
+        if (colorMonochrome) layout = Av1PixelLayout.I400;
         var colorMdat = new byte[colorSeq.Length + colorFrame.Length];
         colorSeq.CopyTo(colorMdat, 0);
         colorFrame.CopyTo(colorMdat, colorSeq.Length);
@@ -63,8 +66,8 @@ internal static class Av1AvifWriter
         alphaSeq.CopyTo(alphaMdat, 0);
         alphaFrame.CopyTo(alphaMdat, alphaSeq.Length);
 
-        byte[] av1CColor = Box("av1C", BuildAv1C(colorMonochrome, bitDepth));
-        byte[] av1CAlpha = Box("av1C", BuildAv1C(true, bitDepth));
+        byte[] av1CColor = Box("av1C", BuildAv1C(layout, bitDepth));
+        byte[] av1CAlpha = Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth));
 
         // ipco properties (1-indexed): 1 ispe (shared), 2 pixi(colour), 3 av1C(colour), 4 colr,
         // 5 av1C(alpha), 6 auxC(alpha URN), 7 pixi(alpha, 1ch).
@@ -116,7 +119,7 @@ internal static class Av1AvifWriter
             return FullBox("meta", 0, 0, metaPayload);
         }
 
-        byte[] ftyp = Ftyp(bitDepth);
+        byte[] ftyp = Ftyp(bitDepth, layout);
 
         int metaLen = MetaWith(0, 0).Length;               // invariant to offset values
         int mdatPayloadOffset = ftyp.Length + metaLen + 8; // +8 mdat box header
@@ -131,15 +134,24 @@ internal static class Av1AvifWriter
     }
 
     // ftyp: major brand avif; compatible avif/mif1/miaf plus the AVIF profile brand the stream qualifies for —
-    // MA1B (Baseline = AV1 Main profile) for 8/10-bit; 12-bit (AV1 Professional) fits no AVIF profile brand, so
-    // none is claimed (as libavif does).
-    private static byte[] Ftyp(int bitDepth) => bitDepth == 12
-        ? Box("ftyp", Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf")))
-        : Box("ftyp", Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"), Fourcc("MA1B")));
-
-    private static byte[] BuildIsoBmff(int width, int height, byte[] av1C, byte[] mdatPayload, bool monochrome, int bitDepth)
+    // MA1B (Baseline = AV1 Main profile), MA1A (Advanced = AV1 High profile, i.e. 8/10-bit 4:4:4); AV1
+    // Professional streams (4:2:2, 12-bit) fit no AVIF profile brand, so none is claimed (as libavif does).
+    private static byte[] Ftyp(int bitDepth, Av1PixelLayout layout)
     {
-        byte[] ftyp = Ftyp(bitDepth);
+        int profile = Av1ObuWriter.SeqProfile(bitDepth, layout);
+        var brands = Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"));
+        return Box("ftyp", profile switch
+        {
+            0 => Concat(brands, Fourcc("MA1B")),
+            1 => Concat(brands, Fourcc("MA1A")),
+            _ => brands,
+        });
+    }
+
+    private static byte[] BuildIsoBmff(int width, int height, byte[] av1C, byte[] mdatPayload, bool monochrome, int bitDepth,
+        Av1PixelLayout layout)
+    {
+        byte[] ftyp = Ftyp(bitDepth, monochrome ? Av1PixelLayout.I400 : layout);
 
         // Property container ipco { ispe, pixi, av1C, colr } — matching libaom/ffmpeg AVIF order so av1C is the
         // 3rd (essential) property.

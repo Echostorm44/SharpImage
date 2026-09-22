@@ -21,6 +21,19 @@ public enum HeifContainerType
     Heic
 }
 
+/// <summary>Chroma subsampling of an encoded AVIF colour image.</summary>
+public enum AvifChromaSubsampling
+{
+    /// <summary>Automatic: 4:2:0 (the most compact and most widely decoded).</summary>
+    Auto,
+    /// <summary>4:2:0 — chroma at half width and half height (AV1 Main profile).</summary>
+    Yuv420,
+    /// <summary>4:2:2 — chroma at half width, full height (AV1 Professional profile).</summary>
+    Yuv422,
+    /// <summary>4:4:4 — full-resolution chroma (AV1 High profile; Professional at 12-bit).</summary>
+    Yuv444,
+}
+
 /// <summary>
 /// Options that control AVIF encoding.
 /// </summary>
@@ -33,6 +46,9 @@ public sealed class AvifEncodeOptions
     /// is exactly representable at 8 bits (e.g. images decoded from 8-bit formats), otherwise 10. 12-bit is coded
     /// with AV1 Professional profile (seq_profile 2).</summary>
     public int BitDepth { get; set; }
+
+    /// <summary>Chroma subsampling for colour images (grayscale images are always coded monochrome).</summary>
+    public AvifChromaSubsampling ChromaSubsampling { get; set; } = AvifChromaSubsampling.Auto;
 }
 
 public static class HeifCoder
@@ -432,7 +448,15 @@ public static class HeifCoder
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
         }
 
-        return bd == 8 ? EncodeAvif8(image, options.Qp) : EncodeAvifHbd(image, options.Qp, bd);
+        var layout = options.ChromaSubsampling switch
+        {
+            AvifChromaSubsampling.Yuv422 => Av1.Av1PixelLayout.I422,
+            AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
+            _ => Av1.Av1PixelLayout.I420,
+        };
+        return bd == 8 && layout == Av1.Av1PixelLayout.I420
+            ? EncodeAvif8(image, options.Qp)
+            : EncodeAvifGeneral(image, options.Qp, bd, layout);
     }
 
     // True when any sample carries more than 8 bits of precision (an 8-bit-origin sample is exactly v8 * 257).
@@ -451,9 +475,10 @@ public static class HeifCoder
         return false;
     }
 
-    // High-bit-depth AVIF encode (10/12-bit): samples are taken straight from the 16-bit quantum at full
-    // precision and coded through the multi-superblock encoder (which handles every size 8..4096).
-    private static byte[] EncodeAvifHbd(ImageFrame image, int qp, int bd)
+    // General AVIF encode (any bit depth, any chroma layout): samples are taken straight from the 16-bit quantum at
+    // full precision and coded through the multi-superblock encoder (which handles every size 8..4096). The 8-bit
+    // 4:2:0 case keeps its original byte path (EncodeAvif8) so its output is unchanged.
+    private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -498,14 +523,14 @@ public static class HeifCoder
         if (hasAlpha && nonOpaque && alpha != null)
         {
             int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
-            RgbToI420Hbd(r, g, b, w, h, bd, out ushort[] yA, out ushort[] uA, out ushort[] vA);
-            return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx, bd);
+            RgbToYuvHbd(r, g, b, w, h, bd, layout, out ushort[] yA, out ushort[] uA, out ushort[] vA);
+            return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx, bd, layout);
         }
 
         if (colour)
         {
-            RgbToI420Hbd(r, g, b, w, h, bd, out ushort[] yP, out ushort[] uP, out ushort[] vP);
-            return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx, bd);
+            RgbToYuvHbd(r, g, b, w, h, bd, layout, out ushort[] yP, out ushort[] uP, out ushort[] vP);
+            return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx, bd, layout);
         }
 
         int max = (1 << bd) - 1;
@@ -514,14 +539,16 @@ public static class HeifCoder
         return Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx, bd);
     }
 
-    // BT.601 full-range RGB -> I420 at an arbitrary bit depth (the same transform as RgbToI420, scaled): chroma is
-    // the rounded mean of each (possibly partial, for odd dims) 2x2 group, offset by 2^(bd-1).
-    private static void RgbToI420Hbd(double[] r, double[] g, double[] b, int w, int h, int bd,
+    // BT.601 full-range RGB -> Y'CbCr at an arbitrary bit depth and chroma layout (the same transform as RgbToI420,
+    // scaled): chroma is the rounded mean of each (possibly partial, for odd dims) subsampling group — 2x2 for 4:2:0,
+    // horizontal pairs for 4:2:2, single samples for 4:4:4 — offset by 2^(bd-1).
+    private static void RgbToYuvHbd(double[] r, double[] g, double[] b, int w, int h, int bd, Av1.Av1PixelLayout layout,
         out ushort[] y, out ushort[] u, out ushort[] v)
     {
         int max = (1 << bd) - 1;
         double mid = 1 << (bd - 1);
-        int cw = (w + 1) >> 1, chh = (h + 1) >> 1;
+        int ssX = layout == Av1.Av1PixelLayout.I444 ? 0 : 1, ssY = layout == Av1.Av1PixelLayout.I420 ? 1 : 0;
+        int cw = (w + ssX) >> ssX, chh = (h + ssY) >> ssY;
         y = new ushort[w * h];
         u = new ushort[cw * chh];
         v = new ushort[cw * chh];
@@ -535,7 +562,7 @@ public static class HeifCoder
                 int i = yy * w + xx;
                 double rr = r[i], gg = g[i], bb = b[i];
                 y[i] = (ushort)Math.Clamp((int)Math.Round(0.299 * rr + 0.587 * gg + 0.114 * bb), 0, max);
-                int ci = (yy >> 1) * cw + (xx >> 1);
+                int ci = (yy >> ssY) * cw + (xx >> ssX);
                 uf[ci] += -0.168736 * rr - 0.331264 * gg + 0.5 * bb + mid;
                 vf[ci] += 0.5 * rr - 0.418688 * gg - 0.081312 * bb + mid;
                 cnt[ci]++;
@@ -915,6 +942,14 @@ public static class HeifCoder
     private static void ConvertYuvToRgbLibavif(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
         bool monochrome, int matrixCoeffs, bool fullRange, int ssHor, int ssVer)
     {
+        // 8-bit colour goes through libyuv in libavif (its default build), whose fixed-point math differs from the
+        // float path by up to 2 levels — use the exact port so we decode what libavif decodes.
+        if (yuv.BitDepth == 8 && !monochrome && LibyuvConstants(matrixCoeffs, fullRange) is { } k)
+        {
+            ConvertYuvToRgbLibyuv8(yuv, frame, w, h, channels, k, ssHor, ssVer);
+            return;
+        }
+
         int bd = yuv.BitDepth, maxCh = (1 << bd) - 1;
         bool hbd = bd > 8;
         float rangeY = fullRange ? maxCh : 219 << (bd - 8), biasY = fullRange ? 0 : 16 << (bd - 8);
@@ -977,6 +1012,100 @@ public static class HeifCoder
                 }
             }
         }
+    }
+
+    // libyuv YuvConstants (row_common.cc, default build: UB clamped to 128 for limited range) as libavif's
+    // getLibYUVConstants selects them: (YG, YB, UB, UG, VG, VR). Null where libavif falls back to its float path.
+    private static (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr)? LibyuvConstants(int mc, bool fullRange) => (mc, fullRange) switch
+    {
+        (5 or 6 or 2, true) => (16320, 32, 113, 22, 46, 90),        // JPEG
+        (1, true) => (16320, 32, 119, 12, 30, 101),                 // F709
+        (9, true) => (16320, 32, 120, 11, 37, 94),                  // V2020
+        (5 or 6 or 2, false) => (18997, -1160, 128, 25, 52, 102),   // I601
+        (1, false) => (18997, -1160, 128, 14, 34, 115),             // H709
+        (9, false) => (19003, -1160, 128, 12, 42, 107),             // 2020
+        _ => null,
+    };
+
+    // libyuv 8-bit YUV->RGB as libavif calls it (AUTOMATIC upsampling => the *MatrixFilter bilinear variants):
+    // chroma upsampled per row by ScaleRowUp2_Linear_Any (4:2:2) / ScaleRowUp2_Bilinear_Any (4:2:0, first/last
+    // row linear), then the x86 CALC_RGB16 fixed-point pixel, >> 6, clamp. Result is 8-bit, widened by 257.
+    private static void ConvertYuvToRgbLibyuv8(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
+        (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr) k, int ssHor, int ssVer)
+    {
+        ReadOnlySpan<byte> yp = yuv.YPlane.Span, up = yuv.UPlane.Span, vp = yuv.VPlane.Span;
+        int ys = yuv.YStride, us = yuv.UStride, vs = yuv.VStride;
+        var ur = new byte[w]; var vr = new byte[w]; var ur2 = new byte[w]; var vr2 = new byte[w];
+
+        if (ssHor == 0)
+        {
+            for (int j = 0; j < h; j++) LibyuvRow(frame, yp.Slice(j * ys, w), j, up.Slice(j * us, w).ToArray(), vp.Slice(j * vs, w).ToArray(), w, channels, k);
+            return;
+        }
+        if (ssVer == 0)
+        {
+            for (int j = 0; j < h; j++) { UpLinear(up.Slice(j * us), ur, w); UpLinear(vp.Slice(j * vs), vr, w); LibyuvRow(frame, yp.Slice(j * ys, w), j, ur, vr, w, channels, k); }
+            return;
+        }
+        UpLinear(up, ur, w); UpLinear(vp, vr, w); LibyuvRow(frame, yp.Slice(0, w), 0, ur, vr, w, channels, k);
+        int jj = 1, cj = 0;
+        for (; jj < h - 1; jj += 2, cj++)
+        {
+            UpBilinear(up.Slice(cj * us), up.Slice((cj + 1) * us), ur, ur2, w);
+            UpBilinear(vp.Slice(cj * vs), vp.Slice((cj + 1) * vs), vr, vr2, w);
+            LibyuvRow(frame, yp.Slice(jj * ys, w), jj, ur, vr, w, channels, k); LibyuvRow(frame, yp.Slice((jj + 1) * ys, w), jj + 1, ur2, vr2, w, channels, k);
+        }
+        if ((h & 1) == 0) { UpLinear(up.Slice(cj * us), ur, w); UpLinear(vp.Slice(cj * vs), vr, w); LibyuvRow(frame, yp.Slice((h - 1) * ys, w), h - 1, ur, vr, w, channels, k); }
+    }
+
+    private static void LibyuvRow(ImageFrame frame, ReadOnlySpan<byte> yRow, int j, byte[] u, byte[] v, int w, int channels,
+        (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr) k)
+    {
+        var row = frame.GetPixelRowForWrite(j);
+        for (int i = 0; i < w; i++)
+        {
+            int y1 = (int)((uint)(yRow[i] * 0x0101 * k.Yg) >> 16) + k.Yb;   // x86 CALC_RGB16
+            int ui = u[i] - 128, vi = v[i] - 128;
+            int off = i * channels;
+            row[off] = (ushort)(Math.Clamp((y1 + vi * k.Vr) >> 6, 0, 255) * 257);
+            if (channels >= 3)
+            {
+                row[off + 1] = (ushort)(Math.Clamp((y1 - (ui * k.Ug + vi * k.Vg)) >> 6, 0, 255) * 257);
+                row[off + 2] = (ushort)(Math.Clamp((y1 + ui * k.Ub) >> 6, 0, 255) * 257);
+            }
+        }
+    }
+
+    // libyuv ScaleRowUp2_Linear_Any_C: edge samples copied, interior (3a+b+2)>>2 / (a+3b+2)>>2.
+    private static void UpLinear(ReadOnlySpan<byte> s, byte[] d, int dw)
+    {
+        d[0] = s[0];
+        int ww = (dw - 1) & ~1;
+        for (int x = 0; x < ww / 2; x++)
+        {
+            d[1 + 2 * x] = (byte)((s[x] * 3 + s[x + 1] + 2) >> 2);
+            d[2 + 2 * x] = (byte)((s[x] + s[x + 1] * 3 + 2) >> 2);
+        }
+        d[dw - 1] = s[(dw - 1) / 2];
+    }
+
+    // libyuv ScaleRowUp2_Bilinear_Any_C: two output rows from chroma rows sa/sb; 9/3/3/1 interior, 3/1 edges.
+    private static void UpBilinear(ReadOnlySpan<byte> sa, ReadOnlySpan<byte> sb, byte[] da, byte[] db, int dw)
+    {
+        da[0] = (byte)((3 * sa[0] + sb[0] + 2) >> 2);
+        db[0] = (byte)((sa[0] + 3 * sb[0] + 2) >> 2);
+        int ww = (dw - 1) & ~1;
+        for (int x = 0; x < ww / 2; x++)
+        {
+            int s0 = sa[x], s1 = sa[x + 1], t0 = sb[x], t1 = sb[x + 1];
+            da[1 + 2 * x] = (byte)((s0 * 9 + s1 * 3 + t0 * 3 + t1 + 8) >> 4);
+            da[2 + 2 * x] = (byte)((s0 * 3 + s1 * 9 + t0 + t1 * 3 + 8) >> 4);
+            db[1 + 2 * x] = (byte)((s0 * 3 + s1 + t0 * 9 + t1 * 3 + 8) >> 4);
+            db[2 + 2 * x] = (byte)((s0 + s1 * 3 + t0 * 3 + t1 * 9 + 8) >> 4);
+        }
+        int kk = (dw - 1) / 2;
+        da[dw - 1] = (byte)((3 * sa[kk] + sb[kk] + 2) >> 2);
+        db[dw - 1] = (byte)((sa[kk] + 3 * sb[kk] + 2) >> 2);
     }
 
     private static float S(ReadOnlySpan<byte> p8, ReadOnlySpan<ushort> p16, bool hbd, int k, int maxCh, float[] tab)
