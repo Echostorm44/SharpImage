@@ -701,6 +701,46 @@ internal static class Av1StillImageEncoder
             return;
         }
 
+        // Extended partitions (T-shapes): two quarter-square leaves (bl+1) + one half-rect leaf, in the EXACT
+        // sub-block order + edge availability our decoder uses (Av1Decode TopSplit/BottomSplit/LeftSplit/RightSplit).
+        if (choice >= 4)
+        {
+            var rp = RectLeafParams(bl);
+            if (choice == 4) // PARTITION_HORZ_A: two top quarters, then bottom half
+            {
+                c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.TopSplit, nPart);
+                EncodeLeafBlockColor(c, bl + 1, bx4, by4, hsz, Av1EdgeFlags.AllTrAndBl);
+                EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4, hsz, node.V1);
+                EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4 + hsz, blk4, hsz, node.H1);
+                FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.TopSplit);
+            }
+            else if (choice == 5) // PARTITION_HORZ_B: top half, then two bottom quarters
+            {
+                c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.BottomSplit, nPart);
+                EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4, blk4, hsz, node.H0);
+                EncodeLeafBlockColor(c, bl + 1, bx4, by4 + hsz, hsz, node.V0);
+                EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4 + hsz, hsz, Av1EdgeFlags.None);
+                FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.BottomSplit);
+            }
+            else if (choice == 6) // PARTITION_VERT_A: two left quarters, then right half
+            {
+                c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.LeftSplit, nPart);
+                EncodeLeafBlockColor(c, bl + 1, bx4, by4, hsz, Av1EdgeFlags.AllTrAndBl);
+                EncodeLeafBlockColor(c, bl + 1, bx4, by4 + hsz, hsz, node.H1);
+                EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4 + hsz, by4, hsz, blk4, node.V1);
+                FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.LeftSplit);
+            }
+            else // choice == 7, PARTITION_VERT_B: left half, then two right quarters
+            {
+                c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.RightSplit, nPart);
+                EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4, by4, hsz, blk4, node.V0);
+                EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4, hsz, node.H0);
+                EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4 + hsz, hsz, Av1EdgeFlags.None);
+                FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.RightSplit);
+            }
+            return;
+        }
+
         c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.None, nPart);
         EncodeLeafBlockColor(c, bl, bx4, by4, blk4, node.O);
         FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.None);
@@ -796,11 +836,15 @@ internal static class Av1StillImageEncoder
     {
         // Candidates: NONE and SPLIT always; HORZ/VERT at 32x32/16x16 when rect is enabled AND the block is fully
         // inside the frame (the rect leaves assume in-frame dimensions). For partial blocks only NONE vs SPLIT.
-        Span<int> cands = stackalloc int[4];
+        Span<int> cands = stackalloc int[8];
         int nc = 0; cands[nc++] = 0;
         if (bl < 4) cands[nc++] = 3;   // SPLIT — not at 8x8 (that would be 4x4, unsupported); 8x8 offers NONE/HORZ/VERT
-        if (fullyInside && !UsePalette && (((bl == 2 || bl == 3) && UseRectPartition) || (bl == 4 && UseSub8Partition)))
-        { cands[nc++] = 1; cands[nc++] = 2; }
+        bool rectHere = fullyInside && !UsePalette && (((bl == 2 || bl == 3) && UseRectPartition) || (bl == 4 && UseSub8Partition));
+        if (rectHere) { cands[nc++] = 1; cands[nc++] = 2; }
+        // Extended T-shape partitions (HORZ_A/B, VERT_A/B) at 32x32/16x16 — quarter squares + half rects, all
+        // block sizes we already code. Same in-frame + rect gate; 8x8 has no extended types.
+        if (UseExtPartition && (bl == 2 || bl == 3) && rectHere)
+        { cands[nc++] = 4; cands[nc++] = 5; cands[nc++] = 6; cands[nc++] = 7; }
 
         double lambda = RdLambdaK * c.AcDq * c.AcDq;
         var snap0 = SnapshotRd(c, bx4, by4, blk4);
@@ -2561,6 +2605,11 @@ internal static class Av1StillImageEncoder
     // horizontal/vertical edges (piechart wedges, logo edges) with less residual. When on, the colour path's seq
     // header codes reduced_tx_set=0 and every sub-16x16 luma tx codes the 7-type Intra1 symbol.
     internal static bool UseFullIntraTxSet = true;
+
+    // Extended T-shape partitions (HORZ_A/B, VERT_A/B) at 32x32/16x16 — libaom uses the full 10-type partition set;
+    // we default to the 4 basic ones. These add candidates to the true-RD partition search (quarter squares + half
+    // rects). Byte-exact: the sub-block order + edge availability mirror our decoder's Av1Decode recursion.
+    internal static bool UseExtPartition = true;
 
     // Full-set (Intra1) tx candidates for the square depth-0 luma leaf: the 5 reduced types + V_DCT/H_DCT.
     // Idx is the Intra2 index (mapped to Intra1 at emit time); V/H_DCT carry -1 and route through EncodeCoefs1D.
