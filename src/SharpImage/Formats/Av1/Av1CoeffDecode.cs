@@ -769,7 +769,9 @@ public static class Av1CoeffDecode
 
         if (dbgEntry) AvDbg.W($"[COEF-STEP] #10 post-dcTok dcTok={dcTok} rng={msac.DebugRng}");
 
-        // Residual and sign — dequantization
+        // Residual and sign — dequantization. The quantizer matrix applies only to non-identity-class transform
+        // types (dav1d: qm_tbl = txtp < IDTX ? f->qm[tx][plane] : NULL); callers pass the (tx, plane) candidate.
+        if (txtp >= Av1TxType.Identity) qmTable = ReadOnlySpan<byte>.Empty;
         int dqShift = Math.Max(0, tDim.Ctx - 2);
         int cfMax = ~(~127 << (bitDepth == 8 ? 8 : bitDepth));
         uint culLevel;

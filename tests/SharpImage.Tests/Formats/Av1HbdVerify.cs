@@ -157,6 +157,9 @@ public sealed class Av1HbdVerify
                         sb.AppendLine($"  fh.{ff.Name}={ff.GetValue(fh)}");
             }
         }
+        var ctxF = typeof(Av1Decoder).GetField("ctx", bf)?.GetValue(dec);
+        var tss = ctxF?.GetType().GetField("TileStates")?.GetValue(ctxF) as Av1TileState[];
+        if (tss != null && tss.Length > 0) sb.AppendLine($"tile0 LastQIdx={tss[0].LastQIdx} LastDeltaLf=[{string.Join(",", tss[0].LastDeltaLf)}]");
         // Full header dump (all fields/properties of the sequence + frame header objects).
         foreach (var name in new[] { "frameHdr", "seqHdr" })
         {

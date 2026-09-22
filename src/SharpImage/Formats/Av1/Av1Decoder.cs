@@ -572,6 +572,7 @@ internal sealed class Av1Decoder
         {
             var ts = ctx.TileStates![tileIdx];
             ts.LastQIdx = fh.QuantBaseQIdx;
+            Array.Clear(ts.LastDeltaLf);   // dav1d setup_tile: last_delta_lf = 0
 
             for (int seg = 0; seg < 8; seg++)
             {
@@ -581,26 +582,27 @@ internal sealed class Av1Decoder
                     int segDelta = fh.SegmentationData.Segments[seg].DeltaQ;
                     qIdx = Math.Clamp(qIdx + segDelta, 0, 255);
                 }
-                fh.SegmentationQIdx[seg] = (byte)qIdx;
-
-                // Compute dequant values for each plane
-                // dav1d: dq[seg][0][0] = dc, dq[seg][0][1] = ac for luma
-                int yDcDelta = fh.QuantYDcDelta;
-                int uDcDelta = fh.QuantUDcDelta;
-                int uAcDelta = fh.QuantUAcDelta;
-                int vDcDelta = fh.QuantVDcDelta;
-                int vAcDelta = fh.QuantVAcDelta;
-
-                // Y plane
-                ts.Dq[seg, 0, 0] = (ushort)GetDcDequant(qIdx + yDcDelta, ctx.BitDepth);
-                ts.Dq[seg, 0, 1] = (ushort)GetAcDequant(qIdx, ctx.BitDepth);
-                // U plane
-                ts.Dq[seg, 1, 0] = (ushort)GetDcDequant(qIdx + uDcDelta, ctx.BitDepth);
-                ts.Dq[seg, 1, 1] = (ushort)GetAcDequant(qIdx + uAcDelta, ctx.BitDepth);
-                // V plane
-                ts.Dq[seg, 2, 0] = (ushort)GetDcDequant(qIdx + vDcDelta, ctx.BitDepth);
-                ts.Dq[seg, 2, 1] = (ushort)GetAcDequant(qIdx + vAcDelta, ctx.BitDepth);
+                fh.SegmentationQIdx[seg] = (byte)qIdx;   // frame-level (delta-q ignored, as the spec's tx-set rule wants)
             }
+            FillDequant(ts, fh, fh.QuantBaseQIdx, ctx.BitDepth);
+        }
+    }
+
+    /// <summary>dav1d init_quant_tables: per-segment Y/U/V DC+AC dequantizers for a (possibly delta-q adjusted)
+    /// base qindex. Called at tile start and again whenever a superblock's delta_q changes the qindex.</summary>
+    internal static void FillDequant(Av1TileState ts, Av1DecoderFrameHeader fh, int baseQIdx, int bitDepth)
+    {
+        for (int seg = 0; seg < 8; seg++)
+        {
+            int yac = fh.SegmentationEnabled
+                ? Math.Clamp(baseQIdx + fh.SegmentationData.Segments[seg].DeltaQ, 0, 255)
+                : baseQIdx;
+            ts.Dq[seg, 0, 0] = (ushort)GetDcDequant(yac + fh.QuantYDcDelta, bitDepth);
+            ts.Dq[seg, 0, 1] = (ushort)GetAcDequant(yac, bitDepth);
+            ts.Dq[seg, 1, 0] = (ushort)GetDcDequant(yac + fh.QuantUDcDelta, bitDepth);
+            ts.Dq[seg, 1, 1] = (ushort)GetAcDequant(yac + fh.QuantUAcDelta, bitDepth);
+            ts.Dq[seg, 2, 0] = (ushort)GetDcDequant(yac + fh.QuantVDcDelta, bitDepth);
+            ts.Dq[seg, 2, 1] = (ushort)GetAcDequant(yac + fh.QuantVAcDelta, bitDepth);
         }
     }
 

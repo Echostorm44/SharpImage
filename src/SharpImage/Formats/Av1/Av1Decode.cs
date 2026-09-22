@@ -817,9 +817,15 @@ public static class Av1Decode
                     deltaQ *= 1 << fh.DeltaQResLog2;
                 }
                 Av1Msac.TraceLabel = null;
+                int prevQIdx = ts.LastQIdx;
                 ts.LastQIdx = Math.Clamp(ts.LastQIdx + deltaQ, 1, 255);
+                // dav1d decode.c: a changed qindex re-derives this superblock's dequantizers (init_quant_tables).
+                if (ts.LastQIdx != prevQIdx)
+                    Av1Decoder.FillDequant(ts, fh, ts.LastQIdx, ctx.BitDepth);
 
-                // Delta LF (simplified — just consume the symbols)
+                // Delta LF: per-superblock loop-filter level deltas (dav1d decode.c).
+                Span<int> prevDeltaLf = stackalloc int[4];
+                ts.LastDeltaLf.AsSpan().CopyTo(prevDeltaLf);
                 if (fh.DeltaLfPresent)
                 {
                     int nLfs = fh.DeltaLfMulti
@@ -846,6 +852,14 @@ public static class Av1Decode
                         ts.LastDeltaLf[i] = Math.Clamp(ts.LastDeltaLf[i] + deltaLf, -63, 63);
                     }
                 }
+
+                // All-zero deltas use the frame-wide levels; a change re-derives this superblock's levels
+                // (dav1d: ts->lflvl = f->lf.lvl, else dav1d_calc_lf_values(ts->lflvlmem, hdr, last_delta_lf)).
+                var dl = ts.LastDeltaLf;
+                if (dl[0] == 0 && dl[1] == 0 && dl[2] == 0 && dl[3] == 0)
+                    Array.Copy(ctx.LfLvl, ts.LfLvl, ctx.LfLvl.Length);
+                else if (!prevDeltaLf.SequenceEqual(dl))
+                    Av1LoopFilter.CalcLfValues(ts.LfLvl, fh, stackalloc sbyte[] { (sbyte)dl[0], (sbyte)dl[1], (sbyte)dl[2], (sbyte)dl[3] });
             }
         }
 

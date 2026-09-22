@@ -11,6 +11,16 @@ namespace SharpImage.Formats.Av1;
 /// </summary>
 public static class Av1Reconstruction
 {
+    // Quantizer matrix for a transform block (dav1d decode.c: f->qm[tx][plane] = dav1d_qm_tbl[qm_level][plane>0][tx]
+    // when quant.qm is set, else none). DecodeCoefs applies it only for non-identity transform types.
+    private static ReadOnlySpan<byte> QmFor(Av1DecoderFrameHeader fh, int tx, int plane)
+    {
+        if (!fh.QuantUseQMatrix) return ReadOnlySpan<byte>.Empty;
+        int level = plane == 0 ? fh.QmY : plane == 1 ? fh.QmU : fh.QmV;
+        byte[]? m = Av1QuantMatrix.Get(level, plane == 0 ? 0 : 1, tx);
+        return m == null ? ReadOnlySpan<byte>.Empty : m;
+    }
+
     // ========================================================================
     // Edge preparation tables (from ipred_prepare_tmpl.c)
     // ========================================================================
@@ -819,7 +829,7 @@ public static class Av1Reconstruction
                                 b.Tx, (int)bs, b.SegId,
                                 b.YMode, b.UvMode, b.YAngle,
                                 1, 0, cf, ref txtp, out cfCtx,
-                                dqTable, ReadOnlySpan<byte>.Empty,
+                                dqTable, QmFor(fh, b.Tx, 0),
                                 lossless, fh.ReducedTxSet,
                                 fh.SegmentationQIdx[b.SegId], ctx.BitDepth, levels, layout);
 
@@ -1293,7 +1303,7 @@ public static class Av1Reconstruction
                                     b.UvTx, (int)bs, b.SegId,
                                     b.YMode, b.UvMode, b.YAngle,
                                     1, 1 + pl, cf, ref txtp, out cfCtx,
-                                    dqTable, ReadOnlySpan<byte>.Empty,
+                                    dqTable, QmFor(fh, b.UvTx, 1 + pl),
                                     lossless, fh.ReducedTxSet,
                                     fh.SegmentationQIdx[b.SegId], ctx.BitDepth, levels, layout);
 
@@ -1753,7 +1763,7 @@ public static class Av1Reconstruction
                 ytx, (int)bs, b.SegId,
                 b.YMode, b.UvMode, b.YAngle,
                 0, 0, cf, ref txtp, out cfCtx,
-                dqTable, ReadOnlySpan<byte>.Empty,
+                dqTable, QmFor(fh, ytx, 0),
                 lossless, fh.ReducedTxSet,
                 fh.SegmentationQIdx[b.SegId], ctx.BitDepth, levels, layout);
 
@@ -2338,7 +2348,7 @@ public static class Av1Reconstruction
                                     b.UvTx, (int)bs, b.SegId,
                                     b.YMode, b.UvMode, b.YAngle,
                                     0, 1 + pl, cf, ref txtp, out byte cfCtx,
-                                    dqTable, ReadOnlySpan<byte>.Empty,
+                                    dqTable, QmFor(fh, b.UvTx, 1 + pl),
                                     lossless, fh.ReducedTxSet,
                                     fh.SegmentationQIdx[b.SegId], ctx.BitDepth, levels, (int)fh.PixelLayout);
 
