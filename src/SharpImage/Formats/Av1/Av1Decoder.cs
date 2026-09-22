@@ -351,8 +351,12 @@ internal sealed class Av1Decoder
         ctx.SbShift = sbShift;
         ctx.Sb128w = sb128w;
         ctx.Sb128W = sb128w;
-        ctx.W4 = bw;
-        ctx.H4 = bh;
+        // dav1d keeps two frame sizes: bw/bh (MI grid, 2*ceil(dim/8)) for block/CDEF logic, and w4/h4
+        // (ceil(dim/4)) for the loop-filter masks and row/column ranges. Using the MI grid for deblocking filtered an
+        // extra 4px row/column past odd picture edges that dav1d leaves alone; invisible by itself, but CDEF reads
+        // those hidden pixels as neighbours and carried the difference into visible edge rows.
+        ctx.W4 = (fh.CodedWidth + 3) >> 2;
+        ctx.H4 = (fh.Height + 3) >> 2;
         ctx.B4Stride = sb128w * 32;
 
         // Pixel layout from sequence header
@@ -1311,8 +1315,8 @@ internal sealed class Av1Decoder
         int damping = fh.CdefDamping + (ctx.BitDepth - 8); // dav1d: cdef.damping + bitdepth_min_8
         int yStride = ctx.YStride;
         int uvStride = ctx.UvStride;
-        int w4 = ctx.W4;
-        int h4 = ctx.H4;
+        int w4 = ctx.Bw;   // CDEF walks the MI grid (dav1d f->bw/f->bh), unlike the loop filter's w4/h4
+        int h4 = ctx.Bh;
         int sb128 = seqHdr.Sb128 ? 1 : 0;
         int sbsz = 16; // 64x64 in 4x4 units
 

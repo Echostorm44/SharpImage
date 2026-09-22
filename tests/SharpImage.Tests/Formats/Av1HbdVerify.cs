@@ -110,7 +110,7 @@ public sealed class Av1HbdVerify
                 {
                     Av1StillImageEncoder.UseDeblockSearch = db;
                     Av1StillImageEncoder.UseCdefSearch = cd;
-                    string stem = $"e{w}x{h}_{(db ? "D" : "d")}{(cd ? "C" : "c")}";
+                    string stem = $"e{w}x{h}_db{(db ? 1 : 0)}_cdef{(cd ? 1 : 0)}";   // case-distinct names collide on NTFS
                     byte[] avif = HeifCoder.EncodeAvif(img, new AvifEncodeOptions { Qp = 28, BitDepth = 8 });
                     File.WriteAllBytes(Path.Combine(outDir, stem + ".avif"), avif);
                     Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(outDir, stem + ".ours.yuv"));
@@ -122,6 +122,110 @@ public sealed class Av1HbdVerify
         }
         finally { Av1StillImageEncoder.UseDeblockSearch = db0; Av1StillImageEncoder.UseCdefSearch = cd0; }
         File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
+    }
+
+    // Partial-edge conformance isolation (trigger hbd_iso.txt): odd-size gradients, loop filters off, a minimal tool
+    // set (DC-only luma, no filter-intra / full tx set / tx-depth / CfL / UV search / rect-ext-sub8 partitions), then
+    // one luma-mode family or one tool re-enabled at a time. Outputs .avif + our native planes for edge_check.py.
+    [Test, NotInParallel]
+    public void EdgeIsolate()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_iso.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string outDir = Path.Combine(Scratch, "hbd_iso");
+        Directory.CreateDirectory(outDir);
+        var E = typeof(Av1StillImageEncoder);
+        string[] knobs = { "UseDeblockSearch", "UseCdefSearch", "UseFilterIntra", "UseFullIntraTxSet", "UseColorTxDepth",
+            "UseUvModeSearch", "UseCfl", "UseRectPartition", "UseExtPartition", "UseSub8Partition", "UseIntraEdgeFilter" };
+        var bfS = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+        var saved = new System.Collections.Generic.Dictionary<string, object?>();
+        foreach (var k in knobs) saved[k] = E.GetField(k, bfS)!.GetValue(null);
+        void Set(string k, bool v) => E.GetField(k, bfS)!.SetValue(null, v);
+        void Minimal() { foreach (var k in knobs) Set(k, false); Set("UseIntraEdgeFilter", (bool)saved["UseIntraEdgeFilter"]!); }
+        bool Dir(Av1IntraPredMode m) => m >= Av1IntraPredMode.Vertical && m <= Av1IntraPredMode.VerticalLeft;
+        var variants = new (string Name, Func<Av1IntraPredMode, int, bool> Filter, string? Tool)[]
+        {
+            ("dc", (m, d) => m == Av1IntraPredMode.Dc, null),
+            ("dir0", (m, d) => m == Av1IntraPredMode.Dc || (Dir(m) && d == 0), null),
+            ("dirAll", (m, d) => m == Av1IntraPredMode.Dc || Dir(m), null),
+            ("smooth", (m, d) => m is Av1IntraPredMode.Dc or Av1IntraPredMode.Smooth or Av1IntraPredMode.SmoothV or Av1IntraPredMode.SmoothH, null),
+            ("paeth", (m, d) => m is Av1IntraPredMode.Dc or Av1IntraPredMode.Paeth, null),
+            ("all", (m, d) => true, null),
+            ("dc+fi", (m, d) => m == Av1IntraPredMode.Dc, "UseFilterIntra"),
+            ("dc+ftx", (m, d) => m == Av1IntraPredMode.Dc, "UseFullIntraTxSet"),
+            ("dc+txd", (m, d) => m == Av1IntraPredMode.Dc, "UseColorTxDepth"),
+            ("dc+uv", (m, d) => m == Av1IntraPredMode.Dc, "UseUvModeSearch"),
+            ("dc+cfl", (m, d) => m == Av1IntraPredMode.Dc, "UseCfl"),
+            ("dc+rect", (m, d) => m == Av1IntraPredMode.Dc, "UseRectPartition"),
+            ("dc+sub8", (m, d) => m == Av1IntraPredMode.Dc, "UseSub8Partition"),
+            ("dc+ext", (m, d) => m == Av1IntraPredMode.Dc, "UseExtPartition+UseRectPartition"),
+            ("full", (m, d) => true, "ALL"),
+            ("full-fi", (m, d) => true, "ALL-UseFilterIntra"),
+            ("full-ftx", (m, d) => true, "ALL-UseFullIntraTxSet"),
+            ("full-txd", (m, d) => true, "ALL-UseColorTxDepth"),
+            ("full-uv", (m, d) => true, "ALL-UseUvModeSearch"),
+            ("full-cfl", (m, d) => true, "ALL-UseCfl"),
+            ("full-ext", (m, d) => true, "ALL-UseExtPartition"),
+            ("full-rect", (m, d) => true, "ALL-UseRectPartition-UseExtPartition"),
+            ("full-sub8", (m, d) => true, "ALL-UseSub8Partition"),
+        };
+        var log = new System.Text.StringBuilder();
+        try
+        {
+            foreach (var (w, h) in new[] { (257, 131), (129, 67) })
+            {
+                var img = Gradient(w, h, alpha: false, gray: false);
+                foreach (var (name, filter, tool) in variants)
+                {
+                    Minimal();
+                    if (tool != null && tool.StartsWith("ALL"))
+                    {
+                        foreach (var k in knobs) if (k is not ("UseDeblockSearch" or "UseCdefSearch")) Set(k, (bool)saved[k]!);
+                        foreach (var off in tool.Split('-')[1..]) Set(off, false);
+                    }
+                    else if (tool != null) foreach (var on in tool.Split('+')) Set(on, true);
+                    Av1StillImageEncoder.DbgLumaModeFilter = filter;
+                    string stem = $"i{w}x{h}_{name}";
+                    byte[] avif = HeifCoder.EncodeAvif(img, new AvifEncodeOptions { Qp = 28, BitDepth = 8 });
+                    File.WriteAllBytes(Path.Combine(outDir, stem + ".avif"), avif);
+                    Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(outDir, stem + ".ours.yuv"));
+                    HeifCoder.Decode(avif);
+                    Environment.SetEnvironmentVariable("AV1_DUMP10", null);
+                    log.AppendLine($"{stem} {w} {h}");
+                }
+            }
+        }
+        finally
+        {
+            foreach (var k in knobs) E.GetField(k, bfS)!.SetValue(null, saved[k]);
+            Av1StillImageEncoder.DbgLumaModeFilter = null;
+        }
+        File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
+    }
+
+    // Encoder determinism probe (trigger hbd_det.txt): the same image + config must give identical bytes regardless
+    // of what was encoded before in the process.
+    [Test, NotInParallel]
+    public void Determinism()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_det.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        var a = Gradient(257, 131, alpha: false, gray: false);
+        var other = Gradient(129, 67, alpha: false, gray: true);
+        string H(byte[] b) => Convert.ToHexString(System.Security.Cryptography.MD5.HashData(b))[..8] + $"/{b.Length}";
+        var sb = new System.Text.StringBuilder();
+        var opt = new AvifEncodeOptions { Qp = 28, BitDepth = 8 };
+        sb.AppendLine("a#1 " + H(HeifCoder.EncodeAvif(a, opt)));
+        sb.AppendLine("a#2 " + H(HeifCoder.EncodeAvif(a, opt)));
+        HeifCoder.EncodeAvif(other, opt);
+        sb.AppendLine("a#3 after other " + H(HeifCoder.EncodeAvif(a, opt)));
+        Av1StillImageEncoder.UseDeblockSearch = false; Av1StillImageEncoder.UseCdefSearch = false;
+        sb.AppendLine("a nofilt#1 " + H(HeifCoder.EncodeAvif(a, opt)));
+        sb.AppendLine("a nofilt#2 " + H(HeifCoder.EncodeAvif(a, opt)));
+        Av1StillImageEncoder.UseDeblockSearch = true; Av1StillImageEncoder.UseCdefSearch = true;
+        File.WriteAllText(Path.Combine(Scratch, "hbd", "det.txt"), sb.ToString());
     }
 
     // Decoder-state probe for a stream our decoder rejects: decodes the AVIF's mdat payload directly and reports

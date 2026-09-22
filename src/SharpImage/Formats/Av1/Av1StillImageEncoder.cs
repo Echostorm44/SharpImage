@@ -1788,6 +1788,7 @@ internal static class Av1StillImageEncoder
         for (int ci = 0; ci < CandidateModes.Length; ci++)
         {
             (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
+            if (DbgLumaModeFilter != null && !DbgLumaModeFilter(mode, delta)) continue;
             PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, intraFlags);
             long satd = Satd8x8Rect(c.Luma, c.W, bx, by, pred, w, h);
             long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
@@ -2019,6 +2020,7 @@ internal static class Av1StillImageEncoder
         for (int ci = 0; ci < CandidateModes.Length; ci++)
         {
             (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
+            if (DbgLumaModeFilter != null && !DbgLumaModeFilter(mode, delta)) continue;
             if (delta != 0) continue;   // no angle_delta at 8x4/4x8: only the base (delta 0) mode
             PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, 0, pred, edge, intraFlags);
             for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
@@ -2696,6 +2698,10 @@ internal static class Av1StillImageEncoder
     // exhaustive search. Higher trades encode time for <0.1%.
     internal static int RdModeCandidates = 16;
 
+    // Dev/conformance isolation: when set, only luma intra candidates passing the filter are considered (square,
+    // rect and sub-8x8 leaves). Null in production.
+    internal static Func<Av1IntraPredMode, int, bool>? DbgLumaModeFilter;
+
     // Chroma UV-mode search: try directional/Smooth/Paeth UV predictions (not just DC/CfL) so sharp colour
     // boundaries stop paying full chroma residual. SAD-prescreen to this many candidates for the full chroma RD.
     internal static bool UseUvModeSearch = true;
@@ -3105,6 +3111,7 @@ internal static class Av1StillImageEncoder
         for (int ci = 0; ci < CandidateModes.Length; ci++)
         {
             (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
+            if (DbgLumaModeFilter != null && !DbgLumaModeFilter(mode, delta)) continue;
             PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf, edgeFlags, intraFlags);
             long satd = Satd8x8(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
             long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)

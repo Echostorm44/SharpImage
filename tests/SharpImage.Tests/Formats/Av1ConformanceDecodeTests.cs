@@ -23,6 +23,10 @@ public sealed class Av1ConformanceDecodeTests
     [Arguments("libavif_12bit_444_qm_dq.avif", 384, 256, "e6ce1414e1898f4c3ed2be6684a6f94d")]
     [Arguments("libaom_10bit_420_qm_dq_dlf.avif", 384, 256, "1f22d8cb02a9555a91d74b93fd269e64")]
     [Arguments("libavif_10bit_420_alpha.avif", 160, 96, "b70e1446b1e8656c5605b74ef678785b")]
+    // Odd picture sizes with deblock + CDEF: the loop filter must use ceil(dim/4) (dav1d w4/h4), not the MI grid.
+    [Arguments("libavif_10bit_420_257x131_lf_cdef.avif", 257, 131, "ee60cf6338c4bf402de5237263d49b94")]
+    [Arguments("sharpimage_8bit_420_257x131_lf_cdef.avif", 257, 131, "7d0e70c2a59725c98f7746ca477e7b98")]
+    [Arguments("sharpimage_8bit_420_129x67_lf_cdef.avif", 129, 67, "db65513a81a3faf76dcc1ffcf3fb2028")]
     public async Task DecodesByteExactVsDav1d(string file, int w, int h, string md5)
     {
         byte[] item = PrimaryItemData(File.ReadAllBytes(Asset(file)));
