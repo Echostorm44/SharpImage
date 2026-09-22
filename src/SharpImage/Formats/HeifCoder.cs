@@ -785,34 +785,11 @@ public static class HeifCoder
         using var yuv = decoder.Decode(codedData, 0, isKeyframe: true)
             ?? throw new InvalidDataException("AV1 decode produced no frame.");
 
-        int w = (int)frame.Columns;
-        int h = (int)frame.Rows;
-        int channels = frame.NumberOfChannels;
-        if (yuv.BitDepth > 8)
-        {
-            // 10/12-bit: convert from the decoder's native-precision planes straight into the 16-bit quantum.
-            bool is444h = yuv.Format == Av1.PixelFormat.Yuv444P, is422h = yuv.Format == Av1.PixelFormat.Yuv422P;
-            ConvertYuvToRgbHbd(yuv, frame, w, h, channels, decoder.Monochrome, matrixCoeffs == 1, fullRange,
-                is444h ? 0 : 1, (is444h || is422h) ? 0 : 1);
-            return;
-        }
-
-        bool tenBit = yuv.Format is Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12;
-        int shift = tenBit ? (yuv.Format == Av1.PixelFormat.Yuv420P12 ? 4 : 2) : 0;
-        if (decoder.Monochrome)
-        {
-            // I400: no chroma. Replicate luma into every output channel (R=G=B=Y).
-            ConvertGrayToRgb(yuv.YPlane.Span, yuv.YStride, frame, w, h, channels, tenBit, shift);
-        }
-        else
-        {
-            bool is444 = yuv.Format is Av1.PixelFormat.Yuv444P or Av1.PixelFormat.Yuv444P10;
-            bool is422 = yuv.Format is Av1.PixelFormat.Yuv422P or Av1.PixelFormat.Yuv422P10;
-            int ssHor = is444 ? 0 : 1;
-            int ssVer = (is444 || is422) ? 0 : 1;
-            ConvertYuvToRgb(yuv.YPlane.Span, yuv.UPlane.Span, yuv.VPlane.Span, yuv.YStride, yuv.UStride, yuv.VStride,
-                frame, w, h, channels, tenBit, shift, matrixCoeffs == 1, fullRange, ssHor, ssVer);
-        }
+        // YUV -> RGB exactly as libavif's reference path does it (avifImageYUVToRGB, AUTOMATIC/BEST_QUALITY
+        // upsampling): per-depth unorm float tables, bilinear 9/3/3/1 chroma upsampling, libavif's matrix table.
+        bool is444 = yuv.Format == Av1.PixelFormat.Yuv444P, is422 = yuv.Format == Av1.PixelFormat.Yuv422P;
+        ConvertYuvToRgbLibavif(yuv, frame, (int)frame.Columns, (int)frame.Rows, frame.NumberOfChannels,
+            decoder.Monochrome, matrixCoeffs, fullRange, is444 ? 0 : 1, (is444 || is422) ? 0 : 1);
     }
 
     // Converts a decoded 8/10/12-bit planar YUV 4:2:0 frame to RGB, honouring the colour
@@ -918,50 +895,94 @@ public static class HeifCoder
 
     private static byte ClampByte(int v) => (byte)(v < 0 ? 0 : v > 255 ? 255 : v);
 
-    // High-bit-depth YUV -> 16-bit quantum RGB at full precision (float math). Honours the colour matrix
-    // (BT.709 vs BT.601) and range (full vs limited, scaled to the coded bit depth).
-    private static void ConvertYuvToRgbHbd(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
-        bool monochrome, bool bt709, bool fullRange, int ssHor, int ssVer)
+    // libavif's matrix table (colr.c matrixCoefficientsTables): (kr, kb) per CICP matrix_coefficients. Anything else
+    // (incl. unspecified) falls back to the MIAF default BT.601, as libavif does.
+    private static (float Kr, float Kb) MatrixKrKb(int mc) => mc switch
     {
-        int bd = yuv.BitDepth;
-        double max = (1 << bd) - 1, s = 1 << (bd - 8);
-        ReadOnlySpan<ushort> y0 = yuv.YPlane16.Span, u0 = yuv.UPlane16.Span, v0 = yuv.VPlane16.Span;
-        (double kr, double kgU, double kgV, double kb) = bt709
-            ? (1.5748, 0.187324, 0.468124, 1.8556)
-            : (1.402, 0.344136, 0.714136, 1.772);
-        for (int y = 0; y < h; y++)
+        1 => (0.2126f, 0.0722f),   // BT.709
+        4 => (0.30f, 0.11f),       // FCC
+        5 or 6 => (0.299f, 0.114f), // BT.470BG / BT.601
+        7 => (0.212f, 0.087f),     // SMPTE 240
+        9 => (0.2627f, 0.0593f),   // BT.2020 NCL
+        _ => (0.299f, 0.114f),
+    };
+
+    // A port of libavif's avifImageYUVAnyToRGBAnySlow for the YUV->RGB step (8/10/12-bit, 4:0:0/4:2:0/4:2:2/4:4:4):
+    // unorm float tables (limited range: Y (v-16s)/219s, UV (v-2^(bd-1))/224s; full: v/max, (v-2^(bd-1))/max),
+    // bilinear chroma with weights 9/16, 3/16, 3/16, 1/16 where the second tap is the neighbouring chroma sample
+    // toward the luma sample's side (none at the picture edge; 4:2:2 is horizontal only), clamp to [0,1], and
+    // (uint16)(0.5f + v * 65535) into the 16-bit quantum. 32-bit float throughout, like libavif.
+    private static void ConvertYuvToRgbLibavif(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
+        bool monochrome, int matrixCoeffs, bool fullRange, int ssHor, int ssVer)
+    {
+        int bd = yuv.BitDepth, maxCh = (1 << bd) - 1;
+        bool hbd = bd > 8;
+        float rangeY = fullRange ? maxCh : 219 << (bd - 8), biasY = fullRange ? 0 : 16 << (bd - 8);
+        float rangeUV = fullRange ? maxCh : 224 << (bd - 8), biasUV = 1 << (bd - 1);
+        var tabY = new float[maxCh + 1];
+        var tabUV = new float[maxCh + 1];
+        for (int cp = 0; cp <= maxCh; cp++) { tabY[cp] = (cp - biasY) / rangeY; tabUV[cp] = (cp - biasUV) / rangeUV; }
+        (float kr, float kb) = MatrixKrKb(matrixCoeffs);
+        float kg = 1.0f - kr - kb;
+
+        ReadOnlySpan<byte> y8 = yuv.YPlane.Span, u8 = yuv.UPlane.Span, v8 = yuv.VPlane.Span;
+        ReadOnlySpan<ushort> y16 = yuv.YPlane16.Span, u16 = yuv.UPlane16.Span, v16 = yuv.VPlane16.Span;
+        int ys = yuv.YStride, us = yuv.UStride, vs = yuv.VStride;
+        bool is420 = ssVer == 1, is444 = ssHor == 0;
+
+        for (int j = 0; j < h; j++)
         {
-            var row = frame.GetPixelRowForWrite(y);
-            int cy = y >> ssVer;
-            for (int x = 0; x < w; x++)
+            var row = frame.GetPixelRowForWrite(j);
+            int uvJ = j >> ssVer;
+            int adjRow = (j == 0 || (j == h - 1 && (j & 1) != 0) || !is420) ? 0 : ((j & 1) != 0 ? 1 : -1);
+            for (int i = 0; i < w; i++)
             {
-                double yn = fullRange ? y0[y * yuv.YStride + x] / max : (y0[y * yuv.YStride + x] - 16 * s) / (219 * s);
-                double rn, gn, bn;
+                float Y = tabY[Math.Min(hbd ? y16[j * ys + i] : y8[j * ys + i], maxCh)];
+                float R, G, B;
                 if (monochrome)
                 {
-                    rn = gn = bn = yn;
+                    R = G = B = Y;
                 }
                 else
                 {
-                    int cx = x >> ssHor;
-                    double cb = u0[cy * yuv.UStride + cx], cr = v0[cy * yuv.VStride + cx];
-                    double cbn = fullRange ? (cb - (max + 1) / 2) / max : (cb - 128 * s) / (224 * s);
-                    double crn = fullRange ? (cr - (max + 1) / 2) / max : (cr - 128 * s) / (224 * s);
-                    rn = yn + kr * crn;
-                    gn = yn - kgU * cbn - kgV * crn;
-                    bn = yn + kb * cbn;
+                    float Cb, Cr;
+                    int uvI = i >> ssHor;
+                    if (is444)
+                    {
+                        Cb = tabUV[Math.Min(hbd ? u16[uvJ * us + uvI] : u8[uvJ * us + uvI], maxCh)];
+                        Cr = tabUV[Math.Min(hbd ? v16[uvJ * vs + uvI] : v8[uvJ * vs + uvI], maxCh)];
+                    }
+                    else
+                    {
+                        int adjCol = (i == 0 || (i == w - 1 && (i & 1) != 0)) ? 0 : ((i & 1) != 0 ? 1 : -1);
+                        int c0 = uvJ * us + uvI, c1 = c0 + adjCol, c2 = c0 + adjRow * us, c3 = c2 + adjCol;
+                        int d0 = uvJ * vs + uvI, d1 = d0 + adjCol, d2 = d0 + adjRow * vs, d3 = d2 + adjCol;
+                        Cb = S(u8, u16, hbd, c0, maxCh, tabUV) * (9.0f / 16.0f) + S(u8, u16, hbd, c1, maxCh, tabUV) * (3.0f / 16.0f)
+                           + S(u8, u16, hbd, c2, maxCh, tabUV) * (3.0f / 16.0f) + S(u8, u16, hbd, c3, maxCh, tabUV) * (1.0f / 16.0f);
+                        Cr = S(v8, v16, hbd, d0, maxCh, tabUV) * (9.0f / 16.0f) + S(v8, v16, hbd, d1, maxCh, tabUV) * (3.0f / 16.0f)
+                           + S(v8, v16, hbd, d2, maxCh, tabUV) * (3.0f / 16.0f) + S(v8, v16, hbd, d3, maxCh, tabUV) * (1.0f / 16.0f);
+                    }
+
+                    R = Y + (2 * (1 - kr)) * Cr;
+                    B = Y + (2 * (1 - kb)) * Cb;
+                    G = Y - ((2 * ((kr * (1 - kr) * Cr) + (kb * (1 - kb) * Cb))) / kg);
                 }
 
-                int off = x * channels;
-                row[off] = Q16(rn);
+                int off = i * channels;
+                row[off] = Q16f(R);
                 if (channels >= 3)
                 {
-                    row[off + 1] = Q16(gn);
-                    row[off + 2] = Q16(bn);
+                    row[off + 1] = Q16f(G);
+                    row[off + 2] = Q16f(B);
                 }
             }
         }
     }
+
+    private static float S(ReadOnlySpan<byte> p8, ReadOnlySpan<ushort> p16, bool hbd, int k, int maxCh, float[] tab)
+        => tab[Math.Min(hbd ? p16[k] : p8[k], maxCh)];
+
+    private static ushort Q16f(float v) => (ushort)(0.5f + Math.Clamp(v, 0.0f, 1.0f) * 65535.0f);
 
     private static ushort Q16(double n) => (ushort)Math.Clamp((int)Math.Round(n * 65535.0), 0, 65535);
 

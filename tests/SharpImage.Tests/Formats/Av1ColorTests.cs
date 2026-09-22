@@ -103,12 +103,18 @@ public sealed class Av1ColorTests
         double sse = 0; int n = 0;
         for (long y = 0; y < h; y++)
             for (long x = 0; x < w; x++)
+            {
+                // HeifCoder upsamples 4:2:0 chroma bilinearly (libavif parity), which blends the two luma columns that
+                // straddle each hard colour boundary (x % 32 == 31 / 0). That is upsampling, not coding error, so
+                // those columns are excluded; everywhere else the partitioned coding must stay near-exact.
+                if (x % 32 is 31 or 0) continue;
                 for (int cc = 0; cc < 3; cc++)
                 {
                     int a = (f.GetPixelChannel(x, y, cc) * 255 + 32767) / 65535;
                     int b = (dec.GetPixelChannel(x, y, cc) * 255 + 32767) / 65535;
                     int d = a - b; sse += d * d; n++;
                 }
+            }
 
         await Assert.That(System.Math.Sqrt(sse / n)).IsLessThan(3.0);
     }

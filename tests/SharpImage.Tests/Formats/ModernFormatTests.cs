@@ -197,7 +197,7 @@ public class ModernFormatTests
     // (no AV1 encoder). HEIC decoding is pending an HEVC decoder. See HeifCoder.
 
     // Reference RGB sampled from libavif's own decode of TestAssets/avif_sample.avif.
-    // Tolerance absorbs the chroma-upsampling difference (box here vs libavif's bilinear).
+    // HeifCoder now ports libavif's reference YUV->RGB (bilinear chroma), so only output rounding can differ.
     private static readonly (int Y, int X, int R, int G, int B)[] AvifReference =
     [
         (0, 0, 1, 1, 124), (0, 63, 250, 3, 128), (47, 0, 2, 254, 129), (47, 63, 255, 255, 130),
@@ -219,9 +219,9 @@ public class ModernFormatTests
         {
             var row = image.GetPixelRow(y).ToArray();
             int off = x * image.NumberOfChannels;
-            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off]) - r)).IsLessThanOrEqualTo(12);
-            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off + 1]) - g)).IsLessThanOrEqualTo(12);
-            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off + 2]) - b)).IsLessThanOrEqualTo(12);
+            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off]) - r)).IsLessThanOrEqualTo(1);
+            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off + 1]) - g)).IsLessThanOrEqualTo(1);
+            await Assert.That(Math.Abs(Quantum.ScaleToByte(row[off + 2]) - b)).IsLessThanOrEqualTo(1);
         }
     }
 

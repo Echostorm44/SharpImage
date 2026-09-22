@@ -56,6 +56,31 @@ public sealed class Av1ConformanceDecodeTests
         await Assert.That(Hex(MD5.HashData(a))).IsEqualTo("c88079b009940171afbf84e8b48fcfd1");
     }
 
+    // RGB conversion parity with libavif (avifImageYUVToRGB, default AUTOMATIC upsampling): sampled reference pixels
+    // from libavif 1.4.2's own decode, at the coded depth. HeifCoder ports libavif's reference YUV->RGB path
+    // (bilinear 9/3/3/1 chroma, unorm float tables, matrix table), so it must land within one code.
+    [Test]
+    [Arguments("libavif_10bit_420_qm_dq.avif", 10, "(130,379,727,706,564), (183,353,874,834,618), (14,238,564,556,506), (127,332,741,721,580), (26,80,708,690,580), (57,190,770,752,618), (240,126,916,870,586), (194,278,1019,988,715), (52,293,733,713,591), (127,6,952,916,691), (110,208,646,632,534), (143,93,1022,1023,824), (199,81,1023,1023,1022), (36,71,714,695,585), (227,64,1021,1022,777), (67,0,715,705,599), (2,107,626,618,545), (110,84,943,908,717), (85,148,754,727,602), (160,101,1021,1021,1021), (104,93,1021,1020,885), (100,196,653,636,549), (152,11,1023,1022,888), (184,212,1023,1023,1015), (0,0,797,774,636), (255,383,554,529,385), (255,0,1015,1023,757), (0,383,462,463,457)")]
+    [Arguments("libavif_10bit_420_257x131_lf_cdef.avif", 10, "(65,183,694,146,472), (7,238,804,57,376), (63,26,162,877,884), (40,57,239,881,831), (95,240,926,904,287), (63,194,729,199,441), (26,127,457,487,656), (3,110,371,876,726), (104,143,605,238,539), (46,199,723,99,443), (40,36,171,961,886), (35,227,806,161,381), (32,67,266,886,812), (0,2,0,534,1013), (53,110,435,308,676), (42,85,336,660,754), (74,160,626,99,518), (50,104,410,392,696), (46,100,391,482,713), (98,152,630,241,522), (5,184,622,249,524), (106,84,409,58,690), (37,135,499,285,624), (16,169,584,246,554), (0,0,0,521,1015), (130,256,1015,867,214), (130,0,160,329,884), (0,256,855,76,338)")]
+    [Arguments("libavif_12bit_444_qm_dq.avif", 12, "(130,379,2919,2834,2279), (183,353,3490,3338,2454), (14,238,2250,2223,2032), (127,332,2975,2893,2325), (26,80,2831,2769,2350), (57,190,3105,3020,2484), (240,126,3729,3497,2389), (194,278,4063,3971,2864), (52,293,2951,2878,2381), (127,6,3816,3661,2757), (110,208,2568,2517,2140), (143,93,4095,4091,3295), (199,81,4092,4094,4095), (36,71,2857,2788,2353), (227,64,4093,4088,3102), (67,0,2858,2796,2389), (2,107,2509,2456,2178), (110,84,3744,3614,2854), (85,148,3050,2949,2467), (160,101,4095,4094,4059), (104,93,4095,4095,3491), (100,196,2589,2527,2172), (152,11,4092,4085,3575), (184,212,4095,4093,4095), (0,0,3170,3074,2524), (255,383,2194,2100,1546), (255,0,4095,4095,2983), (0,383,1831,1840,1819)")]
+    public async Task RgbMatchesLibavif(string file, int bd, string refs)
+    {
+        var img = HeifCoder.Decode(File.ReadAllBytes(Asset(file)));
+        int ch = img.NumberOfChannels, max = (1 << bd) - 1, worst = 0;
+        foreach (var m in System.Text.RegularExpressions.Regex.Matches(refs, @"\((\d+),(\d+),(\d+),(\d+),(\d+)\)"))
+        {
+            var g = ((System.Text.RegularExpressions.Match)m).Groups;
+            int y = int.Parse(g[1].Value), x = int.Parse(g[2].Value);
+            var row = img.GetPixelRow(y);
+            for (int c = 0; c < 3; c++)
+            {
+                int ours = (int)Math.Round(row[x * ch + c] * (double)max / 65535.0);
+                worst = Math.Max(worst, Math.Abs(ours - int.Parse(g[3 + c].Value)));
+            }
+        }
+        await Assert.That(worst).IsLessThanOrEqualTo(1);
+    }
+
     // Planes as ffmpeg writes raw video: Y, U, V tightly packed; u16 LE for >8-bit, u8 otherwise.
     private static byte[] NativePlanes(DecodedVideoFrame f)
     {
