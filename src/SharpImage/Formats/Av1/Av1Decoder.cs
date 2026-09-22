@@ -73,6 +73,12 @@ internal sealed class Av1Decoder
     /// <summary>True when the decoded sequence is monochrome (I400) — chroma planes are not meaningful.</summary>
     public bool Monochrome => seqHdr.Monochrome;
 
+    /// <summary>Sequence-header colour description (CICP; 2 = unspecified when absent) and color_range.</summary>
+    public int ColorPrimaries => (int)seqHdr.ColorPrimaries;
+    public int TransferCharacteristics => (int)seqHdr.TransferCharacteristics;
+    public int MatrixCoefficients => (int)seqHdr.MatrixCoefficients;
+    public bool FullColorRange => seqHdr.ColorRange != 0;
+
     public bool Initialize(ReadOnlySpan<byte> codecPrivate)
     {
         // AV1 config is in-band (sequence header OBU) — no codec private needed

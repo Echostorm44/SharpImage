@@ -31,10 +31,16 @@ public sealed class ImageMetadata
     public IptcProfile? IptcProfile { get; set; }
 
     /// <summary>
+    /// Coding-independent code points (ITU-T H.273) describing the colour space — set by decoders of formats that
+    /// signal them (AVIF 'colr' nclx / AV1 sequence header) and written back by encoders that support them.
+    /// </summary>
+    public CicpInfo? Cicp { get; set; }
+
+    /// <summary>
     /// Whether any metadata is present.
     /// </summary>
     public bool HasMetadata =>
-        ExifProfile is not null || IccProfile is not null || Xmp is not null || IptcProfile is not null;
+        ExifProfile is not null || IccProfile is not null || Xmp is not null || IptcProfile is not null || Cicp is not null;
 
     /// <summary>
     /// Creates a deep copy of all metadata.
@@ -46,9 +52,20 @@ public sealed class ImageMetadata
             ExifProfile = ExifProfile?.Clone(),
             IccProfile = IccProfile?.Clone(),
             Xmp = Xmp,
-            IptcProfile = IptcProfile?.Clone()
+            IptcProfile = IptcProfile?.Clone(),
+            Cicp = Cicp
         };
     }
+}
+
+/// <summary>
+/// ITU-T H.273 colour description: colour primaries, transfer characteristics, matrix coefficients and the
+/// full-range flag (e.g. sRGB = 1/13/6 full; BT.2100 PQ = 9/16/9).
+/// </summary>
+public sealed record CicpInfo(int ColorPrimaries, int TransferCharacteristics, int MatrixCoefficients, bool FullRange)
+{
+    /// <summary>sRGB primaries + transfer with the BT.601 matrix, full range — libavif's default for sRGB content.</summary>
+    public static CicpInfo Srgb { get; } = new(1, 13, 6, true);
 }
 
 /// <summary>

@@ -49,6 +49,23 @@ public sealed class AvifEncodeOptions
 
     /// <summary>Chroma subsampling for colour images (grayscale images are always coded monochrome).</summary>
     public AvifChromaSubsampling ChromaSubsampling { get; set; } = AvifChromaSubsampling.Auto;
+
+    /// <summary>CICP colour primaries (ITU-T H.273). Null: the image's <c>Metadata.Cicp</c>, else 1 (BT.709/sRGB)
+    /// — or 2 (unspecified) when an ICC profile is attached, as avifenc does.</summary>
+    public int? ColorPrimaries { get; set; }
+
+    /// <summary>CICP transfer characteristics. Null: the image's <c>Metadata.Cicp</c>, else 13 (sRGB) — or 2 when an
+    /// ICC profile is attached.</summary>
+    public int? TransferCharacteristics { get; set; }
+
+    /// <summary>CICP matrix coefficients used to code RGB as YUV: 6/5 (BT.601, default), 1 (BT.709), 9 (BT.2020 NCL),
+    /// 4 (FCC), 7 (SMPTE 240M), 12 (chromaticity-derived NCL), 0 (identity: RGB coded as GBR, 4:4:4 only),
+    /// 8 (YCgCo, full range only), 16/17 (YCgCo-Re/Ro: lossless-reversible, coded 2/1 bits deeper than the RGB).
+    /// Null: the image's <c>Metadata.Cicp</c> matrix when it is one of the linear kr/kb matrices, else 6.</summary>
+    public int? MatrixCoefficients { get; set; }
+
+    /// <summary>Full (true, default) or limited/studio (false) YUV range.</summary>
+    public bool FullRange { get; set; } = true;
 }
 
 public static class HeifCoder
@@ -156,6 +173,7 @@ public static class HeifCoder
         int itemDataOffset = -1, itemDataLength = 0;
         var itemExtents = new Dictionary<int, (int Off, int Len)>(); // all items' first extent
         int alphaItemId = -1;
+        (int Cp, int Tc, int Mc, bool Full)? primaryNclx = null;   // primary item's colr nclx (if any)
 
         // Parse meta box hierarchy
         if (boxes.TryGetValue("meta", out var metaBox))
@@ -185,10 +203,36 @@ public static class HeifCoder
                 var iprpChildren = ParseBoxes(data, iprpBox.DataOffset, iprpBox.DataLength);
                 if (iprpChildren.TryGetValue("ipco", out var ipcoBox))
                 {
-                    // Scan for ispe (image spatial extents)
+                    var props = ParseIpco(data, ipcoBox.DataOffset, ipcoBox.DataLength);
+                    var assoc = iprpChildren.TryGetValue("ipma", out var ipmaBox)
+                        ? ParseIpma(data, ipmaBox.DataOffset, ipmaBox.DataLength)
+                        : new Dictionary<int, List<int>>();
+                    if (assoc.TryGetValue(primaryItemId, out var primaryProps))
+                    {
+                        foreach (int pi in primaryProps)
+                        {
+                            if (pi < 1 || pi > props.Count) continue;
+                            var (pType, pOff, pLen) = props[pi - 1];
+                            if (pType == "ispe" && pLen >= 12 && imageWidth == 0)
+                            {
+                                imageWidth = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 4));
+                                imageHeight = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 8));
+                            }
+                            else if (pType == "colr" && pLen >= 11 && primaryNclx == null
+                                     && Encoding.ASCII.GetString(data, pOff, 4) == "nclx")
+                            {
+                                primaryNclx = (BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pOff + 4)),
+                                    BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pOff + 6)),
+                                    BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pOff + 8)),
+                                    (data[pOff + 10] & 0x80) != 0);
+                            }
+                        }
+                    }
+
+                    // Scan for ispe (image spatial extents) — fallback when ipma gave none
                     int scanPos = ipcoBox.DataOffset;
                     int scanEnd = scanPos + ipcoBox.DataLength;
-                    while (scanPos + 8 <= scanEnd)
+                    while (imageWidth == 0 && scanPos + 8 <= scanEnd)
                     {
                         uint sLen = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(scanPos));
                         string sType = Encoding.ASCII.GetString(data, scanPos + 4, 4);
@@ -332,13 +376,11 @@ public static class HeifCoder
         var frame = new ImageFrame();
         frame.Initialize(imageWidth, imageHeight, ColorspaceType.SRGB, false);
 
-        // Colour matrix + range from the nclx colour box (defaults: BT.601, full range).
-        ParseNclxColour(data, out int matrixCoeffs, out bool fullRange);
-
         if (isAvif)
         {
+            // CICP: the primary item's colr nclx takes precedence; otherwise the AV1 sequence header's (libavif).
             DecodeAv1IntraFrame(data.AsSpan(itemDataOffset, Math.Min(itemDataLength, data.Length - itemDataOffset)),
-                        frame, matrixCoeffs, fullRange);
+                        frame, primaryNclx);
 
             // Auxiliary alpha item (monochrome AV1): decode it and merge into the frame's alpha channel.
             if (alphaItemId >= 0 && itemExtents.TryGetValue(alphaItemId, out var ax) && ax.Len > 0
@@ -349,12 +391,65 @@ public static class HeifCoder
         }
         else
         {
+            // Colour matrix + range from the nclx colour box (defaults: BT.709, limited range).
+            int matrixCoeffs; bool fullRange;
+            if (primaryNclx is { } hn) { matrixCoeffs = hn.Mc; fullRange = hn.Full; }
+            else ParseNclxColour(data, out matrixCoeffs, out fullRange);
             byte[] hvcC = FindConfigBox(data, "hvcC");
             DecodeHevcIntraFrame(data.AsSpan(itemDataOffset, Math.Min(itemDataLength, data.Length - itemDataOffset)),
                         frame, hvcC, matrixCoeffs, fullRange);
         }
 
         return frame;
+    }
+
+    // ipco children in order (property index = position + 1): (type, payload offset, payload length).
+    private static List<(string Type, int Off, int Len)> ParseIpco(byte[] data, int off, int len)
+    {
+        var list = new List<(string, int, int)>();
+        int pos = off, end = Math.Min(data.Length, off + len);
+        while (pos + 8 <= end)
+        {
+            long size = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos));
+            string type = Encoding.ASCII.GetString(data, pos + 4, 4);
+            int hdr = 8;
+            if (size == 1 && pos + 16 <= end) { size = (long)BinaryPrimitives.ReadUInt64BigEndian(data.AsSpan(pos + 8)); hdr = 16; }
+            else if (size == 0) size = end - pos;
+            if (size < hdr || pos + size > end) break;
+            // FullBox properties keep their version/flags in the payload; callers skip them where needed.
+            list.Add((type, pos + hdr, (int)size - hdr));
+            pos += (int)size;
+        }
+        return list;
+    }
+
+    // ipma: item_ID -> associated property indices (1-based; essential bit stripped).
+    private static Dictionary<int, List<int>> ParseIpma(byte[] data, int off, int len)
+    {
+        var map = new Dictionary<int, List<int>>();
+        int end = Math.Min(data.Length, off + len);
+        if (off + 8 > end) return map;
+        int version = data[off];
+        bool wide = (data[off + 3] & 1) != 0;
+        int pos = off + 4;
+        uint entries = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos));
+        pos += 4;
+        for (uint e = 0; e < entries && pos < end; e++)
+        {
+            if (pos + (version < 1 ? 2 : 4) + 1 > end) break;
+            int item = version < 1 ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)) : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos));
+            pos += version < 1 ? 2 : 4;
+            int n = data[pos++];
+            var l = new List<int>(n);
+            for (int k = 0; k < n; k++)
+            {
+                if (pos + (wide ? 2 : 1) > end) break;
+                l.Add(wide ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)) & 0x7FFF : data[pos] & 0x7F);
+                pos += wide ? 2 : 1;
+            }
+            if (!map.ContainsKey(item)) map[item] = l;
+        }
+        return map;
     }
 
     // Finds a codec configuration box (e.g. 'hvcC') in the ISOBMFF stream and returns its
@@ -448,15 +543,43 @@ public static class HeifCoder
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
         }
 
+        var color = ResolveAvifColor(image, options, bd);
+        // The identity matrix (RGB coded as GBR) is only defined for 4:4:4 — Auto picks it, explicit subsampling fails.
         var layout = options.ChromaSubsampling switch
         {
             AvifChromaSubsampling.Yuv422 => Av1.Av1PixelLayout.I422,
             AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
-            _ => Av1.Av1PixelLayout.I420,
+            AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
+            _ => color.Matrix == 0 ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
         };
-        return bd == 8 && layout == Av1.Av1PixelLayout.I420
-            ? EncodeAvif8(image, options.Qp)
-            : EncodeAvifGeneral(image, options.Qp, bd, layout);
+        if (color.Matrix == 0 && layout != Av1.Av1PixelLayout.I444)
+            throw new ArgumentException("The identity matrix (MatrixCoefficients 0) requires 4:4:4 chroma.", nameof(options));
+
+        // 8-bit 4:2:0 BT.601 full range keeps the original byte pipeline (RgbToI420); everything else goes through
+        // the general matrix/range/layout path.
+        bool bt601Full = color.Matrix is 5 or 6 && color.FullRange;
+        return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full
+            ? EncodeAvif8(image, options.Qp, color)
+            : EncodeAvifGeneral(image, options.Qp, bd, layout, color);
+    }
+
+    // CICP for an AVIF encode, validated against what libavif can represent (reformat.c avifGetYUVColorSpaceInfo).
+    private static Av1.Av1ObuWriter.Av1ColorDesc ResolveAvifColor(ImageFrame image, AvifEncodeOptions o, int bd)
+    {
+        var meta = image.Metadata.Cicp;
+        bool hasIcc = image.IccProfile != null || image.Metadata.IccProfile != null;
+        int cp = o.ColorPrimaries ?? meta?.ColorPrimaries ?? (hasIcc ? 2 : 1);
+        int tc = o.TransferCharacteristics ?? meta?.TransferCharacteristics ?? (hasIcc ? 2 : 13);
+        int mc = o.MatrixCoefficients ?? (meta?.MatrixCoefficients is 1 or 4 or 5 or 6 or 7 or 9 or 12 ? meta.MatrixCoefficients : 6);
+        if (cp is < 0 or > 255 || tc is < 0 or > 255)
+            throw new ArgumentOutOfRangeException(nameof(o), "CICP primaries/transfer must be 0..255.");
+        if (mc is not (0 or 1 or 2 or 4 or 5 or 6 or 7 or 8 or 9 or 12 or 16 or 17))
+            throw new NotSupportedException($"AVIF matrix coefficients {mc} are not supported (as in libavif: reserved, BT.2020 CL, SMPTE 2085, chroma-derived CL and ICtCp have no RGB<->YUV mapping here).");
+        if (mc is 8 or 16 or 17 && !o.FullRange)
+            throw new NotSupportedException("YCgCo matrices require full range (as in libavif).");
+        if (mc is 16 or 17 && bd - (mc == 16 ? 2 : 1) < 8)
+            throw new ArgumentException($"YCgCo-{(mc == 16 ? "Re" : "Ro")} codes {(mc == 16 ? 2 : 1)} bit(s) above the RGB depth — use BitDepth 10 or 12.");
+        return new Av1.Av1ObuWriter.Av1ColorDesc(cp, tc, mc, o.FullRange);
     }
 
     // True when any sample carries more than 8 bits of precision (an 8-bit-origin sample is exactly v8 * 257).
@@ -478,7 +601,8 @@ public static class HeifCoder
     // General AVIF encode (any bit depth, any chroma layout): samples are taken straight from the 16-bit quantum at
     // full precision and coded through the multi-superblock encoder (which handles every size 8..4096). The 8-bit
     // 4:2:0 case keeps its original byte path (EncodeAvif8) so its output is unchanged.
-    private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout)
+    private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout,
+        Av1.Av1ObuWriter.Av1ColorDesc color)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -523,30 +647,40 @@ public static class HeifCoder
         if (hasAlpha && nonOpaque && alpha != null)
         {
             int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
-            RgbToYuvHbd(r, g, b, w, h, bd, layout, out ushort[] yA, out ushort[] uA, out ushort[] vA);
-            return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx, bd, layout);
+            RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yA, out ushort[] uA, out ushort[] vA);
+            return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx, bd, layout, color);
         }
 
-        if (colour)
+        // Identity / YCgCo-R carry exact RGB, so even grey content keeps the colour (4:4:4) coding path.
+        if (colour || color.Matrix is 0 or 16 or 17)
         {
-            RgbToYuvHbd(r, g, b, w, h, bd, layout, out ushort[] yP, out ushort[] uP, out ushort[] vP);
-            return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx, bd, layout);
+            RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yP, out ushort[] uP, out ushort[] vP);
+            return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx, bd, layout, color);
         }
 
+        // Grey: 4:0:0 luma (Y = the grey value; limited range maps it into [16, 235] << (bd - 8)).
         int max = (1 << bd) - 1;
         var luma = new ushort[w * h];
-        for (int i = 0; i < luma.Length; i++) luma[i] = (ushort)Math.Clamp((int)Math.Round(r[i]), 0, max);
-        return Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx, bd);
+        for (int i = 0; i < luma.Length; i++)
+            luma[i] = (ushort)Math.Clamp((int)Math.Round(color.FullRange ? r[i] : r[i] / max * (219 << (bd - 8)) + (16 << (bd - 8))), 0, max);
+        return Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx, bd, color);
     }
 
-    // BT.601 full-range RGB -> Y'CbCr at an arbitrary bit depth and chroma layout (the same transform as RgbToI420,
-    // scaled): chroma is the rounded mean of each (possibly partial, for odd dims) subsampling group — 2x2 for 4:2:0,
-    // horizontal pairs for 4:2:2, single samples for 4:4:4 — offset by 2^(bd-1).
-    private static void RgbToYuvHbd(double[] r, double[] g, double[] b, int w, int h, int bd, Av1.Av1PixelLayout layout,
-        out ushort[] y, out ushort[] u, out ushort[] v)
+    // RGB -> Y'CbCr for AVIF at any depth / layout / CICP matrix / range, following libavif's avifImageRGBToYUV:
+    // normalised RGB, per-pixel Y (and U/V for 4:4:4), chroma = mean of each (possibly partial) subsampling group in
+    // the normalised domain, then unorm = round(v * range + bias). Identity codes G/B/R with the luma range; YCgCo
+    // (8) uses H.273 eqs 44-46; YCgCo-Re/Ro (16/17) are the integer lifting transforms on RGB quantised to
+    // bd-2 / bd-1 bits. r/g/b arrive in coded-depth units [0, 2^bd - 1].
+    private static void RgbToYuvAvif(double[] r, double[] g, double[] b, int w, int h, int bd, Av1.Av1PixelLayout layout,
+        Av1.Av1ObuWriter.Av1ColorDesc color, out ushort[] y, out ushort[] u, out ushort[] v)
     {
         int max = (1 << bd) - 1;
-        double mid = 1 << (bd - 1);
+        bool full = color.FullRange;
+        double biasY = full ? 0 : 16 << (bd - 8), rangeY = full ? max : 219 << (bd - 8);
+        double biasUV = 1 << (bd - 1), rangeUV = full ? max : 224 << (bd - 8);
+        int mc = color.Matrix;
+        (double kr, double kb) = mc == 12 ? ChromaDerivedKrKb(color.Primaries) : MatrixKrKb(mc);
+        double kg = 1 - kr - kb;
         int ssX = layout == Av1.Av1PixelLayout.I444 ? 0 : 1, ssY = layout == Av1.Av1PixelLayout.I420 ? 1 : 0;
         int cw = (w + ssX) >> ssX, chh = (h + ssY) >> ssY;
         y = new ushort[w * h];
@@ -555,29 +689,66 @@ public static class HeifCoder
         var uf = new double[cw * chh];
         var vf = new double[cw * chh];
         var cnt = new int[cw * chh];
+        int rgbMax = mc == 16 ? (1 << (bd - 2)) - 1 : mc == 17 ? (1 << (bd - 1)) - 1 : max;
         for (int yy = 0; yy < h; yy++)
         {
             for (int xx = 0; xx < w; xx++)
             {
                 int i = yy * w + xx;
-                double rr = r[i], gg = g[i], bb = b[i];
-                y[i] = (ushort)Math.Clamp((int)Math.Round(0.299 * rr + 0.587 * gg + 0.114 * bb), 0, max);
+                double R = r[i] / max, G = g[i] / max, B = b[i] / max, Y, U, V;
+                if (mc == 0) { Y = G; U = B; V = R; }
+                else if (mc == 8) { Y = 0.5 * G + 0.25 * (R + B); U = 0.5 * G - 0.25 * (R + B); V = 0.5 * (R - B); }
+                else if (mc is 16 or 17)
+                {
+                    int Ri = (int)Math.Round(Math.Clamp(R * rgbMax, 0, rgbMax)), Gi = (int)Math.Round(Math.Clamp(G * rgbMax, 0, rgbMax));
+                    int Bi = (int)Math.Round(Math.Clamp(B * rgbMax, 0, rgbMax));
+                    int co = Ri - Bi, tt = Bi + (co >> 1), cg = Gi - tt;
+                    Y = (tt + (cg >> 1)) / rangeY; U = cg / rangeUV; V = co / rangeUV;
+                }
+                else { Y = kr * R + kg * G + kb * B; U = (B - Y) / (2 * (1 - kb)); V = (R - Y) / (2 * (1 - kr)); }
+                y[i] = (ushort)Math.Clamp((int)Math.Round(Y * rangeY + biasY), 0, max);
                 int ci = (yy >> ssY) * cw + (xx >> ssX);
-                uf[ci] += -0.168736 * rr - 0.331264 * gg + 0.5 * bb + mid;
-                vf[ci] += 0.5 * rr - 0.418688 * gg - 0.081312 * bb + mid;
+                uf[ci] += U;
+                vf[ci] += V;
                 cnt[ci]++;
             }
         }
 
+        // Identity codes chroma planes with the luma range (H.273: G, B, R are all "luma-like").
+        double cRange = mc == 0 ? rangeY : rangeUV, cBias = mc == 0 ? biasY : biasUV;
         for (int i = 0; i < cw * chh; i++)
         {
             int n = cnt[i] > 0 ? cnt[i] : 1;
-            u[i] = (ushort)Math.Clamp((int)Math.Round(uf[i] / n), 0, max);
-            v[i] = (ushort)Math.Clamp((int)Math.Round(vf[i] / n), 0, max);
+            u[i] = (ushort)Math.Clamp((int)Math.Round(uf[i] / n * cRange + cBias), 0, max);
+            v[i] = (ushort)Math.Clamp((int)Math.Round(vf[i] / n * cRange + cBias), 0, max);
         }
     }
 
-    private static byte[] EncodeAvif8(ImageFrame image, int qp)
+    // libavif avifColorPrimariesComputeYCoeffs (H.273 eqs 32-37): kr/kb of the chromaticity-derived NCL matrix.
+    private static (float Kr, float Kb) ChromaDerivedKrKb(int primaries)
+    {
+        float[] p = primaries switch
+        {
+            4 => [0.67f, 0.33f, 0.21f, 0.71f, 0.14f, 0.08f, 0.310f, 0.316f],
+            5 => [0.64f, 0.33f, 0.29f, 0.60f, 0.15f, 0.06f, 0.3127f, 0.3290f],
+            6 or 7 => [0.630f, 0.340f, 0.310f, 0.595f, 0.155f, 0.070f, 0.3127f, 0.3290f],
+            8 => [0.681f, 0.319f, 0.243f, 0.692f, 0.145f, 0.049f, 0.310f, 0.316f],
+            9 => [0.708f, 0.292f, 0.170f, 0.797f, 0.131f, 0.046f, 0.3127f, 0.3290f],
+            10 => [1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.3333f, 0.3333f],
+            11 => [0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, 0.314f, 0.351f],
+            12 => [0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, 0.3127f, 0.3290f],
+            22 => [0.630f, 0.340f, 0.295f, 0.605f, 0.155f, 0.077f, 0.3127f, 0.3290f],
+            _ => [0.64f, 0.33f, 0.3f, 0.6f, 0.15f, 0.06f, 0.3127f, 0.329f],   // BT.709 (and libavif's unknown default)
+        };
+        float rX = p[0], rY = p[1], gX = p[2], gY = p[3], bX = p[4], bY = p[5], wX = p[6], wY = p[7];
+        float rZ = 1.0f - (rX + rY), gZ = 1.0f - (gX + gY), bZ = 1.0f - (bX + bY), wZ = 1.0f - (wX + wY);
+        float den = wY * (rX * (gY * bZ - bY * gZ) + gX * (bY * rZ - rY * bZ) + bX * (rY * gZ - gY * rZ));
+        float kr = rY * (wX * (gY * bZ - bY * gZ) + wY * (bX * gZ - gX * bZ) + wZ * (gX * bY - bX * gY)) / den;
+        float kb = bY * (wX * (rY * gZ - gY * rZ) + wY * (gX * rZ - rX * gZ) + wZ * (rX * gY - gX * rY)) / den;
+        return (kr, kb);
+    }
+
+    private static byte[] EncodeAvif8(ImageFrame image, int qp, Av1.Av1ObuWriter.Av1ColorDesc color)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -638,7 +809,7 @@ public static class HeifCoder
         {
             int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
             RgbToI420(rgb, w, h, out byte[] yA, out byte[] uA, out byte[] vA);
-            return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx);
+            return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx, color);
         }
 
         if (colour)
@@ -648,15 +819,15 @@ public static class HeifCoder
             // partial 2x2 group at the edge).
             RgbToI420(rgb, w, h, out byte[] yP, out byte[] uP, out byte[] vP);
             if (multiSb)
-                return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx);
+                return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx, color);
             if ((w & 1) != 0 || (h & 1) != 0)
                 throw new NotSupportedException($"AVIF single-block colour needs even dimensions (got {w}x{h}); larger frames support odd.");
-            return Av1.Av1StillImageEncoder.EncodeAvifColor(yP, uP, vP, w, h, baseQIdx);
+            return Av1.Av1StillImageEncoder.EncodeAvifColor(yP, uP, vP, w, h, baseQIdx, color);
         }
 
         return multiSb
-            ? Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx)
-            : Av1.Av1StillImageEncoder.EncodeAvifMonochrome(luma, w, h, baseQIdx);
+            ? Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx, color)
+            : Av1.Av1StillImageEncoder.EncodeAvifMonochrome(luma, w, h, baseQIdx, color);
     }
 
     // BT.601 full-range RGB→YUV (the inverse of ConvertYuvToRgb's full-range BT.601 path) with I420 chroma
@@ -765,6 +936,11 @@ public static class HeifCoder
     {
         var decoder = new Av1.Av1Decoder();
         using var yuv = decoder.Decode(codedData, 0, isKeyframe: true) ?? throw new InvalidDataException("AV1 alpha decode produced no frame.");
+        if (!decoder.FullColorRange)
+        {
+            ApplyAv1AlphaLimited(yuv, frame, w, h);
+            return;
+        }
         if (yuv.BitDepth > 8)
         {
             // Native-precision alpha: map [0, 2^bd) onto the full 16-bit quantum range.
@@ -803,7 +979,29 @@ public static class HeifCoder
         }
     }
 
-    private static void DecodeAv1IntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame, int matrixCoeffs, bool fullRange)
+    // Limited-range alpha (allowed by AVIF 1.0.0, since forbidden): libavif converts it to full range per sample with
+    // LIMITED_TO_FULL (v = ((v - lo) * max + (hi - lo) / 2) / (hi - lo), clamped), lo/hi = 16/235 << (bd - 8).
+    private static void ApplyAv1AlphaLimited(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h)
+    {
+        int bd = yuv.BitDepth, max = (1 << bd) - 1, lo = 16 << (bd - 8), hi = 235 << (bd - 8);
+        if (!frame.HasAlpha) frame.SetAlpha(true);
+        int nch = frame.NumberOfChannels, aOff = nch - 1;
+        ReadOnlySpan<byte> a8 = yuv.YPlane.Span;
+        ReadOnlySpan<ushort> a16 = yuv.YPlane16.Span;
+        double s = 65535.0 / max;
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < w; x++)
+            {
+                int v = bd > 8 ? a16[y * yuv.YStride + x] : a8[y * yuv.YStride + x];
+                v = Math.Clamp(((v - lo) * max + (hi - lo) / 2) / (hi - lo), 0, max);
+                row[x * nch + aOff] = bd > 8 ? (ushort)Math.Clamp((int)Math.Round(v * s), 0, 65535) : Quantum.ScaleFromByte((byte)v);
+            }
+        }
+    }
+
+    private static void DecodeAv1IntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame, (int Cp, int Tc, int Mc, bool Full)? nclx)
     {
         // Decode the AV1 keyframe with the vendored AV1 intra decoder (pixel-exact vs dav1d),
         // then convert its YUV planes to RGB. AVIF stores the whole temporal unit (sequence
@@ -812,11 +1010,14 @@ public static class HeifCoder
         using var yuv = decoder.Decode(codedData, 0, isKeyframe: true)
             ?? throw new InvalidDataException("AV1 decode produced no frame.");
 
-        // YUV -> RGB exactly as libavif's reference path does it (avifImageYUVToRGB, AUTOMATIC/BEST_QUALITY
-        // upsampling): per-depth unorm float tables, bilinear 9/3/3/1 chroma upsampling, libavif's matrix table.
+        var cicp = nclx ?? (decoder.ColorPrimaries, decoder.TransferCharacteristics, decoder.MatrixCoefficients, decoder.FullColorRange);
+        frame.Metadata.Cicp = new SharpImage.Metadata.CicpInfo(cicp.Cp, cicp.Tc, cicp.Mc, cicp.Full);
+
+        // YUV -> RGB exactly as libavif does it (avifImageYUVToRGB, AUTOMATIC upsampling): libyuv for 8-bit where it
+        // has the matrix, else the reference float path (unorm tables, bilinear 9/3/3/1 chroma, matrix modes).
         bool is444 = yuv.Format == Av1.PixelFormat.Yuv444P, is422 = yuv.Format == Av1.PixelFormat.Yuv422P;
         ConvertYuvToRgbLibavif(yuv, frame, (int)frame.Columns, (int)frame.Rows, frame.NumberOfChannels,
-            decoder.Monochrome, matrixCoeffs, fullRange, is444 ? 0 : 1, (is444 || is422) ? 0 : 1);
+            decoder.Monochrome, cicp.Mc, cicp.Full, cicp.Cp, is444 ? 0 : 1, (is444 || is422) ? 0 : 1);
     }
 
     // Converts a decoded 8/10/12-bit planar YUV 4:2:0 frame to RGB, honouring the colour
@@ -940,11 +1141,11 @@ public static class HeifCoder
     // toward the luma sample's side (none at the picture edge; 4:2:2 is horizontal only), clamp to [0,1], and
     // (uint16)(0.5f + v * 65535) into the 16-bit quantum. 32-bit float throughout, like libavif.
     private static void ConvertYuvToRgbLibavif(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
-        bool monochrome, int matrixCoeffs, bool fullRange, int ssHor, int ssVer)
+        bool monochrome, int matrixCoeffs, bool fullRange, int primaries, int ssHor, int ssVer)
     {
         // 8-bit colour goes through libyuv in libavif (its default build), whose fixed-point math differs from the
         // float path by up to 2 levels — use the exact port so we decode what libavif decodes.
-        if (yuv.BitDepth == 8 && !monochrome && LibyuvConstants(matrixCoeffs, fullRange) is { } k)
+        if (yuv.BitDepth == 8 && !monochrome && LibyuvConstants(matrixCoeffs, fullRange, primaries) is { } k)
         {
             ConvertYuvToRgbLibyuv8(yuv, frame, w, h, channels, k, ssHor, ssVer);
             return;
@@ -952,13 +1153,16 @@ public static class HeifCoder
 
         int bd = yuv.BitDepth, maxCh = (1 << bd) - 1;
         bool hbd = bd > 8;
+        // libavif reformat modes: identity (GBR, chroma on the luma table), YCgCo, YCgCo-Re/Ro (integer), else kr/kb.
+        int mode = monochrome ? 0 : matrixCoeffs switch { 0 => 1, 8 => 2, 16 or 17 => 3, _ => 0 };
         float rangeY = fullRange ? maxCh : 219 << (bd - 8), biasY = fullRange ? 0 : 16 << (bd - 8);
         float rangeUV = fullRange ? maxCh : 224 << (bd - 8), biasUV = 1 << (bd - 1);
         var tabY = new float[maxCh + 1];
         var tabUV = new float[maxCh + 1];
-        for (int cp = 0; cp <= maxCh; cp++) { tabY[cp] = (cp - biasY) / rangeY; tabUV[cp] = (cp - biasUV) / rangeUV; }
-        (float kr, float kb) = MatrixKrKb(matrixCoeffs);
+        for (int cp = 0; cp <= maxCh; cp++) { tabY[cp] = (cp - biasY) / rangeY; tabUV[cp] = mode == 1 ? tabY[cp] : (cp - biasUV) / rangeUV; }
+        (float kr, float kb) = matrixCoeffs == 12 ? ChromaDerivedKrKb(primaries) : MatrixKrKb(matrixCoeffs);
         float kg = 1.0f - kr - kb;
+        int rgbMaxR = matrixCoeffs == 16 ? (1 << (bd - 2)) - 1 : (1 << (bd - 1)) - 1;   // YCgCo-Re/Ro RGB depth
 
         ReadOnlySpan<byte> y8 = yuv.YPlane.Span, u8 = yuv.UPlane.Span, v8 = yuv.VPlane.Span;
         ReadOnlySpan<ushort> y16 = yuv.YPlane16.Span, u16 = yuv.UPlane16.Span, v16 = yuv.VPlane16.Span;
@@ -998,9 +1202,23 @@ public static class HeifCoder
                            + S(v8, v16, hbd, d2, maxCh, tabUV) * (3.0f / 16.0f) + S(v8, v16, hbd, d3, maxCh, tabUV) * (1.0f / 16.0f);
                     }
 
-                    R = Y + (2 * (1 - kr)) * Cr;
-                    B = Y + (2 * (1 - kb)) * Cb;
-                    G = Y - ((2 * ((kr * (1 - kr) * Cr) + (kb * (1 - kb) * Cb))) / kg);
+                    if (mode == 1) { G = Y; B = Cb; R = Cr; }                               // identity (H.273 41-43)
+                    else if (mode == 2) { float tt = Y - Cb; G = Y + Cb; B = tt - Cr; R = tt + Cr; }  // YCgCo (47-50)
+                    else if (mode == 3)
+                    {
+                        // YCgCo-Re/Ro (H.273-2024 62-65): integer lifting on the unorm Y and rounded Cg/Co.
+                        int yy = Math.Min(hbd ? y16[j * ys + i] : y8[j * ys + i], maxCh);
+                        int cg = (int)MathF.Floor(Cb * maxCh + 0.5f), co = (int)MathF.Floor(Cr * maxCh + 0.5f);   // avifRoundf
+                        int t2 = yy - (cg >> 1);
+                        int gi = Math.Clamp(t2 + cg, 0, rgbMaxR), bi = Math.Clamp(t2 - (co >> 1), 0, rgbMaxR), ri = Math.Clamp(bi + co, 0, rgbMaxR);
+                        G = gi / (float)rgbMaxR; B = bi / (float)rgbMaxR; R = ri / (float)rgbMaxR;
+                    }
+                    else
+                    {
+                        R = Y + (2 * (1 - kr)) * Cr;
+                        B = Y + (2 * (1 - kb)) * Cb;
+                        G = Y - ((2 * ((kr * (1 - kr) * Cr) + (kb * (1 - kb) * Cb))) / kg);
+                    }
                 }
 
                 int off = i * channels;
@@ -1016,6 +1234,11 @@ public static class HeifCoder
 
     // libyuv YuvConstants (row_common.cc, default build: UB clamped to 128 for limited range) as libavif's
     // getLibYUVConstants selects them: (YG, YB, UB, UG, VG, VR). Null where libavif falls back to its float path.
+    private static (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr)? LibyuvConstants(int mc, bool fullRange, int primaries)
+        => mc == 12
+            ? primaries switch { 1 or 2 => LibyuvConstants(1, fullRange), 5 or 6 => LibyuvConstants(6, fullRange), 9 => LibyuvConstants(9, fullRange), _ => null }
+            : LibyuvConstants(mc, fullRange);
+
     private static (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr)? LibyuvConstants(int mc, bool fullRange) => (mc, fullRange) switch
     {
         (5 or 6 or 2, true) => (16320, 32, 113, 22, 46, 90),        // JPEG

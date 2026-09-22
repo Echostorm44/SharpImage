@@ -102,6 +102,82 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
     }
 
+    // CICP verification (trigger hbd_cicp.txt): matrices / ranges / primaries+transfer passthrough, identity & YCgCo,
+    // limited-range grey, and a hand-built limited-range alpha item. Manifest: stem WxH bd cp tc mc full.
+    [Test, NotInParallel]
+    public void Cicp()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_cicp.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string outDir = Path.Combine(Scratch, "hbd_cicp");
+        Directory.CreateDirectory(outDir);
+        var log = new System.Text.StringBuilder();
+        var grad = Gradient(257, 131, alpha: false, gray: false);
+        var gray = Gradient(130, 67, alpha: false, gray: true);
+        var rgba = Gradient(160, 96, alpha: true, gray: false);
+        File.WriteAllBytes(Path.Combine(outDir, "grad.src.rgb48"), Rgb48(grad));
+        File.WriteAllBytes(Path.Combine(outDir, "gray.src.rgb48"), Rgb48(gray));
+        File.WriteAllBytes(Path.Combine(outDir, "rgba.src.rgb48"), Rgb48(rgba));
+        var cases = new (string Name, ImageFrame Img, int Bd, int? Cp, int? Tc, int? Mc, bool Full, AvifChromaSubsampling Ss)[]
+        {
+            ("default", grad, 8, null, null, null, true, AvifChromaSubsampling.Auto),
+            ("lim601", grad, 8, null, null, 6, false, AvifChromaSubsampling.Auto),
+            ("lim709", grad, 8, 1, 1, 1, false, AvifChromaSubsampling.Auto),
+            ("full709", grad, 8, 1, 1, 1, true, AvifChromaSubsampling.Yuv444),
+            ("lim709_10", grad, 10, 1, 1, 1, false, AvifChromaSubsampling.Yuv422),
+            ("pq2020", grad, 10, 9, 16, 9, true, AvifChromaSubsampling.Auto),
+            ("lim2020_12", grad, 12, 9, 18, 9, false, AvifChromaSubsampling.Yuv444),
+            ("full2020_8", grad, 8, 9, 13, 9, true, AvifChromaSubsampling.Auto),
+            ("fcc", grad, 8, 4, 4, 4, true, AvifChromaSubsampling.Auto),
+            ("smpte240", grad, 10, 7, 7, 7, false, AvifChromaSubsampling.Auto),
+            ("cdncl709", grad, 8, 1, 13, 12, true, AvifChromaSubsampling.Auto),
+            ("cdncl2020", grad, 10, 9, 16, 12, false, AvifChromaSubsampling.Auto),
+            ("cdnclp3", grad, 8, 12, 13, 12, true, AvifChromaSubsampling.Auto),
+            ("identity8", grad, 8, 1, 13, 0, true, AvifChromaSubsampling.Auto),
+            ("identity10", grad, 10, 1, 13, 0, true, AvifChromaSubsampling.Auto),
+            ("identitylim", grad, 8, 2, 2, 0, false, AvifChromaSubsampling.Auto),
+            ("ycgco", grad, 8, 2, 2, 8, true, AvifChromaSubsampling.Yuv444),
+            ("ycgco420", grad, 10, 2, 2, 8, true, AvifChromaSubsampling.Auto),
+            ("ycgcore", grad, 10, 2, 2, 16, true, AvifChromaSubsampling.Yuv444),
+            ("ycgcoro", grad, 10, 2, 2, 17, true, AvifChromaSubsampling.Yuv444),
+            ("graylim", gray, 8, 1, 13, 6, false, AvifChromaSubsampling.Auto),
+            ("graylim10", gray, 10, 1, 13, 6, false, AvifChromaSubsampling.Auto),
+            ("rgbalim", rgba, 8, 1, 13, 6, false, AvifChromaSubsampling.Auto),
+        };
+        foreach (var c in cases)
+        {
+            byte[] avif = HeifCoder.EncodeAvif(c.Img, new AvifEncodeOptions
+            {
+                Qp = 6, BitDepth = c.Bd, ColorPrimaries = c.Cp, TransferCharacteristics = c.Tc, MatrixCoefficients = c.Mc,
+                FullRange = c.Full, ChromaSubsampling = c.Ss,
+            });
+            File.WriteAllBytes(Path.Combine(outDir, c.Name + ".avif"), avif);
+            var dec = HeifCoder.Decode(avif);
+            File.WriteAllBytes(Path.Combine(outDir, c.Name + ".ours.rgb48"), Rgb48(dec));
+            var m = dec.Metadata.Cicp!;
+            string src = c.Img == grad ? "grad" : c.Img == gray ? "gray" : "rgba";
+            log.AppendLine($"{c.Name} {src} {c.Img.Columns}x{c.Img.Rows} {c.Bd} {m.ColorPrimaries} {m.TransferCharacteristics} {m.MatrixCoefficients} {(m.FullRange ? 1 : 0)}");
+        }
+
+        // Limited-range alpha (legal in AVIF 1.0.0): colour item + a studio-range monochrome alpha item.
+        foreach (int bd in new[] { 8, 10 })
+        {
+            int w = 160, h = 96, max = (1 << bd) - 1;
+            var yv = new ushort[w * h]; var uv = new ushort[(w / 2) * (h / 2)]; var vv = new ushort[uv.Length]; var av = new ushort[w * h];
+            for (int i = 0; i < yv.Length; i++) { yv[i] = (ushort)(max / 2); av[i] = (ushort)((16 << (bd - 8)) + (i % w) * (219 << (bd - 8)) / (w - 1)); }
+            Array.Fill(uv, (ushort)(1 << (bd - 1))); Array.Fill(vv, (ushort)(1 << (bd - 1)));
+            (byte[] cs, byte[] cf) = Av1StillImageEncoder.BuildColorObus(yv, uv, vv, w, h, 40, bd);
+            (byte[] asq, byte[] af) = Av1StillImageEncoder.BuildMonochromeObus(av, w, h, 8, bd, new Av1ObuWriter.Av1ColorDesc(2, 2, 2, false));
+            byte[] file = Av1AvifWriter.BuildAvifWithAlpha(cs, cf, asq, af, w, h, colorMonochrome: false, bd);
+            string name = $"alphalim{bd}";
+            File.WriteAllBytes(Path.Combine(outDir, name + ".avif"), file);
+            File.WriteAllBytes(Path.Combine(outDir, name + ".ours.rgb48"), Rgb48(HeifCoder.Decode(file)));
+            log.AppendLine($"{name} none {w}x{h} {bd} 2 2 6 1");
+        }
+        File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
+    }
+
     // Decodes externally produced AVIFs (e.g. libavif references) listed one path per line in hbd_decode.txt,
     // writing our HeifCoder 16-bit RGB(A) (.ours.rgb48) and our decoder's native planes (.ours.yuv) beside each.
     [Test, NotInParallel]

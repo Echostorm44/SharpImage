@@ -12,6 +12,17 @@ namespace SharpImage.Formats.Av1;
 internal static class Av1ObuWriter
 {
     /// <summary>Minimal still-image sequence configuration.</summary>
+    /// <summary>CICP colour description + range written to the sequence header's color_config (and mirrored by the
+    /// AVIF 'colr' nclx box). <see cref="Legacy"/> (all 2 = unspecified, full range) writes no description.</summary>
+    internal readonly record struct Av1ColorDesc(int Primaries, int Transfer, int Matrix, bool FullRange)
+    {
+        internal static Av1ColorDesc Legacy => new(2, 2, 2, true);
+        internal bool HasDescription => Primaries != 2 || Transfer != 2 || Matrix != 2;
+        /// <summary>BT.709 primaries + sRGB transfer + identity matrix: AV1's implied 4:4:4 full-range sRGB case
+        /// (color_range and subsampling are not coded).</summary>
+        internal bool IsSrgbIdentity => Primaries == 1 && Transfer == 13 && Matrix == 0;
+    }
+
     internal readonly struct SeqConfig
     {
         public readonly int Width;
@@ -20,10 +31,12 @@ internal static class Av1ObuWriter
         public readonly bool EnableFilterIntra;
         public readonly int BitDepth;   // 8, 10 or 12
         public readonly Av1PixelLayout Layout; // chroma layout of a colour stream (ignored when Monochrome)
+        public readonly Av1ColorDesc Color;
 
         public SeqConfig(int width, int height, bool monochrome, bool enableFilterIntra = false, int bitDepth = 8,
-            Av1PixelLayout layout = Av1PixelLayout.I420)
+            Av1PixelLayout layout = Av1PixelLayout.I420, Av1ColorDesc? color = null)
         {
+            Color = color ?? Av1ColorDesc.Legacy;
             Width = width;
             Height = height;
             Monochrome = monochrome;
@@ -120,22 +133,35 @@ internal static class Av1ObuWriter
             w.PutBool(cfg.BitDepth == 12);                // twelve_bit
         if (seqProfile != 1)
             w.PutBool(cfg.Monochrome); // mono_chrome (profile 1 is always colour 4:4:4)
-        w.PutBool(false);         // color_description_present_flag = 0 (colours = Unspecified)
+        w.PutBool(cfg.Color.HasDescription);   // color_description_present_flag
+        if (cfg.Color.HasDescription)
+        {
+            w.PutBits((uint)cfg.Color.Primaries, 8);
+            w.PutBits((uint)cfg.Color.Transfer, 8);
+            w.PutBits((uint)cfg.Color.Matrix, 8);
+        }
 
         if (cfg.Monochrome)
         {
-            // color_range = 1 (full). Monochrome streams are also AVIF alpha planes, and libavif/Chrome honour this
-            // flag for alpha: writing 0 (studio) made them range-expand our full-range alpha. Also matches the
-            // container's nclx full_range and libavif's own output.
-            w.PutBit(1);
+            // color_range (legacy/default 1 = full). Monochrome streams are also AVIF alpha planes, and libavif/
+            // Chrome honour this flag for alpha: writing 0 (studio) made them range-expand our full-range alpha.
+            w.PutBit(cfg.Color.FullRange ? 1u : 0u);
             // subsampling/chroma-sample-position implied (I400)
+        }
+        else if (cfg.Color.IsSrgbIdentity)
+        {
+            // BT.709/sRGB/Identity: color_range = 1 and 4:4:4 are implied — nothing coded but separate_uv_delta_q.
+            if (cfg.Layout != Av1PixelLayout.I444) throw new ArgumentException("The identity matrix requires 4:4:4.");
+            w.PutBool(false);     // separate_uv_delta_q = 0
         }
         else
         {
             // Colours Unspecified ⇒ the parser's "else" branch: color_range, then the subsampling (implied 1,1 by
             // profile 0 and 0,0 by profile 1; profile 2 codes subsampling_x/_y only at 12-bit, else implies 4:2:2),
             // then chroma_sample_position when subX && subY, then separate_uv_delta_q.
-            w.PutBit(1);          // color_range = 1 (full range)
+            if (cfg.Color.Matrix == 0 && cfg.Layout != Av1PixelLayout.I444)
+                throw new ArgumentException("The identity matrix requires 4:4:4.");
+            w.PutBit(cfg.Color.FullRange ? 1u : 0u);   // color_range
             int ssX = cfg.Layout == Av1PixelLayout.I444 ? 0 : 1;
             int ssY = cfg.Layout == Av1PixelLayout.I420 ? 1 : 0;
             if (seqProfile == 2 && cfg.BitDepth == 12)

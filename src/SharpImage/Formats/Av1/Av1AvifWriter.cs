@@ -14,7 +14,7 @@ internal static class Av1AvifWriter
     /// of the mdat item data (for decoders that decode the item as a self-contained temporal unit — including
     /// SharpImage's own). <paramref name="frameObu"/> is the OBU_FRAME.</summary>
     internal static byte[] BuildAvif(byte[] seqObu, byte[] frameObu, int width, int height, bool monochrome, int bitDepth = 8,
-        Av1PixelLayout layout = Av1PixelLayout.I420)
+        Av1PixelLayout layout = Av1PixelLayout.I420, Av1ObuWriter.Av1ColorDesc? color = null)
     {
         if (monochrome) layout = Av1PixelLayout.I400;
         byte[] av1C = BuildAv1C(layout, bitDepth);
@@ -23,8 +23,16 @@ internal static class Av1AvifWriter
         var mdat = new byte[seqObu.Length + frameObu.Length];
         seqObu.CopyTo(mdat, 0);
         frameObu.CopyTo(mdat, seqObu.Length);
-        return BuildIsoBmff(width, height, av1C, mdat, monochrome, bitDepth, layout);
+        return BuildIsoBmff(width, height, av1C, mdat, monochrome, bitDepth, layout, color);
     }
+
+    // colr nclx. Legacy (no description given): unspecified primaries/transfer, matrix Identity(0) for mono /
+    // BT.601(6) for colour, full range. Otherwise the exact CICP + full_range_flag (must match the sequence header).
+    private static byte[] ColrNclx(Av1ObuWriter.Av1ColorDesc? color, bool monochrome)
+        => color is { } c
+            ? Box("colr", Concat(Fourcc("nclx"), U16((ushort)c.Primaries), U16((ushort)c.Transfer), U16((ushort)c.Matrix),
+                new byte[] { (byte)(c.FullRange ? 0x80 : 0x00) }))
+            : Box("colr", Concat(Fourcc("nclx"), U16(2), U16(2), U16(monochrome ? 0 : 6), new byte[] { 0x80 }));
 
     // AV1CodecConfigurationRecord (av1C payload): the fixed 4-byte record only (configOBUs omitted, as libaom's
     // AVIF output does — the sequence header travels in-band in mdat).
@@ -56,7 +64,8 @@ internal static class Av1AvifWriter
     /// `av01` item (item 2) linked by an `auxl` item reference (item 2 → item 1) with the standard alpha aux URN.
     /// Both items' OBUs share one mdat (colour first, then alpha) as two extents. Verified in ffmpeg/libavif.</summary>
     internal static byte[] BuildAvifWithAlpha(byte[] colorSeq, byte[] colorFrame, byte[] alphaSeq, byte[] alphaFrame,
-        int width, int height, bool colorMonochrome, int bitDepth = 8, Av1PixelLayout layout = Av1PixelLayout.I420)
+        int width, int height, bool colorMonochrome, int bitDepth = 8, Av1PixelLayout layout = Av1PixelLayout.I420,
+        Av1ObuWriter.Av1ColorDesc? color = null)
     {
         if (colorMonochrome) layout = Av1PixelLayout.I400;
         var colorMdat = new byte[colorSeq.Length + colorFrame.Length];
@@ -76,7 +85,7 @@ internal static class Av1AvifWriter
         var pixiC = new List<byte> { (byte)cch };
         for (int i = 0; i < cch; i++) pixiC.Add((byte)bitDepth);
         byte[] pixiColor = FullBox("pixi", 0, 0, pixiC.ToArray());
-        byte[] colr = Box("colr", Concat(Fourcc("nclx"), U16(2), U16(2), U16(colorMonochrome ? 0 : 6), new byte[] { 0x80 }));
+        byte[] colr = ColrNclx(color, colorMonochrome);
         byte[] pixiAlpha = FullBox("pixi", 0, 0, new byte[] { 1, (byte)bitDepth });
         // auxC: aux_type is a null-terminated URN string identifying the alpha plane.
         byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
@@ -149,7 +158,7 @@ internal static class Av1AvifWriter
     }
 
     private static byte[] BuildIsoBmff(int width, int height, byte[] av1C, byte[] mdatPayload, bool monochrome, int bitDepth,
-        Av1PixelLayout layout)
+        Av1PixelLayout layout, Av1ObuWriter.Av1ColorDesc? color = null)
     {
         byte[] ftyp = Ftyp(bitDepth, monochrome ? Av1PixelLayout.I400 : layout);
 
@@ -165,8 +174,7 @@ internal static class Av1AvifWriter
         }
 
         byte[] pixi = FullBox("pixi", 0, 0, pixiPayload.ToArray());
-        // colr nclx: unspecified primaries/transfer, matrix Identity(0)/BT.601(6), full range.
-        byte[] colr = Box("colr", Concat(Fourcc("nclx"), U16(2), U16(2), U16(monochrome ? 0 : 6), new byte[] { 0x80 }));
+        byte[] colr = ColrNclx(color, monochrome);
         byte[] ipco = Box("ipco", Concat(ispe, pixi, av1CBox, colr));
 
         // ipma: item 1 → properties 1..4 (ispe, pixi, av1C essential = index 3, colr).
