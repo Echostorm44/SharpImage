@@ -1072,7 +1072,7 @@ public static class Av1Reconstruction
                             0, uvPlaneSrc, uvOff, uvStride, topSbEdge,
                             Av1IntraPredMode.Dc, ref localAngle,
                             uvtDim.W, uvtDim.H, false,
-                            edgeBuf, edgeCenter, 8);
+                            edgeBuf, edgeCenter, ctx.BitDepth);
 
                         // CFL prediction: DC prediction + AC scaled component
                         Av1IntraPred.Predict16(m,
@@ -1236,7 +1236,7 @@ public static class Av1Reconstruction
                                     topSbEdge, uvMode, ref localAngle,
                                     uvtDim.W, uvtDim.H,
                                     seqHdr.IntraEdgeFilter,
-                                    edgeBuf, edgeCenter, 8);
+                                    edgeBuf, edgeCenter, ctx.BitDepth);
 
                                 localAngle |= intraEdgeFilterFlag;
 
