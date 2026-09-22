@@ -2545,7 +2545,7 @@ internal static class Av1StillImageEncoder
     // noise). tx_size bitstream verified byte-exact in dav1d/ffmpeg.
     internal static bool UseColorTxDepth = true;
     internal static long TrueRdPixelBudget = 1600 * 1600;
-    internal static double EarlyTermBits = 24.0;
+    internal static double EarlyTermBits = 8.0;
 
     // Intra edge filtering + upsampling for directional prediction (AV1 enable_intra_edge_filter). The decoder
     // already implements it fully (Av1IntraPred.PredZ1/Z2/Z3 do the filter/upsample, gated on bit 10 of `angle`;

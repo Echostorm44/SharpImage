@@ -38,6 +38,7 @@ public sealed class Av1CorpusTune
         if (p.Length >= 9) Av1StillImageEncoder.RdModeCandidates = int.Parse(p[8], ci); // optional mode-search breadth
         if (p.Length >= 10) Av1StillImageEncoder.UseFilterIntra = p[9] == "1";          // optional filter-intra toggle
         if (p.Length >= 11) Av1StillImageEncoder.UseSub8Partition = p[10] == "1";       // optional sub-8x8 partition toggle
+        if (p.Length >= 12) Av1StillImageEncoder.EarlyTermBits = double.Parse(p[11], ci); // optional partition early-term threshold
 
         int cw = W / 2, ch = H / 2, ysz = W * H, csz = cw * ch;
         string outDir = Path.Combine(Corpus, "out", label);
