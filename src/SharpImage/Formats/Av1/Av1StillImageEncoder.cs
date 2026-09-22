@@ -730,13 +730,33 @@ internal static class Av1StillImageEncoder
                 EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4 + hsz, by4, hsz, blk4, node.V1);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.LeftSplit);
             }
-            else // choice == 7, PARTITION_VERT_B: left half, then two right quarters
+            else if (choice == 7) // PARTITION_VERT_B: left half, then two right quarters
             {
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.RightSplit, nPart);
                 EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4, by4, hsz, blk4, node.V0);
                 EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4, hsz, node.H0);
                 EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4 + hsz, hsz, Av1EdgeFlags.None);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.RightSplit);
+            }
+            else if (choice == 8) // PARTITION_HORZ_4: four 32x8 strips (bl==2 only; edge flags per decoder)
+            {
+                int q = hsz >> 1;   // quarter-height step in 4-units
+                c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Horizontal4, nPart);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4, bx4, by4, blk4, q, node.H0);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4, bx4, by4 + q, blk4, q, node.H4);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4, bx4, by4 + 2 * q, blk4, q, Av1EdgeFlags.AllLeftHasBottom);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4, bx4, by4 + 3 * q, blk4, q, node.H1);
+                FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Horizontal4);
+            }
+            else // choice == 9, PARTITION_VERT_4: four 8x32 strips
+            {
+                int q = hsz >> 1;
+                c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Vertical4, nPart);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16, bx4, by4, q, blk4, node.V0);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16, bx4 + q, by4, q, blk4, node.V4);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16, bx4 + 2 * q, by4, q, blk4, Av1EdgeFlags.AllTopHasRight);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16, bx4 + 3 * q, by4, q, blk4, node.V1);
+                FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Vertical4);
             }
             return;
         }
@@ -836,7 +856,7 @@ internal static class Av1StillImageEncoder
     {
         // Candidates: NONE and SPLIT always; HORZ/VERT at 32x32/16x16 when rect is enabled AND the block is fully
         // inside the frame (the rect leaves assume in-frame dimensions). For partial blocks only NONE vs SPLIT.
-        Span<int> cands = stackalloc int[8];
+        Span<int> cands = stackalloc int[10];
         int nc = 0; cands[nc++] = 0;
         if (bl < 4) cands[nc++] = 3;   // SPLIT — not at 8x8 (that would be 4x4, unsupported); 8x8 offers NONE/HORZ/VERT
         bool rectHere = fullyInside && !UsePalette && (((bl == 2 || bl == 3) && UseRectPartition) || (bl == 4 && UseSub8Partition));
@@ -845,6 +865,10 @@ internal static class Av1StillImageEncoder
         // block sizes we already code. Same in-frame + rect gate; 8x8 has no extended types.
         if (UseExtPartition && (bl == 2 || bl == 3) && rectHere)
         { cands[nc++] = 4; cands[nc++] = 5; cands[nc++] = 6; cands[nc++] = 7; }
+        // HORZ_4/VERT_4 at 32x32 → 32x8/8x32 strips (normal 16x4 chroma). Only bl==2: the 16x16→16x4 case needs
+        // sub-8x8-style shared chroma. The decoder still reads the symbol wherever we choose not to emit it.
+        if (UseExtPartition && bl == 2 && rectHere)
+        { cands[nc++] = 8; cands[nc++] = 9; }
 
         double lambda = RdLambdaK * c.AcDq * c.AcDq;
         var snap0 = SnapshotRd(c, bx4, by4, blk4);
