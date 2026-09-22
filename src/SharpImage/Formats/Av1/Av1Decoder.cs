@@ -210,7 +210,7 @@ internal sealed class Av1Decoder
 
             // Update reference frame slots
             try { UpdateReferenceFrames(); }
-            catch (Exception ex) { AvDbg.W($"[UPDATE-REF-ERROR] {ex.GetType().Name}: {ex.Message}"); return null; }
+            catch (Exception ex) { LastDecodeError = $"UpdateReferenceFrames: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"; AvDbg.W($"[UPDATE-REF-ERROR] {ex.GetType().Name}: {ex.Message}"); return null; }
 
             // Extract visible frame
             AvDbg.W($"[DECODE-CHECK] Pre-showframe check: ShowFrame={frameHdr.ShowFrame} ShowExistingFrame={frameHdr.ShowExistingFrame}");
@@ -500,7 +500,10 @@ internal sealed class Av1Decoder
     {
         // Align strides to 64 for cache friendliness
         int yStride = (width + 63) & ~63;
-        int uvStride = hasChroma ? (((width >> ssHor) + 63) & ~63) : 0;
+        // Chroma stride must cover the SB-aligned luma width (blocks reconstruct out to the MI grid edge, beyond
+        // the displayed width). Deriving it from floor(width/2) under-allocated odd widths just past a multiple of
+        // 128 (e.g. 257: stride 128 but chroma runs to 132) — rows overlapped and the reference copy threw.
+        int uvStride = hasChroma ? (((yStride >> ssHor) + 63) & ~63) : 0;
         // Superblocks tile the MI grid (MiRows*4 rows), which for non-multiple-of-8 heights exceeds the displayed
         // height — allocate to the SB-aligned height so edge blocks writing past `height` stay in-bounds. The
         // output still reports/reads only `height` rows.
@@ -2155,12 +2158,38 @@ internal sealed class Av1Decoder
             Av1PixelLayout.I422 => PixelFormat.Yuv422P,
             _ => PixelFormat.Yuv420P,
         };
+
+        // High-bit-depth streams additionally expose their native-precision samples (tightly packed, same
+        // strides as the 8-bit planes) so callers can keep full 10/12-bit precision.
+        ReadOnlyMemory<ushort> y16 = default, u16 = default, v16 = default;
+        if (ctx.BitDepth > 8)
+        {
+            var native = new ushort[totalSize];
+            void CopyPlane(ushort[]? pl, int stride, int off, int pw, int ph)
+            {
+                if (pl == null) return;
+                for (int yy = 0; yy < ph; yy++) Array.Copy(pl, yy * stride, native, off + yy * pw, pw);
+            }
+            CopyPlane(yPlane, ctx.CurrentStrides[0], yOff, w, h);
+            CopyPlane(uPlane, ctx.CurrentStrides[1], uOff, uvW, uvH);
+            CopyPlane(vPlane, ctx.CurrentStrides[2], vOff, uvW, uvH);
+            y16 = new ReadOnlyMemory<ushort>(native, yOff, ySize);
+            if (uPlane != null) u16 = new ReadOnlyMemory<ushort>(native, uOff, uvSize);
+            if (vPlane != null) v16 = new ReadOnlyMemory<ushort>(native, vOff, uvSize);
+        }
+
         return new DecodedVideoFrame(
             w, h, outFmt, presentationTimeTicks,
             outputBuffer,
             yOff, w,
             uOff, uvW,
-            vOff, uvW);
+            vOff, uvW)
+        {
+            BitDepth = ctx.BitDepth,
+            YPlane16 = y16,
+            UPlane16 = u16,
+            VPlane16 = v16,
+        };
     }
 
     /// <summary>

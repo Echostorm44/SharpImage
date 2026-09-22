@@ -18,13 +18,15 @@ internal static class Av1ObuWriter
         public readonly int Height;
         public readonly bool Monochrome;
         public readonly bool EnableFilterIntra;
+        public readonly int BitDepth;   // 8, 10 or 12
 
-        public SeqConfig(int width, int height, bool monochrome, bool enableFilterIntra = false)
+        public SeqConfig(int width, int height, bool monochrome, bool enableFilterIntra = false, int bitDepth = 8)
         {
             Width = width;
             Height = height;
             Monochrome = monochrome;
             EnableFilterIntra = enableFilterIntra;
+            BitDepth = bitDepth;
         }
     }
 
@@ -69,13 +71,19 @@ internal static class Av1ObuWriter
         return n < 1 ? 1 : n;
     }
 
+    /// <summary>AV1 seq_profile for a configuration: 12-bit requires Professional (2); 8/10-bit 4:2:0 and
+    /// monochrome are Main (0).</summary>
+    internal static int SeqProfile(in SeqConfig cfg) => cfg.BitDepth == 12 ? 2 : 0;
+
     /// <summary>Writes the sequence header OBU payload (no OBU framing). Mirrors Av1ObuParser.ParseSequenceHeader
     /// for the reduced_still_picture_header path.</summary>
     internal static byte[] WriteSequenceHeaderPayload(in SeqConfig cfg)
     {
         var w = new Av1BitWriter();
 
-        w.PutBits(0, 3);          // seq_profile = 0
+        // seq_profile: 0 (Main) covers 8/10-bit 4:2:0 + mono; 12-bit needs 2 (Professional).
+        int seqProfile = SeqProfile(cfg);
+        w.PutBits((uint)seqProfile, 3);
         w.PutBool(true);          // still_picture = 1
         w.PutBool(true);          // reduced_still_picture_header = 1
 
@@ -100,14 +108,19 @@ internal static class Av1ObuWriter
         w.PutBool(true);          // enable_cdef = 1 (frame header carries cdef_params; strengths may be 0 = no-op)
         w.PutBool(false);         // enable_restoration = 0
 
-        // color_config
-        w.PutBit(0);              // high_bitdepth = 0 (8-bit, profile 0)
+        // color_config (AV1 spec 5.5.2)
+        w.PutBool(cfg.BitDepth > 8);                      // high_bitdepth
+        if (seqProfile == 2 && cfg.BitDepth > 8)
+            w.PutBool(cfg.BitDepth == 12);                // twelve_bit
         w.PutBool(cfg.Monochrome); // mono_chrome (profile != 1)
         w.PutBool(false);         // color_description_present_flag = 0 (colours = Unspecified)
 
         if (cfg.Monochrome)
         {
-            w.PutBit(0);          // color_range = 0 (studio)
+            // color_range = 1 (full). Monochrome streams are also AVIF alpha planes, and libavif/Chrome honour this
+            // flag for alpha: writing 0 (studio) made them range-expand our full-range alpha. Also matches the
+            // container's nclx full_range and libavif's own output.
+            w.PutBit(1);
             // subsampling/chroma-sample-position implied (I400)
         }
         else
@@ -116,6 +129,11 @@ internal static class Av1ObuWriter
             // (subsampling_x=subsampling_y=1 implied by profile 0), then chroma_sample_position (2 bits, read
             // because subX & subY), then separate_uv_delta_q.
             w.PutBit(1);          // color_range = 1 (full range)
+            if (seqProfile == 2 && cfg.BitDepth == 12)
+            {
+                w.PutBit(1);      // subsampling_x = 1 (4:2:0)
+                w.PutBit(1);      // subsampling_y = 1
+            }
             w.PutBits(0, 2);      // chroma_sample_position = Unknown
             w.PutBool(false);     // separate_uv_delta_q = 0
         }

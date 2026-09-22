@@ -11,6 +11,31 @@ namespace SharpImage.Formats.Av1;
 
 internal static class Av1StillImageEncoder
 {
+    // Coding bit depth (8/10/12) for the current encode, set by BitDepthScope at every multi-superblock entry.
+    // Thread-static: the encoder runs single-threaded per call but callers may encode different images on
+    // different threads. The whole pixel pipeline runs in ushort through the decoder's own 16-bit twins
+    // (Predict16 / InvTxfmAdd16 / PrepareIntraEdges<ushort>), which Av1HbdTwinTests pin to the 8-bit results at
+    // bd=8 — so 8-bit streams are unchanged — and which the decoder itself uses for every bit depth.
+    [ThreadStatic] private static int t_bd;
+    private static int Bd => t_bd == 0 ? 8 : t_bd;
+    private static int PixMax => (1 << Bd) - 1;
+    private static int PixMid => 1 << (Bd - 1);
+    private static int BdIdx => Bd == 8 ? 0 : Bd == 10 ? 1 : 2;
+    // Dequantized-coefficient saturation, exactly the decoder's cf_max = ~(~127 << bpc) (32767 at 8-bit).
+    private static int CfMax => ~(~127 << Bd);
+
+    private readonly struct BitDepthScope : IDisposable
+    {
+        private readonly int prev;
+        public BitDepthScope(int bd)
+        {
+            if (bd is not (8 or 10 or 12)) throw new ArgumentOutOfRangeException(nameof(bd), "AV1 bit depth must be 8, 10 or 12.");
+            prev = t_bd;
+            t_bd = bd;
+        }
+        public void Dispose() => t_bd = prev;
+    }
+
     // A/B toggle: rate-distortion leaf decision (mode + tx-type via EstimateCoefBits) vs the SATD-only baseline.
     internal static bool UseRd = true;
 
@@ -283,25 +308,41 @@ internal static class Av1StillImageEncoder
     /// PARTITION_NONE with real DC prediction from reconstructed neighbours and neighbour DC-sign contexts,
     /// reconstructing as it goes. Capped at 2x2 SBs because the decoder's above context holds only two SBs.</summary>
     internal static byte[] EncodeAvifMonochromeMultiSb(ReadOnlySpan<byte> luma, int width, int height, int baseQIdx)
+        => EncodeAvifMonochromeMultiSb(Widen(luma), width, height, baseQIdx, 8);
+
+    /// <summary>High-bit-depth monochrome entry: <paramref name="luma"/> holds samples in [0, 2^bitDepth).</summary>
+    internal static byte[] EncodeAvifMonochromeMultiSb(ReadOnlySpan<ushort> luma, int width, int height, int baseQIdx, int bitDepth)
     {
-        (byte[] seqObu, byte[] frameObu) = BuildMonochromeObus(luma, width, height, baseQIdx);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true);
+        (byte[] seqObu, byte[] frameObu) = BuildMonochromeObus(luma, width, height, baseQIdx, bitDepth);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true, bitDepth);
+    }
+
+    // Widens 8-bit samples to the encoder's ushort pixel type (identity values).
+    private static ushort[] Widen(ReadOnlySpan<byte> src)
+    {
+        var d = new ushort[src.Length];
+        for (int i = 0; i < src.Length; i++) d[i] = src[i];
+        return d;
     }
 
     /// <summary>Builds the sequence-header + OBU_FRAME for a monochrome (I400) multi-superblock key frame — the
     /// shared core used both for a standalone grayscale AVIF and for an AVIF alpha auxiliary item.</summary>
     internal static (byte[] SeqObu, byte[] FrameObu) BuildMonochromeObus(ReadOnlySpan<byte> luma, int width, int height, int baseQIdx)
+        => BuildMonochromeObus(Widen(luma), width, height, baseQIdx, 8);
+
+    internal static (byte[] SeqObu, byte[] FrameObu) BuildMonochromeObus(ReadOnlySpan<ushort> luma, int width, int height, int baseQIdx, int bitDepth)
     {
+        using var bdScope = new BitDepthScope(bitDepth);
         ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
-        byte[] padded = PadPlane(luma, width, height, pw, ph);
+        ushort[] padded = PadPlane(luma, width, height, pw, ph);
         byte[] tile = EncodeMultiSbTile(padded, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
-        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: true);
+        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: true, bitDepth: bitDepth);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
 
         // CDEF strength search: the tile is CDEF-independent (cdef_bits=0), so try candidate strengths by decoding
         // each and keeping the one with the lowest reconstruction SSE vs source (always incl. the no-op, so it can
         // never hurt). The decoder applies CDEF as an output filter; intra prediction used pre-CDEF recon.
-        byte[] srcCopy = luma.ToArray();
+        ushort[] srcCopy = luma.ToArray();
         int lfLevel = SearchDeblock(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
             monochrome: true, srcCopy, null, null, 0, 0);
         Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
@@ -324,7 +365,7 @@ internal static class Av1StillImageEncoder
     // candidate through our own decoder (which matches libdav1d's CDEF), comparing the decoded planes to the
     // source. srcY is width*height; srcU/srcV (cw*ch) are only used when !monochrome.
     private static Av1ObuWriter.CdefParams SearchCdef(byte[] seqObu, byte[] tileRef, int baseQIdx, int sbCols, int sbRows,
-        int width, int height, bool monochrome, byte[] srcY, byte[]? srcU, byte[]? srcV, int cw, int ch, int lfLevel = 0)
+        int width, int height, bool monochrome, ushort[] srcY, ushort[]? srcU, ushort[]? srcV, int cw, int ch, int lfLevel = 0)
     {
         int damping = Math.Clamp(3 + (baseQIdx >> 6), 3, 6);
         long BestSse = long.MaxValue;
@@ -340,12 +381,7 @@ internal static class Av1StillImageEncoder
             var dec = new Av1Decoder();
             using var yuv = dec.Decode(tu, 0, isKeyframe: true);
             if (yuv == null) return long.MaxValue;
-            long sse = PlaneSse(yuv.YPlane.Span, yuv.YStride, srcY, width, height);
-            if (!monochrome && srcU != null && srcV != null)
-            {
-                sse += PlaneSse(yuv.UPlane.Span, yuv.UStride, srcU, cw, ch);
-                sse += PlaneSse(yuv.VPlane.Span, yuv.VStride, srcV, cw, ch);
-            }
+            long sse = DecodedSse(yuv, srcY, srcU, srcV, width, height, cw, ch, monochrome);
 
             return sse;
         }
@@ -356,7 +392,7 @@ internal static class Av1StillImageEncoder
         // re-decode is expensive and CDEF's gain on detailed content is near zero — skip it. Within that gate we
         // evaluate the no-op plus one q-scaled heuristic strength and keep whichever decodes closer to the
         // source, so it can never regress vs no CDEF.
-        if (baseQIdx < 64 || (long)width * height > 512 * 512) return Av1ObuWriter.CdefParams.None;
+        if (!UseCdefSearch || baseQIdx < 64 || (long)width * height > 512 * 512) return Av1ObuWriter.CdefParams.None;
 
         long noopSse = Evaluate(0, 0);
         BestSse = noopSse;
@@ -377,6 +413,7 @@ internal static class Av1StillImageEncoder
     // (SearchCdef then runs with the chosen level), mirroring libaom's deblock-before-CDEF ordering. Returns the
     // level (0 = off) that decoded closest to the source, so it can never regress vs no deblocking.
     internal static bool UseDeblockSearch = true;   // toggle the deblock loop_filter_level RD search (A/B)
+    internal static bool UseCdefSearch = true;      // toggle the CDEF strength search (A/B, conformance isolation)
 
     // Palette mode for colour (screen-content). When on, the frame enables screen_content_tools and eligible
     // DC luma blocks may be coded as palette; rect partitions are disabled to keep palette to the square leaf.
@@ -390,7 +427,7 @@ internal static class Av1StillImageEncoder
     internal static bool UseFilterIntra = true;
 
     private static int SearchDeblock(byte[] seqObu, byte[] tileRef, int baseQIdx, int sbCols, int sbRows,
-        int width, int height, bool monochrome, byte[] srcY, byte[]? srcU, byte[]? srcV, int cw, int ch)
+        int width, int height, bool monochrome, ushort[] srcY, ushort[]? srcU, ushort[]? srcV, int cw, int ch)
     {
         // Deblocking's still-image payoff is largest at coarse quantisation; skip the extra decodes when tiny.
         if (!UseDeblockSearch || (long)width * height > 512 * 512) return 0;
@@ -404,12 +441,7 @@ internal static class Av1StillImageEncoder
             var dec = new Av1Decoder();
             using var yuv = dec.Decode(tu, 0, isKeyframe: true);
             if (yuv == null) return long.MaxValue;
-            long sse = PlaneSse(yuv.YPlane.Span, yuv.YStride, srcY, width, height);
-            if (!monochrome && srcU != null && srcV != null)
-            {
-                sse += PlaneSse(yuv.UPlane.Span, yuv.UStride, srcU, cw, ch);
-                sse += PlaneSse(yuv.VPlane.Span, yuv.VStride, srcV, cw, ch);
-            }
+            long sse = DecodedSse(yuv, srcY, srcU, srcV, width, height, cw, ch, monochrome);
             return sse;
         }
 
@@ -427,7 +459,36 @@ internal static class Av1StillImageEncoder
         return bestLvl;
     }
 
-    private static long PlaneSse(ReadOnlySpan<byte> dec, int stride, byte[] src, int w, int h)
+    // Reconstruction SSE of a decoded frame vs the source planes, at the coded precision (native 10/12-bit
+    // samples for high-bit-depth streams, the 8-bit planes otherwise).
+    private static long DecodedSse(DecodedVideoFrame yuv, ushort[] srcY, ushort[]? srcU, ushort[]? srcV,
+        int width, int height, int cw, int ch, bool monochrome)
+    {
+        bool hbd = yuv.BitDepth > 8;
+        long sse = hbd ? PlaneSse(yuv.YPlane16.Span, yuv.YStride, srcY, width, height)
+                       : PlaneSse(yuv.YPlane.Span, yuv.YStride, srcY, width, height);
+        if (!monochrome && srcU != null && srcV != null)
+        {
+            sse += hbd ? PlaneSse(yuv.UPlane16.Span, yuv.UStride, srcU, cw, ch) : PlaneSse(yuv.UPlane.Span, yuv.UStride, srcU, cw, ch);
+            sse += hbd ? PlaneSse(yuv.VPlane16.Span, yuv.VStride, srcV, cw, ch) : PlaneSse(yuv.VPlane.Span, yuv.VStride, srcV, cw, ch);
+        }
+        return sse;
+    }
+
+    private static long PlaneSse(ReadOnlySpan<byte> dec, int stride, ushort[] src, int w, int h)
+    {
+        long sse = 0;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int d = dec[y * stride + x] - src[y * w + x];
+                sse += (long)d * d;
+            }
+
+        return sse;
+    }
+
+    private static long PlaneSse(ReadOnlySpan<ushort> dec, int stride, ushort[] src, int w, int h)
     {
         long sse = 0;
         for (int y = 0; y < h; y++)
@@ -445,26 +506,36 @@ internal static class Av1StillImageEncoder
     /// planes.</summary>
     internal static byte[] EncodeAvifColorMultiSb(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
         int width, int height, int baseQIdx)
+        => EncodeAvifColorMultiSb(Widen(luma), Widen(u), Widen(v), width, height, baseQIdx, 8);
+
+    /// <summary>High-bit-depth I420 colour entry: planes hold samples in [0, 2^bitDepth).</summary>
+    internal static byte[] EncodeAvifColorMultiSb(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v,
+        int width, int height, int baseQIdx, int bitDepth)
     {
-        (byte[] seqObu, byte[] frameObu) = BuildColorObus(luma, u, v, width, height, baseQIdx);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false);
+        (byte[] seqObu, byte[] frameObu) = BuildColorObus(luma, u, v, width, height, baseQIdx, bitDepth);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false, bitDepth);
     }
 
     /// <summary>Builds the sequence-header + OBU_FRAME for an I420 colour multi-superblock key frame.</summary>
     internal static (byte[] SeqObu, byte[] FrameObu) BuildColorObus(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
         int width, int height, int baseQIdx)
+        => BuildColorObus(Widen(luma), Widen(u), Widen(v), width, height, baseQIdx, 8);
+
+    internal static (byte[] SeqObu, byte[] FrameObu) BuildColorObus(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v,
+        int width, int height, int baseQIdx, int bitDepth)
     {
+        using var bdScope = new BitDepthScope(bitDepth);
         ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
         int cwIn = (width + 1) >> 1, chIn = (height + 1) >> 1;   // ceil — matches RgbToI420's chroma size (odd dims)
-        byte[] padY = PadPlane(luma, width, height, pw, ph);
-        byte[] padU = PadPlane(u, cwIn, chIn, pw / 2, ph / 2);
-        byte[] padV = PadPlane(v, cwIn, chIn, pw / 2, ph / 2);
+        ushort[] padY = PadPlane(luma, width, height, pw, ph);
+        ushort[] padU = PadPlane(u, cwIn, chIn, pw / 2, ph / 2);
+        ushort[] padV = PadPlane(v, cwIn, chIn, pw / 2, ph / 2);
         byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx);
-        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false, enableFilterIntra: UseFilterIntra);
+        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false, enableFilterIntra: UseFilterIntra, bitDepth: bitDepth);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
 
         // In-loop filter search (deblock first, then CDEF with the chosen level; see BuildMonochromeObus).
-        byte[] srcY = luma.ToArray(), srcU = u.ToArray(), srcV = v.ToArray();
+        ushort[] srcY = luma.ToArray(), srcU = u.ToArray(), srcV = v.ToArray();
         int lfLevel = SearchDeblock(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
             monochrome: false, srcY, srcU, srcV, cwIn, chIn);
         Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
@@ -478,10 +549,15 @@ internal static class Av1StillImageEncoder
     /// full-range monochrome AV1 image (the standard AVIF alpha representation).</summary>
     internal static byte[] EncodeAvifColorWithAlpha(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
         ReadOnlySpan<byte> alpha, int width, int height, int baseQIdx, int alphaQIdx)
+        => EncodeAvifColorWithAlpha(Widen(luma), Widen(u), Widen(v), Widen(alpha), width, height, baseQIdx, alphaQIdx, 8);
+
+    /// <summary>High-bit-depth colour + alpha (alpha coded at the same depth, as libavif does).</summary>
+    internal static byte[] EncodeAvifColorWithAlpha(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v,
+        ReadOnlySpan<ushort> alpha, int width, int height, int baseQIdx, int alphaQIdx, int bitDepth)
     {
-        (byte[] cSeq, byte[] cFrame) = BuildColorObus(luma, u, v, width, height, baseQIdx);
-        (byte[] aSeq, byte[] aFrame) = BuildMonochromeObus(alpha, width, height, alphaQIdx);
-        return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: false);
+        (byte[] cSeq, byte[] cFrame) = BuildColorObus(luma, u, v, width, height, baseQIdx, bitDepth);
+        (byte[] aSeq, byte[] aFrame) = BuildMonochromeObus(alpha, width, height, alphaQIdx, bitDepth);
+        return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: false, bitDepth);
     }
 
     // Per-superblock recursive-partition state for I420 colour. Extends the grayscale scheme with two chroma
@@ -491,8 +567,8 @@ internal static class Av1StillImageEncoder
     {
         public Av1MsacWriter Msac = null!;
         public Av1CdfContext Cdf = null!;
-        public byte[] Luma = null!, U = null!, V = null!;
-        public byte[] ReconY = null!, ReconU = null!, ReconV = null!;
+        public ushort[] Luma = null!, U = null!, V = null!;
+        public ushort[] ReconY = null!, ReconU = null!, ReconV = null!;
         public int W, Cw, Chh;         // luma stride, chroma stride, chroma height
         public int Bw4, Bh4;           // REAL luma frame dims in 4-units
         public int DcDq, AcDq;
@@ -508,11 +584,11 @@ internal static class Av1StillImageEncoder
         // context and the colour-prediction cache. APal* are per-SB128-column (like AModeY); LPal* reset per SB row.
         public byte[] APalSz = null!, LPalSz = null!;         // [32] palette size at each position (0 = none)
         public ushort[] APalCol = null!, LPalCol = null!;     // [32*8] palette colours at each position
-        public byte[] Pred = new byte[64 * 64];
-        public byte[] EstScratch = new byte[64 * 64];
+        public ushort[] Pred = new ushort[64 * 64];
+        public ushort[] EstScratch = new ushort[64 * 64];
     }
 
-    private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> uPlane, ReadOnlySpan<byte> vPlane,
+    private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> uPlane, ReadOnlySpan<ushort> vPlane,
         int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx)
     {
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
@@ -528,16 +604,16 @@ internal static class Av1StillImageEncoder
         var aPalSz = new byte[sb128Cols][]; var aPalCol = new ushort[sb128Cols][];
         for (int i = 0; i < sb128Cols; i++) { abovePart[i] = new byte[16]; aModeY[i] = new byte[32]; aSkip[i] = new byte[32]; aTxY[i] = FilledSbyte(32, -1); aModeUv[i] = new byte[32]; aPalSz[i] = new byte[32]; aPalCol[i] = new ushort[32 * 8]; }
 
-        byte[] lumaArr = new byte[w * h]; luma.CopyTo(lumaArr);
-        byte[] uArr = new byte[cw * chh]; uPlane.CopyTo(uArr);
-        byte[] vArr = new byte[cw * chh]; vPlane.CopyTo(vArr);
+        ushort[] lumaArr = new ushort[w * h]; luma.CopyTo(lumaArr);
+        ushort[] uArr = new ushort[cw * chh]; uPlane.CopyTo(uArr);
+        ushort[] vArr = new ushort[cw * chh]; vPlane.CopyTo(vArr);
 
         var c = new ColorPartCtx
         {
             Msac = new Av1MsacWriter(), Cdf = cdf, Luma = lumaArr, U = uArr, V = vArr,
-            ReconY = new byte[w * h], ReconU = new byte[cw * chh], ReconV = new byte[cw * chh],
+            ReconY = new ushort[w * h], ReconU = new ushort[cw * chh], ReconV = new ushort[cw * chh],
             W = w, Cw = cw, Chh = chh, Bw4 = bw4, Bh4 = bh4,
-            DcDq = Av1Tables.DequantTable[0, baseQIdx, 0], AcDq = Av1Tables.DequantTable[0, baseQIdx, 1],
+            DcDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 0], AcDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1],
         };
 
         for (int sby = 0; sby < sbRows; sby++)
@@ -771,21 +847,21 @@ internal static class Av1StillImageEncoder
     {
         public Av1MsacWriter.State Msac;
         public Av1CdfContext Cdf = new();
-        public byte[] ReconY = null!, ReconU = null!, ReconV = null!;   // block regions
+        public ushort[] ReconY = null!, ReconU = null!, ReconV = null!;   // block regions
         public byte[] AbovePart = null!, ALY = null!, ACU = null!, ACV = null!, AModeY = null!, ASkip = null!;
         public byte[] LeftPart = null!, LLY = null!, LCU = null!, LCV = null!, LModeY = null!, LSkip = null!;
         public sbyte[] ATxY = null!, LTxY = null!;
         public byte[] APalSz = null!, LPalSz = null!; public ushort[] APalCol = null!, LPalCol = null!;
     }
 
-    private static byte[] CopyRegion(byte[] plane, int stride, int px, int py, int w, int h)
+    private static ushort[] CopyRegion(ushort[] plane, int stride, int px, int py, int w, int h)
     {
-        var r = new byte[w * h];
+        var r = new ushort[w * h];
         for (int y = 0; y < h; y++) Array.Copy(plane, (py + y) * stride + px, r, y * w, w);
         return r;
     }
 
-    private static void PasteRegion(byte[] region, byte[] plane, int stride, int px, int py, int w, int h)
+    private static void PasteRegion(ushort[] region, ushort[] plane, int stride, int px, int py, int w, int h)
     {
         for (int y = 0; y < h; y++) Array.Copy(region, y * w, plane, (py + y) * stride + px, w);
     }
@@ -927,7 +1003,7 @@ internal static class Av1StillImageEncoder
     }
 
     // === Chroma-from-luma (CfL) — mirrors Av1Reconstruction.ComputeCflAc / ApplyCflAlpha exactly (I420). ===
-    private static void ComputeCflAcEnc(byte[] reconY, int yStride, int bx, int by, int cn, short[] ac)
+    private static void ComputeCflAcEnc(ushort[] reconY, int yStride, int bx, int by, int cn, short[] ac)
     {
         int idx = 0;
         for (int y = 0; y < cn; y++)
@@ -945,19 +1021,19 @@ internal static class Av1StillImageEncoder
         for (int i = 0; i < cn * cn; i++) ac[i] = (short)(ac[i] - dc);
     }
 
-    private static byte[] BuildCflPred(int dcPred, short[] ac, int cn, int alpha)
+    private static ushort[] BuildCflPred(int dcPred, short[] ac, int cn, int alpha)
     {
-        var pred = new byte[cn * cn];
+        var pred = new ushort[cn * cn];
         for (int i = 0; i < cn * cn; i++)
         {
             int diff = ac[i] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6;
-            pred[i] = (byte)Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, 255);
+            pred[i] = (ushort)Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax);
         }
 
         return pred;
     }
 
-    private static int BestCflAlpha(byte[] plane, int planeW, int cbx, int cby, int cn, int dcPred, short[] ac)
+    private static int BestCflAlpha(ushort[] plane, int planeW, int cbx, int cby, int cn, int dcPred, short[] ac)
     {
         int bestAlpha = 0; long bestSse = long.MaxValue;
         for (int alpha = -16; alpha <= 16; alpha++)
@@ -969,7 +1045,7 @@ internal static class Av1StillImageEncoder
                 for (int x = 0; x < cn; x++)
                 {
                     int diff = ac[y * cn + x] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6;
-                    int e = plane[row + x] - Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, 255);
+                    int e = plane[row + x] - Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax);
                     sse += (long)e * e;
                 }
             }
@@ -983,7 +1059,7 @@ internal static class Av1StillImageEncoder
     // Rect (cw x ch) versions of the CfL helpers — mirror the decoder's ComputeCflAc (I420: sum the 2x2 luma,
     // <<1, subtract DC with log2Sz = log2(cw)+log2(ch)). Used to add CfL chroma to the rect and sub-8x8 leaves,
     // which previously coded DC-only chroma (the profiled +722B chroma-coef gap vs libaom on piechart).
-    private static void ComputeCflAcEncRect(byte[] reconY, int yStride, int bx, int by, int cw, int ch, short[] ac)
+    private static void ComputeCflAcEncRect(ushort[] reconY, int yStride, int bx, int by, int cw, int ch, short[] ac)
     {
         int idx = 0;
         for (int y = 0; y < ch; y++)
@@ -1000,15 +1076,15 @@ internal static class Av1StillImageEncoder
         for (int i = 0; i < cw * ch; i++) ac[i] = (short)(ac[i] - dc);
     }
 
-    private static byte[] BuildCflPredRect(int dcPred, short[] ac, int cw, int ch, int alpha)
+    private static ushort[] BuildCflPredRect(int dcPred, short[] ac, int cw, int ch, int alpha)
     {
-        var pred = new byte[cw * ch];
+        var pred = new ushort[cw * ch];
         for (int i = 0; i < cw * ch; i++)
-        { int diff = ac[i] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6; pred[i] = (byte)Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, 255); }
+        { int diff = ac[i] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6; pred[i] = (ushort)Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax); }
         return pred;
     }
 
-    private static int BestCflAlphaRect(byte[] plane, int planeW, int cbx, int cby, int cw, int ch, int dcPred, short[] ac)
+    private static int BestCflAlphaRect(ushort[] plane, int planeW, int cbx, int cby, int cw, int ch, int dcPred, short[] ac)
     {
         int bestAlpha = 0; long bestSse = long.MaxValue;
         for (int alpha = -16; alpha <= 16; alpha++)
@@ -1020,7 +1096,7 @@ internal static class Av1StillImageEncoder
                 for (int x = 0; x < cw; x++)
                 {
                     int diff = ac[y * cw + x] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6;
-                    int e = plane[row + x] - Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, 255);
+                    int e = plane[row + x] - Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax);
                     sse += (long)e * e;
                 }
             }
@@ -1038,21 +1114,21 @@ internal static class Av1StillImageEncoder
         if (signV != 0) w.EncodeSymbolAdapt(cdf.GetCflAlphaCdf((signV == 2 ? 3 : 0) + signU), Math.Abs(alphaV) - 1, 15);
     }
 
-    private static void CopyPlaneBlock(byte[] src, int cn, byte[] recon, int reconW, int cbx, int cby)
+    private static void CopyPlaneBlock(ushort[] src, int cn, ushort[] recon, int reconW, int cbx, int cby)
     {
         for (int y = 0; y < cn; y++) Array.Copy(src, y * cn, recon, (cby + y) * reconW + cbx, cn);
     }
 
-    private static byte[] FlatPlane(int value, int cn)
+    private static ushort[] FlatPlane(int value, int cn)
     {
-        var p = new byte[cn * cn]; Array.Fill(p, (byte)Math.Clamp(value, 0, 255)); return p;
+        var p = new ushort[cn * cn]; Array.Fill(p, (ushort)Math.Clamp(value, 0, PixMax)); return p;
     }
 
     // Reconstruction SSE of a chroma block coded with `coeffs` on prediction `predPlane` (cn x cn), vs the source.
-    private static long ChromaReconSse(int[] coeffs, int tx, int cn, int dcDq, int acDq, byte[] predPlane,
-        byte[] src, int srcW, int cbx, int cby)
+    private static long ChromaReconSse(int[] coeffs, int tx, int cn, int dcDq, int acDq, ushort[] predPlane,
+        ushort[] src, int srcW, int cbx, int cby)
     {
-        var tmp = new byte[cn * cn];
+        var tmp = new ushort[cn * cn];
         DequantAndReconstructPredRect(coeffs, tx, cn, cn, dcDq, acDq, predPlane, tmp, cn, 0, 0);
         long sse = 0;
         for (int y = 0; y < cn; y++)
@@ -1131,7 +1207,7 @@ internal static class Av1StillImageEncoder
         // palette (SSE 0 + λ·palBits) vs the transform mode just chosen (its SSE + λ·coeff/mode bits).
         if (UsePalette && blk4 <= 16 && fullyInside)
         {
-            Span<byte> present = stackalloc byte[256];
+            Span<byte> present = stackalloc byte[1 << Bd];
             int palSz = 0; bool tooMany = false;
             for (int yy = 0; yy < n && !tooMany; yy++)
                 for (int xx = 0; xx < n; xx++)
@@ -1142,7 +1218,7 @@ internal static class Av1StillImageEncoder
             if (!tooMany && palSz >= 2)
             {
                 var palColors = new ushort[8]; int pi = 0;
-                for (int v = 0; v < 256; v++) if (present[v] != 0) palColors[pi++] = (ushort)v;
+                for (int v = 0; v < (1 << Bd); v++) if (present[v] != 0) palColors[pi++] = (ushort)v;
                 int stride = blk4 * 4;
                 var palIdx = new byte[stride * n];
                 for (int yy = 0; yy < n; yy++)
@@ -1193,7 +1269,7 @@ internal static class Av1StillImageEncoder
 
         // Winner state across DC / directional-UV / CfL. predU/predV are the reconstruction prediction planes.
         int uvMode = 0, uvDelta = 0; bool useCfl = false;
-        byte[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
+        ushort[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
         double bestJ = ChromaReconSse(uC, ctx0, cn, c.DcDq, c.AcDq, dcuP, c.U, c.Cw, cbx, cby)
                      + ChromaReconSse(vC, ctx0, cn, c.DcDq, c.AcDq, dcvP, c.V, c.Cw, cbx, cby)
                      + clam0 * (CoeffCost(uC) + CoeffCost(vC) + Av1CoeffEncode.SymBits(uvModeCdf, 0));
@@ -1212,7 +1288,7 @@ internal static class Av1StillImageEncoder
             int cbw4 = c.Bw4 >> 1, cbh4 = c.Bh4 >> 1, cbx4 = bx4 >> 1, cby4 = by4 >> 1;
             int bDimW = Av1Tables.BlockDimensions[bs, 2], bDimH = Av1Tables.BlockDimensions[bs, 3];
             bool uvAngleOk = bDimW + bDimH >= 2;
-            var pu = new byte[cn * cn]; var pv = new byte[cn * cn];
+            var pu = new ushort[cn * cn]; var pv = new ushort[cn * cn];
 
             // SAD prescreen on U (SATD's 8x8 tiling overflows the 4x4 chroma case), then full RD on the best few.
             Span<int> topIdx = stackalloc int[RdUvCandidates];
@@ -1251,7 +1327,7 @@ internal static class Av1StillImageEncoder
                 {
                     bestJ = j; uvMode = (int)mode; uvDelta = delta; useCfl = false;
                     uC = uu; vC = vv; qfU = qfu2; qfV = qfv2;
-                    predU = (byte[])pu.Clone(); predV = (byte[])pv.Clone();
+                    predU = (ushort[])pu.Clone(); predV = (ushort[])pv.Clone();
                 }
             }
         }
@@ -1408,7 +1484,7 @@ internal static class Av1StillImageEncoder
         int bxR = bx4 & 31, byR = by4 & 31, cxR = bxR >> 1, cyR = byR >> 1;
         int bx = bx4 * 4, by = by4 * 4, cbx = bx4 * 2, cby = by4 * 2;
         int cn = n / 2, cblk4 = Math.Max(1, blk4 >> 1), stride = blk4 * 4;
-        const int bitDepth = 8;
+        int bitDepth = Bd;
 
         int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
         c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), 1);
@@ -1437,7 +1513,7 @@ internal static class Av1StillImageEncoder
         // Reconstruct luma from palette; chroma from DC prediction (skip ⇒ no residual on either).
         for (int yy = 0; yy < n; yy++)
             for (int xx = 0; xx < n; xx++)
-                c.ReconY[(by + yy) * c.W + bx + xx] = (byte)palColors[palIdx[yy * stride + xx]];
+                c.ReconY[(by + yy) * c.W + bx + xx] = (ushort)palColors[palIdx[yy * stride + xx]];
         int dcU = DcPredict(c.ReconU, c.Cw, c.Chh, cbx, cby, cn, cn);
         int dcV = DcPredict(c.ReconV, c.Cw, c.Chh, cbx, cby, cn, cn);
         FillFlat(c.ReconU, c.Cw, cbx, cby, cn, dcU);
@@ -1515,7 +1591,7 @@ internal static class Av1StillImageEncoder
         var lumaTxb = new List<(int[], Av1TxType, int, int, int, int, int)>();
         double coefBits = 0;
         int txN = lTDim.W * 4, txW4 = lTDim.W;
-        var predBuf = new byte[txN * txN];
+        var predBuf = new ushort[txN * txN];
         int sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0 ? 1 : 0;
         int sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0 ? 1 : 0;
         for (int iy = 0; iy < blk4; iy += txW4)
@@ -1564,8 +1640,8 @@ internal static class Av1StillImageEncoder
     {
         int w = w4 * 4, h = h4 * 4;
         int lScan = Av1Tables.Scans[lumaTx].Length;
-        var pred = new byte[h * w];
-        var bestPred = new byte[h * w];
+        var pred = new ushort[h * w];
+        var bestPred = new ushort[h * w];
         int[] bestCf = null!;
         long bestBits = long.MaxValue;
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
@@ -1576,7 +1652,7 @@ internal static class Av1StillImageEncoder
             if (bits < bestBits) { bestBits = bits; bestCf = cf; Array.Copy(pred, bestPred, h * w); }
         }
 
-        var reconTmp = new byte[h * w];
+        var reconTmp = new ushort[h * w];
         DequantAndReconstructPredRect(bestCf, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, reconTmp, w, 0, 0);
         long sse = 0;
         for (int y = 0; y < h; y++)
@@ -1593,7 +1669,7 @@ internal static class Av1StillImageEncoder
     // DC intra prediction for a w x h block from reconstructed neighbours — matches the decoder's DcGenBoth/Top/
     // Left (Av1IntraPred), INCLUDING the non-square reciprocal-multiplier correction (0x5556 for 1:2, 0x3334 for
     // 1:4). Square DcPredict cannot be used for rect blocks (w+h isn't a power of two).
-    private static int DcPredictRect(byte[] recon, int reconW, int bx, int by, int w, int h)
+    private static int DcPredictRect(ushort[] recon, int reconW, int bx, int by, int w, int h)
     {
         bool haveTop = by > 0, haveLeft = bx > 0;
         if (haveTop && haveLeft)
@@ -1625,14 +1701,14 @@ internal static class Av1StillImageEncoder
             return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)h);
         }
 
-        return 128;
+        return PixMid;
     }
 
-    private static void FillFlatRect(byte[] recon, int reconW, int bx, int by, int w, int h, int value)
+    private static void FillFlatRect(ushort[] recon, int reconW, int bx, int by, int w, int h, int value)
     {
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
-                recon[(by + y) * reconW + (bx + x)] = (byte)value;
+                recon[(by + y) * reconW + (bx + x)] = (ushort)value;
     }
 
     // Estimated chroma coding cost (both planes, DC-predicted from the block mean) of an I420 chroma block of
@@ -1649,7 +1725,7 @@ internal static class Av1StillImageEncoder
              + CoeffCost(ForwardResidualRectDc(c.V, c.Cw, cbx, cby, cw, ch, dcV, chromaTx, c.DcDq, c.AcDq, scan));
     }
 
-    private static int[] ForwardResidualRectDc(ReadOnlySpan<byte> plane, int planeW, int bx, int by, int w, int h,
+    private static int[] ForwardResidualRectDc(ReadOnlySpan<ushort> plane, int planeW, int bx, int by, int w, int h,
         int dc, int txIdx, int dcDq, int acDq, int rcCount)
     {
         var residual = new int[h * w];
@@ -1660,10 +1736,10 @@ internal static class Av1StillImageEncoder
 
     // Reconstructs a rect w x h block on top of a flat DC prediction, via the decoder's InvTxfmAdd.
     private static byte DequantAndReconstructRectDc(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
-        int dc, byte[] recon, int reconW, int bx, int by)
+        int dc, ushort[] recon, int reconW, int bx, int by)
     {
-        var pred = new byte[h * w];
-        Array.Fill(pred, (byte)Math.Clamp(dc, 0, 255));
+        var pred = new ushort[h * w];
+        Array.Fill(pred, (ushort)Math.Clamp(dc, 0, PixMax));
         return DequantAndReconstructPredRect(levels, txIdx, w, h, dcDq, acDq, pred, recon, reconW, bx, by);
     }
 
@@ -1687,8 +1763,8 @@ internal static class Av1StillImageEncoder
         int leftCtx = Av1Tables.IntraModeContext[c.LModeY[byR]];
         var ymCdf = c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
         int ySign = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
-        var pred = new byte[h * w];
-        var bestPred = new byte[h * w];
+        var pred = new ushort[h * w];
+        var bestPred = new ushort[h * w];
         var resBuf = new int[h * w];
         var qfCand = new double[lScan];
         var qfWin = new double[lScan];
@@ -1758,11 +1834,11 @@ internal static class Av1StillImageEncoder
         int[] vC = ForwardResidualRectDc(c.V, c.Cw, cbx, cby, cw, ch, dcV, chromaTx, c.DcDq, c.AcDq, cScan);
         double clam0 = RdLambdaK * c.AcDq * c.AcDq;
         var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode);
-        var dcuP = new byte[cw * ch]; Array.Fill(dcuP, (byte)Math.Clamp(dcU, 0, 255));
-        var dcvP = new byte[cw * ch]; Array.Fill(dcvP, (byte)Math.Clamp(dcV, 0, 255));
+        var dcuP = new ushort[cw * ch]; Array.Fill(dcuP, (ushort)Math.Clamp(dcU, 0, PixMax));
+        var dcvP = new ushort[cw * ch]; Array.Fill(dcvP, (ushort)Math.Clamp(dcV, 0, PixMax));
 
         int uvMode = 0, uvDelta = 0; bool useCfl = false;
-        byte[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
+        ushort[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
         double bestJ = ReconSseCandRect(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcuP, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
                      + ReconSseCandRect(vC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcvP, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
                      + clam0 * (CoeffCost(uC) + CoeffCost(vC) + Av1CoeffEncode.SymBits(uvModeCdf, 0));
@@ -1778,7 +1854,7 @@ internal static class Av1StillImageEncoder
             int cbw4 = c.Bw4 >> 1, cbh4 = c.Bh4 >> 1, cbx4 = bx4 >> 1, cby4 = by4 >> 1;
             int bDimW = Av1Tables.BlockDimensions[lumaBs, 2], bDimH = Av1Tables.BlockDimensions[lumaBs, 3];
             bool uvAngleOk = bDimW + bDimH >= 2;
-            var pu = new byte[cw * ch]; var pv = new byte[cw * ch];
+            var pu = new ushort[cw * ch]; var pv = new ushort[cw * ch];
             Span<int> uvTopIdx = stackalloc int[RdUvCandidates];
             Span<long> uvTopCost = stackalloc long[RdUvCandidates];
             uvTopCost.Fill(long.MaxValue);
@@ -1811,7 +1887,7 @@ internal static class Av1StillImageEncoder
                 if (j < bestJ)
                 {
                     bestJ = j; uvMode = (int)mode; uvDelta = delta; useCfl = false;
-                    uC = uu; vC = vv; predU = (byte[])pu.Clone(); predV = (byte[])pv.Clone();
+                    uC = uu; vC = vv; predU = (ushort[])pu.Clone(); predV = (ushort[])pv.Clone();
                 }
             }
         }
@@ -1935,7 +2011,7 @@ internal static class Av1StillImageEncoder
         // Luma mode search (no angle_delta at these sizes, so only the ~13 base modes — all RD-evaluated directly,
         // no SATD prescreen). Full reduced tx-type set (IDTX+DCT/ADST): the symbol is coded for 8x4/4x8 (max tx
         // dim <= 16), and IDTX helps these tiny edge sub-blocks — same win as the square/rect leaves.
-        var pred = new byte[h * w]; var bestPred = new byte[h * w]; var resBuf = new int[h * w];
+        var pred = new ushort[h * w]; var bestPred = new ushort[h * w]; var resBuf = new int[h * w];
         var qfCand = new double[lScan]; var qfWin = new double[lScan];
         double rectLambda = RdLambdaK * c.AcDq * c.AcDq;
         int[] yC = null!; Av1IntraPredMode yMode = Av1IntraPredMode.Dc; Av1TxType yInv = Av1TxType.DctDct; int yTxIdx = 1;
@@ -1973,7 +2049,7 @@ internal static class Av1StillImageEncoder
         int dcU = 0, dcV = 0; int[] uC = System.Array.Empty<int>(), vC = System.Array.Empty<int>();
         bool cflAllowed = ((Av1Tables.CflAllowedMask >> lumaBs) & 1) != 0;
         int uvNsym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
-        bool useCfl = false; int alphaU = 0, alphaV = 0; byte[]? cflU = null, cflV = null;
+        bool useCfl = false; int alphaU = 0, alphaV = 0; ushort[]? cflU = null, cflV = null;
         if (hasChroma)
         {
             dcU = DcPredictRect(c.ReconU, c.Cw, cbx, cby, 4, 4);
@@ -1990,8 +2066,8 @@ internal static class Av1StillImageEncoder
                 cflV = BuildCflPredRect(dcV, acc, 4, 4, alphaV);
                 int[] uCc = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cflU, 4, 4, chromaTx, c.DcDq, c.AcDq, cScan);
                 int[] vCc = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cflV, 4, 4, chromaTx, c.DcDq, c.AcDq, cScan);
-                var dcuP = new byte[16]; Array.Fill(dcuP, (byte)Math.Clamp(dcU, 0, 255));
-                var dcvP = new byte[16]; Array.Fill(dcvP, (byte)Math.Clamp(dcV, 0, 255));
+                var dcuP = new ushort[16]; Array.Fill(dcuP, (ushort)Math.Clamp(dcU, 0, PixMax));
+                var dcvP = new ushort[16]; Array.Fill(dcvP, (ushort)Math.Clamp(dcV, 0, PixMax));
                 double lam = RdLambdaK * c.AcDq * c.AcDq;
                 double dcJ = ReconSseCandRect(uC, chromaTx, 4, 4, c.DcDq, c.AcDq, dcuP, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
                            + ReconSseCandRect(vC, chromaTx, 4, 4, c.DcDq, c.AcDq, dcvP, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
@@ -2086,7 +2162,7 @@ internal static class Av1StillImageEncoder
         return a;
     }
 
-    private static int[] ForwardResidual(ReadOnlySpan<byte> plane, int planeW, int bx, int by, int n, int dcPred,
+    private static int[] ForwardResidual(ReadOnlySpan<ushort> plane, int planeW, int bx, int by, int n, int dcPred,
         int dcDq, int acDq, int scanLen, double[]? qfOut = null)
     {
         var residual = new int[n * n];
@@ -2125,9 +2201,9 @@ internal static class Av1StillImageEncoder
     }
 
     // Pads a plane to pw x ph by replicating the right/bottom edge.
-    private static byte[] PadPlane(ReadOnlySpan<byte> src, int w, int h, int pw, int ph)
+    private static ushort[] PadPlane(ReadOnlySpan<ushort> src, int w, int h, int pw, int ph)
     {
-        var padded = new byte[pw * ph];
+        var padded = new ushort[pw * ph];
         for (int y = 0; y < ph; y++)
         {
             int sy = Math.Min(y, h - 1);
@@ -2140,13 +2216,13 @@ internal static class Av1StillImageEncoder
         return padded;
     }
 
-    private static void FillFlat(byte[] recon, int reconW, int bx, int by, int n, int value)
+    private static void FillFlat(ushort[] recon, int reconW, int bx, int by, int n, int value)
     {
         for (int y = 0; y < n; y++)
         {
             for (int x = 0; x < n; x++)
             {
-                recon[(by + y) * reconW + (bx + x)] = (byte)value;
+                recon[(by + y) * reconW + (bx + x)] = (ushort)value;
             }
         }
     }
@@ -2158,8 +2234,8 @@ internal static class Av1StillImageEncoder
     {
         public Av1MsacWriter Msac = null!;
         public Av1CdfContext Cdf = null!;
-        public byte[] Luma = null!;   // padded plane
-        public byte[] Recon = null!;  // padded plane (SB-aligned), reconstructed as-we-go
+        public ushort[] Luma = null!;   // padded plane
+        public ushort[] Recon = null!;  // padded plane (SB-aligned), reconstructed as-we-go
         public int W;                 // padded stride
         public int Bw4, Bh4;          // REAL frame dims in 4-units (partition decisions use these)
         public int DcDq, AcDq;
@@ -2169,8 +2245,8 @@ internal static class Av1StillImageEncoder
         public byte[] AbovePart = null!, AboveLCoef = null!, AboveMode = null!, AboveSkip = null!;
         public byte[] LeftPart = null!, LeftLCoef = null!, LeftMode = null!, LeftSkip = null!;
         public sbyte[] AboveTxIntra = null!, LeftTxIntra = null!; // neighbour tx log-size, for the tx-depth context
-        public byte[] Pred = new byte[64 * 64];
-        public byte[] EstScratch = new byte[64 * 64];
+        public ushort[] Pred = new ushort[64 * 64];
+        public ushort[] EstScratch = new ushort[64 * 64];
     }
 
     private static sbyte[] FilledSbyte(int n, sbyte v) { var a = new sbyte[n]; Array.Fill(a, v); return a; }
@@ -2182,12 +2258,12 @@ internal static class Av1StillImageEncoder
     // reconstructing each leaf so later blocks predict from the pixels the decoder will produce. Only fully-inside
     // blocks are split; edge superblocks (non-multiple-of-64 frames) stay a single PARTITION_NONE 64x64 block, so
     // every partition decision is full-range and never needs the partial-edge bool path.
-    private static byte[] EncodeMultiSbTile(ReadOnlySpan<byte> luma, int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx)
+    private static byte[] EncodeMultiSbTile(ReadOnlySpan<ushort> luma, int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx)
     {
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
         var cdf = new Av1CdfContext();
         Av1CdfDefaults.InitializeDefault(cdf, qcat);
-        int acDq = Av1Tables.DequantTable[0, baseQIdx, 1];
+        int acDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1];
 
         int sb128Cols = (sbCols + 1) >> 1;
         var abovePart = new byte[sb128Cols][];
@@ -2206,14 +2282,14 @@ internal static class Av1StillImageEncoder
 
         var ctx = new GrayPartCtx
         {
-            Msac = new Av1MsacWriter(), Cdf = cdf, Luma = new byte[0], Recon = new byte[w * h], W = w,
-            Bw4 = bw4, Bh4 = bh4, DcDq = Av1Tables.DequantTable[0, baseQIdx, 0], AcDq = acDq,
+            Msac = new Av1MsacWriter(), Cdf = cdf, Luma = new ushort[0], Recon = new ushort[w * h], W = w,
+            Bw4 = bw4, Bh4 = bh4, DcDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 0], AcDq = acDq,
             // Extra split bias beyond the per-block header cost already in EstimateCost. Zero works well because
             // that header term already penalises the four sub-block headers a split introduces.
             SplitLambda = 0L,
         };
         // `Luma` is a ReadOnlySpan param; copy to a field-friendly array once.
-        var lumaArr = new byte[w * h];
+        var lumaArr = new ushort[w * h];
         luma.CopyTo(lumaArr);
         ctx.Luma = lumaArr;
 
@@ -2402,7 +2478,7 @@ internal static class Av1StillImageEncoder
         {
             int txN = tDim.W * 4;          // tx pixel size
             int txW4 = tDim.W;             // tx 4-unit size
-            var predBuf = new byte[txN * txN];
+            var predBuf = new ushort[txN * txN];
             int sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0 ? 1 : 0;
             int sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0 ? 1 : 0;
             // Per-tx-block: predict from reconstruction, code coeffs, reconstruct — in raster order.
@@ -2573,7 +2649,7 @@ internal static class Av1StillImageEncoder
     // the decoder's own inverse and returns J = SSE + λ·rate — so a 64x64 (or 32x32) transform that drops the
     // high-frequency detail of a sharp block is penalised by its reconstruction error, not just its (small) rate.
     // Used for the NONE/SPLIT decision in both the grayscale and colour encoders (the tree is luma-driven).
-    private static long EstimateBlockCost(byte[] luma, int w, int bw4, int bh4, int dcDq, int acDq, byte[] scratch,
+    private static long EstimateBlockCost(ushort[] luma, int w, int bw4, int bh4, int dcDq, int acDq, ushort[] scratch,
         int bl, int bx4, int by4)
     {
         int n = (32 >> bl) * 4;
@@ -2585,7 +2661,7 @@ internal static class Av1StillImageEncoder
             if (v != 0) { int a = Math.Abs(v); bits += 5 + (a >= 15 ? 8 : a >> 1); } // base+sign ~5b, magnitude tail
 
         // Reconstruct through the decoder's inverse (from the same source-plane prediction) and measure SSE.
-        var reconTmp = new byte[n * n];
+        var reconTmp = new ushort[n * n];
         DequantAndReconstructPred(coeffs, tx, n, dcDq, acDq, scratch, reconTmp, n, 0, 0);
         long sse = 0;
         for (int y = 0; y < n; y++)
@@ -2670,10 +2746,10 @@ internal static class Av1StillImageEncoder
     // Predicts an n x n luma block with the given intra mode into dst (stride n), reusing the decoder's own edge
     // preparation + prediction so encoder and decoder agree bit-for-bit. recon is the reconstruction plane
     // (stride reconW), bx4/by4 the block position in 4-unit units, bw4/bh4 the frame size in 4-unit units.
-    private static void PredictIntra(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4, int n,
-        Av1IntraPredMode mode, int delta, byte[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
+    private static void PredictIntra(ushort[] recon, int reconW, int bw4, int bh4, int bx4, int by4, int n,
+        Av1IntraPredMode mode, int delta, ushort[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
     {
-        Span<byte> edge = stackalloc byte[257];
+        Span<ushort> edge = stackalloc ushort[257];
         const int edgeCenter = 128;
         int dstOff = (by4 * 4) * reconW + (bx4 * 4);
         int tw4 = n >> 2;
@@ -2683,9 +2759,9 @@ internal static class Av1StillImageEncoder
         int m = Av1Reconstruction.PrepareIntraEdges(
             bx4, haveLeft, by4, haveTop, bw4, bh4, edgeFlags,
             recon, dstOff, reconW, default, mode, ref angle, tw4, tw4,
-            filterEdge: (intraFlags & EdgeFilterEnableBit) != 0, edge, edgeCenter, 8);
-        Av1IntraPred.Predict(m, dst, n, edge, edgeCenter, n, n, angle | intraFlags,
-            4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
+            filterEdge: (intraFlags & EdgeFilterEnableBit) != 0, edge, edgeCenter, Bd);
+        Av1IntraPred.Predict16(m, dst, n, edge, edgeCenter, n, n, angle | intraFlags,
+            4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4, Bd);
     }
 
     // Chooses the intra mode with the lowest residual SATD (sum of absolute Hadamard-transformed differences) —
@@ -2693,13 +2769,13 @@ internal static class Av1StillImageEncoder
     // directional edges are scored the way the transform will actually code them. Returns the winning (mode,
     // angle_delta) and writes its prediction into predOut (n x n). Purely an encoder decision: any candidate is
     // a valid mode, so this can never desync the decoder.
-    private static (Av1IntraPredMode Mode, int Delta, long Cost) ChooseIntraMode(byte[] recon, int reconW, int bw4, int bh4,
-        int bx4, int by4, int n, ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] predOut,
+    private static (Av1IntraPredMode Mode, int Delta, long Cost) ChooseIntraMode(ushort[] recon, int reconW, int bw4, int bh4,
+        int bx4, int by4, int n, ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] predOut,
         Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
     {
         long best = long.MaxValue;
         (Av1IntraPredMode Mode, int Delta) bestCand = (Av1IntraPredMode.Dc, 0);
-        var tmp = new byte[n * n];
+        var tmp = new ushort[n * n];
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
             PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, tmp, edgeFlags);
@@ -2717,7 +2793,7 @@ internal static class Av1StillImageEncoder
 
     // Sum of 8x8 Hadamard-transformed absolute residuals (src - pred) tiled over an n x n block. SATD is the
     // standard cheap frequency-domain proxy for transform coding cost.
-    private static long Satd8x8(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] pred, int n)
+    private static long Satd8x8(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int n)
     {
         long total = 0;
         var d = new int[64];
@@ -2737,7 +2813,7 @@ internal static class Av1StillImageEncoder
 
     // Sum of absolute differences over a cn x cn block (pred stride = cn). Works at any size (unlike the 8x8-tiled
     // SATD), so it prescreens chroma UV modes down to 4x4. A coarse proxy — good enough to pick the RD shortlist.
-    private static long SadBlock(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] pred, int cn)
+    private static long SadBlock(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int cn)
     {
         long total = 0;
         for (int y = 0; y < cn; y++)
@@ -2750,7 +2826,7 @@ internal static class Av1StillImageEncoder
 
     // SATD over a w x h rectangular block (pred stride = w). Rect leaf sizes are all multiples of 8, so the 8x8
     // Hadamard tiling is exact. Used to prescreen rect intra modes cheaply before the full RD tx-type search.
-    private static long Satd8x8Rect(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] pred, int w, int h)
+    private static long Satd8x8Rect(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int w, int h)
     {
         long total = 0;
         var d = new int[64];
@@ -2796,7 +2872,7 @@ internal static class Av1StillImageEncoder
     }
 
     // DC prediction for a 64x64 block from reconstructed neighbours, mirroring Av1IntraPred DC modes.
-    private static int DcPredict(byte[] recon, int w, int h, int bx, int by, int bw, int bh)
+    private static int DcPredict(ushort[] recon, int w, int h, int bx, int by, int bw, int bh)
     {
         bool haveTop = by > 0;
         bool haveLeft = bx > 0;
@@ -2822,23 +2898,23 @@ internal static class Av1StillImageEncoder
             return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)bh);
         }
 
-        return 128;
+        return PixMid;
     }
 
     // Dequantizes the quantized levels the way the decoder does, inverse-transforms onto the DC prediction (via
     // the decoder's own InvTxfmAdd) to reconstruct the 64x64 block into `recon`, and returns the coefficient
     // context byte (cul_level | dc-sign) that neighbours read.
-    private static byte DequantAndReconstruct(int[] levels, int dcDq, int acDq, int dcPred, byte[] recon, int w, int bx, int by)
+    private static byte DequantAndReconstruct(int[] levels, int dcDq, int acDq, int dcPred, ushort[] recon, int w, int bx, int by)
         => DequantAndReconstruct(levels, Tx64x64, 64, dcDq, acDq, dcPred, recon, w, bx, by);
 
     // Dequantizes quantized levels (decoder-exact), inverse-transforms onto the DC prediction (via the decoder's
     // own InvTxfmAdd) to reconstruct an n x n block of transform <paramref name="tx"/> into <paramref
     // name="recon"/> (stride <paramref name="reconW"/>), and returns the block's coefficient context byte.
     private static byte DequantAndReconstruct(int[] levels, int tx, int n, int dcDq, int acDq, int dcPred,
-        byte[] recon, int reconW, int bx, int by)
+        ushort[] recon, int reconW, int bx, int by)
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[tx].Ctx - 2);
-        const int cfMax = 32767; // ~(~127 << 8), 8-bit
+        int cfMax = CfMax;
         var scan = Av1Tables.Scans[tx];
 
         int eob = -1;
@@ -2865,9 +2941,9 @@ internal static class Av1StillImageEncoder
         int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
-        var block = new byte[n * n];
-        Array.Fill(block, (byte)dcPred);
-        Av1InvTransform.InvTxfmAdd(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], Av1TxType.DctDct, 8);
+        var block = new ushort[n * n];
+        Array.Fill(block, (ushort)dcPred);
+        Av1InvTransform.InvTxfmAdd16(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], Av1TxType.DctDct, Bd);
         for (int y = 0; y < n; y++)
         {
             for (int x = 0; x < n; x++)
@@ -2882,10 +2958,10 @@ internal static class Av1StillImageEncoder
     // Dequantizes and reconstructs an n x n block on top of an arbitrary intra prediction (predBlock, n x n),
     // via the decoder's InvTxfmAdd, into recon. Returns the coefficient-context byte.
     private static byte DequantAndReconstructPred(int[] levels, int tx, int n, int dcDq, int acDq,
-        byte[] predBlock, byte[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct)
+        ushort[] predBlock, ushort[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct)
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[tx].Ctx - 2);
-        const int cfMax = 32767;
+        int cfMax = CfMax;
         var scan = Av1Tables.Scans[tx];
         int eob = -1;
         for (int i = scan.Length - 1; i >= 0; i--)
@@ -2911,8 +2987,8 @@ internal static class Av1StillImageEncoder
         int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
-        var block = (byte[])predBlock.Clone();
-        Av1InvTransform.InvTxfmAdd(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], txType, 8);
+        var block = (ushort[])predBlock.Clone();
+        Av1InvTransform.InvTxfmAdd16(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], txType, Bd);
         for (int y = 0; y < n; y++)
         {
             for (int x = 0; x < n; x++)
@@ -2928,11 +3004,11 @@ internal static class Av1StillImageEncoder
     // `predBlock`, and sum squared error vs the source. Used to score tx-type / mode candidates by true RD (D + λR)
     // rather than rate alone — necessary because IDTX changes the reconstruction distortion at a matched quantizer
     // (unlike the DCT/ADST family), so a rate-only comparison over-selects it on smooth content.
-    private static long ReconSseCand(int[] levels, int tx, int n, int dcDq, int acDq, byte[] predBlock,
-        byte[] src, int srcW, int srcBx, int srcBy, Av1TxType txType)
+    private static long ReconSseCand(int[] levels, int tx, int n, int dcDq, int acDq, ushort[] predBlock,
+        ushort[] src, int srcW, int srcBx, int srcBy, Av1TxType txType)
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[tx].Ctx - 2);
-        const int cfMax = 32767;
+        int cfMax = CfMax;
         var scan = Av1Tables.Scans[tx];
         int eob = -1;
         for (int i = scan.Length - 1; i >= 0; i--) if (levels[scan[i]] != 0) { eob = i; break; }
@@ -2945,8 +3021,8 @@ internal static class Av1StillImageEncoder
             int dq = Math.Min(((rc == 0 ? dcDq : acDq) * mag) >> dqShift, cfMax + sign);
             cf[rc] = sign != 0 ? -dq : dq;
         }
-        var block = (byte[])predBlock.Clone();
-        Av1InvTransform.InvTxfmAdd(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], txType, 8);
+        var block = (ushort[])predBlock.Clone();
+        Av1InvTransform.InvTxfmAdd16(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], txType, Bd);
         long sse = 0;
         for (int y = 0; y < n; y++)
             for (int x = 0; x < n; x++) { int d = block[y * n + x] - src[(srcBy + y) * srcW + (srcBx + x)]; sse += (long)d * d; }
@@ -3002,9 +3078,9 @@ internal static class Av1StillImageEncoder
     // bits. This replaces the SATD proxy: it directly minimises what the bitstream costs and lets the tx-type
     // (ADST/DCT) choice compound with the mode choice. Writes the winning prediction into predOut.
     private static (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx)
-        ChooseLeafRdCore(byte[] recon, int reconW, int bw4, int bh4, byte[] luma, int lumaW, int bx4, int by4,
+        ChooseLeafRdCore(ushort[] recon, int reconW, int bw4, int bh4, ushort[] luma, int lumaW, int bx4, int by4,
             int n, int tx, int dcDq, int acDq, Av1CdfContext cdf, byte aboveMode, byte leftMode,
-            ReadOnlySpan<byte> aboveLCoef, ReadOnlySpan<byte> leftLCoef, byte[] predOut,
+            ReadOnlySpan<byte> aboveLCoef, ReadOnlySpan<byte> leftLCoef, ushort[] predOut,
             Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, bool filterEligible = false, int bs = 0, bool fullSet = false)
     {
         // Full intra set adds V_DCT/H_DCT for sub-16x16 luma (n in {4,8}); 16x16 and up stay on the reduced set.
@@ -3015,7 +3091,7 @@ internal static class Av1StillImageEncoder
         int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, aboveLCoef, leftLCoef);
         int intraFlags = IntraEdgeFlags(aboveMode, leftMode);
         int scanLen = Av1Tables.Scans[tx].Length;
-        var predBuf = new byte[n * n];
+        var predBuf = new ushort[n * n];
         var qfCand = new double[scanLen];
         var qfWin = new double[scanLen];
 
@@ -3112,10 +3188,10 @@ internal static class Av1StillImageEncoder
     // PrepareIntraEdges + Av1IntraPred.Predict + InvTxfmAdd, so they are conformant by construction. ===
 
     // Intra prediction for a w x h block into dst (h rows x w cols, stride w).
-    private static void PredictIntraRect(byte[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
-        int w, int h, Av1IntraPredMode mode, int delta, byte[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
+    private static void PredictIntraRect(ushort[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
+        int w, int h, Av1IntraPredMode mode, int delta, ushort[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
     {
-        Span<byte> edge = stackalloc byte[257];
+        Span<ushort> edge = stackalloc ushort[257];
         const int edgeCenter = 128;
         int dstOff = (by4 * 4) * reconW + (bx4 * 4);
         int tw4 = w >> 2, th4 = h >> 2;
@@ -3124,13 +3200,13 @@ internal static class Av1StillImageEncoder
         int m = Av1Reconstruction.PrepareIntraEdges(
             bx4, haveLeft, by4, haveTop, bw4, bh4, edgeFlags,
             recon, dstOff, reconW, default, mode, ref angle, tw4, th4,
-            filterEdge: (intraFlags & EdgeFilterEnableBit) != 0, edge, edgeCenter, 8);
-        Av1IntraPred.Predict(m, dst, w, edge, edgeCenter, w, h, angle | intraFlags, 4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4);
+            filterEdge: (intraFlags & EdgeFilterEnableBit) != 0, edge, edgeCenter, Bd);
+        Av1IntraPred.Predict16(m, dst, w, edge, edgeCenter, w, h, angle | intraFlags, 4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4, Bd);
     }
 
     // Forward+quant of (src - pred) for a w x h block. pred is h x w row-major.
-    private static int[] ForwardResidualPredRect(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy,
-        byte[] pred, int w, int h, int txIdx, int dcDq, int acDq, int rcCount, double[]? qfOut = null,
+    private static int[] ForwardResidualPredRect(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy,
+        ushort[] pred, int w, int h, int txIdx, int dcDq, int acDq, int rcCount, double[]? qfOut = null,
         Av1FwdTransform.FwdTxType fwd = Av1FwdTransform.FwdTxType.DctDct)
     {
         var residual = new int[h * w];
@@ -3143,10 +3219,10 @@ internal static class Av1StillImageEncoder
     // Dequantizes rect levels and reconstructs a w x h block onto predBlock (h x w) via the decoder's InvTxfmAdd,
     // into recon. Returns the coefficient-context byte.
     private static byte DequantAndReconstructPredRect(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
-        byte[] predBlock, byte[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct)
+        ushort[] predBlock, ushort[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct)
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[txIdx].Ctx - 2);
-        const int cfMax = 32767;
+        int cfMax = CfMax;
         var scan = Av1Tables.Scans[txIdx];
         int eob = -1;
         for (int i = scan.Length - 1; i >= 0; i--)
@@ -3170,8 +3246,8 @@ internal static class Av1StillImageEncoder
         int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
-        var block = (byte[])predBlock.Clone();
-        Av1InvTransform.InvTxfmAdd(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, 8);
+        var block = (ushort[])predBlock.Clone();
+        Av1InvTransform.InvTxfmAdd16(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, Bd);
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 recon[(by + y) * reconW + (bx + x)] = block[y * w + x];
@@ -3182,10 +3258,10 @@ internal static class Av1StillImageEncoder
     // Reconstruction SSE of a w x h rectangular candidate (dequant + inverse onto predBlock) vs the source — the
     // distortion term for true-RD rect leaf selection (mirrors ReconSseCand for the square path).
     private static long ReconSseCandRect(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
-        byte[] predBlock, byte[] src, int srcW, int srcBx, int srcBy, Av1TxType txType)
+        ushort[] predBlock, ushort[] src, int srcW, int srcBx, int srcBy, Av1TxType txType)
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[txIdx].Ctx - 2);
-        const int cfMax = 32767;
+        int cfMax = CfMax;
         var scan = Av1Tables.Scans[txIdx];
         int eob = -1;
         for (int i = scan.Length - 1; i >= 0; i--) if (levels[scan[i]] != 0) { eob = i; break; }
@@ -3198,8 +3274,8 @@ internal static class Av1StillImageEncoder
             int dq = Math.Min(((rc == 0 ? dcDq : acDq) * mag) >> dqShift, cfMax + sign);
             cf[rc] = sign != 0 ? -dq : dq;
         }
-        var block = (byte[])predBlock.Clone();
-        Av1InvTransform.InvTxfmAdd(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, 8);
+        var block = (ushort[])predBlock.Clone();
+        Av1InvTransform.InvTxfmAdd16(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, Bd);
         long sse = 0;
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++) { int d = block[y * w + x] - src[(srcBy + y) * srcW + (srcBx + x)]; sse += (long)d * d; }
@@ -3207,7 +3283,7 @@ internal static class Av1StillImageEncoder
     }
 
     // Residual (src - prediction) for an n x n block.
-    private static int[] ComputeResidualPred(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, byte[] pred, int n)
+    private static int[] ComputeResidualPred(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int n)
     {
         var r = new int[n * n];
         for (int y = 0; y < n; y++)
@@ -3228,7 +3304,7 @@ internal static class Av1StillImageEncoder
     // signalled (Intra2 set: DctDct + ADST combos); for tx ≥ 32x32 DctDct is forced. Returns the quantized coeffs,
     // the inverse type for reconstruction, and the Intra2 symbol index to code.
     private static (int[] Coeffs, Av1TxType Inv, int Idx) ChooseTxType(int[] residual, int n, int tx, int dcDq, int acDq,
-        byte[] predBlock, byte[] src, int srcW, int srcBx, int srcBy, double rdLambda)
+        ushort[] predBlock, ushort[] src, int srcW, int srcBx, int srcBy, double rdLambda)
     {
         int scanLen = Av1Tables.Scans[tx].Length;
         if (n > 16)
@@ -3247,8 +3323,8 @@ internal static class Av1StillImageEncoder
         return bestCand;
     }
 
-    private static int[] ForwardResidualPred(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy,
-        byte[] pred, int n, int dcDq, int acDq, int scanLen)
+    private static int[] ForwardResidualPred(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy,
+        ushort[] pred, int n, int dcDq, int acDq, int scanLen)
     {
         var residual = new int[n * n];
         for (int y = 0; y < n; y++)

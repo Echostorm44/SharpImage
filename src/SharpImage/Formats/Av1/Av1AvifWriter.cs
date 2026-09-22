@@ -13,32 +13,34 @@ internal static class Av1AvifWriter
     /// form); it is placed both in av1C configOBUs (for decoders that configure from it) and in-band at the head
     /// of the mdat item data (for decoders that decode the item as a self-contained temporal unit — including
     /// SharpImage's own). <paramref name="frameObu"/> is the OBU_FRAME.</summary>
-    internal static byte[] BuildAvif(byte[] seqObu, byte[] frameObu, int width, int height, bool monochrome)
+    internal static byte[] BuildAvif(byte[] seqObu, byte[] frameObu, int width, int height, bool monochrome, int bitDepth = 8)
     {
-        byte[] av1C = BuildAv1C(monochrome);
+        byte[] av1C = BuildAv1C(monochrome, bitDepth);
         // Sequence header + frame OBUs go in-band in mdat (matches libaom/ffmpeg AVIF output and lets any AV1
         // decoder treat the item as a self-contained temporal unit).
         var mdat = new byte[seqObu.Length + frameObu.Length];
         seqObu.CopyTo(mdat, 0);
         frameObu.CopyTo(mdat, seqObu.Length);
-        return BuildIsoBmff(width, height, av1C, mdat, monochrome);
+        return BuildIsoBmff(width, height, av1C, mdat, monochrome, bitDepth);
     }
 
     // AV1CodecConfigurationRecord (av1C payload): the fixed 4-byte record only (configOBUs omitted, as libaom's
     // AVIF output does — the sequence header travels in-band in mdat).
-    private static byte[] BuildAv1C(bool monochrome)
+    private static byte[] BuildAv1C(bool monochrome, int bitDepth)
     {
-        // Profile 0, seq_level_idx_0 = 0 (matches Av1ObuWriter's reduced-still header), tier 0, 8-bit.
+        // seq_level_idx_0 = 0 (matches Av1ObuWriter's reduced-still header), tier 0. seq_profile / high_bitdepth /
+        // twelve_bit mirror the sequence header's color_config (profile 2 for 12-bit, else 0).
+        int profile = bitDepth == 12 ? 2 : 0;
         byte b0 = 0x81;                       // marker(1)=1 | version(7)=1
-        byte b1 = 0x00;                       // seq_profile(3)=0 | seq_level_idx_0(5)=0
+        byte b1 = (byte)(profile << 5);       // seq_profile(3) | seq_level_idx_0(5)=0
         int monoBit = monochrome ? 1 : 0;
         // AV1 sets subsampling 1,1 for monochrome (I400); colour here is I420 (also 1,1).
         int cssX = 1;
         int cssY = 1;
         byte b2 = (byte)(
             (0 << 7) |                        // seq_tier_0
-            (0 << 6) |                        // high_bitdepth (8-bit)
-            (0 << 5) |                        // twelve_bit
+            ((bitDepth > 8 ? 1 : 0) << 6) |   // high_bitdepth
+            ((bitDepth == 12 ? 1 : 0) << 5) | // twelve_bit
             (monoBit << 4) |                  // monochrome
             (cssX << 3) |                     // chroma_subsampling_x
             (cssY << 2) |                     // chroma_subsampling_y
@@ -52,7 +54,7 @@ internal static class Av1AvifWriter
     /// `av01` item (item 2) linked by an `auxl` item reference (item 2 → item 1) with the standard alpha aux URN.
     /// Both items' OBUs share one mdat (colour first, then alpha) as two extents. Verified in ffmpeg/libavif.</summary>
     internal static byte[] BuildAvifWithAlpha(byte[] colorSeq, byte[] colorFrame, byte[] alphaSeq, byte[] alphaFrame,
-        int width, int height, bool colorMonochrome)
+        int width, int height, bool colorMonochrome, int bitDepth = 8)
     {
         var colorMdat = new byte[colorSeq.Length + colorFrame.Length];
         colorSeq.CopyTo(colorMdat, 0);
@@ -61,18 +63,18 @@ internal static class Av1AvifWriter
         alphaSeq.CopyTo(alphaMdat, 0);
         alphaFrame.CopyTo(alphaMdat, alphaSeq.Length);
 
-        byte[] av1CColor = Box("av1C", BuildAv1C(colorMonochrome));
-        byte[] av1CAlpha = Box("av1C", BuildAv1C(true));
+        byte[] av1CColor = Box("av1C", BuildAv1C(colorMonochrome, bitDepth));
+        byte[] av1CAlpha = Box("av1C", BuildAv1C(true, bitDepth));
 
         // ipco properties (1-indexed): 1 ispe (shared), 2 pixi(colour), 3 av1C(colour), 4 colr,
         // 5 av1C(alpha), 6 auxC(alpha URN), 7 pixi(alpha, 1ch).
         byte[] ispe = FullBox("ispe", 0, 0, Concat(U32((uint)width), U32((uint)height)));
         int cch = colorMonochrome ? 1 : 3;
         var pixiC = new List<byte> { (byte)cch };
-        for (int i = 0; i < cch; i++) pixiC.Add(8);
+        for (int i = 0; i < cch; i++) pixiC.Add((byte)bitDepth);
         byte[] pixiColor = FullBox("pixi", 0, 0, pixiC.ToArray());
         byte[] colr = Box("colr", Concat(Fourcc("nclx"), U16(2), U16(2), U16(colorMonochrome ? 0 : 6), new byte[] { 0x80 }));
-        byte[] pixiAlpha = FullBox("pixi", 0, 0, new byte[] { 1, 8 });
+        byte[] pixiAlpha = FullBox("pixi", 0, 0, new byte[] { 1, (byte)bitDepth });
         // auxC: aux_type is a null-terminated URN string identifying the alpha plane.
         byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
         byte[] auxC = FullBox("auxC", 0, 0, auxUrn);
@@ -114,8 +116,7 @@ internal static class Av1AvifWriter
             return FullBox("meta", 0, 0, metaPayload);
         }
 
-        byte[] ftyp = Box("ftyp", Concat(Fourcc("avif"), U32(0),
-            Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"), Fourcc("MA1B")));
+        byte[] ftyp = Ftyp(bitDepth);
 
         int metaLen = MetaWith(0, 0).Length;               // invariant to offset values
         int mdatPayloadOffset = ftyp.Length + metaLen + 8; // +8 mdat box header
@@ -129,11 +130,16 @@ internal static class Av1AvifWriter
         return Concat(ftyp, meta, mdat);
     }
 
-    private static byte[] BuildIsoBmff(int width, int height, byte[] av1C, byte[] mdatPayload, bool monochrome)
+    // ftyp: major brand avif; compatible avif/mif1/miaf plus the AVIF profile brand the stream qualifies for —
+    // MA1B (Baseline = AV1 Main profile) for 8/10-bit; 12-bit (AV1 Professional) fits no AVIF profile brand, so
+    // none is claimed (as libavif does).
+    private static byte[] Ftyp(int bitDepth) => bitDepth == 12
+        ? Box("ftyp", Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf")))
+        : Box("ftyp", Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"), Fourcc("MA1B")));
+
+    private static byte[] BuildIsoBmff(int width, int height, byte[] av1C, byte[] mdatPayload, bool monochrome, int bitDepth)
     {
-        // ftyp: major brand avif, compatible brands avif/mif1/miaf/MA1B.
-        byte[] ftyp = Box("ftyp", Concat(Fourcc("avif"), U32(0),
-            Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"), Fourcc("MA1B")));
+        byte[] ftyp = Ftyp(bitDepth);
 
         // Property container ipco { ispe, pixi, av1C, colr } — matching libaom/ffmpeg AVIF order so av1C is the
         // 3rd (essential) property.
@@ -143,7 +149,7 @@ internal static class Av1AvifWriter
         var pixiPayload = new List<byte> { (byte)channels };
         for (int i = 0; i < channels; i++)
         {
-            pixiPayload.Add(8); // bits per channel
+            pixiPayload.Add((byte)bitDepth); // bits per channel
         }
 
         byte[] pixi = FullBox("pixi", 0, 0, pixiPayload.ToArray());

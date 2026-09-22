@@ -61,6 +61,13 @@ internal sealed class DecodedVideoFrame : IDisposable
     public int UStride { get; }
     public int VStride { get; }
 
+    /// <summary>Coded bit depth (8, 10 or 12). The byte planes above are always 8-bit (rounded down-shift);
+    /// for high-bit-depth streams the native-precision samples are in the *Plane16 planes (same strides).</summary>
+    public int BitDepth { get; init; } = 8;
+    public ReadOnlyMemory<ushort> YPlane16 { get; init; }
+    public ReadOnlyMemory<ushort> UPlane16 { get; init; }
+    public ReadOnlyMemory<ushort> VPlane16 { get; init; }
+
     public DecodedVideoFrame(
         int width, int height, PixelFormat format, long pts,
         byte[] buffer,

@@ -21,6 +21,20 @@ public enum HeifContainerType
     Heic
 }
 
+/// <summary>
+/// Options that control AVIF encoding.
+/// </summary>
+public sealed class AvifEncodeOptions
+{
+    /// <summary>Quantization parameter 0..51 (0 = highest quality / largest file). Default 20.</summary>
+    public int Qp { get; set; } = 20;
+
+    /// <summary>Coded bit depth: 8, 10 or 12 — or 0 (default) to choose automatically: 8 when every source sample
+    /// is exactly representable at 8 bits (e.g. images decoded from 8-bit formats), otherwise 10. 12-bit is coded
+    /// with AV1 Professional profile (seq_profile 2).</summary>
+    public int BitDepth { get; set; }
+}
+
 public static class HeifCoder
 {
     // AVIF ftypes
@@ -376,15 +390,15 @@ public static class HeifCoder
 
     /// <summary>
     /// Encodes an image to HEIC (HEVC) or AVIF (AV1) still image at the given quantization parameter (0 = highest
-    /// quality/largest, ~51 = lowest). AVIF uses SharpImage's from-scratch AV1 intra encoder and currently
-    /// supports grayscale images up to 64x64 (a single superblock); larger or colour images are not yet
-    /// supported and throw <see cref="NotSupportedException"/>.
+    /// quality/largest, ~51 = lowest). AVIF uses SharpImage's from-scratch AV1 intra encoder with automatic bit
+    /// depth (see <see cref="AvifEncodeOptions.BitDepth"/>); use <see cref="EncodeAvif(ImageFrame, AvifEncodeOptions?)"/>
+    /// for full control.
     /// </summary>
     public static byte[] Encode(ImageFrame image, HeifContainerType containerType, int qp)
     {
         if (containerType == HeifContainerType.Avif)
         {
-            return EncodeAvif(image, qp);
+            return EncodeAvif(image, new AvifEncodeOptions { Qp = qp });
         }
 
         int w = (int)image.Columns;
@@ -408,7 +422,135 @@ public static class HeifCoder
     }
 
     // AVIF encode via the from-scratch AV1 intra encoder. Current scope: grayscale, up to one 64x64 superblock.
-    private static byte[] EncodeAvif(ImageFrame image, int qp)
+    /// <summary>Encodes an image as AVIF (AV1 intra) with the given options.</summary>
+    public static byte[] EncodeAvif(ImageFrame image, AvifEncodeOptions? options = null)
+    {
+        options ??= new AvifEncodeOptions();
+        int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
+        if (bd is not (8 or 10 or 12))
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
+        }
+
+        return bd == 8 ? EncodeAvif8(image, options.Qp) : EncodeAvifHbd(image, options.Qp, bd);
+    }
+
+    // True when any sample carries more than 8 bits of precision (an 8-bit-origin sample is exactly v8 * 257).
+    private static bool HasSubByteDetail(ImageFrame image)
+    {
+        int w = (int)image.Columns, h = (int)image.Rows, n = w * image.NumberOfChannels;
+        for (int y = 0; y < h; y++)
+        {
+            ReadOnlySpan<ushort> row = image.GetPixelRow(y);
+            for (int i = 0; i < n; i++)
+            {
+                if (row[i] % 257 != 0) return true;
+            }
+        }
+
+        return false;
+    }
+
+    // High-bit-depth AVIF encode (10/12-bit): samples are taken straight from the 16-bit quantum at full
+    // precision and coded through the multi-superblock encoder (which handles every size 8..4096).
+    private static byte[] EncodeAvifHbd(ImageFrame image, int qp, int bd)
+    {
+        int w = (int)image.Columns;
+        int h = (int)image.Rows;
+        if (w > 4096 || h > 4096 || w < 8 || h < 8)
+        {
+            throw new NotSupportedException($"AVIF encoding supports 8..4096 per dimension (got {w}x{h}).");
+        }
+
+        int channels = image.NumberOfChannels;
+        bool hasAlpha = image.HasAlpha;
+        int alphaOff = channels - 1;
+        double scale = ((1 << bd) - 1) / 65535.0;
+        var r = new double[w * h];
+        var g = new double[w * h];
+        var b = new double[w * h];
+        var alpha = hasAlpha ? new ushort[w * h] : null;
+        bool colour = false, nonOpaque = false;
+        for (int y = 0; y < h; y++)
+        {
+            ReadOnlySpan<ushort> row = image.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * channels;
+                ushort r16 = row[o];
+                ushort g16 = channels >= 3 ? row[o + 1] : r16;
+                ushort b16 = channels >= 3 ? row[o + 2] : r16;
+                if (r16 != g16 || g16 != b16) colour = true;
+                int i = y * w + x;
+                r[i] = r16 * scale;
+                g[i] = g16 * scale;
+                b[i] = b16 * scale;
+                if (alpha != null)
+                {
+                    ushort a16 = row[o + alphaOff];
+                    alpha[i] = (ushort)Math.Round(a16 * scale);
+                    if (a16 != ushort.MaxValue) nonOpaque = true;
+                }
+            }
+        }
+
+        int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        if (hasAlpha && nonOpaque && alpha != null)
+        {
+            int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
+            RgbToI420Hbd(r, g, b, w, h, bd, out ushort[] yA, out ushort[] uA, out ushort[] vA);
+            return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx, bd);
+        }
+
+        if (colour)
+        {
+            RgbToI420Hbd(r, g, b, w, h, bd, out ushort[] yP, out ushort[] uP, out ushort[] vP);
+            return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx, bd);
+        }
+
+        int max = (1 << bd) - 1;
+        var luma = new ushort[w * h];
+        for (int i = 0; i < luma.Length; i++) luma[i] = (ushort)Math.Clamp((int)Math.Round(r[i]), 0, max);
+        return Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx, bd);
+    }
+
+    // BT.601 full-range RGB -> I420 at an arbitrary bit depth (the same transform as RgbToI420, scaled): chroma is
+    // the rounded mean of each (possibly partial, for odd dims) 2x2 group, offset by 2^(bd-1).
+    private static void RgbToI420Hbd(double[] r, double[] g, double[] b, int w, int h, int bd,
+        out ushort[] y, out ushort[] u, out ushort[] v)
+    {
+        int max = (1 << bd) - 1;
+        double mid = 1 << (bd - 1);
+        int cw = (w + 1) >> 1, chh = (h + 1) >> 1;
+        y = new ushort[w * h];
+        u = new ushort[cw * chh];
+        v = new ushort[cw * chh];
+        var uf = new double[cw * chh];
+        var vf = new double[cw * chh];
+        var cnt = new int[cw * chh];
+        for (int yy = 0; yy < h; yy++)
+        {
+            for (int xx = 0; xx < w; xx++)
+            {
+                int i = yy * w + xx;
+                double rr = r[i], gg = g[i], bb = b[i];
+                y[i] = (ushort)Math.Clamp((int)Math.Round(0.299 * rr + 0.587 * gg + 0.114 * bb), 0, max);
+                int ci = (yy >> 1) * cw + (xx >> 1);
+                uf[ci] += -0.168736 * rr - 0.331264 * gg + 0.5 * bb + mid;
+                vf[ci] += 0.5 * rr - 0.418688 * gg - 0.081312 * bb + mid;
+                cnt[ci]++;
+            }
+        }
+
+        for (int i = 0; i < cw * chh; i++)
+        {
+            int n = cnt[i] > 0 ? cnt[i] : 1;
+            u[i] = (ushort)Math.Clamp((int)Math.Round(uf[i] / n), 0, max);
+            v[i] = (ushort)Math.Clamp((int)Math.Round(vf[i] / n), 0, max);
+        }
+    }
+
+    private static byte[] EncodeAvif8(ImageFrame image, int qp)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -596,6 +738,21 @@ public static class HeifCoder
     {
         var decoder = new Av1.Av1Decoder();
         using var yuv = decoder.Decode(codedData, 0, isKeyframe: true) ?? throw new InvalidDataException("AV1 alpha decode produced no frame.");
+        if (yuv.BitDepth > 8)
+        {
+            // Native-precision alpha: map [0, 2^bd) onto the full 16-bit quantum range.
+            if (!frame.HasAlpha) frame.SetAlpha(true);
+            ReadOnlySpan<ushort> a16 = yuv.YPlane16.Span;
+            double s = 65535.0 / ((1 << yuv.BitDepth) - 1);
+            int aOff = frame.NumberOfChannels - 1, nch = frame.NumberOfChannels;
+            for (int y = 0; y < h; y++)
+            {
+                var row = frame.GetPixelRowForWrite(y);
+                for (int x = 0; x < w; x++) row[x * nch + aOff] = (ushort)Math.Clamp((int)Math.Round(a16[y * yuv.YStride + x] * s), 0, 65535);
+            }
+            return;
+        }
+
         bool tenBit = yuv.Format is Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12;
         int shift = tenBit ? (yuv.Format == Av1.PixelFormat.Yuv420P12 ? 4 : 2) : 0;
         ReadOnlySpan<byte> y0 = yuv.YPlane.Span;
@@ -631,6 +788,15 @@ public static class HeifCoder
         int w = (int)frame.Columns;
         int h = (int)frame.Rows;
         int channels = frame.NumberOfChannels;
+        if (yuv.BitDepth > 8)
+        {
+            // 10/12-bit: convert from the decoder's native-precision planes straight into the 16-bit quantum.
+            bool is444h = yuv.Format == Av1.PixelFormat.Yuv444P, is422h = yuv.Format == Av1.PixelFormat.Yuv422P;
+            ConvertYuvToRgbHbd(yuv, frame, w, h, channels, decoder.Monochrome, matrixCoeffs == 1, fullRange,
+                is444h ? 0 : 1, (is444h || is422h) ? 0 : 1);
+            return;
+        }
+
         bool tenBit = yuv.Format is Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12;
         int shift = tenBit ? (yuv.Format == Av1.PixelFormat.Yuv420P12 ? 4 : 2) : 0;
         if (decoder.Monochrome)
@@ -751,6 +917,53 @@ public static class HeifCoder
     }
 
     private static byte ClampByte(int v) => (byte)(v < 0 ? 0 : v > 255 ? 255 : v);
+
+    // High-bit-depth YUV -> 16-bit quantum RGB at full precision (float math). Honours the colour matrix
+    // (BT.709 vs BT.601) and range (full vs limited, scaled to the coded bit depth).
+    private static void ConvertYuvToRgbHbd(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
+        bool monochrome, bool bt709, bool fullRange, int ssHor, int ssVer)
+    {
+        int bd = yuv.BitDepth;
+        double max = (1 << bd) - 1, s = 1 << (bd - 8);
+        ReadOnlySpan<ushort> y0 = yuv.YPlane16.Span, u0 = yuv.UPlane16.Span, v0 = yuv.VPlane16.Span;
+        (double kr, double kgU, double kgV, double kb) = bt709
+            ? (1.5748, 0.187324, 0.468124, 1.8556)
+            : (1.402, 0.344136, 0.714136, 1.772);
+        for (int y = 0; y < h; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            int cy = y >> ssVer;
+            for (int x = 0; x < w; x++)
+            {
+                double yn = fullRange ? y0[y * yuv.YStride + x] / max : (y0[y * yuv.YStride + x] - 16 * s) / (219 * s);
+                double rn, gn, bn;
+                if (monochrome)
+                {
+                    rn = gn = bn = yn;
+                }
+                else
+                {
+                    int cx = x >> ssHor;
+                    double cb = u0[cy * yuv.UStride + cx], cr = v0[cy * yuv.VStride + cx];
+                    double cbn = fullRange ? (cb - (max + 1) / 2) / max : (cb - 128 * s) / (224 * s);
+                    double crn = fullRange ? (cr - (max + 1) / 2) / max : (cr - 128 * s) / (224 * s);
+                    rn = yn + kr * crn;
+                    gn = yn - kgU * cbn - kgV * crn;
+                    bn = yn + kb * cbn;
+                }
+
+                int off = x * channels;
+                row[off] = Q16(rn);
+                if (channels >= 3)
+                {
+                    row[off + 1] = Q16(gn);
+                    row[off + 2] = Q16(bn);
+                }
+            }
+        }
+    }
+
+    private static ushort Q16(double n) => (ushort)Math.Clamp((int)Math.Round(n * 65535.0), 0, 65535);
 
     private static byte[] EncodeAv1IntraFrame(ImageFrame image)
     {
