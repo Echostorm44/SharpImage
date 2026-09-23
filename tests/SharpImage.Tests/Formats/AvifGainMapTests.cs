@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using SharpImage.Formats;
 
@@ -80,6 +81,82 @@ public sealed class AvifGainMapTests
                 }
         }
         await Assert.That(Convert.ToHexStringLower(SHA256.HashData(buf))).IsEqualTo(sha256);
+    }
+
+    // ComputeGainMap + EncodeAvif(GainMap) = avifgainmaputil combine: the written metadata and the (lossless) gain map
+    // image equal what libavif's combine writes for the same inputs (expected values read from libavif's files):
+    // plain, YUV-space downscaling x2 / x3, single channel, 10-bit 4:2:0, a BT.2020 PQ alternate (math in the
+    // alternate's space), an HDR base with an SDR alternate (sign flip), and a BT.2020 base with an sRGB alternate.
+    [Test]
+    [Arguments("libavif_seine_sdr_gainmap_srgb.avif", "libavif_seine_tonemapped_pq_h1.3.avif", 1, 8, false, "444", "c571b399a6c36f30",
+        "base=0/1 alt=5558157/4194304 min=-5683895/16777216 -11500805/33554432 -6038545/16777216 max=5541417/4194304 2783957/2097152 11329927/8388608 boff=1/64 1/64 1/64 aoff=1/64 1/64 1/64 gamma=1/1 1/1 1/1 usebase=True alt=1/16/6 altpixi=3x8")]
+    [Arguments("libavif_seine_sdr_gainmap_srgb.avif", "libavif_seine_tonemapped_pq_h1.3.avif", 2, 8, false, "444", "96bafb2ec9a7f1f2",
+        "base=0/1 alt=5558157/4194304 min=-5683895/16777216 -11500805/33554432 -6038545/16777216 max=5541417/4194304 2783957/2097152 11329927/8388608 boff=1/64 1/64 1/64 aoff=1/64 1/64 1/64 gamma=1/1 1/1 1/1 usebase=True alt=1/16/6 altpixi=3x8")]
+    [Arguments("libavif_seine_sdr_gainmap_srgb.avif", "libavif_seine_tonemapped_pq_h1.3.avif", 3, 8, true, "444", "6cc6a17f0ae28706",
+        "base=0/1 alt=10676315/8388608 min=-1361431/4194304 -1361431/4194304 -1361431/4194304 max=11058799/8388608 11058799/8388608 11058799/8388608 boff=1/64 1/64 1/64 aoff=1/64 1/64 1/64 gamma=1/1 1/1 1/1 usebase=True alt=1/16/6 altpixi=3x8")]
+    [Arguments("libavif_seine_sdr_gainmap_srgb.avif", "libavif_seine_tonemapped_pq_h1.3.avif", 1, 10, false, "420", "295d7123d74bd4ee",
+        "base=0/1 alt=5558157/4194304 min=-5683895/16777216 -11500805/33554432 -6038545/16777216 max=5541417/4194304 2783957/2097152 11329927/8388608 boff=1/64 1/64 1/64 aoff=1/64 1/64 1/64 gamma=1/1 1/1 1/1 usebase=True alt=1/16/6 altpixi=3x8")]
+    [Arguments("libavif_seine_sdr_gainmap_srgb.avif", "libavif_seine_tonemapped_bt2020pq10_h1.3.avif", 1, 8, false, "444", "0cd45fc8b4ae0c2f",
+        "base=0/1 alt=2668317/2097152 min=-9368687/33554432 -9445223/33554432 -4966425/16777216 max=675277/524288 10803081/8388608 10862281/8388608 boff=1/64 1/64 1/64 aoff=1/64 1/64 1/64 gamma=1/1 1/1 1/1 usebase=False alt=9/16/9 altpixi=3x10")]
+    [Arguments("libavif_seine_hdr_gainmap_srgb.avif", "libavif_seine_tonemapped_srgb_h0.avif", 1, 8, false, "444", "125368a8dc0874f6",
+        "base=3979117/2097152 alt=0/1 min=-1240767/4194304 -4953885/16777216 -10624599/33554432 max=1353623/1048576 5586753/4194304 710767/524288 boff=1/64 1/64 1/64 aoff=1/64 1/64 1/64 gamma=1/1 1/1 1/1 usebase=True alt=1/13/6 altpixi=3x8")]
+    [Arguments("libavif_seine_tonemapped_bt2020pq10_h1.3.avif", "libavif_seine_sdr_gainmap_srgb.avif", 1, 8, true, "444", "bcabce01be697127",
+        "base=2646033/2097152 alt=0/1 min=-9196415/33554432 -9196415/33554432 -9196415/33554432 max=5384513/4194304 5384513/4194304 5384513/4194304 boff=1/64 1/64 1/64 aoff=1/64 1/64 1/64 gamma=1/1 1/1 1/1 usebase=True alt=1/13/6 altpixi=3x8")]
+    public async Task EncodedGainMap_MatchesLibavifCombine(string baseFile, string altFile, int downscaling, int depth, bool single,
+        string subsampling, string gainMapSha, string metadata)
+    {
+        var b = HeifCoder.DecodeNativeDepth(Asset(baseFile));
+        var a = HeifCoder.DecodeNativeDepth(Asset(altFile));
+        var computed = HeifCoder.ComputeGainMap(b, a, depth, single);
+        byte[] file = HeifCoder.EncodeAvif(b, new AvifEncodeOptions
+        {
+            Lossless = true, GainMap = computed, GainMapLossless = true, GainMapDownscaling = downscaling,
+            GainMapChromaSubsampling = subsampling == "420" ? AvifChromaSubsampling.Yuv420 : AvifChromaSubsampling.Yuv444,
+        });
+        var gm = HeifCoder.DecodeGainMap(file)!;
+        string F(GainMapFraction[] f) => string.Join(" ", f.Select(x => $"{x.Numerator}/{x.Denominator}"));
+        string G(GainMapUFraction[] f) => string.Join(" ", f.Select(x => $"{x.Numerator}/{x.Denominator}"));
+        string meta = $"base={gm.BaseHdrHeadroom.Numerator}/{gm.BaseHdrHeadroom.Denominator} alt={gm.AlternateHdrHeadroom.Numerator}/{gm.AlternateHdrHeadroom.Denominator}" +
+            $" min={F(gm.Min)} max={F(gm.Max)} boff={F(gm.BaseOffset)} aoff={F(gm.AlternateOffset)} gamma={G(gm.Gamma)} usebase={gm.UseBaseColorSpace}" +
+            $" alt={gm.AlternateCicp!.ColorPrimaries}/{gm.AlternateCicp.TransferCharacteristics}/{gm.AlternateCicp.MatrixCoefficients} altpixi={gm.AlternatePlaneCount}x{gm.AlternateDepth}";
+        await Assert.That(meta).IsEqualTo(metadata);
+
+        var img = gm.Image!;
+        int w = (int)img.Columns, h = (int)img.Rows, ch = img.NumberOfChannels;
+        uint max = (1u << img.Depth) - 1;
+        var buf = new byte[w * h * 6];
+        for (int y = 0; y < h; y++)
+        {
+            var row = img.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+                for (int k = 0; k < 3; k++)
+                {
+                    ushort v = (ushort)((row[x * ch + Math.Min(k, ch - 1)] * max + 32767u) / 65535u);
+                    buf[(y * w + x) * 6 + k * 2] = (byte)v;
+                    buf[(y * w + x) * 6 + k * 2 + 1] = (byte)(v >> 8);
+                }
+        }
+        await Assert.That(Convert.ToHexStringLower(SHA256.HashData(buf))[..16]).IsEqualTo(gainMapSha);
+    }
+
+    [Test]
+    public async Task EncodedGainMap_HasLibavifLayout()
+    {
+        // ftyp 'tmap'; tmap item preferred in 'altr'; dimg tmap -> [colour, gain map]; gain map item hidden.
+        var b = HeifCoder.DecodeNativeDepth(Asset("libavif_seine_sdr_gainmap_srgb.avif"));
+        var a = HeifCoder.DecodeNativeDepth(Asset("libavif_seine_tonemapped_pq_h1.3.avif"));
+        byte[] file = HeifCoder.EncodeAvif(b, new AvifEncodeOptions { Qp = 30, GainMap = HeifCoder.ComputeGainMap(b, a), GainMapQp = 30 });
+        var c = HeifContainer.Parse(file);
+        await Assert.That(c.Brands).Contains("tmap");
+        var tmap = c.Items.Values.Single(i => i.Type == "tmap");
+        var dimg = c.ReferencesFrom(tmap.Id, "dimg");
+        await Assert.That(dimg.Count).IsEqualTo(2);
+        await Assert.That(dimg[0]).IsEqualTo(c.PrimaryId);
+        await Assert.That(c.Groups.Single().Type).IsEqualTo("altr");
+        await Assert.That(c.Groups.Single().Entities).IsEquivalentTo(new uint[] { (uint)tmap.Id, (uint)c.PrimaryId });
+        // A lossy gain map still decodes and tone maps (the gain map's quality only changes its precision).
+        var hdr = HeifCoder.DecodeToneMapped(file, 1.3f);
+        await Assert.That(hdr.Metadata.Cicp!.TransferCharacteristics).IsEqualTo(16);
     }
 
     [Test]

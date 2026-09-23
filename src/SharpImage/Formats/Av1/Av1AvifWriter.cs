@@ -27,12 +27,27 @@ internal sealed class AvifContainerExtras
     public long[]? AlphaLayerSizes;          // layered alpha item
 
     public AvifSequenceData? Sequence;       // image sequence (animated AVIF): tracks written after the items
+    public AvifGainMapItem? GainMap;         // ISO 21496-1 gain map: 'tmap' derived item + hidden gain map image item
 
     internal bool HasItems => Exif != null || Xmp != null;
 }
 
 /// <summary>An AVIF image sequence's coded samples (one temporal unit per frame, colour and optional alpha) and timing.
 /// The first samples double as the primary colour / alpha items.</summary>
+/// <summary>A coded gain map and its 'tmap' item, laid out as libavif writes them: the tmap item (payload = the
+/// ToneMapImage box contents) with ispe / alternate pixi / alternate colr / alternate clli, preferred over the colour item
+/// in an 'altr' group and deriving from [colour, gain map] ('dimg'); the gain map a hidden av01 item with its own
+/// ispe / pixi / av1C / colr nclx, plus the colour item's pasp and transforms.</summary>
+internal sealed class AvifGainMapItem
+{
+    public byte[] Data = [];                 // coded gain map (temporal unit)
+    public int Width, Height;
+    public byte[] PixiBox = [], Av1CBox = [], ColrBox = [];
+    public byte[] Tmap = [];                 // tmap item payload
+    public byte[]? AltPixiBox, AltIccBox, AltClliBox;
+    public byte[] AltNclxBox = [];
+}
+
 internal sealed class AvifSequenceData
 {
     public List<byte[]> ColorSamples = [];
@@ -103,19 +118,21 @@ internal static class Av1AvifWriter
     // ftyp: major brand avif; compatible avif/mif1/miaf plus the AVIF profile brand the stream qualifies for —
     // MA1B (Baseline = AV1 Main profile), MA1A (Advanced = AV1 High profile, i.e. 8/10-bit 4:4:4); AV1
     // Professional streams (4:2:2, 12-bit) fit no AVIF profile brand, so none is claimed (as libavif does).
-    private static byte[] Ftyp(int bitDepth, Av1PixelLayout layout, bool sequence = false)
+    private static byte[] Ftyp(int bitDepth, Av1PixelLayout layout, bool sequence = false, bool toneMapped = false)
     {
         int profile = Av1ObuWriter.SeqProfile(bitDepth, layout);
         // An image sequence (libavif): major brand 'avis', compatible avif, avis, msf1, iso8, mif1, miaf.
         var brands = sequence
             ? Concat(Fourcc("avis"), U32(0), Fourcc("avif"), Fourcc("avis"), Fourcc("msf1"), Fourcc("iso8"), Fourcc("mif1"), Fourcc("miaf"))
             : Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"));
-        return Box("ftyp", profile switch
+        brands = profile switch
         {
             0 => Concat(brands, Fourcc("MA1B")),
             1 => Concat(brands, Fourcc("MA1A")),
             _ => brands,
-        });
+        };
+        // 'tmap' (ISO/IEC 23008-12:2024/AMD 1): readers only consider a tone-mapped derived image with this brand.
+        return Box("ftyp", toneMapped ? Concat(brands, Fourcc("tmap")) : brands);
     }
 
     // One container builder for every layout. Item IDs: 1 = colour (primary), 2 = alpha (if any), then Exif, XMP.
@@ -142,10 +159,17 @@ internal static class Av1AvifWriter
     {
         bool monochrome = layout == Av1PixelLayout.I400;
         var sq = x?.Sequence;
-        byte[] ftyp = Ftyp(bitDepth, layout, sq != null);
+        var gmx = x?.GainMap;
+        byte[] ftyp = Ftyp(bitDepth, layout, sq != null, gmx != null);
 
         var props = new List<byte[]>();
         int Add(byte[] box) { props.Add(box); return props.Count; }
+        // Gain map properties are deduplicated against the existing ones, as libavif does.
+        int AddShared(byte[] box)
+        {
+            for (int i = 0; i < props.Count; i++) if (props[i].AsSpan().SequenceEqual(box)) return i + 1;
+            return Add(box);
+        }
         var assoc1 = new List<(int Index, bool Essential)>();
         int ispeIdx = Add(FullBox("ispe", 0, 0, Concat(U32((uint)width), U32((uint)height))));
         assoc1.Add((ispeIdx, false));
@@ -185,27 +209,55 @@ internal static class Av1AvifWriter
             assoc2.AddRange(transforms);   // the alpha plane is transformed exactly like the colour image
         }
 
-        // Items: (id, type, name, content type, payload).
-        var items = new List<(int Id, string Type, byte[] Payload, byte[] InfeExtra)>
+        var assocTmap = new List<(int Index, bool Essential)>();
+        var assocGm = new List<(int Index, bool Essential)>();
+        if (gmx != null)
         {
-            (1, "av01", colorData, new byte[] { 0 }),
+            assocTmap.Add((ispeIdx, false));
+            if (gmx.AltPixiBox != null) assocTmap.Add((AddShared(gmx.AltPixiBox), false));
+            if (gmx.AltIccBox != null) assocTmap.Add((AddShared(gmx.AltIccBox), false));
+            assocTmap.Add((AddShared(gmx.AltNclxBox), false));
+            if (gmx.AltClliBox != null) assocTmap.Add((AddShared(gmx.AltClliBox), false));
+
+            assocGm.Add((AddShared(FullBox("ispe", 0, 0, Concat(U32((uint)gmx.Width), U32((uint)gmx.Height)))), false));
+            assocGm.Add((AddShared(gmx.PixiBox), false));
+            assocGm.Add((AddShared(gmx.Av1CBox), true));
+            assocGm.Add((AddShared(gmx.ColrBox), false));
+            if (x?.Pasp is { } gpasp) assocGm.Add((AddShared(Box("pasp", Concat(U32(gpasp.H), U32(gpasp.V)))), false));
+            if (x?.Clap != null && (gmx.Width != width || gmx.Height != height))
+                throw new NotSupportedException("A clean aperture cannot be applied to a gain map of another size.");
+            assocGm.AddRange(transforms);  // the gain map is transformed exactly like the colour image
+        }
+
+        // Items: (id, type, payload, infe name / content type, infe flags; 1 = hidden).
+        var items = new List<(int Id, string Type, byte[] Payload, byte[] InfeExtra, uint Flags)>
+        {
+            (1, "av01", colorData, new byte[] { 0 }, 0),
         };
-        if (alphaData != null) items.Add((2, "av01", alphaData, new byte[] { 0 }));
+        if (alphaData != null) items.Add((2, "av01", alphaData, new byte[] { 0 }, 0));
         int nextId = items.Count + 1;
+        int tmapId = 0, gmId = 0;
+        if (gmx != null)
+        {
+            tmapId = nextId++;
+            items.Add((tmapId, "tmap", gmx.Tmap, new byte[] { 0 }, 0));
+            gmId = nextId++;
+            items.Add((gmId, "av01", gmx.Data, new byte[] { 0 }, 1));
+        }
         int exifId = 0, xmpId = 0;
         if (x?.Exif is { Length: > 0 } exif)
         {
             exifId = nextId++;
-            items.Add((exifId, "Exif", ExifItemPayload(exif), System.Text.Encoding.ASCII.GetBytes("Exif\0")));
+            items.Add((exifId, "Exif", ExifItemPayload(exif), System.Text.Encoding.ASCII.GetBytes("Exif\0"), 0));
         }
         if (x?.Xmp is { Length: > 0 } xmp)
         {
             xmpId = nextId++;
-            items.Add((xmpId, "mime", xmp, System.Text.Encoding.ASCII.GetBytes("XMP\0application/rdf+xml\0")));
+            items.Add((xmpId, "mime", xmp, System.Text.Encoding.ASCII.GetBytes("XMP\0application/rdf+xml\0"), 0));
         }
 
         byte[] ipco = Box("ipco", Concat(props.ToArray()));
-        var ipmaBody = new List<byte[]> { U32((uint)(alphaData != null ? 2 : 1)) };
+        var ipmaBody = new List<byte[]> { U32((uint)((alphaData != null ? 2 : 1) + (gmx != null ? 2 : 0))) };
         void Assoc(int id, List<(int Index, bool Essential)> a)
         {
             ipmaBody.Add(U16(id));
@@ -214,19 +266,21 @@ internal static class Av1AvifWriter
         }
         Assoc(1, assoc1);
         if (alphaData != null) Assoc(2, assoc2);
+        if (gmx != null) { Assoc(tmapId, assocTmap); Assoc(gmId, assocGm); }
         byte[] iprp = Box("iprp", Concat(ipco, FullBox("ipma", 0, 0, Concat(ipmaBody.ToArray()))));
 
         byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc("pict"), U32(0), U32(0), U32(0),
             System.Text.Encoding.ASCII.GetBytes("PictureHandler\0")));
         byte[] pitm = FullBox("pitm", 0, 0, U16(1));
         var infes = new List<byte[]> { U16(items.Count) };
-        foreach (var it in items) infes.Add(FullBox("infe", 2, 0, Concat(U16(it.Id), U16(0), Fourcc(it.Type), it.InfeExtra)));
+        foreach (var it in items) infes.Add(FullBox("infe", 2, it.Flags, Concat(U16(it.Id), U16(0), Fourcc(it.Type), it.InfeExtra)));
         byte[] iinf = FullBox("iinf", 0, 0, Concat(infes.ToArray()));
 
         // iref (version 0): auxl alpha → colour; cdsc metadata → colour.
         var refs = new List<byte[]>();
         if (alphaData != null) refs.Add(Box("auxl", Concat(U16(2), U16(1), U16(1))));   // from_ID, ref_count, to_ID
         if (alphaData != null && x?.Premultiplied == true) refs.Add(Box("prem", Concat(U16(1), U16(1), U16(2))));   // colour premultiplied by alpha
+        if (gmx != null) refs.Add(Box("dimg", Concat(U16(tmapId), U16(2), U16(1), U16(gmId))));   // tmap from [colour, gain map]
         if (exifId != 0) refs.Add(Box("cdsc", Concat(U16(exifId), U16(1), U16(1))));
         if (xmpId != 0) refs.Add(Box("cdsc", Concat(U16(xmpId), U16(1), U16(1))));
         byte[]? iref = refs.Count > 0 ? FullBox("iref", 0, 0, Concat(refs.ToArray())) : null;
@@ -265,9 +319,15 @@ internal static class Av1AvifWriter
             return FullBox("iloc", 0, 0, Concat(body.ToArray()));
         }
 
+        // grpl: the tmap item is the preferred alternative to the colour item ('altr', tmap first); the group id must
+        // not collide with an item id.
+        byte[] grpl = gmx != null
+            ? Box("grpl", FullBox("altr", 0, 0, Concat(U32((uint)nextId), U32(2), U32((uint)tmapId), U32(1))))
+            : [];
+
         byte[] Meta(uint mdatStart) => FullBox("meta", 0, 0, iref != null
-            ? Concat(hdlr, pitm, Iloc(mdatStart), iinf, iref, iprp)
-            : Concat(hdlr, pitm, Iloc(mdatStart), iinf, iprp));
+            ? Concat(hdlr, pitm, Iloc(mdatStart), iinf, iref, iprp, grpl)
+            : Concat(hdlr, pitm, Iloc(mdatStart), iinf, iprp, grpl));
 
         int metaLen = Meta(0).Length;
         if (sq == null)
@@ -382,9 +442,9 @@ internal static class Av1AvifWriter
         return Concat(U32((uint)off), exif);
     }
 
-    private static byte[] Box(string type, byte[] payload) => Concat(U32((uint)(payload.Length + 8)), Fourcc(type), payload);
+    internal static byte[] Box(string type, byte[] payload) => Concat(U32((uint)(payload.Length + 8)), Fourcc(type), payload);
 
-    private static byte[] FullBox(string type, byte version, uint flags, byte[] payload)
+    internal static byte[] FullBox(string type, byte version, uint flags, byte[] payload)
         => Box(type, Concat(new byte[] { version, (byte)(flags >> 16), (byte)(flags >> 8), (byte)flags }, payload));
 
     private static byte[] Fourcc(string s) => new[] { (byte)s[0], (byte)s[1], (byte)s[2], (byte)s[3] };

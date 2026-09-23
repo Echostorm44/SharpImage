@@ -865,6 +865,40 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(Path.GetDirectoryName(bin)!, "yuvscale.txt"), log.ToString());
     }
 
+    // Gain map encode probe (trigger hbd_gmenc.txt: lines "base.avif|alt.avif|out.avif|downscaling|depth|single(0/1)|444/420"):
+    // the avifgainmaputil combine equivalent — ComputeGainMap on the two decodes, then a lossless base + lossless gain map
+    // encode. Manifest gmenc_manifest.txt next to the outputs.
+    [Test, NotInParallel]
+    public void GainMapEncodeProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_gmenc.txt");
+        if (!File.Exists(trig)) return;
+        var lines = File.ReadAllLines(trig);
+        File.Delete(trig);
+        var log = new System.Text.StringBuilder();
+        string dir = "";
+        foreach (var line in lines.Where(l => l.Trim().Length > 0))
+        {
+            var p = line.Trim().Split('|');
+            dir = Path.GetDirectoryName(p[2])!;
+            try
+            {
+                var b = HeifCoder.DecodeNativeDepth(File.ReadAllBytes(p[0]));
+                var a = HeifCoder.DecodeNativeDepth(File.ReadAllBytes(p[1]));
+                var gm = HeifCoder.ComputeGainMap(b, a, int.Parse(p[4]), p[5] == "1");
+                var opt = new AvifEncodeOptions
+                {
+                    Lossless = true, GainMap = gm, GainMapLossless = true, GainMapDownscaling = int.Parse(p[3]),
+                    GainMapChromaSubsampling = p[6] == "420" ? AvifChromaSubsampling.Yuv420 : AvifChromaSubsampling.Yuv444,
+                };
+                File.WriteAllBytes(p[2], HeifCoder.EncodeAvif(b, opt));
+                log.AppendLine($"{Path.GetFileName(p[2])} ok");
+            }
+            catch (Exception e) { log.AppendLine($"{Path.GetFileName(p[2])} ERROR {e.ToString().ReplaceLineEndings(" | ")}"); }
+        }
+        File.WriteAllText(Path.Combine(dir, "gmenc_manifest.txt"), log.ToString());
+    }
+
     // Tone map probe (trigger hbd_tm.txt: lines "file|headroom|outName[|cp/tc|depth]"): HeifCoder.DecodeToneMapped, the
     // result dumped as outName.rgb16 (planar-free little-endian u16 RGB at native depth) + "outName WxH depth cp/tc clli".
     [Test, NotInParallel]

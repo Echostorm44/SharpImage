@@ -127,6 +127,25 @@ public sealed class AvifEncodeOptions
     /// (<see cref="HeifCoder.DecodeProgressive"/>, libavif allowProgressive) can show the preview first; every other
     /// reader decodes the full image. Not available with <see cref="Lossless"/>.</summary>
     public bool Progressive { get; set; }
+
+    /// <summary>An ISO 21496-1 gain map to store with the image (e.g. from <see cref="HeifCoder.ComputeGainMap"/>): a
+    /// 'tmap' tone-mapped derived item preferred over the image, and the gain map as a hidden image item, laid out as
+    /// libavif writes them. Its <see cref="AvifGainMap.Image"/> is coded at its <c>Depth</c> (8, 10 or 12).</summary>
+    public AvifGainMap? GainMap { get; set; }
+
+    /// <summary>Quantization parameter for the gain map image. Null: <see cref="Qp"/>.</summary>
+    public int? GainMapQp { get; set; }
+
+    /// <summary>Code the gain map losslessly (avifgainmaputil --qgain-map 100): its YUV samples are exact.</summary>
+    public bool GainMapLossless { get; set; }
+
+    /// <summary>Downscaling factor of the gain map image (avifgainmaputil combine --downscaling): the gain map is
+    /// converted to YUV at full size, then scaled to (size + factor / 2) / factor with libyuv's box filter.</summary>
+    public int GainMapDownscaling { get; set; } = 1;
+
+    /// <summary>Chroma subsampling of the gain map image (single-channel gain maps are coded 4:0:0). Default 4:4:4, as
+    /// avifgainmaputil combine.</summary>
+    public AvifChromaSubsampling GainMapChromaSubsampling { get; set; } = AvifChromaSubsampling.Yuv444;
 }
 
 /// <summary>Film grain for one AVIF encode: explicit parameters, or denoise-and-estimate (Level &lt; 0 = all-intra estimate).</summary>
@@ -890,6 +909,7 @@ public static partial class HeifCoder
         bool bt601Full = color.Matrix is 5 or 6 && color.FullRange;
         var extras = AvifExtras(image, options);
         extras.Premultiplied = options.PremultiplyAlpha && image.HasAlpha;
+        if (options.GainMap != null) extras.GainMap = BuildGainMapItem(options.GainMap, options, extras);
         bool denoise = options.DenoiseNoiseLevel > 0;
         if ((options.FilmGrain != null || denoise) && options.Lossless)
             throw new ArgumentException("Film grain / denoising cannot be combined with lossless coding.", nameof(options));
@@ -1212,7 +1232,7 @@ public static partial class HeifCoder
     // 4:2:0 case keeps its original byte path (EncodeAvif8) so its output is unchanged.
     private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout,
         Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras, bool lossless = false, AvifGrainRequest? request = null,
-        bool progressive = false)
+        bool progressive = false, (int W, int H)? scaleYuvTo = null, bool libavifFloatYuv = false)
     {
         // Film grain rides on the colour stream only: the ambient scope is read by the colour builders' headers and
         // suppressed around the alpha builds. Denoising (libaom aom_denoise_and_model_run) replaces the colour planes
@@ -1236,6 +1256,16 @@ public static partial class HeifCoder
         }
         int w = (int)image.Columns;
         int h = (int)image.Rows;
+        // libavif avifImageScale after RGB->YUV (a gain map's --downscaling): planes rescaled with libyuv's box filter.
+        void ScaleYuv(ref ushort[] yPl, ref ushort[]? uPl, ref ushort[]? vPl, int ssX, int ssY)
+        {
+            if (scaleYuvTo is not { } st || (st.W == w && st.H == h)) return;
+            int scw = (w + ssX) >> ssX, sch = (h + ssY) >> ssY, dcw = (st.W + ssX) >> ssX, dch = (st.H + ssY) >> ssY;
+            yPl = LibyuvScale.ScalePlane(yPl, w, w, h, st.W, st.H, bd > 8);
+            if (uPl != null) uPl = LibyuvScale.ScalePlane(uPl, scw, scw, sch, dcw, dch, bd > 8);
+            if (vPl != null) vPl = LibyuvScale.ScalePlane(vPl, scw, scw, sch, dcw, dch, bd > 8);
+            (w, h) = st;
+        }
         if (w > 65536 || h > 65536 || w < 8 || h < 8)
         {
             throw new NotSupportedException($"AVIF encoding supports 8..65536 per dimension (got {w}x{h}).");
@@ -1274,8 +1304,13 @@ public static partial class HeifCoder
         // coded as 4:0:0 like libavif (the single plane is exact already).
         if (colour || (!lossless && color.Matrix is 0 or 16 or 17))
         {
-            RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yP, out ushort[] uP0, out ushort[] vP0);
+            ushort[] yP, uP0, vP0;
+            if (libavifFloatYuv && color.Matrix is not (8 or 16 or 17))
+                RgbToYuvAvifFloat(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0);
+            else
+                RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0);
             ushort[]? uP = uP0, vP = vP0;
+            ScaleYuv(ref yP, ref uP, ref vP, gssX, gssY);
             Denoise(ref yP, ref uP, ref vP, gssX, gssY);
             if (lossless)
                 return Av1.Av1StillImageEncoder.EncodeAvifLossless(yP, uP!, vP!, false, default, false, w, h, bd, layout, color, extras);
@@ -1291,6 +1326,10 @@ public static partial class HeifCoder
         var luma = new ushort[w * h];
         for (int i = 0; i < luma.Length; i++)
             luma[i] = (ushort)Math.Clamp((int)Math.Round(color.FullRange ? r[i] : r[i] / max * (219 << (bd - 8)) + (16 << (bd - 8))), 0, max);
+        {
+            ushort[]? su = null, sv = null;
+            ScaleYuv(ref luma, ref su, ref sv, 1, 1);
+        }
         if (lossless)
             return Av1.Av1StillImageEncoder.EncodeAvifLossless(luma, default, default, true, default, false, w, h, bd, Av1.Av1PixelLayout.I400,
                 color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color, extras);
@@ -1355,6 +1394,75 @@ public static partial class HeifCoder
     // the normalised domain, then unorm = round(v * range + bias). Identity codes G/B/R with the luma range; YCgCo
     // (8) uses H.273 eqs 44-46; YCgCo-Re/Ro (16/17) are the integer lifting transforms on RGB quantised to
     // bd-2 / bd-1 bits. r/g/b arrive in coded-depth units [0, 2^bd - 1].
+    // libavif avifImageRGBToYUV's built-in path operation for operation (float, 2x2 blocks, chroma averaged in block
+    // order, avifRoundf), for the kr/kb matrices and identity. Samples are the native-depth integers (r/g/b as read by
+    // ReadRgbPlanes, rounded). Used where the coded YUV must equal libavif's exactly (lossless gain maps).
+    private static void RgbToYuvAvifFloat(double[] r, double[] g, double[] b, int w, int h, int bd, Av1.Av1PixelLayout layout,
+        Av1.Av1ObuWriter.Av1ColorDesc color, out ushort[] y, out ushort[] u, out ushort[] v)
+    {
+        int max = (1 << bd) - 1;
+        float maxF = max;
+        bool full = color.FullRange;
+        float biasY = full ? 0.0f : 16 << (bd - 8), rangeY = full ? max : 219 << (bd - 8);
+        float biasUV = 1 << (bd - 1), rangeUV = full ? max : 224 << (bd - 8);
+        bool identity = color.Matrix == 0;
+        (float kr, float kb) = color.Matrix == 12 ? ChromaDerivedKrKb(color.Primaries) : MatrixKrKb(color.Matrix);
+        float kg = 1.0f - kr - kb;
+        int ssX = layout == Av1.Av1PixelLayout.I444 ? 0 : 1, ssY = layout == Av1.Av1PixelLayout.I420 ? 1 : 0;
+        int cw = (w + ssX) >> ssX, chh = (h + ssY) >> ssY;
+        y = new ushort[w * h];
+        u = new ushort[cw * chh];
+        v = new ushort[cw * chh];
+        int ToY(float x) => Math.Clamp((int)MathF.Floor(x * rangeY + biasY + 0.5f), 0, max);
+        int ToUV(float x) => Math.Clamp((int)MathF.Floor(identity ? x * rangeY + biasY + 0.5f : x * rangeUV + biasUV + 0.5f), 0, max);
+        Span<float> bu = stackalloc float[4], bv = stackalloc float[4];
+        for (int oj = 0; oj < h; oj += 2)
+            for (int oi = 0; oi < w; oi += 2)
+            {
+                int bw = oi + 1 >= w ? 1 : 2, bh = oj + 1 >= h ? 1 : 2;
+                for (int bj = 0; bj < bh; bj++)
+                    for (int bi = 0; bi < bw; bi++)
+                    {
+                        int i = (oj + bj) * w + oi + bi;
+                        float R = (int)Math.Round(r[i]) / maxF, G = (int)Math.Round(g[i]) / maxF, B = (int)Math.Round(b[i]) / maxF;
+                        float Y, U, V;
+                        if (identity) { Y = G; U = B; V = R; }
+                        else
+                        {
+                            Y = (kr * R) + (kg * G) + (kb * B);
+                            U = (B - Y) / (2 * (1 - kb));
+                            V = (R - Y) / (2 * (1 - kr));
+                        }
+                        y[i] = (ushort)ToY(Y);
+                        bu[bi * 2 + bj] = U;
+                        bv[bi * 2 + bj] = V;
+                        if (layout == Av1.Av1PixelLayout.I444) { u[i] = (ushort)ToUV(U); v[i] = (ushort)ToUV(V); }
+                    }
+                if (layout == Av1.Av1PixelLayout.I420)
+                {
+                    float su = 0.0f, sv = 0.0f;
+                    for (int bj = 0; bj < bh; bj++)
+                        for (int bi = 0; bi < bw; bi++) { su += bu[bi * 2 + bj]; sv += bv[bi * 2 + bj]; }
+                    float n = bw * bh;
+                    int ci = (oj >> 1) * cw + (oi >> 1);
+                    u[ci] = (ushort)ToUV(su / n);
+                    v[ci] = (ushort)ToUV(sv / n);
+                }
+                else if (layout == Av1.Av1PixelLayout.I422)
+                {
+                    for (int bj = 0; bj < bh; bj++)
+                    {
+                        float su = 0.0f, sv = 0.0f;
+                        for (int bi = 0; bi < bw; bi++) { su += bu[bi * 2 + bj]; sv += bv[bi * 2 + bj]; }
+                        float n = bw;
+                        int ci = (oj + bj) * cw + (oi >> 1);
+                        u[ci] = (ushort)ToUV(su / n);
+                        v[ci] = (ushort)ToUV(sv / n);
+                    }
+                }
+            }
+    }
+
     private static void RgbToYuvAvif(double[] r, double[] g, double[] b, int w, int h, int bd, Av1.Av1PixelLayout layout,
         Av1.Av1ObuWriter.Av1ColorDesc color, out ushort[] y, out ushort[] u, out ushort[] v)
     {

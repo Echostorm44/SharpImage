@@ -27,6 +27,19 @@ internal static class AvifColorMath
         return Primaries[0].P;
     }
 
+    /// <summary>avifColorPrimariesComputeYCoeffs: luma coefficients (kr, kg, kb) of the primaries (H.273 eq. 32-37).</summary>
+    public static float[] YCoeffs(int cp)
+    {
+        float[] p = PrimariesValues(cp);
+        float rX = p[0], rY = p[1], gX = p[2], gY = p[3], bX = p[4], bY = p[5], wX = p[6], wY = p[7];
+        float rZ = 1.0f - (rX + rY), gZ = 1.0f - (gX + gY), bZ = 1.0f - (bX + bY), wZ = 1.0f - (wX + wY);
+        float kr = (rY * (wX * (gY * bZ - bY * gZ) + wY * (bX * gZ - gX * bZ) + wZ * (gX * bY - bX * gY))) /
+                   (wY * (rX * (gY * bZ - bY * gZ) + gX * (bY * rZ - rY * bZ) + bX * (rY * gZ - gY * rZ)));
+        float kb = (bY * (wX * (rY * gZ - gY * rZ) + wY * (gX * rZ - rX * gZ) + wZ * (rX * gY - gX * rY))) /
+                   (wY * (rX * (gY * bZ - bY * gZ) + gX * (bY * rZ - rY * bZ) + bX * (rY * gZ - gY * rZ)));
+        return [kr, 1.0f - kr - kb, kb];
+    }
+
     // AVIF_CLAMP: NaN passes through.
     private static float Clamp(float x, float lo, float hi) => x < lo ? lo : (hi < x ? hi : x);
 

@@ -233,11 +233,7 @@ public static partial class HeifCoder
     public static ImageFrame DecodeToneMapped(byte[] data, float hdrHeadroom, CicpInfo? output = null, int depth = 0)
     {
         // The base as libavif converts it for tone mapping: RGB at its coded depth.
-        ImageFrame baseImage;
-        bool prev = t_nativeDepthRgb;
-        t_nativeDepthRgb = true;
-        try { baseImage = Decode(data); }
-        finally { t_nativeDepthRgb = prev; }
+        var baseImage = DecodeNativeDepth(data);
         var gm = DecodeGainMap(data) ?? throw new InvalidDataException("The image has no gain map.");
         var baseCicp = baseImage.Metadata.Cicp ?? CicpInfo.Srgb;
         float baseH = gm.BaseHdrHeadroom.ToSingle(), altH = gm.AlternateHdrHeadroom.ToSingle();
@@ -266,6 +262,16 @@ public static partial class HeifCoder
         result.Metadata.Cicp = new CicpInfo(cp, tc, mc, true);
         result.Metadata.ContentLightLevel = clli ?? computed;
         return result;
+    }
+
+    // Decode with high-bit-depth RGB quantised to the coded depth first, as libavif's avifImageYUVToRGB produces it for
+    // an RGB image of the image's depth (what its gain map computation and tone mapping work on).
+    internal static ImageFrame DecodeNativeDepth(byte[] data)
+    {
+        bool prev = t_nativeDepthRgb;
+        t_nativeDepthRgb = true;
+        try { return Decode(data); }
+        finally { t_nativeDepthRgb = prev; }
     }
 
     /// <summary>
@@ -408,6 +414,372 @@ public static partial class HeifCoder
         float rgbAverageLinear = rgbSumLinear / ((long)width * height);
         contentLightLevel = new ContentLightLevel(Nits(rgbMaxLinear), Nits(rgbAverageLinear));
         return result;
+    }
+
+    /// <summary>
+    /// Computes the gain map that turns <paramref name="baseImage"/> into <paramref name="alternateImage"/> (libavif
+    /// avifImageComputeGainMap, as <c>avifgainmaputil combine</c> runs it): per-pixel log2 ratios in the gain map math
+    /// colour space (the wider of the two primaries), outlier-trimmed min/max per channel, headrooms from the images'
+    /// peaks (capped at <paramref name="maxHeadroom"/>; 0 = no cap), the image quantised to <paramref name="depth"/>
+    /// bits; <paramref name="singleChannel"/> computes one luma-weighted channel. Both images carry their CICP in
+    /// Metadata.Cicp (sRGB if absent) and their sample precision in <see cref="ImageFrame.Depth"/>. The alternate
+    /// image's CICP, depth, plane count and content light level are recorded. Encode it with
+    /// <see cref="AvifEncodeOptions.GainMap"/>.
+    /// </summary>
+    public static AvifGainMap ComputeGainMap(ImageFrame baseImage, ImageFrame alternateImage, int depth = 8, bool singleChannel = false,
+        double maxHeadroom = 4.0)
+    {
+        if (baseImage.IccProfile is { Length: > 0 } || alternateImage.IccProfile is { Length: > 0 })
+            throw new NotSupportedException("Computing gain maps for images with ICC profiles is not supported");
+        if (baseImage.Columns != alternateImage.Columns || baseImage.Rows != alternateImage.Rows)
+            throw new ArgumentException($"Image dimensions don't match, got {baseImage.Columns}x{baseImage.Rows} and {alternateImage.Columns}x{alternateImage.Rows}");
+        if (depth is not (8 or 10 or 12)) throw new ArgumentOutOfRangeException(nameof(depth), "Gain map depth must be 8, 10 or 12.");
+
+        int width = (int)baseImage.Columns, height = (int)baseImage.Rows;
+        var baseCicp = baseImage.Metadata.Cicp ?? CicpInfo.Srgb;
+        var altCicp = alternateImage.Metadata.Cicp ?? CicpInfo.Srgb;
+        int baseCp = baseCicp.ColorPrimaries, altCp = altCicp.ColorPrimaries;
+        bool colorSpacesDiffer = baseCp != altCp;
+        int mathCp = ChooseGainMapMathPrimaries(baseCp, altCp);
+
+        var gm = new AvifGainMap { UseBaseColorSpace = mathCp == baseCp };   // encoding defaults (gamma 1, offsets 1/64)
+        var baseToLinear = AvifColorMath.ToLinear(baseCicp.TransferCharacteristics);
+        var altToLinear = AvifColorMath.ToLinear(altCicp.TransferCharacteristics);
+        float[] yCoeffs = AvifColorMath.YCoeffs(mathCp);
+        double[,]? conv = null;
+        if (colorSpacesDiffer)
+            conv = (gm.UseBaseColorSpace ? AvifColorMath.RgbToRgbMatrix(altCp, baseCp) : AvifColorMath.RgbToRgbMatrix(baseCp, altCp))
+                ?? throw new NotSupportedException("Unsupported RGB color space conversion");
+
+        int bDepth = Math.Clamp(baseImage.Depth, 1, 16), aDepth = Math.Clamp(alternateImage.Depth, 1, 16);
+        float bMax = (1 << bDepth) - 1, aMax = (1 << aDepth) - 1;
+        int bch = baseImage.NumberOfChannels, ach = alternateImage.NumberOfChannels;
+        bool bGray = bch - (baseImage.HasAlpha ? 1 : 0) < 3, aGray = ach - (alternateImage.HasAlpha ? 1 : 0) < 3;
+        Span<float> bpx = stackalloc float[4], apx = stackalloc float[4];
+
+        Span<float> baseOffset = stackalloc float[3], altOffset = stackalloc float[3];
+        for (int c = 0; c < 3; c++) { baseOffset[c] = gm.BaseOffset[c].ToSingle(); altOffset[c] = gm.AlternateOffset[c].ToSingle(); }
+
+        // Converting between colour spaces can give negative values: raise the offset of the converted image to avoid
+        // clamping (capped at 0.1, larger offsets cause artefacts when partially applying the gain map).
+        const float kEpsilon = 1e-10f;
+        if (colorSpacesDiffer)
+        {
+            Span<float> channelMin = stackalloc float[3];
+            var src = gm.UseBaseColorSpace ? alternateImage : baseImage;
+            var toLin = gm.UseBaseColorSpace ? altToLinear : baseToLinear;
+            int sch = gm.UseBaseColorSpace ? ach : bch, sd = gm.UseBaseColorSpace ? aDepth : bDepth;
+            bool sg = gm.UseBaseColorSpace ? aGray : bGray;
+            float sm = gm.UseBaseColorSpace ? aMax : bMax;
+            for (int j = 0; j < height; j++)
+            {
+                var row = src.GetPixelRow(j);
+                for (int i = 0; i < width; i++)
+                {
+                    ReadPixel(row, i, sch, sg, src.HasAlpha, sd, sm, apx);
+                    for (int c = 0; c < 3; c++) apx[c] = toLin(apx[c]);
+                    AvifColorMath.Convert(apx, conv!);
+                    for (int c = 0; c < 3; c++) channelMin[c] = MathF.Min(channelMin[c], apx[c]);
+                }
+            }
+            for (int c = 0; c < 3; c++)
+            {
+                const float maxOffset = 0.1f;
+                if (channelMin[c] < -kEpsilon)
+                {
+                    if (gm.UseBaseColorSpace) altOffset[c] = MathF.Min(altOffset[c] - channelMin[c], maxOffset);
+                    else baseOffset[c] = MathF.Min(baseOffset[c] - channelMin[c], maxOffset);
+                }
+            }
+        }
+
+        int channels = singleChannel ? 1 : 3;
+        int numPixels = width * height;
+        var gmf = new float[channels][];
+        for (int c = 0; c < channels; c++) gmf[c] = new float[numPixels];
+        float baseMaxV = 1.0f, altMaxV = 1.0f;
+        for (int j = 0; j < height; j++)
+        {
+            var brow = baseImage.GetPixelRow(j);
+            var arow = alternateImage.GetPixelRow(j);
+            for (int i = 0; i < width; i++)
+            {
+                ReadPixel(brow, i, bch, bGray, baseImage.HasAlpha, bDepth, bMax, bpx);
+                ReadPixel(arow, i, ach, aGray, alternateImage.HasAlpha, aDepth, aMax, apx);
+                for (int c = 0; c < 3; c++) { bpx[c] = baseToLinear(bpx[c]); apx[c] = altToLinear(apx[c]); }
+                if (colorSpacesDiffer)
+                {
+                    if (gm.UseBaseColorSpace) AvifColorMath.Convert(apx, conv!);
+                    else AvifColorMath.Convert(bpx, conv!);
+                }
+                for (int c = 0; c < channels; c++)
+                {
+                    float b = bpx[c], a = apx[c];
+                    if (singleChannel)
+                    {
+                        b = yCoeffs[0] * bpx[0] + yCoeffs[1] * bpx[1] + yCoeffs[2] * bpx[2];
+                        a = yCoeffs[0] * apx[0] + yCoeffs[1] * apx[1] + yCoeffs[2] * apx[2];
+                    }
+                    if (b > baseMaxV) baseMaxV = b;
+                    if (a > altMaxV) altMaxV = a;
+                    float ratio = (a + altOffset[c]) / (b + baseOffset[c]);
+                    gmf[c][j * width + i] = MathF.Log2(MathF.Max(ratio, kEpsilon));
+                }
+            }
+        }
+
+        double baseHeadroom = MathF.Log2(MathF.Max(baseMaxV, kEpsilon));
+        double altHeadroom = MathF.Log2(MathF.Max(altMaxV, kEpsilon));
+        gm.BaseHdrHeadroom = ToUFraction(baseHeadroom);
+        gm.AlternateHdrHeadroom = ToUFraction(altHeadroom);
+        // Store the log-ratio of the HDR representation to the SDR one.
+        if (altHeadroom < baseHeadroom)
+            foreach (var plane in gmf)
+                for (int k = 0; k < plane.Length; k++) plane[k] *= -1.0f;
+
+        Span<float> minLog2 = stackalloc float[3], maxLog2 = stackalloc float[3];
+        for (int c = 0; c < channels; c++) FindMinMaxWithoutOutliers(gmf[c], out minLog2[c], out maxLog2[c]);
+        for (int c = 0; c < 3; c++)
+        {
+            gm.Min[c] = ToSFraction(minLog2[singleChannel ? 0 : c]);
+            gm.Max[c] = ToSFraction(maxLog2[singleChannel ? 0 : c]);
+            gm.AlternateOffset[c] = ToSFraction(altOffset[c]);
+            gm.BaseOffset[c] = ToSFraction(baseOffset[c]);
+        }
+
+        // Remap [min, max] to [0, 1] (with the encoding gamma).
+        for (int c = 0; c < channels; c++)
+        {
+            float range = MathF.Max(maxLog2[c] - minLog2[c], 0.0f);
+            var plane = gmf[c];
+            if (range == 0.0f) { Array.Clear(plane); continue; }
+            float gamma = gm.Gamma[c].ToSingle();
+            for (int k = 0; k < plane.Length; k++)
+            {
+                float v = plane[k];
+                v = v < minLog2[c] ? minLog2[c] : (maxLog2[c] < v ? maxLog2[c] : v);
+                v = MathF.Pow((v - minLog2[c]) / range, gamma);
+                plane[k] = NanSafeClamp(v);
+            }
+        }
+
+        // The gain map image at the requested depth (avifSetRGBAPixel quantisation), grey for a single channel.
+        var img = new ImageFrame();
+        img.Initialize(width, height, ColorspaceType.SRGB, false);
+        img.Depth = depth;
+        float gMaxQ = (1 << depth) - 1;
+        Span<float> q = stackalloc float[4];
+        for (int j = 0; j < height; j++)
+        {
+            var row = img.GetPixelRowForWrite(j);
+            for (int i = 0; i < width; i++)
+            {
+                int o = j * width + i;
+                q[0] = gmf[0][o];
+                q[1] = singleChannel ? q[0] : gmf[1][o];
+                q[2] = singleChannel ? q[0] : gmf[2][o];
+                WritePixel(row, i, 3, false, depth, gMaxQ, q);
+            }
+        }
+        img.Metadata.Cicp = new CicpInfo(2, 2, 2, true);
+        gm.Image = img;
+
+        gm.AlternateCicp = altCicp with { FullRange = true };   // libavif leaves altYUVRange at its default (full)
+        gm.AlternateDepth = aDepth;
+        gm.AlternatePlaneCount = aGray ? 1 : 3;
+        gm.AlternateContentLightLevel = alternateImage.Metadata.ContentLightLevel;
+
+        // avifgainmaputil combine --max-headroom (default 4): cap headrooms computed from the content.
+        if (maxHeadroom > 0)
+        {
+            if (maxHeadroom * gm.BaseHdrHeadroom.Denominator < gm.BaseHdrHeadroom.Numerator) gm.BaseHdrHeadroom = ToUFraction(maxHeadroom);
+            if (maxHeadroom * gm.AlternateHdrHeadroom.Denominator < gm.AlternateHdrHeadroom.Numerator) gm.AlternateHdrHeadroom = ToUFraction(maxHeadroom);
+        }
+        return gm;
+    }
+
+    // Codes the gain map image through the regular AV1 path (RGB -> YUV at full size with the gain map's own CICP —
+    // libavif leaves it unspecified, 2/2/2, i.e. BT.601 coefficients — then the optional YUV downscale) and collects
+    // the item data and properties the container needs, plus the tmap payload and the alternate image's properties.
+    private static Av1.AvifGainMapItem BuildGainMapItem(AvifGainMap gm, AvifEncodeOptions o, Av1.AvifContainerExtras extras)
+    {
+        if (gm.Validate() is { } why) throw new ArgumentException(why, nameof(o));
+        var img = gm.Image ?? throw new ArgumentException("The gain map has no image.", nameof(o));
+        if (o.GainMapDownscaling < 1) throw new ArgumentOutOfRangeException(nameof(o), "GainMapDownscaling must be at least 1.");
+        int bd = img.Depth is 8 or 10 or 12 ? img.Depth : 8;
+        var cicp = img.Metadata.Cicp ?? new CicpInfo(2, 2, 2, true);
+        var color = new Av1.Av1ObuWriter.Av1ColorDesc(cicp.ColorPrimaries, cicp.TransferCharacteristics, cicp.MatrixCoefficients, cicp.FullRange);
+        var layout = o.GainMapChromaSubsampling switch
+        {
+            AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
+            AvifChromaSubsampling.Yuv422 => Av1.Av1PixelLayout.I422,
+            _ => Av1.Av1PixelLayout.I444,
+        };
+        int ds = o.GainMapDownscaling, rounding = ds / 2;
+        int gw = Math.Max(((int)img.Columns + rounding) / ds, 1), gh = Math.Max(((int)img.Rows + rounding) / ds, 1);
+        byte[] file = EncodeAvifGeneral(img, o.GainMapQp ?? o.Qp, bd, layout, color, new Av1.AvifContainerExtras(), o.GainMapLossless,
+            scaleYuvTo: (gw, gh), libavifFloatYuv: true);
+
+        // Lift the coded item and its properties out of the single-item file.
+        var c = HeifContainer.Parse(file);
+        byte[] d = c.Data;
+        byte[] RawBox(int id, string type, Func<int, int, bool>? match = null)
+        {
+            var p = c.Property(id, type, match) ?? throw new InvalidOperationException($"Encoded gain map lacks '{type}'.");
+            return d.AsSpan(p.Off - 8, p.Len + 8).ToArray();
+        }
+        int pid = c.PrimaryId;
+        var item = new Av1.AvifGainMapItem
+        {
+            Data = c.ItemData(pid)!,
+            Width = gw,
+            Height = gh,
+            PixiBox = RawBox(pid, "pixi"),
+            Av1CBox = RawBox(pid, "av1C"),
+            ColrBox = RawBox(pid, "colr", (off, len) => len >= 11 && Encoding.ASCII.GetString(d, off, 4) == "nclx"),
+            Tmap = ToneMapImagePayload(gm),
+        };
+
+        // Alternate image properties on the tmap item (libavif: pixi only when known, colr prof + nclx, clli).
+        if (gm.AlternateDepth != 0 || gm.AlternatePlaneCount != 0)
+        {
+            int ch = gm.AlternatePlaneCount == 1 ? 1 : 3;
+            var pixi = new byte[1 + ch];
+            pixi[0] = (byte)ch;
+            for (int i = 1; i <= ch; i++) pixi[i] = (byte)gm.AlternateDepth;
+            item.AltPixiBox = Av1.Av1AvifWriter.FullBox("pixi", 0, 0, pixi);
+        }
+        if (gm.AlternateIccProfile is { Length: > 0 } icc)
+            item.AltIccBox = Av1.Av1AvifWriter.Box("colr", [.. "prof"u8, .. icc]);
+        var alt = gm.AlternateCicp ?? new CicpInfo(2, 2, 2, true);
+        var nclx = new byte[11];
+        "nclx"u8.CopyTo(nclx);
+        BinaryPrimitives.WriteUInt16BigEndian(nclx.AsSpan(4), (ushort)alt.ColorPrimaries);
+        BinaryPrimitives.WriteUInt16BigEndian(nclx.AsSpan(6), (ushort)alt.TransferCharacteristics);
+        BinaryPrimitives.WriteUInt16BigEndian(nclx.AsSpan(8), (ushort)alt.MatrixCoefficients);
+        nclx[10] = (byte)(alt.FullRange ? 0x80 : 0);
+        item.AltNclxBox = Av1.Av1AvifWriter.Box("colr", nclx);
+        if (gm.AlternateContentLightLevel is { } cl && (cl.MaxContentLightLevel != 0 || cl.MaxFrameAverageLightLevel != 0))
+        {
+            var b = new byte[4];
+            BinaryPrimitives.WriteUInt16BigEndian(b, cl.MaxContentLightLevel);
+            BinaryPrimitives.WriteUInt16BigEndian(b.AsSpan(2), cl.MaxFrameAverageLightLevel);
+            item.AltClliBox = Av1.Av1AvifWriter.Box("clli", b);
+        }
+        return item;
+    }
+
+    // The tmap item payload (libavif avifWriteToneMappedImagePayload): version 0, then ISO 21496-1 GainMapMetadata with
+    // minimum_version = writer_version = 0; one channel when all three carry the same metadata.
+    private static byte[] ToneMapImagePayload(AvifGainMap gm)
+    {
+        bool multi = gm.IsMultichannel;
+        int channels = multi ? 3 : 1;
+        var p = new byte[1 + 4 + 1 + 16 + channels * 40];
+        int pos = 5;   // version (0), minimum_version (0), writer_version (0)
+        p[pos++] = (byte)((multi ? 0x80 : 0) | (gm.UseBaseColorSpace ? 0x40 : 0));
+        void U32(uint v) { BinaryPrimitives.WriteUInt32BigEndian(p.AsSpan(pos), v); pos += 4; }
+        U32(gm.BaseHdrHeadroom.Numerator); U32(gm.BaseHdrHeadroom.Denominator);
+        U32(gm.AlternateHdrHeadroom.Numerator); U32(gm.AlternateHdrHeadroom.Denominator);
+        for (int c = 0; c < channels; c++)
+        {
+            U32((uint)gm.Min[c].Numerator); U32(gm.Min[c].Denominator);
+            U32((uint)gm.Max[c].Numerator); U32(gm.Max[c].Denominator);
+            U32(gm.Gamma[c].Numerator); U32(gm.Gamma[c].Denominator);
+            U32((uint)gm.BaseOffset[c].Numerator); U32(gm.BaseOffset[c].Denominator);
+            U32((uint)gm.AlternateOffset[c].Numerator); U32(gm.AlternateOffset[c].Denominator);
+        }
+        return p;
+    }
+
+    // avifChooseColorSpaceForGainMapMath: the primaries whose gamut holds the other's pure R, G and B (largest min).
+    private static int ChooseGainMapMathPrimaries(int baseCp, int altCp)
+    {
+        if (baseCp == altCp) return baseCp;
+        var baseToAlt = AvifColorMath.RgbToRgbMatrix(baseCp, altCp);
+        var altToBase = AvifColorMath.RgbToRgbMatrix(altCp, baseCp);
+        if (baseToAlt == null || altToBase == null) throw new NotSupportedException("Unsupported RGB color space conversion");
+        Span<float> rgba = stackalloc float[4];
+        float baseMin = 0, altMin = 0;
+        for (int c = 0; c < 3; c++)
+        {
+            rgba.Clear(); rgba[c] = 1.0f;
+            AvifColorMath.Convert(rgba, altToBase);
+            for (int i = 0; i < 3; i++) baseMin = MathF.Min(baseMin, rgba[i]);
+            rgba.Clear(); rgba[c] = 1.0f;
+            AvifColorMath.Convert(rgba, baseToAlt);
+            for (int i = 0; i < 3; i++) altMin = MathF.Min(altMin, rgba[i]);
+        }
+        return altMin <= baseMin ? baseCp : altCp;
+    }
+
+    // avifFindMinMaxWithoutOutliers: min / max ignoring up to 0.1% outliers (0.01-wide histogram buckets).
+    private static void FindMinMaxWithoutOutliers(float[] v, out float rangeMin, out float rangeMax)
+    {
+        const float bucketSize = 0.01f, maxOutliersRatio = 0.001f;
+        int maxOutliersOnEachSide = (int)MathF.Floor(v.Length * maxOutliersRatio / 2.0f + 0.5f);
+        float min = v[0], max = v[0];
+        for (int i = 1; i < v.Length; i++) { min = MathF.Min(min, v[i]); max = MathF.Max(max, v[i]); }
+        rangeMin = min;
+        rangeMax = max;
+        if ((max - min) <= (bucketSize * 2) || maxOutliersOnEachSide == 0) return;
+
+        int numBuckets = Math.Min((int)MathF.Ceiling((max - min) / bucketSize), 10000);
+        var histogram = new int[numBuckets];
+        foreach (float x in v)
+        {
+            float c = x < min ? min : (max < x ? max : x);
+            histogram[Math.Min((int)MathF.Floor((c - min) / (max - min) * numBuckets + 0.5f), numBuckets - 1)]++;
+        }
+        float BucketValue(int idx) => idx * (max - min) / numBuckets + min;
+        int left = 0;
+        for (int i = 0; i < numBuckets; i++)
+        {
+            left += histogram[i];
+            if (left > maxOutliersOnEachSide) break;
+            if (histogram[i] == 0) rangeMin = BucketValue(i + 1);
+        }
+        int right = 0;
+        for (int i = numBuckets - 1; i >= 0; i--)
+        {
+            right += histogram[i];
+            if (right > maxOutliersOnEachSide) break;
+            if (histogram[i] == 0) rangeMax = BucketValue(i);
+        }
+    }
+
+    // avifDoubleToUnsignedFractionImpl: best continued-fraction approximation with numerator <= maxNumerator.
+    private static (uint N, uint D) DoubleToFraction(double v, uint maxNumerator)
+    {
+        if (double.IsNaN(v) || v < 0 || v > maxNumerator) throw new ArgumentException($"{v} cannot be expressed as a fraction.");
+        uint maxD = v <= 1 ? uint.MaxValue : (uint)Math.Floor(maxNumerator / v);
+        uint d = 1, previousD = 0, n;
+        double currentV = v - Math.Floor(v);
+        for (int iter = 0; iter < 39; iter++)
+        {
+            double numeratorDouble = (double)d * v;
+            n = (uint)Math.Round(numeratorDouble, MidpointRounding.AwayFromZero);
+            if (Math.Abs(numeratorDouble - n) == 0.0) return (n, d);
+            currentV = 1.0 / currentV;
+            double newD = previousD + Math.Floor(currentV) * d;
+            if (newD > maxD) return (n, d);
+            previousD = d;
+            d = (uint)newD;
+            currentV -= Math.Floor(currentV);
+        }
+        return ((uint)Math.Round((double)d * v, MidpointRounding.AwayFromZero), d);
+    }
+
+    private static GainMapUFraction ToUFraction(double v)
+    {
+        var (n, d) = DoubleToFraction(v, uint.MaxValue);
+        return new GainMapUFraction(n, d);
+    }
+
+    private static GainMapFraction ToSFraction(double v)
+    {
+        var (n, d) = DoubleToFraction(Math.Abs(v), int.MaxValue);
+        return new GainMapFraction(v < 0 ? -(int)n : (int)n, d);
     }
 
     // A weight in [-1, 1]: how much of the gain map to apply for a display headroom (libavif avifGetGainMapWeight).
