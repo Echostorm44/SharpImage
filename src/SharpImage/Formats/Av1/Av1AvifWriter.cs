@@ -17,7 +17,7 @@ internal sealed class AvifContainerExtras
     public byte[]? Exif;                     // Exif item payload (TIFF header onward, or with a leading "Exif\0\0")
     public byte[]? Xmp;                      // XMP packet (mime item, application/rdf+xml)
     public int? IrotAngle;                   // irot: anti-clockwise rotation in 90° units (0..3)
-    public int? ImirAxis;                    // imir: 0 = vertical axis (left-right flip), 1 = horizontal axis (top-bottom)
+    public int? ImirAxis;                    // imir (ISO/IEC 23008-12:2022): 0 = top/bottom exchanged, 1 = left/right exchanged
     public uint[]? Clap;                     // clap: widthN,widthD,heightN,heightD,horizOffN,horizOffD,vertOffN,vertOffD
     public (uint H, uint V)? Pasp;           // pasp: pixel aspect ratio hSpacing:vSpacing
     public (ushort MaxCll, ushort MaxPall)? Clli;
@@ -123,14 +123,16 @@ internal static class Av1AvifWriter
         if (x?.Pasp is { } pasp) assoc1.Add((Add(Box("pasp", Concat(U32(pasp.H), U32(pasp.V)))), false));
         if (x?.Clli is { } clli) assoc1.Add((Add(Box("clli", Concat(U16(clli.MaxCll), U16(clli.MaxPall)))), false));
         if (x?.Mdcv is { Length: 24 } mdcv) assoc1.Add((Add(Box("mdcv", mdcv)), false));
+        var transforms = new List<(int Index, bool Essential)>();   // shared with the alpha item (libavif >= 1.3)
         if (x?.Clap is { Length: 8 } clap)
         {
             var cb = new byte[32];
             for (int i = 0; i < 8; i++) WriteU32(cb, i * 4, clap[i]);
-            assoc1.Add((Add(Box("clap", cb)), true));
+            transforms.Add((Add(Box("clap", cb)), true));
         }
-        if (x?.IrotAngle is { } angle) assoc1.Add((Add(Box("irot", new[] { (byte)(angle & 3) })), true));
-        if (x?.ImirAxis is { } axis) assoc1.Add((Add(Box("imir", new[] { (byte)(axis & 1) })), true));
+        if (x?.IrotAngle is { } angle) transforms.Add((Add(Box("irot", new[] { (byte)(angle & 3) })), true));
+        if (x?.ImirAxis is { } axis) transforms.Add((Add(Box("imir", new[] { (byte)(axis & 1) })), true));
+        assoc1.AddRange(transforms);
 
         var assoc2 = new List<(int Index, bool Essential)>();
         if (alphaData != null)
@@ -141,6 +143,7 @@ internal static class Av1AvifWriter
             byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
             assoc2.Add((Add(FullBox("auxC", 0, 0, auxUrn)), true));
             assoc2.Add((Add(FullBox("pixi", 0, 0, new byte[] { 1, (byte)bitDepth })), false));
+            assoc2.AddRange(transforms);   // the alpha plane is transformed exactly like the colour image
         }
 
         // Items: (id, type, name, content type, payload).

@@ -37,6 +37,12 @@ public sealed class ImageMetadata
     public CicpInfo? Cicp { get; set; }
 
     /// <summary>
+    /// Pixel aspect ratio (horizontal : vertical spacing) when the source signals non-square pixels (e.g. AVIF/HEIF
+    /// 'pasp'); null means square / unspecified.
+    /// </summary>
+    public PixelAspectRatio? PixelAspectRatio { get; set; }
+
+    /// <summary>
     /// Whether any metadata is present.
     /// </summary>
     public bool HasMetadata =>
@@ -53,10 +59,14 @@ public sealed class ImageMetadata
             IccProfile = IccProfile?.Clone(),
             Xmp = Xmp,
             IptcProfile = IptcProfile?.Clone(),
-            Cicp = Cicp
+            Cicp = Cicp,
+            PixelAspectRatio = PixelAspectRatio
         };
     }
 }
+
+/// <summary>Pixel aspect ratio as relative horizontal and vertical pixel spacing (1:1 = square pixels).</summary>
+public sealed record PixelAspectRatio(uint HorizontalSpacing, uint VerticalSpacing);
 
 /// <summary>
 /// ITU-T H.273 colour description: colour primaries, transfer characteristics, matrix coefficients and the

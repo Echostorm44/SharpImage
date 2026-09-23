@@ -66,6 +66,22 @@ public sealed class AvifEncodeOptions
 
     /// <summary>Full (true, default) or limited/studio (false) YUV range.</summary>
     public bool FullRange { get; set; } = true;
+
+    /// <summary>'irot' rotation to signal, in anti-clockwise quarter turns (0..3). Null: derived (with
+    /// <see cref="Mirror"/>) from the image's EXIF-style <c>Orientation</c>, as avifenc does. Pixels are stored as
+    /// given; readers apply the rotation for display.</summary>
+    public int? Rotation { get; set; }
+
+    /// <summary>'imir' mirror to signal: 0 = top/bottom exchanged, 1 = left/right exchanged (ISO/IEC 23008-12:2022).
+    /// Applied after <see cref="Rotation"/>. Null: derived from <c>Orientation</c>.</summary>
+    public int? Mirror { get; set; }
+
+    /// <summary>Clean aperture ('clap'): the display crop (x, y, width, height) within the coded image. Applied by
+    /// readers before rotation/mirroring.</summary>
+    public (int X, int Y, int Width, int Height)? CropRect { get; set; }
+
+    /// <summary>Pixel aspect ratio ('pasp') to signal. Null: the image's <c>Metadata.PixelAspectRatio</c>.</summary>
+    public SharpImage.Metadata.PixelAspectRatio? PixelAspectRatio { get; set; }
 }
 
 public static class HeifCoder
@@ -176,6 +192,7 @@ public static class HeifCoder
         (int Cp, int Tc, int Mc, bool Full)? primaryNclx = null;   // primary item's colr nclx (if any)
         byte[]? primaryIcc = null;                                  // primary item's colr prof/rICC (if any)
         byte[]? exifTiff = null, xmpBytes = null;                   // cdsc metadata items of the primary
+        uint[]? primaryClap = null; int? primaryIrot = null, primaryImir = null; (uint H, uint V)? primaryPasp = null;
 
         // Parse meta box hierarchy
         if (boxes.TryGetValue("meta", out var metaBox))
@@ -220,6 +237,15 @@ public static class HeifCoder
                                 imageWidth = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 4));
                                 imageHeight = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 8));
                             }
+                            else if (pType == "clap" && pLen >= 32)
+                            {
+                                primaryClap = new uint[8];
+                                for (int k = 0; k < 8; k++) primaryClap[k] = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 4 * k));
+                            }
+                            else if (pType == "irot" && pLen >= 1) primaryIrot = data[pOff] & 3;
+                            else if (pType == "imir" && pLen >= 1) primaryImir = data[pOff] & 1;
+                            else if (pType == "pasp" && pLen >= 8)
+                                primaryPasp = (BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff)), BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 4)));
                             else if (pType == "colr" && pLen > 4 && primaryIcc == null
                                      && Encoding.ASCII.GetString(data, pOff, 4) is "prof" or "rICC")
                             {
@@ -414,6 +440,42 @@ public static class HeifCoder
                         frame, hvcC, matrixCoeffs, fullRange);
         }
 
+        if (primaryPasp is { } pp && pp.H > 0 && pp.V > 0)
+            frame.Metadata.PixelAspectRatio = new SharpImage.Metadata.PixelAspectRatio(pp.H, pp.V);
+        return ApplyHeifTransforms(frame, primaryClap, primaryIrot, primaryImir);
+    }
+
+    // HEIF transformative properties are essential: the displayed image is clap-cropped, then rotated (irot, anti-
+    // clockwise quarter turns), then mirrored (imir: 0 = top/bottom, 1 = left/right) — MIAF 7.3.6.7 order. The result
+    // is display-oriented, so Orientation (and any EXIF orientation tag, which AVIF readers ignore) become top-left.
+    private static ImageFrame ApplyHeifTransforms(ImageFrame frame, uint[]? clap, int? irot, int? imir)
+    {
+        var src = frame;
+        if (clap != null && CropRectFromCleanAperture(clap, (int)frame.Columns, (int)frame.Rows) is { } r
+            && (r.X != 0 || r.Y != 0 || r.W != frame.Columns || r.H != frame.Rows))
+            frame = SharpImage.Transform.Geometry.Crop(frame, r.X, r.Y, r.W, r.H);
+        if (irot is 1 or 2 or 3)
+            frame = SharpImage.Transform.Geometry.Rotate(frame, irot switch
+            {
+                1 => SharpImage.Transform.RotationAngle.Rotate270,   // 90° anti-clockwise
+                2 => SharpImage.Transform.RotationAngle.Rotate180,
+                _ => SharpImage.Transform.RotationAngle.Rotate90,    // 270° anti-clockwise
+            });
+        if (imir == 0) frame = SharpImage.Transform.Geometry.Flip(frame);
+        else if (imir == 1) frame = SharpImage.Transform.Geometry.Flop(frame);
+
+        if (!ReferenceEquals(frame, src))
+        {
+            frame.Metadata = src.Metadata;
+            frame.IccProfile = src.IccProfile;
+            frame.Colorspace = src.Colorspace;
+        }
+        frame.Orientation = OrientationType.TopLeft;
+        if (frame.Metadata.ExifProfile is { } exif && exif.GetTag(SharpImage.Metadata.ExifTag.Orientation) is { } ot)
+        {
+            byte[] one = exif.IsLittleEndian ? [1, 0] : [0, 1];
+            exif.SetTag(new SharpImage.Metadata.ExifEntry { Tag = ot.Tag, DataType = SharpImage.Metadata.ExifDataType.Short, Count = 1, Value = one });
+        }
         return frame;
     }
 
@@ -625,7 +687,7 @@ public static class HeifCoder
         // 8-bit 4:2:0 BT.601 full range keeps the original byte pipeline (RgbToI420); everything else goes through
         // the general matrix/range/layout path.
         bool bt601Full = color.Matrix is 5 or 6 && color.FullRange;
-        var extras = AvifExtras(image);
+        var extras = AvifExtras(image, options);
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full
             ? EncodeAvif8(image, options.Qp, color, extras)
             : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras);
@@ -633,12 +695,71 @@ public static class HeifCoder
 
     // Container content carried over from the image: the ICC profile (colr 'prof'), Exif (as raw TIFF, the
     // form libavif stores after its 4-byte header offset) and XMP (mime item, application/rdf+xml).
-    private static Av1.AvifContainerExtras AvifExtras(ImageFrame image) => new()
+    // Transforms: irot/imir from the options, else from the EXIF-style Orientation (libavif
+    // avifImageExtractExifOrientationToIrotImir); clap from CropRect; pasp from the options or metadata.
+    private static Av1.AvifContainerExtras AvifExtras(ImageFrame image, AvifEncodeOptions o)
     {
-        Icc = image.Metadata.IccProfile?.Data ?? image.IccProfile,
-        Exif = image.Metadata.ExifProfile is { } exif ? SharpImage.Metadata.ExifParser.SerializeForPngExif(exif) : null,
-        Xmp = image.Metadata.Xmp is { Length: > 0 } xmp ? Encoding.UTF8.GetBytes(xmp) : null,
-    };
+        var x = new Av1.AvifContainerExtras
+        {
+            Icc = image.Metadata.IccProfile?.Data ?? image.IccProfile,
+            Exif = image.Metadata.ExifProfile is { } exif ? SharpImage.Metadata.ExifParser.SerializeForPngExif(exif) : null,
+            Xmp = image.Metadata.Xmp is { Length: > 0 } xmp ? Encoding.UTF8.GetBytes(xmp) : null,
+        };
+        (int? irot, int? imir) = image.Orientation switch
+        {
+            OrientationType.TopRight => ((int?)null, (int?)1),
+            OrientationType.BottomRight => (2, null),
+            OrientationType.BottomLeft => (null, 0),
+            OrientationType.LeftTop => (1, 0),
+            OrientationType.RightTop => (3, null),
+            OrientationType.RightBottom => (3, 0),
+            OrientationType.LeftBottom => (1, null),
+            _ => (null, null),
+        };
+        if (o.Rotation != null || o.Mirror != null) (irot, imir) = (o.Rotation, o.Mirror);
+        if (irot is < 0 or > 3) throw new ArgumentOutOfRangeException(nameof(o), "Rotation must be 0..3 quarter turns.");
+        if (imir is < 0 or > 1) throw new ArgumentOutOfRangeException(nameof(o), "Mirror axis must be 0 or 1.");
+        x.IrotAngle = irot is > 0 ? irot : null;
+        x.ImirAxis = imir;
+        if (o.CropRect is { } crop)
+            x.Clap = CleanApertureFromCropRect(crop.X, crop.Y, crop.Width, crop.Height, (int)image.Columns, (int)image.Rows);
+        if ((o.PixelAspectRatio ?? image.Metadata.PixelAspectRatio) is { } pa)
+            x.Pasp = (pa.HorizontalSpacing, pa.VerticalSpacing);
+        return x;
+    }
+
+    // libavif avifCleanApertureBoxFromCropRect: clap size = crop size (/1); offsets = crop centre - image centre as
+    // reduced fractions (centres are dim/2, so offsets are multiples of 1/2).
+    private static uint[] CleanApertureFromCropRect(int x, int y, int w, int h, int imageW, int imageH)
+    {
+        if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > imageW || y + h > imageH)
+            throw new ArgumentOutOfRangeException(nameof(x), "CropRect must be non-empty and inside the image.");
+        (long hn, long hd) = Reduce(2L * x + w - imageW, 2);
+        (long vn, long vd) = Reduce(2L * y + h - imageH, 2);
+        return [(uint)w, 1, (uint)h, 1, (uint)(int)hn, (uint)hd, (uint)(int)vn, (uint)vd];
+    }
+
+    private static (long N, long D) Reduce(long n, long d)
+    {
+        long a = Math.Abs(n), b = d;
+        while (b != 0) (a, b) = (b, a % b);
+        return a > 1 ? (n / a, d / a) : (n, d);
+    }
+
+    // libavif avifCropRectFromCleanApertureBox: null when the clap is invalid or not integral (then ignored).
+    private static (int X, int Y, int W, int H)? CropRectFromCleanAperture(uint[] c, int imageW, int imageH)
+    {
+        long wN = (int)c[0], wD = (int)c[1], hN = (int)c[2], hD = (int)c[3], xN = (int)c[4], xD = (int)c[5], yN = (int)c[6], yD = (int)c[7];
+        if (wD <= 0 || hD <= 0 || xD <= 0 || yD <= 0 || wN < 0 || hN < 0 || wN % wD != 0 || hN % hD != 0) return null;
+        long cw = wN / wD, ch = hN / hD;
+        // cropX = imageW/2 + horizOff - cw/2, computed over the common denominator 2 * xD.
+        long xNum = (long)imageW * xD + 2 * xN - cw * xD, xDen = 2 * xD;
+        long yNum = (long)imageH * yD + 2 * yN - ch * yD, yDen = 2 * yD;
+        if (xNum % xDen != 0 || yNum % yDen != 0) return null;
+        long cx = xNum / xDen, cy = yNum / yDen;
+        if (cx < 0 || cy < 0 || cw == 0 || ch == 0 || cx + cw > imageW || cy + ch > imageH) return null;
+        return ((int)cx, (int)cy, (int)cw, (int)ch);
+    }
 
     // CICP for an AVIF encode, validated against what libavif can represent (reformat.c avifGetYUVColorSpaceInfo).
     private static Av1.Av1ObuWriter.Av1ColorDesc ResolveAvifColor(ImageFrame image, AvifEncodeOptions o, int bd)

@@ -212,6 +212,15 @@ public sealed class Av1HbdVerify
         if (File.Exists(exifIn)) src.Metadata.ExifProfile = SharpImage.Metadata.ExifParser.ParseFromTiff(File.ReadAllBytes(exifIn));
         if (File.Exists(xmpIn)) src.Metadata.Xmp = File.ReadAllText(xmpIn);
         File.WriteAllBytes(Path.Combine(outDir, "ours_meta.avif"), HeifCoder.EncodeAvif(src));
+        // Orientation 1..8 → irot/imir (asymmetric 96x64 gradient), plus clap crops.
+        for (int o = 1; o <= 8; o++)
+        {
+            var oi = Gradient(96, 64, alpha: false, gray: false);
+            oi.Orientation = (OrientationType)o;
+            File.WriteAllBytes(Path.Combine(outDir, $"ours_orient{o}.avif"), HeifCoder.EncodeAvif(oi, new AvifEncodeOptions { Qp = 2 }));
+        }
+        var ci = Gradient(96, 64, alpha: false, gray: false);
+        File.WriteAllBytes(Path.Combine(outDir, "ours_clap.avif"), HeifCoder.EncodeAvif(ci, new AvifEncodeOptions { Qp = 2, CropRect = (10, 7, 51, 33) }));
         var rgba = Gradient(96, 64, alpha: true, gray: false);
         rgba.Metadata = src.Metadata.Clone();
         File.WriteAllBytes(Path.Combine(outDir, "ours_icc_alpha.avif"), HeifCoder.EncodeAvif(rgba, new AvifEncodeOptions { BitDepth = 10 }));
