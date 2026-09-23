@@ -83,6 +83,12 @@ public sealed class AvifEncodeOptions
     /// <summary>Pixel aspect ratio ('pasp') to signal. Null: the image's <c>Metadata.PixelAspectRatio</c>.</summary>
     public SharpImage.Metadata.PixelAspectRatio? PixelAspectRatio { get; set; }
 
+    /// <summary>Lossless coding (AV1 base_q_idx 0: 4x4 Walsh-Hadamard, no in-loop filters): the decoded samples equal
+    /// the coded ones exactly. Unless <see cref="MatrixCoefficients"/> is set, RGB is coded with the identity matrix at
+    /// 4:4:4, so an 8/10/12-bit source round-trips bit-exactly (avifenc --lossless); YCgCo-Re (16) is also exact.
+    /// <see cref="Qp"/> is ignored. Alpha is coded losslessly too.</summary>
+    public bool Lossless { get; set; }
+
     /// <summary>HDR content light level ('clli'). Null: the image's <c>Metadata.ContentLightLevel</c>.</summary>
     public SharpImage.Metadata.ContentLightLevel? ContentLightLevel { get; set; }
 
@@ -605,13 +611,16 @@ public static class HeifCoder
         }
 
         var color = ResolveAvifColor(image, options, bd);
+        if (options.Lossless && options.MatrixCoefficients == null)
+            color = color with { Matrix = 0 };   // identity (GBR) at 4:4:4 — exact RGB
         // The identity matrix (RGB coded as GBR) is only defined for 4:4:4 — Auto picks it, explicit subsampling fails.
         var layout = options.ChromaSubsampling switch
         {
             AvifChromaSubsampling.Yuv422 => Av1.Av1PixelLayout.I422,
             AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
             AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
-            _ => color.Matrix == 0 ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
+            // Auto: 4:4:4 for identity and for lossless (subsampled chroma cannot be lossless; avifenc --lossless), else 4:2:0.
+            _ => color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
         };
         if (color.Matrix == 0 && layout != Av1.Av1PixelLayout.I444)
             throw new ArgumentException("The identity matrix (MatrixCoefficients 0) requires 4:4:4 chroma.", nameof(options));
@@ -620,9 +629,9 @@ public static class HeifCoder
         // the general matrix/range/layout path.
         bool bt601Full = color.Matrix is 5 or 6 && color.FullRange;
         var extras = AvifExtras(image, options);
-        return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full
+        return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless
             ? EncodeAvif8(image, options.Qp, color, extras)
-            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras);
+            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless);
     }
 
     // Container content carried over from the image: the ICC profile (colr 'prof'), Exif (as raw TIFF, the
@@ -743,7 +752,7 @@ public static class HeifCoder
     // full precision and coded through the multi-superblock encoder (which handles every size 8..4096). The 8-bit
     // 4:2:0 case keeps its original byte path (EncodeAvif8) so its output is unchanged.
     private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout,
-        Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras)
+        Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras, bool lossless = false)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -789,13 +798,18 @@ public static class HeifCoder
         {
             int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
             RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yA, out ushort[] uA, out ushort[] vA);
+            if (lossless)
+                return Av1.Av1StillImageEncoder.EncodeAvifLossless(yA, uA, vA, false, alpha, true, w, h, bd, layout, color, extras);
             return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx, bd, layout, color, extras);
         }
 
-        // Identity / YCgCo-R carry exact RGB, so even grey content keeps the colour (4:4:4) coding path.
-        if (colour || color.Matrix is 0 or 16 or 17)
+        // Identity / YCgCo-R carry exact RGB, so lossy grey content keeps the colour (4:4:4) path; lossless grey is
+        // coded as 4:0:0 like libavif (the single plane is exact already).
+        if (colour || (!lossless && color.Matrix is 0 or 16 or 17))
         {
             RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yP, out ushort[] uP, out ushort[] vP);
+            if (lossless)
+                return Av1.Av1StillImageEncoder.EncodeAvifLossless(yP, uP, vP, false, default, false, w, h, bd, layout, color, extras);
             return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx, bd, layout, color, extras);
         }
 
@@ -804,6 +818,9 @@ public static class HeifCoder
         var luma = new ushort[w * h];
         for (int i = 0; i < luma.Length; i++)
             luma[i] = (ushort)Math.Clamp((int)Math.Round(color.FullRange ? r[i] : r[i] / max * (219 << (bd - 8)) + (16 << (bd - 8))), 0, max);
+        if (lossless)
+            return Av1.Av1StillImageEncoder.EncodeAvifLossless(luma, default, default, true, default, false, w, h, bd, Av1.Av1PixelLayout.I400,
+                color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color, extras);
         return Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx, bd, color, extras);
     }
 

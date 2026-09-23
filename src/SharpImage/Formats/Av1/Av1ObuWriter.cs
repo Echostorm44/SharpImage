@@ -258,10 +258,13 @@ internal static class Av1ObuWriter
     /// tx-size signalling (TX_MODE_SELECT) — the encoder must then code a tx_depth symbol per block.</summary>
     internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef, int lfLevel = 0, bool screenContentTools = false, bool reducedTxSet = true)
     {
-        if (baseQIdx <= 0 || baseQIdx > 255)
+        if (baseQIdx < 0 || baseQIdx > 255)
         {
-            throw new ArgumentOutOfRangeException(nameof(baseQIdx), "base_q_idx must be in [1,255] (0 = lossless path).");
+            throw new ArgumentOutOfRangeException(nameof(baseQIdx), "base_q_idx must be in [0,255].");
         }
+        // base_q_idx 0 with every delta 0 is CodedLossless (and AllLossless: no superres): the loop filter, CDEF,
+        // restoration and tx-mode fields are absent and every transform is a 4x4 WHT.
+        bool lossless = baseQIdx == 0;
 
         var w = new Av1BitWriter();
 
@@ -310,8 +313,15 @@ internal static class Av1ObuWriter
         // segmentation_params
         w.PutBool(false);         // segmentation_enabled = 0
 
-        // delta_q_params (base_q_idx != 0)
-        w.PutBool(false);         // delta_q_present = 0
+        // delta_q_params: delta_q_present is only coded when base_q_idx > 0.
+        if (!lossless) w.PutBool(false);   // delta_q_present = 0
+        if (lossless)
+        {
+            // loop_filter_params / cdef_params / lr_params / read_tx_mode are all skipped for a coded-lossless frame.
+            w.PutBool(reducedTxSet);  // reduced_tx_set
+            if (!isObuFrame) w.TrailingBits();
+            return w.ToArray();
+        }
 
         // loop_filter_params (not lossless, not intrabc). A single deblocking level is applied to both Y edges
         // (and, for colour, to U/V); level 0 = filter off. Deblocking is post-reconstruction and does not feed

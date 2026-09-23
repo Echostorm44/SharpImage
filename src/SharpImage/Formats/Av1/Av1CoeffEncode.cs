@@ -29,7 +29,8 @@ internal static class Av1CoeffEncode
         int skipCtx = 0,
         int dcSignCtx = 0,
         int txTypeIdx = 1,
-        bool fullSet = false)
+        bool fullSet = false,
+        bool lossless = false)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
 
@@ -72,7 +73,7 @@ internal static class Av1CoeffEncode
         // TX_32X32/TX_64X64 imply DctDct with no symbol. We always emit DctDct = index 1 in the reduced Intra2
         // set (TxtpIntra2[tDim.Min*13 + yMode]).
         const int intra = 1;
-        if (chroma == 0 && tDim.Max + intra < (int)Av1TxSize.Tx64x64)
+        if (chroma == 0 && !lossless && tDim.Max + intra < (int)Av1TxSize.Tx64x64)   // lossless: WHT_WHT implied
         {
             // Full intra set (reduced_tx_set=0): sub-16x16 luma codes the 7-type Intra1 symbol; larger tx and the
             // reduced set code the 5-type Intra2 symbol. The caller passes the Intra2 index; map it to Intra1 here.

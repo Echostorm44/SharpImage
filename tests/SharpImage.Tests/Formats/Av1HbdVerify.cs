@@ -466,6 +466,68 @@ public sealed class Av1HbdVerify
         }
     }
 
+    // Lossless probe (trigger hbd_lossless.txt): encodes images losslessly, checks our decode is bit-exact at the coded
+    // depth, and dumps .avif / .src.rgb48 / .item1.yuv for dav1d + libavif checks. Manifest lines: stem WxH bd exact.
+    [Test, NotInParallel]
+    public void Lossless()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_lossless.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string outDir = Path.Combine(Scratch, "lossless");
+        Directory.CreateDirectory(outDir);
+        var rng = new Random(9);
+        ImageFrame Noisy(int w, int h, bool alpha, bool gray, int bits)
+        {
+            var f = Gradient(w, h, alpha, gray);
+            int ch = f.NumberOfChannels, q = 16 - bits;
+            for (int y = 0; y < h; y++)
+            {
+                var row = f.GetPixelRowForWrite(y);
+                for (int i = 0; i < w * ch; i++)
+                {
+                    int v = Math.Clamp(row[i] + rng.Next(-3000, 3000), 0, 65535) >> q;          // value at `bits` depth
+                    row[i] = (ushort)Math.Round(v * 65535.0 / ((1 << bits) - 1));              // exact at that depth
+                }
+                if (gray) for (int x = 0; x < w; x++) { row[x * ch + 1] = row[x * ch]; row[x * ch + 2] = row[x * ch]; }
+            }
+            return f;
+        }
+        var log = new System.Text.StringBuilder();
+        var cases = new (string Name, int W, int H, bool A, bool G, int Bd, int? Mc, AvifChromaSubsampling Ss)[]
+        {
+            ("rgb8", 257, 131, false, false, 8, null, AvifChromaSubsampling.Auto),
+            ("rgba8", 160, 96, true, false, 8, null, AvifChromaSubsampling.Auto),
+            ("rgb10", 130, 70, false, false, 10, null, AvifChromaSubsampling.Auto),
+            ("rgb12", 96, 64, false, false, 12, null, AvifChromaSubsampling.Auto),
+            ("gray8", 99, 67, false, true, 8, null, AvifChromaSubsampling.Auto),
+            ("ycgcore10", 120, 80, false, false, 10, 16, AvifChromaSubsampling.Yuv444),
+            ("yuv420_601", 128, 96, false, false, 8, 6, AvifChromaSubsampling.Yuv420),
+        };
+        foreach (var c in cases)
+        {
+            int srcBits = c.Mc == 16 ? c.Bd - 2 : c.Bd;
+            var img = Noisy(c.W, c.H, c.A, c.G, srcBits);
+            byte[] avif = HeifCoder.EncodeAvif(img, new AvifEncodeOptions { Lossless = true, BitDepth = c.Bd, MatrixCoefficients = c.Mc, ChromaSubsampling = c.Ss });
+            File.WriteAllBytes(Path.Combine(outDir, c.Name + ".avif"), avif);
+            File.WriteAllBytes(Path.Combine(outDir, c.Name + ".src.rgb48"), Rgb48(img));
+            if (!c.A) Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(outDir, c.Name + ".item1.yuv"));
+            ImageFrame dec;
+            try { dec = HeifCoder.Decode(avif); }
+            finally { Environment.SetEnvironmentVariable("AV1_DUMP10", null); }
+            File.WriteAllBytes(Path.Combine(outDir, c.Name + ".ours.rgb48"), Rgb48(dec));
+            long diffs = 0;
+            int nch = img.NumberOfChannels;
+            for (int y = 0; y < c.H; y++)
+            {
+                var r0 = img.GetPixelRow(y); var r1 = dec.GetPixelRow(y);
+                for (int i = 0; i < c.W * nch; i++) if (r0[i] != r1[i]) diffs++;
+            }
+            log.AppendLine($"{c.Name} {c.W}x{c.H} bd={c.Bd} bytes={avif.Length} raw={c.W * c.H * nch * srcBits / 8} ours_exact={(diffs == 0)} diffs={diffs}");
+        }
+        File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
+    }
+
     // Isolates in-loop-filter conformance at odd picture edges: encodes odd-size gradients at q28 with deblock only,
     // CDEF only, both, and neither (trigger hbd_edge.txt), dumping .avif + our native planes for the ffmpeg diff.
     [Test, NotInParallel]

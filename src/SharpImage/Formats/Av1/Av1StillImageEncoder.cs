@@ -554,6 +554,49 @@ internal static class Av1StillImageEncoder
         return (seqObu, frameObu);
     }
 
+    /// <summary>Lossless key frame (base_q_idx 0, 4x4 WHT, no in-loop filters) for a colour image in any chroma layout
+    /// (<paramref name="u"/>/<paramref name="v"/> null = monochrome, e.g. an alpha plane). The decoded samples equal the
+    /// input exactly.</summary>
+    internal static (byte[] SeqObu, byte[] FrameObu) BuildLosslessObus(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> u,
+        ReadOnlySpan<ushort> v, bool monochrome, int width, int height, int bitDepth, Av1PixelLayout layout,
+        Av1ObuWriter.Av1ColorDesc? color)
+    {
+        using var bdScope = new BitDepthScope(bitDepth);
+        ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
+        ushort[] padY = PadPlane(luma, width, height, pw, ph);
+        ushort[]? padU = null, padV = null;
+        if (!monochrome)
+        {
+            int ssX = layout == Av1PixelLayout.I444 ? 0 : 1, ssY = layout == Av1PixelLayout.I420 ? 1 : 0;
+            int cwIn = (width + ssX) >> ssX, chIn = (height + ssY) >> ssY;
+            padU = PadPlane(u, cwIn, chIn, pw >> ssX, ph >> ssY);
+            padV = PadPlane(v, cwIn, chIn, pw >> ssX, ph >> ssY);
+        }
+        byte[] tile = Av1LosslessEncoder.EncodeTiles(padY, padU, padV, pw, bw4, bh4, sbCols, sbRows,
+            monochrome ? Av1PixelLayout.I400 : layout, bitDepth, UseIntraEdgeFilter);
+        var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome, enableFilterIntra: false, bitDepth: bitDepth,
+            layout: layout, color: color);
+        byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
+        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(0, isObuFrame: true, sbCols, sbRows, monochrome,
+            txModeSelect: false, Av1ObuWriter.CdefParams.None, 0, screenContentTools: false, reducedTxSet: true);
+        var payload = new byte[frameHdr.Length + tile.Length];
+        frameHdr.CopyTo(payload, 0);
+        tile.CopyTo(payload.AsSpan(frameHdr.Length));
+        return (seqObu, Av1ObuWriter.WrapObu(Av1ObuType.Frame, payload));
+    }
+
+    /// <summary>Lossless AVIF: colour (any layout) or monochrome, plus an optional lossless alpha item.</summary>
+    internal static byte[] EncodeAvifLossless(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v,
+        bool monochrome, ReadOnlySpan<ushort> alpha, bool hasAlpha, int width, int height, int bitDepth, Av1PixelLayout layout,
+        Av1ObuWriter.Av1ColorDesc? color, AvifContainerExtras? extras)
+    {
+        (byte[] cSeq, byte[] cFrame) = BuildLosslessObus(luma, u, v, monochrome, width, height, bitDepth, layout, color);
+        if (!hasAlpha)
+            return Av1AvifWriter.BuildAvif(cSeq, cFrame, width, height, monochrome, bitDepth, layout, color, extras);
+        (byte[] aSeq, byte[] aFrame) = BuildLosslessObus(alpha, default, default, true, width, height, bitDepth, Av1PixelLayout.I400, null);
+        return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, monochrome, bitDepth, layout, color, extras);
+    }
+
     /// <summary>Encodes an I420 colour image plus an 8-bit alpha plane into a 2-item AVIF: a primary colour
     /// `av01` item and a monochrome alpha auxiliary item, linked by an `auxl` item reference. Alpha is coded as a
     /// full-range monochrome AV1 image (the standard AVIF alpha representation).</summary>
@@ -687,7 +730,7 @@ internal static class Av1StillImageEncoder
     // tile_group_obu payload after the frame header: a single tile is its bare data; with several tiles, one byte
     // for tile_start_and_end_present_flag = 0 (+ byte alignment), then every tile but the last prefixed by
     // tile_size_minus_1 as a 4-byte little-endian value (tile_size_bytes_minus_1 = 3 in tile_info).
-    private static byte[] AssembleTileGroup(List<byte[]> tiles)
+    internal static byte[] AssembleTileGroup(List<byte[]> tiles)
     {
         if (tiles.Count == 1) return tiles[0];
         var o = new System.IO.MemoryStream();
