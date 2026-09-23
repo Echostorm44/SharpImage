@@ -948,8 +948,8 @@ public static partial class HeifCoder
         foreach (var f in sequence.Frames)
             if ((int)f.Columns != w || (int)f.Rows != h)
                 throw new ArgumentException("Every frame of an AVIF sequence must have the same size.", nameof(sequence));
-        if (w > 65536 || h > 65536 || w < 8 || h < 8)
-            throw new NotSupportedException($"AVIF encoding supports 8..65536 per dimension (got {w}x{h}).");
+        if (w > 65536 || h > 65536 || w < 1 || h < 1)
+            throw new NotSupportedException($"AVIF encoding supports 1..65536 per dimension (got {w}x{h}).");
 
         int bd = options.BitDepth == 0 ? (sequence.Frames.Any(HasSubByteDetail) ? 10 : 8) : options.BitDepth;
         if (bd is not (8 or 10 or 12))
@@ -1266,9 +1266,9 @@ public static partial class HeifCoder
             if (vPl != null) vPl = LibyuvScale.ScalePlane(vPl, scw, scw, sch, dcw, dch, bd > 8);
             (w, h) = st;
         }
-        if (w > 65536 || h > 65536 || w < 8 || h < 8)
+        if (w > 65536 || h > 65536 || w < 1 || h < 1)
         {
-            throw new NotSupportedException($"AVIF encoding supports 8..65536 per dimension (got {w}x{h}).");
+            throw new NotSupportedException($"AVIF encoding supports 1..65536 per dimension (got {w}x{h}).");
         }
 
         bool hasAlpha = image.HasAlpha;
@@ -1544,15 +1544,15 @@ public static partial class HeifCoder
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
-        if (w > 65536 || h > 65536 || w < 8 || h < 8)
+        if (w > 65536 || h > 65536 || w < 1 || h < 1)
         {
-            throw new NotSupportedException($"AVIF encoding supports 8..65536 per dimension (got {w}x{h}).");
+            throw new NotSupportedException($"AVIF encoding supports 1..65536 per dimension (got {w}x{h}).");
         }
 
-        // The single-block path is a fast path for an even, square frame <=64px; the multi-superblock path (a grid
+        // The single-block path is a fast path for an even, square frame of 6..64px; the multi-superblock path (a grid
         // of 64x64 superblocks with edge force-split partitioning) handles everything else — larger, non-square,
-        // odd, or mixed small/large dimensions.
-        bool multiSb = w > 64 || h > 64 || w != h || (w & 1) != 0 || (h & 1) != 0;
+        // odd, tiny (down to 1x1, as libavif), or mixed small/large dimensions.
+        bool multiSb = w > 64 || h > 64 || w != h || (w & 1) != 0 || (h & 1) != 0 || w < 5;
 
         int channels = image.NumberOfChannels;
         bool hasAlpha = image.HasAlpha;

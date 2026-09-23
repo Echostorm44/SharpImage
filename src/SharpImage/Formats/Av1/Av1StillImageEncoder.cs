@@ -2602,9 +2602,9 @@ internal static class Av1StillImageEncoder
     // in-frame remainder must exceed 32px), i.e. a dimension's remainder mod 64 is 0 or >32.
     private static void ValidateMultiSb(int w, int h, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph)
     {
-        if (w < 8 || h < 8 || w > 65536 || h > 65536)
+        if (w < 1 || h < 1 || w > 65536 || h > 65536)
         {
-            throw new NotSupportedException($"AVIF encode supports 8..65536 per dimension (got {w}x{h}).");
+            throw new NotSupportedException($"AVIF encode supports 1..65536 per dimension (got {w}x{h}).");
         }
 
         // Frame dims in 4-unit MI units: MiCols = 2*ceil(w/8) (always even), matching dav1d's f->bw. Using ceil(w/4)

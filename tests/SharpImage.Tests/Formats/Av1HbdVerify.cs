@@ -899,6 +899,75 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(dir, "gmenc_manifest.txt"), log.ToString());
     }
 
+    // Tiny-image probe (trigger hbd_tiny.txt naming a scratch subdir): encodes sizes below 8 px (and odd small ones) in
+    // every mode, writing name.avif + our RGBA decode (name.ours.rgba64, 16-bit) for comparison with avifdec.
+    [Test, NotInParallel]
+    public void TinyProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_tiny.txt");
+        if (!File.Exists(trig)) return;
+        string dir = Path.Combine(Scratch, File.ReadAllText(trig).Trim());
+        File.Delete(trig);
+        Directory.CreateDirectory(dir);
+        var log = new System.Text.StringBuilder();
+        var sizes = new[] { (1, 1), (1, 2), (2, 1), (2, 2), (3, 5), (4, 4), (5, 3), (7, 7), (1, 9), (9, 1), (6, 13), (15, 2), (8, 8), (12, 4) };
+        var configs = new (string Name, AvifEncodeOptions Opt, bool Alpha, bool Gray)[]
+        {
+            ("q420", new AvifEncodeOptions { Qp = 20 }, false, false),
+            ("q444", new AvifEncodeOptions { Qp = 20, ChromaSubsampling = AvifChromaSubsampling.Yuv444 }, false, false),
+            ("q422", new AvifEncodeOptions { Qp = 20, ChromaSubsampling = AvifChromaSubsampling.Yuv422 }, false, false),
+            ("d10", new AvifEncodeOptions { Qp = 20, BitDepth = 10 }, false, false),
+            ("d12", new AvifEncodeOptions { Qp = 20, BitDepth = 12, ChromaSubsampling = AvifChromaSubsampling.Yuv444 }, false, false),
+            ("gray", new AvifEncodeOptions { Qp = 20 }, false, true),
+            ("alpha", new AvifEncodeOptions { Qp = 20 }, true, false),
+            ("ll8", new AvifEncodeOptions { Lossless = true }, false, false),
+            ("ll10", new AvifEncodeOptions { Lossless = true, BitDepth = 10 }, true, false),
+        };
+        foreach (var (w, h) in sizes)
+            foreach (var (name, opt, alpha, gray) in configs)
+            {
+                string stem = $"{name}_{w}x{h}";
+                try
+                {
+                    var f = new ImageFrame();
+                    f.Initialize(w, h, ColorspaceType.SRGB, alpha);
+                    int ch = f.NumberOfChannels;
+                    for (int y = 0; y < h; y++)
+                    {
+                        var row = f.GetPixelRowForWrite(y);
+                        for (int x = 0; x < w; x++)
+                        {
+                            int v = (x * 37 + y * 91 + 13) % 256;
+                            row[x * ch] = (ushort)(v * 257);
+                            row[x * ch + 1] = (ushort)((gray ? v : (255 - v)) * 257);
+                            row[x * ch + 2] = (ushort)((gray ? v : (v * 3) % 256) * 257);
+                            if (alpha) row[x * ch + 3] = (ushort)(((x + y) * 50 + 30) % 256 * 257);
+                        }
+                    }
+                    byte[] avif = HeifCoder.EncodeAvif(f, opt);
+                    File.WriteAllBytes(Path.Combine(dir, stem + ".avif"), avif);
+                    var d = HeifCoder.Decode(avif);
+                    int dch = d.NumberOfChannels;
+                    var buf = new byte[w * h * 8];
+                    for (int y = 0; y < h; y++)
+                    {
+                        var row = d.GetPixelRow(y);
+                        for (int x = 0; x < w; x++)
+                            for (int k = 0; k < 4; k++)
+                            {
+                                ushort v = k < 3 ? row[x * dch + Math.Min(k, dch - 1 - (d.HasAlpha ? 1 : 0))] : d.HasAlpha ? row[x * dch + dch - 1] : (ushort)65535;
+                                buf[(y * w + x) * 8 + k * 2] = (byte)v;
+                                buf[(y * w + x) * 8 + k * 2 + 1] = (byte)(v >> 8);
+                            }
+                    }
+                    File.WriteAllBytes(Path.Combine(dir, stem + ".ours.rgba64"), buf);
+                    log.AppendLine($"{stem} ok {avif.Length}");
+                }
+                catch (Exception e) { log.AppendLine($"{stem} ERROR {e.GetType().Name}: {e.Message} @ {e.StackTrace?.Split('\n').FirstOrDefault()?.Trim()}"); }
+            }
+        File.WriteAllText(Path.Combine(dir, "manifest.txt"), log.ToString());
+    }
+
     // Tone map probe (trigger hbd_tm.txt: lines "file|headroom|outName[|cp/tc|depth]"): HeifCoder.DecodeToneMapped, the
     // result dumped as outName.rgb16 (planar-free little-endian u16 RGB at native depth) + "outName WxH depth cp/tc clli".
     [Test, NotInParallel]
