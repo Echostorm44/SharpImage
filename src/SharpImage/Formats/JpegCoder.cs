@@ -75,9 +75,11 @@ public sealed class JpegDctComponent
 }
 
 /// <summary>
-/// Pure C# JPEG reader/writer (ITU-T T.81 / ISO 10918-1). Supports: SOF0 baseline DCT, SOF2 progressive DCT,
-/// Huffman coding, YCbCr/grayscale, 4:4:4/4:2:2/4:2:0 subsampling, optimized Huffman tables.
-/// Does not support: arithmetic coding, lossless, JPEG2000.
+/// Pure C# JPEG reader/writer (ITU-T T.81 / ISO 10918-1). Reading decodes everything libjpeg-turbo 3.1 does,
+/// pixel-identically: baseline / extended / progressive DCT at 8 or 12 bits with Huffman or arithmetic coding,
+/// lossless (SOF3, 2..16 bits), greyscale / YCbCr / RGB / CMYK / YCCK, any integral sampling. Writing: baseline and
+/// progressive 8-bit Huffman, YCbCr / greyscale, 4:4:4 / 4:2:2 / 4:2:0, optimized Huffman tables.
+/// Not supported (as in libjpeg-turbo): hierarchical and arithmetic-lossless files, JPEG 2000 / XL.
 /// </summary>
 public static partial class JpegCoder
 {
@@ -117,9 +119,10 @@ public static partial class JpegCoder
     }
 
     /// <summary>
-    /// Decodes a JPEG as libjpeg-turbo does by default (accurate integer IDCT, fancy chroma upsampling, fixed-point
-    /// YCbCr -> RGB), so the pixels are identical to djpeg / Pillow / browsers built on it. Files that path does not
-    /// cover (CMYK / YCCK, unusual sampling) use the general decoder.
+    /// Decodes a JPEG as libjpeg-turbo 3.1 does by default (accurate integer IDCT, fancy chroma upsampling, fixed-point
+    /// colour conversion), so the pixels are identical to djpeg / Pillow / browsers built on it: baseline, extended and
+    /// progressive files with Huffman or arithmetic coding at 8 or 12 bits, lossless files (2..16 bits), grey / YCbCr /
+    /// RGB and CMYK / YCCK (returned as CMYK). Files libjpeg-turbo does not decode fall back to the general decoder.
     /// </summary>
     public static ImageFrame Read(Stream stream)
     {
@@ -129,7 +132,7 @@ public static partial class JpegCoder
             stream.CopyTo(ms);
             data = ms.ToArray();
         }
-        var frame = data.Length >= 4 && data[0] == 0xFF && data[1] == SOI ? ReadLibjpegRgb(data) : null;
+        var frame = data.Length >= 4 && data[0] == 0xFF && data[1] == SOI ? ReadLibjpegExact(data) : null;
         if (frame == null) return ReadGeneral(new MemoryStream(data));
 
         byte[]? exifData = null, iptcData = null;

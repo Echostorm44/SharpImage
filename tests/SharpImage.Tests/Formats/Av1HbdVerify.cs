@@ -1623,6 +1623,20 @@ public sealed class Av1HbdVerify
                     }
                     continue;
                 }
+                if (t[0] == "jraw")
+                {
+                    // jraw <in.jpg> <out>: our JPEG decode as a "w h channels colorspace" line + 16-bit LE samples (all channels).
+                    using var fr = JpegCoder.Read(t[1]);
+                    using var fo = File.Create(t[2]);
+                    int nch = fr.NumberOfChannels;
+                    fo.Write(System.Text.Encoding.ASCII.GetBytes($"{fr.Columns} {fr.Rows} {nch} {fr.Colorspace}" + "\n"));
+                    for (int y = 0; y < (int)fr.Rows; y++)
+                    {
+                        var row = fr.GetPixelRow(y);
+                        for (int k = 0; k < (int)fr.Columns * nch; k++) { fo.WriteByte((byte)row[k]); fo.WriteByte((byte)(row[k] >> 8)); }
+                    }
+                    continue;
+                }
                 if (t[0] == "obuq")
                 {
                     // obuq <stream.obu> <sizes>: every frame's base_q_idx (hidden frames too; 's' shown, 'h' hidden,

@@ -52,4 +52,39 @@ public sealed class JpegLibjpegParityTests
         var img = JpegCoder.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", asset));
         await Assert.That(Hash8(img)).IsEqualTo(sha16);
     }
+
+    // The formats libjpeg-turbo 3.1 decodes beyond 8-bit Huffman DCT: CMYK / YCCK (Adobe APP14 inverted samples come
+    // back as ink amounts in a CMYK frame), 12-bit DCT, lossless (SOF3: precisions 6 / 12 / 16, predictors, point
+    // transform) and arithmetic coding (SOF9 / SOF10, restarts). Expected: SHA-256 of the 16-bit samples of every
+    // channel, from libjpeg-turbo's raw output (the dev harness ljdump) scaled v * 65535 / max rounded. The dev harness
+    // matched all 519 files of a cjpeg / libjpeg-made corpus (sizes 1x1..67x45, all samplings, predictors 1-7).
+    private static string Hash16(ImageFrame f)
+    {
+        int w = (int)f.Columns, h = (int)f.Rows, n = f.NumberOfChannels;
+        var buf = new byte[w * h * n * 2];
+        for (int y = 0; y < h; y++)
+        {
+            var row = f.GetPixelRow(y);
+            for (int k = 0; k < w * n; k++) { buf[(y * w * n + k) * 2] = (byte)row[k]; buf[(y * w * n + k) * 2 + 1] = (byte)(row[k] >> 8); }
+        }
+        return Convert.ToHexStringLower(SHA256.HashData(buf))[..16];
+    }
+
+    [Test]
+    [Arguments("jpeg_libjpeg/ljt_ycck_prog.jpg", "e34b32216aacd353")]
+    [Arguments("jpeg_libjpeg/ljt_cmyk_arith.jpg", "f06fe4463056dada")]
+    [Arguments("jpeg_libjpeg/ljt_cmyk_noadobe.jpg", "82c408362031476f")]
+    [Arguments("jpeg_libjpeg/ljt_p12_420.jpg", "2ecf50e1a37c8242")]
+    [Arguments("jpeg_libjpeg/ljt_p12_arith_prog.jpg", "2ecf50e1a37c8242")]
+    [Arguments("jpeg_libjpeg/ljt_ll16_psv7.jpg", "3cbaa7c08b851920")]
+    [Arguments("jpeg_libjpeg/ljt_ll6_psv4_pt1.jpg", "6eb9265703f9fae0")]
+    [Arguments("jpeg_libjpeg/ljt_ll12_psv5.jpg", "d7f8e8aeca0faef5")]
+    [Arguments("jpeg_libjpeg/ljt_arith_prog.jpg", "26262238397e96b1")]
+    [Arguments("jpeg_libjpeg/ljt_arith_rst.jpg", "26262238397e96b1")]
+    public async Task Read_ExtendedFormats_MatchLibjpegTurbo(string asset, string sha16)
+    {
+        var img = JpegCoder.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", asset));
+        await Assert.That(img.Colorspace).IsEqualTo(asset.Contains("cmyk") || asset.Contains("ycck") ? ColorspaceType.CMYK : ColorspaceType.SRGB);
+        await Assert.That(Hash16(img)).IsEqualTo(sha16);
+    }
 }
