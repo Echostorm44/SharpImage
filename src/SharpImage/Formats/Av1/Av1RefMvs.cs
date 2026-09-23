@@ -632,7 +632,7 @@ public static class Av1RefMvs
             int leftRowBase = (by4 & 31) + 5;
             bLeft = new Av1RefMvsBlock[h4][];
             for (int i = 0; i < h4; i++)
-                bLeft[i] = rt.R[leftRowBase + i];
+                bLeft[i] = leftRowBase + i < rt.R.Length ? rt.R[leftRowBase + i] : null;   // scan_col reads lazily; rows past the window are never reached
             if (bx4 == 8 && by4 == 8)
             {
                 AvDbg.W($"[OUR-LSCAN] h4={h4} maxCols={maxCols} step={(bh4 >= 16 ? 4 : 1)} row13null={bLeft[0] == null} row14null={(h4 > 1 && bLeft[1] == null)}");
@@ -750,7 +750,7 @@ public static class Av1RefMvs
                 int leftRowBase = ((by4 & 31) | 1) + 5;
                 var secLeft = new Av1RefMvsBlock[h4][];
                 for (int i = 0; i < h4; i++)
-                    secLeft[i] = rt.R[leftRowBase + i];
+                    secLeft[i] = leftRowBase + i < rt.R.Length ? rt.R[leftRowBase + i] : null;
                 nCols = (nCols < 0 ? 0 : nCols) + ScanCol(mvstack, ref cnt, refPair, gmv,
                     secLeft, bh4, h4, (bx4 - n * 2 + 1) | 1,
                     1 + maxCols - n, bh4 >= 16 ? 4 : 2,

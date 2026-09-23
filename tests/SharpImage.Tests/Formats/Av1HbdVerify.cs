@@ -678,6 +678,85 @@ public sealed class Av1HbdVerify
         }
     }
 
+    // Progressive decode probe (trigger hbd_prog.txt): HeifCoder.DecodeProgressive on every prog/*.avif, each layer
+    // dumped as raw 16-bit RGBA (name_Li.ours.rgba64, little-endian) with a manifest "name layers WxH".
+    [Test, NotInParallel]
+    public void ProgressiveDecode()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_prog.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string dir = Path.Combine(Scratch, "prog");
+        var log = new System.Text.StringBuilder();
+        foreach (var file in Directory.GetFiles(dir, "*.avif"))
+        {
+            string name = Path.GetFileNameWithoutExtension(file);
+            try
+            {
+                var layers = HeifCoder.DecodeProgressive(File.ReadAllBytes(file));
+                for (int i = 0; i < layers.Count; i++)
+                {
+                    var f = layers[i];
+                    int w = (int)f.Columns, h = (int)f.Rows, ch = f.NumberOfChannels;
+                    var buf = new byte[w * h * 8];
+                    for (int y = 0; y < h; y++)
+                    {
+                        var row = f.GetPixelRow(y);
+                        for (int x = 0; x < w; x++)
+                            for (int k = 0; k < 4; k++)
+                            {
+                                ushort v = k < 3 ? row[x * ch + Math.Min(k, ch - 1 - (f.HasAlpha ? 1 : 0))] : f.HasAlpha ? row[x * ch + ch - 1] : (ushort)65535;
+                                buf[(y * w + x) * 8 + k * 2] = (byte)v;
+                                buf[(y * w + x) * 8 + k * 2 + 1] = (byte)(v >> 8);
+                            }
+                    }
+                    File.WriteAllBytes(Path.Combine(dir, $"{name}_L{i}.ours.rgba64"), buf);
+                }
+                log.AppendLine($"{name} {layers.Count} {layers[0].Columns}x{layers[0].Rows}");
+            }
+            catch (Exception e) { log.AppendLine($"{name} ERROR {e.GetType().Name}: {e.Message}"); }
+        }
+        File.WriteAllText(Path.Combine(dir, "manifest.txt"), log.ToString());
+    }
+
+    // Layered-stream probe (trigger hbd_layers.txt holding an .avif path): decodes the primary item's payload and writes
+    // the outcome / full exception to layers.txt.
+    [Test, NotInParallel]
+    public void LayersProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_layers.txt");
+        if (!File.Exists(trig)) return;
+        var parts = File.ReadAllText(trig).Trim().Split('|');
+        string file = parts[0];
+        int? itemId = parts.Length > 1 ? int.Parse(parts[1]) : null;
+        File.Delete(trig);
+        var log = new System.Text.StringBuilder();
+        try
+        {
+            var box = HeifContainer.Parse(File.ReadAllBytes(file));
+            var dec = new Av1Decoder();
+            Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(Scratch, "layers_ours.yuv"));
+            using var trace = new StreamWriter(Path.Combine(Scratch, "trace_ours.txt"));
+            Av1Decode.BlockTrace = trace;
+            using var f = dec.Decode(box.ItemData(itemId ?? box.PrimaryId)!, 0, true);
+            Av1Decode.BlockTrace = null;
+            Environment.SetEnvironmentVariable("AV1_DUMP10", null);
+            log.AppendLine(f == null ? "null frame" : $"frame {f.Width}x{f.Height}");
+        }
+        catch (Exception e) { log.AppendLine(e.ToString()); }
+        log.AppendLine("last error: " + Av1Decoder.LastDecodeError);
+        try
+        {
+            var box = HeifContainer.Parse(File.ReadAllBytes(file));
+            var dec = new Av1Decoder();
+            var frames = dec.DecodeTemporalUnit(box.ItemData(itemId ?? box.PrimaryId)!, 0);
+            var fh = dec.CurrentFrameHeader;
+            log.AppendLine($"frames={frames.Count} last hdr: type={fh.FrameType} sid={fh.SpatialId} coded={fh.CodedWidth}x{fh.Height} upscaled={fh.SuperResUpscaledWidth} render={fh.RenderWidth}x{fh.RenderHeight} tiles={fh.TileCols}x{fh.TileRows} nbytes={fh.TileNBytes} showFrame={fh.ShowFrame} primRef={fh.PrimaryRefFrame} q={fh.QuantBaseQIdx} lr={fh.GetLrType(0)},{fh.GetLrType(1)},{fh.GetLrType(2)} cdefBits={fh.CdefNBits} uvStr0={fh.GetCdefUvStrength(0)}");
+        }
+        catch (Exception e) { log.AppendLine("hdr probe: " + e.Message); }
+        File.WriteAllText(Path.Combine(Scratch, "layers.txt"), log.ToString());
+    }
+
     // Isolates in-loop-filter conformance at odd picture edges: encodes odd-size gradients at q28 with deblock only,
     // CDEF only, both, and neither (trigger hbd_edge.txt), dumping .avif + our native planes for the ffmpeg diff.
     [Test, NotInParallel]

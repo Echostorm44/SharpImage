@@ -1508,8 +1508,8 @@ public static class Av1Reconstruction
         var refPlane = refp.Planes[pl];
         int refStride = refp.Strides[pl];
 
-        // Same-size path (no scaling)
-        if (refp.Width == (ctx.FrameHeader!.SuperResUpscaledWidth) &&
+        // Same-size path (no scaling): dav1d compares the reference picture with the current (pre-superres) frame.
+        if (refp.Width == ctx.FrameHeader!.CodedWidth &&
             refp.Height == ctx.FrameHeader.Height)
         {
             int dx = bx * hMul + (mvx >> (3 + ssHor));
@@ -1572,22 +1572,30 @@ public static class Av1Reconstruction
                         AvDbg.W(line);
                     }
                 }
-                Av1MotionComp.Put8Tap(
-                    dstByte, dstStride,
-                    refSrc, refSrcStride,
-                    blockW, blockH,
-                    mx << (ssHor == 0 ? 1 : 0), my << (ssVer == 0 ? 1 : 0),
-                    filter2d);
+                if (filter2d == (int)Av1Filter2d.Bilinear)
+                    Av1MotionComp.PutBilin(dstByte, dstStride, refSrc.Slice(3 * refSrcStride + 3), refSrcStride,
+                        blockW, blockH, mx << (ssHor == 0 ? 1 : 0), my << (ssVer == 0 ? 1 : 0));
+                else
+                    Av1MotionComp.Put8Tap(
+                        dstByte, dstStride,
+                        refSrc, refSrcStride,
+                        blockW, blockH,
+                        mx << (ssHor == 0 ? 1 : 0), my << (ssVer == 0 ? 1 : 0),
+                        Av1MotionComp.PackedFilterType(filter2d));
             }
             else
             {
                 // Prep path — intermediate values for compound
-                Av1MotionComp.Prep8Tap(
-                    dstShort,
-                    refSrc, refSrcStride,
-                    blockW, blockH,
-                    mx << (ssHor == 0 ? 1 : 0), my << (ssVer == 0 ? 1 : 0),
-                    filter2d);
+                if (filter2d == (int)Av1Filter2d.Bilinear)
+                    Av1MotionComp.PrepBilin(dstShort, refSrc.Slice(3 * refSrcStride + 3), refSrcStride,
+                        blockW, blockH, mx << (ssHor == 0 ? 1 : 0), my << (ssVer == 0 ? 1 : 0));
+                else
+                    Av1MotionComp.Prep8Tap(
+                        dstShort,
+                        refSrc, refSrcStride,
+                        blockW, blockH,
+                        mx << (ssHor == 0 ? 1 : 0), my << (ssVer == 0 ? 1 : 0),
+                        Av1MotionComp.PackedFilterType(filter2d));
             }
         }
         else
@@ -1616,7 +1624,7 @@ public static class Av1Reconstruction
             int h = (refp.Height + ssVer) >> ssVer;
 
             ReadOnlySpan<ushort> refSrc;
-            int refSrcStride;
+            int refSrcStride, org;
 
             if (left < 3 || top < 3 || right + 4 > w || bottom + 4 > h)
             {
@@ -1625,27 +1633,20 @@ public static class Av1Reconstruction
                     w, h, left - 3, top - 3,
                     t.EmuEdgeBuf, 320,
                     refPlane!, refStride);
-                refSrc = t.EmuEdgeBuf.AsSpan(320 * 3 + 3);
+                refSrc = t.EmuEdgeBuf;
                 refSrcStride = 320;
+                org = 320 * 3 + 3;
             }
             else
             {
-                refSrc = refPlane.AsSpan(refStride * top + left);
+                refSrc = refPlane;
                 refSrcStride = refStride;
+                org = refStride * top + left;
             }
 
-            // TODO: Scaled MC (mc_scaled / mct_scaled) — not yet implemented in Av1MotionComp
-            // For now, fall back to unscaled MC with position fractional bits
-            if (!dstByte.IsEmpty)
-            {
-                Av1MotionComp.Put8Tap(dstByte, dstStride, refSrc, refSrcStride,
-                    blockW, blockH, posX & 0x3ff, posY & 0x3ff, filter2d);
-            }
-            else
-            {
-                Av1MotionComp.Prep8Tap(dstShort, refSrc, refSrcStride,
-                    blockW, blockH, posX & 0x3ff, posY & 0x3ff, filter2d);
-            }
+            // dav1d mc_scaled / mct_scaled: per-pixel 1/1024 stepping with svc step sizes.
+            Av1MotionComp.McScaled(dstByte, dstStride, dstShort, refSrc, org, refSrcStride,
+                blockW, blockH, posX & 0x3ff, posY & 0x3ff, stepX, stepY, filter2d);
         }
     }
 

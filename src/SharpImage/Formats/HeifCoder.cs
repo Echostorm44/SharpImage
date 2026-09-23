@@ -213,7 +213,61 @@ public static class HeifCoder
         return false;
     }
 
-    public static ImageFrame Decode(byte[] data)
+    public static ImageFrame Decode(byte[] data) => DecodeCore(data);
+
+    /// <summary>
+    /// Progressive / layered AVIF (libavif allowProgressive): one image per layer of the primary item, from the coarsest
+    /// preview to the final image, each scaled to the full output size as libavif does. Items without layers ('a1lx'
+    /// with no specific 'lsel' layer) give a single image, identical to <see cref="Decode"/>.
+    /// </summary>
+    public static IReadOnlyList<ImageFrame> DecodeProgressive(byte[] data)
+    {
+        if (!CanDecode(data)) throw new InvalidDataException("Not a valid AVIF/HEIC file");
+        var c = HeifContainer.Parse(data);
+        int layers = c.Primary is { } p ? ProgressiveLayerCount(c, p.Type == "grid" ? c.ReferencesFrom(p.Id, "dimg").FirstOrDefault() : p.Id) : 0;
+        if (layers <= 1) return [DecodeCore(data)];
+        var result = new List<ImageFrame>(layers);
+        for (int i = 0; i < layers; i++)
+        {
+            t_progressiveLayer = i;
+            try { result.Add(DecodeCore(data)); }
+            finally { t_progressiveLayer = -1; }
+        }
+        return result;
+    }
+
+    // The layer being produced by DecodeProgressive (-1: the default, final image).
+    [ThreadStatic] private static int t_progressiveLayer = -1;
+
+    // libavif avifCodecDecodeInputFillFromDecoderItem: an item is progressive when it has 'a1lx' and no 'lsel' selecting
+    // a specific layer; its layer count follows from the a1lx sizes (a zero size ends the list; a remainder is the last).
+    private static int ProgressiveLayerCount(HeifContainer c, int id)
+    {
+        if (c.Property(id, "a1lx") is not { } ax) return 0;
+        if (c.Property(id, "lsel") is { } ls && BinaryPrimitives.ReadUInt16BigEndian(c.Data.AsSpan(ls.Off + 0)) != 0xFFFF) return 0;
+        var sizes = A1lxSizes(c, id, ax);
+        return sizes.Count;
+    }
+
+    private static List<long> A1lxSizes(HeifContainer c, int id, (int Off, int Len, bool Essential) ax)
+    {
+        var d = c.Data.AsSpan(ax.Off, ax.Len);
+        bool large = (d[0] & 1) != 0;
+        long remaining = c.ItemData(id)?.Length ?? 0;
+        var sizes = new List<long>();
+        for (int i = 0; i < 3; i++)
+        {
+            long s = large ? BinaryPrimitives.ReadUInt32BigEndian(d.Slice(1 + 4 * i)) : BinaryPrimitives.ReadUInt16BigEndian(d.Slice(1 + 2 * i));
+            if (s == 0) { sizes.Add(remaining); remaining = 0; break; }
+            if (s >= remaining) throw new InvalidDataException("a1lx layer size does not fit in the item.");
+            sizes.Add(s);
+            remaining -= s;
+        }
+        if (remaining > 0) sizes.Add(remaining);
+        return sizes;
+    }
+
+    private static ImageFrame DecodeCore(byte[] data)
     {
         if (!CanDecode(data))
         {
@@ -366,9 +420,8 @@ public static class HeifCoder
             Av1.Av1Decoder? first = null;
             foreach (int id in tiles)
             {
-                var dec = new Av1.Av1Decoder();
                 byte[] coded = c.ItemData(id) ?? throw new InvalidDataException($"Grid tile {id} has no data.");
-                yuvs.Add(dec.Decode(coded, 0, isKeyframe: true) ?? throw new InvalidDataException($"Grid tile {id} did not decode. " + FirstLine(Av1.Av1Decoder.LastDecodeError)));
+                yuvs.Add(DecodeAv1Item(c, id, coded, out var dec, $"Grid tile {id}"));
                 first ??= dec;
             }
             var f0 = yuvs[0];
@@ -477,7 +530,7 @@ public static class HeifCoder
         f.Initialize(w, h, ColorspaceType.SRGB, false);
         if (codec == "av01")
         {
-            DecodeAv1IntraFrame(coded, f, nclx, premAlpha);
+            DecodeAv1IntraFrame(coded, f, nclx, premAlpha, c, id);
         }
         else
         {
@@ -502,7 +555,7 @@ public static class HeifCoder
             else InferAv1Dimensions(coded, out w, out h);
             var af = new ImageFrame();
             af.Initialize(w, h, ColorspaceType.SRGB, false);
-            ApplyAv1Alpha(coded, af, w, h);
+            ApplyAv1Alpha(coded, af, w, h, c, aTiles[i]);
             if (!frame.HasAlpha) frame.SetAlpha(true);
             Blit(af, frame, (i % cols) * w, (i / cols) * h, alphaOnly: true);
         }
@@ -1183,10 +1236,9 @@ public static class HeifCoder
 
     // Decodes a monochrome AV1 alpha auxiliary item and writes its luma samples into the frame's alpha channel
     // (enabling alpha if needed). Full-range 8-bit is the standard AVIF alpha representation.
-    private static void ApplyAv1Alpha(ReadOnlySpan<byte> codedData, ImageFrame frame, int w, int h)
+    private static void ApplyAv1Alpha(ReadOnlySpan<byte> codedData, ImageFrame frame, int w, int h, HeifContainer? c = null, int id = 0)
     {
-        var decoder = new Av1.Av1Decoder();
-        using var yuv = decoder.Decode(codedData, 0, isKeyframe: true) ?? throw new InvalidDataException("AV1 alpha decode produced no frame. " + FirstLine(Av1.Av1Decoder.LastDecodeError));
+        using var yuv = DecodeAv1Item(c, id, codedData, out var decoder, "AV1 alpha");
         if (!decoder.FullColorRange)
         {
             ApplyAv1AlphaLimited(yuv, frame, w, h);
@@ -1253,14 +1305,11 @@ public static class HeifCoder
     }
 
     private static void DecodeAv1IntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame, (int Cp, int Tc, int Mc, bool Full)? nclx,
-        ushort[]? premAlpha = null)
+        ushort[]? premAlpha = null, HeifContainer? c = null, int id = 0)
     {
-        // Decode the AV1 keyframe with the vendored AV1 intra decoder (pixel-exact vs dav1d),
-        // then convert its YUV planes to RGB. AVIF stores the whole temporal unit (sequence
-        // header + frame OBUs) in the item's coded data.
-        var decoder = new Av1.Av1Decoder();
-        using var yuv = decoder.Decode(codedData, 0, isKeyframe: true)
-            ?? throw new InvalidDataException("AV1 decode produced no frame. " + FirstLine(Av1.Av1Decoder.LastDecodeError));
+        // Decode the AV1 item with the vendored decoder (pixel-exact vs dav1d), then convert its YUV planes to RGB. AVIF
+        // stores the whole temporal unit (sequence header + frame OBUs, possibly several layers) in the item's data.
+        using var yuv = DecodeAv1Item(c, id, codedData, out var decoder, "AV1");
 
         var cicp = nclx ?? (decoder.ColorPrimaries, decoder.TransferCharacteristics, decoder.MatrixCoefficients, decoder.FullColorRange);
         frame.Metadata.Cicp = new SharpImage.Metadata.CicpInfo(cicp.Cp, cicp.Tc, cicp.Mc, cicp.Full);
@@ -1555,12 +1604,90 @@ public static class HeifCoder
         }
     }
 
+    /// <summary>
+    /// Decodes an AV1 item the way libavif does: the 'a1op' operating point; a layer chosen by 'lsel' (or by
+    /// DecodeProgressive for a progressive item), else the temporal unit's top spatial layer; and finally the image is
+    /// scaled to the item's 'ispe' size when the coded frame differs (avifImageScaleWithLimit / libyuv kFilterBox).
+    /// </summary>
+    private static Av1.DecodedVideoFrame DecodeAv1Item(HeifContainer? c, int id, ReadOnlySpan<byte> coded, out Av1.Av1Decoder decoder, string what)
+    {
+        decoder = new Av1.Av1Decoder();
+        int layer = -1;
+        bool byIndex = false;
+        if (c != null)
+        {
+            if (c.Property(id, "a1op") is { } op) decoder.OperatingPoint = c.Data[op.Off + 0];
+            if (c.Property(id, "lsel") is { } ls && BinaryPrimitives.ReadUInt16BigEndian(c.Data.AsSpan(ls.Off)) is var lid && lid != 0xFFFF)
+                layer = lid;
+            else if (t_progressiveLayer >= 0 && ProgressiveLayerCount(c, id) > 1) { layer = t_progressiveLayer; byIndex = true; }
+        }
+        Av1.DecodedVideoFrame? yuv;
+        if (layer < 0) yuv = decoder.Decode(coded, 0, isKeyframe: true);
+        else
+        {
+            // All layers are decoded; the requested one is kept (libavif: all_layers + spatial id / sample index).
+            var frames = decoder.DecodeTemporalUnit(coded, 0);
+            int pick = -1;
+            for (int k = 0; k < frames.Count && pick < 0; k++)
+                if (byIndex ? k == layer : frames[k].SpatialId == layer) pick = k;
+            if (byIndex && pick < 0 && frames.Count > 0) pick = frames.Count - 1;
+            for (int k = 0; k < frames.Count; k++) if (k != pick) frames[k].Frame.Dispose();
+            yuv = pick >= 0 ? frames[pick].Frame : null;
+        }
+        if (yuv == null) throw new InvalidDataException($"{what} decode produced no frame. " + FirstLine(Av1.Av1Decoder.LastDecodeError));
+        if (c?.Ispe(id) is { } ispe && (ispe.W != yuv.Width || ispe.H != yuv.Height))
+        {
+            var scaled = ScaleDecodedFrame(yuv, ispe.W, ispe.H);
+            yuv.Dispose();
+            yuv = scaled;
+        }
+        return yuv;
+    }
+
+    // Per-plane libyuv scaling of a decoded frame (8-bit ScalePlane or ScalePlane_12, kFilterBox), as libavif scales an
+    // image whose coded size is not its item's output size.
+    private static Av1.DecodedVideoFrame ScaleDecodedFrame(Av1.DecodedVideoFrame f, int w, int h)
+    {
+        int ssx = f.Format == Av1.PixelFormat.Yuv444P ? 0 : 1, ssy = f.Format == Av1.PixelFormat.Yuv420P ? 1 : 0;
+        bool hbd = f.BitDepth > 8;
+        int scw = (f.Width + ssx) >> ssx, sch = (f.Height + ssy) >> ssy;
+        int dcw = (w + ssx) >> ssx, dch = (h + ssy) >> ssy;
+        ushort[] Src(ReadOnlyMemory<byte> p8, ReadOnlyMemory<ushort> p16, int stride, int pw, int ph)
+        {
+            if (hbd) return p16.Span.ToArray();
+            var a = new ushort[stride * ph];
+            var s = p8.Span;
+            for (int i = 0; i < a.Length && i < s.Length; i++) a[i] = s[i];
+            return a;
+        }
+        var y = LibyuvScale.ScalePlane(Src(f.YPlane, f.YPlane16, f.YStride, f.Width, f.Height), f.YStride, f.Width, f.Height, w, h, hbd);
+        var u = LibyuvScale.ScalePlane(Src(f.UPlane, f.UPlane16, f.UStride, scw, sch), f.UStride, scw, sch, dcw, dch, hbd);
+        var v = LibyuvScale.ScalePlane(Src(f.VPlane, f.VPlane16, f.VStride, scw, sch), f.VStride, scw, sch, dcw, dch, hbd);
+        int ySize = w * h, cSize = dcw * dch;
+        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(ySize + 2 * cSize);
+        int bdShift = f.BitDepth - 8, bdRound = bdShift > 0 ? 1 << (bdShift - 1) : 0;
+        void Put8(ushort[] p, int off) { for (int i = 0; i < p.Length; i++) buf[off + i] = (byte)Math.Min(255, (p[i] + bdRound) >> bdShift); }
+        Put8(y, 0); Put8(u, ySize); Put8(v, ySize + cSize);
+        ReadOnlyMemory<ushort> y16 = default, u16 = default, v16 = default;
+        if (hbd)
+        {
+            var native = new ushort[ySize + 2 * cSize];
+            y.CopyTo(native, 0); u.CopyTo(native, ySize); v.CopyTo(native, ySize + cSize);
+            y16 = new ReadOnlyMemory<ushort>(native, 0, ySize);
+            u16 = new ReadOnlyMemory<ushort>(native, ySize, cSize);
+            v16 = new ReadOnlyMemory<ushort>(native, ySize + cSize, cSize);
+        }
+        return new Av1.DecodedVideoFrame(w, h, f.Format, f.PresentationTimeTicks, buf, 0, w, ySize, dcw, ySize + cSize, dcw)
+        {
+            BitDepth = f.BitDepth, YPlane16 = y16, UPlane16 = u16, VPlane16 = v16,
+        };
+    }
+
     // The alpha item's samples at their native depth (studio range expanded to full, as ApplyAv1Alpha does).
     private static ushort[] DecodeAlphaNative(HeifContainer c, int id)
     {
         byte[] coded = c.ItemData(id) ?? throw new InvalidDataException($"Alpha item {id} has no data.");
-        var decoder = new Av1.Av1Decoder();
-        using var yuv = decoder.Decode(coded, 0, isKeyframe: true) ?? throw new InvalidDataException("AV1 alpha decode produced no frame. " + FirstLine(Av1.Av1Decoder.LastDecodeError));
+        using var yuv = DecodeAv1Item(c, id, coded, out var decoder, "AV1 alpha");
         int w = yuv.Width, h = yuv.Height, bd = yuv.BitDepth, max = (1 << bd) - 1, lo = 16 << (bd - 8), hi = 235 << (bd - 8);
         var a = new ushort[w * h];
         for (int y = 0; y < h; y++)

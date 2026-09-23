@@ -16,9 +16,10 @@ namespace SharpImage.Formats.Av1;
 /// </summary>
 public static class Av1MotionComp
 {
-    // For 8-bit: intermediate_bits = 4, PREP_BIAS = 0
-    private const int IntermediateBits8 = 4;
-    private const int PrepBias8 = 0;
+    // dav1d get_intermediate_bits / PREP_BIAS: 4 and 0 for 8-bit; 14 - bitdepth and 8192 for 10/12-bit (keeps the
+    // compound intermediates inside int16).
+    private static int IntermediateBits8 => McBitDepth == 8 ? 4 : 14 - McBitDepth;
+    private static int PrepBias8 => McBitDepth == 8 ? 0 : 8192;
 
     // ========================================================================
     // Simple copy / prepare
@@ -109,7 +110,7 @@ public static class Av1MotionComp
         ReadOnlySpan<ushort> src, int srcStride,
         int w, int h, int mx, int my, int filterType)
     {
-        const int intermediateBits = IntermediateBits8;
+        int intermediateBits = IntermediateBits8;
         int intermediateRnd = 32 + ((1 << (6 - intermediateBits)) >> 1);
 
         int srcPad = 3 * srcStride + 3; // top-left padding offset within src
@@ -266,7 +267,7 @@ public static class Av1MotionComp
         ReadOnlySpan<ushort> src, int srcStride,
         int w, int h, int mx, int my, int filterType)
     {
-        const int intermediateBits = IntermediateBits8;
+        int intermediateBits = IntermediateBits8;
         int srcPad = 3 * srcStride + 3;
 
         GetFilters(mx, my, w, h, filterType,
@@ -401,7 +402,7 @@ public static class Av1MotionComp
         ReadOnlySpan<ushort> src, int srcStride,
         int w, int h, int mx, int my)
     {
-        const int intermediateBits = IntermediateBits8;
+        int intermediateBits = IntermediateBits8;
         int intermediateRnd = (1 << intermediateBits) >> 1;
 
         if (mx != 0)
@@ -468,7 +469,7 @@ public static class Av1MotionComp
         ReadOnlySpan<ushort> src, int srcStride,
         int w, int h, int mx, int my)
     {
-        const int intermediateBits = IntermediateBits8;
+        int intermediateBits = IntermediateBits8;
 
         if (mx != 0)
         {
@@ -540,7 +541,7 @@ public static class Av1MotionComp
         ReadOnlySpan<short> tmp1, ReadOnlySpan<short> tmp2,
         int w, int h)
     {
-        const int sh = IntermediateBits8 + 1;
+        int sh = IntermediateBits8 + 1;
         int rnd = (1 << IntermediateBits8) + PrepBias8 * 2;
         int idx = 0;
         for (int y = 0; y < h; y++)
@@ -677,7 +678,7 @@ public static class Av1MotionComp
         int w, int h, Span<byte> mask, int sign,
         int ssHor, int ssVer)
     {
-        const int intermediateBits = IntermediateBits8;
+        int intermediateBits = IntermediateBits8;
         const int bitDepth = 8;
         int sh = intermediateBits + 6;
         int rnd = (32 << intermediateBits) + PrepBias8 * 64;
@@ -731,7 +732,7 @@ public static class Av1MotionComp
         ReadOnlySpan<ushort> src, int srcStride,
         ReadOnlySpan<short> abcd, int mx, int my)
     {
-        const int intermediateBits = IntermediateBits8;
+        int intermediateBits = IntermediateBits8;
         Span<short> mid = stackalloc short[15 * 8];
         int midIdx = 0;
 
@@ -775,7 +776,7 @@ public static class Av1MotionComp
         ReadOnlySpan<ushort> src, int srcStride,
         ReadOnlySpan<short> abcd, int mx, int my)
     {
-        const int intermediateBits = IntermediateBits8;
+        int intermediateBits = IntermediateBits8;
         Span<short> mid = stackalloc short[15 * 8];
         int midIdx = 0;
 
@@ -816,6 +817,134 @@ public static class Av1MotionComp
     // ========================================================================
     // Edge emulation
     // ========================================================================
+
+    // ========================================================================
+    // Scaled motion compensation (reference frame of a different size)
+    // ========================================================================
+
+    /// <summary>Converts dav1d's FILTER_2D index (0..8 eight-tap combinations) to the packed h | v &lt;&lt; 2 filter type.</summary>
+    internal static int PackedFilterType(int filter2d) => filter2d switch
+    {
+        0 => 0,             // REGULAR
+        1 => 0 | (1 << 2),  // REGULAR_SMOOTH (h regular, v smooth)
+        2 => 0 | (2 << 2),  // REGULAR_SHARP
+        3 => 2 | (0 << 2),  // SHARP_REGULAR
+        4 => 2 | (1 << 2),  // SHARP_SMOOTH
+        5 => 2 | (2 << 2),  // SHARP
+        6 => 1 | (0 << 2),  // SMOOTH_REGULAR
+        7 => 1 | (1 << 2),  // SMOOTH
+        8 => 1 | (2 << 2),  // SMOOTH_SHARP
+        _ => 0,
+    };
+
+    // put_8tap_scaled_c / prep_8tap_scaled_c (dav1d mc_tmpl.c): 16-row... rolling 8-row window of horizontally filtered
+    // rows, 10-bit (1/1024) source positions stepping by dx / dy. src[org] is the block origin in the reference; the
+    // span must include 3 rows above / 3 columns left of it (and the right / bottom margin).
+    private static void Scaled8Tap(Span<ushort> dst, int dstStride, Span<short> tmp, ReadOnlySpan<ushort> src, int org,
+        int srcStride, int w, int h, int mx, int my, int dx, int dy, int filterType, bool put)
+    {
+        int ib = IntermediateBits8, irnd = (1 << ib) >> 1, bias = PrepBias8;
+        var mid = new short[128 * 8];
+        var rows = new int[8];
+        for (int i = 0; i < 8; i++) rows[i] = 128 * i;
+        int inY = -8;
+        int s = org - 3 * srcStride;
+        for (int y = 0; y < h; y++)
+        {
+            int srcY = my >> 10;
+            int fvPos = (my & 0x3ff) >> 6;
+            int fvType = h > 4 ? filterType >> 2 : 3 + ((filterType >> 2) & 1);
+            while (inY < srcY)
+            {
+                int imx = mx, ioff = 0;
+                int first = rows[0];
+                for (int i = 0; i < 7; i++) rows[i] = rows[i + 1];
+                rows[7] = first;
+                for (int x = 0; x < w; x++)
+                {
+                    int fhPos = imx >> 6;
+                    if (fhPos != 0)
+                    {
+                        int fhType = w > 4 ? filterType & 3 : 3 + (filterType & 1);
+                        int sum = 0;
+                        for (int k = 0; k < 8; k++) sum += Av1Tables.McSubpelFilters[fhType, fhPos - 1, k] * src[s + ioff + k - 3];
+                        mid[first + x] = (short)((sum + ((1 << (6 - ib)) >> 1)) >> (6 - ib));
+                    }
+                    else mid[first + x] = (short)(src[s + ioff] << ib);
+                    imx += dx;
+                    ioff += imx >> 10;
+                    imx &= 0x3ff;
+                }
+                s += srcStride;
+                inY++;
+            }
+            for (int x = 0; x < w; x++)
+            {
+                int v;
+                if (fvPos != 0)
+                {
+                    int sum = 0;
+                    for (int k = 0; k < 8; k++) sum += Av1Tables.McSubpelFilters[fvType, fvPos - 1, k] * mid[rows[k] + x];
+                    v = put ? (sum + ((1 << (6 + ib)) >> 1)) >> (6 + ib) : (sum + 32) >> 6;
+                }
+                else v = put ? (mid[rows[3] + x] + irnd) >> ib : mid[rows[3] + x];
+                if (put) dst[y * dstStride + x] = ClipPixel(v);
+                else tmp[y * w + x] = (short)(v - bias);
+            }
+            my += dy;
+        }
+    }
+
+    // put_bilin_scaled_c / prep_bilin_scaled_c.
+    private static void ScaledBilin(Span<ushort> dst, int dstStride, Span<short> tmp, ReadOnlySpan<ushort> src, int org,
+        int srcStride, int w, int h, int mx, int my, int dx, int dy, bool put)
+    {
+        int ib = IntermediateBits8, bias = PrepBias8;
+        var mid = new short[128 * 2];
+        int inY = -2;
+        int s = org;
+        for (int y0 = 0; y0 < h; y0++)
+        {
+            int y = my >> 10;
+            int m1 = (y & 1) * 128, m2 = ((y + 1) & 1) * 128;
+            int dmy = my & 0x3ff;
+            while (inY < y)
+            {
+                int imx = mx, ioff = 0;
+                int mp = (inY & 1) * 128;
+                for (int x = 0; x < w; x++)
+                {
+                    int f = imx >> 6;
+                    int a = src[s + ioff], b = src[s + ioff + 1];
+                    mid[mp + x] = (short)((16 * a + f * (b - a) + ((1 << (4 - ib)) >> 1)) >> (4 - ib));
+                    imx += dx;
+                    ioff += imx >> 10;
+                    imx &= 0x3ff;
+                }
+                s += srcStride;
+                inY++;
+            }
+            int fy = dmy >> 6;
+            for (int x = 0; x < w; x++)
+            {
+                int a = mid[m1 + x], b = mid[m2 + x];
+                int sum = 16 * a + fy * (b - a);
+                if (put) dst[y0 * dstStride + x] = ClipPixel((sum + ((1 << (4 + ib)) >> 1)) >> (4 + ib));
+                else tmp[y0 * w + x] = (short)(((sum + 8) >> 4) - bias);
+            }
+            my += dy;
+        }
+    }
+
+    /// <summary>Scaled MC (dav1d mc_scaled / mct_scaled): <paramref name="filter2d"/> is the FILTER_2D index (9 = bilinear).
+    /// Exactly one of <paramref name="dst"/> (put) / <paramref name="tmp"/> (prep) is non-empty.</summary>
+    internal static void McScaled(Span<ushort> dst, int dstStride, Span<short> tmp, ReadOnlySpan<ushort> src, int org,
+        int srcStride, int w, int h, int mx, int my, int dx, int dy, int filter2d)
+    {
+        bool put = !dst.IsEmpty;
+        if (filter2d == 9) ScaledBilin(dst, dstStride, tmp, src, org, srcStride, w, h, mx, my, dx, dy, put);
+        else Scaled8Tap(dst, dstStride, tmp, src, org, srcStride, w, h, mx, my, dx, dy, PackedFilterType(filter2d), put);
+    }
 
     /// <summary>
     /// Emulate edges for blocks that extend beyond the frame boundary.

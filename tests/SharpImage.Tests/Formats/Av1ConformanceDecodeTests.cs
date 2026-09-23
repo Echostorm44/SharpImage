@@ -37,6 +37,16 @@ public sealed class Av1ConformanceDecodeTests
     [Arguments("libavif_8bit_420_517x333_tiles2x2.avif", 517, 333, "a6833bdbc249ed72b20ef4e6534cd97e")]
     [Arguments("libavif_8bit_420_1300x300_tiles2x4.avif", 1300, 300, "3cfdf31cba06724a2e0ae1371a2791f6")]
     [Arguments("libavif_10bit_420_700x420_tiles2x2.avif", 700, 420, "a9a105e5d1abb7ec158e182c20c3dea5")]
+    // Progressive (libavif --progressive: key frame at half size + an inter enhancement layer with spatial_id 1 that
+    // predicts from it through a scaled reference): the temporal unit's top spatial layer, as dav1d outputs it.
+    [Arguments("libavif_draw_points_idat_progressive.avif", 33, 11, "1a5c39ef86fd744ec3039a96939fb39c")]
+    // avifenc --progressive / --layered (libavif 1.4.2 + aom 3.14): half- / quarter-size base layers predicted
+    // through scaled references (svc scale/step, scaled 8-tap MC), inter refmvs across SB rows, 8/10/12-bit.
+    [Arguments("libavif_prog_8_444.avif", 384, 256, "3185d322368ccc9affb1ba318a4c3eea")]
+    [Arguments("libavif_prog_10_444_odd.avif", 257, 131, "e5f4e85159d522c393f098ae64ee88f2")]
+    [Arguments("libavif_prog_12_420_odd.avif", 257, 131, "b415524172d7eeaf5fe3f4b7bb687b11")]
+    [Arguments("libavif_prog_8_420_alpha.avif", 161, 97, "7ddeeb444b0ef83681bd4b24abb3d4cc")]
+    [Arguments("libavif_layered3_8_444.avif", 300, 200, "be1a3510a9a06d261282eb6f2590a969")]
     public async Task DecodesByteExactVsDav1d(string file, int w, int h, string md5)
     {
         byte[] item = PrimaryItemData(File.ReadAllBytes(Asset(file)));
@@ -182,57 +192,10 @@ public sealed class Av1ConformanceDecodeTests
 
     private static string Hex(byte[] h) => Convert.ToHexString(h).ToLowerInvariant();
 
-    // Minimal ISOBMFF walk: meta/pitm -> primary item id, meta/iloc -> its (single-extent, file-offset) data.
+    // The primary item's payload.
     private static byte[] PrimaryItemData(byte[] d)
     {
-        int meta = FindBox(d, 0, d.Length, "meta");
-        int metaEnd = meta + (int)BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(meta));
-        int pitm = FindBox(d, meta + 12, metaEnd, "pitm");
-        int primary = d[pitm + 8] == 0 ? BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(pitm + 12))
-                                       : (int)BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(pitm + 12));
-        int iloc = FindBox(d, meta + 12, metaEnd, "iloc");
-        int ver = d[iloc + 8], p = iloc + 12;
-        int offSz = d[p] >> 4, lenSz = d[p] & 15, baseSz = d[p + 1] >> 4, idxSz = ver >= 1 ? d[p + 1] & 15 : 0;
-        p += 2;
-        int count = ver < 2 ? BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p)) : (int)BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(p));
-        p += ver < 2 ? 2 : 4;
-        for (int i = 0; i < count; i++)
-        {
-            int id = ver < 2 ? BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p)) : (int)BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(p));
-            p += ver < 2 ? 2 : 4;
-            if (ver >= 1) p += 2;
-            p += 2;
-            long baseOff = ReadN(d, p, baseSz); p += baseSz;
-            int ext = BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p)); p += 2;
-            using var ms = new MemoryStream();
-            for (int e = 0; e < ext; e++)
-            {
-                p += idxSz;
-                long off = ReadN(d, p, offSz); p += offSz;
-                long len = ReadN(d, p, lenSz); p += lenSz;
-                ms.Write(d, (int)(baseOff + off), (int)len);
-            }
-            if (id == primary) return ms.ToArray();
-        }
-        throw new InvalidDataException("primary item not found");
-    }
-
-    private static long ReadN(byte[] d, int p, int n)
-    {
-        long v = 0;
-        for (int i = 0; i < n; i++) v = (v << 8) | d[p + i];
-        return v;
-    }
-
-    private static int FindBox(byte[] d, int start, int end, string type)
-    {
-        for (int p = start; p + 8 <= end;)
-        {
-            int size = (int)BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(p));
-            if (System.Text.Encoding.ASCII.GetString(d, p + 4, 4) == type) return p;
-            if (size < 8) break;
-            p += size;
-        }
-        throw new InvalidDataException($"box {type} not found");
+        var box = HeifContainer.Parse(d);   // handles idat / multi-extent items too
+        return box.ItemData(box.PrimaryId)!;
     }
 }

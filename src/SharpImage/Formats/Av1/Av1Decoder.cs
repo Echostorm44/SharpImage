@@ -111,22 +111,61 @@ internal sealed class Av1Decoder
     /// </summary>
     public DecodedVideoFrame? Decode(ReadOnlySpan<byte> data, long presentationTimeTicks, bool isKeyframe)
     {
-        if (data.Length == 0)
-            return null;
+        // One output per temporal unit: the shown frame with the highest spatial id (dav1d with all_layers = 0 outputs
+        // only the operating point's top spatial layer; a plain stream has one shown frame per TU anyway).
+        var frames = DecodeTemporalUnit(data, presentationTimeTicks);
+        if (frames.Count == 0) return null;
+        int best = 0;
+        for (int k = 1; k < frames.Count; k++)
+            if (frames[k].SpatialId >= frames[best].SpatialId) best = k;
+        for (int k = 0; k < frames.Count; k++)
+            if (k != best) frames[k].Frame.Dispose();
+        return frames[best].Frame;
+    }
 
-        // Parse all OBUs in this temporal unit
+    /// <summary>dav1d operating_point: OBUs with an extension header whose temporal / spatial layer is not in this
+    /// operating point's operating_point_idc are dropped (AVIF 'a1op').</summary>
+    public int OperatingPoint { get; set; }
+
+    /// <summary>
+    /// Decodes one temporal unit and returns every shown frame in decode order with its spatial id (dav1d all_layers:
+    /// a layered / progressive AVIF item yields one frame per layer). Each frame is decoded as soon as its tiles are
+    /// complete, so later frames of the unit (e.g. an enhancement layer) can reference earlier ones.
+    /// </summary>
+    internal List<(DecodedVideoFrame Frame, int SpatialId)> DecodeTemporalUnit(ReadOnlySpan<byte> data, long presentationTimeTicks)
+    {
+        var outputs = new List<(DecodedVideoFrame Frame, int SpatialId)>();
+        if (data.Length == 0)
+            return outputs;
+
         int offset = 0;
         tileGroupCount = 0;
         tilesCollected = 0;
         bool haveFrameHeader = false;
 
+        bool FinishFrame()
+        {
+            int totalTiles = frameHdr.TileCols * frameHdr.TileRows;
+            if (!haveFrameHeader || tilesCollected < totalTiles) return true;
+            haveFrameHeader = false;
+            try { DecodeFrame(ReadOnlySpan<byte>.Empty); }   // tile data was copied by ParseTileGroupObu
+            catch (Exception ex) { LastDecodeError = ex.ToString(); AvDbg.W($"[DECODE-FRAME-ERROR] {ex.GetType().Name}: {ex.Message}"); return false; }
+            try { UpdateReferenceFrames(); }
+            catch (Exception ex) { LastDecodeError = $"UpdateReferenceFrames: {ex}"; return false; }
+            if (frameHdr.ShowFrame)
+            {
+                isReady = true;
+                var frame = ExtractOutputFrame(presentationTimeTicks);
+                if (frame != null) outputs.Add((frame, frameHdr.SpatialId));
+            }
+            return true;
+        }
+
         while (offset < data.Length)
         {
-            int obuStart = offset;
-
             // Parse OBU header (§5.3.1)
             var gb = new Av1GetBits(data.Slice(offset));
-            int forbiddenBit = (int)gb.GetBit();
+            gb.GetBit(); // obu_forbidden_bit
             int obuType = (int)gb.GetBits(4);
             bool hasExtension = gb.GetBool();
             bool hasLengthField = gb.GetBool();
@@ -159,6 +198,14 @@ internal sealed class Av1Decoder
             var obuPayload = data.Slice(offset + headerBytes, obuSize);
             offset += headerBytes + obuSize;
 
+            // Operating point selection (dav1d_parse_obus): drop layers outside the chosen operating point.
+            if (obuType != 1 && obuType != 2 && hasExtension && hasSequenceHeader && seqHdr.NumOperatingPoints > 0)
+            {
+                int idc = seqHdr.OperatingPoints[Math.Clamp(OperatingPoint, 0, seqHdr.NumOperatingPoints - 1)].Idc;
+                if (idc != 0 && (((idc >> temporalId) & 1) == 0 || ((idc >> (spatialId + 8)) & 1) == 0))
+                    continue;
+            }
+
             switch (obuType)
             {
                 case 1: // OBU_SEQUENCE_HEADER
@@ -166,7 +213,6 @@ internal sealed class Av1Decoder
                     break;
 
                 case 2: // OBU_TEMPORAL_DELIMITER
-                    // Nothing to do — we already reset per temporal unit
                     break;
 
                 case 3: // OBU_FRAME_HEADER
@@ -174,15 +220,20 @@ internal sealed class Av1Decoder
                     if (!hasSequenceHeader)
                         break;
                     haveFrameHeader = ParseFrameHeaderObu(obuPayload, temporalId, spatialId, out int fhBytesConsumed, isObuFrame: obuType == 6);
+                    if (haveFrameHeader && frameHdr.ShowExistingFrame)
+                    {
+                        haveFrameHeader = false;
+                        var shown = HandleShowExistingFrame(presentationTimeTicks);
+                        if (shown != null) outputs.Add((shown, spatialId));
+                        break;
+                    }
                     if (haveFrameHeader && obuType == 6)
                     {
                         // OBU_FRAME: tile data starts immediately after frame header
-                        // No tile_group_obu() header — direct tile_size fields follow
                         int tileDataOffset = fhBytesConsumed;
                         if (tileDataOffset < obuSize)
-                        {
-                            ParseTileGroupObu(obuPayload.Slice(tileDataOffset), offset + headerBytes + tileDataOffset, isObuFrame: true);
-                        }
+                            ParseTileGroupObu(obuPayload.Slice(tileDataOffset), offset - obuSize + tileDataOffset, isObuFrame: true);
+                        if (!FinishFrame()) return Fail(outputs);
                     }
                     break;
 
@@ -190,6 +241,7 @@ internal sealed class Av1Decoder
                     if (!hasSequenceHeader || !haveFrameHeader)
                         break;
                     ParseTileGroupObu(obuPayload, offset - obuSize);
+                    if (!FinishFrame()) return Fail(outputs);
                     break;
 
                 case 5: // OBU_METADATA — skip for now
@@ -199,38 +251,15 @@ internal sealed class Av1Decoder
                     break;
             }
         }
+        return outputs;
+    }
 
-        // Handle show_existing_frame
-        if (haveFrameHeader && frameHdr.ShowExistingFrame)
-        {
-            return HandleShowExistingFrame(presentationTimeTicks);
-        }
-
-        // Check if we have all tiles to decode
-        int totalTiles = frameHdr.TileCols * frameHdr.TileRows;
-        if (haveFrameHeader && tilesCollected >= totalTiles)
-        {
-            AvDbg.W($"[FRAME-DECODE] FrameOffset={frameHdr.FrameOffset} ShowFrame={frameHdr.ShowFrame} ShowExistingFrame={frameHdr.ShowExistingFrame} IsIntra={frameHdr.IsIntra} IsInterOrSwitch={frameHdr.IsInterOrSwitch}");
-            try { DecodeFrame(data); }
-            catch (Exception ex) { LastDecodeError = $"{ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"; AvDbg.W($"[DECODE-FRAME-ERROR] {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); return null; }
-
-            // Update reference frame slots
-            try { UpdateReferenceFrames(); }
-            catch (Exception ex) { LastDecodeError = $"UpdateReferenceFrames: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"; AvDbg.W($"[UPDATE-REF-ERROR] {ex.GetType().Name}: {ex.Message}"); return null; }
-
-            // Extract visible frame
-            AvDbg.W($"[DECODE-CHECK] Pre-showframe check: ShowFrame={frameHdr.ShowFrame} ShowExistingFrame={frameHdr.ShowExistingFrame}");
-            if (frameHdr.ShowFrame)
-            {
-                AvDbg.W($"[DECODE-RETURN] About to extract frame {frameHdr.FrameOffset}");
-                isReady = true;
-                var frame = ExtractOutputFrame(presentationTimeTicks);
-                AvDbg.W($"[DECODE-RETURN] Extracted frame {frameHdr.FrameOffset}: {(frame == null ? "NULL" : "OK")}");
-                return frame;
-            }
-        }
-
-        return null;
+    // A frame failed to decode: nothing from this temporal unit is returned (the caller reports LastDecodeError).
+    private static List<(DecodedVideoFrame Frame, int SpatialId)> Fail(List<(DecodedVideoFrame Frame, int SpatialId)> outputs)
+    {
+        foreach (var o in outputs) o.Frame.Dispose();
+        outputs.Clear();
+        return outputs;
     }
 
     // ======================================================================
@@ -253,6 +282,7 @@ internal sealed class Av1Decoder
 
     private bool ParseFrameHeaderObu(ReadOnlySpan<byte> payload, int temporalId, int spatialId, out int bytesConsumed, bool isObuFrame = false)
     {
+        frameHdr.Reset();   // the header object is reused: nothing may leak from the previous frame (e.g. force_integer_mv)
         frameHdr.TemporalId = (byte)temporalId;
         frameHdr.SpatialId = (byte)spatialId;
 
@@ -383,6 +413,36 @@ internal sealed class Av1Decoder
 
         // Allocate tile states
         ctx.AllocateTileStates(fh.TileCols, fh.TileRows);
+
+        // Motion compensation clips / scales intermediates by the stream's bit depth (thread-static, like the
+        // restoration filter's): set it for every frame, not only on the IntraBC path.
+        Av1MotionComp.McBitDepth = ctx.BitDepth;
+
+        // Reference scaling + global-motion warp eligibility per reference (dav1d decode.c, dav1d_submit_frame):
+        // svc scale / step (14-bit / 10-bit fixed point) for refs of another size; a global warp needs valid shear
+        // parameters (computed into the header's gmv), integer-mv off and an unscaled reference.
+        for (int i = 0; i < 7; i++)
+        {
+            ctx.Svc[i, 0] = default;
+            ctx.Svc[i, 1] = default;
+            ctx.GmvWarpAllowed[i] = false;
+            if (!fh.IsInterOrSwitch) continue;
+            int refIdx = fh.GetRefIdx(i);
+            if (refIdx < 0 || refIdx > 7) continue;
+            var rf = ctx.RefFrames[refIdx];
+            if (!rf.Valid || fh.CodedWidth * 2 < rf.Width || fh.Height * 2 < rf.Height
+                || fh.CodedWidth > rf.Width * 16 || fh.Height > rf.Height * 16)
+                throw new System.IO.InvalidDataException("AV1 reference frame has an unsupported size for this frame.");
+            if (fh.CodedWidth != rf.Width || fh.Height != rf.Height)
+            {
+                int sx = ((rf.Width << 14) + (fh.CodedWidth >> 1)) / fh.CodedWidth;
+                int sy = ((rf.Height << 14) + (fh.Height >> 1)) / fh.Height;
+                ctx.Svc[i, 0] = new Av1ScalingParams { Scale = sx, Step = (sx + 8) >> 4 };
+                ctx.Svc[i, 1] = new Av1ScalingParams { Scale = sy, Step = (sy + 8) >> 4 };
+            }
+            ctx.GmvWarpAllowed[i] = fh.Gmv[i].Type > Av1WarpedMotionType.Translation && !fh.ForceIntegerMv
+                && !Av1WarpMv.GetShearParams(ref fh.Gmv[i]) && ctx.Svc[i, 0].Scale == 0;
+        }
 
         // Initialize CDF contexts
         Av1CdfContext? refCdf = null;
@@ -1034,41 +1094,12 @@ internal sealed class Av1Decoder
         t.Rt.TileRowStart = ts.RowStart;
         t.Rt.TileRowEnd = ts.RowEnd;
 
-        // Link tile R rows to frame R rows (dav1d: refmvs_init_tile_row). Also required on
-        // key/intra frames that allow intra block copy, so intraBC DV prediction can read the
-        // spatial MV grid.
+        // Link tile R rows to frame R rows (dav1d_refmvs_tile_sbrow_init). The frame keeps sbsz + 3 rows that every SB
+        // row reuses; for odd SB rows the three rows above are exchanged so the previous SB row's bottom rows become
+        // this row's "above" candidates. Also required on key/intra frames that allow intra block copy, so intraBC DV
+        // prediction can read the spatial MV grid.
         if (!isIntra || fh.AllowIntraBc)
-        {
-            int sbSize = sbStep; // dav1d sbsz: 16 for SB64, 32 for SB128 (in 4x4 units)
-            int sby = by >> sbShift;
-            int off = (sbSize * sby) & 16;
-            int rowBase = sby * sbSize;
-            var rf = ctx.RefMvs;
-            bool anyNull = false;
-            for (int i = 0; i < sbSize; i++)
-            {
-                int rIdx = rowBase + i;
-                if (rIdx < rf.R.Length)
-                {
-                    t.Rt.R[off + 5 + i] = rf.R[rIdx];
-                    if (rf.R[rIdx] == null) anyNull = true;
-                }
-                else
-                    t.Rt.R[off + 5 + i] = null;
-            }
-            if (rowBase + sbSize < rf.R.Length)
-            {
-                t.Rt.R[off + 0] = rf.R[rowBase + sbSize];
-                t.Rt.R[off + 1] = null;
-                t.Rt.R[off + 2] = rf.R[rowBase + sbSize + 2];
-                t.Rt.R[off + 3] = null;
-                t.Rt.R[off + 4] = rf.R[rowBase + sbSize + 4];
-            }
-            if (anyNull)
-                AvDbg.W($"[RFMVS-NULL] sby={sby} rowBase={rowBase} sbSize={sbSize} RfLen={rf.R.Length}");
-            if (ctx.FrameHeader?.FrameOffset == 1 && sby == 0)
-                AvDbg.W($"[RFMVS-LINK] sby={sby} sbSize={sbSize} off={off} rfR4null={rf.R[4] == null} rfR0len={(rf.R[0]?.Length ?? -1)} rtR9null={t.Rt.R[off + 9] == null}");
-        }
+            Av1RefMvs.TileSbRowInit(t.Rt, ctx.RefMvs, ts.ColStart, ts.ColEnd, ts.RowStart, ts.RowEnd, by >> sbShift);
 
         // Reset palette UV context (clear the "left" row)
         Array.Clear(t.PalSzUv, 0, t.PalSzUv.GetLength(0) * t.PalSzUv.GetLength(1));
@@ -2048,6 +2079,9 @@ internal sealed class Av1Decoder
 
     /// <summary>Film grain parameters of the last parsed frame header (null when none).</summary>
     internal Av1FilmGrainData? LastFilmGrain => frameHdr.FilmGrainPresent ? frameHdr.FilmGrain : null;
+
+    /// <summary>The last parsed frame header (diagnostics).</summary>
+    internal Av1DecoderFrameHeader CurrentFrameHeader => frameHdr;
 
     private (ushort[], ushort[]?, ushort[]?) WithFilmGrain(in Av1FilmGrainData fg, int w, int h, int ssHor, int ssVer,
         ushort[] y, int strideY, ushort[]? u, ushort[]? v, int strideUv)

@@ -688,6 +688,9 @@ public static class Av1Decode
     /// <returns>0 on success, -1 on error.</returns>
     private static bool DbgFirstBlock = true;
 
+    /// <summary>Diagnostics: when set, every non-key-frame block writes "B by bx bs r=rng" (as a patched dav1d does).</summary>
+    [ThreadStatic] internal static System.IO.TextWriter? BlockTrace;
+
     public static int DecodeBlock(
         Av1TaskContext t,
         ref Av1Msac msac,
@@ -701,6 +704,8 @@ public static class Av1Decode
     {
         var ts = t.TileState!;
         var fh = ctx.FrameHeader!;
+        if (BlockTrace != null && fh.FrameType != Av1FrameType.Key)
+            BlockTrace.WriteLine($"B {t.By} {t.Bx} {(int)bs} r={msac.DebugRng}");
         var seqHdr = ctx.SequenceHeader!;
         int bx4 = t.Bx & 31;
         int by4 = t.By & 31;
@@ -1004,6 +1009,7 @@ public static class Av1Decode
                 haveLeft, haveTop, hasChroma, intraEdgeFlags);
 
             // Reconstruct inter block
+            BlockTrace?.WriteLine($"M {t.By} {t.Bx} r{b.Ref0},{(sbyte)b.Ref1} mv{b.Mv0.Y},{b.Mv0.X}/{b.Mv1.Y},{b.Mv1.X} mm{b.Motion} f{b.Filter} c{b.CompType}");
             var yPlane = ctx.CurrentPlanes[0]!;
             var uPlane = hasChroma ? ctx.CurrentPlanes[1]! : Array.Empty<ushort>();
             var vPlane = hasChroma ? ctx.CurrentPlanes[2]! : Array.Empty<ushort>();
@@ -1072,6 +1078,13 @@ public static class Av1Decode
             for (int j = 0; j < bh4; j++) t.Left.SegPred[by4 + j] = 0;
             for (int j = 0; j < bh4; j++) t.Left.PalSz[by4 + j] = 0;
             for (int j = 0; j < bh4; j++) t.Left.TxIntra[by4 + j] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 3];
+            if (hasChroma)
+            {
+                // dav1d decode_b: inter blocks leave DC_PRED as the neighbouring uv mode (the chroma intra-edge
+                // filter's smooth-neighbour test reads it).
+                for (int i = 0; i < cbw4; i++) t.Above.UvMode[cbx4 + i] = (byte)Av1IntraPredMode.Dc;
+                for (int j = 0; j < cbh4; j++) t.Left.UvMode[cby4 + j] = (byte)Av1IntraPredMode.Dc;
+            }
 
             // Update refmvs spatial grid for inter blocks (dav1d: splat_oneref_mv + edge updates)
             // dav1d: ref[1] = interintra_type ? 0 : -1 (interintra blocks excluded from warp candidates)
@@ -1716,6 +1729,12 @@ public static class Av1Decode
         Av1RefMvs.FindRefMvs(t.Rt, mvstack, out int nCand, out int modeCtx, out int _,
             new Av1RefMvsRefPair { Ref0 = (sbyte)(b.Ref0 + 1), Ref1 = -1 },
             (int)bs, intraEdgeFlags, t.By, t.Bx);
+        if (BlockTrace != null)
+        {
+            var sb = new System.Text.StringBuilder($"S {t.By} {t.Bx} n{nCand} c{modeCtx}");
+            for (int q = 0; q < nCand; q++) sb.Append($" {mvstack[q].Mv.Mv0.Y},{mvstack[q].Mv.Mv0.X}:{mvstack[q].Weight}");
+            BlockTrace.WriteLine(sb.ToString());
+        }
 
         if (t.Bx == 0 && t.By == 0)
             AvDbg.W($"[INTER-MVS] nCand={nCand} modeCtx={modeCtx} (0x{modeCtx:X}) newmvCtx={modeCtx&7} globalmvCtx={(modeCtx>>3)&1} refmvCtx={(modeCtx>>4)&15}");
@@ -2323,15 +2342,93 @@ public static class Av1Decode
     }
 
     /// <summary>
-    /// Port of dav1d's derive_warpmv (decode.c:266-382).
-    /// Derives affine warp parameters from neighbor blocks sharing the same reference.
-    /// Currently stubbed — full implementation needed for warp support.
+    /// Port of dav1d's derive_warpmv (decode.c): collects up to 8 projected motion samples from the neighbouring
+    /// blocks that share this block's reference (the masks from FindMatchingRef), drops outliers against a size-based
+    /// threshold, then fits the local affine warp (find_affine_int) and its shear parameters.
     /// </summary>
     private static void DeriveWarpmv(Av1TaskContext t, int bw4, int bh4,
         Span<long> masks, Av1MotionVector mv)
     {
-        // TODO: Full implement — derive affine parameters from matching neighbors
-        t.WarpMv = default;
+        var r = t.Rt.R;
+        int ri = (t.By & 31) + 5;
+        var pts = new int[8 * 4];
+        int np = 0;
+        void AddSample(int dx, int dy, int sx, int sy, in Av1RefMvsBlock rp)
+        {
+            int w4 = Av1Tables.BlockDimensions[rp.Bs, 0], h4 = Av1Tables.BlockDimensions[rp.Bs, 1];
+            pts[np * 4 + 0] = 16 * (2 * dx + sx * w4) - 8;
+            pts[np * 4 + 1] = 16 * (2 * dy + sy * h4) - 8;
+            pts[np * 4 + 2] = pts[np * 4 + 0] + rp.Mv.Mv0.X;
+            pts[np * 4 + 3] = pts[np * 4 + 1] + rp.Mv.Mv0.Y;
+            np++;
+        }
+        ulong m0 = (ulong)masks[0], m1 = (ulong)masks[1];
+        if ((uint)m0 == 1 && (m1 >> 32) == 0)
+        {
+            ref var above = ref r[ri - 1]![t.Bx];
+            int off = t.Bx & (Av1Tables.BlockDimensions[above.Bs, 0] - 1);
+            AddSample(-off, 0, 1, -1, above);
+        }
+        else
+        {
+            uint xmask = (uint)m0;
+            for (int off = 0; np < 8 && xmask != 0;)
+            {
+                int tz = System.Numerics.BitOperations.TrailingZeroCount(xmask);
+                off += tz;
+                xmask >>= tz;
+                AddSample(off, 0, 1, -1, r[ri - 1]![t.Bx + off]);
+                xmask &= ~1u;
+            }
+        }
+        if (np < 8 && m1 == 1)
+        {
+            int off = t.By & (Av1Tables.BlockDimensions[r[ri]![t.Bx - 1].Bs, 1] - 1);
+            AddSample(0, -off, -1, 1, r[ri - off]![t.Bx - 1]);
+        }
+        else
+        {
+            uint ymask = (uint)m1;
+            for (int off = 0; np < 8 && ymask != 0;)
+            {
+                int tz = System.Numerics.BitOperations.TrailingZeroCount(ymask);
+                off += tz;
+                ymask >>= tz;
+                AddSample(0, off, -1, 1, r[ri + off]![t.Bx - 1]);
+                ymask &= ~1u;
+            }
+        }
+        if (np < 8 && (m1 >> 32) != 0) AddSample(0, 0, -1, -1, r[ri - 1]![t.Bx - 1]);        // top-left
+        if (np < 8 && (m0 >> 32) != 0) AddSample(bw4, 0, 1, -1, r[ri - 1]![t.Bx + bw4]);     // top-right
+
+        // Keep the samples whose motion is close to this block's (threshold by block size).
+        Span<int> mvd = stackalloc int[8];
+        int ret = 0, thresh = 4 * Math.Clamp(Math.Max(bw4, bh4), 4, 28);
+        for (int i = 0; i < np; i++)
+        {
+            mvd[i] = Math.Abs(pts[i * 4 + 2] - pts[i * 4 + 0] - mv.X) + Math.Abs(pts[i * 4 + 3] - pts[i * 4 + 1] - mv.Y);
+            if (mvd[i] > thresh) mvd[i] = -1;
+            else ret++;
+        }
+        if (ret == 0) ret = 1;
+        else
+        {
+            for (int i = 0, j = np - 1, k = 0; k < np - ret; k++, i++, j--)
+            {
+                while (mvd[i] != -1) i++;
+                while (mvd[j] == -1) j--;
+                if (i > j) break;
+                mvd[i] = mvd[j];
+                for (int q = 0; q < 4; q++) pts[i * 4 + q] = pts[j * 4 + q];
+            }
+        }
+
+        var wm = t.WarpMv;
+        if (!Av1WarpMv.FindAffineInt(pts, ret, bw4, bh4, mv, ref wm, t.Bx, t.By) && !Av1WarpMv.GetShearParams(ref wm))
+            wm.Type = Av1WarpedMotionType.Affine;
+        else
+            wm.Type = Av1WarpedMotionType.Identity;
+        t.WarpMv = wm;
     }
 
     // ========================================================================
