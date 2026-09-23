@@ -8,8 +8,8 @@ using SharpImage.Metadata;
 
 namespace SharpImage.Tests.Formats;
 
-// AVIF container metadata parity with libavif: ICC profiles (colr 'prof'), checked against a libavif-made file
-// (Pillow 12 / libavif 1.3) and through our own encode -> decode -> other-format round trips.
+// AVIF container metadata parity with libavif: ICC profiles (colr 'prof') and Exif / XMP items (cdsc), checked
+// against libavif-made files (Pillow 12 / libavif 1.3) and through our own encode -> decode -> other-format round trips.
 public sealed class AvifMetadataTests
 {
     private static string Asset(string name) =>
@@ -70,6 +70,38 @@ public sealed class AvifMetadataTests
         ms.Position = 0;
         var png = PngCoder.Read(ms);
         await Assert.That(png.Metadata.IccProfile!.Data).IsEquivalentTo(icc);
+    }
+
+    private const string Xmp = "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>Parity</dc:title></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>";
+
+    [Test]
+    public async Task ExifAndXmp_FromLibavifFile_AreExtracted()
+    {
+        var img = HeifCoder.Decode(File.ReadAllBytes(Asset("libavif_exif_xmp.avif")));
+        var exif = img.Metadata.ExifProfile!;
+        await Assert.That(exif.GetTag(ExifTag.Make)!.Value.GetString()).IsEqualTo("SharpCam");
+        await Assert.That(exif.GetTag(ExifTag.Model)!.Value.GetString()).IsEqualTo("Model X-1");
+        await Assert.That(exif.GetTag(ExifTag.DateTime)!.Value.GetString()).IsEqualTo("2026:09:22 12:34:56");
+        await Assert.That(img.Metadata.Xmp).IsEqualTo(Xmp);
+    }
+
+    [Test]
+    public async Task ExifAndXmp_RoundTrip_AndReachJpeg()
+    {
+        var withMeta = HeifCoder.Decode(File.ReadAllBytes(Asset("libavif_exif_xmp.avif")));
+        var src = Gradient(80, 48, alpha: true);
+        src.Metadata.ExifProfile = withMeta.Metadata.ExifProfile;
+        src.Metadata.Xmp = Xmp;
+        var dec = HeifCoder.Decode(HeifCoder.EncodeAvif(src));
+        await Assert.That(dec.Metadata.ExifProfile!.GetTag(ExifTag.Model)!.Value.GetString()).IsEqualTo("Model X-1");
+        await Assert.That(dec.Metadata.Xmp).IsEqualTo(Xmp);
+
+        using var ms = new MemoryStream();
+        JpegCoder.Write(dec, ms);
+        ms.Position = 0;
+        var jpg = JpegCoder.Read(ms);
+        await Assert.That(jpg.Metadata.ExifProfile!.GetTag(ExifTag.Make)!.Value.GetString()).IsEqualTo("SharpCam");
+        await Assert.That(jpg.Metadata.Xmp).IsEqualTo(Xmp);
     }
 
     [Test]

@@ -194,6 +194,13 @@ public sealed class Av1HbdVerify
             var img = HeifCoder.Decode(File.ReadAllBytes(f));
             string stem = Path.Combine(outDir, Path.GetFileNameWithoutExtension(f));
             if (img.IccProfile != null) File.WriteAllBytes(stem + ".icc", img.IccProfile);
+            if (img.Metadata.Xmp != null) File.WriteAllText(stem + ".xmp", img.Metadata.Xmp);
+            if (img.Metadata.ExifProfile is { } ex)
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var e in ex.Ifd0Tags) sb.Append(e.Tag).Append(' ').Append(e.GetString() ?? Convert.ToHexString(e.Value)).AppendLine();
+                File.WriteAllText(stem + ".exif.txt", sb.ToString());
+            }
             File.WriteAllText(stem + ".txt", $"{img.Columns}x{img.Rows} cicp={img.Metadata.Cicp} icc={img.IccProfile?.Length ?? -1}");
             File.WriteAllBytes(stem + ".rgb48", Rgb48(img));
         }
@@ -201,6 +208,10 @@ public sealed class Av1HbdVerify
         string icc = Path.Combine(inDir, "test.icc");
         if (File.Exists(icc)) src.Metadata.IccProfile = new SharpImage.Metadata.IccProfile(File.ReadAllBytes(icc));
         File.WriteAllBytes(Path.Combine(outDir, "ours_icc.avif"), HeifCoder.EncodeAvif(src));
+        string exifIn = Path.Combine(inDir, "test.exif"), xmpIn = Path.Combine(inDir, "test.xmp");
+        if (File.Exists(exifIn)) src.Metadata.ExifProfile = SharpImage.Metadata.ExifParser.ParseFromTiff(File.ReadAllBytes(exifIn));
+        if (File.Exists(xmpIn)) src.Metadata.Xmp = File.ReadAllText(xmpIn);
+        File.WriteAllBytes(Path.Combine(outDir, "ours_meta.avif"), HeifCoder.EncodeAvif(src));
         var rgba = Gradient(96, 64, alpha: true, gray: false);
         rgba.Metadata = src.Metadata.Clone();
         File.WriteAllBytes(Path.Combine(outDir, "ours_icc_alpha.avif"), HeifCoder.EncodeAvif(rgba, new AvifEncodeOptions { BitDepth = 10 }));

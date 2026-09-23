@@ -175,6 +175,7 @@ public static class HeifCoder
         int alphaItemId = -1;
         (int Cp, int Tc, int Mc, bool Full)? primaryNclx = null;   // primary item's colr nclx (if any)
         byte[]? primaryIcc = null;                                  // primary item's colr prof/rICC (if any)
+        byte[]? exifTiff = null, xmpBytes = null;                   // cdsc metadata items of the primary
 
         // Parse meta box hierarchy
         if (boxes.TryGetValue("meta", out var metaBox))
@@ -323,30 +324,30 @@ public static class HeifCoder
                 }
             }
 
-            // iref → auxl: an auxiliary item (alpha) referencing the primary. from_item is the alpha item.
-            if (metaChildren.TryGetValue("iref", out var irefBox))
+            // iinf → item types (Exif / mime content types); iref → every reference box (auxl, cdsc, ...).
+            var itemTypes = metaChildren.TryGetValue("iinf", out var iinfBox)
+                ? ParseIinf(data, iinfBox.DataOffset, iinfBox.DataLength)
+                : new Dictionary<int, (string Type, string ContentType)>();
+            var itemRefs = metaChildren.TryGetValue("iref", out var irefBox)
+                ? ParseIref(data, irefBox.DataOffset, irefBox.DataLength)
+                : new List<(string Type, int From, List<int> To)>();
+            foreach (var (refType, fromId, toIds) in itemRefs)
             {
-                byte irefVersion = data[irefBox.DataOffset];
-                var irefChildren = ParseBoxes(data, irefBox.DataOffset + 4, irefBox.DataLength - 4);
-                if (irefChildren.TryGetValue("auxl", out var auxlBox))
+                if (!toIds.Contains(primaryItemId)) continue;
+                if (refType == "auxl" && alphaItemId < 0) alphaItemId = fromId;   // alpha auxiliary of the primary
+                else if (refType == "cdsc" && itemTypes.TryGetValue(fromId, out var mt) && itemExtents.TryGetValue(fromId, out var mx)
+                         && mx.Off >= 0 && mx.Len > 0 && mx.Off + mx.Len <= data.Length)
                 {
-                    int p = auxlBox.DataOffset;
-                    int fromId = irefVersion == 0
-                        ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(p))
-                        : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p));
-                    p += irefVersion == 0 ? 2 : 4;
-                    int refCount = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(p));
-                    p += 2;
-                    for (int r = 0; r < refCount; r++)
+                    var payload = data.AsSpan(mx.Off, mx.Len);
+                    if (mt.Type == "Exif" && exifTiff == null && payload.Length > 4)
                     {
-                        int toId = irefVersion == 0
-                            ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(p))
-                            : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p));
-                        p += irefVersion == 0 ? 2 : 4;
-                        if (toId == primaryItemId)
-                        {
-                            alphaItemId = fromId;
-                        }
+                        // unsigned int(32) exif_tiff_header_offset, then the Exif block.
+                        long tiffOff = 4L + BinaryPrimitives.ReadUInt32BigEndian(payload);
+                        if (tiffOff < payload.Length) exifTiff = payload[(int)tiffOff..].ToArray();
+                    }
+                    else if (mt.Type == "mime" && mt.ContentType == "application/rdf+xml" && xmpBytes == null)
+                    {
+                        xmpBytes = payload.ToArray();
                     }
                 }
             }
@@ -386,6 +387,8 @@ public static class HeifCoder
             frame.IccProfile = primaryIcc;
             frame.Metadata.IccProfile = new SharpImage.Metadata.IccProfile(primaryIcc);
         }
+        if (exifTiff != null) frame.Metadata.ExifProfile = SharpImage.Metadata.ExifParser.ParseFromTiff(exifTiff);
+        if (xmpBytes != null) frame.Metadata.Xmp = Encoding.UTF8.GetString(xmpBytes).TrimEnd(' ');
 
         if (isAvif)
         {
@@ -412,6 +415,59 @@ public static class HeifCoder
         }
 
         return frame;
+    }
+
+    // iinf: item_ID -> (item_type, content_type) from each infe (versions 2/3; content_type only for 'mime').
+    private static Dictionary<int, (string Type, string ContentType)> ParseIinf(byte[] data, int off, int len)
+    {
+        var map = new Dictionary<int, (string, string)>();
+        int end = Math.Min(data.Length, off + len);
+        if (off + 6 > end) return map;
+        int pos = off + 4 + (data[off] == 0 ? 2 : 4);   // FullBox header + entry_count
+        foreach (var (type, pOff, pLen) in ParseIpco(data, pos, end - pos))
+        {
+            if (type != "infe" || pLen < 4) continue;
+            int v = data[pOff], q = pOff + 4, qEnd = pOff + pLen;
+            if (v < 2) continue;                          // v0/v1 carry no item_type (not used by AVIF)
+            if (q + (v == 2 ? 2 : 4) + 6 > qEnd) continue;
+            int id = v == 2 ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q)) : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(q));
+            q += (v == 2 ? 2 : 4) + 2;                    // item_ID, item_protection_index
+            string itemType = Encoding.ASCII.GetString(data, q, 4);
+            q += 4;
+            int nameEnd = Array.IndexOf(data, (byte)0, q, qEnd - q);   // item_name
+            string contentType = "";
+            if (itemType == "mime" && nameEnd >= 0 && nameEnd + 1 < qEnd)
+            {
+                int ctEnd = Array.IndexOf(data, (byte)0, nameEnd + 1, qEnd - nameEnd - 1);
+                contentType = Encoding.ASCII.GetString(data, nameEnd + 1, (ctEnd >= 0 ? ctEnd : qEnd) - nameEnd - 1);
+            }
+            map[id] = (itemType, contentType);
+        }
+        return map;
+    }
+
+    // iref: every SingleItemTypeReferenceBox in order — (reference type, from_item_ID, to_item_IDs).
+    private static List<(string Type, int From, List<int> To)> ParseIref(byte[] data, int off, int len)
+    {
+        var list = new List<(string, int, List<int>)>();
+        int end = Math.Min(data.Length, off + len);
+        if (off + 4 > end) return list;
+        bool wide = data[off] != 0;                       // version 1: 32-bit item IDs
+        int idSize = wide ? 4 : 2;
+        foreach (var (type, pOff, pLen) in ParseIpco(data, off + 4, end - off - 4))
+        {
+            int q = pOff, qEnd = pOff + pLen;
+            if (q + idSize + 2 > qEnd) continue;
+            int from = wide ? (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(q)) : BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q));
+            q += idSize;
+            int n = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q));
+            q += 2;
+            var to = new List<int>(n);
+            for (int k = 0; k < n && q + idSize <= qEnd; k++, q += idSize)
+                to.Add(wide ? (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(q)) : BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q)));
+            list.Add((type, from, to));
+        }
+        return list;
     }
 
     // ipco children in order (property index = position + 1): (type, payload offset, payload length).
@@ -575,9 +631,14 @@ public static class HeifCoder
             : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras);
     }
 
-    // Container content carried over from the image: the ICC profile (colr 'prof').
-    private static Av1.AvifContainerExtras AvifExtras(ImageFrame image)
-        => new() { Icc = image.Metadata.IccProfile?.Data ?? image.IccProfile };
+    // Container content carried over from the image: the ICC profile (colr 'prof'), Exif (as raw TIFF, the
+    // form libavif stores after its 4-byte header offset) and XMP (mime item, application/rdf+xml).
+    private static Av1.AvifContainerExtras AvifExtras(ImageFrame image) => new()
+    {
+        Icc = image.Metadata.IccProfile?.Data ?? image.IccProfile,
+        Exif = image.Metadata.ExifProfile is { } exif ? SharpImage.Metadata.ExifParser.SerializeForPngExif(exif) : null,
+        Xmp = image.Metadata.Xmp is { Length: > 0 } xmp ? Encoding.UTF8.GetBytes(xmp) : null,
+    };
 
     // CICP for an AVIF encode, validated against what libavif can represent (reformat.c avifGetYUVColorSpaceInfo).
     private static Av1.Av1ObuWriter.Av1ColorDesc ResolveAvifColor(ImageFrame image, AvifEncodeOptions o, int bd)
