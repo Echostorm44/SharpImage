@@ -149,6 +149,7 @@ public static partial class JpegCoder
         List<byte[]>? iccChunks = null;
         byte[]? iptcData = null;
         string? xmpData = null;
+        List<byte[]>? extendedXmp = null;
 
         // Parse all markers
         while (true)
@@ -191,7 +192,7 @@ public static partial class JpegCoder
                         ReadSosHeader(stream, components, componentCount);
                         var frame = DecodeScanData(stream, width, height, componentCount, components,
                             quantTables, dcTables, acTables, maxHSample, maxVSample, restartInterval);
-                        AttachMetadata(frame, exifData, iccChunks, iptcData, xmpData);
+                        AttachMetadata(frame, exifData, iccChunks, iptcData, xmpData, extendedXmp);
                         return frame;
                     }
 
@@ -224,7 +225,7 @@ public static partial class JpegCoder
 
                 default:
                     // Capture metadata from APP markers before skipping
-                    ReadOrSkipAppMarker(stream, marker, ref exifData, ref iccChunks, ref iptcData, ref xmpData);
+                    ReadOrSkipAppMarker(stream, marker, ref exifData, ref iccChunks, ref iptcData, ref xmpData, ref extendedXmp);
                     break;
             }
         }
@@ -245,7 +246,7 @@ public static partial class JpegCoder
                 }
             }
             var progFrame = BlocksToImage(width, height, componentCount, components, maxHSample, maxVSample, mcuCols);
-            AttachMetadata(progFrame, exifData, iccChunks, iptcData, xmpData);
+            AttachMetadata(progFrame, exifData, iccChunks, iptcData, xmpData, extendedXmp);
             return progFrame;
         }
 
@@ -2778,7 +2779,8 @@ public static partial class JpegCoder
     /// Falls back to skipping for unrecognized markers.
     /// </summary>
     private static void ReadOrSkipAppMarker(Stream stream, int marker,
-        ref byte[]? exifData, ref List<byte[]>? iccChunks, ref byte[]? iptcData, ref string? xmpData)
+        ref byte[]? exifData, ref List<byte[]>? iccChunks, ref byte[]? iptcData, ref string? xmpData,
+        ref List<byte[]>? extendedXmp)
     {
         int length = ReadUInt16(stream);
         int dataLen = length - 2;
@@ -2808,6 +2810,11 @@ public static partial class JpegCoder
                 {
                     xmpData = System.Text.Encoding.UTF8.GetString(data, 29, totalRead - 29);
                 }
+                // Extended XMP (Adobe XMP Part 3): merged into the standard packet after all markers are read.
+                else if (span.Length > 35 && span[..35].SequenceEqual("http://ns.adobe.com/xmp/extension/ "u8))
+                {
+                    (extendedXmp ??= []).Add(data[..totalRead]);
+                }
                 break;
 
             case APP2:
@@ -2834,7 +2841,7 @@ public static partial class JpegCoder
     /// Attaches parsed metadata to an ImageFrame after decoding.
     /// </summary>
     private static void AttachMetadata(ImageFrame frame, byte[]? exifData, List<byte[]>? iccChunks,
-        byte[]? iptcData, string? xmpData)
+        byte[]? iptcData, string? xmpData, List<byte[]>? extendedXmp = null)
     {
         if (exifData is not null)
         {
@@ -2875,7 +2882,7 @@ public static partial class JpegCoder
 
         if (xmpData is not null)
         {
-            frame.Metadata.Xmp = xmpData;
+            frame.Metadata.Xmp = extendedXmp != null ? MergeExtendedXmp(xmpData.TrimEnd(' '), extendedXmp) ?? xmpData : xmpData;
         }
     }
 

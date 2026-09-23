@@ -1543,4 +1543,54 @@ public sealed class Av1HbdVerify
         }
         return o;
     }
+
+    // JPEG input probe (trigger hbd_jpeg.txt: lines "<in.jpg> <out.avif> [quality] [qgainmap] [ignore]"): avifenc-style
+    // JPEG -> AVIF through HeifCoder.EncodeAvifFromJpeg.
+    [Test, NotInParallel]
+    public void JpegProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_jpeg.txt");
+        if (!File.Exists(trig)) return;
+        var lines = File.ReadAllLines(trig);
+        File.Delete(trig);
+        var log = new System.Text.StringBuilder();
+        foreach (var line in lines)
+        {
+            var t = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (t.Length < 2) continue;
+            try
+            {
+                if (t[0] == "rgb")
+                {
+                    var m = typeof(JpegCoder).GetMethod("ReadLibjpegRgb", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+                    var f = (ImageFrame)m.Invoke(null, [File.ReadAllBytes(t[1]), 0])!;
+                    var bytes = new byte[f.Columns * f.Rows * 3];
+                    for (int y = 0; y < (int)f.Rows; y++)
+                    {
+                        var row = f.GetPixelRow(y);
+                        for (int x = 0; x < (int)f.Columns * 3; x++) bytes[(y * (int)f.Columns * 3) + x] = (byte)(row[x / 3 * f.NumberOfChannels + x % 3] >> 8);
+                    }
+                    File.WriteAllBytes(t[2], bytes);
+                    log.AppendLine($"ok {t[2]}");
+                    continue;
+                }
+                if (t[0] == "swap")
+                {
+                    var so = new AvifEncodeOptions { Quality = int.Parse(t[3]), QualityGainMap = int.Parse(t[4]) };
+                    File.WriteAllBytes(t[2], HeifCoder.SwapGainMapBase(File.ReadAllBytes(t[1]), so, ignoreIccProfile: true));
+                    log.AppendLine($"ok {t[2]}");
+                    continue;
+                }
+                var o = new AvifEncodeOptions();
+                if (t.Length > 2) o.Quality = int.Parse(t[2]);
+                if (t.Length > 3) o.QualityGainMap = int.Parse(t[3]);
+                bool ignore = t.Length > 4 && t[4] == "ignore", swapBase = t.Length > 4 && t[4] == "swapbase";
+                if (t.Length > 5) o.ChromaSubsampling = Enum.Parse<AvifChromaSubsampling>(t[5]);
+                File.WriteAllBytes(t[1], HeifCoder.EncodeAvifFromJpeg(File.ReadAllBytes(t[0]), o, ignore, swapBase, ignoreIccProfile: swapBase));
+                log.AppendLine($"ok {t[1]}");
+            }
+            catch (Exception e) { log.AppendLine($"ERR {t[0]}: {e}"); }
+        }
+        File.WriteAllText(Path.Combine(Scratch, "corpus", "hbd_jpeg.log"), log.ToString());
+    }
 }

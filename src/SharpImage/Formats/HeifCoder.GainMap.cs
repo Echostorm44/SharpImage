@@ -158,6 +158,21 @@ public static partial class HeifCoder
             }
             gm.Image = Decode(null);
             gm.Image.Depth = ItemBitDepth(c, tiles[0]);
+            // Keep the coded planes reachable so re-encoding the gain map (swapbase) copies them instead of
+            // converting the RGB decode back to YUV.
+            if (codec == "av01" && c.Property(tiles[0], "av1C") is { Len: >= 4 } av1c)
+            {
+                byte f = d[av1c.Off + 2];
+                var layout = (f & 0x10) != 0 ? Av1.Av1PixelLayout.I400
+                    : (f & 0x08) == 0 ? Av1.Av1PixelLayout.I444 : (f & 0x04) == 0 ? Av1.Av1PixelLayout.I422 : Av1.Av1PixelLayout.I420;
+                var cicp = gm.Image.Metadata.Cicp;
+                SourcePlanes.AddOrUpdate(gm.Image, new SourceYuv
+                {
+                    Planes = new Lazy<ushort[][]>(() => DecodeItemPlanes(c, gainMapId).Planes),
+                    Width = (int)gm.Image.Columns, Height = (int)gm.Image.Rows, Depth = gm.Image.Depth, Layout = layout,
+                    Matrices = [cicp?.MatrixCoefficients ?? 2], FullRange = cicp?.FullRange ?? true,
+                });
+            }
             gm.ScaledImage = (w, h) => Decode((w, h));
         }
         return gm;
@@ -774,13 +789,13 @@ public static partial class HeifCoder
         return ((uint)Math.Round((double)d * v, MidpointRounding.AwayFromZero), d);
     }
 
-    private static GainMapUFraction ToUFraction(double v)
+    internal static GainMapUFraction ToUFraction(double v)
     {
         var (n, d) = DoubleToFraction(v, uint.MaxValue);
         return new GainMapUFraction(n, d);
     }
 
-    private static GainMapFraction ToSFraction(double v)
+    internal static GainMapFraction ToSFraction(double v)
     {
         var (n, d) = DoubleToFraction(Math.Abs(v), int.MaxValue);
         return new GainMapFraction(v < 0 ? -(int)n : (int)n, d);

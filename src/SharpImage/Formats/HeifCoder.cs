@@ -1224,7 +1224,7 @@ public static partial class HeifCoder
         var (qIdx, aQIdx, qualityLossless) = QualityQIndices(options, color);
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
                && options.FilmGrain == null && !denoise && !options.Progressive && !forceColor && !forceAlpha && qIdx == null && aQIdx == null
-               && !qualityLossless && !options.SharpYuv
+               && !qualityLossless && !options.SharpYuv && !SourcePlanes.TryGetValue(image, out _)
             ? EncodeAvif8(image, options.Qp, color, extras)
             : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless || qualityLossless, grain,
                 options.Progressive && image.Columns >= 16 && image.Rows >= 16,   // a sub-8px base layer is pointless
@@ -1585,6 +1585,14 @@ public static partial class HeifCoder
         ReadRgbPlanes(image, bd, out var r, out var g, out var b, out var alpha, out bool colour, out bool nonOpaque);
         colour |= forceColor;
         nonOpaque |= forceAlpha && alpha != null;
+        // Source YUV planes (JPEG input, a decoded gain map): coded as they are when the layout matches (a grey-looking
+        // colour JPEG stays YCbCr, as in libavif); 4:0:0 takes the luma of any source.
+        var srcYuv = hasAlpha && nonOpaque ? null : SourcePlanesFor(image, bd, color, w, h);
+        if (srcYuv != null && srcYuv.Layout != Av1.Av1PixelLayout.I400 && layout != Av1.Av1PixelLayout.I400)
+        {
+            if (srcYuv.Layout == layout) colour = true;
+            else srcYuv = null;
+        }
 
         int baseQIdx = qIdxOverride ?? Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
         if (progressive && alphaQIdxOverride == 0 && hasAlpha)
@@ -1602,7 +1610,12 @@ public static partial class HeifCoder
         // 4:0:0 requested for a colour source (avifenc -y 400): luma from RGB with the matrix, chroma dropped.
         bool forceMono = layout == Av1.Av1PixelLayout.I400;
         ushort[]? monoLuma = null;
-        if (forceMono && colour)
+        if (forceMono && srcYuv != null)
+        {
+            monoLuma = srcYuv.Planes.Value[0].ToArray();
+            colour = false;
+        }
+        else if (forceMono && colour)
         {
             monoLuma = MonoLumaLibavif(r, g, b, w, h, bd, color, image.Depth is >= 1 and <= 16 ? image.Depth : 16);
             colour = false;
@@ -1645,7 +1658,8 @@ public static partial class HeifCoder
         if (!forceMono && (colour || (!lossless && color.Matrix is 0 or 16 or 17)))
         {
             ushort[] yP, uP0, vP0;
-            if (sharpYuv && TrySharpYuv(image, r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0)) { }
+            if (srcYuv != null) { yP = srcYuv.Planes.Value[0].ToArray(); uP0 = srcYuv.Planes.Value[1].ToArray(); vP0 = srcYuv.Planes.Value[2].ToArray(); }
+            else if (sharpYuv && TrySharpYuv(image, r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0)) { }
             else if (libavifFloatYuv && color.Matrix is not (8 or 16 or 17))
                 RgbToYuvAvifFloat(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0, image.Depth is >= 1 and <= 16 ? image.Depth : 16);
             else
@@ -1663,7 +1677,7 @@ public static partial class HeifCoder
         }
 
         // Grey: 4:0:0 luma (Y = the grey value; limited range maps it into [16, 235] << (bd - 8)).
-        var luma = monoLuma ?? GreyLuma(r, w, h, bd, color);
+        var luma = monoLuma ?? (srcYuv != null ? srcYuv.Planes.Value[0].ToArray() : GreyLuma(r, w, h, bd, color));
         {
             ushort[]? su = null, sv = null;
             ScaleYuv(ref luma, ref su, ref sv, 1, 1);
