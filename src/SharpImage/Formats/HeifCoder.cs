@@ -82,6 +82,12 @@ public sealed class AvifEncodeOptions
 
     /// <summary>Pixel aspect ratio ('pasp') to signal. Null: the image's <c>Metadata.PixelAspectRatio</c>.</summary>
     public SharpImage.Metadata.PixelAspectRatio? PixelAspectRatio { get; set; }
+
+    /// <summary>HDR content light level ('clli'). Null: the image's <c>Metadata.ContentLightLevel</c>.</summary>
+    public SharpImage.Metadata.ContentLightLevel? ContentLightLevel { get; set; }
+
+    /// <summary>HDR mastering display colour volume ('mdcv'). Null: the image's <c>Metadata.MasteringDisplay</c>.</summary>
+    public SharpImage.Metadata.MasteringDisplayColourVolume? MasteringDisplay { get; set; }
 }
 
 public static class HeifCoder
@@ -275,6 +281,15 @@ public static class HeifCoder
             {
                 frame.Metadata.Xmp = Encoding.UTF8.GetString(payload).TrimEnd('\0');
             }
+        }
+        if (c.Property(pid, "clli") is { Len: >= 4 } clliP)
+            frame.Metadata.ContentLightLevel = new SharpImage.Metadata.ContentLightLevel(
+                BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(clliP.Off)), BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(clliP.Off + 2)));
+        if (c.Property(pid, "mdcv") is { Len: >= 24 } mdcvP)
+        {
+            ushort U(int k) => BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(mdcvP.Off + 2 * k));
+            frame.Metadata.MasteringDisplay = new SharpImage.Metadata.MasteringDisplayColourVolume(U(0), U(1), U(2), U(3), U(4), U(5), U(6), U(7),
+                BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(mdcvP.Off + 16)), BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(mdcvP.Off + 20)));
         }
         if (c.Property(pid, "pasp") is { Len: >= 8 } pasp)
         {
@@ -642,6 +657,17 @@ public static class HeifCoder
             x.Clap = CleanApertureFromCropRect(crop.X, crop.Y, crop.Width, crop.Height, (int)image.Columns, (int)image.Rows);
         if ((o.PixelAspectRatio ?? image.Metadata.PixelAspectRatio) is { } pa)
             x.Pasp = (pa.HorizontalSpacing, pa.VerticalSpacing);
+        if ((o.ContentLightLevel ?? image.Metadata.ContentLightLevel) is { } cll)
+            x.Clli = (cll.MaxContentLightLevel, cll.MaxFrameAverageLightLevel);
+        if ((o.MasteringDisplay ?? image.Metadata.MasteringDisplay) is { } md)
+        {
+            var b = new byte[24];
+            ushort[] p16 = [md.GreenX, md.GreenY, md.BlueX, md.BlueY, md.RedX, md.RedY, md.WhitePointX, md.WhitePointY];
+            for (int i = 0; i < 8; i++) BinaryPrimitives.WriteUInt16BigEndian(b.AsSpan(2 * i), p16[i]);
+            BinaryPrimitives.WriteUInt32BigEndian(b.AsSpan(16), md.MaxLuminance);
+            BinaryPrimitives.WriteUInt32BigEndian(b.AsSpan(20), md.MinLuminance);
+            x.Mdcv = b;
+        }
         return x;
     }
 

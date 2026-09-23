@@ -105,6 +105,29 @@ public sealed class AvifMetadataTests
     }
 
     [Test]
+    public async Task HdrMetadata_ClliAndMdcv_RoundTrip()
+    {
+        // HDR10 example: BT.2020 primaries (G, B, R), D65, 1000 / 0.005 cd/m² mastering, MaxCLL 1000 / MaxFALL 400.
+        // (ffprobe reads the same file back as "Mastering display" / "Content light level" side data.)
+        var mdcv = new MasteringDisplayColourVolume(8500, 39850, 6550, 2300, 35400, 14600, 15635, 16450, 10000000, 50);
+        var cll = new ContentLightLevel(1000, 400);
+        var src = Gradient(64, 40);
+        var dec = HeifCoder.Decode(HeifCoder.EncodeAvif(src, new AvifEncodeOptions
+        {
+            BitDepth = 10, ColorPrimaries = 9, TransferCharacteristics = 16, MatrixCoefficients = 9,
+            ContentLightLevel = cll, MasteringDisplay = mdcv,
+        }));
+        await Assert.That(dec.Metadata.ContentLightLevel).IsEqualTo(cll);
+        await Assert.That(dec.Metadata.MasteringDisplay).IsEqualTo(mdcv);
+        await Assert.That(dec.Metadata.Cicp).IsEqualTo(new CicpInfo(9, 16, 9, true));
+
+        // Carried by metadata into a re-encode, and absent when never set.
+        var again = HeifCoder.Decode(HeifCoder.EncodeAvif(dec, new AvifEncodeOptions { BitDepth = 10 }));
+        await Assert.That(again.Metadata.MasteringDisplay).IsEqualTo(mdcv);
+        await Assert.That(HeifCoder.Decode(HeifCoder.EncodeAvif(src)).Metadata.ContentLightLevel).IsNull();
+    }
+
+    [Test]
     public async Task Icc_FromFrameProperty_IsWritten()
     {
         // JPEG XL decode populates ImageFrame.IccProfile (not Metadata); that slot is honoured too.

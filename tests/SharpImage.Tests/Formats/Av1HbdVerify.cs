@@ -222,6 +222,14 @@ public sealed class Av1HbdVerify
             oi.Orientation = (OrientationType)o;
             File.WriteAllBytes(Path.Combine(outDir, $"ours_orient{o}.avif"), HeifCoder.EncodeAvif(oi, new AvifEncodeOptions { Qp = 2 }));
         }
+        var hdr = Gradient(96, 64, alpha: false, gray: false);
+        File.WriteAllBytes(Path.Combine(outDir, "ours_hdr.avif"), HeifCoder.EncodeAvif(hdr, new AvifEncodeOptions
+        {
+            BitDepth = 10, ColorPrimaries = 9, TransferCharacteristics = 16, MatrixCoefficients = 9,
+            ContentLightLevel = new SharpImage.Metadata.ContentLightLevel(1000, 400),
+            // BT.2020 primaries (G, B, R) / D65, 1000 cd/m2 max, 0.005 min — the classic HDR10 example
+            MasteringDisplay = new SharpImage.Metadata.MasteringDisplayColourVolume(8500, 39850, 6550, 2300, 35400, 14600, 15635, 16450, 10000000, 50),
+        }));
         var ci = Gradient(96, 64, alpha: false, gray: false);
         File.WriteAllBytes(Path.Combine(outDir, "ours_clap.avif"), HeifCoder.EncodeAvif(ci, new AvifEncodeOptions { Qp = 2, CropRect = (10, 7, 51, 33) }));
         var rgba = Gradient(96, 64, alpha: true, gray: false);

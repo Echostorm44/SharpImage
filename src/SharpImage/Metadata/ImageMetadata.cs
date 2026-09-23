@@ -42,6 +42,12 @@ public sealed class ImageMetadata
     /// </summary>
     public PixelAspectRatio? PixelAspectRatio { get; set; }
 
+    /// <summary>HDR content light level (CTA-861.3 MaxCLL / MaxFALL, cd/m²) — AVIF/HEIF 'clli'.</summary>
+    public ContentLightLevel? ContentLightLevel { get; set; }
+
+    /// <summary>HDR mastering display colour volume (SMPTE ST 2086) — AVIF/HEIF 'mdcv'.</summary>
+    public MasteringDisplayColourVolume? MasteringDisplay { get; set; }
+
     /// <summary>
     /// Whether any metadata is present.
     /// </summary>
@@ -60,10 +66,23 @@ public sealed class ImageMetadata
             Xmp = Xmp,
             IptcProfile = IptcProfile?.Clone(),
             Cicp = Cicp,
-            PixelAspectRatio = PixelAspectRatio
+            PixelAspectRatio = PixelAspectRatio,
+            ContentLightLevel = ContentLightLevel,
+            MasteringDisplay = MasteringDisplay
         };
     }
 }
+
+/// <summary>HDR content light level: maximum content light level and maximum frame-average light level, in cd/m².</summary>
+public sealed record ContentLightLevel(ushort MaxContentLightLevel, ushort MaxFrameAverageLightLevel);
+
+/// <summary>
+/// Mastering display colour volume (SMPTE ST 2086, as in the ISOBMFF 'mdcv' box): display primaries and white point in
+/// units of 0.00002 (CIE 1931 x/y), luminance in units of 0.0001 cd/m². Primaries are in G, B, R order.
+/// </summary>
+public sealed record MasteringDisplayColourVolume(
+    ushort GreenX, ushort GreenY, ushort BlueX, ushort BlueY, ushort RedX, ushort RedY,
+    ushort WhitePointX, ushort WhitePointY, uint MaxLuminance, uint MinLuminance);
 
 /// <summary>Pixel aspect ratio as relative horizontal and vertical pixel spacing (1:1 = square pixels).</summary>
 public sealed record PixelAspectRatio(uint HorizontalSpacing, uint VerticalSpacing);
