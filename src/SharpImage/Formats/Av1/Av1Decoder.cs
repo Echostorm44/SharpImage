@@ -656,6 +656,22 @@ internal sealed class Av1Decoder
         int sb128w = ctx.Sb128w;
         for (int i = 0; i < sb128w * fh.TileRows; i++)
             aboveCtx![i].Reset(isIntra);
+        ctx.AboveCtx = aboveCtx;
+
+        // Tile-boundary deblock bookkeeping (dav1d decode.c): right-edge tx contexts per tile column, and which SB
+        // rows start a tile row.
+        {
+            int alignH = (ctx.Bh + 31) & ~31;
+            int reSz = alignH * fh.TileCols;
+            if (ctx.TxLpfRightEdgeY.Length < reSz) { ctx.TxLpfRightEdgeY = new byte[reSz]; ctx.TxLpfRightEdgeUv = new byte[reSz]; }
+            if (ctx.StartOfTileRow.Length < ctx.SuperBlockRows) ctx.StartOfTileRow = new int[ctx.SuperBlockRows];
+            int sbyI = 0;
+            for (int tr = 0; tr < fh.TileRows && sbyI < ctx.SuperBlockRows; tr++)
+            {
+                ctx.StartOfTileRow[sbyI++] = tr;
+                while (sbyI < Math.Min((int)fh.TileRowStartSb[tr + 1], ctx.SuperBlockRows)) ctx.StartOfTileRow[sbyI++] = 0;
+            }
+        }
 
         // Allocate the ipred-edge backup buffers (pre-deblock bottom row of each SB row,
         // used as the top reference when predicting the first block-row of the next SB row).
@@ -1144,6 +1160,19 @@ internal sealed class Av1Decoder
                 aboveIdx++;
         }
 
+        // Back up the left tx_lpf contexts at this tile's right edge (dav1d decode_tile_sbrow): the loop filter uses
+        // them to fix the deblock strength of the next tile column's left edge.
+        {
+            int stepRows = sh.Sb128 ? 32 : 16;
+            int alignH = (ctx.Bh + 31) & ~31;
+            Array.Copy(t.Left.TxLpfY, t.By & 16, ctx.TxLpfRightEdgeY, alignH * tileCol + t.By, stepRows);
+            if (fh.PixelLayout != Av1PixelLayout.I400)
+            {
+                int ssV = fh.PixelLayout == Av1PixelLayout.I420 ? 1 : 0;
+                Array.Copy(t.Left.TxLpfUv, (t.By & 16) >> ssV, ctx.TxLpfRightEdgeUv, (alignH >> ssV) * tileCol + (t.By >> ssV), stepRows >> ssV);
+            }
+        }
+
         // Save MSAC state for next SB row
         ts.MsacState = msac.Save();
     }
@@ -1288,9 +1317,8 @@ internal sealed class Av1Decoder
                 AvDbg.W($"[PRE-DEBLOCK] Dumped F{fh.FrameOffset} {w}x{h} Y plane to {dumpPath}");
             }
 
-            bool startOfTileRow = true; // Simplified: we do one tile at a time
             Av1LoopFilter.LoopFilterSbRowCols(ctx, yPlane, uPlane, vPlane,
-                yOff, uvOff, uvOff, ctx.LfMasks, sby, startOfTileRow);
+                yOff, uvOff, uvOff, ctx.LfMasks, sby, ctx.StartOfTileRow.Length > sby ? ctx.StartOfTileRow[sby] : 0);
             Av1LoopFilter.LoopFilterSbRowRows(ctx, yPlane, uPlane, vPlane,
                 yOff, uvOff, uvOff, ctx.LfMasks, sby);
 

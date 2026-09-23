@@ -250,6 +250,14 @@ public sealed class Av1DecoderContext : IDisposable
     /// <summary>SB128 columns in frame (dav1d: f->sb128w).</summary>
     public int Sb128W;
 
+    /// <summary>dav1d f->lf.tx_lpf_right_edge: per tile column, the left-context tx_lpf_y/uv at the right edge of
+    /// each SB row (4-unit rows, stride alignH / alignH >> ss_ver) — used to fix deblock strength at tile-column starts.</summary>
+    public byte[] TxLpfRightEdgeY = [], TxLpfRightEdgeUv = [];
+    /// <summary>dav1d f->lf.start_of_tile_row: per SB row, the tile-row index when it starts a tile row (else 0).</summary>
+    public int[] StartOfTileRow = [];
+    /// <summary>The per-tile-row above block contexts (dav1d f->a), for the tile-row deblock fix-up.</summary>
+    public Av1BlockContextManaged[]? AboveCtx;
+
     /// <summary>Frame width in 4px blocks (dav1d: f->bw, also called w4).</summary>
     public int W4;
 

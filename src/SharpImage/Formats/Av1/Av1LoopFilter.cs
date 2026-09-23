@@ -958,9 +958,90 @@ public static class Av1LoopFilter
     /// <summary>
     /// Apply loop filter column pass for one SB row. Maps to dav1d_loopfilter_sbrow_cols.
     /// </summary>
+    // dav1d lf_apply_tmpl.c dav1d_loopfilter_sbrow_cols: the left/top edges of a tile were masked with *reset*
+    // neighbour contexts, so clamp their filter size to the real neighbour — the previous tile column's saved right-edge
+    // tx sizes, and the previous tile row's above context.
+    private static void FixTileBoundaryStrength(Av1DecoderContext ctx, Av1FilterMask[] lflvl, int sby, int startOfTileRow,
+        int isSb64, int starty4, int endy4, int uvEndy4, int ssHor, int ssVer)
+    {
+        var fh = ctx.FrameHeader!;
+        bool hasUv = fh.PixelLayout != Av1PixelLayout.I400;
+        int sbl2 = 5 - isSb64;
+        int halign = (ctx.Bh + 31) & ~31;
+        uint vmax = 1u << (16 >> ssVer), hmax = 1u << (16 >> ssHor);
+        int lpfY = sby << sbl2, lpfUv = sby << (sbl2 - ssVer);
+        for (int tileCol = 1; tileCol <= fh.TileCols; tileCol++)
+        {
+            int x = fh.TileColStartSb[tileCol];
+            if ((x << sbl2) >= ctx.Bw) break;
+            int bx4 = (x & isSb64) != 0 ? 16 : 0, cbx4 = bx4 >> ssHor;
+            x >>= isSb64;
+            var m = lflvl[x];
+            uint mask = 1u << starty4;
+            for (int y = starty4; y < endy4; y++, mask <<= 1)
+            {
+                int sidx = mask >= 0x10000u ? 1 : 0;
+                ushort smask = (ushort)(mask >> (sidx << 4));
+                int idx = ((m.FilterY[0, bx4, 2, sidx] & smask) != 0 ? 2 : 0) + ((m.FilterY[0, bx4, 1, sidx] & smask) != 0 ? 1 : 0);
+                m.FilterY[0, bx4, 2, sidx] &= (ushort)~smask;
+                m.FilterY[0, bx4, 1, sidx] &= (ushort)~smask;
+                m.FilterY[0, bx4, 0, sidx] &= (ushort)~smask;
+                m.FilterY[0, bx4, Math.Min(idx, ctx.TxLpfRightEdgeY[lpfY + y - starty4]), sidx] |= smask;
+            }
+            if (hasUv)
+            {
+                uint uvMask = 1u << (starty4 >> ssVer);
+                for (int y = starty4 >> ssVer; y < uvEndy4; y++, uvMask <<= 1)
+                {
+                    int sidx = uvMask >= vmax ? 1 : 0;
+                    ushort smask = (ushort)(uvMask >> (sidx << (4 - ssVer)));
+                    int idx = (m.FilterUv[0, cbx4, 1, sidx] & smask) != 0 ? 1 : 0;
+                    m.FilterUv[0, cbx4, 1, sidx] &= (ushort)~smask;
+                    m.FilterUv[0, cbx4, 0, sidx] &= (ushort)~smask;
+                    m.FilterUv[0, cbx4, Math.Min(idx, ctx.TxLpfRightEdgeUv[lpfUv + y - (starty4 >> ssVer)]), sidx] |= smask;
+                }
+            }
+            lpfY += halign;
+            lpfUv += halign >> ssVer;
+        }
+
+        if (startOfTileRow == 0 || ctx.AboveCtx == null) return;
+        for (int x = 0; x < ctx.Sb128W; x++)
+        {
+            var a = ctx.AboveCtx[ctx.Sb128W * (startOfTileRow - 1) + x];
+            var m = lflvl[x];
+            int w = Math.Min(32, ctx.W4 - (x << 5));
+            uint mask = 1;
+            for (int i = 0; i < w; mask <<= 1, i++)
+            {
+                int sidx = mask >= 0x10000u ? 1 : 0;
+                ushort smask = (ushort)(mask >> (sidx << 4));
+                int idx = ((m.FilterY[1, starty4, 2, sidx] & smask) != 0 ? 2 : 0) + ((m.FilterY[1, starty4, 1, sidx] & smask) != 0 ? 1 : 0);
+                m.FilterY[1, starty4, 2, sidx] &= (ushort)~smask;
+                m.FilterY[1, starty4, 1, sidx] &= (ushort)~smask;
+                m.FilterY[1, starty4, 0, sidx] &= (ushort)~smask;
+                m.FilterY[1, starty4, Math.Min(idx, a.TxLpfY[i]), sidx] |= smask;
+            }
+            if (hasUv)
+            {
+                int cw = (w + ssHor) >> ssHor, cy = starty4 >> ssVer;
+                uint uvMask = 1;
+                for (int i = 0; i < cw; uvMask <<= 1, i++)
+                {
+                    int sidx = uvMask >= hmax ? 1 : 0;
+                    ushort smask = (ushort)(uvMask >> (sidx << (4 - ssHor)));
+                    int idx = (m.FilterUv[1, cy, 1, sidx] & smask) != 0 ? 1 : 0;
+                    m.FilterUv[1, cy, 1, sidx] &= (ushort)~smask;
+                    m.FilterUv[1, cy, 0, sidx] &= (ushort)~smask;
+                    m.FilterUv[1, cy, Math.Min(idx, a.TxLpfUv[i]), sidx] |= smask;
+                }
+            }
+        }
+    }
+
     public static void LoopFilterSbRowCols(Av1DecoderContext ctx, Span<ushort> yPlane,
         Span<ushort> uPlane, Span<ushort> vPlane, int yOffset, int uOffset, int vOffset,
-        Av1FilterMask[] lflvl, int sby, bool startOfTileRow)
+        Av1FilterMask[] lflvl, int sby, int startOfTileRow)
     {
         int bitDepth = ctx.BitDepth;
         ref readonly var fh = ref ctx.FrameHeader;
@@ -973,7 +1054,7 @@ public static class Av1LoopFilter
         int ssHor = ctx.PixelLayout != Av1PixelLayout.I444 ? 1 : 0;
         int uvEndy4 = (endy4 + ssVer) >> ssVer;
 
-        // TODO: fix lpf strength at tile col/row boundaries (requires tx_lpf_right_edge)
+        FixTileBoundaryStrength(ctx, lflvl, sby, startOfTileRow, isSb64, starty4, endy4, uvEndy4, ssHor, ssVer);
 
         // Filter luma columns
         int yOff = yOffset;

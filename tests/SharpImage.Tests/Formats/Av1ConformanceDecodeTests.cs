@@ -32,6 +32,11 @@ public sealed class Av1ConformanceDecodeTests
     [Arguments("sharpimage_8bit_422_384x256.avif", 384, 256, "0276804a28f4241f102ec42867a23495")]
     [Arguments("sharpimage_10bit_422_257x131.avif", 257, 131, "5488799f8f03fb637ed61970e93efc7b")]
     [Arguments("sharpimage_12bit_422_384x256.avif", 384, 256, "f68aaa6429308459eb317ab9b8832a78")]
+    // Multi-tile frames (libaom via libavif, tilelog2): deblock strength is fixed up at tile-column / tile-row starts
+    // from the saved right-edge / previous-row tx contexts (dav1d tx_lpf_right_edge, start_of_tile_row).
+    [Arguments("libavif_8bit_420_517x333_tiles2x2.avif", 517, 333, "a6833bdbc249ed72b20ef4e6534cd97e")]
+    [Arguments("libavif_8bit_420_1300x300_tiles2x4.avif", 1300, 300, "3cfdf31cba06724a2e0ae1371a2791f6")]
+    [Arguments("libavif_10bit_420_700x420_tiles2x2.avif", 700, 420, "a9a105e5d1abb7ec158e182c20c3dea5")]
     public async Task DecodesByteExactVsDav1d(string file, int w, int h, string md5)
     {
         byte[] item = PrimaryItemData(File.ReadAllBytes(Asset(file)));
