@@ -1010,6 +1010,7 @@ public sealed class Av1HbdVerify
                         case "qalpha": o.QualityAlpha = int.Parse(t[1]); break;
                         case "target": o.TargetSize = int.Parse(t[1]); break;
                         case "sharp": o.SharpYuv = true; break;
+                        case "ext": o.BitDepthExtension = t[1] switch { "8,8" => AvifBitDepthExtension.Bits8Plus8, "12,4" => AvifBitDepthExtension.Bits12Plus4, _ => AvifBitDepthExtension.Bits12Plus8Overlap4 }; break;
                         case "layers":
                             o.Layers = t[1].Split(',').Select(spec =>
                             {

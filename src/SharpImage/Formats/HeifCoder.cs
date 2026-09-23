@@ -37,6 +37,20 @@ public enum AvifChromaSubsampling
     Yuv400,
 }
 
+/// <summary>libavif bit-depth extension recipes (avifenc -d D,Dextension): a 16-bit image stored as a backward-compatible
+/// base item plus a hidden item with the remaining bits, combined by a 'sato' Sample Transform derived item.</summary>
+public enum AvifBitDepthExtension
+{
+    /// <summary>No extension (a single coded item).</summary>
+    None,
+    /// <summary>avifenc -d 8,8: 8 most significant bits (lossless) + 8 least significant bits.</summary>
+    Bits8Plus8,
+    /// <summary>avifenc -d 12,4: 12 most significant bits (lossless) + 4 least significant bits.</summary>
+    Bits12Plus4,
+    /// <summary>avifenc -d 12,8: 12 most significant bits (lossy allowed) + an 8-bit residual overlapping 4 bits.</summary>
+    Bits12Plus8Overlap4,
+}
+
 /// <summary>One layer of a layered AVIF (avifenc --layered): coded at a scaling fraction of the image size with its own
 /// quality, optionally from its own image (same size as the main image, as avifenc requires).</summary>
 public sealed class AvifLayer
@@ -215,6 +229,10 @@ public sealed class AvifEncodeOptions
     /// <summary>Sharp RGB -> YUV 4:2:0 (avifenc --sharpyuv, libsharpyuv): chroma and luma refined together in linear light
     /// so upsampled colour edges stay crisp. Applies to 4:2:0 with the kr/kb matrices; ignored otherwise.</summary>
     public bool SharpYuv { get; set; }
+
+    /// <summary>Store 16-bit samples through a Sample Transform (avifenc -d 8,8 / 12,4 / 12,8): readers without Sample
+    /// Transform support see the base image, this decoder (and avifdec --sato) the full 16 bits.</summary>
+    public AvifBitDepthExtension BitDepthExtension { get; set; }
 
     internal AvifEncodeOptions Clone() => (AvifEncodeOptions)MemberwiseClone();
 }
@@ -500,6 +518,14 @@ public static partial class HeifCoder
         // libavif validates the gain map of every file carrying the 'tmap' brand; invalid gain map metadata fails the decode.
         FindGainMap(c, decodeImage: false);
 
+        // ---- a Sample Transform ('sato', e.g. 16-bit depth extension) preferred over the primary: decoded as avifdec does
+        ImageFrame frame;
+        if (TryDecodeSampleTransform(c, pid) is { } satoFrame)
+        {
+            frame = satoFrame;
+            goto primaryMetadata;
+        }
+
         // ---- colour image: a coded item, or a 'grid' of coded tiles (ISO/IEC 23008-12 6.6.2.3) ----------------------
         var (tiles, rows, cols, outW, outH, codec) = ResolveImageTiles(c, pid);
         var nclx = Nclx(c, pid);
@@ -516,7 +542,7 @@ public static partial class HeifCoder
                  && c.ItemData(premAlphaId) is { } agp)
             premAlpha = DecodeAlphaGridNative(c, c.ReferencesFrom(premAlphaId, "dimg"), ParseImageGrid(agp), outW, outH);
 
-        ImageFrame frame = DecodeImageTiles(c, tiles, rows, cols, outW, outH, codec, nclx, premAlpha);
+        frame = DecodeImageTiles(c, tiles, rows, cols, outW, outH, codec, nclx, premAlpha);
         frame.Depth = ItemBitDepth(c, tiles[0]);
 
         // ---- alpha: an auxl alpha item (or alpha grid) of the primary; else per-tile alpha items -------------------
@@ -545,6 +571,7 @@ public static partial class HeifCoder
         // Premultiplied grids (alpha not available during conversion): un-premultiply the 16-bit result.
         if (premAlphaId >= 0 && premAlpha == null && frame.HasAlpha) UnpremultiplyFrame(frame);
 
+    primaryMetadata:
         // ---- metadata of the primary: ICC, Exif, XMP, pasp; then transforms -----------------------------------------
         if (c.Property(pid, "colr", (o, l) => l > 4 && Encoding.ASCII.GetString(data, o, 4) is "prof" or "rICC") is { } prof)
         {
@@ -959,6 +986,11 @@ public static partial class HeifCoder
         options ??= new AvifEncodeOptions();
         if (options.TargetSize is { } target)
             return SearchTargetSize(options, target, o => EncodeAvif(image, o));
+        if (options.BitDepthExtension != AvifBitDepthExtension.None)
+        {
+            using var satoTiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, (int)image.Columns, (int)image.Rows));
+            return EncodeAvifBitDepthExtension(image, options);
+        }
         if (options.Grid is { } grid && (grid.Columns != 1 || grid.Rows != 1))
         {
             if (options.Layers is { Count: > 0 }) throw new NotSupportedException("Layered grid images are not supported.");

@@ -28,6 +28,7 @@ internal sealed class AvifContainerExtras
 
     public AvifSequenceData? Sequence;       // image sequence (animated AVIF): tracks written after the items
     public AvifGainMapItem? GainMap;         // ISO 21496-1 gain map: 'tmap' derived item + hidden gain map image item
+    public AvifSampleTransformItems? SampleTransform;   // 'sato' bit-depth extension: derived item + hidden input items
 
     internal bool HasItems => Exif != null || Xmp != null;
 }
@@ -57,6 +58,21 @@ internal sealed class AvifGridCells
     public List<byte[]> Color = [];
     public List<byte[]>? Alpha;
     public byte[] ColorAv1CBox = [], AlphaAv1CBox = [];
+}
+
+/// <summary>A 'sato' Sample Transform derived item (libavif bit-depth extension) and its hidden second input items, laid
+/// out as libavif writes them: the sato item (payload = SampleTransform box contents; ispe, pixi at the extended depth)
+/// preferred over the colour item in an 'altr' group and deriving from [colour, hidden colour] ('dimg'); the hidden
+/// colour item (ispe / pixi / av1C) with, for translucent images, a hidden alpha item (auxl to the hidden colour).</summary>
+internal sealed class AvifSampleTransformItems
+{
+    public byte[] Payload = [];
+    public int Depth = 16;
+    public byte[] HiddenColor = [];
+    public int HiddenDepth = 8;
+    public byte[] HiddenColorAv1CBox = [];
+    public byte[]? HiddenAlpha;
+    public byte[] HiddenAlphaAv1CBox = [];
 }
 
 internal sealed class AvifSequenceData
@@ -102,7 +118,7 @@ internal static class Av1AvifWriter
 
     // AV1CodecConfigurationRecord (av1C payload): the fixed 4-byte record only (configOBUs omitted, as libaom's
     // AVIF output does — the sequence header travels in-band in mdat).
-    private static byte[] BuildAv1C(Av1PixelLayout layout, int bitDepth, int width, int height)
+    internal static byte[] BuildAv1C(Av1PixelLayout layout, int bitDepth, int width, int height)
     {
         // seq_level_idx_0 = 0 (matches Av1ObuWriter's reduced-still header), tier 0. seq_profile / high_bitdepth /
         // twelve_bit / subsampling mirror the sequence header's color_config.
@@ -171,6 +187,8 @@ internal static class Av1AvifWriter
         bool monochrome = layout == Av1PixelLayout.I400;
         var sq = x?.Sequence;
         var gmx = x?.GainMap;
+        var stx = x?.SampleTransform;
+        if (gmx != null && stx != null) throw new NotSupportedException("A gain map and a Sample Transform cannot share the 'altr' group.");
         byte[] ftyp = Ftyp(bitDepth, layout, sq != null, gmx != null);
 
         var props = new List<byte[]>();
@@ -240,6 +258,33 @@ internal static class Av1AvifWriter
             assocGm.AddRange(transforms);  // the gain map is transformed exactly like the colour image
         }
 
+        var assocSato = new List<(int Index, bool Essential)>();
+        var assocHidden = new List<(int Index, bool Essential)>();
+        var assocHiddenAlpha = new List<(int Index, bool Essential)>();
+        if (stx != null)
+        {
+            int chs = monochrome ? 1 : 3;
+            var sp = new byte[1 + chs];
+            sp[0] = (byte)chs;
+            for (int i = 1; i <= chs; i++) sp[i] = (byte)stx.Depth;
+            assocSato.Add((ispeIdx, false));
+            assocSato.Add((AddShared(FullBox("pixi", 0, 0, sp)), false));
+            var hp = new byte[1 + chs];
+            hp[0] = (byte)chs;
+            for (int i = 1; i <= chs; i++) hp[i] = (byte)stx.HiddenDepth;
+            assocHidden.Add((ispeIdx, false));
+            assocHidden.Add((AddShared(FullBox("pixi", 0, 0, hp)), false));
+            assocHidden.Add((AddShared(stx.HiddenColorAv1CBox), true));
+            if (stx.HiddenAlpha != null)
+            {
+                assocHiddenAlpha.Add((ispeIdx, false));
+                assocHiddenAlpha.Add((AddShared(stx.HiddenAlphaAv1CBox), true));
+                byte[] urn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
+                assocHiddenAlpha.Add((AddShared(FullBox("auxC", 0, 0, urn)), true));
+                assocHiddenAlpha.Add((AddShared(FullBox("pixi", 0, 0, new byte[] { 1, (byte)stx.HiddenDepth })), false));
+            }
+        }
+
         // Items: (id, type, payload, infe name / content type, infe flags; 1 = hidden).
         var items = new List<(int Id, string Type, byte[] Payload, byte[] InfeExtra, uint Flags)>
         {
@@ -255,6 +300,19 @@ internal static class Av1AvifWriter
             gmId = nextId++;
             items.Add((gmId, "av01", gmx.Data, new byte[] { 0 }, 1));
         }
+        int satoId = 0, hiddenId = 0, hiddenAlphaId = 0;
+        if (stx != null)
+        {
+            satoId = nextId++;
+            items.Add((satoId, "sato", stx.Payload, new byte[] { 0 }, 0));
+            hiddenId = nextId++;
+            items.Add((hiddenId, "av01", stx.HiddenColor, new byte[] { 0 }, 1));
+            if (stx.HiddenAlpha != null)
+            {
+                hiddenAlphaId = nextId++;
+                items.Add((hiddenAlphaId, "av01", stx.HiddenAlpha, new byte[] { 0 }, 0));
+            }
+        }
         int exifId = 0, xmpId = 0;
         if (x?.Exif is { Length: > 0 } exif)
         {
@@ -268,7 +326,8 @@ internal static class Av1AvifWriter
         }
 
         byte[] ipco = Box("ipco", Concat(props.ToArray()));
-        var ipmaBody = new List<byte[]> { U32((uint)((alphaData != null ? 2 : 1) + (gmx != null ? 2 : 0))) };
+        var ipmaBody = new List<byte[]> { U32((uint)((alphaData != null ? 2 : 1) + (gmx != null ? 2 : 0)
+            + (stx != null ? (stx.HiddenAlpha != null ? 3 : 2) : 0))) };
         void Assoc(int id, List<(int Index, bool Essential)> a)
         {
             ipmaBody.Add(U16(id));
@@ -278,6 +337,12 @@ internal static class Av1AvifWriter
         Assoc(1, assoc1);
         if (alphaData != null) Assoc(2, assoc2);
         if (gmx != null) { Assoc(tmapId, assocTmap); Assoc(gmId, assocGm); }
+        if (stx != null)
+        {
+            Assoc(satoId, assocSato);
+            Assoc(hiddenId, assocHidden);
+            if (hiddenAlphaId != 0) Assoc(hiddenAlphaId, assocHiddenAlpha);
+        }
         byte[] iprp = Box("iprp", Concat(ipco, FullBox("ipma", 0, 0, Concat(ipmaBody.ToArray()))));
 
         byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc("pict"), U32(0), U32(0), U32(0),
@@ -292,6 +357,15 @@ internal static class Av1AvifWriter
         if (alphaData != null) refs.Add(Box("auxl", Concat(U16(2), U16(1), U16(1))));   // from_ID, ref_count, to_ID
         if (alphaData != null && x?.Premultiplied == true) refs.Add(Box("prem", Concat(U16(1), U16(1), U16(2))));   // colour premultiplied by alpha
         if (gmx != null) refs.Add(Box("dimg", Concat(U16(tmapId), U16(2), U16(1), U16(gmId))));   // tmap from [colour, gain map]
+        if (stx != null)
+        {
+            refs.Add(Box("dimg", Concat(U16(satoId), U16(2), U16(1), U16(hiddenId))));   // sato from [colour, hidden colour]
+            if (hiddenAlphaId != 0)
+            {
+                refs.Add(Box("auxl", Concat(U16(hiddenAlphaId), U16(1), U16(hiddenId))));
+                if (x?.Premultiplied == true) refs.Add(Box("prem", Concat(U16(hiddenId), U16(1), U16(hiddenAlphaId))));
+            }
+        }
         if (exifId != 0) refs.Add(Box("cdsc", Concat(U16(exifId), U16(1), U16(1))));
         if (xmpId != 0) refs.Add(Box("cdsc", Concat(U16(xmpId), U16(1), U16(1))));
         byte[]? iref = refs.Count > 0 ? FullBox("iref", 0, 0, Concat(refs.ToArray())) : null;
@@ -334,6 +408,8 @@ internal static class Av1AvifWriter
         // not collide with an item id.
         byte[] grpl = gmx != null
             ? Box("grpl", FullBox("altr", 0, 0, Concat(U32((uint)nextId), U32(2), U32((uint)tmapId), U32(1))))
+            : stx != null
+            ? Box("grpl", FullBox("altr", 0, 0, Concat(U32((uint)nextId), U32(2), U32((uint)satoId), U32(1))))
             : [];
 
         byte[] Meta(uint mdatStart) => FullBox("meta", 0, 0, iref != null
