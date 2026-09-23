@@ -1580,6 +1580,103 @@ public sealed class Av1HbdVerify
                     log.AppendLine($"ok {t[2]}");
                     continue;
                 }
+                if (t[0] == "obudec")
+                {
+                    // obudec <stream.obu> <sizes (comma list)> <out.yuv>: decode sample by sample, write every frame's
+                    // planes (8-bit bytes, or 16-bit LE above 8 bits) as dav1d -o does.
+                    byte[] obu = File.ReadAllBytes(t[1]);
+                    var sizes = t[2].Split(',').Select(int.Parse).ToArray();
+                    var dec = new Av1Decoder();
+                    using var outF = File.Create(t[3]);
+                    int off = 0;
+                    for (int si = 0; si < sizes.Length; si++)
+                    {
+                        using var f = dec.Decode(obu.AsSpan(off, sizes[si]), si, si == 0) ?? throw new Exception("decode failed " + si + ": " + Av1Decoder.LastDecodeError);
+                        off += sizes[si];
+                        var fhq = (Av1DecoderFrameHeader)typeof(Av1Decoder).GetField("frameHdr", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(dec)!;
+                        log.Append($"q{fhq.QuantBaseQIdx} ");
+                        int ssx = f.Format is PixelFormat.Yuv444P or PixelFormat.Yuv444P10 or PixelFormat.Yuv444P12 ? 0 : 1;
+                        int ssy = f.Format is PixelFormat.Yuv420P or PixelFormat.Yuv420P10 or PixelFormat.Yuv420P12 ? 1 : 0;
+                        bool monoOut = t.Length > 4 && t[4] == "mono";   // dav1d writes only luma for 4:0:0
+                        for (int pl = 0; pl < (monoOut ? 1 : 3); pl++)
+                        {
+                            int pw = pl == 0 ? f.Width : (f.Width + ssx) >> ssx, ph = pl == 0 ? f.Height : (f.Height + ssy) >> ssy;
+                            int stride = pl == 0 ? f.YStride : pl == 1 ? f.UStride : f.VStride;
+                            for (int y = 0; y < ph; y++)
+                            {
+                                if (f.BitDepth > 8)
+                                {
+                                    var src = (pl == 0 ? f.YPlane16 : pl == 1 ? f.UPlane16 : f.VPlane16).Span.Slice(y * stride, pw);
+                                    foreach (ushort v in src) { outF.WriteByte((byte)v); outF.WriteByte((byte)(v >> 8)); }
+                                }
+                                else outF.Write((pl == 0 ? f.YPlane : pl == 1 ? f.UPlane : f.VPlane).Span.Slice(y * stride, pw));
+                            }
+                        }
+                    }
+                    log.AppendLine($"ok {t[3]} {sizes.Length} frames");
+                    continue;
+                }
+                if (t[0] == "seqenc")
+                {
+                    // seqenc <out.avif> <w> <h> <frames> <alpha 0|1> [quality] [kf] [bd] [yuv]
+                    int sw = int.Parse(t[2]), sh = int.Parse(t[3]), nf = int.Parse(t[4]);
+                    bool sa = t[5] == "1";
+                    using var seq = new ImageSequence();
+                    var rnd = new Random(5);
+                    var tex = new byte[512 * 512 * 3];
+                    rnd.NextBytes(tex);
+                    for (int i = 0; i < tex.Length; i++) tex[i] = (byte)((tex[i] >> 2) + 64);
+                    ImageFrame? photo = t.Length > 10 && t[10] != "-" ? FormatRegistry.Read(t[10]) : null;
+                    for (int fi = 0; fi < nf; fi++)
+                    {
+                        var fr = new ImageFrame();
+                        fr.Initialize(sw, sh, SharpImage.Core.ColorspaceType.SRGB, sa);
+                        int nch = fr.NumberOfChannels;
+                        for (int y = 0; y < sh; y++)
+                        {
+                            var row = fr.GetPixelRowForWrite(y);
+                            for (int x = 0; x < sw; x++)
+                            {
+                                // A textured, smooth-shaded background panning 3 px right and 1 px down per frame, plus a
+                                // sprite moving the other way.
+                                int tx = (x - 3 * fi) & 511, ty = (y - fi) & 511;
+                                int bx0 = (x + 2 * fi) - sw / 2, by0 = y - sh / 2;
+                                bool sprite = bx0 * bx0 + by0 * by0 < (sh / 5) * (sh / 5);
+                                for (int k = 0; k < 3; k++)
+                                {
+                                    int v = sprite ? 40 + 70 * k : (tex[(ty * 512 + tx) * 3 + k] + (tx + ty) / 4 * (k + 1)) & 255;
+                                    if (photo != null)
+                                    {
+                                        // Natural content: a window panning 3 px right / 1 px down per frame over the photo.
+                                        int px2 = Math.Min(x + 3 * fi, (int)photo.Columns - 1), py2 = Math.Min(y + fi, (int)photo.Rows - 1);
+                                        v = sprite ? 40 + 70 * k : photo.GetPixelRow(py2)[px2 * photo.NumberOfChannels + k] >> 8;
+                                    }
+                                    row[x * nch + k] = (ushort)(v * 257);
+                                }
+                                if (sa) row[x * nch + 3] = (ushort)(((x + y + fi * 4) & 255) * 257);
+                            }
+                        }
+                        fr.Delay = 10;
+                        seq.AddFrame(fr);
+                    }
+                    var so = new AvifEncodeOptions();
+                    if (t.Length > 6) so.Quality = int.Parse(t[6]);
+                    if (t.Length > 7) so.KeyframeInterval = int.Parse(t[7]);
+                    if (t.Length > 8) so.BitDepth = int.Parse(t[8]);
+                    if (t.Length > 9) so.ChromaSubsampling = Enum.Parse<AvifChromaSubsampling>(t[9]);
+                    if (t.Length > 11) so.TileColumnsLog2 = int.Parse(t[11]);
+                    var sw2 = System.Diagnostics.Stopwatch.StartNew();
+                    byte[] avif = HeifCoder.EncodeAvifSequence(seq, so);
+                    File.WriteAllBytes(t[1], avif);
+                    var dec = HeifCoder.DecodeSequence(avif);
+                    for (int fi = 0; fi < dec.Count; fi++)
+                    {
+                        File.WriteAllBytes($"{t[1]}.f{fi}.rgb48", Rgb48(dec[fi]));
+                        File.WriteAllBytes($"{t[1]}.src{fi}.rgb48", Rgb48(seq[fi]));
+                    }
+                    log.AppendLine($"ok {t[1]} {avif.Length} bytes {dec.Count} frames {sw2.ElapsedMilliseconds} ms");
+                    continue;
+                }
                 if (t[0] == "progdec")
                 {
                     var layers = HeifCoder.DecodeProgressive(File.ReadAllBytes(t[1]));

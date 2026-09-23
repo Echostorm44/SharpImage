@@ -166,6 +166,12 @@ public sealed class AvifEncodeOptions
     /// reader decodes the full image. Not available with <see cref="Lossless"/>.</summary>
     public bool Progressive { get; set; }
 
+    /// <summary>Image sequences (avifenc --keyframe): the maximum distance between key frames — any
+    /// <c>KeyframeInterval</c> consecutive frames include at least one. 0 (default): only the first frame, plus scene
+    /// cuts; 1: every frame is a key frame (all-intra). The other frames are inter frames predicted from the previous
+    /// frame.</summary>
+    public int KeyframeInterval { get; set; }
+
     /// <summary>An ISO 21496-1 gain map to store with the image (e.g. from <see cref="HeifCoder.ComputeGainMap"/>): a
     /// 'tmap' tone-mapped derived item preferred over the image, and the gain map as a hidden image item, laid out as
     /// libavif writes them. Its <see cref="AvifGainMap.Image"/> is coded at its <c>Depth</c> (8, 10 or 12).</summary>
@@ -1327,7 +1333,17 @@ public static partial class HeifCoder
         int gssX = layout == Av1.Av1PixelLayout.I444 ? 0 : 1, gssY = layout == Av1.Av1PixelLayout.I420 ? 1 : 0;
         int max = (1 << bd) - 1;
 
-        var sq = new Av1.AvifSequenceData { ColorSamples = [], AlphaSamples = hasAlpha ? [] : null };
+        var sq = new Av1.AvifSequenceData
+        {
+            ColorSamples = [], AlphaSamples = hasAlpha ? [] : null, ColorSync = [], AlphaSync = hasAlpha ? [] : null,
+        };
+        if (options.KeyframeInterval < 0) throw new ArgumentOutOfRangeException(nameof(options), "KeyframeInterval must be >= 0.");
+        // Inter frames reference the previous frame as the decoder reconstructs it (before film grain synthesis).
+        var colorDec = new Av1.Av1Decoder { ApplyFilmGrain = false };
+        var alphaDec = hasAlpha ? new Av1.Av1Decoder { ApplyFilmGrain = false } : null;
+        Av1.Av1InterEncoder.Picture? refC = null, refA = null;
+        int sinceKey = 0, lastKeyBytes = 0;
+        var noCdef = new Av1.Av1ObuWriter.CdefParams(3, 0, [0], [0]);
         byte[] td = [0x12, 0x00];   // temporal delimiter: every sample is one complete temporal unit (as libavif writes)
         var ls = new Av1.Av1ObuWriter.LayeredStream
         {
@@ -1375,18 +1391,64 @@ public static partial class HeifCoder
                     }
                 }
 
-                (byte[] cSeq, byte[] cFrame) cObus;
+                // Key frame: the first, every KeyframeInterval-th, and scene cuts (an inter frame about as large as a key
+                // frame). Lossless sequences stay all-intra.
+                bool key = lossless || refC == null || (options.KeyframeInterval > 0 && sinceKey >= options.KeyframeInterval);
+                byte[] cSample;
+                int lf = InterLoopFilterLevel(baseQIdx, bd);
                 using (Av1.Av1ObuWriter.UseFilmGrain(grain?.ToAv1(mono, mono ? 1 : gssX, mono ? 1 : gssY), !mono && gssX == 1 && gssY == 1))
-                    cObus = lossless
-                        ? Av1.Av1StillImageEncoder.BuildLosslessObus(yP, uP, vP, mono, w, h, bd, codedLayout,
-                            mono && color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color)
-                        : mono ? Av1.Av1StillImageEncoder.BuildMonochromeObus(yP, w, h, baseQIdx, bd, color)
-                        : Av1.Av1StillImageEncoder.BuildColorObus(yP, uP!, vP!, w, h, baseQIdx, bd, layout, color);
-                sq.ColorSamples.Add([.. td, .. cObus.cSeq, .. cObus.cFrame]);
+                {
+                    byte[]? interObu = null;
+                    if (!key)
+                    {
+                        ls.InterFrame = true;
+                        try
+                        {
+                            interObu = Av1.Av1InterEncoder.EncodeFrameObu(new Av1.Av1InterEncoder.Picture { Y = yP, U = uP, V = vP, Width = w, Height = h },
+                                refC!, bd, codedLayout, baseQIdx, noCdef, lf);
+                        }
+                        finally { ls.InterFrame = false; }
+                        if (interObu.Length > lastKeyBytes * 9 / 10) interObu = null;
+                    }
+                    if (interObu != null) cSample = [.. td, .. interObu];
+                    else
+                    {
+                        key = true;
+                        (byte[] cSeq, byte[] cFrame) cObus = lossless
+                            ? Av1.Av1StillImageEncoder.BuildLosslessObus(yP, uP, vP, mono, w, h, bd, codedLayout,
+                                mono && color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color)
+                            : mono ? Av1.Av1StillImageEncoder.BuildMonochromeObus(yP, w, h, KeyFrameQIdx(baseQIdx, bd), bd, color)
+                            : Av1.Av1StillImageEncoder.BuildColorObus(yP, uP!, vP!, w, h, KeyFrameQIdx(baseQIdx, bd), bd, layout, color);
+                        cSample = [.. td, .. cObus.cSeq, .. cObus.cFrame];
+                        lastKeyBytes = cObus.cFrame.Length;
+                    }
+                }
+                sinceKey = key ? 1 : sinceKey + 1;
+                sq.ColorSamples.Add(cSample);
+                sq.ColorSync!.Add(key);
+                if (!lossless) refC = DecodedPicture(colorDec, cSample, key, mono, gssX, gssY);
                 if (alpha != null)
                 {
-                    var aObus = Av1.Av1StillImageEncoder.BuildAlphaObus(alpha, w, h, alphaQIdx, bd);
-                    sq.AlphaSamples!.Add([.. td, .. aObus.SeqObu, .. aObus.FrameObu]);
+                    // The alpha track keeps the colour track's key frames.
+                    byte[] aSample;
+                    if (key)
+                    {
+                        var aObus = Av1.Av1StillImageEncoder.BuildAlphaObus(alpha, w, h, lossless ? alphaQIdx : KeyFrameQIdx(alphaQIdx, bd), bd);
+                        aSample = [.. td, .. aObus.SeqObu, .. aObus.FrameObu];
+                    }
+                    else
+                    {
+                        ls.InterFrame = true;
+                        try
+                        {
+                            aSample = [.. td, .. Av1.Av1InterEncoder.EncodeFrameObu(new Av1.Av1InterEncoder.Picture { Y = alpha, Width = w, Height = h },
+                                refA!, bd, Av1.Av1PixelLayout.I400, Math.Max(alphaQIdx, 1), noCdef, InterLoopFilterLevel(alphaQIdx, bd))];
+                        }
+                        finally { ls.InterFrame = false; }
+                    }
+                    sq.AlphaSamples!.Add(aSample);
+                    sq.AlphaSync!.Add(key);
+                    if (!lossless) refA = DecodedPicture(alphaDec!, aSample, key, true, 1, 1);
                 }
             }
         }
@@ -1403,6 +1465,67 @@ public static partial class HeifCoder
         return hasAlpha
             ? Av1.Av1AvifWriter.BuildAvifWithAlpha(c0, [], sq.AlphaSamples![0], [], w, h, mono, bd, layout, color, extras)
             : Av1.Av1AvifWriter.BuildAvif(c0, [], w, h, mono, bd, layout, color, extras);
+    }
+
+    // Key frames of a sequence get a lower q-index than the cq level the inter frames use, as libaom's good-quality
+    // rate control gives them (its lookahead key-frame boost): measured on libavif sequences at qualities 30-80 its key
+    // frames sit at the q-index whose quantizer is ~0.43x the cq level's (av1_compute_qdelta: the smallest q-index
+    // reaching each q, q = ac_quant / 4, 16, 64 for 8, 10, 12 bits) — cq 52/76/100/128/152 -> 19/29/42/69/101
+    // against libaom's 19/30/43/69/100.
+    internal static int KeyFrameQIdx(int cqIdx, int bd)
+    {
+        if (cqIdx == 0) return 0;
+        int bdIdx = bd == 8 ? 0 : bd == 10 ? 1 : 2;
+        double scale = bd == 8 ? 4.0 : bd == 10 ? 16.0 : 64.0;
+        int FindQIdx(double q)
+        {
+            for (int i = 0; i < 255; i++) if (Av1.Av1Tables.DequantTable[bdIdx, i, 1] / scale >= q) return i;
+            return 255;
+        }
+        double qv = Av1.Av1Tables.DequantTable[bdIdx, cqIdx, 1] / scale;
+        return Math.Clamp(cqIdx + FindQIdx(qv * 0.43) - FindQIdx(qv), 1, 255);
+    }
+
+    // libaom picklpf.c LPF_PICK_FROM_Q for inter frames: the deblocking level guessed from the AC quantizer.
+    private static int InterLoopFilterLevel(int qIdx, int bd)
+    {
+        int q = Av1.Av1Tables.DequantTable[bd == 8 ? 0 : bd == 10 ? 1 : 2, Math.Clamp(qIdx, 0, 255), 1];
+        long guess = bd switch
+        {
+            8 => ((long)q * 6017 + 650707 + (1 << 17)) >> 18,
+            10 => ((long)q * 20723 + 4060632 + (1 << 19)) >> 20,
+            _ => ((long)q * 20723 + 16242526 + (1 << 21)) >> 22,
+        };
+        return (int)Math.Clamp(guess, 0, 63);
+    }
+
+    // Decodes one coded sample and returns the reconstruction (the next inter frame's reference).
+    private static Av1.Av1InterEncoder.Picture DecodedPicture(Av1.Av1Decoder dec, byte[] sample, bool key, bool mono, int ssX, int ssY)
+    {
+        using var f = dec.Decode(sample, 0, key) ?? throw new InvalidOperationException("Reference decode failed: " + Av1.Av1Decoder.LastDecodeError);
+        int w = f.Width, h = f.Height;
+        ushort[] Plane(int pl, int pw, int ph)
+        {
+            var o = new ushort[pw * ph];
+            int stride = pl == 0 ? f.YStride : pl == 1 ? f.UStride : f.VStride;
+            if (f.BitDepth > 8)
+            {
+                var src = (pl == 0 ? f.YPlane16 : pl == 1 ? f.UPlane16 : f.VPlane16).Span;
+                for (int y = 0; y < ph; y++) src.Slice(y * stride, pw).CopyTo(o.AsSpan(y * pw));
+            }
+            else
+            {
+                var src = (pl == 0 ? f.YPlane : pl == 1 ? f.UPlane : f.VPlane).Span;
+                for (int y = 0; y < ph; y++)
+                    for (int x = 0; x < pw; x++) o[y * pw + x] = src[y * stride + x];
+            }
+            return o;
+        }
+        int cw = (w + ssX) >> ssX, ch = (h + ssY) >> ssY;
+        return new Av1.Av1InterEncoder.Picture
+        {
+            Y = Plane(0, w, h), U = mono ? null : Plane(1, cw, ch), V = mono ? null : Plane(2, cw, ch), Width = w, Height = h,
+        };
     }
 
     // The frame's samples as RGB in coded-depth units [0, 2^bd - 1] plus the alpha plane (null without an alpha

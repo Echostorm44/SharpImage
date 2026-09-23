@@ -82,11 +82,12 @@ internal static class Av1ObuWriter
 
     /// <summary>film_grain_params() for a shown key frame (spec 5.9.30; libaom write_film_grain_params):
     /// apply_grain, grain_seed, then the full parameter set (update_grain is implied for non-inter frames).</summary>
-    private static unsafe void WriteFilmGrainParams(Av1BitWriter w, bool monochrome)
+    private static unsafe void WriteFilmGrainParams(Av1BitWriter w, bool monochrome, bool interFrame = false)
     {
         if (ActiveFilmGrain is not Av1FilmGrainData fg) return;
         w.PutBool(true);                            // apply_grain
         w.PutBits(fg.Seed & 0xFFFF, 16);            // grain_seed
+        if (interFrame) w.PutBool(true);            // update_grain (INTER_FRAME): parameters follow
         w.PutBits((uint)fg.NumYPoints, 4);
         for (int i = 0; i < fg.NumYPoints; i++)
         {
@@ -147,6 +148,15 @@ internal static class Av1ObuWriter
         /// OBU extension headers, every frame a shown key frame at the sequence's maximum size.
         /// </summary>
         public bool Sequence;
+
+        /// <summary>
+        /// Sequence only: the frame being written is an INTER_FRAME predicted from reference slot 0 (LAST), with every
+        /// ref_frame_idx pointing there, no CDF inheritance (primary_ref_frame NONE), quarter-pel MVs, the regular
+        /// 8-tap filter, simple motion only, single references and no global motion. <see cref="RefreshFlags"/> names
+        /// the slots it replaces.
+        /// </summary>
+        public bool InterFrame;
+        public int RefreshFlags = 1;
     }
 
     [ThreadStatic] private static LayeredStream? t_layered;
@@ -209,6 +219,31 @@ internal static class Av1ObuWriter
     // layer, intra-only frames above it; every frame shown and explicitly sized (render size = the full image).
     private static void WriteLayeredFramePrefix(Av1BitWriter w, LayeredStream ls, bool screenContentTools)
     {
+        if (ls.Sequence && ls.InterFrame)
+        {
+            w.PutBool(false);                  // show_existing_frame
+            w.PutBits(1, 2);                   // frame_type: INTER_FRAME
+            w.PutBool(true);                   // show_frame
+            w.PutBool(false);                  // error_resilient_mode
+            w.PutBool(false);                  // disable_cdf_update
+            w.PutBool(screenContentTools);     // allow_screen_content_tools (SELECT)
+            if (screenContentTools) w.PutBool(false);   // force_integer_mv (SELECT)
+            w.PutBool(false);                  // frame_size_override_flag
+            // order_hint: 0 bits (enable_order_hint = 0)
+            w.PutBits(7, 3);                   // primary_ref_frame = PRIMARY_REF_NONE: default CDFs, no inherited state
+            w.PutBits((uint)ls.RefreshFlags, 8);   // refresh_frame_flags
+            // frame_refs_short_signaling absent (no order hints); every reference is slot 0.
+            for (int i = 0; i < 7; i++) w.PutBits(0, 3);   // ref_frame_idx[i]
+            // frame_size(): the sequence maximum (no override), no superres; render_size():
+            w.PutBool(false);                  // render_and_frame_size_different
+            w.PutBool(false);                  // allow_high_precision_mv (quarter-pel)
+            w.PutBool(false);                  // is_filter_switchable
+            w.PutBits(0, 2);                   // interpolation_filter = EIGHTTAP (regular)
+            w.PutBool(false);                  // is_motion_mode_switchable
+            // use_ref_frame_mvs absent (enable_ref_frame_mvs = 0)
+            w.PutBool(true);                   // disable_frame_end_update_cdf
+            return;
+        }
         bool key = ls.Sequence || ls.Current == 0;
         w.PutBool(false);                      // show_existing_frame
         w.PutBits(key ? 0u : 2u, 2);           // frame_type: KEY_FRAME / INTRA_ONLY_FRAME
@@ -568,8 +603,11 @@ internal static class Av1ObuWriter
         if (lossless)
         {
             // loop_filter_params / cdef_params / lr_params / read_tx_mode are all skipped for a coded-lossless frame.
+            bool interLl = t_layered is { Sequence: true, InterFrame: true };
+            if (interLl) w.PutBool(false);   // reference_select = 0
             w.PutBool(reducedTxSet);  // reduced_tx_set
-            WriteFilmGrainParams(w, monochrome);
+            if (interLl) for (int r = 0; r < 7; r++) w.PutBool(false);   // is_global
+            WriteFilmGrainParams(w, monochrome, interLl);
             if (!isObuFrame) w.TrailingBits();
             return w.ToArray();
         }
@@ -604,11 +642,15 @@ internal static class Av1ObuWriter
         // read_tx_mode (not lossless)
         w.PutBool(txModeSelect);  // tx_mode_select: 0 ⇒ TX_MODE_LARGEST, 1 ⇒ TX_MODE_SELECT
 
-        // frame_reference_mode / skip_mode / warp skipped (intra)
+        bool inter = t_layered is { Sequence: true, InterFrame: true };
+        // frame_reference_mode: reference_select (inter frames); skip_mode / allow_warped_motion are absent (no order
+        // hints, warped motion disabled).
+        if (inter) w.PutBool(false);   // reference_select = 0: single references
         w.PutBool(reducedTxSet);  // reduced_tx_set (0 = full Intra1 set with V_DCT/H_DCT for sub-16x16 luma)
 
-        // global_motion skipped (intra)
-        WriteFilmGrainParams(w, monochrome);
+        // global_motion_params (inter frames): is_global = 0 for LAST..ALTREF.
+        if (inter) for (int r = 0; r < 7; r++) w.PutBool(false);
+        WriteFilmGrainParams(w, monochrome, inter);
 
         if (!isObuFrame)
         {

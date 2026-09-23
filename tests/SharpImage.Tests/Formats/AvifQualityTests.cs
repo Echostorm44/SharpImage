@@ -85,7 +85,9 @@ public sealed class AvifQualityTests
         var seq = new ImageSequence { Timescale = 10 };
         for (int k = 0; k < 2; k++) { var f = Rgba(64, 48); f.DurationTicks = 1; seq.AddFrame(f); }
         var c = HeifContainer.Parse(HeifCoder.EncodeAvifSequence(seq, new AvifEncodeOptions { Quality = 60 }));
-        await Assert.That(QIdx(c, c.PrimaryId)).IsEqualTo(100);   // quantizer ((100-60)*63+50)/100 = 25 -> 100
+        // quantizer ((100-60)*63+50)/100 = 25 -> cq 100 for the inter frames; the key frame (the primary item) gets
+        // libaom's good-quality key-frame boost: the q-index at ~0.43x the cq quantizer, 42 (libaom: 43).
+        await Assert.That(QIdx(c, c.PrimaryId)).IsEqualTo(42);
     }
 
     [Test]

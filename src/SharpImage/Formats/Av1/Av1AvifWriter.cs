@@ -86,6 +86,12 @@ internal sealed class AvifSequenceData
     public uint Timescale = 30;
     public int RepetitionCount;              // extra plays; -1 = infinite (libavif AVIF_REPETITION_COUNT_INFINITE)
     public bool AllKeyFrames = true;         // every sample a sync (key) frame: no 'stss', all-intra 'ccst'
+    // Per-sample sync (key frame) flags of each track when some samples are inter frames (null = all sync). A track
+    // with non-sync samples gets an 'stss' listing its sync samples and a 'ccst' allowing inter prediction; the file
+    // gets the 'avio' brand when some track is all sync (libavif write.c).
+    public List<bool>? ColorSync, AlphaSync;
+    public bool ColorAllSync => ColorSync == null || ColorSync.TrueForAll(v => v);
+    public bool AlphaAllSync => AlphaSync == null || AlphaSync.TrueForAll(v => v);
 }
 
 internal static class Av1AvifWriter
@@ -148,12 +154,14 @@ internal static class Av1AvifWriter
     // ftyp: major brand avif; compatible avif/mif1/miaf plus the AVIF profile brand the stream qualifies for —
     // MA1B (Baseline = AV1 Main profile), MA1A (Advanced = AV1 High profile, i.e. 8/10-bit 4:4:4); AV1
     // Professional streams (4:2:2, 12-bit) fit no AVIF profile brand, so none is claimed (as libavif does).
-    private static byte[] Ftyp(int bitDepth, Av1PixelLayout layout, bool sequence = false, bool toneMapped = false)
+    private static byte[] Ftyp(int bitDepth, Av1PixelLayout layout, bool sequence = false, bool toneMapped = false, bool avio = false)
     {
         int profile = Av1ObuWriter.SeqProfile(bitDepth, layout);
-        // An image sequence (libavif): major brand 'avis', compatible avif, avis, msf1, iso8, mif1, miaf.
+        // An image sequence (libavif): major brand 'avis', compatible avif, [avio: some track made only of sync
+        // samples], avis, msf1, iso8, mif1, miaf.
         var brands = sequence
-            ? Concat(Fourcc("avis"), U32(0), Fourcc("avif"), Fourcc("avis"), Fourcc("msf1"), Fourcc("iso8"), Fourcc("mif1"), Fourcc("miaf"))
+            ? Concat(Fourcc("avis"), U32(0), Fourcc("avif"), avio ? Fourcc("avio") : [], Fourcc("avis"), Fourcc("msf1"), Fourcc("iso8"),
+                Fourcc("mif1"), Fourcc("miaf"))
             : Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"));
         brands = profile switch
         {
@@ -209,7 +217,8 @@ internal static class Av1AvifWriter
         var gmx = x?.GainMap;
         var stx = x?.SampleTransform;
         if (gmx != null && stx != null) throw new NotSupportedException("A gain map and a Sample Transform cannot share the 'altr' group.");
-        byte[] ftyp = Ftyp(bitDepth, layout, sq != null, gmx != null);
+        byte[] ftyp = Ftyp(bitDepth, layout, sq != null, gmx != null,
+            avio: sq != null && (sq.ColorAllSync || (sq.AlphaSamples != null && sq.AlphaAllSync)));
 
         var props = new List<byte[]>();
         int Add(byte[] box) { props.Add(box); return props.Count; }
@@ -446,9 +455,11 @@ internal static class Av1AvifWriter
             byte[] meta = Meta((uint)(ftyp.Length + metaLen + 8));   // + 8: mdat box header
             return Concat(ftyp, meta, Box("mdat", Concat(chunks.ToArray())));
         }
-        var colorEntry = SampleEntryChildren(Box("av1C", BuildAv1C(layout, bitDepth, width, height)), x, color, monochrome, alpha: false, sq.AllKeyFrames);
+        var colorEntry = SampleEntryChildren(Box("av1C", BuildAv1C(layout, bitDepth, width, height)), x, color, monochrome, alpha: false,
+            sq.AllKeyFrames && sq.ColorAllSync);
         byte[]? alphaEntry = sq.AlphaSamples != null
-            ? SampleEntryChildren(Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth, width, height)), null, null, true, alpha: true, sq.AllKeyFrames)
+            ? SampleEntryChildren(Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth, width, height)), null, null, true, alpha: true,
+                sq.AllKeyFrames && sq.AlphaAllSync)
             : null;
         int moovLen = Moov(sq, width, height, colorEntry, alphaEntry, 0, 0, x?.Premultiplied == true).Length;
         uint start = (uint)(ftyp.Length + metaLen + moovLen + 8);
@@ -717,7 +728,7 @@ internal static class Av1AvifWriter
         byte[] mvhd = FullBox("mvhd", 1, 0, Concat(U64(0), U64(0), U32(sq.Timescale), U64(duration), U32(0x00010000), U16(0x0100),
             U16(0), new byte[8], unity, new byte[24], U32((uint)(tracks + 1))));
 
-        byte[] Trak(int trackId, List<byte[]> samples, byte[] entryChildren, bool alpha, uint chunkOffset)
+        byte[] Trak(int trackId, List<byte[]> samples, byte[] entryChildren, bool alpha, uint chunkOffset, List<bool>? sync)
         {
             byte[] tkhd = FullBox("tkhd", 1, 1, Concat(U64(0), U64(0), U32((uint)trackId), U32(0), U64(duration), new byte[8],
                 U16(0), U16(0), U16(0), U16(0), unity, U32((uint)width << 16), U32((uint)height << 16)));
@@ -754,14 +765,22 @@ internal static class Av1AvifWriter
             foreach (var smp in samples) sizes.Add(U32((uint)smp.Length));
             byte[] stsz = FullBox("stsz", 0, 0, Concat(sizes.ToArray()));
             byte[] stco = FullBox("stco", 0, 0, Concat(U32(1), U32(chunkOffset)));
-            byte[] stbl = Box("stbl", Concat(stsd, sttsBox, stsc, stsz, stco));
+            // stss (ISO/IEC 14496-12 8.6.2): absent = every sample is a sync sample.
+            byte[] stss = [];
+            if (sync != null && !sync.TrueForAll(v => v))
+            {
+                var entries = new List<byte[]> { U32((uint)sync.Count(v => v)) };
+                for (int i = 0; i < sync.Count; i++) if (sync[i]) entries.Add(U32((uint)(i + 1)));
+                stss = FullBox("stss", 0, 0, Concat(entries.ToArray()));
+            }
+            byte[] stbl = Box("stbl", Concat(stsd, sttsBox, stsc, stsz, stco, stss));
             byte[] minf = Box("minf", Concat(vmhd, dinf, stbl));
             byte[] mdia = Box("mdia", Concat(mdhd, hdlr, minf));
             return Box("trak", Concat(tkhd, tref, edts, mdia));
         }
 
-        var body = new List<byte[]> { mvhd, Trak(1, sq.ColorSamples, colorEntry, false, colorChunkOffset) };
-        if (alphaEntry != null) body.Add(Trak(2, sq.AlphaSamples!, alphaEntry, true, alphaChunkOffset));
+        var body = new List<byte[]> { mvhd, Trak(1, sq.ColorSamples, colorEntry, false, colorChunkOffset, sq.ColorSync) };
+        if (alphaEntry != null) body.Add(Trak(2, sq.AlphaSamples!, alphaEntry, true, alphaChunkOffset, sq.AlphaSync));
         return Box("moov", Concat(body.ToArray()));
     }
 

@@ -30,7 +30,8 @@ internal static class Av1CoeffEncode
         int dcSignCtx = 0,
         int txTypeIdx = 1,
         bool fullSet = false,
-        bool lossless = false)
+        bool lossless = false,
+        bool inter = false)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
 
@@ -72,8 +73,14 @@ internal static class Av1CoeffEncode
         // and smaller) and segQIdx != 0; chroma derives its type from the UV mode (no symbol), and
         // TX_32X32/TX_64X64 imply DctDct with no symbol. We always emit DctDct = index 1 in the reduced Intra2
         // set (TxtpIntra2[tDim.Min*13 + yMode]).
-        const int intra = 1;
-        if (chroma == 0 && !lossless && tDim.Max + intra < (int)Av1TxSize.Tx64x64)   // lossless: WHT_WHT implied
+        if (inter)
+        {
+            // Inter luma below 64 points codes its type; with reduced_tx_set (what the inter encoder signals) and for
+            // 32-point transforms it is the 2-type Inter3 set: 1 = DCT_DCT, 0 = IDTX. Chroma derives it from luma.
+            if (chroma == 0 && !lossless && tDim.Max < (int)Av1TxSize.Tx64x64)
+                w.EncodeBoolAdapt(modeCdf.TxtpInter3[tDim.Min], 1);
+        }
+        else if (chroma == 0 && !lossless && tDim.Max + 1 < (int)Av1TxSize.Tx64x64)   // lossless: WHT_WHT implied
         {
             // Full intra set (reduced_tx_set=0): sub-16x16 luma codes the 7-type Intra1 symbol; larger tx and the
             // reduced set code the 5-type Intra2 symbol. The caller passes the Intra2 index; map it to Intra1 here.
@@ -411,7 +418,7 @@ internal static class Av1CoeffEncode
     /// <summary>Estimated bit cost of coding one 2D transform block's coefficients with the given contexts, from
     /// the current CDF probabilities (no side effects). Mirrors EncodeCoefs symbol-for-symbol.</summary>
     internal static double EstimateCoefBits(Av1CdfCoefContext coef, Av1CdfModeContext modeCdf, int tx, int chroma,
-        int yMode, ReadOnlySpan<int> signedLevels, int skipCtx, int dcSignCtx, int txTypeIdx, bool fullSet = false)
+        int yMode, ReadOnlySpan<int> signedLevels, int skipCtx, int dcSignCtx, int txTypeIdx, bool fullSet = false, bool inter = false)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
         int cdfIdx = tDim.Ctx * 13 + skipCtx;
@@ -427,8 +434,11 @@ internal static class Av1CoeffEncode
         if (eob < 0) return BoolBits(coef.CoefSkip[cdfIdx][0], 1);
         double bits = BoolBits(coef.CoefSkip[cdfIdx][0], 0);
 
-        const int intra = 1;
-        if (chroma == 0 && tDim.Max + intra < (int)Av1TxSize.Tx64x64)
+        if (inter)
+        {
+            if (chroma == 0 && tDim.Max < (int)Av1TxSize.Tx64x64) bits += BoolBits(modeCdf.TxtpInter3[tDim.Min][0], 1);
+        }
+        else if (chroma == 0 && tDim.Max + 1 < (int)Av1TxSize.Tx64x64)
             bits += (fullSet && tDim.Min < (int)Av1TxSize.Tx16x16)
                 ? SymBits(modeCdf.TxtpIntra1[tDim.Min * 13 + yMode], Intra2ToIntra1(txTypeIdx))
                 : SymBits(modeCdf.TxtpIntra2[tDim.Min * 13 + yMode], txTypeIdx);

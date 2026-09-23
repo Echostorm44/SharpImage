@@ -1453,7 +1453,7 @@ public static class Av1Decode
     // ========================================================================
 
     /// <summary>Context for single-ref reference frame selection (dav1d: av1_get_ref_ctx).</summary>
-    private static int GetRefCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    internal static int GetRefCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
     {
         int cnt0 = 0, cnt1 = 0;
 
@@ -1492,7 +1492,7 @@ public static class Av1Decode
     }
 
     /// <summary>Forward ref context for single-ref (dav1d: av1_get_fwd_ref_ctx = av1_get_ref_3_ctx).</summary>
-    private static int GetFwdRefCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    internal static int GetFwdRefCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
     {
         int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
         if (haveTop && above.Intra[bx4] == 0) {
@@ -1509,7 +1509,7 @@ public static class Av1Decode
     }
 
     /// <summary>Forward ref 1 context (dav1d: av1_get_fwd_ref_1_ctx = av1_get_ref_4_ctx).</summary>
-    private static int GetFwdRef1Ctx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    internal static int GetFwdRef1Ctx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
     {
         int c0 = 0, c1 = 0;
         if (haveTop && above.Intra[bx4] == 0) {
