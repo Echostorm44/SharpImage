@@ -1021,6 +1021,7 @@ public sealed class Av1HbdVerify
                             break;
                         case "irot": o.Rotation = int.Parse(t[1]); break;
                         case "prem": o.PremultiplyAlpha = true; break;
+                        case "prog": o.Progressive = true; break;
                     }
                 }
                 byte[] avif = HeifCoder.EncodeAvif(img, o);
@@ -1577,6 +1578,14 @@ public sealed class Av1HbdVerify
                     }
                     File.WriteAllBytes(t[2], bytes);
                     log.AppendLine($"ok {t[2]}");
+                    continue;
+                }
+                if (t[0] == "progdec")
+                {
+                    var layers = HeifCoder.DecodeProgressive(File.ReadAllBytes(t[1]));
+                    for (int li = 0; li < layers.Count; li++)
+                        File.WriteAllBytes($"{t[2]}_L{li}.rgb48", Rgb48(layers[li]));
+                    log.AppendLine($"ok {t[1]} {layers.Count} layers {layers[0].Columns}x{layers[0].Rows}");
                     continue;
                 }
                 if (t[0] == "swap")

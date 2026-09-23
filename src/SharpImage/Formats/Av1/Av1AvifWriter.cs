@@ -58,6 +58,9 @@ internal sealed class AvifGridCells
     public List<byte[]> Color = [];
     public List<byte[]>? Alpha;
     public byte[] ColorAv1CBox = [], AlphaAv1CBox = [];
+    // Layered (progressive) cells: each cell's layer sizes -> its own 'a1lx' and one iloc extent per layer (libavif's
+    // layered grid, avifEncoderAddImageGrid with extraLayerCount).
+    public List<long[]>? ColorLayerSizes, AlphaLayerSizes;
 }
 
 /// <summary>A 'sato' Sample Transform derived item (libavif bit-depth extension) and its hidden second input items, laid
@@ -167,6 +170,23 @@ internal static class Av1AvifWriter
     // item's av1C / auxC / pixi. With no extras this reproduces the original single/2-item byte layout exactly.
     // AV1LayeredImageIndexingProperty: the sizes of all layers but the last (libavif writes it non-essential and, like
     // it, no 'lsel', so the default presentation is the full image and progressive readers get every layer).
+    // One iloc entry (version 0, 4-byte offsets / lengths, no base offset): a single extent, or one extent per layer of
+    // a layered item as libavif writes it.
+    private static byte[] IlocEntry(int id, uint offset, int length, long[]? layerSizes)
+    {
+        if (layerSizes is not { Length: > 1 } || layerSizes.Sum() != length)
+            return Concat(U16(id), U16(0), U16(1), U32(offset), U32((uint)length));
+        var parts = new List<byte[]> { U16(id), U16(0), U16(layerSizes.Length) };
+        uint o = offset;
+        foreach (long sz in layerSizes)
+        {
+            parts.Add(U32(o));
+            parts.Add(U32((uint)sz));
+            o += (uint)sz;
+        }
+        return Concat(parts.ToArray());
+    }
+
     private static byte[] A1lx(long[] sizes)
     {
         bool large = false;
@@ -394,13 +414,17 @@ internal static class Av1AvifWriter
             pos += items[i].Payload.Length;
         }
 
-        // iloc: version 0, offset_size=4/length_size=4/base_offset_size=0; one extent per item. Offsets are patched
-        // once the meta (and moov) lengths (invariant to the offset values) are known.
+        // iloc: version 0, offset_size=4/length_size=4/base_offset_size=0; one extent per item, or per layer of a layered
+        // colour / alpha item. Offsets are patched once the meta (and moov) lengths (invariant to the offset values) are
+        // known.
         byte[] Iloc(uint mdatStart)
         {
             var body = new List<byte[]> { new byte[] { 0x44, 0x00 }, U16(items.Count) };
             for (int i = 0; i < items.Count; i++)
-                body.Add(Concat(U16(items[i].Id), U16(0), U16(1), U32((uint)(mdatStart + itemOffset[i])), U32((uint)items[i].Payload.Length)));
+            {
+                long[]? layers = items[i].Id == 1 ? x?.ColorLayerSizes : items[i].Id == 2 && alphaData != null ? x?.AlphaLayerSizes : null;
+                body.Add(IlocEntry(items[i].Id, (uint)(mdatStart + itemOffset[i]), items[i].Payload.Length, layers));
+            }
             return FullBox("iloc", 0, 0, Concat(body.ToArray()));
         }
 
@@ -542,14 +566,34 @@ internal static class Av1AvifWriter
         int gridId = nextId++;
         items.Add((gridId, "grid", gridPayload, 0, gridAssoc));
         var cellIds = new List<int>();
-        foreach (var cell in g.Color) { int id = nextId++; cellIds.Add(id); items.Add((id, "av01", cell, 1, cellAssoc)); }
+        var layerSizesById = new Dictionary<int, long[]>();
+        List<(int Index, bool Essential)> CellAssoc(List<(int Index, bool Essential)> shared, long[]? layers)
+        {
+            if (layers is not { Length: > 1 }) return shared;
+            return [.. shared, (Add(A1lx(layers)), false)];
+        }
+        for (int ci = 0; ci < g.Color.Count; ci++)
+        {
+            int id = nextId++;
+            cellIds.Add(id);
+            long[]? layers = g.ColorLayerSizes?[ci];
+            if (layers != null) layerSizesById[id] = layers;
+            items.Add((id, "av01", g.Color[ci], 1, CellAssoc(cellAssoc, layers)));
+        }
         int alphaGridId = 0;
         var alphaCellIds = new List<int>();
         if (hasAlpha)
         {
             alphaGridId = nextId++;
             items.Add((alphaGridId, "grid", gridPayload, 0, alphaGridAssoc));
-            foreach (var cell in g.Alpha!) { int id = nextId++; alphaCellIds.Add(id); items.Add((id, "av01", cell, 1, alphaCellAssoc)); }
+            for (int ci = 0; ci < g.Alpha!.Count; ci++)
+            {
+                int id = nextId++;
+                alphaCellIds.Add(id);
+                long[]? layers = g.AlphaLayerSizes?[ci];
+                if (layers != null) layerSizesById[id] = layers;
+                items.Add((id, "av01", g.Alpha[ci], 1, CellAssoc(alphaCellAssoc, layers)));
+            }
         }
         int tmapId = 0, gmId = 0;
         if (gmx != null)
@@ -623,7 +667,8 @@ internal static class Av1AvifWriter
         {
             var body = new List<byte[]> { new byte[] { 0x44, 0x00 }, U16(items.Count) };
             for (int i = 0; i < items.Count; i++)
-                body.Add(Concat(U16(items[i].Id), U16(0), U16(1), U32((uint)(mdatStart + itemOffset[i])), U32((uint)items[i].Payload.Length)));
+                body.Add(IlocEntry(items[i].Id, (uint)(mdatStart + itemOffset[i]), items[i].Payload.Length,
+                    layerSizesById.GetValueOrDefault(items[i].Id)));
             return FullBox("iloc", 0, 0, Concat(body.ToArray()));
         }
         byte[] Meta(uint mdatStart) => FullBox("meta", 0, 0, Concat(hdlr, pitm, Iloc(mdatStart), iinf, iref, iprp, grpl));

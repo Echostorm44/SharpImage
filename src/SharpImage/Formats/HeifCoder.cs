@@ -1007,10 +1007,7 @@ public static partial class HeifCoder
             return EncodeAvifBitDepthExtension(image, options);
         }
         if (options.Grid is { } grid && (grid.Columns != 1 || grid.Rows != 1))
-        {
-            if (options.Layers is { Count: > 0 }) throw new NotSupportedException("Layered grid images are not supported.");
             return EncodeAvifGrid(image, options, grid.Columns, grid.Rows);
-        }
         using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, (int)image.Columns, (int)image.Rows));
         if (options.Layers is { Count: > 0 } layers) return EncodeAvifLayers(image, options, layers);
         return EncodeAvifCore(image, options, forceColor: false, forceAlpha: false);
@@ -1018,7 +1015,8 @@ public static partial class HeifCoder
 
     // avifenc --layered: every layer converted to YUV at full size, area-scaled to its libaom-scaled size, coded with its
     // own q-index (libavif codes layered images with tune=iq), alpha layered alongside.
-    private static byte[] EncodeAvifLayers(ImageFrame image, AvifEncodeOptions options, IList<AvifLayer> layers)
+    private static byte[] EncodeAvifLayers(ImageFrame image, AvifEncodeOptions options, IList<AvifLayer> layers,
+        bool forceColor = false, bool forceAlpha = false)
     {
         if (layers.Count is < 2 or > 4) throw new ArgumentException("A layered AVIF has 2 to 4 layers.", nameof(options));
         if (options.Progressive || options.Lossless)
@@ -1058,9 +1056,10 @@ public static partial class HeifCoder
         {
             ReadRgbPlanes(src, bd, out var r, out var g, out var b, out var a, out bool colour, out bool nonOpaque);
             anyColour |= colour;
-            anyTranslucent |= nonOpaque && a != null;
+            anyTranslucent |= (nonOpaque || forceAlpha) && a != null;
             planes.Add((r, g, b, a));
         }
+        anyColour |= forceColor;
         bool mono = layout == Av1.Av1PixelLayout.I400 || (!anyColour && color.Matrix is not (0 or 16 or 17));
         var coded = mono ? Av1.Av1PixelLayout.I400 : layout;
         int ssX = coded is Av1.Av1PixelLayout.I420 or Av1.Av1PixelLayout.I422 ? 1 : 0, ssY = coded == Av1.Av1PixelLayout.I420 ? 1 : 0;
@@ -2077,9 +2076,9 @@ public static partial class HeifCoder
     {
         if (cols is < 1 or > 256 || rows is < 1 or > 256)
             throw new ArgumentOutOfRangeException(nameof(options), "Grid columns and rows must be in 1..256.");
-        if (options.Progressive)
-            throw new NotSupportedException("Progressive (layered) encoding of a grid image is not supported.");
         int w = (int)image.Columns, h = (int)image.Rows;
+        // Layered grids (libavif avifEncoderAddImageGrid with extraLayerCount): every cell is itself layered.
+        var layerSpecs = options.Layers is { Count: > 0 } ls ? ls : null;
         int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
         if (bd is not (8 or 10 or 12))
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
@@ -2115,31 +2114,49 @@ public static partial class HeifCoder
             FullRange = color.FullRange, Rotation = 0, Mirror = null, Lossless = options.Lossless, PremultiplyAlpha = options.PremultiplyAlpha,
             FilmGrain = options.FilmGrain, DenoiseNoiseLevel = options.DenoiseNoiseLevel, DenoiseUseRequestedLevel = options.DenoiseUseRequestedLevel,
             DenoiseBlockSize = options.DenoiseBlockSize, DenoiseApply = options.DenoiseApply,
-            Quality = options.Quality, QualityAlpha = options.QualityAlpha,
+            Quality = options.Quality, QualityAlpha = options.QualityAlpha, Progressive = options.Progressive,
         };
-        var cells = new Av1.AvifGridCells { Columns = cols, Rows = rows, CellWidth = cellW, CellHeight = cellH, Alpha = alpha ? [] : null };
+        bool layered = options.Progressive || layerSpecs != null;
+        var cells = new Av1.AvifGridCells
+        {
+            Columns = cols, Rows = rows, CellWidth = cellW, CellHeight = cellH, Alpha = alpha ? [] : null,
+            ColorLayerSizes = layered ? [] : null, AlphaLayerSizes = layered && alpha ? [] : null,
+        };
         using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, cellW, cellH));   // libavif: from the first cell
         for (int gy = 0; gy < rows; gy++)
             for (int gx = 0; gx < cols; gx++)
             {
                 int x0 = gx * cellW, y0 = gy * cellH;
                 int cw = Math.Min(cellW, w - x0), chh = Math.Min(cellH, h - y0);
-                var cell = new ImageFrame();
-                cell.Initialize(cw, chh, ColorspaceType.SRGB, image.HasAlpha);
-                cell.Depth = image.Depth;
-                int n = image.NumberOfChannels;
-                for (int y = 0; y < chh; y++)
-                    image.GetPixelRow(y0 + y).Slice(x0 * n, cw * n).CopyTo(cell.GetPixelRowForWrite(y));
-                byte[] file = EncodeAvifCore(cell, cellOpt, forceColor: !mono, forceAlpha: alpha);
+                ImageFrame Crop(ImageFrame src)
+                {
+                    var cell = new ImageFrame();
+                    cell.Initialize(cw, chh, ColorspaceType.SRGB, src.HasAlpha);
+                    cell.Depth = src.Depth;
+                    int n = src.NumberOfChannels;
+                    for (int y = 0; y < chh; y++)
+                        src.GetPixelRow(y0 + y).Slice(x0 * n, cw * n).CopyTo(cell.GetPixelRowForWrite(y));
+                    return cell;
+                }
+                var cellImage = Crop(image);
+                byte[] file = layerSpecs != null
+                    ? EncodeAvifLayers(cellImage, cellOpt, layerSpecs.Select(l => new AvifLayer
+                    {
+                        Image = l.Image == null ? null : Crop(l.Image), Quality = l.Quality, QualityAlpha = l.QualityAlpha,
+                        ScaleNumerator = l.ScaleNumerator, ScaleDenominator = l.ScaleDenominator,
+                    }).ToList(), forceColor: !mono, forceAlpha: alpha)
+                    : EncodeAvifCore(cellImage, cellOpt, forceColor: !mono, forceAlpha: alpha);
                 var c = HeifContainer.Parse(file);
                 int pid = c.PrimaryId;
                 cells.Color.Add(c.ItemData(pid)!);
                 if (cells.ColorAv1CBox.Length == 0) cells.ColorAv1CBox = RawProperty(c, pid, "av1C");
+                if (layered) cells.ColorLayerSizes!.Add(LayerSizes(c, pid));
                 if (alpha)
                 {
                     int aid = c.ReferencesTo(pid, "auxl").First();
                     cells.Alpha!.Add(c.ItemData(aid)!);
                     if (cells.AlphaAv1CBox.Length == 0) cells.AlphaAv1CBox = RawProperty(c, aid, "av1C");
+                    if (layered) cells.AlphaLayerSizes!.Add(LayerSizes(c, aid));
                 }
             }
 
@@ -2168,6 +2185,26 @@ public static partial class HeifCoder
                 throw new ArgumentException($"Odd cell size {size - 1} is forbidden on a {dimension} subsampled image.");
         }
         return (int)size;
+    }
+
+    // The layer sizes of a layered item from its 'a1lx' (every layer but the last; the last is the remainder).
+    private static long[] LayerSizes(HeifContainer c, int id)
+    {
+        int total = c.ItemData(id)!.Length;
+        if (c.Property(id, "a1lx") is not { } p) return [total];
+        byte[] d = c.Data;
+        bool large = (d[p.Off] & 1) != 0;
+        var sizes = new List<long>();
+        long sum = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            long v = large ? BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(p.Off + 1 + i * 4)) : BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p.Off + 1 + i * 2));
+            if (v == 0) break;
+            sizes.Add(v);
+            sum += v;
+        }
+        sizes.Add(total - sum);
+        return sizes.ToArray();
     }
 
     private static byte[] RawProperty(HeifContainer c, int id, string type)
