@@ -149,6 +149,11 @@ public sealed class AvifEncodeOptions
     /// <summary>Chroma subsampling of the gain map image (single-channel gain maps are coded 4:0:0). Default 4:4:4, as
     /// avifgainmaputil combine.</summary>
     public AvifChromaSubsampling GainMapChromaSubsampling { get; set; } = AvifChromaSubsampling.Yuv444;
+
+    /// <summary>Encode as a grid of Columns x Rows independently coded cells (avifenc --grid MxN): a 'grid' derived
+    /// item over hidden cell items (and an alpha grid). Cell sizes follow avifenc: ceil(size / count), at least 64 px
+    /// (MIAF), even along subsampled axes; the last row / column may be smaller. Null or 1x1: a single coded item.</summary>
+    public (int Columns, int Rows)? Grid { get; set; }
 }
 
 /// <summary>Film grain for one AVIF encode: explicit parameters, or denoise-and-estimate (Level &lt; 0 = all-intra estimate).</summary>
@@ -444,6 +449,9 @@ public static partial class HeifCoder
         ushort[]? premAlpha = null;
         if (premAlphaId >= 0 && tiles.Count == 1 && codec == "av01" && c.Items.TryGetValue(premAlphaId, out var pai) && pai.Type == "av01")
             premAlpha = DecodeAlphaNative(c, premAlphaId);
+        else if (premAlphaId >= 0 && tiles.Count > 1 && codec == "av01" && c.Items.TryGetValue(premAlphaId, out var pag) && pag.Type == "grid"
+                 && c.ItemData(premAlphaId) is { } agp)
+            premAlpha = DecodeAlphaGridNative(c, c.ReferencesFrom(premAlphaId, "dimg"), ParseImageGrid(agp), outW, outH);
 
         ImageFrame frame = DecodeImageTiles(c, tiles, rows, cols, outW, outH, codec, nclx, premAlpha);
         frame.Depth = ItemBitDepth(c, tiles[0]);
@@ -559,7 +567,7 @@ public static partial class HeifCoder
             frame = new ImageFrame();
             var (fw, fh) = scaleTo ?? (outW, outH);
             frame.Initialize(fw, fh, ColorspaceType.SRGB, false);
-            DecodeAv1GridInto(c, tiles, cols, outW, outH, nclx, frame, scaleTo);
+            DecodeAv1GridInto(c, tiles, cols, outW, outH, nclx, frame, scaleTo, premAlpha);
             return frame;
         }
         if (scaleTo is { } st)
@@ -593,7 +601,7 @@ public static partial class HeifCoder
     // Decodes an AV1 image grid: every tile to YUV, the planes stitched at the tile offsets (clipped to the grid's
     // output size), then one YUV->RGB conversion of the whole image. Tiles must share size, layout and depth.
     private static void DecodeAv1GridInto(HeifContainer c, List<int> tiles, int cols, int outW, int outH,
-        (int Cp, int Tc, int Mc, bool Full)? nclx, ImageFrame frame, (int W, int H)? scaleTo = null)
+        (int Cp, int Tc, int Mc, bool Full)? nclx, ImageFrame frame, (int W, int H)? scaleTo = null, ushort[]? premAlpha = null)
     {
         var yuvs = new List<Av1.DecodedVideoFrame>(tiles.Count);
         try
@@ -660,7 +668,7 @@ public static partial class HeifCoder
                 using var scaled = ScaleDecodedFrame(stitched, st.W, st.H);
                 ConvertYuvToRgbLibavif(scaled, frame, st.W, st.H, frame.NumberOfChannels, mono, cicp.Mc, cicp.Full, cicp.Cp, ssX, ssY);
             }
-            else ConvertYuvToRgbLibavif(stitched, frame, outW, outH, frame.NumberOfChannels, mono, cicp.Mc, cicp.Full, cicp.Cp, ssX, ssY);
+            else ConvertYuvToRgbLibavif(stitched, frame, outW, outH, frame.NumberOfChannels, mono, cicp.Mc, cicp.Full, cicp.Cp, ssX, ssY, premAlpha);
         }
         finally
         {
@@ -886,6 +894,15 @@ public static partial class HeifCoder
     public static byte[] EncodeAvif(ImageFrame image, AvifEncodeOptions? options = null)
     {
         options ??= new AvifEncodeOptions();
+        if (options.Grid is { } grid && (grid.Columns != 1 || grid.Rows != 1))
+            return EncodeAvifGrid(image, options, grid.Columns, grid.Rows);
+        return EncodeAvifCore(image, options, forceColor: false, forceAlpha: false);
+    }
+
+    // forceColor / forceAlpha: grid cells must share one chroma format and all carry alpha (MIAF), so a grey or opaque
+    // cell of a colour / translucent image is still coded in colour / with an alpha item.
+    private static byte[] EncodeAvifCore(ImageFrame image, AvifEncodeOptions options, bool forceColor, bool forceAlpha)
+    {
         int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
         if (bd is not (8 or 10 or 12))
         {
@@ -929,10 +946,11 @@ public static partial class HeifCoder
         var grain = new AvifGrainRequest(options.FilmGrain, denoise, options.DenoiseUseRequestedLevel ? options.DenoiseNoiseLevel / 10.0f : -1,
             options.DenoiseBlockSize, options.DenoiseApply);
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
-               && options.FilmGrain == null && !denoise && !options.Progressive
+               && options.FilmGrain == null && !denoise && !options.Progressive && !forceColor && !forceAlpha
             ? EncodeAvif8(image, options.Qp, color, extras)
             : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless, grain,
-                options.Progressive && image.Columns >= 16 && image.Rows >= 16);   // a sub-8px base layer is pointless
+                options.Progressive && image.Columns >= 16 && image.Rows >= 16,   // a sub-8px base layer is pointless
+                forceColor: forceColor, forceAlpha: forceAlpha);
     }
 
     /// <summary>
@@ -1239,7 +1257,8 @@ public static partial class HeifCoder
     // 4:2:0 case keeps its original byte path (EncodeAvif8) so its output is unchanged.
     private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout,
         Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras, bool lossless = false, AvifGrainRequest? request = null,
-        bool progressive = false, (int W, int H)? scaleYuvTo = null, bool libavifFloatYuv = false)
+        bool progressive = false, (int W, int H)? scaleYuvTo = null, bool libavifFloatYuv = false, bool forceColor = false,
+        bool forceAlpha = false)
     {
         // Film grain rides on the colour stream only: the ambient scope is read by the colour builders' headers and
         // suppressed around the alpha builds. Denoising (libaom aom_denoise_and_model_run) replaces the colour planes
@@ -1280,6 +1299,8 @@ public static partial class HeifCoder
 
         bool hasAlpha = image.HasAlpha;
         ReadRgbPlanes(image, bd, out var r, out var g, out var b, out var alpha, out bool colour, out bool nonOpaque);
+        colour |= forceColor;
+        nonOpaque |= forceAlpha && alpha != null;
 
         int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
         if (extras.Premultiplied && hasAlpha && nonOpaque && alpha != null)
@@ -1692,6 +1713,109 @@ public static partial class HeifCoder
             : Av1.Av1StillImageEncoder.EncodeAvifMonochrome(luma, w, h, baseQIdx, color, extras);
     }
 
+    // avifenc --grid: the image split into Columns x Rows cells (avifImageSplitGrid / avifGetBestCellSize), every cell
+    // coded with the same settings, laid out as libavif does (Av1AvifWriter.BuildGridAvif).
+    private static byte[] EncodeAvifGrid(ImageFrame image, AvifEncodeOptions options, int cols, int rows)
+    {
+        if (cols is < 1 or > 256 || rows is < 1 or > 256)
+            throw new ArgumentOutOfRangeException(nameof(options), "Grid columns and rows must be in 1..256.");
+        if (options.Progressive)
+            throw new NotSupportedException("Progressive (layered) encoding of a grid image is not supported.");
+        int w = (int)image.Columns, h = (int)image.Rows;
+        int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
+        if (bd is not (8 or 10 or 12))
+            throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
+        var color = ResolveAvifColor(image, options, bd);
+        if (options.Lossless && options.MatrixCoefficients == null) color = color with { Matrix = 0 };
+        if (options.ChromaSubsampling == AvifChromaSubsampling.Yuv400 && color.Matrix == 0) color = color with { Matrix = 6 };
+        var layout = options.ChromaSubsampling switch
+        {
+            AvifChromaSubsampling.Yuv422 => Av1.Av1PixelLayout.I422,
+            AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
+            AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
+            AvifChromaSubsampling.Yuv400 => Av1.Av1PixelLayout.I400,
+            _ => color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
+        };
+
+        // The coded chroma format of every cell: grey sources are coded 4:0:0 (except lossy identity / YCgCo-R).
+        ReadRgbPlanes(image, bd, out _, out _, out _, out _, out bool colour, out bool nonOpaque);
+        bool mono = layout == Av1.Av1PixelLayout.I400 || (!colour && !(!options.Lossless && color.Matrix is 0 or 16 or 17));
+        var coded = mono ? Av1.Av1PixelLayout.I400 : layout;
+        bool ssX = coded is Av1.Av1PixelLayout.I420 or Av1.Av1PixelLayout.I422, ssY = coded == Av1.Av1PixelLayout.I420;
+        int cellW = GridCellSize("horizontally", w, cols, ssX), cellH = GridCellSize("vertically", h, rows, ssY);
+        // MIAF 7.3.11.4.2 (libavif avifAreGridDimensionsValid): the output size must be even along subsampled axes.
+        if ((ssX && (w & 1) != 0) || (ssY && (h & 1) != 0))
+            throw new ArgumentException($"A {coded} grid image must have an even {(ssX && (w & 1) != 0 ? "width" : "height")} (MIAF 7.3.11.4.2).", nameof(options));
+        bool alpha = image.HasAlpha && nonOpaque;
+
+        var cellOpt = new AvifEncodeOptions
+        {
+            Qp = options.Qp, BitDepth = bd, ChromaSubsampling = options.ChromaSubsampling == AvifChromaSubsampling.Auto
+                ? (layout switch { Av1.Av1PixelLayout.I444 => AvifChromaSubsampling.Yuv444, _ => AvifChromaSubsampling.Yuv420 })
+                : options.ChromaSubsampling,
+            ColorPrimaries = color.Primaries, TransferCharacteristics = color.Transfer, MatrixCoefficients = color.Matrix,
+            FullRange = color.FullRange, Rotation = 0, Mirror = null, Lossless = options.Lossless, PremultiplyAlpha = options.PremultiplyAlpha,
+            FilmGrain = options.FilmGrain, DenoiseNoiseLevel = options.DenoiseNoiseLevel, DenoiseUseRequestedLevel = options.DenoiseUseRequestedLevel,
+            DenoiseBlockSize = options.DenoiseBlockSize, DenoiseApply = options.DenoiseApply,
+        };
+        var cells = new Av1.AvifGridCells { Columns = cols, Rows = rows, CellWidth = cellW, CellHeight = cellH, Alpha = alpha ? [] : null };
+        for (int gy = 0; gy < rows; gy++)
+            for (int gx = 0; gx < cols; gx++)
+            {
+                int x0 = gx * cellW, y0 = gy * cellH;
+                int cw = Math.Min(cellW, w - x0), chh = Math.Min(cellH, h - y0);
+                var cell = new ImageFrame();
+                cell.Initialize(cw, chh, ColorspaceType.SRGB, image.HasAlpha);
+                cell.Depth = image.Depth;
+                int n = image.NumberOfChannels;
+                for (int y = 0; y < chh; y++)
+                    image.GetPixelRow(y0 + y).Slice(x0 * n, cw * n).CopyTo(cell.GetPixelRowForWrite(y));
+                byte[] file = EncodeAvifCore(cell, cellOpt, forceColor: !mono, forceAlpha: alpha);
+                var c = HeifContainer.Parse(file);
+                int pid = c.PrimaryId;
+                cells.Color.Add(c.ItemData(pid)!);
+                if (cells.ColorAv1CBox.Length == 0) cells.ColorAv1CBox = RawProperty(c, pid, "av1C");
+                if (alpha)
+                {
+                    int aid = c.ReferencesTo(pid, "auxl").First();
+                    cells.Alpha!.Add(c.ItemData(aid)!);
+                    if (cells.AlphaAv1CBox.Length == 0) cells.AlphaAv1CBox = RawProperty(c, aid, "av1C");
+                }
+            }
+
+        var extras = AvifExtras(image, options);
+        extras.Premultiplied = options.PremultiplyAlpha && alpha;
+        if (options.GainMap != null) extras.GainMap = BuildGainMapItem(options.GainMap, options, extras);
+        return Av1.Av1AvifWriter.BuildGridAvif(cells, w, h, bd, coded, color, extras);
+    }
+
+    // avifGetBestCellSize (avifenc): ceil(pixels / cells), raised to MIAF's 64 minimum and to even along subsampled axes,
+    // rejected when a cell would fall entirely off the canvas or exceed AV1's 65536.
+    private static int GridCellSize(string dimension, int pixels, int cells, bool subsampled)
+    {
+        long size = ((long)pixels + cells - 1) / cells;
+        if (cells > 1 && size < 64)
+        {
+            size = 64;
+            if ((long)(cells - 1) * size >= pixels)
+                throw new ArgumentException($"There are too many cells {dimension} ({cells}) to have at least 64 pixels per cell.");
+        }
+        if (size > 65536) throw new ArgumentException($"Cell size {size} is bigger {dimension} than the maximum frame size 65536.");
+        if (subsampled && (size & 1) != 0)
+        {
+            size++;
+            if ((long)(cells - 1) * size >= pixels)
+                throw new ArgumentException($"Odd cell size {size - 1} is forbidden on a {dimension} subsampled image.");
+        }
+        return (int)size;
+    }
+
+    private static byte[] RawProperty(HeifContainer c, int id, string type)
+    {
+        var p = c.Property(id, type) ?? throw new InvalidOperationException($"Encoded cell lacks '{type}'.");
+        return c.Data.AsSpan(p.Off - 8, p.Len + 8).ToArray();
+    }
+
     // BT.601 full-range RGB→YUV (the inverse of ConvertYuvToRgb's full-range BT.601 path) with I420 chroma
     // subsampling: w x h luma, (w/2) x (h/2) U and V (2x2 box average). Requires even dimensions.
     private static void RgbToI420(byte[] rgb, int w, int h, out byte[] y, out byte[] u, out byte[] v)
@@ -1809,15 +1933,17 @@ public static partial class HeifCoder
         }
         if (yuv.BitDepth > 8)
         {
-            // Native-precision alpha: map [0, 2^bd) onto the full 16-bit quantum range.
+            // Native-precision alpha onto the 16-bit quantum, as libavif's avifReformatAlpha rescales depth (float):
+            // (int)(0.5f + (a / srcMax) * 65535f).
             if (!frame.HasAlpha) frame.SetAlpha(true);
             ReadOnlySpan<ushort> a16 = yuv.YPlane16.Span;
-            double s = 65535.0 / ((1 << yuv.BitDepth) - 1);
+            float srcMax = (1 << yuv.BitDepth) - 1;
             int aOff = frame.NumberOfChannels - 1, nch = frame.NumberOfChannels;
             for (int y = 0; y < h; y++)
             {
                 var row = frame.GetPixelRowForWrite(y);
-                for (int x = 0; x < w; x++) row[x * nch + aOff] = (ushort)Math.Clamp((int)Math.Round(a16[y * yuv.YStride + x] * s), 0, 65535);
+                for (int x = 0; x < w; x++)
+                    row[x * nch + aOff] = (ushort)Math.Clamp((int)(0.5f + (a16[y * yuv.YStride + x] / srcMax) * 65535.0f), 0, 65535);
             }
             return;
         }
@@ -1854,7 +1980,6 @@ public static partial class HeifCoder
         int nch = frame.NumberOfChannels, aOff = nch - 1;
         ReadOnlySpan<byte> a8 = yuv.YPlane.Span;
         ReadOnlySpan<ushort> a16 = yuv.YPlane16.Span;
-        double s = 65535.0 / max;
         for (int y = 0; y < h; y++)
         {
             var row = frame.GetPixelRowForWrite(y);
@@ -1862,7 +1987,7 @@ public static partial class HeifCoder
             {
                 int v = bd > 8 ? a16[y * yuv.YStride + x] : a8[y * yuv.YStride + x];
                 v = Math.Clamp(((v - lo) * max + (hi - lo) / 2) / (hi - lo), 0, max);
-                row[x * nch + aOff] = bd > 8 ? (ushort)Math.Clamp((int)Math.Round(v * s), 0, 65535) : Quantum.ScaleFromByte((byte)v);
+                row[x * nch + aOff] = bd > 8 ? (ushort)Math.Clamp((int)(0.5f + (v / (float)max) * 65535.0f), 0, 65535) : Quantum.ScaleFromByte((byte)v);
             }
         }
     }
@@ -2027,6 +2152,11 @@ public static partial class HeifCoder
         bool hbd = bd > 8;
         // libavif reformat modes: identity (GBR, chroma on the luma table), YCgCo, YCgCo-Re/Ro (integer), else kr/kb.
         int mode = monochrome ? 0 : matrixCoeffs switch { 0 => 1, 8 => 2, 16 or 17 => 3, _ => 0 };
+        // libavif converts high-bit-depth 4:4:4 colour with kr/kb coefficients through its fast path and un-premultiplies
+        // the quantised result afterwards; every other case goes through the slow path, which un-premultiplies in float
+        // before quantisation (monochrome included: avifdec converts grey images to a grey RGB format, which the fast
+        // paths do not take).
+        bool postUnmultiply = premAlpha != null && hbd && mode == 0 && !monochrome && ssHor == 0 && ssVer == 0;
         float rangeY = fullRange ? maxCh : 219 << (bd - 8), biasY = fullRange ? 0 : 16 << (bd - 8);
         float rangeUV = fullRange ? maxCh : 224 << (bd - 8), biasUV = 1 << (bd - 1);
         var tabY = new float[maxCh + 1];
@@ -2093,7 +2223,7 @@ public static partial class HeifCoder
                     }
                 }
 
-                if (premAlpha != null)
+                if (premAlpha != null && !postUnmultiply)
                 {
                     // libavif slow path UNMULTIPLY: on the clamped float colour, before quantisation.
                     float ac = Math.Clamp(premAlpha[j * w + i] / (float)maxCh, 0.0f, 1.0f);
@@ -2121,7 +2251,26 @@ public static partial class HeifCoder
                         row[off + 2] = Q16f(B);
                     }
                 }
+                if (postUnmultiply) UnmultiplyQuantized(row, off, channels >= 3 ? 3 : 1, premAlpha![j * w + i], maxCh, t_nativeDepthRgb);
             }
+        }
+    }
+
+    // libavif avifRGBImageUnpremultiplyAlpha (high-bit-depth RGB): after its 4:4:4 fast YUV->RGB path the
+    // colour is un-premultiplied on the quantised samples, c = min(roundf(c * max / a), max), with alpha rescaled to the
+    // RGB depth by avifReformatAlpha. Stored values are 16-bit (or native-depth scaled, see t_nativeDepthRgb).
+    private static void UnmultiplyQuantized(Span<ushort> row, int off, int n, ushort alphaNative, int alphaMax, bool nativeDepth)
+    {
+        int max = nativeDepth ? alphaMax : 65535;
+        float maxF = max;
+        int a = nativeDepth ? alphaNative : Math.Clamp((int)(0.5f + (alphaNative / (float)alphaMax) * 65535.0f), 0, 65535);
+        if (a >= max) return;
+        for (int k = 0; k < n; k++)
+        {
+            if (a == 0) { row[off + k] = 0; continue; }
+            int p = nativeDepth ? (int)((row[off + k] * (uint)max + 32767u) / 65535u) : row[off + k];
+            float c = MathF.Min(MathF.Floor(p * maxF / a + 0.5f), maxF);
+            row[off + k] = nativeDepth ? (ushort)(((uint)c * 65535u + (uint)max / 2) / (uint)max) : (ushort)c;
         }
     }
 
@@ -2278,6 +2427,26 @@ public static partial class HeifCoder
         byte[] coded = c.ItemData(id) ?? throw new InvalidDataException($"Alpha item {id} has no data.");
         using var yuv = DecodeAv1Item(c, id, coded, out var decoder, "AV1 alpha");
         return NativeAlpha(yuv, decoder);
+    }
+
+    // A premultiplied grid's alpha at native precision, its tiles stitched (and cropped) like the colour grid, so the
+    // colour can be un-premultiplied during YUV->RGB exactly where libavif does it (on the reassembled image).
+    private static ushort[] DecodeAlphaGridNative(HeifContainer c, List<int> aTiles, (int Rows, int Cols, int W, int H) grid, int outW, int outH)
+    {
+        var full = new ushort[outW * outH];
+        int tw = 0, th = 0;
+        for (int i = 0; i < aTiles.Count; i++)
+        {
+            byte[] coded = c.ItemData(aTiles[i]) ?? throw new InvalidDataException($"Alpha tile {aTiles[i]} has no data.");
+            using var yuv = DecodeAv1Item(c, aTiles[i], coded, out var decoder, "AV1 alpha tile");
+            var a = NativeAlpha(yuv, decoder);
+            if (i == 0) { tw = yuv.Width; th = yuv.Height; }
+            int x0 = (i % grid.Cols) * tw, y0 = (i / grid.Cols) * th;
+            int cw = Math.Min(yuv.Width, outW - x0), chh = Math.Min(yuv.Height, outH - y0);
+            for (int y = 0; y < chh; y++)
+                a.AsSpan(y * yuv.Width, Math.Max(0, cw)).CopyTo(full.AsSpan((y0 + y) * outW + x0));
+        }
+        return full;
     }
 
     private static ushort[] NativeAlpha(Av1.DecodedVideoFrame yuv, Av1.Av1Decoder decoder)

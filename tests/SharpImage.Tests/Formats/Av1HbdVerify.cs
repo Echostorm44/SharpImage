@@ -891,6 +891,7 @@ public sealed class Av1HbdVerify
                     Lossless = true, GainMap = gm, GainMapLossless = true, GainMapDownscaling = int.Parse(p[3]),
                     GainMapChromaSubsampling = p[6] == "420" ? AvifChromaSubsampling.Yuv420 : AvifChromaSubsampling.Yuv444,
                 };
+                if (p.Length > 7) { var gg = p[7].Split('x'); opt.Grid = (int.Parse(gg[0]), int.Parse(gg[1])); }
                 File.WriteAllBytes(p[2], HeifCoder.EncodeAvif(b, opt));
                 log.AppendLine($"{Path.GetFileName(p[2])} ok");
             }
@@ -1001,6 +1002,9 @@ public sealed class Av1HbdVerify
                         case "mc": o.MatrixCoefficients = int.Parse(t[1]); break;
                         case "cp": o.ColorPrimaries = int.Parse(t[1]); break;
                         case "tc": o.TransferCharacteristics = int.Parse(t[1]); break;
+                        case "g": { var gg = t[1].Split('x'); o.Grid = (int.Parse(gg[0]), int.Parse(gg[1])); break; }
+                        case "irot": o.Rotation = int.Parse(t[1]); break;
+                        case "prem": o.PremultiplyAlpha = true; break;
                     }
                 }
                 byte[] avif = HeifCoder.EncodeAvif(img, o);

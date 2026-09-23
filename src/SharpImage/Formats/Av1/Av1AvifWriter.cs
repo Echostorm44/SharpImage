@@ -48,6 +48,17 @@ internal sealed class AvifGainMapItem
     public byte[] AltNclxBox = [];
 }
 
+/// <summary>The coded cells of a grid image ('grid' derived item, ISO/IEC 23008-12 6.6.2.3): row-major colour cells and,
+/// when present, alpha cells, with the configuration boxes of the first cell (shared by every cell, as libavif writes
+/// them — the last row / column may be coded smaller).</summary>
+internal sealed class AvifGridCells
+{
+    public int Columns, Rows, CellWidth, CellHeight;
+    public List<byte[]> Color = [];
+    public List<byte[]>? Alpha;
+    public byte[] ColorAv1CBox = [], AlphaAv1CBox = [];
+}
+
 internal sealed class AvifSequenceData
 {
     public List<byte[]> ColorSamples = [];
@@ -343,6 +354,208 @@ internal static class Av1AvifWriter
         uint start = (uint)(ftyp.Length + metaLen + moovLen + 8);
         return Concat(ftyp, Meta(start), Moov(sq, width, height, colorEntry, alphaEntry, start + (uint)colorChunk, start + (uint)alphaChunk,
             x?.Premultiplied == true), Box("mdat", Concat(chunks.ToArray())));
+    }
+
+    /// <summary>
+    /// A grid image as libavif writes it: item 1 = the colour 'grid' (payload ImageGrid; ispe of the whole image, pixi,
+    /// colr, pasp / clli / mdcv, transforms), its cells as hidden av01 items (ispe of the first cell, pixi, av1C, the same
+    /// colr / pasp / clli / mdcv); then an alpha 'grid' (auxC, auxl to the colour grid) with hidden alpha cells; then an
+    /// optional tone-mapped gain map ('tmap' over [colour grid, gain map]) and Exif / XMP. Transforms (clap / irot /
+    /// imir) sit on the grid items only: HEIF applies an input image's transforms before composing the grid, so they must
+    /// not be on the cells (libavif also stamps them on cells and ignores them there when reading).
+    /// </summary>
+    internal static byte[] BuildGridAvif(AvifGridCells g, int width, int height, int bitDepth, Av1PixelLayout layout,
+        Av1ObuWriter.Av1ColorDesc? color, AvifContainerExtras? x)
+    {
+        bool monochrome = layout == Av1PixelLayout.I400;
+        var gmx = x?.GainMap;
+        bool hasAlpha = g.Alpha != null;
+        byte[] ftyp = Ftyp(bitDepth, layout, false, gmx != null);
+
+        var props = new List<byte[]>();
+        int Add(byte[] box)
+        {
+            for (int i = 0; i < props.Count; i++) if (props[i].AsSpan().SequenceEqual(box)) return i + 1;
+            props.Add(box);
+            return props.Count;
+        }
+
+        // ImageGrid payload: version 0, flags (1 = 32-bit output size), rows_minus_one, columns_minus_one, size.
+        bool large = width > 65535 || height > 65535;
+        byte[] gridPayload = Concat(new byte[] { 0, (byte)(large ? 1 : 0), (byte)(g.Rows - 1), (byte)(g.Columns - 1) },
+            large ? Concat(U32((uint)width), U32((uint)height)) : Concat(U16(width), U16(height)));
+
+        int ch = monochrome ? 1 : 3;
+        var pixiBytes = new byte[1 + ch];
+        pixiBytes[0] = (byte)ch;
+        for (int i = 1; i <= ch; i++) pixiBytes[i] = (byte)bitDepth;
+
+        // Colour grid.
+        var gridAssoc = new List<(int Index, bool Essential)>();
+        int ispeFull = Add(FullBox("ispe", 0, 0, Concat(U32((uint)width), U32((uint)height))));
+        gridAssoc.Add((ispeFull, false));
+        int pixiIdx = Add(FullBox("pixi", 0, 0, pixiBytes));
+        gridAssoc.Add((pixiIdx, false));
+        var colourProps = new List<(int Index, bool Essential)>();
+        if (x?.Icc is { Length: > 0 } icc) colourProps.Add((Add(Box("colr", Concat(Fourcc("prof"), icc))), false));
+        colourProps.Add((Add(ColrNclx(color, monochrome)), false));
+        if (x?.Pasp is { } pasp) colourProps.Add((Add(Box("pasp", Concat(U32(pasp.H), U32(pasp.V)))), false));
+        if (x?.Clli is { } clli) colourProps.Add((Add(Box("clli", Concat(U16(clli.MaxCll), U16(clli.MaxPall)))), false));
+        if (x?.Mdcv is { Length: 24 } mdcv) colourProps.Add((Add(Box("mdcv", mdcv)), false));
+        gridAssoc.AddRange(colourProps);
+        var transforms = new List<(int Index, bool Essential)>();
+        if (x?.Clap is { Length: 8 } clap)
+        {
+            var cb = new byte[32];
+            for (int i = 0; i < 8; i++) WriteU32(cb, i * 4, clap[i]);
+            transforms.Add((Add(Box("clap", cb)), true));
+        }
+        if (x?.IrotAngle is { } angle) transforms.Add((Add(Box("irot", new[] { (byte)(angle & 3) })), true));
+        if (x?.ImirAxis is { } axis) transforms.Add((Add(Box("imir", new[] { (byte)(axis & 1) })), true));
+        gridAssoc.AddRange(transforms);
+
+        // Colour cells.
+        var cellAssoc = new List<(int Index, bool Essential)>();
+        int ispeCell = Add(FullBox("ispe", 0, 0, Concat(U32((uint)g.CellWidth), U32((uint)g.CellHeight))));
+        cellAssoc.Add((ispeCell, false));
+        cellAssoc.Add((pixiIdx, false));
+        cellAssoc.Add((Add(g.ColorAv1CBox), true));
+        cellAssoc.AddRange(colourProps);
+
+        // Alpha grid + cells.
+        byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
+        var alphaGridAssoc = new List<(int Index, bool Essential)>();
+        var alphaCellAssoc = new List<(int Index, bool Essential)>();
+        if (hasAlpha)
+        {
+            int aPixi = Add(FullBox("pixi", 0, 0, new byte[] { 1, (byte)bitDepth }));
+            int auxC = Add(FullBox("auxC", 0, 0, auxUrn));
+            alphaGridAssoc.Add((ispeFull, false));
+            alphaGridAssoc.Add((aPixi, false));
+            alphaGridAssoc.Add((auxC, true));
+            alphaGridAssoc.AddRange(transforms);
+            alphaCellAssoc.Add((ispeCell, false));
+            alphaCellAssoc.Add((aPixi, false));
+            alphaCellAssoc.Add((Add(g.AlphaAv1CBox), true));
+            alphaCellAssoc.Add((auxC, true));
+        }
+
+        // Gain map (a single coded item even under a grid base: the tmap derives from [colour grid, gain map]).
+        var assocTmap = new List<(int Index, bool Essential)>();
+        var assocGm = new List<(int Index, bool Essential)>();
+        if (gmx != null)
+        {
+            assocTmap.Add((ispeFull, false));
+            if (gmx.AltPixiBox != null) assocTmap.Add((Add(gmx.AltPixiBox), false));
+            if (gmx.AltIccBox != null) assocTmap.Add((Add(gmx.AltIccBox), false));
+            assocTmap.Add((Add(gmx.AltNclxBox), false));
+            if (gmx.AltClliBox != null) assocTmap.Add((Add(gmx.AltClliBox), false));
+            assocGm.Add((Add(FullBox("ispe", 0, 0, Concat(U32((uint)gmx.Width), U32((uint)gmx.Height)))), false));
+            assocGm.Add((Add(gmx.PixiBox), false));
+            assocGm.Add((Add(gmx.Av1CBox), true));
+            assocGm.Add((Add(gmx.ColrBox), false));
+            if (x?.Pasp is { } gpasp) assocGm.Add((Add(Box("pasp", Concat(U32(gpasp.H), U32(gpasp.V)))), false));
+            if (x?.Clap != null && (gmx.Width != width || gmx.Height != height))
+                throw new NotSupportedException("A clean aperture cannot be applied to a gain map of another size.");
+            assocGm.AddRange(transforms);
+        }
+
+        // Items.
+        var items = new List<(int Id, string Type, byte[] Payload, uint Flags, List<(int Index, bool Essential)>? Assoc)>();
+        int nextId = 1;
+        int gridId = nextId++;
+        items.Add((gridId, "grid", gridPayload, 0, gridAssoc));
+        var cellIds = new List<int>();
+        foreach (var cell in g.Color) { int id = nextId++; cellIds.Add(id); items.Add((id, "av01", cell, 1, cellAssoc)); }
+        int alphaGridId = 0;
+        var alphaCellIds = new List<int>();
+        if (hasAlpha)
+        {
+            alphaGridId = nextId++;
+            items.Add((alphaGridId, "grid", gridPayload, 0, alphaGridAssoc));
+            foreach (var cell in g.Alpha!) { int id = nextId++; alphaCellIds.Add(id); items.Add((id, "av01", cell, 1, alphaCellAssoc)); }
+        }
+        int tmapId = 0, gmId = 0;
+        if (gmx != null)
+        {
+            tmapId = nextId++;
+            items.Add((tmapId, "tmap", gmx.Tmap, 0, assocTmap));
+            gmId = nextId++;
+            items.Add((gmId, "av01", gmx.Data, 1, assocGm));
+        }
+        int exifId = 0, xmpId = 0;
+        if (x?.Exif is { Length: > 0 } exif) { exifId = nextId++; items.Add((exifId, "Exif", ExifItemPayload(exif), 0, null)); }
+        if (x?.Xmp is { Length: > 0 } xmp) { xmpId = nextId++; items.Add((xmpId, "mime", xmp, 0, null)); }
+
+        var ipmaBody = new List<byte[]>();
+        int assocCount = 0;
+        foreach (var it in items)
+        {
+            if (it.Assoc == null) continue;
+            assocCount++;
+            ipmaBody.Add(U16(it.Id));
+            ipmaBody.Add(new[] { (byte)it.Assoc.Count });
+            foreach (var (idx, ess) in it.Assoc) ipmaBody.Add(new[] { (byte)((ess ? 0x80 : 0) | idx) });
+        }
+        if (props.Count > 127) throw new NotSupportedException("Too many distinct properties for a 7-bit ipma index.");
+        byte[] iprp = Box("iprp", Concat(Box("ipco", Concat(props.ToArray())), FullBox("ipma", 0, 0, Concat(U32((uint)assocCount), Concat(ipmaBody.ToArray())))));
+
+        byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc("pict"), U32(0), U32(0), U32(0),
+            System.Text.Encoding.ASCII.GetBytes("PictureHandler\0")));
+        byte[] pitm = FullBox("pitm", 0, 0, U16(gridId));
+        var infes = new List<byte[]> { U16(items.Count) };
+        foreach (var it in items)
+        {
+            byte[] extra = it.Type switch
+            {
+                "Exif" => System.Text.Encoding.ASCII.GetBytes("Exif\0"),
+                "mime" => System.Text.Encoding.ASCII.GetBytes("XMP\0application/rdf+xml\0"),
+                _ => new byte[] { 0 },
+            };
+            infes.Add(FullBox("infe", 2, it.Flags, Concat(U16(it.Id), U16(0), Fourcc(it.Type), extra)));
+        }
+        byte[] iinf = FullBox("iinf", 0, 0, Concat(infes.ToArray()));
+
+        byte[] Ref(string type, int from, List<int> to)
+        {
+            var b = new List<byte[]> { U16(from), U16(to.Count) };
+            foreach (int t in to) b.Add(U16(t));
+            return Box(type, Concat(b.ToArray()));
+        }
+        var refs = new List<byte[]> { Ref("dimg", gridId, cellIds) };
+        if (hasAlpha)
+        {
+            refs.Add(Ref("dimg", alphaGridId, alphaCellIds));
+            refs.Add(Ref("auxl", alphaGridId, [gridId]));
+            if (x?.Premultiplied == true) refs.Add(Ref("prem", gridId, [alphaGridId]));
+        }
+        if (gmx != null) refs.Add(Ref("dimg", tmapId, [gridId, gmId]));
+        if (exifId != 0) refs.Add(Ref("cdsc", exifId, [gridId]));
+        if (xmpId != 0) refs.Add(Ref("cdsc", xmpId, [gridId]));
+        byte[] iref = FullBox("iref", 0, 0, Concat(refs.ToArray()));
+
+        byte[] grpl = gmx != null
+            ? Box("grpl", FullBox("altr", 0, 0, Concat(U32((uint)nextId), U32(2), U32((uint)tmapId), U32((uint)gridId))))
+            : [];
+
+        var itemOffset = new long[items.Count];
+        long pos = 0;
+        for (int i = 0; i < items.Count; i++) { itemOffset[i] = pos; pos += items[i].Payload.Length; }
+        bool largeOffsets = pos > uint.MaxValue - 1_000_000;
+        if (largeOffsets) throw new NotSupportedException("AVIF files over 4 GB are not supported.");
+        byte[] Iloc(uint mdatStart)
+        {
+            var body = new List<byte[]> { new byte[] { 0x44, 0x00 }, U16(items.Count) };
+            for (int i = 0; i < items.Count; i++)
+                body.Add(Concat(U16(items[i].Id), U16(0), U16(1), U32((uint)(mdatStart + itemOffset[i])), U32((uint)items[i].Payload.Length)));
+            return FullBox("iloc", 0, 0, Concat(body.ToArray()));
+        }
+        byte[] Meta(uint mdatStart) => FullBox("meta", 0, 0, Concat(hdlr, pitm, Iloc(mdatStart), iinf, iref, iprp, grpl));
+        int metaLen = Meta(0).Length;
+        byte[] meta = Meta((uint)(ftyp.Length + metaLen + 8));
+        var payloads = new byte[items.Count][];
+        for (int i = 0; i < items.Count; i++) payloads[i] = items[i].Payload;
+        return Concat(ftyp, meta, Box("mdat", Concat(payloads)));
     }
 
     // Sample-entry child boxes (libavif write.c): av1C, then for colour its colr (ICC / nclx) and pasp / clli / mdcv,
