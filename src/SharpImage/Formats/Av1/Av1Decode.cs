@@ -738,7 +738,10 @@ public static class Av1Decode
 
         // === Skip Mode ===
         b.SkipMode = 0;
-        if (fh.SkipModeEnabled && !fh.SegmentationEnabled && bw4 > 1 && bh4 > 1)
+        var segF = fh.SegmentationEnabled ? fh.SegmentationData.Segments[b.SegId] : default;
+        bool segOnF = fh.SegmentationEnabled;
+        if ((!segOnF || (segF.GlobalMv == 0 && segF.Ref == -1 && segF.Skip == 0)) &&
+            fh.SkipModeEnabled && Math.Min(bw4, bh4) > 1)
         {
             int smctx = t.Above.SkipMode[bx4] + t.Left.SkipMode[by4];
             b.SkipMode = (byte)(msac.DecodeBoolAdapt(ts.Cdf.Mode.SkipMode[smctx]) != 0 ? 1 : 0);
@@ -748,7 +751,7 @@ public static class Av1Decode
 
         // === Skip ===
         // dav1d: skip_mode blocks are always skipped (no MSAC read)
-        if (b.SkipMode != 0)
+        if (b.SkipMode != 0 || (segOnF && segF.Skip != 0))
         {
             b.Skip = 1;
         }
@@ -873,6 +876,10 @@ public static class Av1Decode
         if (b.SkipMode != 0)
         {
             b.Intra = 0;
+        }
+        else if (fh.IsInterOrSwitch && segOnF && (segF.Ref >= 0 || segF.GlobalMv != 0))
+        {
+            b.Intra = (byte)(segF.Ref == 0 ? 1 : 0);
         }
         else if (fh.IsInterOrSwitch)
         {
@@ -1091,14 +1098,24 @@ public static class Av1Decode
 
             // Update refmvs spatial grid for inter blocks (dav1d: splat_oneref_mv + edge updates)
             // dav1d: ref[1] = interintra_type ? 0 : -1 (interintra blocks excluded from warp candidates)
-            var tmpl = new Av1RefMvsBlock
-            {
-                Ref = new Av1RefMvsRefPair { Ref0 = (sbyte)(b.Ref0 + 1), Ref1 = b.InterIntraTypeField != 0 ? (sbyte)0 : (sbyte)(-1) },
-                Mv = new Av1RefMvsMvPair { Mv0 = b.Mv0 },
-                Bs = (byte)bs,
-                Mf = (byte)((b.InterMode == (byte)Av1InterPredMode.GlobalMv && Math.Min(bw4, bh4) >= 2 ? 1 : 0) |
-                            ((b.InterMode == (byte)Av1InterPredMode.NewMv) ? 2 : 0)),
-            };
+            var tmpl = b.CompType != (byte)Av1CompInterType.None
+                ? new Av1RefMvsBlock   // dav1d splat_tworef_mv
+                {
+                    Ref = new Av1RefMvsRefPair { Ref0 = (sbyte)(b.Ref0 + 1), Ref1 = (sbyte)(b.Ref1 + 1) },
+                    Mv = new Av1RefMvsMvPair { Mv0 = b.Mv0, Mv1 = b.Mv1 },
+                    Bs = (byte)bs,
+                    // GLOBALMV_GLOBALMV, and any mode with a NEWMV half (mask 0xbc)
+                    Mf = (byte)((b.InterMode == (byte)Av1CompInterPredMode.GlobalGlobal ? 1 : 0) |
+                                (((1 << b.InterMode) & 0xbc) != 0 ? 2 : 0)),
+                }
+                : new Av1RefMvsBlock   // dav1d splat_oneref_mv
+                {
+                    Ref = new Av1RefMvsRefPair { Ref0 = (sbyte)(b.Ref0 + 1), Ref1 = b.InterIntraTypeField != 0 ? (sbyte)0 : (sbyte)(-1) },
+                    Mv = new Av1RefMvsMvPair { Mv0 = b.Mv0 },
+                    Bs = (byte)bs,
+                    Mf = (byte)((b.InterMode == (byte)Av1InterPredMode.GlobalMv && Math.Min(bw4, bh4) >= 2 ? 1 : 0) |
+                                ((b.InterMode == (byte)Av1InterPredMode.NewMv) ? 2 : 0)),
+                };
             int r0 = (t.By & 31) + 5;
             Av1RefMvs.SplatMv(t.Rt.R, r0, in tmpl, t.Bx, bw4, bh4);
 
@@ -1671,281 +1688,351 @@ public static class Av1Decode
             AvDbg.W($"[INTER-STATE] pre-ref rng={msac.DebugRng:X4} dif_lo={(uint)msac.DebugDif:X8} dif_hi={(uint)(msac.DebugDif>>32):X8} cnt={msac.Cnt}");
         }
 
-        // ── Compound type ──
-        bool isComp = false;
-        if (fh.SwitchableCompRefs && Math.Min(bw4, bh4) > 1)
-        {
-            int compCtx = GetCompCtx(above, left, by4, bx4, haveTop, haveLeft);
-            isComp = msac.DecodeBoolAdapt(mode.Comp[compCtx]) != 0;
-        }
+        var seqHdr = ctx.SequenceHeader!;
+        // Segment features that pin the reference / mode (dav1d `seg`, null when segmentation is off).
+        bool segOn = fh.SegmentationEnabled;
+        var seg = segOn ? fh.SegmentationData.Segments[b.SegId] : default;
+        bool segSkipOrGmv = segOn && (seg.Skip != 0 || seg.GlobalMv != 0);
 
-        if (isComp)
+        // ── Compound flag (dav1d decode_b) ──
+        bool isComp;
+        if (b.SkipMode != 0)
+            isComp = true;
+        else if ((!segOn || (seg.Ref == -1 && seg.GlobalMv == 0 && seg.Skip == 0)) &&
+                 fh.SwitchableCompRefs && Math.Min(bw4, bh4) > 1)
+            isComp = msac.DecodeBoolAdapt(mode.Comp[GetCompCtx(above, left, by4, bx4, haveTop, haveLeft)]) != 0;
+        else
+            isComp = false;
+
+        Span<Av1RefMvsCandidate> mvstack = stackalloc Av1RefMvsCandidate[8];
+        if (b.SkipMode != 0)
         {
-            // TODO: Compound path — for now, decode as single ref (skip compound symbols)
-            // For the av1-inter-test stream, is_comp = false, so we don't hit this path
-            b.CompType = (byte)Av1CompInterType.None;
-            b.Ref0 = (sbyte)0; b.Ref1 = (sbyte)(-1);
+            // Skip mode: the frame's two skip-mode references, NEAREST/NEAREST, plain average, no residual.
+            BlockTrace?.WriteLine($"K {t.By} {t.Bx}");
+            b.Ref0 = fh.SkipModeRef0;
+            b.Ref1 = fh.SkipModeRef1;
+            b.CompType = (byte)Av1CompInterType.Average;
+            b.InterMode = (byte)Av1CompInterPredMode.NearestNearest;
+            b.DrlIdx = 0;
+            hasSubpelFilter = false;
+            Av1RefMvs.FindRefMvs(t.Rt, mvstack, out _, out _, out _,
+                new Av1RefMvsRefPair { Ref0 = (sbyte)(b.Ref0 + 1), Ref1 = (sbyte)(b.Ref1 + 1) },
+                (int)bs, intraEdgeFlags, t.By, t.Bx);
+            b.Mv0 = mvstack[0].Mv.Mv0;
+            b.Mv1 = mvstack[0].Mv.Mv1;
+            Av1RefMvs.FixMvPrecision(fh, ref b.Mv0);
+            Av1RefMvs.FixMvPrecision(fh, ref b.Mv1);
+        }
+        else if (isComp)
+        {
+            // ── Compound references ──
+            if (msac.DecodeBoolAdapt(mode.CompDir[GetCompDirCtx(above, left, by4, bx4, haveTop, haveLeft)]) != 0)
+            {
+                // bidirectional: a forward (LAST..GOLDEN) then a backward (BWDREF..ALTREF) reference
+                if (msac.DecodeBoolAdapt(mode.CompFwdRef[0 * 3 + GetFwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)]) != 0)
+                    b.Ref0 = (sbyte)(2 + (int)msac.DecodeBoolAdapt(
+                        mode.CompFwdRef[2 * 3 + GetFwdRef2Ctx(above, left, by4, bx4, haveTop, haveLeft)]));
+                else
+                    b.Ref0 = (sbyte)msac.DecodeBoolAdapt(
+                        mode.CompFwdRef[1 * 3 + GetFwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)]);
+
+                if (msac.DecodeBoolAdapt(mode.CompBwdRef[0 * 3 + GetBwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)]) != 0)
+                    b.Ref1 = 6;
+                else
+                    b.Ref1 = (sbyte)(4 + (int)msac.DecodeBoolAdapt(
+                        mode.CompBwdRef[1 * 3 + GetBwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)]));
+            }
+            else
+            {
+                // unidirectional: BWDREF+ALTREF, or LAST with LAST2/LAST3/GOLDEN
+                if (msac.DecodeBoolAdapt(mode.CompUniRef[0 * 3 + GetRefCtx(above, left, by4, bx4, haveTop, haveLeft)]) != 0)
+                {
+                    b.Ref0 = 4;
+                    b.Ref1 = 6;
+                }
+                else
+                {
+                    b.Ref0 = 0;
+                    b.Ref1 = (sbyte)(1 + (int)msac.DecodeBoolAdapt(
+                        mode.CompUniRef[1 * 3 + GetUniP1Ctx(above, left, by4, bx4, haveTop, haveLeft)]));
+                    if (b.Ref1 == 2)
+                        b.Ref1 += (sbyte)msac.DecodeBoolAdapt(
+                            mode.CompUniRef[2 * 3 + GetFwdRef2Ctx(above, left, by4, bx4, haveTop, haveLeft)]);
+                }
+            }
+
+            Av1RefMvs.FindRefMvs(t.Rt, mvstack, out int nMvs, out int cctx, out _,
+                new Av1RefMvsRefPair { Ref0 = (sbyte)(b.Ref0 + 1), Ref1 = (sbyte)(b.Ref1 + 1) },
+                (int)bs, intraEdgeFlags, t.By, t.Bx);
+
+            // ── Compound inter mode + DRL ──
+            b.InterMode = (byte)msac.DecodeSymbolAdapt8(mode.CompInterMode[cctx], (int)Av1CompInterPredMode.Count - 1);
+            int im0 = Av1Tables.CompInterPredModes[b.InterMode, 0];
+            int im1 = Av1Tables.CompInterPredModes[b.InterMode, 1];
+            const int nearMv = (int)Av1InterPredMode.NearMv;
+            b.DrlIdx = 0;
+            if (b.InterMode == (byte)Av1CompInterPredMode.NewNew)
+            {
+                if (nMvs > 1)
+                {
+                    b.DrlIdx += (byte)msac.DecodeBoolAdapt(mode.DrlBit[Av1RefMvs.GetDrlContext(mvstack, 0)]);
+                    if (b.DrlIdx == 1 && nMvs > 2)
+                        b.DrlIdx += (byte)msac.DecodeBoolAdapt(mode.DrlBit[Av1RefMvs.GetDrlContext(mvstack, 1)]);
+                }
+            }
+            else if (im0 == nearMv || im1 == nearMv)
+            {
+                b.DrlIdx = 1;
+                if (nMvs > 2)
+                {
+                    b.DrlIdx += (byte)msac.DecodeBoolAdapt(mode.DrlBit[Av1RefMvs.GetDrlContext(mvstack, 1)]);
+                    if (b.DrlIdx == 2 && nMvs > 3)
+                        b.DrlIdx += (byte)msac.DecodeBoolAdapt(mode.DrlBit[Av1RefMvs.GetDrlContext(mvstack, 2)]);
+                }
+            }
+
+            hasSubpelFilter = Math.Min(bw4, bh4) == 1 || b.InterMode != (byte)Av1CompInterPredMode.GlobalGlobal;
+            b.Mv0 = AssignCompMv(ts, ref msac, fh, mvstack, im0, 0, b.Ref0, b.DrlIdx, t.Bx, t.By, bw4, bh4, ref hasSubpelFilter);
+            b.Mv1 = AssignCompMv(ts, ref msac, fh, mvstack, im1, 1, b.Ref1, b.DrlIdx, t.Bx, t.By, bw4, bh4, ref hasSubpelFilter);
+
+            // ── Compound type: distance-weighted / average vs wedge / difference-weighted segment mask ──
+            bool isSegWedge = false;
+            if (seqHdr.MaskedCompound)
+                isSegWedge = msac.DecodeBoolAdapt(mode.MaskComp[GetMaskCompCtx(above, left, by4, bx4)]) != 0;
+            if (!isSegWedge)
+            {
+                if (seqHdr.JntComp)
+                {
+                    int jctx = GetJntCompCtx(seqHdr.OrderHintNBits, fh.FrameOffset,
+                        ctx.RefFrames[fh.GetRefIdx(b.Ref0)].OrderHint, ctx.RefFrames[fh.GetRefIdx(b.Ref1)].OrderHint,
+                        above, left, by4, bx4);
+                    b.CompType = (byte)((int)Av1CompInterType.WeightedAvg + (int)msac.DecodeBoolAdapt(mode.JntComp[jctx]));
+                }
+                else
+                {
+                    b.CompType = (byte)Av1CompInterType.Average;
+                }
+            }
+            else
+            {
+                if (((Av1Tables.WedgeAllowedMask >> (int)bs) & 1) != 0)
+                {
+                    int wctx = Av1Tables.WedgeCtxLut[(int)bs];
+                    b.CompType = (byte)((int)Av1CompInterType.Wedge - (int)msac.DecodeBoolAdapt(mode.WedgeComp[wctx]));
+                    if (b.CompType == (byte)Av1CompInterType.Wedge)
+                        b.WedgeIdx = (byte)msac.DecodeSymbolAdapt16(mode.WedgeIdx[wctx], 15);
+                }
+                else
+                {
+                    b.CompType = (byte)Av1CompInterType.Seg;
+                }
+                b.MaskSign = (byte)msac.DecodeBoolEqui();
+            }
         }
         else
         {
             b.CompType = (byte)Av1CompInterType.None;
 
-            // ── Reference frame decoding (single ref) ──
-            int ctx1 = GetRefCtx(above, left, by4, bx4, haveTop, haveLeft);
-            bool r0 = msac.DecodeBoolAdapt(mode.Ref[ctx1]) != 0;
-            if (r0)
+            // ── Single reference ──
+            if (segOn && seg.Ref > 0)
             {
-                int ctx2 = GetBwdRefCtx(above, left, by4, bx4, haveTop, haveLeft);
-                bool r1 = msac.DecodeBoolAdapt(mode.Ref[3 + ctx2]) != 0;
-                if (r1)
-                    b.Ref0 = (sbyte)6;
+                b.Ref0 = (sbyte)(seg.Ref - 1);
+            }
+            else if (segSkipOrGmv)
+            {
+                b.Ref0 = 0;
+            }
+            else if (msac.DecodeBoolAdapt(mode.Ref[GetRefCtx(above, left, by4, bx4, haveTop, haveLeft)]) != 0)
+            {
+                if (msac.DecodeBoolAdapt(mode.Ref[1 * 3 + GetBwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)]) != 0)
+                    b.Ref0 = 6;
                 else
-                {
-                    int ctx3 = GetBwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft);
-                    bool r2 = msac.DecodeBoolAdapt(mode.Ref[5 * 3 + ctx3]) != 0;
-                    b.Ref0 = (sbyte)(4 + (r2 ? 1 : 0));
-                }
+                    b.Ref0 = (sbyte)(4 + (int)msac.DecodeBoolAdapt(
+                        mode.Ref[5 * 3 + GetBwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)]));
             }
             else
             {
-                int ctx2 = GetFwdRefCtx(above, left, by4, bx4, haveTop, haveLeft);
-                bool r1 = msac.DecodeBoolAdapt(mode.Ref[2 * 3 + ctx2]) != 0;
-                if (r1)
+                if (msac.DecodeBoolAdapt(mode.Ref[2 * 3 + GetFwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)]) != 0)
+                    b.Ref0 = (sbyte)(2 + (int)msac.DecodeBoolAdapt(
+                        mode.Ref[4 * 3 + GetFwdRef2Ctx(above, left, by4, bx4, haveTop, haveLeft)]));
+                else
+                    b.Ref0 = (sbyte)msac.DecodeBoolAdapt(
+                        mode.Ref[3 * 3 + GetFwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)]);
+            }
+            b.Ref1 = -1;
+
+            Av1RefMvs.FindRefMvs(t.Rt, mvstack, out int nCand, out int modeCtx, out int _,
+                new Av1RefMvsRefPair { Ref0 = (sbyte)(b.Ref0 + 1), Ref1 = -1 },
+                (int)bs, intraEdgeFlags, t.By, t.Bx);
+            if (BlockTrace != null)
+            {
+                var sb = new System.Text.StringBuilder($"S {t.By} {t.Bx} n{nCand} c{modeCtx}");
+                for (int q = 0; q < nCand; q++) sb.Append($" {mvstack[q].Mv.Mv0.Y},{mvstack[q].Mv.Mv0.X}:{mvstack[q].Weight}");
+                BlockTrace.WriteLine(sb.ToString());
+            }
+
+            // ── Single-reference mode + MV (dav1d: newmv / globalmv / refmv flags, then DRL) ──
+            if (segSkipOrGmv || msac.DecodeBoolAdapt(mode.NewmvMode[modeCtx & 7]) != 0)
+            {
+                if (segSkipOrGmv || msac.DecodeBoolAdapt(mode.GlobalmvMode[(modeCtx >> 3) & 1]) == 0)
                 {
-                    int ctx3 = GetFwdRef2Ctx(above, left, by4, bx4, haveTop, haveLeft);
-                    bool r2 = msac.DecodeBoolAdapt(mode.Ref[4 * 3 + ctx3]) != 0;
-                    b.Ref0 = (sbyte)(2 + (r2 ? 1 : 0));
+                    b.InterMode = (byte)Av1InterPredMode.GlobalMv;
+                    b.Mv0 = Av1RefMvs.GetGmv2d(in fh.Gmv[b.Ref0], t.Bx, t.By, bw4, bh4, fh);
+                    hasSubpelFilter = Math.Min(bw4, bh4) == 1 ||
+                        fh.Gmv[b.Ref0].Type == Av1WarpedMotionType.Translation;
                 }
                 else
                 {
-                    int ctx3 = GetFwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft);
-                    bool r2 = msac.DecodeBoolAdapt(mode.Ref[3 * 3 + ctx3]) != 0;
-                    b.Ref0 = (sbyte)(r2 ? 1 : 0);
-                }
-            }
-            b.Ref1 = (sbyte)(-1);
-        }
-
-        if (t.Bx == 0 && t.By == 0)
-            AvDbg.W($"[INTER-STATE] post-ref rng={msac.DebugRng:X4} dif_lo={(uint)msac.DebugDif:X8} cnt={msac.Cnt}");
-
-        // Find reference MVs
-        Span<Av1RefMvsCandidate> mvstack = stackalloc Av1RefMvsCandidate[8];
-        Av1RefMvs.FindRefMvs(t.Rt, mvstack, out int nCand, out int modeCtx, out int _,
-            new Av1RefMvsRefPair { Ref0 = (sbyte)(b.Ref0 + 1), Ref1 = -1 },
-            (int)bs, intraEdgeFlags, t.By, t.Bx);
-        if (BlockTrace != null)
-        {
-            var sb = new System.Text.StringBuilder($"S {t.By} {t.Bx} n{nCand} c{modeCtx}");
-            for (int q = 0; q < nCand; q++) sb.Append($" {mvstack[q].Mv.Mv0.Y},{mvstack[q].Mv.Mv0.X}:{mvstack[q].Weight}");
-            BlockTrace.WriteLine(sb.ToString());
-        }
-
-        if (t.Bx == 0 && t.By == 0)
-            AvDbg.W($"[INTER-MVS] nCand={nCand} modeCtx={modeCtx} (0x{modeCtx:X}) newmvCtx={modeCtx&7} globalmvCtx={(modeCtx>>3)&1} refmvCtx={(modeCtx>>4)&15}");
-        else if (nCand > 0)
-            AvDbg.W($"[INTER-MVS] bx={t.Bx} by={t.By} nCand={nCand} modeCtx={modeCtx} newmvCtx={modeCtx&7}");
-
-        // Multi-step inter mode decode (dav1d: read_inter_mode)
-        // CDF bit meanings: newmv_mode: 0=NEWMV, 1=not; globalmv_mode: 0=GLOBALMV, 1=not;
-        // refmv_mode: 0=NEARESTMV, 1=NEARMV
-        // Note: DecodeBoolAdapt returns 1 when NOT crossing threshold (matching dav1d's !ret)
-        // modeCtx already set above from FindRefMvs
-        if (t.Bx <= 4 && t.By <= 4)
-            AvDbg.W($"[INTER-MODE-CHK] bx={t.Bx} by={t.By} nCand={nCand} modeCtx=0x{modeCtx:X} newmvCtx={modeCtx&7} globalmvCtx={(modeCtx>>3)&1} refmvCtx={(modeCtx>>4)&15} NewmvCdf0={ts.Cdf.GetNewmvModeCdf(modeCtx&7)[0]} GlobalmvCdf0={ts.Cdf.GetGlobalmvModeCdf((modeCtx>>3)&1)[0]} RefmvCdf0={ts.Cdf.GetRefmvModeCdf((modeCtx>>4)&15)[0]} rng={msac.DebugRng:X4} cnt={msac.Cnt}");
-
-        if (msac.DecodeBoolAdapt(ts.Cdf.GetNewmvModeCdf(modeCtx & 7)) != 0)
-        {
-            // NOT NEWMV — check globalmv_mode
-            if (t.Bx == 0 && t.By == 0) {
-                AvDbg.W("[INTER-MODE] newmv=NOT_NEWMV (not crossing threshold)");
-                AvDbg.W($"[INTER-MODE] post-newmv rng={msac.DebugRng:X4}({msac.DebugRng}) cnt={msac.Cnt}");
-            }
-            if (msac.DecodeBoolAdapt(ts.Cdf.GetGlobalmvModeCdf((modeCtx >> 3) & 1)) == 0)
-            {
-                // GLOBALMV
-                b.InterMode = (byte)Av1InterPredMode.GlobalMv;
-                b.Mv0 = Av1RefMvs.GetGmv2d(in fh.Gmv[b.Ref0], bx4, by4, bw4, bh4, fh);
-                hasSubpelFilter = Math.Min(bw4, bh4) == 1 ||
-                    fh.Gmv[b.Ref0].Type == Av1WarpedMotionType.Translation;
-                if (t.Bx == 0 && t.By == 0)
-                    AvDbg.W($"[INTER-MODE] post-globalmv rng={msac.DebugRng:X4} cnt={msac.Cnt} IS_GLOBALMV hasSubpel={hasSubpelFilter}");
-            }
-            else
-            {
-                // NOT GLOBALMV — check refmv_mode
-                if (t.Bx == 0 && t.By == 0) {
-                    var gmvCdf = ts.Cdf.Mode.GlobalmvMode[(modeCtx >> 3) & 1];
-                    AvDbg.W($"[INTER-MODE] globalmv-NOT gmvCdf[0]={gmvCdf[0]} gmvCdf[1]={gmvCdf[1]} rng={msac.DebugRng:X4} cnt={msac.Cnt}");
-                }
-                if (t.Bx == 0 && t.By == 0) {
-                    var refmvCdf = ts.Cdf.GetRefmvModeCdf((modeCtx >> 4) & 15);
-                    AvDbg.W($"[INTER-MODE] pre-refmv rng={msac.DebugRng:X4} cnt={msac.Cnt} refmvCdf[0]={refmvCdf[0]} refmvCdf[1]={refmvCdf[1]}");
-                }
-                if (msac.DecodeBoolAdapt(ts.Cdf.GetRefmvModeCdf((modeCtx >> 4) & 15)) != 0)
-                {
-                    // NEARMV
-                    b.InterMode = (byte)Av1InterPredMode.NearMv;
-                    b.DrlIdx = 1; // NEARER_DRL
                     hasSubpelFilter = true;
-                    if (nCand > 2)
+                    if (msac.DecodeBoolAdapt(mode.RefmvMode[(modeCtx >> 4) & 15]) != 0)
                     {
-                        int drlCtx = Av1RefMvs.GetDrlContext(mvstack, 1);
-                        b.DrlIdx += (byte)msac.DecodeBoolAdapt(ts.Cdf.GetDrlBitCdf(drlCtx));
-                        if (b.DrlIdx == 2 && nCand > 3)
+                        b.InterMode = (byte)Av1InterPredMode.NearMv;
+                        b.DrlIdx = 1;
+                        if (nCand > 2)
                         {
-                            drlCtx = Av1RefMvs.GetDrlContext(mvstack, 2);
-                            b.DrlIdx += (byte)msac.DecodeBoolAdapt(ts.Cdf.GetDrlBitCdf(drlCtx));
+                            b.DrlIdx += (byte)msac.DecodeBoolAdapt(mode.DrlBit[Av1RefMvs.GetDrlContext(mvstack, 1)]);
+                            if (b.DrlIdx == 2 && nCand > 3)
+                                b.DrlIdx += (byte)msac.DecodeBoolAdapt(mode.DrlBit[Av1RefMvs.GetDrlContext(mvstack, 2)]);
                         }
                     }
-                    // FindRefMvs pads the stack to two entries with the global MV, so mvstack[1] is valid even with one
-                    // candidate (dav1d reads mvstack[drl_idx] unconditionally).
+                    else
+                    {
+                        b.InterMode = (byte)Av1InterPredMode.NearestMv;
+                        b.DrlIdx = 0;
+                    }
+                    // FindRefMvs pads the stack to two entries with the global MV, so mvstack[1] is valid even with
+                    // one candidate (dav1d reads mvstack[drl_idx] unconditionally).
                     b.Mv0 = mvstack[b.DrlIdx].Mv.Mv0;
-                    if (b.DrlIdx < 2) // NEAREST_DRL=0, NEARER_DRL=1
+                    if (b.DrlIdx < 2)
                         Av1RefMvs.FixMvPrecision(fh, ref b.Mv0);
+                }
+            }
+            else
+            {
+                hasSubpelFilter = true;
+                b.InterMode = (byte)Av1InterPredMode.NewMv;
+                b.DrlIdx = 0;
+                if (nCand > 1)
+                {
+                    b.DrlIdx += (byte)msac.DecodeBoolAdapt(mode.DrlBit[Av1RefMvs.GetDrlContext(mvstack, 0)]);
+                    if (b.DrlIdx == 1 && nCand > 2)
+                        b.DrlIdx += (byte)msac.DecodeBoolAdapt(mode.DrlBit[Av1RefMvs.GetDrlContext(mvstack, 1)]);
+                }
+                if (nCand > 1)
+                {
+                    b.Mv0 = mvstack[b.DrlIdx].Mv.Mv0;
                 }
                 else
                 {
-                    // NEARESTMV
-                    b.InterMode = (byte)Av1InterPredMode.NearestMv;
-                    b.DrlIdx = 0;
-                    b.Mv0 = mvstack[0].Mv.Mv0;
-                    hasSubpelFilter = true;
+                    b.Mv0 = mvstack[0].Mv.Mv0;   // the padded global MV when there are no candidates
                     Av1RefMvs.FixMvPrecision(fh, ref b.Mv0);
                 }
+                ReadMvResidual(ts, ref msac, ref b.Mv0, fh);
             }
         }
-        else
+
+        // Inter-intra and motion modes exist only for single-reference blocks.
+        if (!isComp)
         {
-            // NEWMV
-            if (t.Bx == 0 && t.By == 0)
-                AvDbg.W("[INTER-MODE] newmv=NEWMV (crossing threshold)");
-            b.InterMode = (byte)Av1InterPredMode.NewMv;
-            b.DrlIdx = 0;
-            hasSubpelFilter = true;
-            if (nCand > 1)
+            // ── Interintra decode ──
+            int iiSzGrp = Av1Tables.YmodeSizeContext[(int)bs];
+            if (seqHdr.InterIntra &&
+                (Av1Tables.InterIntraAllowedMask & (1u << (int)bs)) != 0)
             {
-                int drlCtx = Av1RefMvs.GetDrlContext(mvstack, 0);
-                b.DrlIdx += (byte)msac.DecodeBoolAdapt(ts.Cdf.GetDrlBitCdf(drlCtx));
-                if (b.DrlIdx == 1 && nCand > 2)
+                if (msac.DecodeBoolAdapt(ts.Cdf.Mode.Interintra[iiSzGrp]) != 0)
                 {
-                    drlCtx = Av1RefMvs.GetDrlContext(mvstack, 1);
-                    b.DrlIdx += (byte)msac.DecodeBoolAdapt(ts.Cdf.GetDrlBitCdf(drlCtx));
+                    b.InterIntraMode = (byte)msac.DecodeSymbolAdapt4(
+                        ts.Cdf.Mode.InterintraMode[iiSzGrp], 3);
+                    byte wedgeCtx = Av1Tables.WedgeCtxLut[(int)bs];
+                    int wedgeFlag = (int)msac.DecodeBoolAdapt(ts.Cdf.Mode.InterintraWedge[wedgeCtx]);
+                    b.InterIntraTypeField = (byte)((int)Av1InterIntraType.Blend + wedgeFlag);
+                    if (b.InterIntraTypeField == (byte)Av1InterIntraType.Wedge)
+                        b.WedgeIdx = (byte)msac.DecodeSymbolAdapt16(ts.Cdf.Mode.WedgeIdx[wedgeCtx], 15);
+                }
+                else
+                {
+                    b.InterIntraTypeField = (byte)Av1InterIntraType.None;
+                }
+                if (t.Bx == 0 && t.By == 0) {
+                    AvDbg.W($"[INTER-INTRA] ii_sz_grp={iiSzGrp} mode={b.InterIntraMode} type={b.InterIntraTypeField} wedge={b.WedgeIdx} rng={msac.DebugRng:X4}");
+                    // Print the dif at this point too
+                    AvDbg.W($"[INTER-INTRA-DIF] dif_lo={(uint)msac.DebugDif:X8} dif_hi={(uint)(msac.DebugDif>>32):X8} c48={(ushort)(msac.DebugDif>>48):X4}");
                 }
             }
-            if (nCand > 1)
-            {
-                b.Mv0 = mvstack[b.DrlIdx].Mv.Mv0;
-            }
-            else
-            {
-                b.Mv0 = mvstack[0].Mv.Mv0;   // the padded global MV when there are no candidates
-                Av1RefMvs.FixMvPrecision(fh, ref b.Mv0);
-            }
-            ReadMvResidual(ts, ref msac, ref b.Mv0, fh);
-        }
 
-        if (t.Bx == 0 && t.By == 0)
-            AvDbg.W($"[INTER-MV] bx=0 by=0 mv0=({b.Mv0.Y},{b.Mv0.X}) interMode={b.InterMode} rng={msac.DebugRng:X4} dif_lo={(uint)msac.DebugDif:X8} cnt={msac.Cnt}");
-
-        // Also dump MSAC state right before MV decode
-        if (t.Bx == 0 && t.By == 0)
-            AvDbg.W($"[INTER-STATE] post-MV rng={msac.DebugRng:X4} dif_lo={(uint)msac.DebugDif:X8} cnt={msac.Cnt}");
-
-        // ── Interintra decode ──
-        var seqHdr = ctx.SequenceHeader!;
-        int iiSzGrp = Av1Tables.YmodeSizeContext[(int)bs];
-        if (seqHdr.InterIntra &&
-            (Av1Tables.InterIntraAllowedMask & (1u << (int)bs)) != 0)
-        {
-            if (msac.DecodeBoolAdapt(ts.Cdf.Mode.Interintra[iiSzGrp]) != 0)
+            // ── Motion mode (dav1d: decode.c ~1795) ──
+            // Gate conditions (dav1d: switchable_motion_mode && interintra_type==NONE
+            // && imin(bw4,bh4)>=2 && not_warped_globalmv && overlappable neighbours)
+            // NOTE: b.Skip has NO effect on motion mode decode — skipped blocks still code motion mode.
+            if (fh.SwitchableMotionMode &&
+                b.InterIntraTypeField == (byte)Av1InterIntraType.None &&
+                Math.Min(bw4, bh4) >= 2 &&
+                // Not warped global motion (dav1d: !(!force_integer_mv && GLOBALMV && gmv.type > TRANSLATION))
+                !(!fh.ForceIntegerMv && b.InterMode == (byte)Av1InterPredMode.GlobalMv &&
+                  fh.Gmv[b.Ref0].Type > Av1WarpedMotionType.Translation) &&
+                // Has overlappable neighbours (dav1d: findoddzero on intra flags)
+                ((haveLeft && FindOddZero(t.Left.Intra, by4 + 1, h4 >> 1)) ||
+                 (haveTop && FindOddZero(t.Above.Intra, bx4 + 1, w4 >> 1))))
             {
-                b.InterIntraMode = (byte)msac.DecodeSymbolAdapt4(
-                    ts.Cdf.Mode.InterintraMode[iiSzGrp], 3);
-                byte wedgeCtx = Av1Tables.WedgeCtxLut[(int)bs];
-                int wedgeFlag = (int)msac.DecodeBoolAdapt(ts.Cdf.Mode.InterintraWedge[wedgeCtx]);
-                b.InterIntraTypeField = (byte)((int)Av1InterIntraType.Blend + wedgeFlag);
-                if (b.InterIntraTypeField == (byte)Av1InterIntraType.Wedge)
-                    b.WedgeIdx = (byte)msac.DecodeSymbolAdapt16(ts.Cdf.Mode.WedgeIdx[wedgeCtx], 15);
-            }
-            else
-            {
-                b.InterIntraTypeField = (byte)Av1InterIntraType.None;
-            }
-            if (t.Bx == 0 && t.By == 0) {
-                AvDbg.W($"[INTER-INTRA] ii_sz_grp={iiSzGrp} mode={b.InterIntraMode} type={b.InterIntraTypeField} wedge={b.WedgeIdx} rng={msac.DebugRng:X4}");
-                // Print the dif at this point too
-                AvDbg.W($"[INTER-INTRA-DIF] dif_lo={(uint)msac.DebugDif:X8} dif_hi={(uint)(msac.DebugDif>>32):X8} c48={(ushort)(msac.DebugDif>>48):X4}");
-            }
-        }
+                Span<long> mask = stackalloc long[2]; mask[0] = 0; mask[1] = 0;
+                FindMatchingRef(t, intraEdgeFlags, bw4, bh4, w4, h4,
+                                haveLeft, haveTop, b.Ref0, mask);
+                bool allowWarp = ctx.Svc[b.Ref0, 0].Scale == 0 &&
+                                 !fh.ForceIntegerMv && fh.WarpMotion &&
+                                 (mask[0] | mask[1]) != 0;
+                if (t.Bx <= 4 && t.By <= 16)
+                    AvDbg.W($"[MOTION-GATE] bx={t.Bx} by={t.By} bs={(int)bs} interMode={b.InterMode} allowWarp={allowWarp} mask0={mask[0]:X} mask1={mask[1]:X} warpMotion={fh.WarpMotion} svcScale={ctx.Svc[b.Ref0,0].Scale} forceInt={fh.ForceIntegerMv}");
 
-        // ── Motion mode (dav1d: decode.c ~1795) ──
-        // Gate conditions (dav1d: switchable_motion_mode && interintra_type==NONE
-        // && imin(bw4,bh4)>=2 && not_warped_globalmv && overlappable neighbours)
-        // NOTE: b.Skip has NO effect on motion mode decode — skipped blocks still code motion mode.
-        if (fh.SwitchableMotionMode &&
-            b.InterIntraTypeField == (byte)Av1InterIntraType.None &&
-            Math.Min(bw4, bh4) >= 2 &&
-            // Not warped global motion (dav1d: !(!force_integer_mv && GLOBALMV && gmv.type > TRANSLATION))
-            !(!fh.ForceIntegerMv && b.InterMode == (byte)Av1InterPredMode.GlobalMv &&
-              fh.Gmv[b.Ref0].Type > Av1WarpedMotionType.Translation) &&
-            // Has overlappable neighbours (dav1d: findoddzero on intra flags)
-            ((haveLeft && FindOddZero(t.Left.Intra, by4 + 1, h4 >> 1)) ||
-             (haveTop && FindOddZero(t.Above.Intra, bx4 + 1, w4 >> 1))))
-        {
-            Span<long> mask = stackalloc long[2]; mask[0] = 0; mask[1] = 0;
-            FindMatchingRef(t, intraEdgeFlags, bw4, bh4, w4, h4,
-                            haveLeft, haveTop, b.Ref0, mask);
-            bool allowWarp = ctx.Svc[b.Ref0, 0].Scale == 0 &&
-                             !fh.ForceIntegerMv && fh.WarpMotion &&
-                             (mask[0] | mask[1]) != 0;
-            if (t.Bx <= 4 && t.By <= 16)
-                AvDbg.W($"[MOTION-GATE] bx={t.Bx} by={t.By} bs={(int)bs} interMode={b.InterMode} allowWarp={allowWarp} mask0={mask[0]:X} mask1={mask[1]:X} warpMotion={fh.WarpMotion} svcScale={ctx.Svc[b.Ref0,0].Scale} forceInt={fh.ForceIntegerMv}");
-
-            if (allowWarp)
-            {
-                b.Motion = (byte)msac.DecodeSymbolAdapt4(ts.Cdf.Mode.MotionMode[(int)bs], 2);
-                if (t.Bx <= 2 && t.By == 0)
-                    AvDbg.W($"[MOTION-MODE] bx={t.Bx} by={t.By} bs={(int)bs} motion={b.Motion} cdf=MotionMode[{bs}] allowWarp=1 mask0={mask[0]:X} mask1={mask[1]:X}");
-                if (b.Motion == (byte)Av1MotionMode.Warp)
+                if (allowWarp)
                 {
-                    hasSubpelFilter = false;
-                    DeriveWarpmv(t, bw4, bh4, mask, b.Mv0);
+                    b.Motion = (byte)msac.DecodeSymbolAdapt4(ts.Cdf.Mode.MotionMode[(int)bs], 2);
+                    if (t.Bx <= 2 && t.By == 0)
+                        AvDbg.W($"[MOTION-MODE] bx={t.Bx} by={t.By} bs={(int)bs} motion={b.Motion} cdf=MotionMode[{bs}] allowWarp=1 mask0={mask[0]:X} mask1={mask[1]:X}");
+                    if (b.Motion == (byte)Av1MotionMode.Warp)
+                    {
+                        hasSubpelFilter = false;
+                        DeriveWarpmv(t, bw4, bh4, mask, b.Mv0);
+                    }
+                }
+                else
+                {
+                    b.Motion = (byte)msac.DecodeBoolAdapt(ts.Cdf.Mode.Obmc[(int)bs]);
+                    if (t.Bx <= 2 && t.By == 0)
+                        AvDbg.W($"[MOTION-MODE] bx={t.Bx} by={t.By} bs={(int)bs} motion={b.Motion} cdf=Obmc[{bs}] allowWarp=0 mask0={mask[0]:X} mask1={mask[1]:X}");
                 }
             }
             else
             {
-                b.Motion = (byte)msac.DecodeBoolAdapt(ts.Cdf.Mode.Obmc[(int)bs]);
-                if (t.Bx <= 2 && t.By == 0)
-                    AvDbg.W($"[MOTION-MODE] bx={t.Bx} by={t.By} bs={(int)bs} motion={b.Motion} cdf=Obmc[{bs}] allowWarp=0 mask0={mask[0]:X} mask1={mask[1]:X}");
+                b.Motion = (byte)Av1MotionMode.Translation;
+                if (t.Bx <= 4 && t.By == 0)
+                    AvDbg.W($"[MOTION-GATE-SKIP] bx={t.Bx} by={t.By} interIntra={b.InterIntraTypeField} minBW={Math.Min(bw4,bh4)} interMode={b.InterMode} gmvType={fh.Gmv[b.Ref0].Type} haveL={haveLeft} haveT={haveTop}");
             }
         }
         else
         {
+            b.InterIntraTypeField = (byte)Av1InterIntraType.None;
             b.Motion = (byte)Av1MotionMode.Translation;
-            if (t.Bx <= 4 && t.By == 0)
-                AvDbg.W($"[MOTION-GATE-SKIP] bx={t.Bx} by={t.By} interIntra={b.InterIntraTypeField} minBW={Math.Min(bw4,bh4)} interMode={b.InterMode} gmvType={fh.Gmv[b.Ref0].Type} haveL={haveLeft} haveT={haveTop}");
         }
 
-        // ── Subpel filter (dav1d: decode.c ~1856) ──
-        // Gate is has_subpel_filter, NOT b.Skip! Skipped blocks may still need filter symbols.
-        int filterV = (int)fh.SubpelFilterMode;  // 1D vertical filter (0=REGULAR, 1=SMOOTH, 2=SHARP)
-        int filterH = (int)fh.SubpelFilterMode;
+        if (b.InterIntraTypeField != 0) BlockTrace?.WriteLine($"II {t.By} {t.Bx} t{b.InterIntraTypeField} m{b.InterIntraMode}");
+        // ── Subpel filters (dav1d: filter[0] then, with dual_filter, filter[1]; filter2d = filter_2d[f1][f0]) ──
+        int filter0 = (int)fh.SubpelFilterMode, filter1 = (int)fh.SubpelFilterMode;
         if (fh.SubpelFilterMode == Av1FilterMode.Switchable)
         {
             if (hasSubpelFilter)
             {
                 bool comp = b.CompType != (byte)Av1CompInterType.None;
-                int filterCtx = GetFilterCtx(t.Above, t.Left, comp, 0, b.Ref0, by4, bx4);
-                filterV = (int)msac.DecodeSymbolAdapt4(ts.Cdf.Mode.Filter[filterCtx], 2);
-                filterH = filterV;
+                filter0 = (int)msac.DecodeSymbolAdapt4(mode.Filter[GetFilterCtx(above, left, comp, 0, b.Ref0, by4, bx4)], 2);
+                filter1 = seqHdr.DualFilter
+                    ? (int)msac.DecodeSymbolAdapt4(mode.Filter[8 + GetFilterCtx(above, left, comp, 1, b.Ref0, by4, bx4)], 2)
+                    : filter0;
             }
             else
             {
-                filterV = filterH = 0; // EIGHTTAP_REGULAR
+                filter0 = filter1 = 0; // EIGHTTAP_REGULAR
             }
         }
-        b.Filter = Av1Tables.Filter2d[filterH, filterV];
+        b.Filter = Av1Tables.Filter2d[filter1, filter0];
 
         // ── Variable transform tree ──
         b.MaxYTx = Av1Tables.MaxTxfmSizeForBlockSize[(int)bs, 0];
@@ -2324,14 +2411,122 @@ public static class Av1Decode
     /// Port of dav1d's get_filter_ctx (env.h:135-154).
     /// Computes switchable filter context from above/left neighbors.
     /// </summary>
+    // dav1d assign_comp_mv: NEAREST/NEAR take the stack entry (precision-fixed), GLOBAL the global motion vector at
+    // this block, NEW the stack entry plus a coded residual.
+    private static Av1MotionVector AssignCompMv(Av1TileState ts, ref Av1Msac msac, Av1DecoderFrameHeader fh,
+        scoped ReadOnlySpan<Av1RefMvsCandidate> mvstack, int im, int idx, int refFrame, int drl,
+        int bx, int by, int bw4, int bh4, ref bool hasSubpelFilter)
+    {
+        Av1MotionVector mv;
+        switch ((Av1InterPredMode)im)
+        {
+            case Av1InterPredMode.NearMv:
+            case Av1InterPredMode.NearestMv:
+                mv = idx == 0 ? mvstack[drl].Mv.Mv0 : mvstack[drl].Mv.Mv1;
+                Av1RefMvs.FixMvPrecision(fh, ref mv);
+                break;
+            case Av1InterPredMode.GlobalMv:
+                hasSubpelFilter |= fh.Gmv[refFrame].Type == Av1WarpedMotionType.Translation;
+                mv = Av1RefMvs.GetGmv2d(in fh.Gmv[refFrame], bx, by, bw4, bh4, fh);
+                break;
+            default: // NEWMV
+                mv = idx == 0 ? mvstack[drl].Mv.Mv0 : mvstack[drl].Mv.Mv1;
+                ReadMvResidual(ts, ref msac, ref mv, fh);
+                break;
+        }
+        return mv;
+    }
+
+    private static bool HasUniComp(Av1BlockContextManaged e, int off) => (e.Ref0[off] < 4) == (e.Ref1[off] < 4);
+
+    /// <summary>Compound direction context (dav1d get_comp_dir_ctx).</summary>
+    private static int GetCompDirCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    {
+        if (haveTop && haveLeft)
+        {
+            bool aIntra = above.Intra[bx4] != 0, lIntra = left.Intra[by4] != 0;
+            if (aIntra && lIntra) return 2;
+            if (aIntra || lIntra)
+            {
+                var edge = aIntra ? left : above;
+                int off = aIntra ? by4 : bx4;
+                if (edge.CompType[off] == 0) return 2;
+                return 1 + 2 * (HasUniComp(edge, off) ? 1 : 0);
+            }
+            bool aComp = above.CompType[bx4] != 0, lComp = left.CompType[by4] != 0;
+            int aRef0 = above.Ref0[bx4], lRef0 = left.Ref0[by4];
+            if (!aComp && !lComp)
+                return 1 + 2 * ((aRef0 >= 4) == (lRef0 >= 4) ? 1 : 0);
+            if (!aComp || !lComp)
+            {
+                var edge = aComp ? above : left;
+                int off = aComp ? bx4 : by4;
+                if (!HasUniComp(edge, off)) return 1;
+                return 3 + ((aRef0 >= 4) == (lRef0 >= 4) ? 1 : 0);
+            }
+            bool aUni = HasUniComp(above, bx4), lUni = HasUniComp(left, by4);
+            if (!aUni && !lUni) return 0;
+            if (!aUni || !lUni) return 2;
+            return 3 + ((aRef0 == 4) == (lRef0 == 4) ? 1 : 0);
+        }
+        if (haveTop || haveLeft)
+        {
+            var edge = haveLeft ? left : above;
+            int off = haveLeft ? by4 : bx4;
+            if (edge.Intra[off] != 0) return 2;
+            if (edge.CompType[off] == 0) return 2;
+            return 4 * (HasUniComp(edge, off) ? 1 : 0);
+        }
+        return 2;
+    }
+
+    /// <summary>Distance-weighted compound context (dav1d get_jnt_comp_ctx).</summary>
+    private static int GetJntCompCtx(int orderHintNBits, int poc, int ref0Poc, int ref1Poc,
+        Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4)
+    {
+        int d0 = Math.Abs(Av1ObuParser.GetPocDiff(orderHintNBits, ref0Poc, poc));
+        int d1 = Math.Abs(Av1ObuParser.GetPocDiff(orderHintNBits, poc, ref1Poc));
+        int offset = d0 == d1 ? 1 : 0;
+        int aCtx = above.CompType[bx4] >= (byte)Av1CompInterType.Average || above.Ref0[bx4] == 6 ? 1 : 0;
+        int lCtx = left.CompType[by4] >= (byte)Av1CompInterType.Average || left.Ref0[by4] == 6 ? 1 : 0;
+        return 3 * offset + aCtx + lCtx;
+    }
+
+    /// <summary>Masked-compound context (dav1d get_mask_comp_ctx).</summary>
+    private static int GetMaskCompCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4)
+    {
+        int aCtx = above.CompType[bx4] >= (byte)Av1CompInterType.Seg ? 1 : above.Ref0[bx4] == 6 ? 3 : 0;
+        int lCtx = left.CompType[by4] >= (byte)Av1CompInterType.Seg ? 1 : left.Ref0[by4] == 6 ? 3 : 0;
+        return Math.Min(aCtx + lCtx, 5);
+    }
+
+    /// <summary>Unidirectional compound LAST2 vs LAST3/GOLDEN context (dav1d av1_get_uni_p1_ctx).</summary>
+    private static int GetUniP1Ctx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    {
+        int c0 = 0, c1 = 0, c2 = 0;
+        void Count(int r) { if (r == 1) c0++; else if (r == 2) c1++; else if (r == 3) c2++; }
+        if (haveTop && above.Intra[bx4] == 0)
+        {
+            Count(above.Ref0[bx4]);
+            if (above.CompType[bx4] != 0) Count(above.Ref1[bx4]);
+        }
+        if (haveLeft && left.Intra[by4] == 0)
+        {
+            Count(left.Ref0[by4]);
+            if (left.CompType[by4] != 0) Count(left.Ref1[by4]);
+        }
+        c1 += c2;
+        return c0 == c1 ? 1 : c0 < c1 ? 0 : 2;
+    }
+
     private static int GetFilterCtx(Av1BlockContextManaged above, Av1BlockContextManaged left,
         bool comp, int dir, int refIdx, int yb4, int xb4)
     {
         int nFilters = Av1Tables.NSwitchableFilters;
         int aFilter = (above.Ref0[xb4] == refIdx || above.Ref1[xb4] == refIdx)
-            ? above.Filter0[xb4] : nFilters;
+            ? (dir == 0 ? above.Filter0[xb4] : above.Filter1[xb4]) : nFilters;
         int lFilter = (left.Ref0[yb4] == refIdx || left.Ref1[yb4] == refIdx)
-            ? left.Filter0[yb4] : nFilters;
+            ? (dir == 0 ? left.Filter0[yb4] : left.Filter1[yb4]) : nFilters;
 
         int baseIdx = comp ? 4 : 0;
         if (aFilter == lFilter)

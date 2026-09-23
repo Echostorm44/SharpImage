@@ -2114,7 +2114,7 @@ public static class Av1Reconstruction
                         // Blend with ii_mask (dav1d: dsp->mc.blend, II_MASK(chr_layout_idx, bs, b))
                         {
                             var uvDst = uvPlaneFull.Slice(uvDstOff);
-                            var mask = Av1WedgeMasks.GetMask(2, (int)bs, b.InterIntraTypeField,
+                            var mask = Av1WedgeMasks.GetMask(chrLayoutIdx, (int)bs, b.InterIntraTypeField,
                                 b.InterIntraTypeField == 2 ? b.WedgeIdx : b.InterIntraMode, out int mw, out int mh);
                             int tmpStride = cbw4 * 4;
                             for (int y = 0; y < Math.Min(mh, cbh4 * 4); y++)
@@ -2161,8 +2161,10 @@ public static class Av1Reconstruction
                 }
             }
 
-            // Blend the two predictions
+            // Blend the two predictions. The chroma mask for SEG is the luma w_mask's subsampled output; for WEDGE it is
+            // the layout's wedge mask with this block's sign (chrLayoutIdx: 4:4:4 -> 0, 4:2:2 -> 1, 4:2:0 -> 2).
             int blockW = bw4 * 4, blockH = bh4 * 4;
+            ReadOnlySpan<byte> chromaMask = default;
             switch ((Av1CompInterType)b.CompType)
             {
                 case Av1CompInterType.Average:
@@ -2183,13 +2185,15 @@ public static class Av1Reconstruction
                         b.MaskSign != 0 ? tmp0 : tmp1,
                         blockW, blockH, t.SegMask, b.MaskSign,
                         ssHor, ssVer);
-                    // segMask is also used as the mask for chroma
+                    chromaMask = t.SegMask;
                     break;
 
                 case Av1CompInterType.Wedge:
-                    // TODO: Wedge mask lookup (requires dav1d_masks table port)
-                    // For now, fall back to average
-                    Av1MotionComp.Avg(dst, yStride, tmp0, tmp1, blockW, blockH);
+                    Av1MotionComp.Mask(dst, yStride,
+                        b.MaskSign != 0 ? tmp1 : tmp0,
+                        b.MaskSign != 0 ? tmp0 : tmp1,
+                        blockW, blockH, Av1WedgeMasks.GetWedgeMask(0, bs, 0, b.WedgeIdx));
+                    chromaMask = Av1WedgeMasks.GetWedgeMask(chrLayoutIdx, bs, b.MaskSign, b.WedgeIdx);
                     break;
             }
 
@@ -2237,9 +2241,10 @@ public static class Av1Reconstruction
 
                         case Av1CompInterType.Wedge:
                         case Av1CompInterType.Seg:
-                            // For wedge/seg compound, use the mask for blending
-                            // TODO: Proper wedge/seg mask for chroma
-                            Av1MotionComp.Avg(uvDst, uvStride, tmp0, tmp1, uvW, uvH);
+                            Av1MotionComp.Mask(uvDst, uvStride,
+                                b.MaskSign != 0 ? tmp1 : tmp0,
+                                b.MaskSign != 0 ? tmp0 : tmp1,
+                                uvW, uvH, chromaMask);
                             break;
                     }
                 }

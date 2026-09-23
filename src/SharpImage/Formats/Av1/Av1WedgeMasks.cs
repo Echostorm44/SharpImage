@@ -138,8 +138,10 @@ public static class Av1WedgeMasks
     }
 
     private static readonly byte[][][] Wedge444; // [sizeIdx][idx] -> bw4*4 x bh4*4 bytes
-    private static readonly byte[][][] Wedge422; // [sizeIdx][idx] -> bw4*2 x bh4*4 bytes
-    private static readonly byte[][][] Wedge420; // [sizeIdx][idx] -> bw4*2 x bh4*2 bytes
+    // Chroma wedges are [sizeIdx][rounding][idx]: dav1d's wedge[s] offsets point at the 4:4:4 mask downsampled with
+    // rounding s (init_chroma's (sum - sign)); the codebook sign only flips the 4:4:4 mask itself.
+    private static readonly byte[][][][] Wedge422; // -> bw4*2 x bh4*4 bytes
+    private static readonly byte[][][][] Wedge420; // -> bw4*2 x bh4*2 bytes
     private static readonly byte[] IiDc;         // 32x32 all-32 shared blend mask
 
     static Av1WedgeMasks()
@@ -162,16 +164,16 @@ public static class Av1WedgeMasks
 
         int n = Sizes.Length;
         Wedge444 = new byte[n][][];
-        Wedge422 = new byte[n][][];
-        Wedge420 = new byte[n][][];
+        Wedge422 = new byte[n][][][];
+        Wedge420 = new byte[n][][][];
 
         for (int s = 0; s < n; s++)
         {
             var si = Sizes[s];
             int w = si.Bw4 * 4, h = si.Bh4 * 4; // luma (444) pixel dims
             Wedge444[s] = new byte[16][];
-            Wedge422[s] = new byte[16][];
-            Wedge420[s] = new byte[16][];
+            Wedge422[s] = [new byte[16][], new byte[16][]];
+            Wedge420[s] = [new byte[16][], new byte[16][]];
 
             uint signs = si.Signs;
             for (int idx = 0; idx < 16; idx++)
@@ -183,8 +185,11 @@ public static class Av1WedgeMasks
                 int yOff = 32 - (h * code.YOff >> 3);
 
                 Wedge444[s][idx] = Copy2D(master[(int)code.Dir], sign, w, h, xOff, yOff);
-                Wedge422[s][idx] = InitChroma(Wedge444[s][idx], sign, w, h, 0);
-                Wedge420[s][idx] = InitChroma(Wedge444[s][idx], sign, w, h, 1);
+                for (int r = 0; r < 2; r++)
+                {
+                    Wedge422[s][r][idx] = InitChroma(Wedge444[s][idx], r, w, h, 0);
+                    Wedge420[s][r][idx] = InitChroma(Wedge444[s][idx], r, w, h, 1);
+                }
             }
         }
 
@@ -271,6 +276,18 @@ public static class Av1WedgeMasks
     }
 
     /// <summary>
+    /// The compound wedge mask (dav1d WEDGE_MASK(c, bs, sign, idx)): c = 0 luma / 4:4:4 chroma, 1 = 4:2:2, 2 = 4:2:0
+    /// chroma. The 4:4:4 mask is the same for both signs (the sign swaps the two predictions instead); chroma masks are
+    /// downsampled with rounding = sign.
+    /// </summary>
+    public static ReadOnlySpan<byte> GetWedgeMask(int c, int bs, int sign, int idx)
+    {
+        int s = SizeIndex(bs);
+        if (s < 0) return ReadOnlySpan<byte>.Empty;
+        return c == 0 ? Wedge444[s][idx] : c == 1 ? Wedge422[s][sign][idx] : Wedge420[s][sign][idx];
+    }
+
+    /// <summary>
     /// Get the interintra mask for a block (dav1d II_MASK).
     /// c: 0 = luma (444), 1 = chroma 422, 2 = chroma 420.
     /// type: 1 = BLEND, 2 = WEDGE.
@@ -286,8 +303,8 @@ public static class Av1WedgeMasks
         if (type == 2) // WEDGE
         {
             if (c == 0) { w = si.Bw4 * 4; h = si.Bh4 * 4; return Wedge444[s][modeOrIdx]; }
-            if (c == 1) { w = si.Bw4 * 2; h = si.Bh4 * 4; return Wedge422[s][modeOrIdx]; }
-            w = si.Bw4 * 2; h = si.Bh4 * 2; return Wedge420[s][modeOrIdx];
+            if (c == 1) { w = si.Bw4 * 2; h = si.Bh4 * 4; return Wedge422[s][0][modeOrIdx]; }
+            w = si.Bw4 * 2; h = si.Bh4 * 2; return Wedge420[s][0][modeOrIdx];
         }
 
         // BLEND

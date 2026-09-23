@@ -206,6 +206,54 @@ public sealed class Av1ConformanceDecodeTests
         await Assert.That(Hex(MD5.HashData(all.ToArray()))).IsEqualTo(md5);
     }
 
+    // Raw AV1 streams (Section 5 OBUs) from libaom with hidden alt-refs and every inter tool enabled: compound
+    // prediction (average, distance-weighted, wedge and difference-weighted masks), skip mode, inter-intra (smooth and
+    // wedge), OBMC, local warp, global motion and dual filters; 8/10/12-bit, 4:2:0/4:2:2/4:4:4. Every shown frame's
+    // planes, concatenated, against libdav1d.
+    [Test]
+    [Arguments("libaom_inter_8_420_altref.obu", 176, 144, 20, "f8362f4d4eb8726201b7b32dfa0e7de2")]
+    [Arguments("libaom_inter_8_420_tools.obu", 160, 96, 12, "940b0605c0b27f55bca0ca377bb828dc")]
+    [Arguments("libaom_inter_10_420_tools.obu", 128, 96, 12, "3b91d08b1241f71bf6350eebb7acb214")]
+    [Arguments("libaom_inter_8_444_tools.obu", 128, 80, 12, "4441ad5c76e00c39516d1ca266bae993")]
+    [Arguments("libaom_inter_10_422_tools.obu", 128, 80, 10, "bb2b5fa616f0a259ffb066d4a0e329e4")]
+    [Arguments("libaom_inter_12_420_tools.obu", 144, 96, 10, "99b3e1869ddc25634e389348a150c795")]
+    public async Task InterStream_ByteExactVsDav1d(string file, int w, int h, int frames, string md5)
+    {
+        byte[] data = File.ReadAllBytes(Asset(file));
+        var dec = new Av1Decoder();
+        using var all = new MemoryStream();
+        int shown = 0, tu = 0;
+        foreach (var (off, len) in TemporalUnits(data))
+        {
+            using var f = dec.Decode(data.AsSpan(off, len), tu++, false);
+            if (f == null) continue;
+            await Assert.That(f.Width).IsEqualTo(w);
+            await Assert.That(f.Height).IsEqualTo(h);
+            all.Write(NativePlanes(f));
+            shown++;
+        }
+        await Assert.That(shown).IsEqualTo(frames);
+        await Assert.That(Hex(MD5.HashData(all.ToArray()))).IsEqualTo(md5);
+    }
+
+    // Splits a low-overhead OBU stream at its temporal delimiters.
+    private static List<(int Off, int Len)> TemporalUnits(byte[] d)
+    {
+        var tus = new List<(int, int)>();
+        int pos = 0, start = -1;
+        while (pos < d.Length)
+        {
+            int type = (d[pos] >> 3) & 15;
+            int p = pos + 1 + ((d[pos] & 4) != 0 ? 1 : 0);
+            long size = 0;
+            for (int i = 0; ; i++) { byte v = d[p++]; size |= (long)(v & 0x7f) << (7 * i); if ((v & 0x80) == 0) break; }
+            if (type == 2) { if (start >= 0) tus.Add((start, pos - start)); start = pos; }
+            pos = p + (int)size;
+        }
+        if (start >= 0) tus.Add((start, d.Length - start));
+        return tus;
+    }
+
     // Planes as ffmpeg writes raw video: Y, U, V tightly packed; u16 LE for >8-bit, u8 otherwise.
     private static byte[] NativePlanes(DecodedVideoFrame f)
     {

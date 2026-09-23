@@ -816,6 +816,49 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(Scratch, "track.txt"), log.ToString());
     }
 
+    // Raw OBU stream probe (trigger hbd_obu.txt = path of a Section 5 .obu file): splits the stream into temporal units
+    // at temporal delimiters, decodes each with one decoder, dumps every output frame to track_ours_{i}.yuv and the block
+    // trace to trace_ours.txt (same outputs as TrackProbe, for trackdiff-style comparison with dav1d).
+    [Test, NotInParallel]
+    public void ObuProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_obu.txt");
+        if (!File.Exists(trig)) return;
+        byte[] data = File.ReadAllBytes(File.ReadAllText(trig).Trim());
+        File.Delete(trig);
+        var tus = new List<(int Off, int Len)>();
+        int pos = 0, tuStart = -1;
+        while (pos < data.Length)
+        {
+            int hdr = data[pos];
+            int type = (hdr >> 3) & 15;
+            bool ext = (hdr & 4) != 0;
+            int p = pos + 1 + (ext ? 1 : 0);
+            long size = 0;
+            for (int i = 0; ; i++) { byte v = data[p++]; size |= (long)(v & 0x7f) << (7 * i); if ((v & 0x80) == 0) break; }
+            if (type == 2) { if (tuStart >= 0) tus.Add((tuStart, pos - tuStart)); tuStart = pos; }
+            pos = p + (int)size;
+        }
+        if (tuStart >= 0) tus.Add((tuStart, data.Length - tuStart));
+        var dec = new Av1Decoder();
+        var log = new System.Text.StringBuilder();
+        int outIdx = 0;
+        using (var trace = new StreamWriter(Path.Combine(Scratch, "trace_ours.txt")))
+        {
+            Av1Decode.BlockTrace = trace;
+            for (int i = 0; i < tus.Count; i++)
+            {
+                Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(Scratch, $"track_ours_{outIdx}.yuv"));
+                using var f = dec.Decode(data.AsSpan(tus[i].Off, tus[i].Len), i, false);
+                if (f != null) outIdx++;
+                log.AppendLine(f == null ? $"{i} null: {Av1Decoder.LastDecodeError?.ReplaceLineEndings(" | ")}" : $"{i} {f.Width}x{f.Height}");
+            }
+            Av1Decode.BlockTrace = null;
+            Environment.SetEnvironmentVariable("AV1_DUMP10", null);
+        }
+        File.WriteAllText(Path.Combine(Scratch, "track.txt"), log.ToString());
+    }
+
     // Layered-stream probe (trigger hbd_layers.txt holding an .avif path): decodes the primary item's payload and writes
     // the outcome / full exception to layers.txt.
     [Test, NotInParallel]

@@ -152,6 +152,7 @@ internal sealed class Av1Decoder
             catch (Exception ex) { LastDecodeError = ex.ToString(); AvDbg.W($"[DECODE-FRAME-ERROR] {ex.GetType().Name}: {ex.Message}"); return false; }
             try { UpdateReferenceFrames(); }
             catch (Exception ex) { LastDecodeError = $"UpdateReferenceFrames: {ex}"; return false; }
+            DumpDecodedFrame();
             if (frameHdr.ShowFrame)
             {
                 isReady = true;
@@ -442,6 +443,32 @@ internal sealed class Av1Decoder
             }
             ctx.GmvWarpAllowed[i] = fh.Gmv[i].Type > Av1WarpedMotionType.Translation && !fh.ForceIntegerMv
                 && !Av1WarpMv.GetShearParams(ref fh.Gmv[i]) && ctx.Svc[i, 0].Scale == 0;
+        }
+
+        // Distance weights for COMP_INTER_WEIGHTED_AVG (dav1d decode_frame_init "setup jnt_comp weights").
+        if (fh.SwitchableCompRefs)
+        {
+            ReadOnlySpan<byte> quantDistWeight = [2, 3, 2, 5, 2, 7];
+            ReadOnlySpan<byte> quantDistLookup = [9, 7, 11, 5, 12, 4, 13, 3];
+            for (int i = 0; i < 7; i++)
+            {
+                int ref0Poc = ctx.RefFrames[fh.GetRefIdx(i)].OrderHint;
+                for (int j = i + 1; j < 7; j++)
+                {
+                    int ref1Poc = ctx.RefFrames[fh.GetRefIdx(j)].OrderHint;
+                    int d1 = Math.Min(Math.Abs(Av1ObuParser.GetPocDiff(seqHdr.OrderHintNBits, ref0Poc, fh.FrameOffset)), 31);
+                    int d0 = Math.Min(Math.Abs(Av1ObuParser.GetPocDiff(seqHdr.OrderHintNBits, ref1Poc, fh.FrameOffset)), 31);
+                    int order = d0 <= d1 ? 1 : 0;
+                    int k;
+                    for (k = 0; k < 3; k++)
+                    {
+                        int c0 = quantDistWeight[k * 2 + order], c1 = quantDistWeight[k * 2 + (1 - order)];
+                        int d0c0 = d0 * c0, d1c1 = d1 * c1;
+                        if ((d0 > d1 && d0c0 < d1c1) || (d0 <= d1 && d0c0 > d1c1)) break;
+                    }
+                    ctx.JntWeights[i, j] = quantDistLookup[k * 2 + order];
+                }
+            }
         }
 
         // Initialize CDF contexts
@@ -971,7 +998,7 @@ internal sealed class Av1Decoder
         }
 
         // === Loop Restoration ===
-        if (ctx.RestorePlanes != 0 && System.Environment.GetEnvironmentVariable("AV1_NOLR") == "1" && ctx.BitDepth > 8) { AvDbg.W("[LR] skipped (probe)"); }
+        if (ctx.RestorePlanes != 0 && System.Environment.GetEnvironmentVariable("AV1_NOLR") == "1") { AvDbg.W("[LR] skipped (probe)"); }
         else if (ctx.RestorePlanes != 0) {
             AvDbg.W($"[LR-INFO] RestorePlanes={ctx.RestorePlanes} LRtypes=({fh.GetLrType(0)},{fh.GetLrType(1)},{fh.GetLrType(2)}) unitSizes=({fh.LrUnitSizeY},{fh.LrUnitSizeUv})");
             _lrRestored = 0;
@@ -1977,6 +2004,26 @@ internal sealed class Av1Decoder
     // ======================================================================
     // Reference Frame Management
     // ======================================================================
+
+    // Debug (env AV1_DUMPALL = file): appends every decoded frame's native planes (u16 LE, Y then U then V), hidden
+    // frames included, in decode order - the counterpart of dav1d --outputinvisible 1.
+    private void DumpDecodedFrame()
+    {
+        string? path = Environment.GetEnvironmentVariable("AV1_DUMPALL");
+        if (string.IsNullOrEmpty(path)) return;
+        int w = frameHdr.SuperResUpscaledWidth, h = frameHdr.Height;
+        int ssHor = ctx.PixelLayout != Av1PixelLayout.I444 ? 1 : 0, ssVer = ctx.PixelLayout == Av1PixelLayout.I420 ? 1 : 0;
+        using var fs = new FileStream(path, FileMode.Append);
+        using var bw = new BinaryWriter(fs);
+        for (int p = 0; p < 3; p++)
+        {
+            var pl = ctx.CurrentPlanes[p];
+            if (pl == null) continue;
+            int pw = p == 0 ? w : (w + ssHor) >> ssHor, ph = p == 0 ? h : (h + ssVer) >> ssVer;
+            for (int y = 0; y < ph; y++)
+                for (int x = 0; x < pw; x++) bw.Write(pl[y * ctx.CurrentStrides[p] + x]);
+        }
+    }
 
     private void UpdateReferenceFrames()
     {

@@ -679,7 +679,7 @@ public static class Av1MotionComp
         int ssHor, int ssVer)
     {
         int intermediateBits = IntermediateBits8;
-        const int bitDepth = 8;
+        int bitDepth = McBitDepth;
         int sh = intermediateBits + 6;
         int rnd = (32 << intermediateBits) + PrepBias8 * 64;
         int maskSh = bitDepth + intermediateBits - 4;

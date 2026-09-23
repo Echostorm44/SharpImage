@@ -719,7 +719,8 @@ public static class Av1RefMvs
 
         // === Top-left ===
         int haveDummyNewmv = 0;
-        if (nRows >= 0 || nCols >= 0)
+        // dav1d: (n_rows | n_cols) != ~0U with ~0U = unavailable, i.e. only when BOTH top and left exist.
+        if (nRows >= 0 && nCols >= 0)
         {
             var topRow = rt.R[(by4 & 31) - 1 + 5];
             if (topRow != null && bx4 - 1 >= 0)
