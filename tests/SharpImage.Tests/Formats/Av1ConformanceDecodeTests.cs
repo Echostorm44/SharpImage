@@ -171,6 +171,41 @@ public sealed class Av1ConformanceDecodeTests
             await Assert.That(Hex(MD5.HashData(Planes(dn, plain!)))).IsEqualTo(md5NoGrain);
     }
 
+    // Image-sequence tracks (animated AVIF colour and alpha tracks): every sample through one decoder, all frames' planes
+    // concatenated, against libdav1d on the same samples. Exercises the inter decoder end to end: temporal MV projection,
+    // frame-end CDF propagation, reference-slot mapping (ref_frame_idx), show-existing / hidden alt-ref frames, OBMC,
+    // warped motion, palette in inter frames, 4:2:2 chroma CDEF, and 12-bit self-guided restoration on 128x128 superblocks.
+    [Test]
+    [Arguments("colors-animated-8bpc.avif", 0, 5, "7e1a3987ad45f0e9d5d1b964dd258138")]
+    [Arguments("colors-animated-8bpc-alpha-exif-xmp.avif", 0, 5, "eec228f7c2739ac89ec7a7dab0f2987f")]
+    [Arguments("colors-animated-8bpc-alpha-exif-xmp.avif", 1, 5, "c801310653c526a7d5b0cef3dbf1cf88")]
+    [Arguments("colors-animated-12bpc-keyframes-0-2-3.avif", 0, 5, "7496ad64370db7a124c5d47814375b50")]
+    [Arguments("colors-animated-12bpc-keyframes-0-2-3.avif", 1, 5, "3f4cc3d593c8fed0ce27080504c3efaf")]
+    [Arguments("libavif_anim_8_444_alpha.avif", 0, 5, "f977c51aa7cf2ce10283e7ac902ea12e")]
+    [Arguments("libavif_anim_8_444_alpha.avif", 1, 5, "7d0040e89f39753e9f0952e8551bba5b")]
+    public async Task SequenceTrack_ByteExactVsDav1d(string file, int track, int frames, string md5)
+    {
+        byte[] data = File.ReadAllBytes(Asset(file));
+        var t = AvifTracks.Parse(data).Tracks[track];
+        await Assert.That(t.Samples.Count).IsEqualTo(frames);
+        var dec = new Av1Decoder();
+        using var all = new MemoryStream();
+        for (int i = 0; i < t.Samples.Count; i++)
+        {
+            var (off, size) = t.Samples[i];
+            using var f = dec.Decode(data.AsSpan((int)off, size), i, t.Sync[i]);
+            await Assert.That(f).IsNotNull();
+            if (!dec.Monochrome) { all.Write(NativePlanes(f!)); continue; }
+            for (int y = 0; y < f!.Height; y++)   // dav1d writes only the luma plane of a 4:0:0 stream
+                for (int x = 0; x < f.Width; x++)
+                {
+                    if (f.BitDepth > 8) { ushort v = f.YPlane16.Span[y * f.YStride + x]; all.WriteByte((byte)v); all.WriteByte((byte)(v >> 8)); }
+                    else all.WriteByte(f.YPlane.Span[y * f.YStride + x]);
+                }
+        }
+        await Assert.That(Hex(MD5.HashData(all.ToArray()))).IsEqualTo(md5);
+    }
+
     // Planes as ffmpeg writes raw video: Y, U, V tightly packed; u16 LE for >8-bit, u8 otherwise.
     private static byte[] NativePlanes(DecodedVideoFrame f)
     {

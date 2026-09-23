@@ -121,8 +121,12 @@ public sealed class Av1ReferenceFrame
     /// <summary>CDF context snapshot from this reference frame (for CDF update).</summary>
     public Av1CdfContext? CdfSnapshot;
 
-    /// <summary>Temporal MV projection from this reference frame (for inter prediction).</summary>
+    /// <summary>
+    /// The saved 8x8 motion field of the (inter) frame stored here (dav1d refs[].refmvs; null for intra frames), and
+    /// that frame's own reference order hints (refs[].refpoc) for temporal MV projection.
+    /// </summary>
     public Av1RefMvsTemporalBlock[]? TemporalMvs;
+    public byte[] RefPoc = new byte[7];
 
     public void Reset()
     {
@@ -242,6 +246,13 @@ public sealed class Av1DecoderContext : IDisposable
 
     /// <summary>Temporal MV blocks from previous frame (dav1d: f->cur.rp, stored between frames).</summary>
     public Av1RefMvsTemporalBlock[]? PrevRp;
+
+    /// <summary>This frame's motion field (dav1d f->mvs; null for intra frames) and reference order hints (f->refpoc).</summary>
+    public Av1RefMvsTemporalBlock[]? CurrentRp;
+    public byte[] CurrentRefPoc = new byte[7];
+
+    /// <summary>The CDFs the current frame started from (dav1d f->in_cdf).</summary>
+    public Av1CdfContext? InCdf;
 
     /// <summary>Block stride for the block grid (dav1d: f->b4_stride).</summary>
     public int B4Stride;

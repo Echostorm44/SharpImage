@@ -219,7 +219,126 @@ public static class HeifCoder
         return false;
     }
 
-    public static ImageFrame Decode(byte[] data) => DecodeCore(data);
+    public static ImageFrame Decode(byte[] data)
+    {
+        // libavif AVIF_DECODER_SOURCE_AUTO: an 'avis' major brand (or no 'avif' major brand with tracks present) decodes
+        // the image sequence track; the single-image result is its first frame.
+        if (IsAvifSequence(data, out var tracks))
+        {
+            using var seq = DecodeTracks(data, tracks!.Value, maxFrames: 1);
+            var first = seq.Frames[0];
+            seq.RemoveFrameWithoutDispose(0);
+            return first;
+        }
+        return DecodeCore(data);
+    }
+
+    private static bool IsAvifSequence(byte[] data, out (string Major, List<AvifTrack> Tracks)? tracks)
+    {
+        tracks = null;
+        if (data.Length < 12) return false;
+        var parsed = AvifTracks.Parse(data);
+        bool anyTrack = parsed.Tracks.Exists(t => t.Samples.Count > 0 && t.Codec == "av01");
+        // Honour the major brand ('avis' tracks, 'avif' primary item), otherwise prefer tracks when present.
+        if (!anyTrack || parsed.MajorBrand == "avif") return false;
+        tracks = parsed;
+        return true;
+    }
+
+    /// <summary>
+    /// Decodes an AVIF image sequence (animated AVIF, 'avis' tracks) to frames with their exact timing
+    /// (<see cref="ImageSequence.Timescale"/> / <see cref="ImageFrame.DurationTicks"/>, plus centisecond
+    /// <see cref="ImageFrame.Delay"/>) and loop count, as libavif does: the colour track, its 'auxl' alpha track and
+    /// 'prem' premultiplication, inter frames decoded in order. A still AVIF yields a one-frame sequence.
+    /// </summary>
+    public static ImageSequence DecodeSequence(byte[] data)
+    {
+        if (!CanDecode(data)) throw new InvalidDataException("Not a valid AVIF/HEIC file");
+        if (IsAvifSequence(data, out var tracks)) return DecodeTracks(data, tracks!.Value, int.MaxValue);
+        var seq = new ImageSequence { FormatName = "AVIF" };
+        seq.AddFrame(DecodeCore(data));
+        return seq;
+    }
+
+    private static (int Cp, int Tc, int Mc, bool Full)? SampleEntryNclx(byte[] d, AvifTrack t)
+    {
+        foreach (var p in t.Properties)
+            if (p.Type == "colr" && p.Len >= 11 && Encoding.ASCII.GetString(d, p.Off, 4) == "nclx")
+                return (BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p.Off + 4)), BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p.Off + 6)),
+                    BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p.Off + 8)), (d[p.Off + 10] & 0x80) != 0);
+        return null;
+    }
+
+    private static ImageSequence DecodeTracks(byte[] data, (string Major, List<AvifTrack> Tracks) parsed, int maxFrames)
+    {
+        var tracks = parsed.Tracks;
+        var color = tracks.Find(t => t.Id != 0 && t.Samples.Count > 0 && t.Codec == "av01" && t.AuxForId == 0)
+            ?? throw new InvalidDataException("AVIF sequence has no AV1 colour track.");
+        AvifTrack? alpha = tracks.Find(t => t.Id != 0 && t.Samples.Count > 0 && t.Codec == "av01" && t.AuxForId == color.Id
+            && (t.Property("auxi") is not { } ax || Encoding.ASCII.GetString(data, ax.Off + 4, Math.Max(0, ax.Len - 4)).TrimEnd('\0')
+                is "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"));
+        bool prem = alpha != null && color.PremById == alpha.Id;
+        var nclx = SampleEntryNclx(data, color);
+        byte[]? icc = null;
+        foreach (var p in color.Properties)
+            if (p.Type == "colr" && p.Len > 4 && Encoding.ASCII.GetString(data, p.Off, 4) is "prof" or "rICC")
+                icc = data.AsSpan(p.Off + 4, p.Len - 4).ToArray();
+
+        var seq = new ImageSequence { FormatName = "AVIF", Timescale = color.MediaTimescale };
+        int rep = color.RepetitionCount;
+        seq.LoopCount = rep < 0 ? 0 : rep + 1;   // plays in total; infinite / unknown -> 0 (loop forever)
+
+        var cDec = new Av1.Av1Decoder();
+        var aDec = alpha != null ? new Av1.Av1Decoder() : null;
+        int n = Math.Min(maxFrames, color.Samples.Count);
+        for (int i = 0; i < n; i++)
+        {
+            var (off, size) = color.Samples[i];
+            using var yuv = cDec.Decode(data.AsSpan((int)off, size), i, isKeyframe: color.Sync[i])
+                ?? throw new InvalidDataException($"AVIF sequence frame {i} did not decode. " + FirstLine(Av1.Av1Decoder.LastDecodeError));
+            int w = color.Width > 0 ? color.Width : yuv.Width, h = color.Height > 0 ? color.Height : yuv.Height;
+            var frame = new ImageFrame();
+            frame.Initialize(w, h, ColorspaceType.SRGB, false);
+            Av1.DecodedVideoFrame? scaled = null;
+            var src = yuv;
+            if (yuv.Width != w || yuv.Height != h) src = scaled = ScaleDecodedFrame(yuv, w, h);
+            ushort[]? premAlpha = null;
+            Av1.DecodedVideoFrame? ayuv = null;
+            try
+            {
+                if (aDec != null && i < alpha!.Samples.Count)
+                {
+                    var (ao, asz) = alpha.Samples[i];
+                    ayuv = aDec.Decode(data.AsSpan((int)ao, asz), i, isKeyframe: alpha.Sync[i]);
+                    if (ayuv != null && (ayuv.Width != w || ayuv.Height != h))
+                    {
+                        var s2 = ScaleDecodedFrame(ayuv, w, h);
+                        ayuv.Dispose();
+                        ayuv = s2;
+                    }
+                    if (ayuv != null && prem) premAlpha = NativeAlpha(ayuv, aDec);
+                }
+                ConvertDecodedAv1(src, cDec, frame, nclx, premAlpha);
+                if (ayuv != null) ApplyDecodedAlpha(ayuv, aDec!.FullColorRange, frame, w, h);
+            }
+            finally
+            {
+                scaled?.Dispose();
+                ayuv?.Dispose();
+            }
+            if (icc != null)
+            {
+                frame.IccProfile = icc;
+                frame.Metadata.IccProfile = new SharpImage.Metadata.IccProfile(icc);
+            }
+            long ticks = color.Durations[i];
+            frame.DurationTicks = ticks;
+            frame.Delay = color.MediaTimescale > 0 ? (int)Math.Round(ticks * 100.0 / color.MediaTimescale) : 0;
+            frame.Iterations = seq.LoopCount;
+            seq.AddFrame(frame);
+        }
+        return seq;
+    }
 
     /// <summary>
     /// Progressive / layered AVIF (libavif allowProgressive): one image per layer of the primary item, from the coarsest
@@ -1305,7 +1424,12 @@ public static class HeifCoder
     private static void ApplyAv1Alpha(ReadOnlySpan<byte> codedData, ImageFrame frame, int w, int h, HeifContainer? c = null, int id = 0)
     {
         using var yuv = DecodeAv1Item(c, id, codedData, out var decoder, "AV1 alpha");
-        if (!decoder.FullColorRange)
+        ApplyDecodedAlpha(yuv, decoder.FullColorRange, frame, w, h);
+    }
+
+    private static void ApplyDecodedAlpha(Av1.DecodedVideoFrame yuv, bool fullRange, ImageFrame frame, int w, int h)
+    {
+        if (!fullRange)
         {
             ApplyAv1AlphaLimited(yuv, frame, w, h);
             return;
@@ -1376,7 +1500,14 @@ public static class HeifCoder
         // Decode the AV1 item with the vendored decoder (pixel-exact vs dav1d), then convert its YUV planes to RGB. AVIF
         // stores the whole temporal unit (sequence header + frame OBUs, possibly several layers) in the item's data.
         using var yuv = DecodeAv1Item(c, id, codedData, out var decoder, "AV1");
+        ConvertDecodedAv1(yuv, decoder, frame, nclx, premAlpha);
+    }
 
+    // YUV -> RGB of one decoded AV1 frame into `frame` (sized like it), with the container's nclx overriding the
+    // sequence header's CICP (MIAF 7.3.6.4).
+    private static void ConvertDecodedAv1(Av1.DecodedVideoFrame yuv, Av1.Av1Decoder decoder, ImageFrame frame,
+        (int Cp, int Tc, int Mc, bool Full)? nclx, ushort[]? premAlpha)
+    {
         var cicp = nclx ?? (decoder.ColorPrimaries, decoder.TransferCharacteristics, decoder.MatrixCoefficients, decoder.FullColorRange);
         frame.Metadata.Cicp = new SharpImage.Metadata.CicpInfo(cicp.Cp, cicp.Tc, cicp.Mc, cicp.Full);
 
@@ -1760,6 +1891,11 @@ public static class HeifCoder
     {
         byte[] coded = c.ItemData(id) ?? throw new InvalidDataException($"Alpha item {id} has no data.");
         using var yuv = DecodeAv1Item(c, id, coded, out var decoder, "AV1 alpha");
+        return NativeAlpha(yuv, decoder);
+    }
+
+    private static ushort[] NativeAlpha(Av1.DecodedVideoFrame yuv, Av1.Av1Decoder decoder)
+    {
         int w = yuv.Width, h = yuv.Height, bd = yuv.BitDepth, max = (1 << bd) - 1, lo = 16 << (bd - 8), hi = 235 << (bd - 8);
         var a = new ushort[w * h];
         for (int y = 0; y < h; y++)

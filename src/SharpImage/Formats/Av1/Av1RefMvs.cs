@@ -967,11 +967,7 @@ public static class Av1RefMvs
         rf.Iw4 = rf.Iw8 << 1;
         rf.Ih4 = rf.Ih8 << 1;
 
-        // Allocate temporal MV storage if not provided
-        int rpSize = rpStride * fh.TileRows;
-        if (rp == null || rp.Length < rpSize)
-            rp = new Av1RefMvsTemporalBlock[rpSize];
-        rf.Rp = rp;
+        rf.Rp = rp;   // whole-frame motion field (dav1d f->mvs), null for intra frames
         rf.RpStride = rpStride;
 
         // Allocate spatial MV rows if needed

@@ -162,6 +162,12 @@ public class ImageFrame : IDisposable
     public int Duration { get; set; }
 
     /// <summary>
+    /// Animation: exact frame duration in the owning sequence's <c>ImageSequence.Timescale</c> ticks (0 = use
+    /// <see cref="Delay"/>).
+    /// </summary>
+    public long DurationTicks { get; set; }
+
+    /// <summary>
     /// Animation: loop count (0 = infinite).
     /// </summary>
     public int Iterations { get; set; }

@@ -915,6 +915,7 @@ public static class Av1Decode
                     vPlane = ctx.CurrentPlanes[2].AsSpan();
                 }
 
+                BlockTrace?.WriteLine($"I {t.By} {t.Bx} y{b.YMode} uv{b.UvMode} a{b.YAngle},{b.UvAngle} tx{b.Tx} uvtx{b.UvTx} pal{b.PalSzY},{b.PalSzUv} cfl{b.CflAlpha0},{b.CflAlpha1} fi{(b.YMode == 13 ? 1 : 0)},{(b.YMode == 13 ? b.YAngle : 0)} r={msac.DebugRng}");
                 if (t.Bx == 0 && t.By == 0)
                     AvDbg.W($"[RECON-DBG] Calling ReconBlockIntra for bx=0 by=0, yPlane.Length={yPlane.Length}");
 
@@ -1065,6 +1066,7 @@ public static class Av1Decode
             for (int i = 0; i < bw4; i++) t.Above.SkipMode[bx4 + i] = b.SkipMode;
             for (int i = 0; i < bw4; i++) t.Above.SegPred[bx4 + i] = 0;
             for (int i = 0; i < bw4; i++) t.Above.PalSz[bx4 + i] = 0;
+            for (int i = 0; i < bw4; i++) t.PalSzUv[0, bx4 + i] = 0;   // dav1d t->pal_sz_uv (palette cache)
             for (int i = 0; i < bw4; i++) t.Above.TxIntra[bx4 + i] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 2];
             for (int j = 0; j < bh4; j++) t.Left.Mode[by4 + j] = interModeByte;
             for (int j = 0; j < bh4; j++) t.Left.CompType[by4 + j] = compTypeByte;
@@ -1077,6 +1079,7 @@ public static class Av1Decode
             for (int j = 0; j < bh4; j++) t.Left.SkipMode[by4 + j] = b.SkipMode;
             for (int j = 0; j < bh4; j++) t.Left.SegPred[by4 + j] = 0;
             for (int j = 0; j < bh4; j++) t.Left.PalSz[by4 + j] = 0;
+            for (int j = 0; j < bh4; j++) t.PalSzUv[1, by4 + j] = 0;
             for (int j = 0; j < bh4; j++) t.Left.TxIntra[by4 + j] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 3];
             if (hasChroma)
             {
@@ -1625,6 +1628,7 @@ public static class Av1Decode
             t.Above.SkipMode[bx4 + i] = 0;
             t.Above.SegPred[bx4 + i] = 0;
             t.Above.PalSz[bx4 + i] = 0;
+            t.PalSzUv[0, bx4 + i] = 0;
             t.Above.TxIntra[bx4 + i] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 2];
         }
         for (int j = 0; j < bh4; j++)
@@ -1635,6 +1639,7 @@ public static class Av1Decode
             t.Left.SkipMode[by4 + j] = 0;
             t.Left.SegPred[by4 + j] = 0;
             t.Left.PalSz[by4 + j] = 0;
+            t.PalSzUv[1, by4 + j] = 0;
             t.Left.TxIntra[by4 + j] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 3];
         }
         if (hasChroma)
@@ -1793,8 +1798,9 @@ public static class Av1Decode
                             b.DrlIdx += (byte)msac.DecodeBoolAdapt(ts.Cdf.GetDrlBitCdf(drlCtx));
                         }
                     }
-                    int miNear = b.DrlIdx < nCand ? b.DrlIdx : 0;
-                    b.Mv0 = mvstack[miNear].Mv.Mv0;
+                    // FindRefMvs pads the stack to two entries with the global MV, so mvstack[1] is valid even with one
+                    // candidate (dav1d reads mvstack[drl_idx] unconditionally).
+                    b.Mv0 = mvstack[b.DrlIdx].Mv.Mv0;
                     if (b.DrlIdx < 2) // NEAREST_DRL=0, NEARER_DRL=1
                         Av1RefMvs.FixMvPrecision(fh, ref b.Mv0);
                 }
@@ -1827,18 +1833,14 @@ public static class Av1Decode
                     b.DrlIdx += (byte)msac.DecodeBoolAdapt(ts.Cdf.GetDrlBitCdf(drlCtx));
                 }
             }
-            if (nCand > 0)
+            if (nCand > 1)
             {
-                if (nCand > 1)
-                {
-                    int miNew = b.DrlIdx < nCand ? b.DrlIdx : 0;
-                    b.Mv0 = mvstack[miNew].Mv.Mv0;
-                }
-                else
-                {
-                    b.Mv0 = mvstack[0].Mv.Mv0;
-                    Av1RefMvs.FixMvPrecision(fh, ref b.Mv0);
-                }
+                b.Mv0 = mvstack[b.DrlIdx].Mv.Mv0;
+            }
+            else
+            {
+                b.Mv0 = mvstack[0].Mv.Mv0;   // the padded global MV when there are no candidates
+                Av1RefMvs.FixMvPrecision(fh, ref b.Mv0);
             }
             ReadMvResidual(ts, ref msac, ref b.Mv0, fh);
         }

@@ -37,6 +37,12 @@ public sealed class ImageSequence : IDisposable
     public int LoopCount { get; set; }
 
     /// <summary>
+    /// Ticks per second for <see cref="ImageFrame.DurationTicks"/> (0 = unset: frame timing is <see cref="ImageFrame.Delay"/>
+    /// in centiseconds). Formats with exact timing (AVIF sequences) read and write it.
+    /// </summary>
+    public long Timescale { get; set; }
+
+    /// <summary>
     /// Background color index (GIF-specific).
     /// </summary>
     public int BackgroundColorIndex { get; set; }
@@ -65,6 +71,13 @@ public sealed class ImageSequence : IDisposable
             CanvasWidth = (int)frame.Columns;
             CanvasHeight = (int)frame.Rows;
         }
+    }
+
+    /// <summary>Detaches the frame at <paramref name="index"/> without disposing it (the caller takes ownership).</summary>
+    internal void RemoveFrameWithoutDispose(int index)
+    {
+        frames.RemoveAt(index);
+        for (int i = index; i < frames.Count; i++) frames[i].Scene = i;
     }
 
     /// <summary>

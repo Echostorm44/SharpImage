@@ -457,6 +457,10 @@ internal sealed class Av1Decoder
         }
         AvDbg.W($"[CDF-INIT] PrimaryRefFrame={fh.PrimaryRefFrame} RefreshContext={fh.RefreshContext} refCdfNull={refCdf == null} QuantBaseQIdx={fh.QuantBaseQIdx}");
         ctx.InitializeTileCdfs(fh.QuantBaseQIdx, refCdf);
+        // dav1d in_cdf: what this frame leaves for its references when it does not refresh the context, and the base
+        // of the frame-end save when it does.
+        ctx.InCdf ??= new Av1CdfContext();
+        ctx.InCdf.CopyFrom(ctx.TileStates![0].Cdf);
 
         // Apply dav1d CDF override after init (for testing/debugging)
         // Only for inter frames with a valid primary reference (dav1d: primary_ref_frame != NONE)
@@ -610,7 +614,8 @@ internal sealed class Av1Decoder
         // dav1d: decode.c:2973 — for single-threaded: num_lines = 12
         if (ctx.RestorePlanes != 0)
         {
-            const int numLines = 12;
+            // 12 rows per SB row; the per-SB-row snapshot below copies 24 for 128x128 superblocks.
+            int numLines = seqHdr.Sb128 ? 24 : 12;
             int yLpfSize = yStride * numLines;
             int uvLpfSize = uvStride * numLines;
             if (ctx.LrLpfLine[0] == null || ctx.LrLpfLine[0].Length < yLpfSize)
@@ -746,11 +751,38 @@ internal sealed class Av1Decoder
             }
         }
 
-        // Initialize refmvs frame for inter prediction (dav1d: dav1d_refmvs_init_frame)
-        Span<byte> refPoc = stackalloc byte[7];
-        Av1RefMvs.InitFrame(ctx.RefMvs, seqHdr, fh, refPoc,
-            ctx.PrevRp, refRefPoc: null, rpRef: null);
-        ctx.PrevRp = null; // consume temporal projection from previous frame
+        // Initialize refmvs frame for inter prediction (dav1d: dav1d_submit_frame ref_mvs setup +
+        // dav1d_refmvs_init_frame): the reference order hints, a fresh motion field for this frame (kept by the
+        // reference slots it refreshes), and the saved motion fields of same-size inter references.
+        bool interOrSwitch = fh.IsInterOrSwitch;
+        byte[,]? refRefPoc = null;
+        ctx.CurrentRp = null;
+        if (interOrSwitch || fh.AllowIntraBc)
+        {
+            int rpStride = ((fh.CodedWidth + 127) & ~127) >> 3;
+            ctx.CurrentRp = new Av1RefMvsTemporalBlock[rpStride * ctx.SuperBlockRows * (seqHdr.Sb128 ? 16 : 8)];
+            if (!fh.AllowIntraBc)
+                for (int i = 0; i < 7; i++) ctx.CurrentRefPoc[i] = (byte)ctx.RefFrames[fh.GetRefIdx(i)].OrderHint;
+            else
+                Array.Clear(ctx.CurrentRefPoc);
+            if (fh.UseRefFrameMvs)
+            {
+                var rpRefs = new Av1RefMvsTemporalBlock[]?[7];
+                refRefPoc = new byte[7, 7];
+                for (int i = 0; i < 7; i++)
+                {
+                    var rfr = ctx.RefFrames[fh.GetRefIdx(i)];
+                    if (rfr.TemporalMvs != null && ((rfr.Width + 7) >> 3) == ((fh.CodedWidth + 7) >> 3)
+                        && ((rfr.Height + 7) >> 3) == ((fh.Height + 7) >> 3))
+                        rpRefs[i] = rfr.TemporalMvs;
+                    for (int m = 0; m < 7; m++) refRefPoc[i, m] = rfr.RefPoc[m];
+                }
+                Av1RefMvs.InitFrame(ctx.RefMvs, seqHdr, fh, ctx.CurrentRefPoc, ctx.CurrentRp, refRefPoc, rpRefs);
+            }
+            else Av1RefMvs.InitFrame(ctx.RefMvs, seqHdr, fh, ctx.CurrentRefPoc, ctx.CurrentRp, null, null);
+        }
+        else Av1RefMvs.InitFrame(ctx.RefMvs, seqHdr, fh, ctx.CurrentRefPoc, null, null, null);
+        Av1Decode.BlockTrace?.WriteLine($"F type={fh.FrameType} show={fh.ShowFrame} off={fh.FrameOffset} urfm={fh.UseRefFrameMvs} ohb={seqHdr.OrderHintNBits} n={ctx.RefMvs.MfmvCount} refpoc={string.Join(',', ctx.CurrentRefPoc)} refidx={string.Join(',', Enumerable.Range(0, 7).Select(i => fh.GetRefIdx(i)))} tm={string.Join(',', ctx.RefFrames.Select(r => r.TemporalMvs != null ? 1 : 0))} refresh={fh.RefreshFrameFlags} lf={fh.LfLevelY0},{fh.LfLevelY1},{fh.LfLevelU},{fh.LfLevelV} mrd={fh.LfModeRefDeltaEnabled} cdef={fh.CdefNBits}/{fh.CdefYStrength0} lr={fh.GetLrType(0)},{fh.GetLrType(1)},{fh.GetLrType(2)} dlf={fh.DeltaLfPresent} slotY0={string.Join(',', ctx.RefFrames.Select(r => r.Planes[0] == null ? -1 : r.Planes[0]![0]))} oh={string.Join(',', ctx.RefFrames.Select(r => r.OrderHint))}");
 
         // Process tile rows by superblock rows
         for (int tileRow = 0; tileRow < fh.TileRows; tileRow++)
@@ -790,22 +822,18 @@ internal sealed class Av1Decoder
                     DecodeTileSuperblockRow(ts, tileIdx, by, tileCol, tileRow);
                 }
 
-                // Save temporal MVs for this SB row (dav1d: save_tmvs)
-                // DISABLED: IndexOutOfRangeException in SaveTemporalMvs — needs debugging
-                // if (fh.IsInterOrSwitch)
-                // {
-                //     var rf = ctx.RefMvs;
-                //     if (rf.Rp != null)
-                //     {
-                //         int byEnd8 = Math.Min((by + sbStep) >> 1, ctx.Bh >> 1);
-                //         Av1RefMvs.SaveTemporalMvs(
-                //             rf.Rp, (by >> 1) * rf.RpStride, rf.RpStride,
-                //             taskCtx.Rt.R,
-                //             rf.MfmvSign,
-                //             Math.Min(ctx.Bw >> 1, rf.Iw8), byEnd8,
-                //             0, by >> 1);
-                //     }
-                // }
+                // Save temporal MVs for this SB row (dav1d: dav1d_refmvs_save_tmvs)
+                if (interOrSwitch)
+                {
+                    var rf = ctx.RefMvs;
+                    int byEnd8 = Math.Min((by + sbStep) >> 1, rf.Ih8);
+                    Av1RefMvs.SaveTemporalMvs(
+                        rf.Rp!, (by >> 1) * rf.RpStride, rf.RpStride,
+                        taskCtx.Rt.R,
+                        rf.MfmvSign,
+                        Math.Min(ctx.Bw >> 1, rf.Iw8), byEnd8,
+                        0, by >> 1);
+                }
 
                 // Back up pre-loopfilter pixels for intra prediction of the next SB row.
                 // MUST run before ApplyInLoopFilters (which deblocks in place).
@@ -917,7 +945,9 @@ internal sealed class Av1Decoder
         // === CDEF (Constrained Directional Enhancement Filter) ===
         // Applied once after all deblocking is complete
         AvDbg.W($"[CDEF-ENTRY] CdefBits={fh.CdefBits} LfMasksNull={ctx.LfMasks == null} Damping={fh.CdefDamping} y0={fh.CdefYStrength0}");
-        if ((fh.CdefNBits > 0 || fh.CdefYStrength0 != 0)  // CDEF enabled if any strength > 0
+        // dav1d runs CDEF whenever the sequence enables it; blocks whose luma and chroma strengths are both 0 are
+        // skipped inside (a frame with only a chroma strength still filters chroma).
+        if ((fh.CdefNBits > 0 || fh.CdefYStrength0 != 0 || fh.GetCdefUvStrength(0) != 0)
             && System.Environment.GetEnvironmentVariable("AV1_NOCDEF") != "1")
         {
             ApplyCdef(ssHor, ssVer, hasChroma);
@@ -1320,7 +1350,7 @@ internal sealed class Av1Decoder
             for (int di = 0; di < 4; di++)
                 AvDbg.W($"[LF-LEVEL] LfLevel[{di}] col0={ctx.LfLevel[di, 0]} col1={ctx.LfLevel[di, 1]} col2={ctx.LfLevel[di, 2]} col3={ctx.LfLevel[di, 3]}");
         }
-        if ((fh.LfLevelY0 != 0 || fh.LfLevelY1 != 0) && ctx.LfMasks != null)
+        if ((fh.LfLevelY0 != 0 || fh.LfLevelY1 != 0) && ctx.LfMasks != null && Environment.GetEnvironmentVariable("AV1_NODEBLOCK") == null)
         {
             int sbSz = seqHdr.Sb128 ? 32 : 16;
             int yPixelRow = sby * sbSz * 4;
@@ -1657,8 +1687,10 @@ internal sealed class Av1Decoder
         }
         dstOff = 4 * dstStride;
 
-        // The first stripe is shorter by 8 luma rows (→ fewer for chroma)
-        int stripeH = ((64 << sb128) - 8 * (row == 0 ? 1 : 0)) >> ssVer;
+        // Loop-restoration stripes are 64 luma rows whatever the superblock size (dav1d: 64 << (cdef_backup & sb128)
+        // with cdef_backup = 0 here); the first stripe is shorter by 8 luma rows (fewer for chroma). A 128x128
+        // superblock row therefore holds two stripes.
+        int stripeH = (64 - 8 * (row == 0 ? 1 : 0)) >> ssVer;
         // Advance src to stripe_h - 2 rows in (the last 2 rows of the stripe)
         int srcOff = srcOffset + (stripeH - 2) * srcStride;
 
@@ -1969,26 +2001,18 @@ internal sealed class Av1Decoder
                 // Copy current frame planes to reference
                 CopyFrameToReference(refFrame);
 
-                // Snapshot CDF if not disabled
-                if (!fh.DisableCdfUpdate)
-                {
-                    int updateTile = fh.TileUpdate;
-                    if (updateTile < fh.TileCols * fh.TileRows && ctx.TileStates != null)
-                    {
-                        if (refFrame.CdfSnapshot == null)
-                            refFrame.CdfSnapshot = new Av1CdfContext();
-                        refFrame.CdfSnapshot.CopyFrom(ctx.TileStates[updateTile].Cdf);
-                    }
-                }
+                // The CDFs later frames load from this slot (dav1d refs[].cdf = out_cdf): the frame-end update of the
+                // context_update_tile_id tile when refresh_context is set, else the frame's input CDFs.
+                refFrame.CdfSnapshot ??= new Av1CdfContext();
+                int updateTile = fh.TileUpdate;
+                if (fh.RefreshContext && ctx.TileStates != null && updateTile < fh.TileCols * fh.TileRows)
+                    refFrame.CdfSnapshot.SaveFrameEnd(ctx.InCdf!, ctx.TileStates[updateTile].Cdf, fh.IsInterOrSwitch);
+                else
+                    refFrame.CdfSnapshot.CopyFrom(ctx.InCdf!);
 
-                // Snapshot temporal MVs for inter prediction
-                if (ctx.RefMvs.Rp != null)
-                {
-                    int rpLen = ctx.RefMvs.Rp.Length;
-                    if (refFrame.TemporalMvs == null || refFrame.TemporalMvs.Length < rpLen)
-                        refFrame.TemporalMvs = new Av1RefMvsTemporalBlock[rpLen];
-                    ctx.RefMvs.Rp.CopyTo(refFrame.TemporalMvs, 0);
-                }
+                // The frame's motion field (shared, never written again) and its reference order hints.
+                refFrame.TemporalMvs = ctx.CurrentRp;
+                ctx.CurrentRefPoc.CopyTo(refFrame.RefPoc, 0);
             }
         }
     }
@@ -2033,8 +2057,9 @@ internal sealed class Av1Decoder
         if (!refFrame.Valid || refFrame.Planes[0] == null)
             return null;
 
-        // For key frames, show_existing_frame refreshes all reference slots
-        if (fh.FrameType == Av1FrameType.Key)
+        // Showing an existing key frame refreshes all reference slots. The type is the stored frame's (dav1d
+        // refs[existing_frame_idx].frame_type): a show_existing_frame header carries none.
+        if (refFrame.FrameType == Av1FrameType.Key)
         {
             for (int i = 0; i < 8; i++)
             {
@@ -2048,6 +2073,7 @@ internal sealed class Av1Decoder
                 dst.OrderHint = refFrame.OrderHint;
                 dst.FilmGrain = refFrame.FilmGrain;
                 dst.FilmGrainPresent = refFrame.FilmGrainPresent;
+                dst.TemporalMvs = null;   // dav1d drops the other slots' refmvs
                 dst.Valid = true;
 
                 for (int p = 0; p < 3; p++)

@@ -745,6 +745,77 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(dir, "manifest.txt"), log.ToString());
     }
 
+    // Sequence decode probe (trigger hbd_seq.txt naming a scratch subdir): HeifCoder.DecodeSequence on every *.avif, each
+    // frame dumped as name_Li.ours.rgba64 with a manifest "name frames WxH timescale loop d0,d1,..".
+    [Test, NotInParallel]
+    public void SequenceDecode()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_seq.txt");
+        if (!File.Exists(trig)) return;
+        string dir = Path.Combine(Scratch, File.ReadAllText(trig).Trim());
+        File.Delete(trig);
+        var log = new System.Text.StringBuilder();
+        foreach (var file in Directory.GetFiles(dir, "*.avif"))
+        {
+            string name = Path.GetFileNameWithoutExtension(file);
+            try
+            {
+                using var seq = HeifCoder.DecodeSequence(File.ReadAllBytes(file));
+                for (int i = 0; i < seq.Count; i++)
+                {
+                    var f = seq[i];
+                    int w = (int)f.Columns, h = (int)f.Rows, ch = f.NumberOfChannels;
+                    var buf = new byte[w * h * 8];
+                    for (int y = 0; y < h; y++)
+                    {
+                        var row = f.GetPixelRow(y);
+                        for (int x = 0; x < w; x++)
+                            for (int k = 0; k < 4; k++)
+                            {
+                                ushort v = k < 3 ? row[x * ch + Math.Min(k, ch - 1 - (f.HasAlpha ? 1 : 0))] : f.HasAlpha ? row[x * ch + ch - 1] : (ushort)65535;
+                                buf[(y * w + x) * 8 + k * 2] = (byte)v;
+                                buf[(y * w + x) * 8 + k * 2 + 1] = (byte)(v >> 8);
+                            }
+                    }
+                    File.WriteAllBytes(Path.Combine(dir, $"{name}_L{i}.ours.rgba64"), buf);
+                }
+                var durs = string.Join(",", Enumerable.Range(0, seq.Count).Select(i => seq[i].DurationTicks));
+                log.AppendLine($"{name} {seq.Count} {seq[0].Columns}x{seq[0].Rows} {seq.Timescale} {seq.LoopCount} {durs}");
+            }
+            catch (Exception e) { log.AppendLine($"{name} ERROR {e.ToString().ReplaceLineEndings(" | ")} || INNER {SharpImage.Formats.Av1.Av1Decoder.LastDecodeError?.ReplaceLineEndings(" | ")}"); }
+        }
+        File.WriteAllText(Path.Combine(dir, "manifest.txt"), log.ToString());
+    }
+
+    // Track probe (trigger hbd_track.txt = "file|trackIndex"): decodes every sample of one sequence track with one
+    // decoder, dumping each frame's native planes to track_ours_{i}.yuv and the block trace to trace_ours.txt.
+    [Test, NotInParallel]
+    public void TrackProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_track.txt");
+        if (!File.Exists(trig)) return;
+        var parts = File.ReadAllText(trig).Trim().Split('|');
+        File.Delete(trig);
+        byte[] data = File.ReadAllBytes(parts[0]);
+        var track = AvifTracks.Parse(data).Tracks[int.Parse(parts[1])];
+        var dec = new Av1Decoder();
+        var log = new System.Text.StringBuilder();
+        using (var trace = new StreamWriter(Path.Combine(Scratch, "trace_ours.txt")))
+        {
+            Av1Decode.BlockTrace = trace;
+            for (int i = 0; i < track.Samples.Count; i++)
+            {
+                Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(Scratch, $"track_ours_{i}.yuv"));
+                var (off, size) = track.Samples[i];
+                using var f = dec.Decode(data.AsSpan((int)off, size), i, track.Sync[i]);
+                log.AppendLine(f == null ? $"{i} null: {Av1Decoder.LastDecodeError}" : $"{i} {f.Width}x{f.Height}");
+            }
+            Av1Decode.BlockTrace = null;
+            Environment.SetEnvironmentVariable("AV1_DUMP10", null);
+        }
+        File.WriteAllText(Path.Combine(Scratch, "track.txt"), log.ToString());
+    }
+
     // Layered-stream probe (trigger hbd_layers.txt holding an .avif path): decodes the primary item's payload and writes
     // the outcome / full exception to layers.txt.
     [Test, NotInParallel]

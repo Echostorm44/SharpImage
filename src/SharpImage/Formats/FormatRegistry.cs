@@ -442,6 +442,7 @@ public static class FormatRegistry
         {
             ImageFileFormat.Gif => GifCoder.ReadSequence(new MemoryStream(data)),
             ImageFileFormat.WebP => WebpCoder.ReadSequence(new MemoryStream(data)),
+            ImageFileFormat.Avif => HeifCoder.DecodeSequence(data),
             _ => throw new NotSupportedException($"Multi-frame read not supported for: {format}")
         };
     }

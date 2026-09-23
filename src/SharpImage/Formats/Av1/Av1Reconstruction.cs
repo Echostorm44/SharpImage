@@ -1866,7 +1866,7 @@ public static class Av1Reconstruction
         else if (b.CompType == (byte)Av1CompInterType.None)
         {
             // ──── Single reference ────
-            var refp = ctx.RefFrames[b.Ref0];
+            var refp = RefFrame(ctx, b.Ref0);
 
             if (t.Bx <= 2 && t.By == 0)
                 AvDbg.W($"[INTER-RECON] bx={t.Bx} by={t.By} mv0=({b.Mv0.Y},{b.Mv0.X}) ref0={b.Ref0} bs={bs} pred_before_MC: dst[0]={dst[0]}");
@@ -1995,7 +1995,7 @@ public static class Av1Reconstruction
                         var uvDst = (pl == 0 ? uPlane : vPlane).Slice(uvDstOff);
                         Mc(t, ctx, uvDst, Span<short>.Empty, uvStride,
                             bw4, bh4, t.Bx - 1, t.By - 1, 1 + pl,
-                            nb.Mv.Mv0, ctx.RefFrames[nbRef], nbRef,
+                            nb.Mv.Mv0, RefFrame(ctx, nbRef), nbRef,
                             t.Tl4x4Filter);
                     }
                     vOff = 2 * uvStride;
@@ -2012,7 +2012,7 @@ public static class Av1Reconstruction
                         var uvDst = (pl == 0 ? uPlane : vPlane).Slice(uvDstOff + vOff);
                         Mc(t, ctx, uvDst, Span<short>.Empty, uvStride,
                             bw4, bh4, t.Bx - 1, t.By, 1 + pl,
-                            nb.Mv.Mv0, ctx.RefFrames[nbRef], nbRef,
+                            nb.Mv.Mv0, RefFrame(ctx, nbRef), nbRef,
                             leftFilter);
                     }
                     hOff = 2;
@@ -2028,7 +2028,7 @@ public static class Av1Reconstruction
                         var uvDst = (pl == 0 ? uPlane : vPlane).Slice(uvDstOff + hOff);
                         Mc(t, ctx, uvDst, Span<short>.Empty, uvStride,
                             bw4, bh4, t.Bx, t.By - 1, 1 + pl,
-                            nb.Mv.Mv0, ctx.RefFrames[nbRef], nbRef,
+                            nb.Mv.Mv0, RefFrame(ctx, nbRef), nbRef,
                             topFilter);
                     }
                     vOff = 2 * uvStride;
@@ -2143,7 +2143,7 @@ public static class Av1Reconstruction
             for (int i = 0; i < 2; i++)
             {
                 int refIdx = i == 0 ? b.Ref0 : b.Ref1;
-                var refp = ctx.RefFrames[refIdx];
+                var refp = RefFrame(ctx, refIdx);
                 var mv = i == 0 ? b.Mv0 : b.Mv1;
                 var tmpBuf = i == 0 ? tmp0 : tmp1;
 
@@ -2201,7 +2201,7 @@ public static class Av1Reconstruction
                     for (int i = 0; i < 2; i++)
                     {
                         int refIdx = i == 0 ? b.Ref0 : b.Ref1;
-                        var refp = ctx.RefFrames[refIdx];
+                        var refp = RefFrame(ctx, refIdx);
                         var mv = i == 0 ? b.Mv0 : b.Mv1;
                         var tmpBuf = i == 0 ? tmp0 : tmp1;
 
@@ -2363,6 +2363,10 @@ public static class Av1Reconstruction
         }
     }
 
+    // The reference picture of reference frame `r` (0 = LAST .. 6 = ALTREF): the slot ref_frame_idx[r] names
+    // (dav1d f->refp[r]).  Slots and reference frames coincide only when ref_frame_idx is the identity.
+    private static Av1ReferenceFrame RefFrame(Av1DecoderContext ctx, int r) => ctx.RefFrames[ctx.FrameHeader!.GetRefIdx(r)];
+
     // ========================================================================
     // Warp affine helper
     // ========================================================================
@@ -2422,12 +2426,12 @@ public static class Av1Reconstruction
                         15, 15, width, height, dx - 3, dy - 3,
                         t.EmuEdgeBuf, 32,
                         refPlane!, refStride);
-                    refSrc = t.EmuEdgeBuf.AsSpan(32 * 3 + 3);
+                    refSrc = t.EmuEdgeBuf.AsSpan(0);
                     refSrcStride = 32;
                 }
                 else
                 {
-                    refSrc = refPlane.AsSpan(refStride * dy + dx);
+                    refSrc = refPlane.AsSpan(refStride * (dy - 3) + dx - 3);
                     refSrcStride = refStride;
                 }
 
@@ -2502,10 +2506,10 @@ public static class Av1Reconstruction
                             int lapW = ow4 * hMul, lapH = mcH * vMul;
                             Span<ushort> lap = lapPool.AsSpan(0, lapW * lapH);
                             int filter2d = Av1Tables.Filter2d[t.Above.Filter1[bx4 + x + 1], t.Above.Filter0[bx4 + x + 1]];
-                            var refp = ctx.RefFrames[aR.Ref.Ref0];
+                            var refp = RefFrame(ctx, aR.Ref.Ref0 - 1);   // refmvs refs are 1-based (dav1d refp[ref - 1])
 
                             Mc(t, ctx, lap, default, lapW, ow4, mcH, t.Bx + x, t.By, pl,
-                                aR.Mv.Mv0, refp, aR.Ref.Ref0, filter2d);
+                                aR.Mv.Mv0, refp, aR.Ref.Ref0 - 1, filter2d);
 
                             // blend_h: rows [0, (vMul*oh4*3)>>2), per-row mask = ObmcMasks[vMul*oh4 + row]
                             int hpx = vMul * oh4;
@@ -2547,10 +2551,10 @@ public static class Av1Reconstruction
                         int lapW = ow4 * hMul, lapH = oh4 * vMul;
                         Span<ushort> lap = lapPool.AsSpan(0, lapW * lapH);
                         int filter2d = Av1Tables.Filter2d[t.Left.Filter1[by4 + y + 1], t.Left.Filter0[by4 + y + 1]];
-                        var refp = ctx.RefFrames[lR.Ref.Ref0];
+                        var refp = RefFrame(ctx, lR.Ref.Ref0 - 1);   // refmvs refs are 1-based (dav1d refp[ref - 1])
 
                         Mc(t, ctx, lap, default, lapW, ow4, oh4, t.Bx, t.By + y, pl,
-                            lR.Mv.Mv0, refp, lR.Ref.Ref0, filter2d);
+                            lR.Mv.Mv0, refp, lR.Ref.Ref0 - 1, filter2d);
 
                         // blend_v: columns [0, (lapW*3)>>2), per-col mask = ObmcMasks[lapW + col]
                         int blendCols = (lapW * 3) >> 2;

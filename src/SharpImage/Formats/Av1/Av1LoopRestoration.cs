@@ -445,7 +445,8 @@ public static class Av1LoopRestoration
             int x = SgrXByX[Math.Min(z, 255)];
 
             BB[offset + i] = x;
-            AA[offset + i] = (x * bFull * sgrOneByX + (1 << 11)) >> 12;
+            // Unsigned as in dav1d: at 12 bits x * sum * one_by_x reaches ~4.3e9, past int but within uint.
+            AA[offset + i] = (int)(((uint)x * (uint)bFull * (uint)sgrOneByX + (1u << 11)) >> 12);
         }
     }
 

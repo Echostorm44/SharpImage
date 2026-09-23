@@ -185,6 +185,27 @@ public sealed class Av1CdfContext
     }
 
     /// <summary>
+    /// The CDFs a frame leaves for later frames when refresh_context is set (dav1d_cdf_thread_update over a copy of the
+    /// frame's input CDFs): the context_update_tile_id tile's adapted coefficient and intra-mode CDFs, plus the inter
+    /// mode and MV CDFs for inter/switch frames, with every adaptation counter cleared. intrabc and the key-frame
+    /// y-mode CDFs always keep the input values.
+    /// </summary>
+    public void SaveFrameEnd(Av1CdfContext input, Av1CdfContext tile, bool interOrSwitch)
+    {
+        CopyFrom(input);
+        CopyCoef(tile.Coef, Coef);
+        CopyModeIntra(tile.Mode, Mode);
+        if (interOrSwitch)
+        {
+            CopyModeInter(tile.Mode, Mode);
+            CopyMvComponent(tile.Mv.Comp0, Mv.Comp0);
+            CopyMvComponent(tile.Mv.Comp1, Mv.Comp1);
+            Array.Copy(tile.Mv.Joint, Mv.Joint, Mv.Joint.Length);
+        }
+        ResetCounters();
+    }
+
+    /// <summary>
     /// Resets all adaptation counters to zero. Called after copying CDFs from
     /// a reference frame to start fresh adaptation.
     /// </summary>
@@ -315,6 +336,14 @@ public sealed class Av1CdfContext
 
     private static void CopyMode(Av1CdfModeContext src, Av1CdfModeContext dst)
     {
+        CopyModeIntra(src, dst);
+        Array.Copy(src.Intrabc, dst.Intrabc, 2);
+        CopyModeInter(src, dst);
+    }
+
+    // The mode CDFs every frame adapts (dav1d CdfModeContext up to intrabc); CopyMode continues with the rest.
+    private static void CopyModeIntra(Av1CdfModeContext src, Av1CdfModeContext dst)
+    {
         CopyJagged(src.UvMode, dst.UvMode);
         CopyJagged(src.Partition, dst.Partition);
         CopyJagged(src.CflAlpha, dst.CflAlpha);
@@ -340,7 +369,11 @@ public sealed class Av1CdfContext
         CopyJagged(src.Skip, dst.Skip);
         CopyJagged(src.PalY, dst.PalY);
         CopyJagged(src.PalUv, dst.PalUv);
-        Array.Copy(src.Intrabc, dst.Intrabc, 2);
+    }
+
+    // The inter/switch-frame mode CDFs (dav1d CdfModeContext from y_mode on).
+    private static void CopyModeInter(Av1CdfModeContext src, Av1CdfModeContext dst)
+    {
         CopyJagged(src.YMode, dst.YMode);
         CopyJagged(src.WedgeIdx, dst.WedgeIdx);
         CopyJagged(src.CompInterMode, dst.CompInterMode);
@@ -432,7 +465,7 @@ public sealed class Av1CdfContext
         ResetJaggedCounter(m.YMode, 12);
         ResetJaggedCounter(m.WedgeIdx, 15);
         ResetJaggedCounter(m.CompInterMode, 7);
-        ResetJaggedCounter(m.Filter, 3);
+        ResetJaggedCounter(m.Filter, 2);   // 3 filters: 2 CDF values, counter at [2]
         ResetJaggedCounter(m.InterintraMode, 3);
         ResetJaggedCounter(m.MotionMode, 2);
         ResetJaggedCounter(m.SkipMode, 1);

@@ -727,6 +727,7 @@ public static class Av1MotionComp
     /// Warp affine motion compensation for an 8×8 block (pixel output).
     /// </summary>
     /// <param name="abcd">Warp parameters: [alpha, beta, gamma, delta].</param>
+    /// <param name="src">Reference pixels starting 3 rows above and 3 columns left of the block (the tap corner).</param>
     public static void WarpAffine8x8(
         Span<ushort> dst, int dstStride,
         ReadOnlySpan<ushort> src, int srcStride,
@@ -736,7 +737,7 @@ public static class Av1MotionComp
         Span<short> mid = stackalloc short[15 * 8];
         int midIdx = 0;
 
-        int srcIdx = -3 * srcStride;
+        int srcIdx = 0;   // src starts at the (-3, -3) tap corner (spans cannot index backwards)
         for (int y = 0; y < 15; y++, mx += abcd[1])
         {
             for (int x = 0, tmx = mx; x < 8; x++, tmx += abcd[0])
@@ -745,7 +746,7 @@ public static class Av1MotionComp
                 filterIdx = Math.Clamp(filterIdx, 0, 192);
                 int val = 0;
                 for (int t = 0; t < 8; t++)
-                    val += Av1Tables.McWarpFilter[filterIdx, t] * src[srcIdx + x + (t - 3)];
+                    val += Av1Tables.McWarpFilter[filterIdx, t] * src[srcIdx + x + t];
                 mid[midIdx + x] = (short)((val + ((1 << (7 - intermediateBits)) >> 1)) >> (7 - intermediateBits));
             }
             srcIdx += srcStride;
@@ -780,7 +781,7 @@ public static class Av1MotionComp
         Span<short> mid = stackalloc short[15 * 8];
         int midIdx = 0;
 
-        int srcIdx = -3 * srcStride;
+        int srcIdx = 0;   // src starts at the (-3, -3) tap corner (spans cannot index backwards)
         for (int y = 0; y < 15; y++, mx += abcd[1])
         {
             for (int x = 0, tmx = mx; x < 8; x++, tmx += abcd[0])
@@ -789,7 +790,7 @@ public static class Av1MotionComp
                 filterIdx = Math.Clamp(filterIdx, 0, 192);
                 int val = 0;
                 for (int t = 0; t < 8; t++)
-                    val += Av1Tables.McWarpFilter[filterIdx, t] * src[srcIdx + x + (t - 3)];
+                    val += Av1Tables.McWarpFilter[filterIdx, t] * src[srcIdx + x + t];
                 mid[midIdx + x] = (short)((val + ((1 << (7 - intermediateBits)) >> 1)) >> (7 - intermediateBits));
             }
             srcIdx += srcStride;
