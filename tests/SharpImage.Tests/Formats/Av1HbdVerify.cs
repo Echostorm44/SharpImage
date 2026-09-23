@@ -1580,6 +1580,49 @@ public sealed class Av1HbdVerify
                     log.AppendLine($"ok {t[2]}");
                     continue;
                 }
+                if (t[0] == "keyab")
+                {
+                    // keyab <png> <qidx>: BuildColorObus 4:4:4 with and without the sequence scope; Y/U/V PSNR of our decode.
+                    var img = FormatRegistry.Read(t[1]);
+                    int qi = int.Parse(t[2]), kw = (int)img.Columns, kh = (int)img.Rows;
+                    var Y = new ushort[kw * kh]; var U = new ushort[kw * kh]; var V = new ushort[kw * kh];
+                    for (int y = 0; y < kh; y++)
+                    {
+                        var row = img.GetPixelRow(y);
+                        for (int x = 0; x < kw; x++)
+                        {
+                            double r = row[x * img.NumberOfChannels] / 257.0, g = row[x * img.NumberOfChannels + 1] / 257.0, bb = row[x * img.NumberOfChannels + 2] / 257.0;
+                            double yy = 0.299 * r + 0.587 * g + 0.114 * bb;
+                            Y[y * kw + x] = (ushort)Math.Clamp(Math.Round(yy), 0, 255);
+                            U[y * kw + x] = (ushort)Math.Clamp(Math.Round((bb - yy) / 1.772 + 128), 0, 255);
+                            V[y * kw + x] = (ushort)Math.Clamp(Math.Round((r - yy) / 1.402 + 128), 0, 255);
+                        }
+                    }
+                    foreach (bool scoped in new[] { false, true })
+                    {
+                        var ls = new Av1ObuWriter.LayeredStream { Layers = 1, Sequence = true, MaxWidth = kw, MaxHeight = kh, Widths = [kw], Heights = [kh] };
+                        (byte[] sq, byte[] fr) ko;
+                        using (Av1ObuWriter.UseLayers(scoped ? ls : null))
+                            ko = Av1StillImageEncoder.BuildColorObus(Y, U, V, kw, kh, qi, 8, Av1PixelLayout.I444, null);
+                        using var f = new Av1Decoder().Decode([.. ko.sq, .. ko.fr], 0, true)!;
+                        string res = $"scoped={scoped} bytes={ko.fr.Length}";
+                        for (int pl = 0; pl < 3; pl++)
+                        {
+                            var src = pl == 0 ? Y : pl == 1 ? U : V; double se = 0;
+                            var span = (pl == 0 ? f.YPlane : pl == 1 ? f.UPlane : f.VPlane).Span; int st = pl == 0 ? f.YStride : pl == 1 ? f.UStride : f.VStride;
+                            for (int y = 0; y < kh; y++) for (int x = 0; x < kw; x++) { double d = span[y * st + x] - src[y * kw + x]; se += d * d; }
+                            res += $" psnr{pl}={10 * Math.Log10(255.0 * 255 * kw * kh / Math.Max(se, 1)):F2}";
+                        }
+                        log.AppendLine(res);
+                        if (!scoped && t.Length > 3)
+                        {
+                            var yspan = f.YPlane.Span; var dump = new byte[kw * kh * 2];
+                            for (int y = 0; y < kh; y++) for (int x = 0; x < kw; x++) { dump[(y * kw + x) * 2] = yspan[y * f.YStride + x]; dump[(y * kw + x) * 2 + 1] = (byte)Y[y * kw + x]; }
+                            File.WriteAllBytes(t[3], dump);
+                        }
+                    }
+                    continue;
+                }
                 if (t[0] == "obudec")
                 {
                     // obudec <stream.obu> <sizes (comma list)> <out.yuv>: decode sample by sample, write every frame's

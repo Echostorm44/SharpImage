@@ -1096,12 +1096,16 @@ internal static class Av1StillImageEncoder
     // SSE of the reconstructed block (luma + chroma) vs the source planes — the distortion term for true-RD.
     private static long BlockSseColor(ColorPartCtx c, int bx4, int by4, int blk4)
     {
+        // Only in-frame samples count: a partial block's forced-split children never reconstruct the part past the
+        // frame edge, so including it would make every edge SPLIT look hopeless (and force a 64x64 NONE there).
         int lpx = bx4 * 4, lpy = by4 * 4, ln = blk4 * 4;
+        int lw = Math.Min(ln, c.Bw4 * 4 - lpx), lh = Math.Min(ln, c.Bh4 * 4 - lpy);
         long sse = 0;
-        for (int y = 0; y < ln; y++)
-            for (int x = 0; x < ln; x++)
+        for (int y = 0; y < lh; y++)
+            for (int x = 0; x < lw; x++)
             { int d = c.ReconY[(lpy + y) * c.W + lpx + x] - c.Luma[(lpy + y) * c.W + lpx + x]; sse += (long)d * d; }
-        int cpx = (bx4 * 4) >> c.SsX, cpy = (by4 * 4) >> c.SsY, cnw = (blk4 * 4) >> c.SsX, cnh = (blk4 * 4) >> c.SsY;
+        int cpx = (bx4 * 4) >> c.SsX, cpy = (by4 * 4) >> c.SsY;
+        int cnw = Math.Min((blk4 * 4) >> c.SsX, ((c.Bw4 * 4) >> c.SsX) - cpx), cnh = Math.Min((blk4 * 4) >> c.SsY, ((c.Bh4 * 4) >> c.SsY) - cpy);
         for (int y = 0; y < cnh; y++)
             for (int x = 0; x < cnw; x++)
             {
@@ -1830,8 +1834,9 @@ internal static class Av1StillImageEncoder
     private static long LumaBlockSse(ColorPartCtx c, int bx, int by, int n)
     {
         long sse = 0;
-        for (int yy = 0; yy < n; yy++)
-            for (int xx = 0; xx < n; xx++) { int d = c.ReconY[(by + yy) * c.W + bx + xx] - c.Luma[(by + yy) * c.W + bx + xx]; sse += (long)d * d; }
+        int nw = Math.Min(n, c.Bw4 * 4 - bx), nh = Math.Min(n, c.Bh4 * 4 - by);   // in-frame samples only
+        for (int yy = 0; yy < nh; yy++)
+            for (int xx = 0; xx < nw; xx++) { int d = c.ReconY[(by + yy) * c.W + bx + xx] - c.Luma[(by + yy) * c.W + bx + xx]; sse += (long)d * d; }
         return sse;
     }
 
@@ -2822,11 +2827,11 @@ internal static class Av1StillImageEncoder
             return;
         }
 
-        // Interior: full partition symbol. RD NONE-vs-SPLIT only for fully-inside blocks (a block that merely
-        // extends past the frame with its midpoint inside stays a single NONE, matching prior behaviour).
-        bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
+        // Interior: full partition symbol, RD NONE-vs-SPLIT — also for a block that merely extends past the frame
+        // (midpoint inside): all four children start in-frame, and the estimate sees the replicated padding on both
+        // sides. Keeping such blocks a single NONE put a large transform on every bottom/right edge block.
         bool doSplit = false;
-        if (bl < 4 && fullyInside)
+        if (bl < 4)
         {
             long costNone = EstimateCost(c, bl, bx4, by4);
             long costSplit = c.SplitLambda;

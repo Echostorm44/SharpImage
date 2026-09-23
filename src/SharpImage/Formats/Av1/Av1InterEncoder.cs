@@ -523,17 +523,20 @@ internal static class Av1InterEncoder
             var res = new int[tw * th];
             var recon = new ushort[tw * th];
             int max = (1 << Bd) - 1;
+            // Distortion counts in-frame samples only (the padding past the frame edge is never displayed).
+            int visW = plane == 0 ? W : CW, visH = plane == 0 ? H : CH;
             for (int ty = 0; ty < h; ty += th)
                 for (int txo = 0; txo < w; txo += tw)
                 {
                     long ss = 0;
+                    int vw = visW - (px + txo), vh = visH - (py + ty);
                     for (int y = 0; y < th; y++)
                         for (int x = 0; x < tw; x++)
                         {
                             int s = src[(py + ty + y) * srcW + px + txo + x];
                             int p = pred[(ty + y) * w + txo + x];
                             res[y * tw + x] = s - p;
-                            ss += (long)(s - p) * (s - p);
+                            if (x < vw && y < vh) ss += (long)(s - p) * (s - p);
                             recon[y * tw + x] = (ushort)p;
                         }
                     dSkip += ss;
@@ -547,7 +550,7 @@ internal static class Av1InterEncoder
                         for (int x = 0; x < tw; x++)
                         {
                             int d = src[(py + ty + y) * srcW + px + txo + x] - recon[y * tw + x];
-                            sc += (long)d * d;
+                            if (x < vw && y < vh) sc += (long)d * d;
                         }
                     dCoded += sc;
                 }
