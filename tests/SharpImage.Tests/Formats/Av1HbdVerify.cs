@@ -421,6 +421,43 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(Scratch, "statics.txt"), sb.Length == 0 ? "none" : sb.ToString());
     }
 
+    // Large-frame probe (trigger hbd_large.txt: lines "WxH"): encodes a smooth gradient at each size to scratch/large/.
+    [Test, NotInParallel]
+    public void Large()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_large.txt");
+        if (!File.Exists(trig)) return;
+        var sizes = File.ReadAllLines(trig);
+        File.Delete(trig);
+        string outDir = Path.Combine(Scratch, "large");
+        Directory.CreateDirectory(outDir);
+        foreach (var s in sizes)
+        {
+            var parts = s.Trim().Split(' ')[0].Split('x');
+            if (parts.Length != 2) continue;
+            int w = int.Parse(parts[0]), h = int.Parse(parts[1]);
+            // optional 3rd/4th fields: bit depth, "a" (alpha) / "444"
+            var extra = s.Trim().Split(' ');
+            int bd = extra.Length > 1 ? int.Parse(extra[1]) : 8;
+            bool alpha = extra.Contains("a"), yuv444 = extra.Contains("444"), gray = extra.Contains("g");
+            string stem = $"g{w}x{h}_b{bd}{(alpha ? "a" : "")}{(yuv444 ? "444" : "")}{(gray ? "g" : "")}";
+            try
+            {
+                var img = Gradient(w, h, alpha: alpha, gray: gray);
+                byte[] avif = HeifCoder.EncodeAvif(img, new AvifEncodeOptions { Qp = 30, BitDepth = bd,
+                    ChromaSubsampling = yuv444 ? AvifChromaSubsampling.Yuv444 : AvifChromaSubsampling.Auto });
+                File.WriteAllBytes(Path.Combine(outDir, stem + ".avif"), avif);
+                if (!alpha) Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(outDir, stem + ".item1.yuv"));
+                var dec = HeifCoder.Decode(avif);
+                Environment.SetEnvironmentVariable("AV1_DUMP10", null);
+                double se = 0; long n = 0;
+                for (int yy = 0; yy < h; yy += 7) { var r0 = img.GetPixelRow(yy); var r1 = dec.GetPixelRow(yy); for (int k = 0; k < r0.Length; k += 5) { double d = r0[k] - r1[k]; se += d * d; n++; } }
+                File.WriteAllText(Path.Combine(outDir, stem + ".txt"), $"{stem} bytes={avif.Length} psnr={10 * Math.Log10(65535.0 * 65535.0 / (se / n)):F2}");
+            }
+            catch (Exception e) { File.WriteAllText(Path.Combine(outDir, stem + ".err"), e.GetType().Name + ": " + e.Message); }
+        }
+    }
+
     // Isolates in-loop-filter conformance at odd picture edges: encodes odd-size gradients at q28 with deblock only,
     // CDEF only, both, and neither (trigger hbd_edge.txt), dumping .avif + our native planes for the ffmpeg diff.
     [Test, NotInParallel]

@@ -59,13 +59,13 @@ internal static class Av1AvifWriter
 
     // AV1CodecConfigurationRecord (av1C payload): the fixed 4-byte record only (configOBUs omitted, as libaom's
     // AVIF output does — the sequence header travels in-band in mdat).
-    private static byte[] BuildAv1C(Av1PixelLayout layout, int bitDepth)
+    private static byte[] BuildAv1C(Av1PixelLayout layout, int bitDepth, int width, int height)
     {
         // seq_level_idx_0 = 0 (matches Av1ObuWriter's reduced-still header), tier 0. seq_profile / high_bitdepth /
         // twelve_bit / subsampling mirror the sequence header's color_config.
         int profile = Av1ObuWriter.SeqProfile(bitDepth, layout);
         byte b0 = 0x81;                       // marker(1)=1 | version(7)=1
-        byte b1 = (byte)(profile << 5);       // seq_profile(3) | seq_level_idx_0(5)=0
+        byte b1 = (byte)((profile << 5) | Av1ObuWriter.SeqLevelIdx(width, height));   // seq_profile(3) | seq_level_idx_0(5)
         int monoBit = layout == Av1PixelLayout.I400 ? 1 : 0;
         // AV1 sets subsampling 1,1 for monochrome (I400) and 4:2:0; 4:2:2 is 1,0; 4:4:4 is 0,0.
         int cssX = layout == Av1PixelLayout.I444 ? 0 : 1;
@@ -117,7 +117,7 @@ internal static class Av1AvifWriter
         pixi[0] = (byte)ch;
         for (int i = 1; i <= ch; i++) pixi[i] = (byte)bitDepth;
         assoc1.Add((Add(FullBox("pixi", 0, 0, pixi)), false));
-        assoc1.Add((Add(Box("av1C", BuildAv1C(layout, bitDepth))), true));
+        assoc1.Add((Add(Box("av1C", BuildAv1C(layout, bitDepth, width, height))), true));
         if (x?.Icc is { Length: > 0 } icc) assoc1.Add((Add(Box("colr", Concat(Fourcc("prof"), icc))), false));
         assoc1.Add((Add(ColrNclx(color, monochrome)), false));
         if (x?.Pasp is { } pasp) assoc1.Add((Add(Box("pasp", Concat(U32(pasp.H), U32(pasp.V)))), false));
@@ -138,7 +138,7 @@ internal static class Av1AvifWriter
         if (alphaData != null)
         {
             assoc2.Add((ispeIdx, false));
-            assoc2.Add((Add(Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth))), true));
+            assoc2.Add((Add(Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth, width, height))), true));
             // auxC: aux_type is a null-terminated URN string identifying the alpha plane.
             byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
             assoc2.Add((Add(FullBox("auxC", 0, 0, auxUrn)), true));

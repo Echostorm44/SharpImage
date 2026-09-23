@@ -634,24 +634,74 @@ internal static class Av1StillImageEncoder
             DcDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 0], AcDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1],
         };
 
-        for (int sby = 0; sby < sbRows; sby++)
+        // One entropy-coded tile per TileLayout tile: fresh default CDFs, writer and above contexts, and intra edges
+        // confined to the tile (SetTileWindow). Tiles never predict from each other, so their order is free.
+        var (_, _, colStart, rowStart) = Av1ObuWriter.TileLayout(sbCols, sbRows);
+        var tiles = new List<byte[]>();
+        try
         {
-            c.LeftPart = new byte[16]; c.LLY = Filled(32); c.LCU = Filled(32); c.LCV = Filled(32);
-            c.LModeY = new byte[32]; c.LSkip = new byte[32]; c.LTxY = FilledSbyte(32, -1);
-            c.LModeUv = new byte[32];
-            c.LPalSz = new byte[32]; c.LPalCol = new ushort[32 * 8];
-            for (int sbx = 0; sbx < sbCols; sbx++)
-            {
-                int col = sbx >> 1;
-                c.AbovePart = abovePart[col]; c.ALY = aLY[col]; c.ACU = aCU[col]; c.ACV = aCV[col];
-                c.AModeY = aModeY[col]; c.ASkip = aSkip[col]; c.ATxY = aTxY[col];
-                c.AModeUv = aModeUv[col];
-                c.APalSz = aPalSz[col]; c.APalCol = aPalCol[col];
-                EncodePartitionColor(c, 1, sbx * 16, sby * 16);
-            }
+            for (int tr = 0; tr + 1 < rowStart.Length; tr++)
+                for (int tc = 0; tc + 1 < colStart.Length; tc++)
+                {
+                    if (tiles.Count > 0)
+                    {
+                        c.Cdf = new Av1CdfContext();
+                        Av1CdfDefaults.InitializeDefault(c.Cdf, qcat);
+                        c.Msac = new Av1MsacWriter();
+                        for (int i = 0; i < sb128Cols; i++)
+                        {
+                            abovePart[i] = new byte[16]; aLY[i] = Filled(32); aCU[i] = Filled(32); aCV[i] = Filled(32);
+                            aModeY[i] = new byte[32]; aSkip[i] = new byte[32]; aTxY[i] = FilledSbyte(32, -1); aModeUv[i] = new byte[32];
+                            aPalSz[i] = new byte[32]; aPalCol[i] = new ushort[32 * 8];
+                        }
+                    }
+                    SetTileWindow(colStart[tc] * 16, rowStart[tr] * 16, Math.Min(colStart[tc + 1] * 16, bw4),
+                        Math.Min(rowStart[tr + 1] * 16, bh4), w, ssX, ssY);
+                    for (int sby = rowStart[tr]; sby < rowStart[tr + 1]; sby++)
+                    {
+                        c.LeftPart = new byte[16]; c.LLY = Filled(32); c.LCU = Filled(32); c.LCV = Filled(32);
+                        c.LModeY = new byte[32]; c.LSkip = new byte[32]; c.LTxY = FilledSbyte(32, -1);
+                        c.LModeUv = new byte[32];
+                        c.LPalSz = new byte[32]; c.LPalCol = new ushort[32 * 8];
+                        for (int sbx = colStart[tc]; sbx < colStart[tc + 1]; sbx++)
+                        {
+                            int col = sbx >> 1;
+                            c.AbovePart = abovePart[col]; c.ALY = aLY[col]; c.ACU = aCU[col]; c.ACV = aCV[col];
+                            c.AModeY = aModeY[col]; c.ASkip = aSkip[col]; c.ATxY = aTxY[col];
+                            c.AModeUv = aModeUv[col];
+                            c.APalSz = aPalSz[col]; c.APalCol = aPalCol[col];
+                            EncodePartitionColor(c, 1, sbx * 16, sby * 16);
+                        }
+                    }
+                    tiles.Add(c.Msac.Finish());
+                }
+        }
+        finally
+        {
+            ClearTileWindow();
         }
 
-        return c.Msac.Finish();
+        return AssembleTileGroup(tiles);
+    }
+
+    // tile_group_obu payload after the frame header: a single tile is its bare data; with several tiles, one byte
+    // for tile_start_and_end_present_flag = 0 (+ byte alignment), then every tile but the last prefixed by
+    // tile_size_minus_1 as a 4-byte little-endian value (tile_size_bytes_minus_1 = 3 in tile_info).
+    private static byte[] AssembleTileGroup(List<byte[]> tiles)
+    {
+        if (tiles.Count == 1) return tiles[0];
+        var o = new System.IO.MemoryStream();
+        o.WriteByte(0);
+        for (int i = 0; i < tiles.Count; i++)
+        {
+            if (i < tiles.Count - 1)
+            {
+                uint sz = (uint)(tiles[i].Length - 1);
+                o.WriteByte((byte)sz); o.WriteByte((byte)(sz >> 8)); o.WriteByte((byte)(sz >> 16)); o.WriteByte((byte)(sz >> 24));
+            }
+            o.Write(tiles[i]);
+        }
+        return o.ToArray();
     }
 
     private static void EncodePartitionColor(ColorPartCtx c, int bl, int bx4, int by4, int edgeIdx = 0)
@@ -1703,9 +1753,34 @@ internal static class Av1StillImageEncoder
     // DC intra prediction for a w x h block from reconstructed neighbours — matches the decoder's DcGenBoth/Top/
     // Left (Av1IntraPred), INCLUDING the non-square reciprocal-multiplier correction (0x5556 for 1:2, 0x3334 for
     // 1:4). Square DcPredict cannot be used for rect blocks (w+h isn't a power of two).
+    // Per-thread tile window (luma 4-units) for multi-tile encodes: intra edges never cross a tile boundary and
+    // top-right / bottom-left availability ends at the tile's right / bottom edge (dav1d prepare_intra_edges uses
+    // ts->tiling.col_start/col_end/row_start/row_end). Inactive => the whole frame is one tile.
+    [ThreadStatic] private static bool t_tileOn;
+    [ThreadStatic] private static int t_tileX4, t_tileY4, t_tileEndX4, t_tileEndY4, t_tileLumaW, t_tileSsX, t_tileSsY;
+
+    // The active tile's bounds in the 4-unit grid of the plane whose stride is reconW (chroma bounds are the luma
+    // bounds shifted by the subsampling, as dav1d's col_start >> ss_hor).
+    private static (int X0, int Y0, int X1, int Y1) TileBounds4(int reconW, int bw4, int bh4)
+    {
+        if (!t_tileOn) return (0, 0, bw4, bh4);
+        bool luma = reconW == t_tileLumaW;
+        int sx = luma ? 0 : t_tileSsX, sy = luma ? 0 : t_tileSsY;
+        return (t_tileX4 >> sx, t_tileY4 >> sy, Math.Min(bw4, t_tileEndX4 >> sx), Math.Min(bh4, t_tileEndY4 >> sy));
+    }
+
+    private static void SetTileWindow(int x4, int y4, int endX4, int endY4, int lumaW, int ssX, int ssY)
+    {
+        t_tileOn = true; t_tileX4 = x4; t_tileY4 = y4; t_tileEndX4 = endX4; t_tileEndY4 = endY4;
+        t_tileLumaW = lumaW; t_tileSsX = ssX; t_tileSsY = ssY;
+    }
+
+    private static void ClearTileWindow() => t_tileOn = false;
+
     private static int DcPredictRect(ushort[] recon, int reconW, int bx, int by, int w, int h)
     {
-        bool haveTop = by > 0, haveLeft = bx > 0;
+        var tb = TileBounds4(reconW, int.MaxValue, int.MaxValue);
+        bool haveTop = by > tb.Y0 * 4, haveLeft = bx > tb.X0 * 4;
         if (haveTop && haveLeft)
         {
             int dc = (w + h) >> 1;
@@ -2426,9 +2501,9 @@ internal static class Av1StillImageEncoder
     // in-frame remainder must exceed 32px), i.e. a dimension's remainder mod 64 is 0 or >32.
     private static void ValidateMultiSb(int w, int h, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph)
     {
-        if (w < 8 || h < 8 || w > 4096 || h > 4096)
+        if (w < 8 || h < 8 || w > 65536 || h > 65536)
         {
-            throw new NotSupportedException($"AVIF encode supports 8..4096 per dimension (got {w}x{h}).");
+            throw new NotSupportedException($"AVIF encode supports 8..65536 per dimension (got {w}x{h}).");
         }
 
         // Frame dims in 4-unit MI units: MiCols = 2*ceil(w/8) (always even), matching dav1d's f->bw. Using ceil(w/4)
@@ -2535,26 +2610,53 @@ internal static class Av1StillImageEncoder
         luma.CopyTo(lumaArr);
         ctx.Luma = lumaArr;
 
-        for (int sby = 0; sby < sbRows; sby++)
+        var (_, _, colStart, rowStart) = Av1ObuWriter.TileLayout(sbCols, sbRows);
+        var tiles = new List<byte[]>();
+        try
         {
-            ctx.LeftPart = new byte[16];
-            ctx.LeftLCoef = Filled(32);
-            ctx.LeftMode = new byte[32];
-            ctx.LeftSkip = new byte[32];
-            ctx.LeftTxIntra = FilledSbyte(32, -1);
-            for (int sbx = 0; sbx < sbCols; sbx++)
-            {
-                int col = sbx >> 1;
-                ctx.AbovePart = abovePart[col];
-                ctx.AboveLCoef = aboveLCoef[col];
-                ctx.AboveMode = aboveMode[col];
-                ctx.AboveSkip = aboveSkip[col];
-                ctx.AboveTxIntra = aboveTxIntra[col];
-                EncodePartition(ctx, 1 /*Bl64x64*/, sbx * 16, sby * 16);
-            }
+            for (int tr = 0; tr + 1 < rowStart.Length; tr++)
+                for (int tc = 0; tc + 1 < colStart.Length; tc++)
+                {
+                    if (tiles.Count > 0)
+                    {
+                        ctx.Cdf = new Av1CdfContext();
+                        Av1CdfDefaults.InitializeDefault(ctx.Cdf, qcat);
+                        ctx.Msac = new Av1MsacWriter();
+                        for (int i = 0; i < sb128Cols; i++)
+                        {
+                            abovePart[i] = new byte[16]; aboveLCoef[i] = Filled(32); aboveMode[i] = new byte[32];
+                            aboveSkip[i] = new byte[32]; aboveTxIntra[i] = FilledSbyte(32, -1);
+                        }
+                    }
+                    SetTileWindow(colStart[tc] * 16, rowStart[tr] * 16, Math.Min(colStart[tc + 1] * 16, bw4),
+                        Math.Min(rowStart[tr + 1] * 16, bh4), w, 0, 0);
+                    for (int sby = rowStart[tr]; sby < rowStart[tr + 1]; sby++)
+                    {
+                        ctx.LeftPart = new byte[16];
+                        ctx.LeftLCoef = Filled(32);
+                        ctx.LeftMode = new byte[32];
+                        ctx.LeftSkip = new byte[32];
+                        ctx.LeftTxIntra = FilledSbyte(32, -1);
+                        for (int sbx = colStart[tc]; sbx < colStart[tc + 1]; sbx++)
+                        {
+                            int col = sbx >> 1;
+                            ctx.AbovePart = abovePart[col];
+                            ctx.AboveLCoef = aboveLCoef[col];
+                            ctx.AboveMode = aboveMode[col];
+                            ctx.AboveSkip = aboveSkip[col];
+                            ctx.AboveTxIntra = aboveTxIntra[col];
+                            EncodePartition(ctx, 1 /*Bl64x64*/, sbx * 16, sby * 16);
+                        }
+                    }
+                    tiles.Add(ctx.Msac.Finish());
+                }
+        }
+        finally
+        {
+            ClearTileWindow();
         }
 
-        return ctx.Msac.Finish();
+        return AssembleTileGroup(tiles);
     }
 
     // Recursively encodes the partition tree for one block. bl is the Av1BlockLevel (1=64x64..4=8x8); bx4/by4 are
@@ -2999,11 +3101,12 @@ internal static class Av1StillImageEncoder
         const int edgeCenter = 128;
         int dstOff = (by4 * 4) * reconW + (bx4 * 4);
         int tw4 = n >> 2;
-        bool haveTop = by4 > 0;
-        bool haveLeft = bx4 > 0;
+        var tb = TileBounds4(reconW, bw4, bh4);
+        bool haveTop = by4 > tb.Y0;
+        bool haveLeft = bx4 > tb.X0;
         int angle = delta; // PrepareIntraEdges folds this into the base angle for directional modes
         int m = Av1Reconstruction.PrepareIntraEdges(
-            bx4, haveLeft, by4, haveTop, bw4, bh4, edgeFlags,
+            bx4, haveLeft, by4, haveTop, tb.X1, tb.Y1, edgeFlags,
             recon, dstOff, reconW, default, mode, ref angle, tw4, tw4,
             filterEdge: (intraFlags & EdgeFilterEnableBit) != 0, edge, edgeCenter, Bd);
         Av1IntraPred.Predict16(m, dst, n, edge, edgeCenter, n, n, angle | intraFlags,
@@ -3120,8 +3223,9 @@ internal static class Av1StillImageEncoder
     // DC prediction for a 64x64 block from reconstructed neighbours, mirroring Av1IntraPred DC modes.
     private static int DcPredict(ushort[] recon, int w, int h, int bx, int by, int bw, int bh)
     {
-        bool haveTop = by > 0;
-        bool haveLeft = bx > 0;
+        var tb = TileBounds4(w, int.MaxValue, int.MaxValue);
+        bool haveTop = by > tb.Y0 * 4;
+        bool haveLeft = bx > tb.X0 * 4;
         if (haveTop && haveLeft)
         {
             int dc = (bw + bh) >> 1;
@@ -3442,10 +3546,11 @@ internal static class Av1StillImageEncoder
         const int edgeCenter = 128;
         int dstOff = (by4 * 4) * reconW + (bx4 * 4);
         int tw4 = w >> 2, th4 = h >> 2;
-        bool haveTop = by4 > 0, haveLeft = bx4 > 0;
+        var tb = TileBounds4(reconW, bw4, bh4);
+        bool haveTop = by4 > tb.Y0, haveLeft = bx4 > tb.X0;
         int angle = delta;
         int m = Av1Reconstruction.PrepareIntraEdges(
-            bx4, haveLeft, by4, haveTop, bw4, bh4, edgeFlags,
+            bx4, haveLeft, by4, haveTop, tb.X1, tb.Y1, edgeFlags,
             recon, dstOff, reconW, default, mode, ref angle, tw4, th4,
             filterEdge: (intraFlags & EdgeFilterEnableBit) != 0, edge, edgeCenter, Bd);
         Av1IntraPred.Predict16(m, dst, w, edge, edgeCenter, w, h, angle | intraFlags, 4 * bw4 - 4 * bx4, 4 * bh4 - 4 * by4, Bd);

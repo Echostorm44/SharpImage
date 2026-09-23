@@ -721,9 +721,9 @@ public static class HeifCoder
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
-        if (w > 4096 || h > 4096 || w < 8 || h < 8)
+        if (w > 65536 || h > 65536 || w < 8 || h < 8)
         {
-            throw new NotSupportedException($"AVIF encoding supports 8..4096 per dimension (got {w}x{h}).");
+            throw new NotSupportedException($"AVIF encoding supports 8..65536 per dimension (got {w}x{h}).");
         }
 
         int channels = image.NumberOfChannels;
@@ -867,9 +867,9 @@ public static class HeifCoder
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
-        if (w > 4096 || h > 4096 || w < 8 || h < 8)
+        if (w > 65536 || h > 65536 || w < 8 || h < 8)
         {
-            throw new NotSupportedException($"AVIF encoding supports 8..4096 per dimension (got {w}x{h}).");
+            throw new NotSupportedException($"AVIF encoding supports 8..65536 per dimension (got {w}x{h}).");
         }
 
         // The single-block path is a fast path for an even, square frame <=64px; the multi-superblock path (a grid

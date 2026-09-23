@@ -62,6 +62,49 @@ internal static class Av1ObuWriter
         return outBytes;
     }
 
+    // AV1 Annex A picture-size limits (MaxPicSize, MaxHSize, MaxVSize) per seq_level_idx; the lowest level that fits
+    // is signalled, as libaom does. Beyond level 6.x: 31 (maximum parameters).
+    private static readonly (int Idx, long MaxPic, int MaxH, int MaxV)[] Levels =
+    [
+        (0, 147456, 2048, 1152), (1, 278784, 2816, 1584), (4, 665856, 4352, 2448), (5, 1065024, 5504, 3096),
+        (8, 2359296, 6144, 3456), (12, 8912896, 8192, 4352), (16, 35651584, 16384, 8704),
+    ];
+
+    internal static int SeqLevelIdx(int width, int height)
+    {
+        foreach (var l in Levels)
+            if ((long)width * height <= l.MaxPic && width <= l.MaxH && height <= l.MaxV) return l.Idx;
+        return 31;
+    }
+
+    /// <summary>The uniform tile layout for a frame of <paramref name="sbCols"/> x <paramref name="sbRows"/> 64x64
+    /// superblocks with the fewest tiles the syntax allows: tiles at most 4096 px wide (MAX_TILE_WIDTH) and at most
+    /// 4096*2304 px in area (MAX_TILE_AREA) — tile_info() starts TileColsLog2 / TileRowsLog2 at exactly these minima.
+    /// Start arrays carry a final entry = sbCols / sbRows.</summary>
+    internal static (int ColsLog2, int RowsLog2, int[] ColStartSb, int[] RowStartSb) TileLayout(int sbCols, int sbRows)
+    {
+        const int maxTileWidthSb = 4096 >> 6, maxTileAreaSb = (4096 * 2304) >> 12;
+        int minLog2Cols = TileLog2(maxTileWidthSb, sbCols);
+        int minLog2Tiles = Math.Max(minLog2Cols, TileLog2(maxTileAreaSb, sbRows * sbCols));
+        int colsLog2 = minLog2Cols, rowsLog2 = Math.Max(minLog2Tiles - colsLog2, 0);
+        static int[] Starts(int sb, int log2)
+        {
+            int size = (sb + (1 << log2) - 1) >> log2;
+            var s = new List<int>();
+            for (int i = 0; i < sb; i += size) s.Add(i);
+            s.Add(sb);
+            return s.ToArray();
+        }
+        return (colsLog2, rowsLog2, Starts(sbCols, colsLog2), Starts(sbRows, rowsLog2));
+    }
+
+    private static int TileLog2(int blkSize, int target)
+    {
+        int k = 0;
+        while ((blkSize << k) < target) k++;
+        return k;
+    }
+
     // TileMaxLog2 for one axis: smallest k with (1<<k) >= min(sb, MaxTiles=64) (mirrors TileLog2(1, min(sb,64))).
     private static int TileMaxLog2(int sb)
     {
@@ -106,9 +149,10 @@ internal static class Av1ObuWriter
         w.PutBool(true);          // still_picture = 1
         w.PutBool(true);          // reduced_still_picture_header = 1
 
-        // reduced still: seq_level_idx[0] = f(5) (parser splits 3 major + 2 minor). 0 = level 2.0.
-        w.PutBits(0, 3);          // MajorLevel bits
-        w.PutBits(0, 2);          // MinorLevel bits
+        // reduced still: seq_level_idx[0] = f(5) (parser splits 3 major + 2 minor): the lowest level the size fits.
+        int level = SeqLevelIdx(cfg.Width, cfg.Height);
+        w.PutBits((uint)(level >> 2), 3);   // MajorLevel bits
+        w.PutBits((uint)(level & 3), 2);    // MinorLevel bits
 
         int widthBits = BitsFor(cfg.Width - 1);
         int heightBits = BitsFor(cfg.Height - 1);
@@ -238,22 +282,18 @@ internal static class Av1ObuWriter
             w.PutBool(false);     // allow_intra_bc = 0 (read for intra when screen tools on & !superres)
         // refresh_context skipped (reduced still).
 
-        // tile_info: a single tile (uniform spacing, log2 dims 0). The uniform loop reads an "increment" bit
-        // while TileLog2 < TileMaxLog2; a single 0 bit (per axis, only when the max is > 0) keeps it at 0 ⇒ one
-        // tile spanning the whole frame.
+        // tile_info (uniform spacing): the log2 tile counts start at the syntax minima (TileLayout) and the loop reads
+        // an "increment" bit while below the maximum — one 0 bit per axis stops exactly at the minimum. Frames over
+        // 4096 px wide or 2304 superblocks therefore always carry the multiple tiles the decoder will expect.
         w.PutBool(true);          // uniform_tile_spacing_flag
-        int maxLog2Cols = TileMaxLog2(sbCols);
-        int maxLog2Rows = TileMaxLog2(sbRows);
-        if (maxLog2Cols > 0)
+        var layout = TileLayout(sbCols, sbRows);
+        if (layout.ColsLog2 < TileMaxLog2(sbCols)) w.PutBool(false);   // stop incrementing tile cols
+        if (layout.RowsLog2 < TileMaxLog2(sbRows)) w.PutBool(false);   // stop incrementing tile rows
+        if (layout.ColsLog2 + layout.RowsLog2 > 0)
         {
-            w.PutBool(false);     // stop incrementing tile cols ⇒ TileLog2Cols = 0
+            w.PutBits(0, layout.ColsLog2 + layout.RowsLog2);   // context_update_tile_id = 0
+            w.PutBits(3, 2);                                  // tile_size_bytes_minus_1 = 3 (4-byte tile sizes)
         }
-
-        if (maxLog2Rows > 0)
-        {
-            w.PutBool(false);     // stop incrementing tile rows ⇒ TileLog2Rows = 0
-        }
-        // TileLog2Cols == TileLog2Rows == 0 ⇒ no context_update_tile_id / tile_size_bytes fields.
 
         // quantization_params
         w.PutBits((uint)baseQIdx, 8); // base_q_idx
