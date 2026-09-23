@@ -1276,9 +1276,9 @@ public static class Av1CoeffDecode
             t.PalPrevSz[1, row] = (byte)palSz;
         }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not InvalidDataException)
         {
-            AvDbg.W($"[PAL-CRASH-DETAIL] bx4={bx4} by4={by4} palSz={b.PalSzY}: {ex.GetType().Name}: {ex.Message}");
+            throw new InvalidDataException($"AV1 luma palette decode failed at bx4={bx4} by4={by4}: {ex.Message}", ex);
         }
     }
 

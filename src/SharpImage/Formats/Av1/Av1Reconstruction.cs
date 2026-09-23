@@ -492,22 +492,6 @@ public static class Av1Reconstruction
         Span<ushort> yPlane, int yStride,
         Span<ushort> uPlane, Span<ushort> vPlane, int uvStride)
     {
-        if (b.PalSzY > 0)
-        {
-            var sb = new System.Text.StringBuilder();
-            sb.Append($"PAL bxy=[{t.Bx},{t.By}] palSz={b.PalSzY}");
-            sb.Append(" colors:");
-            for (int ci = 0; ci < b.PalSzY; ci++)
-                sb.Append($" {t.PalColorsY[ci]}");
-            int _bw4 = Av1Tables.BlockDimensions[(int)bs, 0];
-            int _bh4 = Av1Tables.BlockDimensions[(int)bs, 1];
-            sb.Append(" idx0:");
-            for (int di = 0; di < Math.Min(_bw4 * 4, 16); di++)
-                sb.Append($" {t.PalIdxY[di]}");
-            // Also log the first decoded pixel: we don't have it yet (palette fill happens later)
-            // Log after reconstruction at the end of the function
-            System.IO.File.AppendAllText(@"C:\Users\adamm\AppData\Local\Temp\ours_pal.txt", sb.ToString() + "\n");
-        }
         var ts = t.TileState!;
         var fh = ctx.FrameHeader!;
         var seqHdr = ctx.SequenceHeader!;
@@ -1144,7 +1128,7 @@ public static class Av1Reconstruction
                     int cw = cbw4 * 4;
                     int ch = cbh4 * 4;
                     int cbw4_pix = cbw4 * 4;
-                    int uvDstOff = 4 * ((t.Bx >> 1) + (t.By >> 1) * uvStride);
+                    int uvDstOff = 4 * ((t.Bx >> ssHor) + (t.By >> ssVer) * uvStride);   // dav1d uv_dstoff
 
                     // Fill U plane
                     for (int dy = 0; dy < ch; dy++)

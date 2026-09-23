@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using SharpImage.Core;
 using SharpImage.Formats;
 using SharpImage.Formats.Av1;
@@ -191,8 +192,10 @@ public sealed class Av1HbdVerify
         Directory.CreateDirectory(outDir);
         foreach (string f in Directory.GetFiles(inDir, "*.avif"))
         {
-            var img = HeifCoder.Decode(File.ReadAllBytes(f));
             string stem = Path.Combine(outDir, Path.GetFileNameWithoutExtension(f));
+            ImageFrame img;
+            try { img = HeifCoder.Decode(File.ReadAllBytes(f)); }
+            catch (Exception e) { File.WriteAllText(stem + ".err", e.GetType().Name + ": " + e.Message); continue; }
             if (img.IccProfile != null) File.WriteAllBytes(stem + ".icc", img.IccProfile);
             if (img.Metadata.Xmp != null) File.WriteAllText(stem + ".xmp", img.Metadata.Xmp);
             if (img.Metadata.ExifProfile is { } ex)
@@ -251,6 +254,171 @@ public sealed class Av1HbdVerify
             finally { Environment.SetEnvironmentVariable("AV1_DUMP10", null); }
         }
         File.WriteAllText(Path.Combine(Scratch, "hbd", "decode_log.txt"), log.ToString());
+    }
+
+    // Dumps every av01 item of the files listed in hbd_items.txt as native planes (<file>.item<ID>.yuv, u16 LE) for an
+    // exact per-item comparison with ffmpeg/dav1d (which decodes the primary/colour item).
+    [Test, NotInParallel]
+    public void DecodeItems()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_items.txt");
+        if (!File.Exists(trig)) return;
+        var files = File.ReadAllLines(trig);
+        File.Delete(trig);
+        foreach (var f in files)
+        {
+            if (!File.Exists(f)) continue;
+            var c = HeifContainer.Parse(File.ReadAllBytes(f));
+            foreach (var item in c.Items.Values)
+            {
+                if (item.Type != "av01" || c.ItemData(item.Id) is not { } coded) continue;
+                string dump = Path.ChangeExtension(f, null) + $".item{item.Id}.yuv";
+                Environment.SetEnvironmentVariable("AV1_DUMP10", dump);
+                try { new Av1Decoder().Decode(coded, 0, isKeyframe: true)?.Dispose(); }
+                catch (Exception e) { File.WriteAllText(dump + ".err", e.ToString() + Environment.NewLine + Av1Decoder.LastDecodeError); }
+                finally { Environment.SetEnvironmentVariable("AV1_DUMP10", null); }
+            }
+        }
+    }
+
+    // Concurrency probe (trigger hbd_race.txt, one file path): decodes the file on 8 threads, 20 rounds, and logs how
+    // many results differ from a single-threaded decode (race detector for shared decoder state).
+    [Test, NotInParallel]
+    public void Race()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_race.txt");
+        if (!File.Exists(trig)) return;
+        string f = File.ReadAllText(trig).Trim();
+        File.Delete(trig);
+        byte[] data = File.ReadAllBytes(f);
+        byte[] reference = Rgb48(HeifCoder.Decode(data));
+        int bad = 0, total = 0;
+        for (int round = 0; round < 20; round++)
+        {
+            var results = new byte[8][];
+            System.Threading.Tasks.Parallel.For(0, 8, i => results[i] = Rgb48(HeifCoder.Decode(data)));
+            foreach (var r in results) { total++; if (!r.AsSpan().SequenceEqual(reference)) bad++; }
+        }
+        // Dirty-pool probe: fill the shared pools with random data, then decode single-threaded.
+        {
+            var rng = new Random(5);
+            for (int k = 0; k < 64; k++)
+            {
+                int n = 1 << rng.Next(6, 20);
+                var bb = System.Buffers.ArrayPool<byte>.Shared.Rent(n); rng.NextBytes(bb); System.Buffers.ArrayPool<byte>.Shared.Return(bb);
+                var us = System.Buffers.ArrayPool<ushort>.Shared.Rent(n); for (int q = 0; q < us.Length; q++) us[q] = (ushort)rng.Next(); System.Buffers.ArrayPool<ushort>.Shared.Return(us);
+            }
+            for (int sz = 16; sz <= 1 << 22; sz <<= 1)
+            {
+                var bb = System.Buffers.ArrayPool<byte>.Shared.Rent(sz); Array.Fill(bb, (byte)0xAB); System.Buffers.ArrayPool<byte>.Shared.Return(bb);
+                var us = System.Buffers.ArrayPool<ushort>.Shared.Rent(sz); Array.Fill(us, (ushort)0x1234); System.Buffers.ArrayPool<ushort>.Shared.Return(us);
+            }
+            bool dirtyDiff = !Rgb48(HeifCoder.Decode(data)).AsSpan().SequenceEqual(reference);
+            byte[]? onWorker = null;
+            System.Threading.Tasks.Task.Run(() => onWorker = Rgb48(HeifCoder.Decode(data))).Wait();
+            File.AppendAllText(Path.Combine(Scratch, "race_dirty.txt"), $"single worker-thread decode differs: {!onWorker!.AsSpan().SequenceEqual(reference)}" + Environment.NewLine);
+            File.AppendAllText(Path.Combine(Scratch, "race_dirty.txt"), $"dirty-pool single-thread differs: {dirtyDiff}" + Environment.NewLine);
+        }
+        // Input-mutation probe: does a decode modify the caller's byte[]? And do private copies stop the race?
+        {
+            byte[] copy = (byte[])data.Clone();
+            HeifCoder.Decode(copy);
+            bool mutated = !copy.AsSpan().SequenceEqual(data);
+            int privBad = 0;
+            for (int round = 0; round < 10; round++)
+            {
+                var rs = new byte[8][];
+                System.Threading.Tasks.Parallel.For(0, 8, i => rs[i] = Rgb48(HeifCoder.Decode((byte[])data.Clone())));
+                foreach (var r in rs) if (!r.AsSpan().SequenceEqual(reference)) privBad++;
+            }
+            File.AppendAllText(Path.Combine(Scratch, "race_dirty.txt"), $"input mutated by decode: {mutated}; private-copy race: {privBad}/80" + Environment.NewLine);
+        }
+        // Cross-file probe: decode this file on one thread while another thread decodes an ordinary AVIF.
+        {
+            byte[] other = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "TestAssets", "avif_conformance", "sharpimage_8bit_420_257x131_lf_cdef.avif"));
+            int crossBad = 0;
+            for (int round = 0; round < 40; round++)
+            {
+                byte[]? mine = null;
+                System.Threading.Tasks.Parallel.Invoke(
+                    () => mine = Rgb48(HeifCoder.Decode(data)),
+                    () => { for (int k = 0; k < 3; k++) HeifCoder.Decode(other); });
+                if (!mine!.AsSpan().SequenceEqual(reference)) crossBad++;
+            }
+            File.AppendAllText(Path.Combine(Scratch, "race_dirty.txt"), $"cross-file differs: {crossBad}/40" + Environment.NewLine);
+        }
+        // Per-item, raw decoder: which AV1 item's planes race?
+        var c = HeifContainer.Parse(data);
+        var sb = new System.Text.StringBuilder($"{bad}/{total} differ;");
+        foreach (var item in c.Items.Values)
+        {
+            if (item.Type != "av01" || c.ItemData(item.Id) is not { } coded) continue;
+            static byte[] Planes(byte[] coded)
+            {
+                using var y = new Av1Decoder().Decode(coded, 0, isKeyframe: true)!;
+                var o = new System.Collections.Generic.List<byte>();
+                o.AddRange(y.YPlane.ToArray()); o.AddRange(y.UPlane.ToArray()); o.AddRange(y.VPlane.ToArray());
+                return o.ToArray();
+            }
+            byte[] refp = Planes(coded);
+            int ibad = 0;
+            for (int round = 0; round < 20; round++)
+            {
+                var rs = new byte[8][];
+                System.Threading.Tasks.Parallel.For(0, 8, i => rs[i] = Planes(coded));
+                foreach (var r in rs)
+                    if (!r.AsSpan().SequenceEqual(refp))
+                    {
+                        ibad++;
+                        if (ibad <= 4)
+                        {
+                            int first = -1, n = 0;
+                            for (int k = 0; k < r.Length; k++) if (r[k] != refp[k]) { n++; if (first < 0) first = k; }
+                            sb.Append($" [item{item.Id} first={first} n={n} len={r.Length} bad[0..6]={string.Join(",", r.Take(6))} ref[0..6]={string.Join(",", refp.Take(6))}]");
+                        }
+                    }
+            }
+            sb.Append($" item{item.Id}:{ibad}/160");
+        }
+        File.WriteAllText(Path.Combine(Scratch, "race.txt"), sb.ToString());
+    }
+
+    // Static-state detector (trigger hbd_statics.txt, one file): hashes every static field of the AV1/HEIF types before
+    // and after a decode; any static whose value/content changes is shared mutable state (thread-safety hazard).
+    [Test, NotInParallel]
+    public void Statics()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_statics.txt");
+        if (!File.Exists(trig)) return;
+        string f = File.ReadAllText(trig).Trim();
+        File.Delete(trig);
+        var asm = typeof(HeifCoder).Assembly;
+        var fields = new System.Collections.Generic.List<System.Reflection.FieldInfo>();
+        foreach (var ty in asm.GetTypes())
+            if (ty.Namespace is "SharpImage.Formats.Av1" or "SharpImage.Formats" && !ty.ContainsGenericParameters)
+                foreach (var fi in ty.GetFields(System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic))
+                    if (!fi.IsLiteral) fields.Add(fi);
+        static long H(object? o)
+        {
+            if (o is null) return 0;
+            if (o is Array a)
+            {
+                long h = a.Length;
+                foreach (var e in a) h = h * 31 + (e is Array inner ? H(inner) : e?.GetHashCode() ?? 0);
+                return h;
+            }
+            return o.GetHashCode();
+        }
+        var before = new long[fields.Count];
+        for (int i = 0; i < fields.Count; i++) { try { before[i] = H(fields[i].GetValue(null)); } catch { before[i] = -1; } }
+        HeifCoder.Decode(File.ReadAllBytes(f));
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < fields.Count; i++)
+        {
+            long h; try { h = H(fields[i].GetValue(null)); } catch { h = -1; }
+            if (h != before[i]) sb.AppendLine($"{fields[i].DeclaringType!.Name}.{fields[i].Name}");
+        }
+        File.WriteAllText(Path.Combine(Scratch, "statics.txt"), sb.Length == 0 ? "none" : sb.ToString());
     }
 
     // Isolates in-loop-filter conformance at odd picture edges: encodes odd-size gradients at q28 with deblock only,

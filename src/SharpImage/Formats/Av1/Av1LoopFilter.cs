@@ -830,7 +830,7 @@ public static class Av1LoopFilter
         // Dump mask for first SB128 column at sby=0
         if (DumpEdges && dstOffset < 128 && starty4 == 0 && !haveLeft && maskIdx == 0)
         {
-            using var sw = new System.IO.StreamWriter(@"C:\Users\adamm\AppData\Local\Temp\ours_lf_mask.txt", true);
+            using var sw = new System.IO.StreamWriter(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ours_lf_mask.txt"), true);
             sw.WriteLine($"cols dstOff={dstOffset} w={w} starty4={starty4} endy4={endy4}");
             for (int col = 0; col < 32; col++)
             {

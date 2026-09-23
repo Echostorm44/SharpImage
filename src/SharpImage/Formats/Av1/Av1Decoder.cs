@@ -42,7 +42,7 @@ internal sealed class Av1Decoder
     public static System.IO.StreamWriter? CdefDecisionWriter;
 
     // Tile data collected during OBU parsing for the current frame
-    internal static string? LastDecodeError;
+    [ThreadStatic] internal static string? LastDecodeError;   // per thread: concurrent decodes must not clobber it
     private readonly TileGroup[] tileGroups = new TileGroup[256];
     private int tileGroupCount;
     private int tilesCollected;
@@ -1117,17 +1117,15 @@ internal sealed class Av1Decoder
             {
                 err = Av1Decode.DecodeSuperblock(t, ref msac, ctx, edgeTree, 0, rootBl);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not InvalidDataException)
             {
-                AvDbg.W($"[DECODE-CRASH] bx={t.Bx} by={t.By} exception={ex.GetType().Name}: {ex.Message}");
-                AvDbg.W($"[DECODE-CRASH] stack: {ex.StackTrace}");
-                err = 1;
+                // A malformed stream must fail the decode, not silently leave the rest of the frame blank.
+                throw new InvalidDataException($"AV1 superblock decode failed at bx={t.Bx} by={t.By}: {ex.GetType().Name}: {ex.Message}", ex);
             }
             if (err != 0)
             {
-                // Decode error — save MSAC state and bail
                 ts.MsacState = msac.Save();
-                return;
+                throw new InvalidDataException($"AV1 superblock decode failed at bx={t.Bx} by={t.By} (error {err}).");
             }
 
             // Store CDEF indices from this SB into the per-SB128 filter mask. For Sb128=1 the SB owns all four
@@ -2136,6 +2134,7 @@ internal sealed class Av1Decoder
                 for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (vPlane[so + x] + bdRound) >> bdShift);
             }
         }
+        if (uPlane == null) outputBuffer.AsSpan(uOff, 2 * uvSize).Fill(128);   // monochrome: neutral chroma, not pool leftovers
 
         {
             string? dumpPath = System.Environment.GetEnvironmentVariable("AV1_DUMPYUV");

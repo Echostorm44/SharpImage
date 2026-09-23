@@ -77,7 +77,9 @@ public static class Av1LoopRestoration
     /// <summary>Bit depth for the Wiener/SGR kernels (8/10/12). The decoder sets this per
     /// frame before applying loop restoration; the 8-bit encoder leaves it at 8. Mirrors
     /// dav1d's HIGHBD_DECL_SUFFIX bitdepth threading (round bits, clip limits, +128 term).</summary>
-    internal static int WienerBitDepth = 8;
+    // Per thread: set by the decoding thread before restoration (0 on a fresh thread means 8-bit).
+    [ThreadStatic] private static int t_wienerBitDepth;
+    internal static int WienerBitDepth { get => t_wienerBitDepth == 0 ? 8 : t_wienerBitDepth; set => t_wienerBitDepth = value; }
 
     /// <summary>
     /// Wiener horizontal filter: produces 16-bit intermediates from source pixels.

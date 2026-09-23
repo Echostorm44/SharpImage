@@ -178,271 +178,290 @@ public static class HeifCoder
             throw new InvalidDataException("Not a valid AVIF/HEIC file");
         }
 
-        bool isAvif = IsAvif(data);
+        var c = HeifContainer.Parse(data);
+        var primary = c.Primary ?? throw new InvalidDataException("AVIF/HEIC has no primary item.");
+        int pid = primary.Id;
 
-        // Parse ISOBMFF boxes
-        var boxes = ParseBoxes(data, 0, data.Length);
-
-        // Find meta box for item info
-        int primaryItemId = 1;
-        int imageWidth = 0, imageHeight = 0;
-        int itemDataOffset = -1, itemDataLength = 0;
-        var itemExtents = new Dictionary<int, (int Off, int Len)>(); // all items' first extent
-        int alphaItemId = -1;
-        (int Cp, int Tc, int Mc, bool Full)? primaryNclx = null;   // primary item's colr nclx (if any)
-        byte[]? primaryIcc = null;                                  // primary item's colr prof/rICC (if any)
-        byte[]? exifTiff = null, xmpBytes = null;                   // cdsc metadata items of the primary
-        uint[]? primaryClap = null; int? primaryIrot = null, primaryImir = null; (uint H, uint V)? primaryPasp = null;
-
-        // Parse meta box hierarchy
-        if (boxes.TryGetValue("meta", out var metaBox))
+        // ---- colour image: a coded item, or a 'grid' of coded tiles (ISO/IEC 23008-12 6.6.2.3) ----------------------
+        List<int> tiles;
+        int rows = 1, cols = 1, outW, outH;
+        if (primary.Type == "grid")
         {
-            int metaStart = metaBox.DataOffset;
-            // Skip version + flags (4 bytes) in meta box
-            var metaChildren = ParseBoxes(data, metaStart + 4, metaBox.DataLength - 4);
-
-            // Primary item reference
-            if (metaChildren.TryGetValue("pitm", out var pitmBox))
-            {
-                int pitmPos = pitmBox.DataOffset;
-                byte version = data[pitmPos];
-                if (version == 0)
-                {
-                    primaryItemId = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pitmPos + 4));
-                }
-                else
-                {
-                    primaryItemId = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pitmPos + 4));
-                }
-            }
-
-            // Image spatial extents from item properties
-            if (metaChildren.TryGetValue("iprp", out var iprpBox))
-            {
-                var iprpChildren = ParseBoxes(data, iprpBox.DataOffset, iprpBox.DataLength);
-                if (iprpChildren.TryGetValue("ipco", out var ipcoBox))
-                {
-                    var props = ParseIpco(data, ipcoBox.DataOffset, ipcoBox.DataLength);
-                    var assoc = iprpChildren.TryGetValue("ipma", out var ipmaBox)
-                        ? ParseIpma(data, ipmaBox.DataOffset, ipmaBox.DataLength)
-                        : new Dictionary<int, List<int>>();
-                    if (assoc.TryGetValue(primaryItemId, out var primaryProps))
-                    {
-                        foreach (int pi in primaryProps)
-                        {
-                            if (pi < 1 || pi > props.Count) continue;
-                            var (pType, pOff, pLen) = props[pi - 1];
-                            if (pType == "ispe" && pLen >= 12 && imageWidth == 0)
-                            {
-                                imageWidth = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 4));
-                                imageHeight = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 8));
-                            }
-                            else if (pType == "clap" && pLen >= 32)
-                            {
-                                primaryClap = new uint[8];
-                                for (int k = 0; k < 8; k++) primaryClap[k] = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 4 * k));
-                            }
-                            else if (pType == "irot" && pLen >= 1) primaryIrot = data[pOff] & 3;
-                            else if (pType == "imir" && pLen >= 1) primaryImir = data[pOff] & 1;
-                            else if (pType == "pasp" && pLen >= 8)
-                                primaryPasp = (BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff)), BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pOff + 4)));
-                            else if (pType == "colr" && pLen > 4 && primaryIcc == null
-                                     && Encoding.ASCII.GetString(data, pOff, 4) is "prof" or "rICC")
-                            {
-                                primaryIcc = data.AsSpan(pOff + 4, pLen - 4).ToArray();
-                            }
-                            else if (pType == "colr" && pLen >= 11 && primaryNclx == null
-                                     && Encoding.ASCII.GetString(data, pOff, 4) == "nclx")
-                            {
-                                primaryNclx = (BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pOff + 4)),
-                                    BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pOff + 6)),
-                                    BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pOff + 8)),
-                                    (data[pOff + 10] & 0x80) != 0);
-                            }
-                        }
-                    }
-
-                    // Scan for ispe (image spatial extents) — fallback when ipma gave none
-                    int scanPos = ipcoBox.DataOffset;
-                    int scanEnd = scanPos + ipcoBox.DataLength;
-                    while (imageWidth == 0 && scanPos + 8 <= scanEnd)
-                    {
-                        uint sLen = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(scanPos));
-                        string sType = Encoding.ASCII.GetString(data, scanPos + 4, 4);
-                        if (sType == "ispe" && scanPos + 16 <= scanEnd)
-                        {
-                            // version(4) + width(4) + height(4)
-                            imageWidth = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(scanPos + 12));
-                            imageHeight = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(scanPos + 16));
-                            break;
-                        }
-                        scanPos += (int)(sLen > 0 ? sLen : 8);
-                    }
-                }
-            }
-
-            // Item location (iloc)
-            if (metaChildren.TryGetValue("iloc", out var ilocBox))
-            {
-                int ilocPos = ilocBox.DataOffset;
-                byte ilocVersion = data[ilocPos];
-                int offsetSize = (data[ilocPos + 4] >> 4) & 0xF;
-                int lengthSize = data[ilocPos + 4] & 0xF;
-                int baseOffsetSize = (data[ilocPos + 5] >> 4) & 0xF;
-                int indexSize = ilocVersion >= 1 ? (data[ilocPos + 5] & 0xF) : 0;
-
-                int itemCount;
-                int itemPos;
-                if (ilocVersion < 2)
-                {
-                    itemCount = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(ilocPos + 6));
-                    itemPos = ilocPos + 8;
-                }
-                else
-                {
-                    itemCount = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(ilocPos + 6));
-                    itemPos = ilocPos + 10;
-                }
-
-                for (int i = 0;i < itemCount && itemPos < data.Length;i++)
-                {
-                    int itemId = ilocVersion < 2
-                        ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(itemPos))
-                        : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(itemPos));
-                    itemPos += ilocVersion < 2 ? 2 : 4;
-
-                    if (ilocVersion >= 1)
-                    {
-                        itemPos += 2; // construction_method
-                    }
-                    itemPos += 2; // data_reference_index
-
-                    long baseOffset = ReadVarInt(data, itemPos, baseOffsetSize);
-                    itemPos += baseOffsetSize;
-
-                    int extentCount = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(itemPos));
-                    itemPos += 2;
-
-                    for (int e = 0;e < extentCount;e++)
-                    {
-                        if (ilocVersion >= 1)
-                        {
-                            itemPos += indexSize; // extent_index
-                        }
-
-                        long extentOffset = ReadVarInt(data, itemPos, offsetSize);
-                        itemPos += offsetSize;
-                        long extentLength = ReadVarInt(data, itemPos, lengthSize);
-                        itemPos += lengthSize;
-
-                        int absOff = (int)(baseOffset + extentOffset);
-                        if (!itemExtents.ContainsKey(itemId))
-                        {
-                            itemExtents[itemId] = (absOff, (int)extentLength);
-                        }
-
-                        if (itemId == primaryItemId && itemDataOffset < 0)
-                        {
-                            itemDataOffset = absOff;
-                            itemDataLength = (int)extentLength;
-                        }
-                    }
-                }
-            }
-
-            // iinf → item types (Exif / mime content types); iref → every reference box (auxl, cdsc, ...).
-            var itemTypes = metaChildren.TryGetValue("iinf", out var iinfBox)
-                ? ParseIinf(data, iinfBox.DataOffset, iinfBox.DataLength)
-                : new Dictionary<int, (string Type, string ContentType)>();
-            var itemRefs = metaChildren.TryGetValue("iref", out var irefBox)
-                ? ParseIref(data, irefBox.DataOffset, irefBox.DataLength)
-                : new List<(string Type, int From, List<int> To)>();
-            foreach (var (refType, fromId, toIds) in itemRefs)
-            {
-                if (!toIds.Contains(primaryItemId)) continue;
-                if (refType == "auxl" && alphaItemId < 0) alphaItemId = fromId;   // alpha auxiliary of the primary
-                else if (refType == "cdsc" && itemTypes.TryGetValue(fromId, out var mt) && itemExtents.TryGetValue(fromId, out var mx)
-                         && mx.Off >= 0 && mx.Len > 0 && mx.Off + mx.Len <= data.Length)
-                {
-                    var payload = data.AsSpan(mx.Off, mx.Len);
-                    if (mt.Type == "Exif" && exifTiff == null && payload.Length > 4)
-                    {
-                        // unsigned int(32) exif_tiff_header_offset, then the Exif block.
-                        long tiffOff = 4L + BinaryPrimitives.ReadUInt32BigEndian(payload);
-                        if (tiffOff < payload.Length) exifTiff = payload[(int)tiffOff..].ToArray();
-                    }
-                    else if (mt.Type == "mime" && mt.ContentType == "application/rdf+xml" && xmpBytes == null)
-                    {
-                        xmpBytes = payload.ToArray();
-                    }
-                }
-            }
-        }
-
-        // Fallback: find mdat box for raw pixel data
-        if (itemDataOffset < 0 && boxes.TryGetValue("mdat", out var mdatBox))
-        {
-            itemDataOffset = mdatBox.DataOffset;
-            itemDataLength = mdatBox.DataLength;
-        }
-
-        if (itemDataOffset < 0 || itemDataLength <= 0)
-        {
-            throw new InvalidDataException("Could not locate image data in AVIF/HEIC file");
-        }
-
-        // Decode the coded image data
-        if (imageWidth <= 0 || imageHeight <= 0)
-        {
-            // Try to infer dimensions from coded data
-            if (isAvif)
-            {
-                InferAv1Dimensions(data.AsSpan(itemDataOffset, Math.Min(itemDataLength, data.Length - itemDataOffset)),
-                                out imageWidth, out imageHeight);
-            }
-            else
-            {
-                throw new InvalidDataException("Cannot determine image dimensions");
-            }
-        }
-
-        var frame = new ImageFrame();
-        frame.Initialize(imageWidth, imageHeight, ColorspaceType.SRGB, false);
-        if (primaryIcc != null)
-        {
-            frame.IccProfile = primaryIcc;
-            frame.Metadata.IccProfile = new SharpImage.Metadata.IccProfile(primaryIcc);
-        }
-        if (exifTiff != null) frame.Metadata.ExifProfile = SharpImage.Metadata.ExifParser.ParseFromTiff(exifTiff);
-        if (xmpBytes != null) frame.Metadata.Xmp = Encoding.UTF8.GetString(xmpBytes).TrimEnd(' ');
-
-        if (isAvif)
-        {
-            // CICP: the primary item's colr nclx takes precedence; otherwise the AV1 sequence header's (libavif).
-            DecodeAv1IntraFrame(data.AsSpan(itemDataOffset, Math.Min(itemDataLength, data.Length - itemDataOffset)),
-                        frame, primaryNclx);
-
-            // Auxiliary alpha item (monochrome AV1): decode it and merge into the frame's alpha channel.
-            if (alphaItemId >= 0 && itemExtents.TryGetValue(alphaItemId, out var ax) && ax.Len > 0
-                && ax.Off >= 0 && ax.Off + ax.Len <= data.Length)
-            {
-                ApplyAv1Alpha(data.AsSpan(ax.Off, ax.Len), frame, imageWidth, imageHeight);
-            }
+            (rows, cols, outW, outH) = ParseImageGrid(c.ItemData(pid) ?? throw new InvalidDataException("Grid item has no data."));
+            tiles = c.ReferencesFrom(pid, "dimg");
+            if (tiles.Count != rows * cols || new HashSet<int>(tiles).Count != tiles.Count)
+                throw new InvalidDataException($"Invalid image grid: {tiles.Count} distinct dimg tiles for a {rows}x{cols} grid.");
         }
         else
         {
-            // Colour matrix + range from the nclx colour box (defaults: BT.709, limited range).
-            int matrixCoeffs; bool fullRange;
-            if (primaryNclx is { } hn) { matrixCoeffs = hn.Mc; fullRange = hn.Full; }
-            else ParseNclxColour(data, out matrixCoeffs, out fullRange);
-            byte[] hvcC = FindConfigBox(data, "hvcC");
-            DecodeHevcIntraFrame(data.AsSpan(itemDataOffset, Math.Min(itemDataLength, data.Length - itemDataOffset)),
-                        frame, hvcC, matrixCoeffs, fullRange);
+            tiles = [pid];
+            (outW, outH) = c.Ispe(pid) ?? (0, 0);
         }
 
-        if (primaryPasp is { } pp && pp.H > 0 && pp.V > 0)
-            frame.Metadata.PixelAspectRatio = new SharpImage.Metadata.PixelAspectRatio(pp.H, pp.V);
-        return ApplyHeifTransforms(frame, primaryClap, primaryIrot, primaryImir);
+        string codec = c.Items.TryGetValue(tiles[0], out var t0) ? t0.Type : "";
+        if (codec is not ("av01" or "hvc1"))
+            throw new NotSupportedException($"AVIF/HEIC coded item type '{codec}' is not supported.");
+        var nclx = Nclx(c, pid);
+
+        ImageFrame frame;
+        if (codec == "av01" && tiles.Count > 1)
+        {
+            // AV1 grid: stitch the tiles' YUV planes, then convert once — chroma upsampling crosses tile seams exactly
+            // as in libavif (which reassembles the YUV image before avifImageYUVToRGB).
+            frame = new ImageFrame();
+            frame.Initialize(outW, outH, ColorspaceType.SRGB, false);
+            DecodeAv1GridInto(c, tiles, cols, outW, outH, nclx, frame);
+        }
+        else
+        {
+        var tileFrames = new ImageFrame[tiles.Count];
+        for (int i = 0; i < tiles.Count; i++)
+            tileFrames[i] = DecodeCodedItem(c, tiles[i], codec, nclx);
+        int tw = (int)tileFrames[0].Columns, th = (int)tileFrames[0].Rows;
+        if (outW <= 0 || outH <= 0) (outW, outH) = (tw * cols, th * rows);
+        if (tiles.Count > 1 && (tw * cols < outW || th * rows < outH))
+            throw new InvalidDataException("Image grid tiles do not cover the output size.");
+
+        if (tiles.Count == 1 && tw == outW && th == outH) frame = tileFrames[0];
+        else
+        {
+            frame = new ImageFrame();
+            frame.Initialize(outW, outH, ColorspaceType.SRGB, false);
+            for (int i = 0; i < tiles.Count; i++) Blit(tileFrames[i], frame, (i % cols) * tw, (i / cols) * th, alphaOnly: false);
+            frame.Metadata.Cicp = tileFrames[0].Metadata.Cicp;
+        }
+        }
+
+        // ---- alpha: an auxl alpha item (or alpha grid) of the primary; else per-tile alpha items -------------------
+        int alphaId = -1;
+        foreach (int a in c.ReferencesTo(pid, "auxl")) if (IsAlphaAux(c, a)) { alphaId = a; break; }
+        if (alphaId >= 0)
+        {
+            List<int> aTiles = c.Items.TryGetValue(alphaId, out var ai) && ai.Type == "grid" ? c.ReferencesFrom(alphaId, "dimg") : [alphaId];
+            int aCols = cols;
+            if (ai?.Type == "grid" && c.ItemData(alphaId) is { } ag) aCols = ParseImageGrid(ag).Cols;
+            AddAlphaTiles(c, aTiles, aCols, frame);
+        }
+        else if (tiles.Count > 1)
+        {
+            // libavif color_grid_alpha_nogrid: each colour tile carries its own auxl alpha item.
+            var perTile = new List<int>();
+            foreach (int tile in tiles)
+            {
+                int found = -1;
+                foreach (int a in c.ReferencesTo(tile, "auxl")) if (IsAlphaAux(c, a)) { found = a; break; }
+                perTile.Add(found);
+            }
+            if (!perTile.Contains(-1)) AddAlphaTiles(c, perTile, cols, frame);
+        }
+
+        // ---- metadata of the primary: ICC, Exif, XMP, pasp; then transforms -----------------------------------------
+        if (c.Property(pid, "colr", (o, l) => l > 4 && Encoding.ASCII.GetString(data, o, 4) is "prof" or "rICC") is { } prof)
+        {
+            byte[] icc = data.AsSpan(prof.Off + 4, prof.Len - 4).ToArray();
+            frame.IccProfile = icc;
+            frame.Metadata.IccProfile = new SharpImage.Metadata.IccProfile(icc);
+        }
+        foreach (int m in c.ReferencesTo(pid, "cdsc"))
+        {
+            if (!c.Items.TryGetValue(m, out var mi) || c.ItemData(m) is not { } payload) continue;
+            if (mi.Type == "Exif" && frame.Metadata.ExifProfile == null && payload.Length > 4)
+            {
+                // unsigned int(32) exif_tiff_header_offset, then the Exif block.
+                long tiffOff = 4L + BinaryPrimitives.ReadUInt32BigEndian(payload);
+                if (tiffOff < payload.Length) frame.Metadata.ExifProfile = SharpImage.Metadata.ExifParser.ParseFromTiff(payload.AsSpan((int)tiffOff));
+            }
+            else if (mi.Type == "mime" && mi.ContentType == "application/rdf+xml" && frame.Metadata.Xmp == null)
+            {
+                frame.Metadata.Xmp = Encoding.UTF8.GetString(payload).TrimEnd('\0');
+            }
+        }
+        if (c.Property(pid, "pasp") is { Len: >= 8 } pasp)
+        {
+            uint h = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pasp.Off)), v = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pasp.Off + 4));
+            if (h > 0 && v > 0) frame.Metadata.PixelAspectRatio = new SharpImage.Metadata.PixelAspectRatio(h, v);
+        }
+        uint[]? clap = null;
+        if (c.Property(pid, "clap") is { Len: >= 32 } cp)
+        {
+            clap = new uint[8];
+            for (int k = 0; k < 8; k++) clap[k] = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(cp.Off + 4 * k));
+        }
+        int? irot = c.Property(pid, "irot") is { Len: >= 1 } ir ? data[ir.Off] & 3 : null;
+        int? imir = c.Property(pid, "imir") is { Len: >= 1 } im ? data[im.Off] & 1 : null;
+        return ApplyHeifTransforms(frame, clap, irot, imir);
+    }
+
+    // Decodes an AV1 image grid: every tile to YUV, the planes stitched at the tile offsets (clipped to the grid's
+    // output size), then one YUV->RGB conversion of the whole image. Tiles must share size, layout and depth.
+    private static void DecodeAv1GridInto(HeifContainer c, List<int> tiles, int cols, int outW, int outH,
+        (int Cp, int Tc, int Mc, bool Full)? nclx, ImageFrame frame)
+    {
+        var yuvs = new List<Av1.DecodedVideoFrame>(tiles.Count);
+        try
+        {
+            Av1.Av1Decoder? first = null;
+            foreach (int id in tiles)
+            {
+                var dec = new Av1.Av1Decoder();
+                byte[] coded = c.ItemData(id) ?? throw new InvalidDataException($"Grid tile {id} has no data.");
+                yuvs.Add(dec.Decode(coded, 0, isKeyframe: true) ?? throw new InvalidDataException($"Grid tile {id} did not decode. " + FirstLine(Av1.Av1Decoder.LastDecodeError)));
+                first ??= dec;
+            }
+            var f0 = yuvs[0];
+            int bd = f0.BitDepth, tw = f0.Width, th = f0.Height;
+            foreach (var f in yuvs)
+                if (f.Width != tw || f.Height != th || f.Format != f0.Format || f.BitDepth != bd)
+                    throw new InvalidDataException("Image grid tiles differ in size, layout or depth.");
+            if (tw * cols < outW || th * ((tiles.Count + cols - 1) / cols) < outH)
+                throw new InvalidDataException("Image grid tiles do not cover the output size.");
+            bool mono = first!.Monochrome;
+            int ssX = f0.Format is Av1.PixelFormat.Yuv444P or Av1.PixelFormat.Yuv444P10 or Av1.PixelFormat.Yuv444P12 ? 0 : 1;
+            int ssY = f0.Format is Av1.PixelFormat.Yuv420P or Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12 ? 1 : 0;
+            int cw = (outW + ssX) >> ssX, chh = (outH + ssY) >> ssY;
+            int ySize = outW * outH, cSize = cw * chh;
+            byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(ySize + 2 * cSize);
+            ushort[]? y16 = null, u16 = null, v16 = null;
+            if (bd > 8) { y16 = new ushort[ySize]; u16 = new ushort[cSize]; v16 = new ushort[cSize]; }
+            for (int i = 0; i < yuvs.Count; i++)
+            {
+                var f = yuvs[i];
+                int x0 = (i % cols) * tw, y0 = (i / cols) * th;
+                for (int pl = 0; pl < 3; pl++)
+                {
+                    if (mono && pl > 0) break;
+                    int sx = pl == 0 ? 0 : ssX, sy = pl == 0 ? 0 : ssY;
+                    int dW = pl == 0 ? outW : cw, dH = pl == 0 ? outH : chh, dOff = pl == 0 ? 0 : pl == 1 ? ySize : ySize + cSize;
+                    int px0 = x0 >> sx, py0 = y0 >> sy, pw = Math.Min((tw + sx) >> sx, dW - px0), ph = Math.Min((th + sy) >> sy, dH - py0);
+                    int stride = pl == 0 ? f.YStride : pl == 1 ? f.UStride : f.VStride;
+                    for (int yy = 0; yy < ph; yy++)
+                    {
+                        if (bd > 8)
+                        {
+                            var src = (pl == 0 ? f.YPlane16 : pl == 1 ? f.UPlane16 : f.VPlane16).Span.Slice(yy * stride, pw);
+                            src.CopyTo((pl == 0 ? y16! : pl == 1 ? u16! : v16!).AsSpan((py0 + yy) * dW + px0, pw));
+                        }
+                        else
+                        {
+                            var src = (pl == 0 ? f.YPlane : pl == 1 ? f.UPlane : f.VPlane).Span.Slice(yy * stride, pw);
+                            src.CopyTo(buf.AsSpan(dOff + (py0 + yy) * dW + px0, pw));
+                        }
+                    }
+                }
+            }
+            using var stitched = new Av1.DecodedVideoFrame(outW, outH, f0.Format, 0, buf, 0, outW, ySize, cw, ySize + cSize, cw)
+            {
+                BitDepth = bd,
+                YPlane16 = y16 ?? ReadOnlyMemory<ushort>.Empty,
+                UPlane16 = u16 ?? ReadOnlyMemory<ushort>.Empty,
+                VPlane16 = v16 ?? ReadOnlyMemory<ushort>.Empty,
+            };
+            var cicp = nclx ?? (first.ColorPrimaries, first.TransferCharacteristics, first.MatrixCoefficients, first.FullColorRange);
+            frame.Metadata.Cicp = new SharpImage.Metadata.CicpInfo(cicp.Cp, cicp.Tc, cicp.Mc, cicp.Full);
+            ConvertYuvToRgbLibavif(stitched, frame, outW, outH, frame.NumberOfChannels, mono, cicp.Mc, cicp.Full, cicp.Cp, ssX, ssY);
+        }
+        finally
+        {
+            foreach (var f in yuvs) f.Dispose();
+        }
+    }
+
+    private static string FirstLine(string? s) => s == null ? "" : s.Split((char)10)[0];
+
+    // ImageGrid payload: version(8)=0, flags(8) (bit 0: 32-bit output size), rows_minus_one(8), columns_minus_one(8),
+    // output_width, output_height.
+    private static (int Rows, int Cols, int W, int H) ParseImageGrid(byte[] g)
+    {
+        if (g.Length < 8 || g[0] != 0) throw new InvalidDataException("Unsupported image grid payload.");
+        bool large = (g[1] & 1) != 0;
+        if (large && g.Length < 12) throw new InvalidDataException("Truncated image grid payload.");
+        int w = large ? (int)BinaryPrimitives.ReadUInt32BigEndian(g.AsSpan(4)) : BinaryPrimitives.ReadUInt16BigEndian(g.AsSpan(4));
+        int h = large ? (int)BinaryPrimitives.ReadUInt32BigEndian(g.AsSpan(8)) : BinaryPrimitives.ReadUInt16BigEndian(g.AsSpan(6));
+        return (g[2] + 1, g[3] + 1, w, h);
+    }
+
+    // colr nclx of an item (CICP + range), if any.
+    private static (int Cp, int Tc, int Mc, bool Full)? Nclx(HeifContainer c, int id)
+    {
+        byte[] d = c.Data;
+        return c.Property(id, "colr", (o, l) => l >= 11 && Encoding.ASCII.GetString(d, o, 4) == "nclx") is { } p
+            ? (BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p.Off + 4)), BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p.Off + 6)),
+               BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(p.Off + 8)), (d[p.Off + 10] & 0x80) != 0)
+            : null;
+    }
+
+    // An auxiliary item is alpha when its auxC names the MPEG alpha URN (AVIF) or the HEVC alpha auxid; an auxl item
+    // without auxC is treated as alpha too (as old writers produced).
+    private static bool IsAlphaAux(HeifContainer c, int id)
+    {
+        if (c.Property(id, "auxC") is not { } p) return true;
+        string urn = Encoding.ASCII.GetString(c.Data, p.Off + 4, Math.Max(0, p.Len - 4)).TrimEnd('\0');
+        return urn is "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha" or "urn:mpeg:hevc:2015:auxid:1";
+    }
+
+    // Decodes one coded colour item (AV1 or HEVC) to an RGB frame of its coded size. CICP: the item's own colr nclx,
+    // else the one inherited from the primary/grid, else (AV1) the sequence header.
+    private static ImageFrame DecodeCodedItem(HeifContainer c, int id, string codec, (int Cp, int Tc, int Mc, bool Full)? inherited)
+    {
+        byte[] coded = c.ItemData(id) ?? throw new InvalidDataException($"Item {id} has no data.");
+        var nclx = Nclx(c, id) ?? inherited;
+        int w, h;
+        if (c.Ispe(id) is { } ispe) (w, h) = ispe;
+        else if (codec == "av01") InferAv1Dimensions(coded, out w, out h);
+        else throw new InvalidDataException("Cannot determine image dimensions");
+        var f = new ImageFrame();
+        f.Initialize(w, h, ColorspaceType.SRGB, false);
+        if (codec == "av01")
+        {
+            DecodeAv1IntraFrame(coded, f, nclx);
+        }
+        else
+        {
+            int matrixCoeffs; bool fullRange;
+            if (nclx is { } hn) { matrixCoeffs = hn.Mc; fullRange = hn.Full; }
+            else ParseNclxColour(c.Data, out matrixCoeffs, out fullRange);
+            byte[] hvcC = c.Property(id, "hvcC") is { } hp ? c.Data.AsSpan(hp.Off, hp.Len).ToArray() : FindConfigBox(c.Data, "hvcC");
+            DecodeHevcIntraFrame(coded, f, hvcC, matrixCoeffs, fullRange);
+        }
+        return f;
+    }
+
+    // Decodes alpha tiles (AV1 monochrome items) into the frame's alpha channel, laid out like the colour grid.
+    private static void AddAlphaTiles(HeifContainer c, List<int> aTiles, int cols, ImageFrame frame)
+    {
+        for (int i = 0; i < aTiles.Count; i++)
+        {
+            byte[]? coded = c.ItemData(aTiles[i]);
+            if (coded == null) continue;
+            int w, h;
+            if (c.Ispe(aTiles[i]) is { } ispe) (w, h) = ispe;
+            else InferAv1Dimensions(coded, out w, out h);
+            var af = new ImageFrame();
+            af.Initialize(w, h, ColorspaceType.SRGB, false);
+            ApplyAv1Alpha(coded, af, w, h);
+            if (!frame.HasAlpha) frame.SetAlpha(true);
+            Blit(af, frame, (i % cols) * w, (i / cols) * h, alphaOnly: true);
+        }
+    }
+
+    // Copies a tile into the destination at (dx, dy), clipped to the destination (grid output cropping).
+    private static void Blit(ImageFrame src, ImageFrame dst, int dx, int dy, bool alphaOnly)
+    {
+        int sw = (int)src.Columns, sh = (int)src.Rows, dw = (int)dst.Columns, dh = (int)dst.Rows;
+        int w = Math.Min(sw, dw - dx), h = Math.Min(sh, dh - dy);
+        if (w <= 0 || h <= 0) return;
+        int sc = src.NumberOfChannels, dc = dst.NumberOfChannels;
+        for (int y = 0; y < h; y++)
+        {
+            var s = src.GetPixelRow(y);
+            var d = dst.GetPixelRowForWrite(dy + y);
+            for (int x = 0; x < w; x++)
+            {
+                int so = x * sc, dofs = (dx + x) * dc;
+                if (alphaOnly) d[dofs + dc - 1] = s[so + sc - 1];
+                else for (int k = 0; k < Math.Min(3, sc); k++) d[dofs + k] = s[so + k];
+            }
+        }
     }
 
     // HEIF transformative properties are essential: the displayed image is clap-cropped, then rotated (irot, anti-
@@ -477,108 +496,6 @@ public static class HeifCoder
             exif.SetTag(new SharpImage.Metadata.ExifEntry { Tag = ot.Tag, DataType = SharpImage.Metadata.ExifDataType.Short, Count = 1, Value = one });
         }
         return frame;
-    }
-
-    // iinf: item_ID -> (item_type, content_type) from each infe (versions 2/3; content_type only for 'mime').
-    private static Dictionary<int, (string Type, string ContentType)> ParseIinf(byte[] data, int off, int len)
-    {
-        var map = new Dictionary<int, (string, string)>();
-        int end = Math.Min(data.Length, off + len);
-        if (off + 6 > end) return map;
-        int pos = off + 4 + (data[off] == 0 ? 2 : 4);   // FullBox header + entry_count
-        foreach (var (type, pOff, pLen) in ParseIpco(data, pos, end - pos))
-        {
-            if (type != "infe" || pLen < 4) continue;
-            int v = data[pOff], q = pOff + 4, qEnd = pOff + pLen;
-            if (v < 2) continue;                          // v0/v1 carry no item_type (not used by AVIF)
-            if (q + (v == 2 ? 2 : 4) + 6 > qEnd) continue;
-            int id = v == 2 ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q)) : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(q));
-            q += (v == 2 ? 2 : 4) + 2;                    // item_ID, item_protection_index
-            string itemType = Encoding.ASCII.GetString(data, q, 4);
-            q += 4;
-            int nameEnd = Array.IndexOf(data, (byte)0, q, qEnd - q);   // item_name
-            string contentType = "";
-            if (itemType == "mime" && nameEnd >= 0 && nameEnd + 1 < qEnd)
-            {
-                int ctEnd = Array.IndexOf(data, (byte)0, nameEnd + 1, qEnd - nameEnd - 1);
-                contentType = Encoding.ASCII.GetString(data, nameEnd + 1, (ctEnd >= 0 ? ctEnd : qEnd) - nameEnd - 1);
-            }
-            map[id] = (itemType, contentType);
-        }
-        return map;
-    }
-
-    // iref: every SingleItemTypeReferenceBox in order — (reference type, from_item_ID, to_item_IDs).
-    private static List<(string Type, int From, List<int> To)> ParseIref(byte[] data, int off, int len)
-    {
-        var list = new List<(string, int, List<int>)>();
-        int end = Math.Min(data.Length, off + len);
-        if (off + 4 > end) return list;
-        bool wide = data[off] != 0;                       // version 1: 32-bit item IDs
-        int idSize = wide ? 4 : 2;
-        foreach (var (type, pOff, pLen) in ParseIpco(data, off + 4, end - off - 4))
-        {
-            int q = pOff, qEnd = pOff + pLen;
-            if (q + idSize + 2 > qEnd) continue;
-            int from = wide ? (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(q)) : BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q));
-            q += idSize;
-            int n = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q));
-            q += 2;
-            var to = new List<int>(n);
-            for (int k = 0; k < n && q + idSize <= qEnd; k++, q += idSize)
-                to.Add(wide ? (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(q)) : BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q)));
-            list.Add((type, from, to));
-        }
-        return list;
-    }
-
-    // ipco children in order (property index = position + 1): (type, payload offset, payload length).
-    private static List<(string Type, int Off, int Len)> ParseIpco(byte[] data, int off, int len)
-    {
-        var list = new List<(string, int, int)>();
-        int pos = off, end = Math.Min(data.Length, off + len);
-        while (pos + 8 <= end)
-        {
-            long size = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos));
-            string type = Encoding.ASCII.GetString(data, pos + 4, 4);
-            int hdr = 8;
-            if (size == 1 && pos + 16 <= end) { size = (long)BinaryPrimitives.ReadUInt64BigEndian(data.AsSpan(pos + 8)); hdr = 16; }
-            else if (size == 0) size = end - pos;
-            if (size < hdr || pos + size > end) break;
-            // FullBox properties keep their version/flags in the payload; callers skip them where needed.
-            list.Add((type, pos + hdr, (int)size - hdr));
-            pos += (int)size;
-        }
-        return list;
-    }
-
-    // ipma: item_ID -> associated property indices (1-based; essential bit stripped).
-    private static Dictionary<int, List<int>> ParseIpma(byte[] data, int off, int len)
-    {
-        var map = new Dictionary<int, List<int>>();
-        int end = Math.Min(data.Length, off + len);
-        if (off + 8 > end) return map;
-        int version = data[off];
-        bool wide = (data[off + 3] & 1) != 0;
-        int pos = off + 4;
-        uint entries = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos));
-        pos += 4;
-        for (uint e = 0; e < entries && pos < end; e++)
-        {
-            if (pos + (version < 1 ? 2 : 4) + 1 > end) break;
-            int item = version < 1 ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)) : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos));
-            pos += version < 1 ? 2 : 4;
-            int n = data[pos++];
-            var l = new List<int>(n);
-            for (int k = 0; k < n; k++)
-            {
-                if (pos + (wide ? 2 : 1) > end) break;
-                l.Add(wide ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)) & 0x7FFF : data[pos] & 0x7F);
-                pos += wide ? 2 : 1;
-            }
-            if (!map.ContainsKey(item)) map[item] = l;
-        }
-        return map;
     }
 
     // Finds a codec configuration box (e.g. 'hvcC') in the ISOBMFF stream and returns its
@@ -1133,7 +1050,7 @@ public static class HeifCoder
     private static void ApplyAv1Alpha(ReadOnlySpan<byte> codedData, ImageFrame frame, int w, int h)
     {
         var decoder = new Av1.Av1Decoder();
-        using var yuv = decoder.Decode(codedData, 0, isKeyframe: true) ?? throw new InvalidDataException("AV1 alpha decode produced no frame.");
+        using var yuv = decoder.Decode(codedData, 0, isKeyframe: true) ?? throw new InvalidDataException("AV1 alpha decode produced no frame. " + FirstLine(Av1.Av1Decoder.LastDecodeError));
         if (!decoder.FullColorRange)
         {
             ApplyAv1AlphaLimited(yuv, frame, w, h);
@@ -1206,7 +1123,7 @@ public static class HeifCoder
         // header + frame OBUs) in the item's coded data.
         var decoder = new Av1.Av1Decoder();
         using var yuv = decoder.Decode(codedData, 0, isKeyframe: true)
-            ?? throw new InvalidDataException("AV1 decode produced no frame.");
+            ?? throw new InvalidDataException("AV1 decode produced no frame. " + FirstLine(Av1.Av1Decoder.LastDecodeError));
 
         var cicp = nclx ?? (decoder.ColorPrimaries, decoder.TransferCharacteristics, decoder.MatrixCoefficients, decoder.FullColorRange);
         frame.Metadata.Cicp = new SharpImage.Metadata.CicpInfo(cicp.Cp, cicp.Tc, cicp.Mc, cicp.Full);
@@ -1728,48 +1645,6 @@ public static class HeifCoder
     #endregion
 
     #region ISOBMFF Helpers
-
-    private readonly record struct BoxInfo(int DataOffset, int DataLength);
-
-    private static Dictionary<string, BoxInfo> ParseBoxes(byte[] data, int start, int length)
-    {
-        var result = new Dictionary<string, BoxInfo>();
-        int pos = start;
-        int end = start + length;
-
-        while (pos + 8 <= end)
-        {
-            uint boxLen = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos));
-            if (pos + 4 > data.Length - 4)
-            {
-                break;
-            }
-
-            string boxType = Encoding.ASCII.GetString(data, pos + 4, 4);
-
-            int headerSize = 8;
-            long actualLen = boxLen;
-            if (boxLen == 1 && pos + 16 <= end)
-            {
-                actualLen = (long)BinaryPrimitives.ReadUInt64BigEndian(data.AsSpan(pos + 8));
-                headerSize = 16;
-            }
-            else if (boxLen == 0)
-            {
-                actualLen = end - pos;
-            }
-
-            if (actualLen < headerSize)
-            {
-                break;
-            }
-
-            result[boxType] = new BoxInfo(pos + headerSize, (int)(actualLen - headerSize));
-            pos += (int)actualLen;
-        }
-
-        return result;
-    }
 
     private static void WriteFtypBox(List<byte> output, string brand)
     {

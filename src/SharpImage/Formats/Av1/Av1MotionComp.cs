@@ -900,7 +900,9 @@ public static class Av1MotionComp
     /// (chroma displacement vectors are half-pel → bilinear interpolation → needs the real clamp).
     /// The bilinear intermediate_bits are 4 for both 8- and 10-bit (dav1d get_intermediate_bits),
     /// so only the clamp differs; 12-bit additionally needs intermediate_bits=2 (follow-up).</summary>
-    internal static int McBitDepth = 8;
+    // Per thread: set by the decoding thread before motion compensation (0 on a fresh thread means 8-bit).
+    [ThreadStatic] private static int t_mcBitDepth;
+    internal static int McBitDepth { get => t_mcBitDepth == 0 ? 8 : t_mcBitDepth; set => t_mcBitDepth = value; }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ushort ClipPixel(int v) => (ushort)Math.Clamp(v, 0, (1 << McBitDepth) - 1);
