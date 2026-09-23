@@ -139,6 +139,20 @@ public sealed class Av1ReferenceFrame
     public Av1RefMvsTemporalBlock[]? TemporalMvs;
     public byte[] RefPoc = new byte[7];
 
+    /// <summary>An independent copy (planes, CDFs, order hints, global motion); the segment map and motion field
+    /// are shared (never written after the frame that produced them).</summary>
+    public Av1ReferenceFrame DeepCopy()
+    {
+        var c = (Av1ReferenceFrame)MemberwiseClone();
+        c.Gmv = (Av1WarpedMotionParams[])Gmv.Clone();
+        c.Planes = new ushort[3][];
+        for (int p = 0; p < 3; p++) c.Planes[p] = (ushort[]?)Planes[p]?.Clone();
+        c.Strides = (int[])Strides.Clone();
+        c.RefPoc = (byte[])RefPoc.Clone();
+        if (CdfSnapshot != null) { c.CdfSnapshot = new Av1CdfContext(); c.CdfSnapshot.CopyFrom(CdfSnapshot); }
+        return c;
+    }
+
     public void Reset()
     {
         Valid = false;

@@ -30,8 +30,19 @@ internal static class Av1InterEncoder
     // transform) by rate-distortion instead of always using the largest transform.
     internal static bool UseVarTx = true;
 
+    // Inter-frame rate-distortion lambda relative to the still-image one (RdLambdaK).
+    internal static double InterLambdaScale = 1.0;
+
+    // Coefficient RDOQ on inter residuals (Av1CoeffEncode.RdoqOptimize), lambda relative to the frame's; 0 = off.
+    internal static double InterRdoqScale = 50.0;
+    internal static int InterRdoqMaxCoefs = 256;   // RDOQ cost is quadratic in the coefficient count: up to 16x16
+
+    // Intra blocks in inter frames (new content, occlusions): every leaf also tries the intra modes (DC chroma).
+    internal static bool UseIntraInInter = true;
+
     // Motion search: full-pel radius around the best predictor (in luma pixels), then half- and quarter-pel.
     internal static int SearchRange = 24;
+    internal static int ExhaustiveRange = 4;
 
     /// <summary>
     /// Encodes <paramref name="src"/> as an INTER_FRAME predicted from <paramref name="reference"/> (the decoder's
@@ -39,8 +50,8 @@ internal static class Av1InterEncoder
     /// scope with <c>InterFrame</c> set. Returns the OBU_FRAME.
     /// </summary>
     internal static byte[] EncodeFrameObu(Picture src, Picture reference, int bitDepth, Av1PixelLayout layout, int baseQIdx,
-        Av1ObuWriter.CdefParams cdef, int lfLevel)
-        => EncodeFrameObu(src, [reference, null, null, null, null, null, null], bitDepth, layout, baseQIdx, cdef, lfLevel);
+        Av1ObuWriter.CdefParams cdef, int lfLevel, (bool FilterIntra, bool EdgeFilter)? seqTools = null)
+        => EncodeFrameObu(src, [reference, null, null, null, null, null, null], bitDepth, layout, baseQIdx, cdef, lfLevel, seqTools);
 
     /// <summary>
     /// As above with several references: <paramref name="refs"/>[i] is the picture reference i (LAST, LAST2, LAST3,
@@ -48,16 +59,24 @@ internal static class Av1InterEncoder
     /// Each block picks the reference (and motion vector) with the lowest rate-distortion cost.
     /// </summary>
     internal static byte[] EncodeFrameObu(Picture src, Picture?[] refs, int bitDepth, Av1PixelLayout layout, int baseQIdx,
-        Av1ObuWriter.CdefParams cdef, int lfLevel)
+        Av1ObuWriter.CdefParams cdef, int lfLevel, (bool FilterIntra, bool EdgeFilter)? seqTools = null)
+        => EncodeFrameVariants(src, refs, bitDepth, layout, baseQIdx, seqTools)(lfLevel, cdef);
+
+    /// <summary>
+    /// Codes the frame's tiles once and returns a builder of the OBU_FRAME for any deblocking level / CDEF parameters
+    /// (post-reconstruction filters: the tile data does not depend on them), so the caller can pick them by decoding
+    /// the variants. Call the builder inside the same <see cref="Av1ObuWriter.LayeredStream"/> scope state.
+    /// </summary>
+    internal static Func<int, Av1ObuWriter.CdefParams, byte[]> EncodeFrameVariants(Picture src, Picture?[] refs, int bitDepth,
+        Av1PixelLayout layout, int baseQIdx, (bool FilterIntra, bool EdgeFilter)? seqTools = null)
     {
         var reference = refs;
         int w = src.Width, h = src.Height;
         int sbCols = (w + 63) >> 6, sbRows = (h + 63) >> 6;
         bool mono = layout == Av1PixelLayout.I400;
-        byte[] hdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, mono, txModeSelect: UseVarTx,
-            cdef, lfLevel, screenContentTools: false, reducedTxSet: true);
         var enc = new FrameCoder(src, reference, bitDepth, layout, baseQIdx);
         enc.ReferenceSelect = Av1ObuWriter.CurrentReferenceSelect;
+        (enc.SeqFilterIntra, enc.SeqEdgeFilter) = seqTools ?? (false, Av1StillImageEncoder.UseIntraEdgeFilter);
         var tl = Av1ObuWriter.TileLayout(sbCols, sbRows);
         var tiles = new List<byte[]>();
         for (int tr = 0; tr < (1 << tl.RowsLog2) && tl.RowStartSb[tr] < sbRows; tr++)
@@ -65,10 +84,15 @@ internal static class Av1InterEncoder
                 tiles.Add(enc.EncodeTile(tl.ColStartSb[tc] << 4, Math.Min(tl.ColStartSb[tc + 1] << 4, enc.Bw),
                     tl.RowStartSb[tr] << 4, Math.Min(tl.RowStartSb[tr + 1] << 4, enc.Bh), tc == 0 ? tr : -1));
         byte[] tg = Av1StillImageEncoder.AssembleTileGroup(tiles);
-        var payload = new byte[hdr.Length + tg.Length];
-        hdr.CopyTo(payload, 0);
-        tg.CopyTo(payload, hdr.Length);
-        return Av1ObuWriter.WrapObu(Av1ObuType.Frame, payload);
+        return (lfLevel, cdef) =>
+        {
+            byte[] hdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, mono, txModeSelect: UseVarTx,
+                cdef, lfLevel, screenContentTools: false, reducedTxSet: true);
+            var payload = new byte[hdr.Length + tg.Length];
+            hdr.CopyTo(payload, 0);
+            tg.CopyTo(payload, hdr.Length);
+            return Av1ObuWriter.WrapObu(Av1ObuType.Frame, payload);
+        };
     }
 
     // One analysed leaf block: its size, motion vector and quantized levels per transform block (luma, then U, V,
@@ -80,6 +104,9 @@ internal static class Av1InterEncoder
         public Av1MotionVector Mv;
         public int Ref;               // 0 = LAST .. 6 = ALTREF
         public int Ref1 = -1;         // compound: the second reference (average of both predictions), else -1
+        public bool Intra;            // an intra block (YMode, DC chroma), levels in LumaTx / ULevels / VLevels
+        public int YMode;
+        public ushort[]? IntraRecY, IntraRecU, IntraRecV;   // its reconstruction (block-sized, packed)
         public Av1MotionVector Mv1;
         public bool Skip;
         public List<int[]> ULevels = [], VLevels = [];
@@ -110,6 +137,14 @@ internal static class Av1InterEncoder
         public readonly ushort[] SrcY, SrcU, SrcV;          // padded to PadW x PadH (edge-replicated)
         public readonly Av1RefMvsFrame Rf = new();
         public bool ReferenceSelect;  // the frame header's reference_select (a comp_mode bit precedes each reference)
+        public bool SeqFilterIntra, SeqEdgeFilter;
+        // The current frame's reconstruction before loop filtering (what intra prediction reads, as the decoder's
+        // planes and pre-filter SB-row edge backups hold it), and the intra modes per 4x4 (luma: -1 inter) / chroma
+        // 4x4 (UV mode, DC for inter) for the smooth-neighbour edge flags.
+        private ushort[] RecY = null!, RecU = null!, RecV = null!;
+        private sbyte[] ModeMap = null!;
+        private byte[] UvMap = null!;
+        private int CBw;
         public readonly Av1DecoderFrameHeader Fh;
         public readonly ushort[] Emu = new ushort[(128 + 16) * 192];
 
@@ -128,9 +163,16 @@ internal static class Av1InterEncoder
             DcDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 0];
             AcDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1];
             Qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
-            Lambda = Av1StillImageEncoder.RdLambdaK * AcDq * AcDq;
+            Lambda = Av1StillImageEncoder.RdLambdaK * InterLambdaScale * AcDq * AcDq;
             LambdaSad = Math.Sqrt(Lambda);
             SrcY = Pad(src.Y, W, H, PadW, PadH);
+            RecY = new ushort[PadW * PadH];
+            RecU = Mono ? [] : new ushort[(PadW >> SsX) * (PadH >> SsY)];
+            RecV = Mono ? [] : new ushort[(PadW >> SsX) * (PadH >> SsY)];
+            ModeMap = new sbyte[Bw * Bh];
+            Array.Fill(ModeMap, (sbyte)-1);
+            CBw = (Bw + SsX) >> SsX;
+            UvMap = new byte[CBw * ((Bh + SsY) >> SsY)];
             SrcU = Mono ? [] : Pad(src.U!, CW, CH, PadW >> SsX, PadH >> SsY);
             SrcV = Mono ? [] : Pad(src.V!, CW, CH, PadW >> SsX, PadH >> SsY);
             Fh = new Av1DecoderFrameHeader { CodedWidth = W, SuperResUpscaledWidth = W, Height = H, Hp = false, ForceIntegerMv = false };
@@ -225,6 +267,7 @@ internal static class Av1InterEncoder
             {
                 node.Leaf = leaf;
                 Splat(leaf);
+                Commit(leaf);
                 j = jNone;
                 return node;
             }
@@ -248,6 +291,7 @@ internal static class Av1InterEncoder
             RestoreGrid(saved, bx, by, hsz * 2);
             node.Leaf = leaf;
             Splat(leaf);
+            Commit(leaf);
             j = jNone;
             return node;
         }
@@ -276,13 +320,22 @@ internal static class Av1InterEncoder
                 single[r] = leaf.Mv;
                 if (j < bestJ) { bestJ = j; best = leaf; }
             }
+            if (UseIntraInInter)
+            {
+                var il = EvaluateIntra(bs, bx, by, edge, edgeIdx, out double ji);
+                if (ji < bestJ) { bestJ = ji; best = il; }
+            }
             // Compound (bidirectional): a forward reference averaged with ALTREF.
-            if (ReferenceSelect && Refs[6] != null)
-                foreach (int r0 in (ReadOnlySpan<int>)[0, 3])
+            if (ReferenceSelect)
+                foreach (int r1 in (ReadOnlySpan<int>)[4, 6])
                 {
-                    if (Refs[r0] == null) continue;
-                    var leaf = EvaluateCompound(bs, bx, by, edge, edgeIdx, r0, 6, single[r0]!.Value, single[6]!.Value, out double j);
-                    if (leaf != null && j < bestJ) { bestJ = j; best = leaf; }
+                    if (Refs[r1] == null) continue;
+                    foreach (int r0 in (ReadOnlySpan<int>)[0, 3])
+                    {
+                        if (Refs[r0] == null) continue;
+                        var leaf = EvaluateCompound(bs, bx, by, edge, edgeIdx, r0, r1, single[r0]!.Value, single[r1]!.Value, out double j);
+                        if (leaf != null && j < bestJ) { bestJ = j; best = leaf; }
+                    }
                 }
             return best!;
         }
@@ -511,7 +564,16 @@ internal static class Av1InterEncoder
                 long c = SadFull(px, py, n, sx, sy) + (long)(LambdaSad * (Math.Abs(sx) + Math.Abs(sy)) * 0.5);
                 if (c < bestCost) { bestCost = c; bmx = sx; bmy = sy; }
             }
-            // Diamond steps down to 1 px, within SearchRange of the best seed.
+            // Exhaustive full-pel search close to the zero vector and the best seed (textured / aliased content has a
+            // rugged SAD surface the diamond can step over), then diamond steps down to 1 px within SearchRange.
+            foreach (var (ex, ey) in new[] { (0, 0), (bmx, bmy) })
+                for (int dy = -ExhaustiveRange; dy <= ExhaustiveRange; dy++)
+                    for (int dx = -ExhaustiveRange; dx <= ExhaustiveRange; dx++)
+                    {
+                        int mx = ex + dx, my = ey + dy;
+                        long c = SadFull(px, py, n, mx, my) + (long)(LambdaSad * (Math.Abs(mx) + Math.Abs(my)) * 0.5);
+                        if (c < bestCost) { bestCost = c; bmx = mx; bmy = my; }
+                    }
             int cx0 = bmx, cy0 = bmy;
             for (int step = Math.Max(1, SearchRange / 2); step >= 1; step >>= 1)
             {
@@ -711,6 +773,260 @@ internal static class Av1InterEncoder
 
         private static bool HasNonZero(int[] a) { foreach (int v in a) if (v != 0) return true; return false; }
 
+        // Writes the chosen leaf's reconstruction (pre-filter) and intra-mode maps: inter = prediction + residual per
+        // transform, intra = the reconstruction its evaluation produced.
+        private void Commit(Leaf leaf)
+        {
+            int bw4 = Av1Tables.BlockDimensions[leaf.Bs, 0], bh4 = Av1Tables.BlockDimensions[leaf.Bs, 1];
+            int n = bw4 * 4, px = leaf.Bx * 4, py = leaf.By * 4;
+            int cw = n >> SsX, ch = n >> SsY, cpx = px >> SsX, cpy = py >> SsY, cStride = PadW >> SsX;
+            if (leaf.Intra)
+            {
+                Blit(leaf.IntraRecY!, n, n, RecY, PadW, px, py);
+                if (!Mono) { Blit(leaf.IntraRecU!, cw, ch, RecU, cStride, cpx, cpy); Blit(leaf.IntraRecV!, cw, ch, RecV, cStride, cpx, cpy); }
+            }
+            else
+            {
+                var pred = new ushort[n * n];
+                Predict(leaf, 0, n, n, pred);
+                if (!leaf.Skip)
+                {
+                    int mtx = Av1Tables.MaxTxfmSizeForBlockSize[leaf.Bs, 0];
+                    ref readonly var mt = ref Av1Tables.TxfmDimensions[mtx];
+                    for (int y = 0, yOff = 0; y < bh4; y += mt.H, yOff++)
+                        for (int x = 0, xOff = 0; x < bw4; x += mt.W, xOff++)
+                            CommitTree(leaf, mtx, 0, xOff, yOff, leaf.Bx + x, leaf.By + y, pred, n);
+                }
+                Blit(pred, n, n, RecY, PadW, px, py);
+                if (!Mono)
+                {
+                    int uvtx = Av1Tables.MaxTxfmSizeForBlockSize[leaf.Bs, (int)Layout];
+                    ref readonly var ut = ref Av1Tables.TxfmDimensions[uvtx];
+                    int tw = ut.W * 4, th = ut.H * 4, ntw = cw / tw;
+                    for (int pl = 1; pl <= 2; pl++)
+                    {
+                        var cp = new ushort[cw * ch];
+                        Predict(leaf, pl, cw, ch, cp);
+                        var lvs = pl == 1 ? leaf.ULevels : leaf.VLevels;
+                        if (!leaf.Skip)
+                            for (int i = 0; i < lvs.Count; i++)
+                                if (HasNonZero(lvs[i])) AddResidual(lvs[i], uvtx, cp, cw, (i / ntw) * th, (i % ntw) * tw);
+                        Blit(cp, cw, ch, pl == 1 ? RecU : RecV, cStride, cpx, cpy);
+                    }
+                }
+            }
+            for (int y = 0; y < bh4 && leaf.By + y < Bh; y++)
+                for (int x = 0; x < bw4 && leaf.Bx + x < Bw; x++)
+                    ModeMap[(leaf.By + y) * Bw + leaf.Bx + x] = leaf.Intra ? (sbyte)leaf.YMode : (sbyte)-1;
+            if (!Mono)
+            {
+                int cbx = leaf.Bx >> SsX, cby = leaf.By >> SsY, cbw = (bw4 + SsX) >> SsX, cbh = (bh4 + SsY) >> SsY;
+                for (int y = 0; y < cbh && (cby + y) * CBw < UvMap.Length; y++)
+                    for (int x = 0; x < cbw && cbx + x < CBw; x++)
+                        UvMap[(cby + y) * CBw + cbx + x] = (byte)Av1IntraPredMode.Dc;
+            }
+        }
+
+        // Adds the residual of every coded luma transform of the var-tx tree (read_coef_tree order and positions).
+        private void CommitTree(Leaf leaf, int tx, int depth, int xOff, int yOff, int bx, int by, ushort[] pred, int n)
+        {
+            ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+            int txw = tDim.W, txh = tDim.H;
+            int mask = depth == 0 ? leaf.Split0 : depth == 1 ? leaf.Split1 : 0;
+            if (depth < 2 && (mask >> (yOff * 4 + xOff) & 1) != 0)
+            {
+                int sub = tDim.Sub;
+                ref readonly var sd = ref Av1Tables.TxfmDimensions[sub];
+                CommitTree(leaf, sub, depth + 1, xOff * 2, yOff * 2, bx, by, pred, n);
+                if (txw >= txh && bx + sd.W < Bw) CommitTree(leaf, sub, depth + 1, xOff * 2 + 1, yOff * 2, bx + sd.W, by, pred, n);
+                if (txh >= txw && by + sd.H < Bh)
+                {
+                    CommitTree(leaf, sub, depth + 1, xOff * 2, yOff * 2 + 1, bx, by + sd.H, pred, n);
+                    if (txw >= txh && bx + sd.W < Bw) CommitTree(leaf, sub, depth + 1, xOff * 2 + 1, yOff * 2 + 1, bx + sd.W, by + sd.H, pred, n);
+                }
+                return;
+            }
+            if (leaf.LumaTx.TryGetValue((bx, by), out var lv) && HasNonZero(lv))
+                AddResidual(lv, tx, pred, n, (by - leaf.By) * 4, (bx - leaf.Bx) * 4);
+        }
+
+        private void AddResidual(int[] levels, int tx, ushort[] buf, int stride, int y0, int x0)
+        {
+            ref readonly var td = ref Av1Tables.TxfmDimensions[tx];
+            int tw = td.W * 4, th = td.H * 4;
+            var tmp = new ushort[tw * th];
+            for (int y = 0; y < th; y++) Array.Copy(buf, (y0 + y) * stride + x0, tmp, y * tw, tw);
+            Reconstruct(levels, tx, tmp, tw);
+            for (int y = 0; y < th; y++) Array.Copy(tmp, y * tw, buf, (y0 + y) * stride + x0, tw);
+        }
+
+        private static void Blit(ushort[] src, int w, int h, ushort[] dst, int dstStride, int x0, int y0)
+        {
+            for (int y = 0; y < h; y++) Array.Copy(src, y * w, dst, (y0 + y) * dstStride + x0, w);
+        }
+
+        private static readonly Av1IntraPredMode[] IntraModes =
+        [
+            Av1IntraPredMode.Dc, Av1IntraPredMode.Vertical, Av1IntraPredMode.Horizontal, Av1IntraPredMode.DiagDownLeft,
+            Av1IntraPredMode.DiagDownRight, Av1IntraPredMode.VerticalRight, Av1IntraPredMode.HorizontalDown,
+            Av1IntraPredMode.HorizontalUp, Av1IntraPredMode.VerticalLeft, Av1IntraPredMode.Smooth, Av1IntraPredMode.SmoothV,
+            Av1IntraPredMode.SmoothH, Av1IntraPredMode.Paeth,
+        ];
+
+        private static bool IsSmooth(int m) => m == (int)Av1IntraPredMode.Smooth || m == (int)Av1IntraPredMode.SmoothV || m == (int)Av1IntraPredMode.SmoothH;
+
+        // The decoder's intra prediction of one transform block (Av1Reconstruction.ReconBlockIntra): edges from the
+        // pre-filter reconstruction, the smooth-neighbour flags from the blocks above / left of the BLOCK.
+        private void PredictIntraTx(int pl, int mode, int bx, int by, int blkX, int blkY, int tx, Av1EdgeFlags edgeFlags,
+            ushort[] plane, int stride, ushort[] dst, int dstStride, int dstOff)
+        {
+            ref readonly var td = ref Av1Tables.TxfmDimensions[tx];
+            int ssH = pl != 0 ? SsX : 0, ssV = pl != 0 ? SsY : 0;
+            Span<ushort> edge = stackalloc ushort[257];
+            int angle = 0;
+            int xpos = bx >> ssH, ypos = by >> ssV;
+            int m = Av1Reconstruction.PrepareIntraEdges(
+                xpos, xpos > (colStart >> ssH), ypos, ypos > (rowStart >> ssV), colEnd >> ssH, rowEnd >> ssV, edgeFlags,
+                plane, ypos * 4 * stride + xpos * 4, stride, default, (Av1IntraPredMode)mode, ref angle, td.W, td.H,
+                SeqEdgeFilter, edge, 128, Bd);
+            int flags = (SeqEdgeFilter ? 1 << 10 : 0);
+            if (pl == 0)
+            {
+                if (blkY > rowStart && ModeMap[(blkY - 1) * Bw + blkX] >= 0 && IsSmooth(ModeMap[(blkY - 1) * Bw + blkX])) flags |= 512;
+                if (blkX > colStart && ModeMap[blkY * Bw + blkX - 1] >= 0 && IsSmooth(ModeMap[blkY * Bw + blkX - 1])) flags |= 512;
+                Av1IntraPred.Predict16(m, dst.AsSpan(dstOff), dstStride, edge, 128, td.W * 4, td.H * 4, angle | flags,
+                    4 * Bw - 4 * bx, 4 * Bh - 4 * by, Bd);
+            }
+            else
+            {
+                int cbx = blkX >> SsX, cby = blkY >> SsY;
+                if (blkY > rowStart && IsSmooth(UvMap[(cby - 1) * CBw + cbx])) flags |= 512;
+                if (blkX > colStart && IsSmooth(UvMap[cby * CBw + cbx - 1])) flags |= 512;
+                Av1IntraPred.Predict16(m, dst.AsSpan(dstOff), dstStride, edge, 128, td.W * 4, td.H * 4, angle | flags,
+                    (4 * Bw + SsX - 4 * (bx & ~SsX)) >> SsX, (4 * Bh + SsY - 4 * (by & ~SsY)) >> SsY, Bd);
+            }
+        }
+
+        // An intra leaf (largest transform, DCT_DCT, UV_DC): the best luma mode by rate-distortion, reconstructed like
+        // the decoder (the chroma transforms predict from the ones before them).
+        private Leaf? EvaluateIntra(int bs, int bx, int by, Av1EdgeFlags edge, int edgeIdx, out double bestJ)
+        {
+            bestJ = double.MaxValue;
+            int bw4 = Av1Tables.BlockDimensions[bs, 0], bh4 = Av1Tables.BlockDimensions[bs, 1];
+            int n = bw4 * 4;
+            int tx = Av1Tables.MaxTxfmSizeForBlockSize[bs, 0];
+            if (Av1Tables.TxfmDimensions[tx].W != bw4) return null;   // one luma transform per block (squares up to 64)
+            int w4 = Math.Min(bw4, Bw - bx), h4 = Math.Min(bh4, Bh - by);
+            // ReconBlockIntra edge flags for the single luma transform (initX = initY = 0).
+            int sbHasTr = 16 < w4 ? 1 : (edge & Av1EdgeFlags.I444TopHasRight) != 0 ? 1 : 0;
+            int sbHasBl = 16 < h4 ? 1 : (edge & Av1EdgeFlags.I444LeftHasBottom) != 0 ? 1 : 0;
+            int subW4 = Math.Min(w4, 16), subH4 = Math.Min(h4, 16);
+            var lumaEdge = ((sbHasTr == 0 && bw4 >= subW4) ? 0 : Av1EdgeFlags.I444TopHasRight) |
+                           ((sbHasBl == 0 && bh4 >= subH4) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
+            var m = cdf.Mode;
+            double hdrBits = Av1CoeffEncode.SymBits(cdf.GetIntraCdf(0), 0);
+            ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+            if (tDim.Max > (int)Av1TxSize.Tx4x4) hdrBits += Av1CoeffEncode.SymBits(cdf.GetTxSzCdf(tDim.Max - 1, 0), 0);
+            var ymCdf = cdf.GetYModeCdf(Av1Tables.YmodeSizeContext[bs]);
+            int rc = Math.Min(n, 32) * Math.Min(n, 32);
+
+            // Luma: every mode (angle delta 0), full rate-distortion on the prediction residual.
+            int bestMode = 0;
+            int[]? bestLv = null;
+            ushort[]? bestRec = null;
+            double bestLumaJ = double.MaxValue, bestLumaD = 0, bestLumaBits = 0;
+            var pred = new ushort[n * n];
+            foreach (var mode in IntraModes)
+            {
+                PredictIntraTx(0, (int)mode, bx, by, bx, by, tx, lumaEdge, RecY, PadW, pred, n, 0);
+                double bits = Av1CoeffEncode.SymBits(ymCdf, (int)mode);
+                if (mode >= Av1IntraPredMode.Vertical && mode <= Av1IntraPredMode.VerticalLeft)
+                    bits += Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), 3);
+                if (mode == Av1IntraPredMode.Dc && SeqFilterIntra && n <= 32) bits += Av1CoeffEncode.SymBits(cdf.GetFilterIntraCdf((Av1BlockSize)bs), 0);
+                var (lv, rec, d, cb) = IntraResidual(SrcY, PadW, bx * 4, by * 4, n, n, tx, pred, 0, (int)mode, W - bx * 4, H - by * 4);
+                double jl = d + Lambda * (bits + cb);
+                if (jl < bestLumaJ) { bestLumaJ = jl; bestMode = (int)mode; bestLv = lv; bestRec = rec; bestLumaD = d; bestLumaBits = bits + cb; }
+            }
+
+            var leaf = new Leaf { Bx = bx, By = by, Bs = bs, EdgeIdx = edgeIdx, Edge = edge, Intra = true, YMode = bestMode, IntraRecY = bestRec };
+            leaf.LumaTx[(bx, by)] = bestLv!;
+            double dTot = bestLumaD, bitsTot = hdrBits + bestLumaBits;
+            if (!Mono)
+            {
+                // UV_DC; each chroma transform predicts from the reconstruction written before it.
+                bool cflAllowed = ((Av1Tables.CflAllowedMask >> bs) & 1) != 0;
+                bitsTot += Av1CoeffEncode.SymBits(cdf.GetUvModeCdf(cflAllowed, bestMode), (int)Av1IntraPredMode.Dc);
+                int uvtx = Av1Tables.MaxTxfmSizeForBlockSize[bs, (int)Layout];
+                ref readonly var ut = ref Av1Tables.TxfmDimensions[uvtx];
+                int cw = n >> SsX, ch = n >> SsY, cStride = PadW >> SsX;
+                int cpx = (bx * 4) >> SsX, cpy = (by * 4) >> SsY;
+                int cw4 = (w4 + SsX) >> SsX, ch4 = (h4 + SsY) >> SsY;
+                int subCw4 = Math.Min(cw4, 16 >> SsX), subCh4 = Math.Min(ch4, 16 >> SsY);
+                var layoutBit = (Av1EdgeFlags)((int)Av1EdgeFlags.I420TopHasRight >> ((int)Layout - 1));
+                var layoutBitB = (Av1EdgeFlags)((int)Av1EdgeFlags.I420LeftHasBottom >> ((int)Layout - 1));
+                int uvSbHasTr = (16 >> SsX) < cw4 ? 1 : (edge & layoutBit) != 0 ? 1 : 0;
+                int uvSbHasBl = (16 >> SsY) < ch4 ? 1 : (edge & layoutBitB) != 0 ? 1 : 0;
+                for (int pl = 1; pl <= 2; pl++)
+                {
+                    var plane = pl == 1 ? RecU : RecV;
+                    var srcP = pl == 1 ? SrcU : SrcV;
+                    var levels = new List<int[]>();
+                    for (int yy = 0; yy < subCh4; yy += ut.H)
+                        for (int xx = 0; xx < subCw4; xx += ut.W)
+                        {
+                            var le = (((yy > 0 || uvSbHasTr == 0) && xx + ut.W >= subCw4) ? 0 : Av1EdgeFlags.I444TopHasRight) |
+                                     ((xx > 0 || (uvSbHasBl == 0 && yy + ut.H >= subCh4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
+                            int tbx = bx + (xx << SsX), tby = by + (yy << SsY);
+                            int ox = cpx + xx * 4, oy = cpy + yy * 4;
+                            var tp = new ushort[ut.W * 4 * ut.H * 4];
+                            PredictIntraTx(pl, (int)Av1IntraPredMode.Dc, tbx, tby, bx, by, uvtx, le, plane, cStride, tp, ut.W * 4, 0);
+                            var (lv, rec, d, cb) = IntraResidual(srcP, cStride, ox, oy, ut.W * 4, ut.H * 4, uvtx, tp, pl, 0,
+                                CW - ox, CH - oy);
+                            Blit(rec, ut.W * 4, ut.H * 4, plane, cStride, ox, oy);   // later transforms predict from it
+                            levels.Add(lv);
+                            dTot += d; bitsTot += cb;
+                        }
+                    // Transforms past the visible area (not coded) keep their prediction-free zero levels.
+                    int nctw = cw / (ut.W * 4), ncth = ch / (ut.H * 4);
+                    var full = new List<int[]>();
+                    int k = 0;
+                    for (int yy = 0; yy < ncth; yy++)
+                        for (int xx = 0; xx < nctw; xx++)
+                            full.Add(yy * ut.H < subCh4 && xx * ut.W < subCw4 ? levels[k++] : new int[Math.Min(ut.W * 4, 32) * Math.Min(ut.H * 4, 32)]);
+                    var recC = new ushort[cw * ch];
+                    for (int y = 0; y < ch; y++) Array.Copy(plane, (cpy + y) * cStride + cpx, recC, y * cw, cw);
+                    if (pl == 1) { leaf.ULevels = full; leaf.IntraRecU = recC; } else { leaf.VLevels = full; leaf.IntraRecV = recC; }
+                }
+            }
+            bool any = leaf.LumaTx.Values.Any(HasNonZero) || leaf.ULevels.Exists(HasNonZero) || leaf.VLevels.Exists(HasNonZero);
+            leaf.Skip = !any;
+            double skipBits = Av1CoeffEncode.SymBits(cdf.GetSkipCdf(0), leaf.Skip ? 1 : 0);
+            bestJ = dTot + Lambda * (bitsTot + skipBits);
+            return leaf;
+        }
+
+        // One intra transform block: residual against pred, quantize (DCT_DCT, RDOQ up to 16x16), reconstruct.
+        // Distortion over the visible (visW x visH) part.
+        private (int[] Levels, ushort[] Rec, double D, double Bits) IntraResidual(ushort[] src, int srcW, int px, int py, int tw, int th,
+            int tx, ushort[] pred, int plane, int yMode, int visW, int visH)
+        {
+            int rcCount = Math.Min(tw, 32) * Math.Min(th, 32);
+            var res = new int[tw * th];
+            for (int y = 0; y < th; y++)
+                for (int x = 0; x < tw; x++) res[y * tw + x] = src[(py + y) * srcW + px + x] - pred[y * tw + x];
+            var qf = InterRdoqScale > 0 && rcCount <= InterRdoqMaxCoefs ? new double[rcCount] : null;
+            int[] lv = Av1FwdTransform.ForwardQuantRect(res, tw, th, tx, DcDq, AcDq, rcCount, Av1FwdTransform.FwdTxType.DctDct, qf);
+            if (qf != null && HasNonZero(lv))
+                Av1CoeffEncode.RdoqOptimize(cdf.Coef, cdf.Mode, tx, plane > 0 ? 1 : 0, yMode, lv, qf, DcDq, AcDq, 0, 0, 1, InterRdoqScale * Lambda);
+            double bits = Av1CoeffEncode.EstimateCoefBits(cdf.Coef, cdf.Mode, tx, plane > 0 ? 1 : 0, yMode, lv, 0, 0, 1);
+            var rec = (ushort[])pred.Clone();
+            if (HasNonZero(lv)) Reconstruct(lv, tx, rec, tw);
+            double d = 0;
+            for (int y = 0; y < Math.Min(th, visH); y++)
+                for (int x = 0; x < Math.Min(tw, visW); x++) { double e = src[(py + y) * srcW + px + x] - rec[y * tw + x]; d += e * e; }
+            return (lv, rec, d, bits);
+        }
+
         private sealed class TxNode
         {
             public double DSkip, DCoded, Bits;
@@ -805,7 +1121,11 @@ internal static class Av1InterEncoder
                             recon[y * tw + x] = (ushort)p;
                         }
                     dSkip += ss;
-                    int[] lv = Av1FwdTransform.ForwardQuantRect(res, tw, th, tx, DcDq, AcDq, rcCount, Av1FwdTransform.FwdTxType.DctDct);
+                    var qf = InterRdoqScale > 0 && rcCount <= InterRdoqMaxCoefs ? new double[rcCount] : null;
+                    int[] lv = Av1FwdTransform.ForwardQuantRect(res, tw, th, tx, DcDq, AcDq, rcCount, Av1FwdTransform.FwdTxType.DctDct, qf);
+                    if (qf != null && HasNonZero(lv))
+                        Av1CoeffEncode.RdoqOptimize(cdf.Coef, cdf.Mode, tx, plane > 0 ? 1 : 0, 0, lv, qf, DcDq, AcDq, 0, 0, 1,
+                            InterRdoqScale * Lambda);
                     levelsOut.Add(lv);
                     if (!HasNonZero(lv)) { dCoded += ss; coefBits += Av1CoeffEncode.EstimateCoefBits(cdf.Coef, cdf.Mode, tx, plane > 0 ? 1 : 0, 0, lv, 0, 0, 1, inter: true); continue; }
                     coefBits += Av1CoeffEncode.EstimateCoefBits(cdf.Coef, cdf.Mode, tx, plane > 0 ? 1 : 0, 0, lv, 0, 0, 1, inter: true);
@@ -864,6 +1184,14 @@ internal static class Av1InterEncoder
         private static Av1RefMvsBlock TemplateFor(Leaf leaf, int interMode)
         {
             int bw4 = Av1Tables.BlockDimensions[leaf.Bs, 0], bh4 = Av1Tables.BlockDimensions[leaf.Bs, 1];
+            if (leaf.Intra)   // the intra-ref marker (DecodeBlock)
+                return new Av1RefMvsBlock
+                {
+                    Ref = new Av1RefMvsRefPair { Ref0 = 0, Ref1 = -1 },
+                    Mv = new Av1RefMvsMvPair { Mv0 = new Av1MotionVector { Raw = 0x80008000 } },
+                    Bs = (byte)leaf.Bs,
+                    Mf = 0,
+                };
             if (leaf.Ref1 >= 0)   // dav1d splat_tworef_mv
                 return new Av1RefMvsBlock
                 {
@@ -954,6 +1282,11 @@ internal static class Av1InterEncoder
             int cbx4 = bx4 >> SsX, cby4 = by4 >> SsY, cbw4 = (bw4 + SsX) >> SsX, cbh4 = (bh4 + SsY) >> SsY;
             var m = cdf.Mode;
 
+            if (leaf.Intra)
+            {
+                WriteIntraBlock(leaf, bs, bx4, by4, bxAbs, byAbs, bw4, bh4, w4, h4, haveTop, haveLeft, hasChroma, cbx4, cby4, cbw4, cbh4);
+                return;
+            }
             // skip (inter frame), then is_inter, then the single reference (read_ref_frames).
             int sctx = above.Skip[bx4] + left.Skip[by4];
             msac.EncodeBoolAdapt(cdf.GetSkipCdf(sctx), leaf.Skip ? 1u : 0u);
@@ -1190,6 +1523,94 @@ internal static class Av1InterEncoder
             return mode;
         }
 
+        // An intra block of an inter frame (DecodeBlock intra branch + DecodeBlockIntra + ReconBlockIntra order +
+        // UpdateIntraBlockContext): skip, is_inter = 0, y mode, angle delta, UV_DC, filter intra off, tx depth 0, then
+        // per 64x64 chunk the luma transform and the chroma transforms.
+        private void WriteIntraBlock(Leaf leaf, int bs, int bx4, int by4, int bxAbs, int byAbs, int bw4, int bh4, int w4, int h4,
+            bool haveTop, bool haveLeft, bool hasChroma, int cbx4, int cby4, int cbw4, int cbh4)
+        {
+            var m = cdf.Mode;
+            msac.EncodeBoolAdapt(cdf.GetSkipCdf(above.Skip[bx4] + left.Skip[by4]), leaf.Skip ? 1u : 0u);
+            msac.EncodeBoolAdapt(cdf.GetIntraCdf(Av1Decode.GetIntraCtx(above, left, by4, bx4, haveTop, haveLeft)), 0);   // is_inter = 0
+            int mode = leaf.YMode;
+            msac.EncodeSymbolAdapt(cdf.GetYModeCdf(Av1Tables.YmodeSizeContext[bs]), mode, Av1Constants.NumIntraPredModes - 1);
+            if (mode >= (int)Av1IntraPredMode.Vertical && mode <= (int)Av1IntraPredMode.VerticalLeft)
+                msac.EncodeSymbolAdapt(cdf.GetAngleDeltaCdf(mode - (int)Av1IntraPredMode.Vertical), 3, 6);
+            if (hasChroma)
+            {
+                bool cflAllowed = ((Av1Tables.CflAllowedMask >> bs) & 1) != 0;
+                msac.EncodeSymbolAdapt(cdf.GetUvModeCdf(cflAllowed, mode), (int)Av1IntraPredMode.Dc,
+                    Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1));
+            }
+            if (mode == (int)Av1IntraPredMode.Dc && SeqFilterIntra && Math.Max(Av1Tables.BlockDimensions[bs, 2], Av1Tables.BlockDimensions[bs, 3]) <= 3)
+                msac.EncodeBoolAdapt(cdf.GetFilterIntraCdf((Av1BlockSize)bs), 0);
+            int tx = Av1Tables.MaxTxfmSizeForBlockSize[bs, 0];
+            ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+            if (UseVarTx && tDim.Max > (int)Av1TxSize.Tx4x4)
+                msac.EncodeSymbolAdapt(cdf.GetTxSzCdf(tDim.Max - 1, Av1Decode.GetTxCtx(above, left, in tDim, by4, bx4)), 0, Math.Min((int)tDim.Max, 2));
+
+            // Coefficients: the single luma transform, then each chroma plane's transforms.
+            if (leaf.Skip)
+            {
+                FillCoefCtx(above.LCoef, bx4, bw4, 0x40);
+                FillCoefCtx(left.LCoef, by4, bh4, 0x40);
+                if (hasChroma)
+                {
+                    FillCoefCtx(above.CCoef0, cbx4, cbw4, 0x40); FillCoefCtx(above.CCoef1, cbx4, cbw4, 0x40);
+                    FillCoefCtx(left.CCoef0, cby4, cbh4, 0x40); FillCoefCtx(left.CCoef1, cby4, cbh4, 0x40);
+                }
+            }
+            else
+            {
+                WriteCoefs(tx, bs, 0, leaf.LumaTx[(bxAbs, byAbs)], above.LCoef, bx4, left.LCoef, by4,
+                    Math.Min(tDim.W, Bw - bxAbs), Math.Min(tDim.H, Bh - byAbs), mode);
+                if (hasChroma)
+                {
+                    int uvtx = Av1Tables.MaxTxfmSizeForBlockSize[bs, (int)Layout];
+                    ref readonly var ut = ref Av1Tables.TxfmDimensions[uvtx];
+                    int cw4 = (w4 + SsX) >> SsX, ch4 = (h4 + SsY) >> SsY;
+                    int subCw4 = Math.Min(cw4, 16 >> SsX), subCh4 = Math.Min(ch4, 16 >> SsY);
+                    int nctw = cbw4 / ut.W;
+                    for (int pl = 0; pl < 2; pl++)
+                    {
+                        var ac = pl == 0 ? above.CCoef0 : above.CCoef1;
+                        var lc = pl == 0 ? left.CCoef0 : left.CCoef1;
+                        var levels = pl == 0 ? leaf.ULevels : leaf.VLevels;
+                        for (int y = 0; y < subCh4; y += ut.H)
+                            for (int x = 0; x < subCw4; x += ut.W)
+                            {
+                                int tbx = bxAbs + (x << SsX), tby = byAbs + (y << SsY);
+                                WriteCoefs(uvtx, bs, 1, levels[(y / ut.H) * nctw + x / ut.W], ac, cbx4 + x, lc, cby4 + y,
+                                    Math.Max(0, Math.Min(ut.W, (Bw - tbx + SsX) >> SsX)), Math.Max(0, Math.Min(ut.H, (Bh - tby + SsY) >> SsY)), mode);
+                            }
+                    }
+                }
+            }
+
+            // UpdateIntraBlockContext.
+            for (int i = 0; i < bw4 && bx4 + i < 32; i++)
+            {
+                above.TxIntra[bx4 + i] = (sbyte)tDim.Lw; above.Tx[bx4 + i] = (sbyte)tDim.Lw; above.Mode[bx4 + i] = (byte)mode;
+                above.PalSz[bx4 + i] = 0; above.SegPred[bx4 + i] = 0; above.SkipMode[bx4 + i] = 0; above.Intra[bx4 + i] = 1;
+                above.Skip[bx4 + i] = leaf.Skip ? (byte)1 : (byte)0; above.CompType[bx4 + i] = 0; above.Ref0[bx4 + i] = -1; above.Ref1[bx4 + i] = -1;
+                above.Filter0[bx4 + i] = Av1Tables.NSwitchableFilters; above.Filter1[bx4 + i] = Av1Tables.NSwitchableFilters;
+            }
+            for (int j = 0; j < bh4 && by4 + j < 32; j++)
+            {
+                left.TxIntra[by4 + j] = (sbyte)tDim.Lh; left.Tx[by4 + j] = (sbyte)tDim.Lh; left.Mode[by4 + j] = (byte)mode;
+                left.PalSz[by4 + j] = 0; left.SegPred[by4 + j] = 0; left.SkipMode[by4 + j] = 0; left.Intra[by4 + j] = 1;
+                left.Skip[by4 + j] = leaf.Skip ? (byte)1 : (byte)0; left.CompType[by4 + j] = 0; left.Ref0[by4 + j] = -1; left.Ref1[by4 + j] = -1;
+                left.Filter0[by4 + j] = Av1Tables.NSwitchableFilters; left.Filter1[by4 + j] = Av1Tables.NSwitchableFilters;
+            }
+            if (hasChroma)
+            {
+                for (int i = 0; i < cbw4 && cbx4 + i < 32; i++) above.UvMode[cbx4 + i] = (byte)Av1IntraPredMode.Dc;
+                for (int j = 0; j < cbh4 && cby4 + j < 32; j++) left.UvMode[cby4 + j] = (byte)Av1IntraPredMode.Dc;
+            }
+            var tmpl = TemplateFor(leaf, 0);
+            Av1RefMvs.SplatMv(rt.R, (byAbs & 31) + 5, in tmpl, bxAbs, bw4, bh4);
+        }
+
         // dav1d read_tx_tree, encoder side: the split flag (below depth 2, above 4x4), the recursion into sub-transforms
         // that start inside the frame, and the leaf's log2 size into the above / left tx contexts.
         private void WriteTxTree(Leaf leaf, int tx, int depth, int xOff, int yOff, int bx, int by)
@@ -1253,13 +1674,15 @@ internal static class Av1InterEncoder
             if (cnt > 0) Array.Fill(arr, v, off, cnt);
         }
 
-        private void WriteCoefs(int tx, int bs, int chroma, int[] levels, byte[] a, int aOff, byte[] l, int lOff, int ctw, int cth)
+        private void WriteCoefs(int tx, int bs, int chroma, int[] levels, byte[] a, int aOff, byte[] l, int lOff, int ctw, int cth,
+            int intraYMode = -1)
         {
             ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
             int aLen = Math.Max(1, Math.Min(tDim.W, 32 - aOff)), lLen = Math.Max(1, Math.Min(tDim.H, 32 - lOff));
             int skipCtx = Av1CoeffDecode.GetSkipCtx(in tDim, bs, a.AsSpan(aOff, aLen), l.AsSpan(lOff, lLen), chroma, (int)Layout);
             int signCtx = Av1CoeffDecode.GetDcSignCtx(tx, a.AsSpan(aOff, aLen), l.AsSpan(lOff, lLen));
-            Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, tx, chroma, 0, levels, skipCtx, signCtx, 1, inter: true);
+            Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, tx, chroma, Math.Max(intraYMode, 0), levels, skipCtx, signCtx, 1,
+                inter: intraYMode < 0);
             byte cf = CfCtx(levels, tx);
             if (ctw > 0) Av1BlockContextManaged.Fill(a, aOff, Math.Min(ctw, a.Length - aOff), cf);
             if (cth > 0) Av1BlockContextManaged.Fill(l, lOff, Math.Min(cth, l.Length - lOff), cf);

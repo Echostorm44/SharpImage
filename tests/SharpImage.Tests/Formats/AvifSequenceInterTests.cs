@@ -136,17 +136,20 @@ public sealed class AvifSequenceInterTests
     {
         using var seq = Panning(72, 40, 4, true);
         byte[] avif = HeifCoder.EncodeAvifSequence(seq, new AvifEncodeOptions { Quality = 80, BitDepth = depth, ChromaSubsampling = cs });
-        using var intra = HeifCoder.DecodeSequence(HeifCoder.EncodeAvifSequence(seq,
-            new AvifEncodeOptions { Quality = 80, BitDepth = depth, ChromaSubsampling = cs, KeyframeInterval = 1 }));
+        byte[] intraFile = HeifCoder.EncodeAvifSequence(seq,
+            new AvifEncodeOptions { Quality = 80, BitDepth = depth, ChromaSubsampling = cs, KeyframeInterval = 1 });
+        await Assert.That(avif.Length).IsLessThan(intraFile.Length);
+        using var intra = HeifCoder.DecodeSequence(intraFile);
         var sync = SyncSamples(avif);
         await Assert.That(sync.Count).IsEqualTo(2);
         await Assert.That(sync[1]!).IsEquivalentTo(sync[0]!);   // the alpha track keeps the colour key frames
         using var dec = HeifCoder.DecodeSequence(avif);
         for (int i = 0; i < 4; i++)
         {
-            // TODO(#27): back to -1.0 once inter frames get intra blocks / tx selection — the key-frame edge fix made
-            // all-intra 10-bit 4:4:4 of this 72x40 (all partial superblocks) ~5 dB better than the inter path.
-            await Assert.That(Psnr(dec[i], seq[i])).IsGreaterThan(Psnr(intra[i], seq[i]) - 6.0);
+            // All-intra frames are each coded at the boosted key-frame q-index (0.43x the cq quantizer, as libaom's
+            // key frames: up to ~7 dB finer), inter frames at the cq level itself — so they trail the all-intra
+            // frames by part of that q difference, at a fraction of the size.
+            await Assert.That(Psnr(dec[i], seq[i])).IsGreaterThan(Psnr(intra[i], seq[i]) - 5.0);
             double aErr = 0;
             for (int y = 0; y < 40; y++)
             {

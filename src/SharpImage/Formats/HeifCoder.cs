@@ -1398,6 +1398,7 @@ public static partial class HeifCoder
         };
         int lf = InterLoopFilterLevel(baseQIdx, bd);
         int arfQIdx = BoostedQIdx(baseQIdx, bd, SequenceArfQuantizerScale);
+        int midQIdx = BoostedQIdx(baseQIdx, bd, SequenceMidArfQuantizerScale);
         using (Av1.Av1ObuWriter.UseLayers(ls))
         {
             int lastKeyBytes = 0, sinceKey = 0, lastSlot = 0, goldenSlot = 0;
@@ -1432,7 +1433,7 @@ public static partial class HeifCoder
 
             // One inter frame of source frame i reading LAST / GOLDEN / ALTREF from the given slots (ALTREF -1: none),
             // replacing the slots in refresh; hidden frames stay showable.
-            byte[] Inter(int i, int last, int golden, int arf, int refresh, bool show, int qIdx)
+            byte[] Inter(int i, int last, int golden, int arf, int refresh, bool show, int qIdx, int bwd = -1)
             {
                 var pics = new Dictionary<int, Av1.Av1InterEncoder.Picture>();
                 Av1.Av1InterEncoder.Picture Slot(int sl)
@@ -1444,18 +1445,50 @@ public static partial class HeifCoder
                 refs[0] = Slot(last);
                 if (golden != last) refs[3] = Slot(golden);
                 if (arf >= 0 && arf != last && arf != golden) refs[6] = Slot(arf);
+                if (bwd >= 0 && bwd != last && bwd != golden && bwd != arf) refs[4] = Slot(bwd);
                 int alt = arf >= 0 ? arf : golden;
-                ls.RefFrameIdx = [last, last, last, golden, alt, alt, alt];
+                ls.RefFrameIdx = [last, last, last, golden, bwd >= 0 ? bwd : alt, alt, alt];
                 ls.RefreshFlags = refresh;
                 ls.ShowFrame = show;
-                ls.ReferenceSelect = SequenceCompound && refs[6] != null;   // compound (past + ALTREF) prediction
+                ls.ReferenceSelect = SequenceCompound && (refs[6] != null || refs[4] != null);   // compound (past + future)
                 ls.InterFrame = true;
                 try
                 {
                     var (yP, uP, vP, _, _) = coded[i];
                     using (Grain(i))
-                        return Av1.Av1InterEncoder.EncodeFrameObu(new Av1.Av1InterEncoder.Picture { Y = yP, U = uP, V = vP, Width = w, Height = h },
-                            refs, bd, codedLayout, qIdx, noCdef, lf);
+                    {
+                        var build = Av1.Av1InterEncoder.EncodeFrameVariants(new Av1.Av1InterEncoder.Picture { Y = yP, U = uP, V = vP, Width = w, Height = h },
+                            refs, bd, codedLayout, qIdx, colorDec.SequenceIntraTools);
+                        if (!SequenceFilterSearch) return build(lf, noCdef);
+                        // Deblocking level, then CDEF strength, by decoding each variant into the refreshed slot and
+                        // measuring it against the source (libaom's full-image loop filter / CDEF search); the slot
+                        // is restored after every trial.
+                        int slot = System.Numerics.BitOperations.TrailingZeroCount(refresh);
+                        long Trial(int lfv, Av1.Av1ObuWriter.CdefParams cd)
+                        {
+                            var snap = colorDec.SnapshotSlot(slot);
+                            Decode([.. td, .. build(lfv, cd)], false);
+                            var r = colorDec.ReferencePicture(slot, mono, gssX, gssY);
+                            long sse = PlaneSse(r.Y, yP) + (uP != null ? PlaneSse(r.U!, uP) + PlaneSse(r.V!, vP!) : 0);
+                            colorDec.RestoreSlot(slot, snap);
+                            return sse;
+                        }
+                        int g = InterLoopFilterLevel(qIdx, bd), bestLf = 0;
+                        long best = long.MaxValue;
+                        foreach (int cand in new[] { 0, g / 2, g, Math.Min(63, g * 3 / 2) }.Distinct())
+                        {
+                            long e = Trial(cand, noCdef);
+                            if (e < best) { best = e; bestLf = cand; }
+                        }
+                        var bestCdef = noCdef;
+                        foreach (byte st in new byte[] { (1 << 2) | 0, (2 << 2) | 1, (4 << 2) | 1, (8 << 2) | 2 })
+                        {
+                            var cd = new Av1.Av1ObuWriter.CdefParams(3, 0, [st], [st]);
+                            long e = Trial(bestLf, cd);
+                            if (e < best) { best = e; bestCdef = cd; }
+                        }
+                        return build(bestLf, bestCdef);
+                    }
                 }
                 finally
                 {
@@ -1467,18 +1500,18 @@ public static partial class HeifCoder
                 }
             }
 
-            // A slot other than the ones given (8 slots; at most three are live).
-            static int FreeSlot(int a, int b)
+            // A slot other than the ones given (8 slots; at most four are live).
+            static int FreeSlot(int a, int b, int c = -1)
             {
-                for (int sl = 0; ; sl++) if (sl != a && sl != b) return sl;
+                for (int sl = 0; ; sl++) if (sl != a && sl != b && sl != c) return sl;
             }
 
             // A shown inter frame from LAST / GOLDEN (/ ALTREF); false when it is a scene cut (about as large as a key
             // frame) — the caller codes a key frame instead.
-            bool Shown(int i, int arf, byte[]? prefix)
+            bool Shown(int i, int arf, byte[]? prefix, int bwd = -1)
             {
-                int ws = FreeSlot(goldenSlot, arf >= 0 ? arf : goldenSlot);
-                byte[] obu = Inter(i, lastSlot, goldenSlot, arf, 1 << ws, true, baseQIdx);
+                int ws = FreeSlot(goldenSlot, arf >= 0 ? arf : goldenSlot, bwd);
+                byte[] obu = Inter(i, lastSlot, goldenSlot, arf, 1 << ws, true, baseQIdx, bwd);
                 if (obu.Length > lastKeyBytes * 9 / 10) return false;
                 Decode([.. td, .. obu], false);
                 lastSlot = ws;
@@ -1509,10 +1542,29 @@ public static partial class HeifCoder
                     if (arf.Length <= lastKeyBytes * 9 / 10)
                     {
                         Decode([.. td, .. arf], false);
+                        // Pyramid (libaom's multi-layer GF group): a second hidden frame in the middle, predicted from
+                        // the past and the ALTREF, serves as BWDREF for the first half and is shown in place.
+                        int midIdx = -1, midSlot = -1;
+                        byte[] prefix = arf;
+                        if (gf >= SequencePyramidMinGroup)
+                        {
+                            midIdx = fi + (gf - 1) / 2;
+                            midSlot = FreeSlot(lastSlot, goldenSlot, arfSlot);
+                            byte[] mid = Inter(midIdx, lastSlot, goldenSlot, arfSlot, 1 << midSlot, false, midQIdx);
+                            Decode([.. td, .. mid], false);
+                            prefix = [.. arf, .. mid];
+                        }
                         bool cut = false;
                         for (int k = fi; k < arfIdx && !cut; k++)
                         {
-                            if (!Shown(k, arfSlot, k == fi ? arf : null))
+                            if (k == midIdx)
+                            {
+                                cSamples[k] = [.. td, .. Av1.Av1ObuWriter.ShowExistingFrameObu(midSlot)];
+                                lastSlot = midSlot;
+                                sinceKey++;
+                                continue;
+                            }
+                            if (!Shown(k, arfSlot, k == fi ? prefix : null, k < midIdx ? midSlot : -1))
                             {
                                 Key(k);
                                 fi = k + 1;
@@ -1555,7 +1607,7 @@ public static partial class HeifCoder
                         {
                             aSample = [.. td, .. Av1.Av1InterEncoder.EncodeFrameObu(new Av1.Av1InterEncoder.Picture { Y = alpha, Width = w, Height = h },
                                 alphaDec.ReferencePicture(0, true, 1, 1), bd, Av1.Av1PixelLayout.I400, Math.Max(alphaQIdx, 1), noCdef,
-                                InterLoopFilterLevel(alphaQIdx, bd))];
+                                InterLoopFilterLevel(alphaQIdx, bd), alphaDec.SequenceIntraTools)];
                         }
                         finally { ls.InterFrame = false; }
                     }
@@ -1596,6 +1648,10 @@ public static partial class HeifCoder
     internal static int SequenceMaxGfInterval = 16, SequenceMinArfGroup = 4;
     internal static double SequenceArfQuantizerScale = 0.6;
     internal static bool SequenceCompound = true;
+    internal static bool SequenceFilterSearch = true;
+    // Pyramid: groups of at least this many frames also code a hidden middle frame (BWDREF) at this quantizer scale.
+    internal static int SequencePyramidMinGroup = 6;
+    internal static double SequenceMidArfQuantizerScale = 0.75;
 
     // The q-index whose quantizer is `scale` x the cq level's (av1_compute_qdelta).
     internal static int BoostedQIdx(int cqIdx, int bd, double scale0)
@@ -1610,6 +1666,13 @@ public static partial class HeifCoder
         }
         double qv = Av1.Av1Tables.DequantTable[bdIdx, cqIdx, 1] / scale;
         return Math.Clamp(cqIdx + FindQIdx(qv * scale0) - FindQIdx(qv), 1, 255);
+    }
+
+    private static long PlaneSse(ushort[] a, ushort[] b)
+    {
+        long s = 0;
+        for (int i = 0; i < a.Length; i++) { int d = a[i] - b[i]; s += (long)d * d; }
+        return s;
     }
 
     // libaom picklpf.c LPF_PICK_FROM_Q for inter frames: the deblocking level guessed from the AC quantizer.

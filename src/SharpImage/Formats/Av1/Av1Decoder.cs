@@ -2278,6 +2278,14 @@ internal sealed class Av1Decoder
     /// <summary>The last parsed frame header (diagnostics).</summary>
     internal Av1DecoderFrameHeader CurrentFrameHeader => frameHdr;
 
+    /// <summary>The active sequence header's intra tools (enable_filter_intra, enable_intra_edge_filter).</summary>
+    internal (bool FilterIntra, bool EdgeFilter) SequenceIntraTools => (seqHdr.FilterIntra, seqHdr.IntraEdgeFilter);
+
+    /// <summary>A deep copy of reference slot <paramref name="slot"/> (encoder trial decodes restore it afterwards).</summary>
+    internal Av1ReferenceFrame SnapshotSlot(int slot) => ctx.RefFrames[slot].DeepCopy();
+
+    internal void RestoreSlot(int slot, Av1ReferenceFrame snapshot) => ctx.RefFrames[slot] = snapshot;
+
     /// <summary>Reference slot <paramref name="slot"/> (post-filter reconstruction, before film grain) as a tightly
     /// packed picture — the image sequence encoder predicts its inter frames from exactly what the decoder holds.</summary>
     internal Av1InterEncoder.Picture ReferencePicture(int slot, bool mono, int ssX, int ssY)
