@@ -364,6 +364,11 @@ public static partial class HeifCoder
     // The layer being produced by DecodeProgressive (-1: the default, final image).
     [ThreadStatic] private static int t_progressiveLayer = -1;
 
+    // When set, high-bit-depth YUV->RGB quantises to the coded depth first ((uint16)(0.5 + v * (2^d - 1)), as libavif's
+    // avifImageYUVToRGB does for an RGB image of that depth) and stores that value scaled to 16 bits — so code working
+    // on libavif's native-depth RGB (gain map tone mapping) sees exactly its samples.
+    [ThreadStatic] private static bool t_nativeDepthRgb;
+
     // libavif avifCodecDecodeInputFillFromDecoderItem: an item is progressive when it has 'a1lx' and no 'lsel' selecting
     // a specific layer; its layer count follows from the a1lx sizes (a zero size ends the list; a remainder is the last).
     private static int ProgressiveLayerCount(HeifContainer c, int id)
@@ -419,6 +424,7 @@ public static partial class HeifCoder
             premAlpha = DecodeAlphaNative(c, premAlphaId);
 
         ImageFrame frame = DecodeImageTiles(c, tiles, rows, cols, outW, outH, codec, nclx, premAlpha);
+        frame.Depth = ItemBitDepth(c, tiles[0]);
 
         // ---- alpha: an auxl alpha item (or alpha grid) of the primary; else per-tile alpha items -------------------
         int alphaId = -1;
@@ -517,9 +523,11 @@ public static partial class HeifCoder
         return (tiles, rows, cols, outW, outH, codec);
     }
 
-    // Decodes the colour of resolved tiles to one RGB frame (AV1 grids stitched in YUV, as libavif does).
+    // Decodes the colour of resolved tiles to one RGB frame (AV1 grids stitched in YUV, as libavif does). scaleTo: the
+    // YUV image is first rescaled to that size with libyuv's box filter (libavif avifImageScale), e.g. a gain map
+    // applied to a larger base image.
     private static ImageFrame DecodeImageTiles(HeifContainer c, List<int> tiles, int rows, int cols, int outW, int outH, string codec,
-        (int Cp, int Tc, int Mc, bool Full)? nclx, ushort[]? premAlpha)
+        (int Cp, int Tc, int Mc, bool Full)? nclx, ushort[]? premAlpha, (int W, int H)? scaleTo = null)
     {
         ImageFrame frame;
         if (codec == "av01" && tiles.Count > 1)
@@ -527,8 +535,21 @@ public static partial class HeifCoder
             // AV1 grid: stitch the tiles' YUV planes, then convert once — chroma upsampling crosses tile seams exactly
             // as in libavif (which reassembles the YUV image before avifImageYUVToRGB).
             frame = new ImageFrame();
-            frame.Initialize(outW, outH, ColorspaceType.SRGB, false);
-            DecodeAv1GridInto(c, tiles, cols, outW, outH, nclx, frame);
+            var (fw, fh) = scaleTo ?? (outW, outH);
+            frame.Initialize(fw, fh, ColorspaceType.SRGB, false);
+            DecodeAv1GridInto(c, tiles, cols, outW, outH, nclx, frame, scaleTo);
+            return frame;
+        }
+        if (scaleTo is { } st)
+        {
+            if (codec != "av01") throw new NotSupportedException("Rescaling is only supported for AV1 items.");
+            byte[] coded = c.ItemData(tiles[0]) ?? throw new InvalidDataException($"Item {tiles[0]} has no data.");
+            using var yuv = DecodeAv1Item(c, tiles[0], coded, out var dec, "AV1");
+            var src = yuv.Width == st.W && yuv.Height == st.H ? yuv : ScaleDecodedFrame(yuv, st.W, st.H);
+            frame = new ImageFrame();
+            frame.Initialize(st.W, st.H, ColorspaceType.SRGB, false);
+            ConvertDecodedAv1(src, dec, frame, Nclx(c, tiles[0]) ?? nclx, premAlpha: null);
+            if (!ReferenceEquals(src, yuv)) src.Dispose();
             return frame;
         }
         var tileFrames = new ImageFrame[tiles.Count];
@@ -550,7 +571,7 @@ public static partial class HeifCoder
     // Decodes an AV1 image grid: every tile to YUV, the planes stitched at the tile offsets (clipped to the grid's
     // output size), then one YUV->RGB conversion of the whole image. Tiles must share size, layout and depth.
     private static void DecodeAv1GridInto(HeifContainer c, List<int> tiles, int cols, int outW, int outH,
-        (int Cp, int Tc, int Mc, bool Full)? nclx, ImageFrame frame)
+        (int Cp, int Tc, int Mc, bool Full)? nclx, ImageFrame frame, (int W, int H)? scaleTo = null)
     {
         var yuvs = new List<Av1.DecodedVideoFrame>(tiles.Count);
         try
@@ -612,7 +633,12 @@ public static partial class HeifCoder
             };
             var cicp = nclx ?? (first.ColorPrimaries, first.TransferCharacteristics, first.MatrixCoefficients, first.FullColorRange);
             frame.Metadata.Cicp = new SharpImage.Metadata.CicpInfo(cicp.Cp, cicp.Tc, cicp.Mc, cicp.Full);
-            ConvertYuvToRgbLibavif(stitched, frame, outW, outH, frame.NumberOfChannels, mono, cicp.Mc, cicp.Full, cicp.Cp, ssX, ssY);
+            if (scaleTo is { } st && (st.W != outW || st.H != outH))
+            {
+                using var scaled = ScaleDecodedFrame(stitched, st.W, st.H);
+                ConvertYuvToRgbLibavif(scaled, frame, st.W, st.H, frame.NumberOfChannels, mono, cicp.Mc, cicp.Full, cicp.Cp, ssX, ssY);
+            }
+            else ConvertYuvToRgbLibavif(stitched, frame, outW, outH, frame.NumberOfChannels, mono, cicp.Mc, cicp.Full, cicp.Cp, ssX, ssY);
         }
         finally
         {
@@ -1899,11 +1925,23 @@ public static partial class HeifCoder
                 }
 
                 int off = i * channels;
-                row[off] = Q16f(R);
-                if (channels >= 3)
+                if (t_nativeDepthRgb && hbd)
                 {
-                    row[off + 1] = Q16f(G);
-                    row[off + 2] = Q16f(B);
+                    row[off] = QNative(R, maxCh);
+                    if (channels >= 3)
+                    {
+                        row[off + 1] = QNative(G, maxCh);
+                        row[off + 2] = QNative(B, maxCh);
+                    }
+                }
+                else
+                {
+                    row[off] = Q16f(R);
+                    if (channels >= 3)
+                    {
+                        row[off + 1] = Q16f(G);
+                        row[off + 2] = Q16f(B);
+                    }
                 }
             }
         }
@@ -2014,7 +2052,8 @@ public static partial class HeifCoder
     // image whose coded size is not its item's output size.
     private static Av1.DecodedVideoFrame ScaleDecodedFrame(Av1.DecodedVideoFrame f, int w, int h)
     {
-        int ssx = f.Format == Av1.PixelFormat.Yuv444P ? 0 : 1, ssy = f.Format == Av1.PixelFormat.Yuv420P ? 1 : 0;
+        int ssx = f.Format is Av1.PixelFormat.Yuv444P or Av1.PixelFormat.Yuv444P10 or Av1.PixelFormat.Yuv444P12 ? 0 : 1;
+        int ssy = f.Format is Av1.PixelFormat.Yuv420P or Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12 ? 1 : 0;
         bool hbd = f.BitDepth > 8;
         int scw = (f.Width + ssx) >> ssx, sch = (f.Height + ssy) >> ssy;
         int dcw = (w + ssx) >> ssx, dch = (h + ssy) >> ssy;
@@ -2159,6 +2198,12 @@ public static partial class HeifCoder
         => tab[Math.Min(hbd ? p16[k] : p8[k], maxCh)];
 
     private static ushort Q16f(float v) => (ushort)(0.5f + Math.Clamp(v, 0.0f, 1.0f) * 65535.0f);
+
+    private static ushort QNative(float v, int max)
+    {
+        uint q = (uint)(0.5f + Math.Clamp(v, 0.0f, 1.0f) * max);
+        return (ushort)((q * 65535u + (uint)max / 2) / (uint)max);
+    }
 
     private static ushort Q16(double n) => (ushort)Math.Clamp((int)Math.Round(n * 65535.0), 0, 65535);
 

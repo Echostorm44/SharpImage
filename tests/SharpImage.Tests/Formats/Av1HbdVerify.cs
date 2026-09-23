@@ -809,7 +809,7 @@ public sealed class Av1HbdVerify
                     $" min={F(gm.Min)} max={F(gm.Max)} boff={F(gm.BaseOffset)} aoff={F(gm.AlternateOffset)}" +
                     $" gamma={string.Join(" ", gm.Gamma.Select(f => $"{f.Numerator}/{f.Denominator}"))} usebase={gm.UseBaseColorSpace}" +
                     $" altcicp={gm.AlternateCicp} altclli={gm.AlternateContentLightLevel} altpixi={gm.AlternatePlaneCount}x{gm.AlternateDepth}" +
-                    $" icc={gm.AlternateIccProfile?.Length ?? 0} img={gm.Image!.Columns}x{gm.Image.Rows} depth={gm.ImageDepth}");
+                    $" icc={gm.AlternateIccProfile?.Length ?? 0} img={gm.Image!.Columns}x{gm.Image.Rows} depth={gm.Image.Depth}");
                 var f = gm.Image;
                 int w = (int)f.Columns, h = (int)f.Rows, ch = f.NumberOfChannels;
                 var buf = new byte[w * h * 8];
@@ -829,6 +829,84 @@ public sealed class Av1HbdVerify
             catch (Exception e) { log.AppendLine($"{name} ERROR {e.GetType().Name}: {e.Message}"); }
         }
         File.WriteAllText(Path.Combine(dir, "manifest.txt"), log.ToString());
+    }
+
+    // libyuv scaler probe (trigger hbd_yuvscale.txt naming a cases.bin from scalecases.c): LibyuvScale.ScalePlane vs
+    // libyuv's ScalePlane/ScalePlane_12 (kFilterBox) per case, report in yuvscale.txt next to it.
+    [Test, NotInParallel]
+    public void YuvScaleProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_yuvscale.txt");
+        if (!File.Exists(trig)) return;
+        string bin = File.ReadAllText(trig).Trim();
+        File.Delete(trig);
+        byte[] d = File.ReadAllBytes(bin);
+        var log = new System.Text.StringBuilder();
+        int pos = 0;
+        while (pos < d.Length)
+        {
+            int I(int k) => BitConverter.ToInt32(d, pos + 4 * k);
+            int sw = I(0), sh = I(1), dw = I(2), dh = I(3); bool hbd = I(4) != 0;
+            pos += 20;
+            var src = new ushort[sw * sh];
+            Buffer.BlockCopy(d, pos, src, 0, sw * sh * 2); pos += sw * sh * 2;
+            var want = new ushort[dw * dh];
+            Buffer.BlockCopy(d, pos, want, 0, dw * dh * 2); pos += dw * dh * 2;
+            var got = SharpImage.Formats.LibyuvScale.ScalePlane(src, sw, sw, sh, dw, dh, hbd);
+            int bad = 0, maxd = 0, first = -1;
+            for (int i = 0; i < want.Length; i++)
+            {
+                int df = Math.Abs(got[i] - want[i]);
+                if (df > 0) { bad++; if (first < 0) first = i; }
+                maxd = Math.Max(maxd, df);
+            }
+            log.AppendLine($"{sw}x{sh}->{dw}x{dh} hbd={hbd} bad={bad} max={maxd}" + (first >= 0 ? $" first=({first % dw},{first / dw}) got {got[first]} want {want[first]}" : ""));
+        }
+        File.WriteAllText(Path.Combine(Path.GetDirectoryName(bin)!, "yuvscale.txt"), log.ToString());
+    }
+
+    // Tone map probe (trigger hbd_tm.txt: lines "file|headroom|outName[|cp/tc|depth]"): HeifCoder.DecodeToneMapped, the
+    // result dumped as outName.rgb16 (planar-free little-endian u16 RGB at native depth) + "outName WxH depth cp/tc clli".
+    [Test, NotInParallel]
+    public void ToneMapProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_tm.txt");
+        if (!File.Exists(trig)) return;
+        var lines = File.ReadAllLines(trig);
+        File.Delete(trig);
+        var log = new System.Text.StringBuilder();
+        string dir = "";
+        foreach (var line in lines.Where(l => l.Trim().Length > 0))
+        {
+            var p = line.Trim().Split('|');
+            dir = Path.GetDirectoryName(p[2])!;
+            try
+            {
+                SharpImage.Metadata.CicpInfo? cicp = null;
+                if (p.Length > 3 && p[3].Length > 0) { var t = p[3].Split('/'); cicp = new(int.Parse(t[0]), int.Parse(t[1]), 0, true); }
+                int depth = p.Length > 4 ? int.Parse(p[4]) : 0;
+                var f = HeifCoder.DecodeToneMapped(File.ReadAllBytes(p[0]), float.Parse(p[1], System.Globalization.CultureInfo.InvariantCulture), cicp, depth);
+                int w = (int)f.Columns, h = (int)f.Rows, ch = f.NumberOfChannels;
+                uint max = (1u << f.Depth) - 1;
+                var buf = new byte[w * h * 6];
+                for (int y = 0; y < h; y++)
+                {
+                    var row = f.GetPixelRow(y);
+                    for (int x = 0; x < w; x++)
+                        for (int k = 0; k < 3; k++)
+                        {
+                            ushort v = (ushort)((row[x * ch + k] * max + 32767u) / 65535u);
+                            buf[(y * w + x) * 6 + k * 2] = (byte)v;
+                            buf[(y * w + x) * 6 + k * 2 + 1] = (byte)(v >> 8);
+                        }
+                }
+                File.WriteAllBytes(p[2] + ".rgb16", buf);
+                var c = f.Metadata.Cicp!;
+                log.AppendLine($"{Path.GetFileName(p[2])} {w}x{h} {f.Depth} {c.ColorPrimaries}/{c.TransferCharacteristics} {f.Metadata.ContentLightLevel?.MaxContentLightLevel},{f.Metadata.ContentLightLevel?.MaxFrameAverageLightLevel}");
+            }
+            catch (Exception e) { log.AppendLine($"{Path.GetFileName(p[2])} ERROR {e.GetType().Name}: {e.Message}"); }
+        }
+        File.WriteAllText(Path.Combine(dir, "tm_manifest.txt"), log.ToString());
     }
 
     // Track probe (trigger hbd_track.txt = "file|trackIndex"): decodes every sample of one sequence track with one

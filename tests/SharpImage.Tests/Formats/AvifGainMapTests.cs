@@ -38,6 +38,50 @@ public sealed class AvifGainMapTests
         await Assert.That(Convert.ToHexStringLower(SHA256.HashData(rgb))).IsEqualTo(sha256);
     }
 
+    // Tone mapping vs libavif (avifgainmaputil tonemap to Y4M with an identity matrix, i.e. its exact RGB; CLLI from
+    // avifImageApplyGainMap): SDR->HDR and HDR->SDR, 10-bit bases, grids, gain maps up- and downscaled (libyuv box
+    // filter), PQ / HLG / sRGB / BT.470BG outputs, BT.709 -> BT.2020 / P3 conversion, 8/10/12-bit output. cicp "" =
+    // the tool's defaults. SHA-256 of the native-depth RGB as little-endian u16.
+    [Test]
+    [Arguments("libavif_seine_sdr_gainmap_srgb.avif", 1.3f, "", 0, 8, "1/16", 492, 177, "e7c501b131fcfcffeeda7b10bd49f2257f96f058b6441062881d23199e25b847")]
+    [Arguments("libavif_seine_hdr_gainmap_srgb.avif", 0f, "", 0, 8, "1/13", 313, 99, "44bc5bd266a2f49e33aa79ee385507c42f17265c725714159cfef286b144096b")]
+    [Arguments("libavif_seine_sdr_gainmap_srgb.avif", 1f, "9/16", 12, 12, "9/16", 401, 154, "436ed894b70c28bf60a12ccb1d5ef1548672df3d72f4870fd851d1d3a613064f")]
+    [Arguments("libavif_seine_sdr_gainmap_srgb.avif", 1.3f, "12/18", 10, 10, "12/18", 492, 177, "18ad39b2dbd5a5409c9c12b24eb83261db07bdaed2fead1637105e36b034ece8")]
+    [Arguments("libavif_seine_hdr_gainmap_srgb.avif", 0.7f, "9/1", 8, 8, "9/1", 504, 134, "d1ea4c1ed570e18e244f5020c5dfefa295cc04126a57adee21c418e34b0ee0de")]
+    [Arguments("libavif_color_grid_gainmap_different_grid.avif", 2f, "", 0, 10, "2/16", 12599, 2059, "9d6781eaca5e3d5c8846f1785de8a32a6abcf38ea57b9ddbbd0439204b26cbca")]
+    [Arguments("libavif_color_nogrid_alpha_nogrid_gainmap_grid.avif", 0.5f, "", 0, 10, "2/16", -1, -1, "59ab98eb105a71a1c8bd86b04be7b048de4291d7b68553453f6dc7361ff19ffe")]
+    [Arguments("libavif_seine_sdr_gainmap_big_srgb.avif", 1.3f, "", 0, 8, "1/16", 456, 177, "d682dcf7ed3c8547d2229f441365bc267deec580dbb83917aebf206fe1d232c7")]
+    [Arguments("libavif_seine_hdr_gainmap_small_srgb.avif", 0.5f, "", 0, 10, "1/16", -1, -1, "ac9c3ebe7ba0982bc262ea710b7f35839e1f86f29bd3dab06e6dd9fdbfa1a8f1")]
+    public async Task ToneMapped_MatchesLibavifExactly(string file, float headroom, string cicp, int depth, int wantDepth, string wantCicp,
+        int maxCll, int maxPall, string sha256)
+    {
+        SharpImage.Metadata.CicpInfo? output = null;
+        if (cicp.Length > 0) { var t = cicp.Split('/'); output = new(int.Parse(t[0]), int.Parse(t[1]), 0, true); }
+        var img = HeifCoder.DecodeToneMapped(Asset(file), headroom, output, depth);
+        await Assert.That(img.Depth).IsEqualTo(wantDepth);
+        await Assert.That($"{img.Metadata.Cicp!.ColorPrimaries}/{img.Metadata.Cicp.TransferCharacteristics}").IsEqualTo(wantCicp);
+        if (maxCll >= 0)
+        {
+            await Assert.That((int)img.Metadata.ContentLightLevel!.MaxContentLightLevel).IsEqualTo(maxCll);
+            await Assert.That((int)img.Metadata.ContentLightLevel.MaxFrameAverageLightLevel).IsEqualTo(maxPall);
+        }
+        int w = (int)img.Columns, h = (int)img.Rows, ch = img.NumberOfChannels;
+        uint max = (1u << img.Depth) - 1;
+        var buf = new byte[w * h * 6];
+        for (int y = 0; y < h; y++)
+        {
+            var row = img.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+                for (int k = 0; k < 3; k++)
+                {
+                    ushort v = (ushort)((row[x * ch + k] * max + 32767u) / 65535u);
+                    buf[(y * w + x) * 6 + k * 2] = (byte)v;
+                    buf[(y * w + x) * 6 + k * 2 + 1] = (byte)(v >> 8);
+                }
+        }
+        await Assert.That(Convert.ToHexStringLower(SHA256.HashData(buf))).IsEqualTo(sha256);
+    }
+
     [Test]
     public async Task Metadata_IsReadPerChannel()
     {
@@ -57,7 +101,7 @@ public sealed class AvifGainMapTests
         await Assert.That(gm.AlternateCicp).IsEqualTo(new SharpImage.Metadata.CicpInfo(1, 16, 6, true));
         await Assert.That(gm.AlternatePlaneCount).IsEqualTo(3);
         await Assert.That(gm.AlternateDepth).IsEqualTo(8);
-        await Assert.That(gm.ImageDepth).IsEqualTo(8);
+        await Assert.That(gm.Image!.Depth).IsEqualTo(8);
     }
 
     [Test]

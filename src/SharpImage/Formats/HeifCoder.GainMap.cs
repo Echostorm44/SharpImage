@@ -58,10 +58,13 @@ public sealed class AvifGainMap
     /// <summary>The alternate image's bit depth (pixi on the tmap item), 0 if unknown.</summary>
     public int AlternateDepth { get; set; }
 
-    /// <summary>The gain map image (RGB; grey when single-channel). Null when only metadata was read.</summary>
+    /// <summary>The gain map image (RGB; grey when single-channel; <see cref="ImageFrame.Depth"/> = coded bit depth).
+    /// Null when only metadata was read.</summary>
     public ImageFrame? Image { get; set; }
-    /// <summary>Bit depth the gain map image is coded at.</summary>
-    public int ImageDepth { get; set; } = 8;
+
+    // Decodes the coded gain map rescaled (in YUV, libyuv box filter) to a base image size, as libavif does before
+    // applying it. Null for gain maps not read from a file (then the RGB image is rescaled instead).
+    internal Func<int, int, ImageFrame>? ScaledImage { get; set; }
 
     /// <summary>True when the three channels have different metadata (written with is_multichannel = 1).</summary>
     public bool IsMultichannel =>
@@ -144,8 +147,18 @@ public static partial class HeifCoder
         if (decodeImage)
         {
             var (tiles, rows, cols, outW, outH, codec) = ResolveImageTiles(c, gainMapId);
-            gm.Image = DecodeImageTiles(c, tiles, rows, cols, outW, outH, codec, Nclx(c, gainMapId), premAlpha: null);
-            gm.ImageDepth = ItemBitDepth(c, tiles[0]);
+            // Gain map samples are used as values: keep them at libavif's native-depth RGB precision.
+            var gmNclx = Nclx(c, gainMapId);
+            ImageFrame Decode((int W, int H)? scaleTo)
+            {
+                bool prev = t_nativeDepthRgb;
+                t_nativeDepthRgb = true;
+                try { return DecodeImageTiles(c, tiles, rows, cols, outW, outH, codec, gmNclx, premAlpha: null, scaleTo); }
+                finally { t_nativeDepthRgb = prev; }
+            }
+            gm.Image = Decode(null);
+            gm.Image.Depth = ItemBitDepth(c, tiles[0]);
+            gm.ScaledImage = (w, h) => Decode((w, h));
         }
         return gm;
     }
@@ -209,6 +222,255 @@ public static partial class HeifCoder
         if (writerVersion <= 0 && pos != p.Length) throw new InvalidDataException(Invalid);
         if (gm.Validate() != null) throw new InvalidDataException(Invalid);
         return true;
+    }
+
+    /// <summary>
+    /// Tone maps an AVIF with a gain map for a display with the given HDR headroom (log2 of peak / SDR white; 0 = SDR),
+    /// with the defaults of libavif's <c>avifgainmaputil tonemap</c>: output primaries and transfer from the image being
+    /// reproduced (base or alternate), else the gain map math colour space and PQ (headroom &gt; 0) or sRGB; depth from
+    /// the image reproduced, else the largest involved. The result carries its CICP, depth and content light level.
+    /// </summary>
+    public static ImageFrame DecodeToneMapped(byte[] data, float hdrHeadroom, CicpInfo? output = null, int depth = 0)
+    {
+        // The base as libavif converts it for tone mapping: RGB at its coded depth.
+        ImageFrame baseImage;
+        bool prev = t_nativeDepthRgb;
+        t_nativeDepthRgb = true;
+        try { baseImage = Decode(data); }
+        finally { t_nativeDepthRgb = prev; }
+        var gm = DecodeGainMap(data) ?? throw new InvalidDataException("The image has no gain map.");
+        var baseCicp = baseImage.Metadata.Cicp ?? CicpInfo.Srgb;
+        float baseH = gm.BaseHdrHeadroom.ToSingle(), altH = gm.AlternateHdrHeadroom.ToSingle();
+        bool toHdr = hdrHeadroom > 0.0f;
+        bool toBase = (hdrHeadroom <= baseH && baseH <= altH) || (hdrHeadroom >= baseH && baseH >= altH);
+        bool toAlt = (hdrHeadroom <= altH && altH <= baseH) || (hdrHeadroom >= altH && altH >= baseH);
+        bool baseIsHdr = baseH != 0.0f;
+
+        int cp, tc, mc;
+        if (output != null) (cp, tc, mc) = (output.ColorPrimaries, output.TransferCharacteristics, output.MatrixCoefficients);
+        else if (toBase || (toHdr && baseIsHdr)) (cp, tc, mc) = (baseCicp.ColorPrimaries, baseCicp.TransferCharacteristics, baseCicp.MatrixCoefficients);
+        else (cp, tc, mc) = gm.AlternateCicp is { } a ? (a.ColorPrimaries, a.TransferCharacteristics, a.MatrixCoefficients) : (2, 2, 2);
+        if (cp == 2) cp = gm.UseBaseColorSpace ? baseCicp.ColorPrimaries : gm.AlternateCicp?.ColorPrimaries ?? 2;
+        if (tc == 2) tc = toHdr ? 16 : 13;
+
+        if (depth == 0)
+        {
+            if (toBase) depth = baseImage.Depth;
+            else if (toAlt) depth = gm.AlternateDepth;
+            if (depth == 0) depth = Math.Max(Math.Max(baseImage.Depth, gm.Image!.Depth), gm.AlternateDepth);
+        }
+
+        ContentLightLevel? clli = toBase ? baseImage.Metadata.ContentLightLevel : toAlt ? gm.Image!.Metadata.ContentLightLevel : null;
+        if (clli is { MaxContentLightLevel: 0, MaxFrameAverageLightLevel: 0 }) clli = null;
+        var result = ApplyGainMap(baseImage, gm, hdrHeadroom, cp, tc, depth, out var computed);
+        result.Metadata.Cicp = new CicpInfo(cp, tc, mc, true);
+        result.Metadata.ContentLightLevel = clli ?? computed;
+        return result;
+    }
+
+    /// <summary>
+    /// libavif avifRGBImageApplyGainMap: applies <paramref name="gainMap"/> to <paramref name="baseImage"/> (its CICP from
+    /// Metadata.Cicp, sRGB if absent; its sample precision from <see cref="ImageFrame.Depth"/>) for the given HDR headroom,
+    /// producing RGB in the output primaries/transfer at <paramref name="outputDepth"/> bits (stored 16-bit). A gain map
+    /// of another size is rescaled first. <paramref name="contentLightLevel"/> receives the result's max / average
+    /// light level in nits (SDR white = 203), as libavif computes it.
+    /// </summary>
+    public static ImageFrame ApplyGainMap(ImageFrame baseImage, AvifGainMap gainMap, float hdrHeadroom, int outputColorPrimaries,
+        int outputTransferCharacteristics, int outputDepth, out ContentLightLevel contentLightLevel)
+    {
+        if (hdrHeadroom < 0.0f) throw new ArgumentOutOfRangeException(nameof(hdrHeadroom), "hdrHeadroom should be >= 0");
+        if (gainMap.Validate() is { } why) throw new ArgumentException(why, nameof(gainMap));
+        if (baseImage.IccProfile is { Length: > 0 } || gainMap.AlternateIccProfile is { Length: > 0 })
+            throw new NotSupportedException("Tone mapping for images with ICC profiles is not supported");
+        if (outputDepth is < 1 or > 16) throw new ArgumentOutOfRangeException(nameof(outputDepth));
+        if (gainMap.Image == null) throw new ArgumentException("The gain map has no image.", nameof(gainMap));
+
+        int width = (int)baseImage.Columns, height = (int)baseImage.Rows;
+        var baseCicp = baseImage.Metadata.Cicp ?? CicpInfo.Srgb;
+        int baseCp = baseCicp.ColorPrimaries, baseTc = baseCicp.TransferCharacteristics;
+        int altCp = gainMap.AlternateCicp?.ColorPrimaries ?? 2;
+        int mathCp = gainMap.UseBaseColorSpace || altCp == 2 ? baseCp : altCp;
+        bool needsInput = baseCp != mathCp, needsOutput = mathCp != outputColorPrimaries;
+
+        var result = new ImageFrame();
+        result.Initialize(width, height, ColorspaceType.SRGB, baseImage.HasAlpha);
+        result.Depth = outputDepth;
+        contentLightLevel = new ContentLightLevel(0, 0);
+        int baseDepth = Math.Clamp(baseImage.Depth, 1, 16);
+        float baseMax = (1 << baseDepth) - 1, outMax = (1 << outputDepth) - 1;
+        int bch = baseImage.NumberOfChannels, och = result.NumberOfChannels;
+        bool baseGray = bch - (baseImage.HasAlpha ? 1 : 0) < 3;
+
+        float weight = GainMapWeight(hdrHeadroom, gainMap);
+        if (weight == 0.0f && outputTransferCharacteristics == baseTc && outputColorPrimaries == baseCp && baseDepth == outputDepth)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                var src = baseImage.GetPixelRow(y);
+                var dst = result.GetPixelRowForWrite(y);
+                for (int x = 0; x < width; x++)
+                    for (int k = 0; k < och; k++)
+                        dst[x * och + k] = src[x * bch + (k < 3 ? (baseGray ? 0 : k) : bch - 1)];
+            }
+            return result;
+        }
+
+        var toLinear = AvifColorMath.ToLinear(baseTc);
+        var toGamma = AvifColorMath.ToGamma(outputTransferCharacteristics);
+        Span<float> px = stackalloc float[4];
+        Span<float> tm = stackalloc float[4];
+
+        if (weight == 0.0f)
+        {
+            bool primariesDiffer = baseCp != outputColorPrimaries;
+            double[,]? m = primariesDiffer ? AvifColorMath.RgbToRgbMatrix(baseCp, outputColorPrimaries)
+                ?? throw new NotSupportedException("Unsupported RGB color space conversion") : null;
+            bool convert = outputTransferCharacteristics != baseTc || primariesDiffer;
+            for (int y = 0; y < height; y++)
+            {
+                var src = baseImage.GetPixelRow(y);
+                var dst = result.GetPixelRowForWrite(y);
+                for (int x = 0; x < width; x++)
+                {
+                    ReadPixel(src, x, bch, baseGray, baseImage.HasAlpha, baseDepth, baseMax, px);
+                    if (convert)
+                    {
+                        for (int k = 0; k < 3; k++) px[k] = toLinear(px[k]);
+                        if (m != null) AvifColorMath.Convert(px, m);
+                        for (int k = 0; k < 3; k++) px[k] = NanSafeClamp(toGamma(px[k]));
+                    }
+                    WritePixel(dst, x, och, result.HasAlpha, outputDepth, outMax, px);
+                }
+            }
+            return result;
+        }
+
+        double[,]? inM = needsInput ? AvifColorMath.RgbToRgbMatrix(baseCp, mathCp)
+            ?? throw new NotSupportedException("Unsupported RGB color space conversion") : null;
+        double[,]? outM = needsOutput ? AvifColorMath.RgbToRgbMatrix(mathCp, outputColorPrimaries)
+            ?? throw new NotSupportedException("Unsupported RGB color space conversion") : null;
+
+        var gmImage = gainMap.Image;
+        int gmDepth = Math.Clamp(gmImage.Depth, 1, 16);
+        bool scaled = gmImage.Columns != width || gmImage.Rows != height;
+        if (scaled) gmImage = gainMap.ScaledImage?.Invoke(width, height) ?? ScaleRgb(gmImage, width, height, gmDepth);
+        float gmMax = (1 << gmDepth) - 1;
+        int gch = gmImage.NumberOfChannels;
+        bool gmGray = gch - (gmImage.HasAlpha ? 1 : 0) < 3;
+
+        Span<float> gammaInv = stackalloc float[3], gMin = stackalloc float[3], gMax = stackalloc float[3],
+            bOff = stackalloc float[3], aOff = stackalloc float[3], gpx = stackalloc float[4];
+        for (int k = 0; k < 3; k++)
+        {
+            gammaInv[k] = 1.0f / gainMap.Gamma[k].ToSingle();
+            gMin[k] = gainMap.Min[k].ToSingle();
+            gMax[k] = gainMap.Max[k].ToSingle();
+            bOff[k] = gainMap.BaseOffset[k].ToSingle();
+            aOff[k] = gainMap.AlternateOffset[k].ToSingle();
+        }
+
+        float rgbMaxLinear = 0, rgbSumLinear = 0;
+        for (int y = 0; y < height; y++)
+        {
+            var src = baseImage.GetPixelRow(y);
+            var gsrc = gmImage.GetPixelRow(y);
+            var dst = result.GetPixelRowForWrite(y);
+            for (int x = 0; x < width; x++)
+            {
+                ReadPixel(src, x, bch, baseGray, baseImage.HasAlpha, baseDepth, baseMax, px);
+                ReadPixel(gsrc, x, gch, gmGray, gmImage.HasAlpha, gmDepth, gmMax, gpx);
+                float pixelRgbMaxLinear = 0.0f;
+                for (int k = 0; k < 3; k++) px[k] = toLinear(px[k]);
+                if (inM != null) AvifColorMath.Convert(px, inM);
+                for (int k = 0; k < 3; k++)
+                {
+                    float gainMapLog2 = Lerp(gMin[k], gMax[k], MathF.Pow(gpx[k], gammaInv[k]));
+                    float toneMappedLinear = (px[k] + bOff[k]) * MathF.Pow(2.0f, gainMapLog2 * weight) - aOff[k];
+                    if (toneMappedLinear > rgbMaxLinear) rgbMaxLinear = toneMappedLinear;
+                    if (toneMappedLinear > pixelRgbMaxLinear) pixelRgbMaxLinear = toneMappedLinear;
+                    tm[k] = toneMappedLinear;
+                }
+                if (outM != null) AvifColorMath.Convert(tm, outM);
+                for (int k = 0; k < 3; k++)
+                {
+                    if (float.IsNaN(tm[k]))
+                        throw new InvalidDataException($"Degenerate gain map parameters produce NaN at pixel ({x}, {y})");
+                    tm[k] = NanSafeClamp(toGamma(tm[k]));
+                }
+                tm[3] = px[3];
+                rgbSumLinear += pixelRgbMaxLinear;
+                WritePixel(dst, x, och, result.HasAlpha, outputDepth, outMax, tm);
+            }
+        }
+        if (scaled) gmImage.Dispose();
+
+        static ushort Nits(float v) => (ushort)Math.Clamp(MathF.Floor(v * AvifColorMath.SdrWhiteNits + 0.5f), 0.0f, 65535.0f);
+        float rgbAverageLinear = rgbSumLinear / ((long)width * height);
+        contentLightLevel = new ContentLightLevel(Nits(rgbMaxLinear), Nits(rgbAverageLinear));
+        return result;
+    }
+
+    // A weight in [-1, 1]: how much of the gain map to apply for a display headroom (libavif avifGetGainMapWeight).
+    private static float GainMapWeight(float hdrHeadroom, AvifGainMap gm)
+    {
+        float baseH = gm.BaseHdrHeadroom.ToSingle(), altH = gm.AlternateHdrHeadroom.ToSingle();
+        if (baseH == altH) return 0.0f;
+        float w = (hdrHeadroom - baseH) / (altH - baseH);
+        w = w < 0.0f ? 0.0f : (1.0f < w ? 1.0f : w);
+        return altH < baseH ? -w : w;
+    }
+
+    private static float Lerp(float a, float b, float w) => (1.0f - w) * a + w * b;
+
+    // fminf(1, fmaxf(0, v)): NaN -> 0.
+    private static float NanSafeClamp(float v) => float.IsNaN(v) ? 0.0f : MathF.Min(1.0f, MathF.Max(0.0f, v));
+
+    // A 16-bit stored sample back to its native-depth value, normalised like libavif (value / (2^depth - 1)).
+    private static float Sample(ushort u, int depth, float max) =>
+        depth >= 16 ? u / 65535.0f : (int)(((uint)u * (uint)max + 32767u) / 65535u) / max;
+
+    private static void ReadPixel(ReadOnlySpan<ushort> row, int x, int ch, bool gray, bool alpha, int depth, float max, Span<float> px)
+    {
+        int o = x * ch;
+        for (int k = 0; k < 3; k++) px[k] = Sample(row[o + (gray ? 0 : k)], depth, max);
+        px[3] = alpha ? Sample(row[o + ch - 1], depth, max) : 1.0f;
+    }
+
+    private static void WritePixel(Span<ushort> row, int x, int ch, bool alpha, int depth, float max, ReadOnlySpan<float> px)
+    {
+        int o = x * ch;
+        for (int k = 0; k < (alpha ? 4 : 3); k++)
+        {
+            uint q = (uint)(0.5f + px[k] * max);
+            row[o + (k < 3 ? k : ch - 1)] = depth >= 16 ? (ushort)q : (ushort)((q * 65535u + (uint)max / 2) / (uint)max);
+        }
+    }
+
+    // A gain map not read from a file: rescale its RGB planes with the same libyuv box filter (at 8 or 12 bits).
+    private static ImageFrame ScaleRgb(ImageFrame src, int w, int h, int depth)
+    {
+        int sw = (int)src.Columns, sh = (int)src.Rows, ch = src.NumberOfChannels;
+        bool gray = ch - (src.HasAlpha ? 1 : 0) < 3;
+        bool hbd = depth > 8;
+        uint max = hbd ? 4095u : 255u;
+        var dst = new ImageFrame();
+        dst.Initialize(w, h, ColorspaceType.SRGB, false);
+        for (int k = 0; k < 3; k++)
+        {
+            var plane = new ushort[sw * sh];
+            for (int y = 0; y < sh; y++)
+            {
+                var row = src.GetPixelRow(y);
+                for (int x = 0; x < sw; x++) plane[y * sw + x] = (ushort)((row[x * ch + (gray ? 0 : k)] * max + 32767u) / 65535u);
+            }
+            var s = LibyuvScale.ScalePlane(plane, sw, sw, sh, w, h, hbd);
+            for (int y = 0; y < h; y++)
+            {
+                var row = dst.GetPixelRowForWrite(y);
+                for (int x = 0; x < w; x++) row[x * 3 + k] = (ushort)((s[y * w + x] * 65535u + max / 2) / max);
+            }
+        }
+        return dst;
     }
 
     // Coded bit depth of an AV1 (av1C) or HEVC item; 8 when unknown.
