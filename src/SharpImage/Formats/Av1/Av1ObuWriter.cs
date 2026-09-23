@@ -32,11 +32,13 @@ internal static class Av1ObuWriter
         public readonly int BitDepth;   // 8, 10 or 12
         public readonly Av1PixelLayout Layout; // chroma layout of a colour stream (ignored when Monochrome)
         public readonly Av1ColorDesc Color;
+        public readonly Av1FilmGrainData? FilmGrain;   // the ambient film grain when this stream was configured
 
         public SeqConfig(int width, int height, bool monochrome, bool enableFilterIntra = false, int bitDepth = 8,
             Av1PixelLayout layout = Av1PixelLayout.I420, Av1ColorDesc? color = null)
         {
             Color = color ?? Av1ColorDesc.Legacy;
+            FilmGrain = ActiveFilmGrain;
             Width = width;
             Height = height;
             Monochrome = monochrome;
@@ -44,6 +46,87 @@ internal static class Av1ObuWriter
             BitDepth = bitDepth;
             Layout = monochrome ? Av1PixelLayout.I400 : layout;
         }
+    }
+
+    // Film grain for the stream being built: set by the AVIF encoder around the colour stream only (alpha builds run
+    // under SuppressFilmGrain), read by SeqConfig (film_grain_params_present) and the frame header writer.
+    [ThreadStatic] private static Av1FilmGrainData? t_filmGrain;
+    [ThreadStatic] private static bool t_filmGrain420;
+    [ThreadStatic] private static int t_filmGrainSuppressed;
+
+    internal static Av1FilmGrainData? ActiveFilmGrain => t_filmGrainSuppressed > 0 ? null : t_filmGrain;
+
+    /// <summary>Sets the ambient film grain for the streams built inside the scope (null = none).</summary>
+    internal static FilmGrainScope UseFilmGrain(Av1FilmGrainData? grain, bool is420) => new(grain, is420);
+
+    internal readonly struct FilmGrainScope : IDisposable
+    {
+        private readonly Av1FilmGrainData? prev;
+        private readonly bool prev420;
+        public FilmGrainScope(Av1FilmGrainData? grain, bool is420)
+        {
+            prev = t_filmGrain; prev420 = t_filmGrain420;
+            t_filmGrain = grain; t_filmGrain420 = is420;
+        }
+        public void Dispose() { t_filmGrain = prev; t_filmGrain420 = prev420; }
+    }
+
+    internal readonly struct SuppressFilmGrain : IDisposable
+    {
+        private readonly bool active;
+        public SuppressFilmGrain(bool suppress) { active = suppress; if (suppress) t_filmGrainSuppressed++; }
+        public void Dispose() { if (active) t_filmGrainSuppressed--; }
+    }
+
+    /// <summary>film_grain_params() for a shown key frame (spec 5.9.30; libaom write_film_grain_params):
+    /// apply_grain, grain_seed, then the full parameter set (update_grain is implied for non-inter frames).</summary>
+    private static unsafe void WriteFilmGrainParams(Av1BitWriter w, bool monochrome)
+    {
+        if (ActiveFilmGrain is not Av1FilmGrainData fg) return;
+        w.PutBool(true);                            // apply_grain
+        w.PutBits(fg.Seed & 0xFFFF, 16);            // grain_seed
+        w.PutBits((uint)fg.NumYPoints, 4);
+        for (int i = 0; i < fg.NumYPoints; i++)
+        {
+            w.PutBits(fg.YPoints[i * 2], 8);
+            w.PutBits(fg.YPoints[i * 2 + 1], 8);
+        }
+        if (!monochrome) w.PutBool(fg.ChromaScalingFromLuma != 0);
+        // Chroma point counts are absent for mono / chroma-from-luma / 4:2:0 without luma points (AvifFilmGrain.ToAv1
+        // has zeroed the chroma points in those cases).
+        if (!monochrome && fg.ChromaScalingFromLuma == 0 && !(fg.NumYPoints == 0 && t_filmGrain420))
+        {
+            w.PutBits((uint)fg.NumUvPoints0, 4);
+            for (int i = 0; i < fg.NumUvPoints0; i++) { w.PutBits(fg.UvPoints[i * 2], 8); w.PutBits(fg.UvPoints[i * 2 + 1], 8); }
+            w.PutBits((uint)fg.NumUvPoints1, 4);
+            for (int i = 0; i < fg.NumUvPoints1; i++) { w.PutBits(fg.UvPoints[20 + i * 2], 8); w.PutBits(fg.UvPoints[21 + i * 2], 8); }
+        }
+        w.PutBits((uint)(fg.ScalingShift - 8), 2);  // grain_scaling_minus_8
+        w.PutBits((uint)fg.ArCoeffLag, 2);
+        int numPosLuma = 2 * fg.ArCoeffLag * (fg.ArCoeffLag + 1);
+        int numPosChroma = numPosLuma + (fg.NumYPoints > 0 ? 1 : 0);
+        if (fg.NumYPoints > 0)
+            for (int i = 0; i < numPosLuma; i++) w.PutBits((uint)(fg.ArCoeffsY[i] + 128), 8);
+        if (fg.NumUvPoints0 > 0 || fg.ChromaScalingFromLuma != 0)
+            for (int i = 0; i < numPosChroma; i++) w.PutBits((uint)(fg.ArCoeffsUv[i] + 128), 8);
+        if (fg.NumUvPoints1 > 0 || fg.ChromaScalingFromLuma != 0)
+            for (int i = 0; i < numPosChroma; i++) w.PutBits((uint)(fg.ArCoeffsUv[28 + i] + 128), 8);
+        w.PutBits((uint)(fg.ArCoeffShift - 6), 2);  // ar_coeff_shift_minus_6
+        w.PutBits((uint)fg.GrainScaleShift, 2);
+        if (fg.NumUvPoints0 > 0)
+        {
+            w.PutBits((uint)(fg.UvMult0 + 128), 8);
+            w.PutBits((uint)(fg.UvLumaMult0 + 128), 8);
+            w.PutBits((uint)(fg.UvOffset0 + 256), 9);
+        }
+        if (fg.NumUvPoints1 > 0)
+        {
+            w.PutBits((uint)(fg.UvMult1 + 128), 8);
+            w.PutBits((uint)(fg.UvLumaMult1 + 128), 8);
+            w.PutBits((uint)(fg.UvOffset1 + 256), 9);
+        }
+        w.PutBool(fg.OverlapFlag != 0);
+        w.PutBool(fg.ClipToRestrictedRange != 0);
     }
 
     /// <summary>Wraps a payload in an OBU: header byte + leb128 size + payload. No extension header.</summary>
@@ -218,7 +301,7 @@ internal static class Av1ObuWriter
             w.PutBool(false);     // separate_uv_delta_q = 0
         }
 
-        w.PutBool(false);         // film_grain_params_present = 0
+        w.PutBool(cfg.FilmGrain != null);   // film_grain_params_present
 
         // open_bitstream_unit() appends trailing_bits() to every OBU except TILE_GROUP/TILE_LIST/FRAME — a 1 bit
         // then zero padding. Our own parser ignores it, but conformant parsers (ffmpeg/dav1d CBS) enforce it.
@@ -319,6 +402,7 @@ internal static class Av1ObuWriter
         {
             // loop_filter_params / cdef_params / lr_params / read_tx_mode are all skipped for a coded-lossless frame.
             w.PutBool(reducedTxSet);  // reduced_tx_set
+            WriteFilmGrainParams(w, monochrome);
             if (!isObuFrame) w.TrailingBits();
             return w.ToArray();
         }
@@ -356,7 +440,8 @@ internal static class Av1ObuWriter
         // frame_reference_mode / skip_mode / warp skipped (intra)
         w.PutBool(reducedTxSet);  // reduced_tx_set (0 = full Intra1 set with V_DCT/H_DCT for sub-16x16 luma)
 
-        // global_motion skipped (intra); film_grain skipped (not present)
+        // global_motion skipped (intra)
+        WriteFilmGrainParams(w, monochrome);
 
         if (!isObuFrame)
         {

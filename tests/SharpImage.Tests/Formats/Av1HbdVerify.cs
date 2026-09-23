@@ -536,6 +536,65 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
     }
 
+    // Film grain encode probe (trigger hbd_fg.txt): encodes with libaom test vectors / tables across layouts, depths,
+    // odd sizes, grey and alpha; dumps .avif, our native colour planes with grain (.ours.yuv, u16 LE) and without
+    // (.ours_ng.yuv), and our RGBA8 decode (.ours.rgba). Manifest: stem pixfmt WxH.
+    [Test, NotInParallel]
+    public void FilmGrainEncode()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_fg.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string outDir = Path.Combine(Scratch, "fgenc");
+        Directory.CreateDirectory(outDir);
+        var full = FormatRegistry.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", "sample1.dng"));
+        ImageFrame Crop(int w, int h) => Geometry.Crop(full, ((int)full.Columns - w) / 2, ((int)full.Rows - h) / 2, w, h);
+        var log = new System.Text.StringBuilder();
+        var cases = new System.Collections.Generic.List<(string Stem, ImageFrame Img, AvifEncodeOptions O, string PixFmt)>();
+        for (int v = 1; v <= 16; v++)
+            cases.Add(($"v{v:D2}_8_420", Crop(257, 131), new AvifEncodeOptions { BitDepth = 8, FilmGrain = AvifFilmGrain.TestVector(v) }, "yuv420p"));
+        cases.Add(("v01_10_420", Crop(384, 256), new AvifEncodeOptions { BitDepth = 10, FilmGrain = AvifFilmGrain.TestVector(1) }, "yuv420p10le"));
+        cases.Add(("v03_12_444", Crop(131, 97), new AvifEncodeOptions { BitDepth = 12, ChromaSubsampling = AvifChromaSubsampling.Yuv444, FilmGrain = AvifFilmGrain.TestVector(3) }, "yuv444p12le"));
+        cases.Add(("v05_10_422", Crop(257, 131), new AvifEncodeOptions { BitDepth = 10, ChromaSubsampling = AvifChromaSubsampling.Yuv422, FilmGrain = AvifFilmGrain.TestVector(5) }, "yuv422p10le"));
+        cases.Add(("v02_8_444_lim709", Crop(200, 120), new AvifEncodeOptions { BitDepth = 8, ChromaSubsampling = AvifChromaSubsampling.Yuv444, MatrixCoefficients = 1, FullRange = false, FilmGrain = AvifFilmGrain.TestVector(2) }, "yuv444p"));
+        cases.Add(("v07_8_gray", Gradient(200, 120, alpha: false, gray: true), new AvifEncodeOptions { BitDepth = 8, FilmGrain = AvifFilmGrain.TestVector(7) }, "gray"));
+        cases.Add(("v01_10_gray", Gradient(131, 97, alpha: false, gray: true), new AvifEncodeOptions { BitDepth = 10, FilmGrain = AvifFilmGrain.TestVector(1) }, "gray10le"));
+        cases.Add(("v01_8_420_alpha", Gradient(160, 96, alpha: true, gray: false), new AvifEncodeOptions { BitDepth = 8, FilmGrain = AvifFilmGrain.TestVector(1) }, "yuv420p"));
+        var tbl = AvifFilmGrain.ParseTable(AvifFilmGrain.TestVector(4).ToTable());
+        cases.Add(("table4_8_420", Crop(257, 131), new AvifEncodeOptions { BitDepth = 8, FilmGrain = tbl }, "yuv420p"));
+        foreach (var c in cases)
+        {
+            try
+            {
+                byte[] avif = HeifCoder.EncodeAvif(c.Img, c.O);
+                File.WriteAllBytes(Path.Combine(outDir, c.Stem + ".avif"), avif);
+                var box = HeifContainer.Parse(avif);
+                byte[] item = box.ItemData(box.PrimaryId)!;
+                foreach (bool g in new[] { true, false })
+                {
+                    Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(outDir, c.Stem + (g ? ".ours.yuv" : ".ours_ng.yuv")));
+                    try { using var f = new Av1Decoder { ApplyFilmGrain = g }.Decode(item, 0, isKeyframe: true); }
+                    finally { Environment.SetEnvironmentVariable("AV1_DUMP10", null); }
+                }
+                var dec = HeifCoder.Decode(avif);
+                int w = (int)dec.Columns, h = (int)dec.Rows, ch = dec.NumberOfChannels;
+                var rgba = new byte[w * h * 4];
+                for (int y = 0; y < h; y++)
+                {
+                    var row = dec.GetPixelRow(y);
+                    for (int x = 0; x < w; x++)
+                        for (int k = 0; k < 4; k++)
+                            rgba[(y * w + x) * 4 + k] = k < 3 ? (byte)Math.Round(row[x * ch + Math.Min(k, ch - 1 - (dec.HasAlpha ? 1 : 0))] * 255.0 / 65535)
+                                : dec.HasAlpha ? (byte)Math.Round(row[x * ch + ch - 1] * 255.0 / 65535) : (byte)255;
+                }
+                File.WriteAllBytes(Path.Combine(outDir, c.Stem + ".ours.rgba"), rgba);
+                log.AppendLine($"{c.Stem} {c.PixFmt} {w}x{h} bytes={avif.Length}");
+            }
+            catch (Exception e) { log.AppendLine($"{c.Stem} ERROR {e.GetType().Name}: {e.Message}"); }
+        }
+        File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
+    }
+
     // Isolates in-loop-filter conformance at odd picture edges: encodes odd-size gradients at q28 with deblock only,
     // CDEF only, both, and neither (trigger hbd_edge.txt), dumping .avif + our native planes for the ffmpeg diff.
     [Test, NotInParallel]

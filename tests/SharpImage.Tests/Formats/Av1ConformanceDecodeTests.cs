@@ -136,6 +136,11 @@ public sealed class Av1ConformanceDecodeTests
     [Arguments("libaom_fg_12bit_444_t6.avif", "84a3bd7be6558581dd92ba69e92a72df", "04ee575d9a691887bb0386e032aa4863")]
     [Arguments("libaom_fg_8bit_420_denoise.avif", "f0016b78fb479da761ff9be5ad0cb088", "f65dd6be5efcb92f90913727498570a0")]
     [Arguments("libaom_fg_10bit_420_denoise.avif", "195dd23512a9ad30e9aee10e38450888", "39c0837a3d8ef2f8148a00f2e9aaff0a")]
+    // Our own encoder's film grain signalling (libaom test vectors 1 and 5; odd-width 4:2:0 exercises the luma padding
+    // for chroma, 10-bit 4:2:2; the alpha item carries no grain).
+    [Arguments("sharpimage_fg_8bit_420_257x131_v1.avif", "fc8b31d3d2437c666a42618dfb8f8b62", "e82427f436d42b08c4e44a57a71a208e")]
+    [Arguments("sharpimage_fg_10bit_422_257x131_v5.avif", "8ac509a50671abf227a78244f072343d", "96409538c4d7e97a1aac83d499db4b23")]
+    [Arguments("sharpimage_fg_8bit_420_alpha_v1.avif", "deee3f3fa25659dd33a614eb7cb7974c", "918a326116695311b254ec70bece6117")]
     public async Task FilmGrain_ByteExactVsDav1d(string file, string md5, string md5NoGrain)
     {
         byte[] item = PrimaryItemData(File.ReadAllBytes(Asset(file)));
