@@ -37,6 +37,27 @@ public enum AvifChromaSubsampling
     Yuv400,
 }
 
+/// <summary>One layer of a layered AVIF (avifenc --layered): coded at a scaling fraction of the image size with its own
+/// quality, optionally from its own image (same size as the main image, as avifenc requires).</summary>
+public sealed class AvifLayer
+{
+    /// <summary>The layer's source; null = the image being encoded.</summary>
+    public ImageFrame? Image { get; set; }
+
+    /// <summary>Quality 0..99 (libavif scale). Null: the options' <see cref="AvifEncodeOptions.Quality"/>, else its Qp.</summary>
+    public int? Quality { get; set; }
+
+    /// <summary>Alpha quality 0..99. Null: <see cref="Quality"/>, else the options' alpha quality.</summary>
+    public int? QualityAlpha { get; set; }
+
+    /// <summary>avifenc --scaling-mode N/D: the layer is coded at ceil(size * N / D) (as libaom sizes a scaled frame);
+    /// one of 1/1, 1/2, 1/4, 1/8, 3/4, 3/5, 4/5 (libaom's modes).</summary>
+    public int ScaleNumerator { get; set; } = 1;
+
+    /// <inheritdoc cref="ScaleNumerator"/>
+    public int ScaleDenominator { get; set; } = 1;
+}
+
 /// <summary>
 /// Options that control AVIF encoding.
 /// </summary>
@@ -184,6 +205,12 @@ public sealed class AvifEncodeOptions
     /// progressive) for the encode closest to it; <see cref="Quality"/> / <see cref="QualityAlpha"/> /
     /// <see cref="QualityGainMap"/> that are set stay fixed. Up to ~7 encodes.</summary>
     public int? TargetSize { get; set; }
+
+    /// <summary>A layered AVIF (avifenc --layered): 2..4 layers coded in one item as spatial layers (the first a key
+    /// frame, the rest intra-only), with an 'a1lx' index so progressive readers can show each layer as it arrives; other
+    /// readers decode the last layer. Not combined with <see cref="Progressive"/>, <see cref="Lossless"/> or
+    /// <see cref="Grid"/>.</summary>
+    public IList<AvifLayer>? Layers { get; set; }
 
     internal AvifEncodeOptions Clone() => (AvifEncodeOptions)MemberwiseClone();
 }
@@ -929,10 +956,97 @@ public static partial class HeifCoder
         if (options.TargetSize is { } target)
             return SearchTargetSize(options, target, o => EncodeAvif(image, o));
         if (options.Grid is { } grid && (grid.Columns != 1 || grid.Rows != 1))
+        {
+            if (options.Layers is { Count: > 0 }) throw new NotSupportedException("Layered grid images are not supported.");
             return EncodeAvifGrid(image, options, grid.Columns, grid.Rows);
+        }
         using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, (int)image.Columns, (int)image.Rows));
+        if (options.Layers is { Count: > 0 } layers) return EncodeAvifLayers(image, options, layers);
         return EncodeAvifCore(image, options, forceColor: false, forceAlpha: false);
     }
+
+    // avifenc --layered: every layer converted to YUV at full size, area-scaled to its libaom-scaled size, coded with its
+    // own q-index (libavif codes layered images with tune=iq), alpha layered alongside.
+    private static byte[] EncodeAvifLayers(ImageFrame image, AvifEncodeOptions options, IList<AvifLayer> layers)
+    {
+        if (layers.Count is < 2 or > 4) throw new ArgumentException("A layered AVIF has 2 to 4 layers.", nameof(options));
+        if (options.Progressive || options.Lossless)
+            throw new ArgumentException("Layers cannot be combined with Progressive or Lossless.", nameof(options));
+        int w = (int)image.Columns, h = (int)image.Rows;
+        var fractions = new (int N, int D)[] { (1, 1), (1, 2), (1, 4), (1, 8), (3, 4), (3, 5), (4, 5) };
+        foreach (var l in layers)
+        {
+            if (l.Image is { } li && (li.Columns != w || li.Rows != h))
+                throw new ArgumentException("Every layer image must have the size of the main image.", nameof(options));
+            int g = Gcd(l.ScaleNumerator, l.ScaleDenominator);
+            if (l.ScaleDenominator <= 0 || g == 0 || Array.IndexOf(fractions, (l.ScaleNumerator / g, l.ScaleDenominator / g)) < 0)
+                throw new ArgumentException($"Unsupported scaling mode {l.ScaleNumerator}/{l.ScaleDenominator} (libaom: 1/1, 1/2, 1/4, 1/8, 3/4, 3/5, 4/5).", nameof(options));
+        }
+        if (layers[^1].ScaleNumerator != layers[^1].ScaleDenominator)
+            throw new ArgumentException("The last layer must be coded at full size.", nameof(options));
+
+        int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
+        if (bd is not (8 or 10 or 12)) throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
+        var color = ResolveAvifColor(image, options, bd);
+        if (options.ChromaSubsampling == AvifChromaSubsampling.Yuv400 && color.Matrix == 0) color = color with { Matrix = 6 };
+        var layout = options.ChromaSubsampling switch
+        {
+            AvifChromaSubsampling.Yuv422 => Av1.Av1PixelLayout.I422,
+            AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
+            AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
+            AvifChromaSubsampling.Yuv400 => Av1.Av1PixelLayout.I400,
+            _ => color.Matrix == 0 ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
+        };
+        if (color.Matrix == 0 && layout != Av1.Av1PixelLayout.I444)
+            throw new ArgumentException("The identity matrix (MatrixCoefficients 0) requires 4:4:4 chroma.", nameof(options));
+
+        var sources = layers.Select(l => l.Image ?? image).ToArray();
+        var planes = new List<(double[] R, double[] G, double[] B, ushort[]? A)>();
+        bool anyColour = false, anyTranslucent = false;
+        foreach (var src in sources)
+        {
+            ReadRgbPlanes(src, bd, out var r, out var g, out var b, out var a, out bool colour, out bool nonOpaque);
+            anyColour |= colour;
+            anyTranslucent |= nonOpaque && a != null;
+            planes.Add((r, g, b, a));
+        }
+        bool mono = layout == Av1.Av1PixelLayout.I400 || (!anyColour && color.Matrix is not (0 or 16 or 17));
+        var coded = mono ? Av1.Av1PixelLayout.I400 : layout;
+        int ssX = coded is Av1.Av1PixelLayout.I420 or Av1.Av1PixelLayout.I422 ? 1 : 0, ssY = coded == Av1.Av1PixelLayout.I420 ? 1 : 0;
+        int defQ = Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        int max = (1 << bd) - 1;
+        var inputs = new List<Av1.Av1StillImageEncoder.LayerInput>();
+        for (int i = 0; i < layers.Count; i++)
+        {
+            var l = layers[i];
+            var (r, g, b, a) = planes[i];
+            ushort[] y;
+            ushort[]? u = null, v = null;
+            if (mono) y = anyColour ? MonoLumaLibavif(r, g, b, w, h, bd, color, sources[i].Depth is >= 1 and <= 16 ? sources[i].Depth : 16) : GreyLuma(r, w, h, bd, color);
+            else { RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out y, out var u0, out var v0); u = u0; v = v0; }
+            ushort[]? alpha = anyTranslucent ? a ?? Enumerable.Repeat((ushort)max, w * h).ToArray() : null;
+            int lw = (int)(((long)w * l.ScaleNumerator + l.ScaleDenominator - 1) / l.ScaleDenominator);
+            int lh = (int)(((long)h * l.ScaleNumerator + l.ScaleDenominator - 1) / l.ScaleDenominator);
+            int cw = (w + ssX) >> ssX, chh = (h + ssY) >> ssY, lcw = (lw + ssX) >> ssX, lch = (lh + ssY) >> ssY;
+            if (lw != w || lh != h)
+            {
+                y = AreaScale(y, w, h, lw, lh);
+                if (u != null) { u = AreaScale(u, cw, chh, lcw, lch); v = AreaScale(v!, cw, chh, lcw, lch); }
+                if (alpha != null) alpha = AreaScale(alpha, w, h, lw, lh);
+            }
+            int? lq = l.Quality ?? options.Quality;
+            int? lqa = l.QualityAlpha ?? l.Quality ?? options.QualityAlpha ?? options.Quality;
+            if (lq >= 100 || lqa >= 100) throw new NotSupportedException("Lossless layers are not supported.");
+            int qIdx = lq is { } q ? QualityToQIndex(q, color.Matrix == 0) : defQ;
+            int aQIdx = lqa is { } qa ? QualityToQIndex(qa, identityMatrix: true) : Math.Clamp(qIdx / 2, 4, 255);
+            inputs.Add(new Av1.Av1StillImageEncoder.LayerInput(y, u, v, alpha, lw, lh, qIdx, aQIdx));
+        }
+        var extras = AvifExtras(image, options);
+        extras.Premultiplied = false;
+        return Av1.Av1StillImageEncoder.EncodeAvifLayered(inputs, mono, bd, coded, color, extras);
+    }
+
+    private static int Gcd(int a, int b) { a = Math.Abs(a); b = Math.Abs(b); while (b != 0) (a, b) = (b, a % b); return a; }
 
     // Quality / QualityAlpha -> q-index overrides (null = the Qp path); alpha 0 = lossless. libavif picks libaom's tune=iq
     // (and its quantizer table) only for colour in all-intra still images and layered images, not for identity-matrix

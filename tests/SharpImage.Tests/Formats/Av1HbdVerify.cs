@@ -1009,6 +1009,14 @@ public sealed class Av1HbdVerify
                         case "quality": o.Quality = int.Parse(t[1]); break;
                         case "qalpha": o.QualityAlpha = int.Parse(t[1]); break;
                         case "target": o.TargetSize = int.Parse(t[1]); break;
+                        case "layers":
+                            o.Layers = t[1].Split(',').Select(spec =>
+                            {
+                                var sp = spec.Split(':');
+                                var fr = sp[0].Split('/');
+                                return new AvifLayer { ScaleNumerator = int.Parse(fr[0]), ScaleDenominator = int.Parse(fr[1]), Quality = sp.Length > 1 ? int.Parse(sp[1]) : null };
+                            }).ToList();
+                            break;
                         case "irot": o.Rotation = int.Parse(t[1]); break;
                         case "prem": o.PremultiplyAlpha = true; break;
                     }
