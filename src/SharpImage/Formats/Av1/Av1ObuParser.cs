@@ -926,10 +926,10 @@ public static class Av1ObuParser
 
             if (hdr.Gmv[i].Type == Av1WarpedMotionType.Identity) continue;
 
-            // Reference global motion params
-            var refGmv = DefaultWmParams;
-            // In a full decoder with stored frame headers, we'd read from primary ref.
-            // This will be refined when we have full frame header storage.
+            // Coded relative to the primary reference frame's parameters (defaults without one).
+            var refGmv = hdr.PrimaryRefFrame == Av1Constants.PrimaryRefNone
+                ? DefaultWmParams
+                : refFrames[hdr.GetRefIdx(hdr.PrimaryRefFrame)].Gmv[i];
 
             int bits, shift;
             if (hdr.Gmv[i].Type >= Av1WarpedMotionType.RotZoom)

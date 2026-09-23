@@ -2158,6 +2158,7 @@ internal sealed class Av1Decoder
                 refFrame.FilmGrainPresent = fh.FilmGrainPresent;
                 refFrame.SegmentMap = ctx.CurSegMap;
                 refFrame.SegmentationData = fh.SegmentationData;
+                Array.Copy(fh.Gmv, refFrame.Gmv, refFrame.Gmv.Length);
                 refFrame.Valid = true;
 
                 // Copy current frame planes to reference
@@ -2238,6 +2239,7 @@ internal sealed class Av1Decoder
                 dst.FilmGrainPresent = refFrame.FilmGrainPresent;
                 dst.SegmentMap = refFrame.SegmentMap;
                 dst.SegmentationData = refFrame.SegmentationData;
+                Array.Copy(refFrame.Gmv, dst.Gmv, dst.Gmv.Length);
                 dst.TemporalMvs = null;   // dav1d drops the other slots' refmvs
                 dst.Valid = true;
 

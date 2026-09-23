@@ -253,6 +253,10 @@ public sealed class Av1ConformanceDecodeTests
     [Arguments("libaom_superres_444_10.obu", 10, "f7c88ff88403a8856686b4b13a91a254")]
     [Arguments("libaom_superres_resize.obu", 10, "e873451d202e0a1ba6d3580479dd1068")]
     [Arguments("libaom_sframe.obu", 12, "93b67a308863688d5c1280d1d0bc3f52")]
+    // 640x360 10-bit, 128x128 superblocks, 2x2 tiles, zooming content (non-translational global motion coded relative to
+    // the primary reference; 64x64 luma transforms beside coded neighbours), and a 10-bit 4:2:2 zoom.
+    [Arguments("libaom_gmv_sb128_tiles_10.obu", 24, "fdc4bc90aef0a53d54ec01820fa9046d")]
+    [Arguments("libaom_inter_422_10_zoom.obu", 24, "529f4cb09d45f2752f9b81ea0c06d9ff")]
     public async Task FeatureStream_ByteExactVsDav1d(string file, int frames, string md5)
     {
         byte[] data = File.ReadAllBytes(Asset(file));

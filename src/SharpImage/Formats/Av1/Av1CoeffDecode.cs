@@ -134,6 +134,14 @@ public static class Av1CoeffDecode
                 v |= v >> 16;
                 v |= v >> 8;
                 break;
+            case 4: // TX_64X64 — 16 bytes: OR the two 8-byte halves, then fold as above (was missing: context read as 0)
+            {
+                ulong t64 = MemoryMarshal.Read<ulong>(ctx) | MemoryMarshal.Read<ulong>(ctx[8..]);
+                v = (uint)(t64 >> 32) | (uint)t64;
+                v |= v >> 16;
+                v |= v >> 8;
+                break;
+            }
             default:
                 v = 0;
                 break;

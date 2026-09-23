@@ -111,6 +111,10 @@ public sealed class Av1ReferenceFrame
     /// <summary>The segment features of the frame stored here (frames with segmentation_update_data = 0 inherit them).</summary>
     public Av1SegmentationDataSet SegmentationData;
 
+    /// <summary>The frame's global motion parameters: later frames code theirs relative to these (dav1d
+    /// refs[primary].frame_hdr->gmv).</summary>
+    public Av1WarpedMotionParams[] Gmv = new Av1WarpedMotionParams[Av1Constants.RefsPerFrame];
+
     /// <summary>
     /// Decoded pixel data per plane. Samples are stored as ushort[] for all bit depths
     /// (8-bit values occupy 0..255, 10-bit 0..1023, 12-bit 0..4095) so one code path
