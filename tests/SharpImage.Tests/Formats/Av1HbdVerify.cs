@@ -222,6 +222,14 @@ public sealed class Av1HbdVerify
             oi.Orientation = (OrientationType)o;
             File.WriteAllBytes(Path.Combine(outDir, $"ours_orient{o}.avif"), HeifCoder.EncodeAvif(oi, new AvifEncodeOptions { Qp = 2 }));
         }
+        foreach (int pbd in new[] { 8, 10 })
+        {
+            var pr = Gradient(96, 64, alpha: true, gray: false);
+            byte[] pf = HeifCoder.EncodeAvif(pr, new AvifEncodeOptions { BitDepth = pbd, PremultiplyAlpha = true, Qp = 10 });
+            File.WriteAllBytes(Path.Combine(outDir, $"ours_prem{pbd}.avif"), pf);
+            File.WriteAllBytes(Path.Combine(outDir, $"ours_prem{pbd}.rgb48"), Rgb48(HeifCoder.Decode(pf)));
+            File.WriteAllBytes(Path.Combine(outDir, $"ours_prem{pbd}.src.rgb48"), Rgb48(pr));
+        }
         var hdr = Gradient(96, 64, alpha: false, gray: false);
         File.WriteAllBytes(Path.Combine(outDir, "ours_hdr.avif"), HeifCoder.EncodeAvif(hdr, new AvifEncodeOptions
         {

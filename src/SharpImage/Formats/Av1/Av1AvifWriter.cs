@@ -22,6 +22,7 @@ internal sealed class AvifContainerExtras
     public (uint H, uint V)? Pasp;           // pasp: pixel aspect ratio hSpacing:vSpacing
     public (ushort MaxCll, ushort MaxPall)? Clli;
     public byte[]? Mdcv;                     // mdcv payload (24 bytes: display primaries, white point, max/min luminance)
+    public bool Premultiplied;               // colour is premultiplied by alpha: iref 'prem' colour -> alpha
 
     internal bool HasItems => Exif != null || Xmp != null;
 }
@@ -187,6 +188,7 @@ internal static class Av1AvifWriter
         // iref (version 0): auxl alpha → colour; cdsc metadata → colour.
         var refs = new List<byte[]>();
         if (alphaData != null) refs.Add(Box("auxl", Concat(U16(2), U16(1), U16(1))));   // from_ID, ref_count, to_ID
+        if (alphaData != null && x?.Premultiplied == true) refs.Add(Box("prem", Concat(U16(1), U16(1), U16(2))));   // colour premultiplied by alpha
         if (exifId != 0) refs.Add(Box("cdsc", Concat(U16(exifId), U16(1), U16(1))));
         if (xmpId != 0) refs.Add(Box("cdsc", Concat(U16(xmpId), U16(1), U16(1))));
         byte[]? iref = refs.Count > 0 ? FullBox("iref", 0, 0, Concat(refs.ToArray())) : null;

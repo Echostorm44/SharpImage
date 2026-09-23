@@ -128,6 +128,28 @@ public sealed class AvifMetadataTests
     }
 
     [Test]
+    public async Task PremultipliedAlpha_IsSignalled_AndUndoneOnDecode()
+    {
+        var src = Gradient(80, 48, alpha: true);
+        byte[] prem = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { PremultiplyAlpha = true, Qp = 4 });
+        byte[] plain = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = 4 });
+        static bool HasPrem(byte[] f) { for (int i = 0; i + 4 < f.Length; i++) if (f[i] == 'p' && f[i + 1] == 'r' && f[i + 2] == 'e' && f[i + 3] == 'm') return true; return false; }
+        await Assert.That(HasPrem(prem)).IsTrue();
+        await Assert.That(HasPrem(plain)).IsFalse();
+        // Decoded colour is straight (un-premultiplied) again: close to the source where alpha is high.
+        var dec = HeifCoder.Decode(prem);
+        double maxErr = 0;
+        for (int y = 0; y < 48; y++)
+        {
+            var r0 = src.GetPixelRow(y); var r1 = dec.GetPixelRow(y);
+            for (int x = 0; x < 80; x++)
+                if (r0[x * 4 + 3] > 40000)
+                    for (int c = 0; c < 3; c++) maxErr = Math.Max(maxErr, Math.Abs(r0[x * 4 + c] - r1[x * 4 + c]) / 257.0);
+        }
+        await Assert.That(maxErr).IsLessThan(12);
+    }
+
+    [Test]
     public async Task Icc_FromFrameProperty_IsWritten()
     {
         // JPEG XL decode populates ImageFrame.IccProfile (not Metadata); that slot is honoured too.

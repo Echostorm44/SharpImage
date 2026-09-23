@@ -89,6 +89,10 @@ public sealed class AvifEncodeOptions
     /// <see cref="Qp"/> is ignored. Alpha is coded losslessly too.</summary>
     public bool Lossless { get; set; }
 
+    /// <summary>Premultiply colour by alpha before coding and signal it ('prem' item reference), as avifenc
+    /// --premultiply. Readers (including this one) un-premultiply on decode. Only meaningful for images with alpha.</summary>
+    public bool PremultiplyAlpha { get; set; }
+
     /// <summary>HDR content light level ('clli'). Null: the image's <c>Metadata.ContentLightLevel</c>.</summary>
     public SharpImage.Metadata.ContentLightLevel? ContentLightLevel { get; set; }
 
@@ -215,6 +219,15 @@ public static class HeifCoder
             throw new NotSupportedException($"AVIF/HEIC coded item type '{codec}' is not supported.");
         var nclx = Nclx(c, pid);
 
+        // Premultiplied alpha ('prem' colour -> alpha): libavif un-premultiplies during/after YUV->RGB. For a single
+        // coded colour item the alpha is decoded first so the division happens exactly where libavif does it.
+        int premAlphaId = -1;
+        foreach (int a in c.ReferencesTo(pid, "auxl"))
+            if (IsAlphaAux(c, a) && c.ReferencesFrom(pid, "prem").Contains(a)) { premAlphaId = a; break; }
+        ushort[]? premAlpha = null;
+        if (premAlphaId >= 0 && tiles.Count == 1 && codec == "av01" && c.Items.TryGetValue(premAlphaId, out var pai) && pai.Type == "av01")
+            premAlpha = DecodeAlphaNative(c, premAlphaId);
+
         ImageFrame frame;
         if (codec == "av01" && tiles.Count > 1)
         {
@@ -228,7 +241,7 @@ public static class HeifCoder
         {
         var tileFrames = new ImageFrame[tiles.Count];
         for (int i = 0; i < tiles.Count; i++)
-            tileFrames[i] = DecodeCodedItem(c, tiles[i], codec, nclx);
+            tileFrames[i] = DecodeCodedItem(c, tiles[i], codec, nclx, premAlpha);
         int tw = (int)tileFrames[0].Columns, th = (int)tileFrames[0].Rows;
         if (outW <= 0 || outH <= 0) (outW, outH) = (tw * cols, th * rows);
         if (tiles.Count > 1 && (tw * cols < outW || th * rows < outH))
@@ -266,6 +279,9 @@ public static class HeifCoder
             }
             if (!perTile.Contains(-1)) AddAlphaTiles(c, perTile, cols, frame);
         }
+
+        // Premultiplied grids (alpha not available during conversion): un-premultiply the 16-bit result.
+        if (premAlphaId >= 0 && premAlpha == null && frame.HasAlpha) UnpremultiplyFrame(frame);
 
         // ---- metadata of the primary: ICC, Exif, XMP, pasp; then transforms -----------------------------------------
         if (c.Property(pid, "colr", (o, l) => l > 4 && Encoding.ASCII.GetString(data, o, 4) is "prof" or "rICC") is { } prof)
@@ -422,7 +438,8 @@ public static class HeifCoder
 
     // Decodes one coded colour item (AV1 or HEVC) to an RGB frame of its coded size. CICP: the item's own colr nclx,
     // else the one inherited from the primary/grid, else (AV1) the sequence header.
-    private static ImageFrame DecodeCodedItem(HeifContainer c, int id, string codec, (int Cp, int Tc, int Mc, bool Full)? inherited)
+    private static ImageFrame DecodeCodedItem(HeifContainer c, int id, string codec, (int Cp, int Tc, int Mc, bool Full)? inherited,
+        ushort[]? premAlpha = null)
     {
         byte[] coded = c.ItemData(id) ?? throw new InvalidDataException($"Item {id} has no data.");
         var nclx = Nclx(c, id) ?? inherited;
@@ -434,7 +451,7 @@ public static class HeifCoder
         f.Initialize(w, h, ColorspaceType.SRGB, false);
         if (codec == "av01")
         {
-            DecodeAv1IntraFrame(coded, f, nclx);
+            DecodeAv1IntraFrame(coded, f, nclx, premAlpha);
         }
         else
         {
@@ -629,7 +646,8 @@ public static class HeifCoder
         // the general matrix/range/layout path.
         bool bt601Full = color.Matrix is 5 or 6 && color.FullRange;
         var extras = AvifExtras(image, options);
-        return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless
+        extras.Premultiplied = options.PremultiplyAlpha && image.HasAlpha;
+        return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
             ? EncodeAvif8(image, options.Qp, color, extras)
             : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless);
     }
@@ -794,6 +812,16 @@ public static class HeifCoder
         }
 
         int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        if (extras.Premultiplied && hasAlpha && nonOpaque && alpha != null)
+        {
+            double amax = (1 << bd) - 1;
+            for (int i = 0; i < r.Length; i++)
+            {
+                double a = alpha[i] / amax;
+                if (a < 1) { r[i] *= a; g[i] *= a; b[i] *= a; }
+            }
+        }
+        else extras.Premultiplied = false;   // nothing to signal without a coded alpha item
         if (hasAlpha && nonOpaque && alpha != null)
         {
             int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
@@ -1159,7 +1187,8 @@ public static class HeifCoder
         }
     }
 
-    private static void DecodeAv1IntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame, (int Cp, int Tc, int Mc, bool Full)? nclx)
+    private static void DecodeAv1IntraFrame(ReadOnlySpan<byte> codedData, ImageFrame frame, (int Cp, int Tc, int Mc, bool Full)? nclx,
+        ushort[]? premAlpha = null)
     {
         // Decode the AV1 keyframe with the vendored AV1 intra decoder (pixel-exact vs dav1d),
         // then convert its YUV planes to RGB. AVIF stores the whole temporal unit (sequence
@@ -1175,7 +1204,7 @@ public static class HeifCoder
         // has the matrix, else the reference float path (unorm tables, bilinear 9/3/3/1 chroma, matrix modes).
         bool is444 = yuv.Format == Av1.PixelFormat.Yuv444P, is422 = yuv.Format == Av1.PixelFormat.Yuv422P;
         ConvertYuvToRgbLibavif(yuv, frame, (int)frame.Columns, (int)frame.Rows, frame.NumberOfChannels,
-            decoder.Monochrome, cicp.Mc, cicp.Full, cicp.Cp, is444 ? 0 : 1, (is444 || is422) ? 0 : 1);
+            decoder.Monochrome, cicp.Mc, cicp.Full, cicp.Cp, is444 ? 0 : 1, (is444 || is422) ? 0 : 1, premAlpha);
     }
 
     // Converts a decoded 8/10/12-bit planar YUV 4:2:0 frame to RGB, honouring the colour
@@ -1299,13 +1328,14 @@ public static class HeifCoder
     // toward the luma sample's side (none at the picture edge; 4:2:2 is horizontal only), clamp to [0,1], and
     // (uint16)(0.5f + v * 65535) into the 16-bit quantum. 32-bit float throughout, like libavif.
     private static void ConvertYuvToRgbLibavif(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
-        bool monochrome, int matrixCoeffs, bool fullRange, int primaries, int ssHor, int ssVer)
+        bool monochrome, int matrixCoeffs, bool fullRange, int primaries, int ssHor, int ssVer, ushort[]? premAlpha = null)
     {
         // 8-bit colour goes through libyuv in libavif (its default build), whose fixed-point math differs from the
         // float path by up to 2 levels — use the exact port so we decode what libavif decodes.
         if (yuv.BitDepth == 8 && !monochrome && LibyuvConstants(matrixCoeffs, fullRange, primaries) is { } k)
         {
             ConvertYuvToRgbLibyuv8(yuv, frame, w, h, channels, k, ssHor, ssVer);
+            if (premAlpha != null) UnattenuateLibyuv(frame, premAlpha, w, h, channels);
             return;
         }
 
@@ -1379,6 +1409,15 @@ public static class HeifCoder
                     }
                 }
 
+                if (premAlpha != null)
+                {
+                    // libavif slow path UNMULTIPLY: on the clamped float colour, before quantisation.
+                    float ac = Math.Clamp(premAlpha[j * w + i] / (float)maxCh, 0.0f, 1.0f);
+                    R = Math.Clamp(R, 0.0f, 1.0f); G = Math.Clamp(G, 0.0f, 1.0f); B = Math.Clamp(B, 0.0f, 1.0f);
+                    if (ac == 0.0f) { R = G = B = 0.0f; }
+                    else if (ac < 1.0f) { R = Math.Min(R / ac, 1.0f); G = Math.Min(G / ac, 1.0f); B = Math.Min(B / ac, 1.0f); }
+                }
+
                 int off = i * channels;
                 row[off] = Q16f(R);
                 if (channels >= 3)
@@ -1411,6 +1450,64 @@ public static class HeifCoder
     // libyuv 8-bit YUV->RGB as libavif calls it (AUTOMATIC upsampling => the *MatrixFilter bilinear variants):
     // chroma upsampled per row by ScaleRowUp2_Linear_Any (4:2:2) / ScaleRowUp2_Bilinear_Any (4:2:0, first/last
     // row linear), then the x86 CALC_RGB16 fixed-point pixel, >> 6, clamp. Result is 8-bit, widened by 257.
+    // libavif's 8-bit un-premultiply (avifRGBImageUnpremultiplyAlpha -> libyuv ARGBUnattenuate): 8.8 fixed-point
+    // reciprocal table fixed_invtbl8 and clamp255(((f | f << 8) * ia) >> 16), exactly as libyuv's C/SIMD rows.
+    private static void UnattenuateLibyuv(ImageFrame frame, ushort[] alpha8, int w, int h, int channels)
+    {
+        for (int j = 0; j < h; j++)
+        {
+            var row = frame.GetPixelRowForWrite(j);
+            for (int i = 0; i < w; i++)
+            {
+                int a = alpha8[j * w + i];
+                int ia = a == 0 ? 0 : a == 1 ? 0xffff : a == 255 ? 0x100 : 0x10000 / a;
+                for (int ch = 0; ch < Math.Min(3, channels); ch++)
+                {
+                    int f = row[i * channels + ch] / 257;
+                    row[i * channels + ch] = (ushort)(Math.Min(255, ((f | (f << 8)) * ia) >> 16) * 257);
+                }
+            }
+        }
+    }
+
+    // Grid fallback: un-premultiply the decoded 16-bit colour by the frame's alpha (float, as libavif's slow path).
+    private static void UnpremultiplyFrame(ImageFrame frame)
+    {
+        int w = (int)frame.Columns, h = (int)frame.Rows, ch = frame.NumberOfChannels;
+        for (int j = 0; j < h; j++)
+        {
+            var row = frame.GetPixelRowForWrite(j);
+            for (int i = 0; i < w; i++)
+            {
+                float a = row[i * ch + ch - 1] / 65535.0f;
+                for (int k = 0; k < Math.Min(3, ch - 1); k++)
+                {
+                    float v = row[i * ch + k] / 65535.0f;
+                    v = a == 0 ? 0 : a < 1 ? Math.Min(v / a, 1.0f) : v;
+                    row[i * ch + k] = Q16f(v);
+                }
+            }
+        }
+    }
+
+    // The alpha item's samples at their native depth (studio range expanded to full, as ApplyAv1Alpha does).
+    private static ushort[] DecodeAlphaNative(HeifContainer c, int id)
+    {
+        byte[] coded = c.ItemData(id) ?? throw new InvalidDataException($"Alpha item {id} has no data.");
+        var decoder = new Av1.Av1Decoder();
+        using var yuv = decoder.Decode(coded, 0, isKeyframe: true) ?? throw new InvalidDataException("AV1 alpha decode produced no frame. " + FirstLine(Av1.Av1Decoder.LastDecodeError));
+        int w = yuv.Width, h = yuv.Height, bd = yuv.BitDepth, max = (1 << bd) - 1, lo = 16 << (bd - 8), hi = 235 << (bd - 8);
+        var a = new ushort[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int v = bd > 8 ? yuv.YPlane16.Span[y * yuv.YStride + x] : yuv.YPlane.Span[y * yuv.YStride + x];
+                if (!decoder.FullColorRange) v = Math.Clamp(((v - lo) * max + (hi - lo) / 2) / (hi - lo), 0, max);
+                a[y * w + x] = (ushort)v;
+            }
+        return a;
+    }
+
     private static void ConvertYuvToRgbLibyuv8(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
         (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr) k, int ssHor, int ssVer)
     {
