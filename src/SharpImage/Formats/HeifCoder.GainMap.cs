@@ -617,8 +617,12 @@ public static partial class HeifCoder
         };
         int ds = o.GainMapDownscaling, rounding = ds / 2;
         int gw = Math.Max(((int)img.Columns + rounding) / ds, 1), gh = Math.Max(((int)img.Rows + rounding) / ds, 1);
-        byte[] file = EncodeAvifGeneral(img, o.GainMapQp ?? o.Qp, bd, layout, color, new Av1.AvifContainerExtras(), o.GainMapLossless,
-            scaleYuvTo: (gw, gh), libavifFloatYuv: true);
+        // Gain map quality: QualityGainMap, else GainMapLossless / GainMapQp, else Quality (100 = lossless).
+        int? gq = o.QualityGainMap ?? (o.GainMapLossless || o.GainMapQp != null ? null : o.Quality);
+        bool gmLossless = gq is { } g ? g >= 100 : o.GainMapLossless;
+        int? gmQIdx = gq is { } g2 && g2 < 100 ? QualityToQIndex(g2, color.Matrix == 0) : null;
+        byte[] file = EncodeAvifGeneral(img, o.GainMapQp ?? o.Qp, bd, layout, color, new Av1.AvifContainerExtras(), gmLossless,
+            scaleYuvTo: (gw, gh), libavifFloatYuv: true, qIdxOverride: gmQIdx);
 
         // Lift the coded item and its properties out of the single-item file.
         var c = HeifContainer.Parse(file);

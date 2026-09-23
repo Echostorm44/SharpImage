@@ -1006,6 +1006,9 @@ public sealed class Av1HbdVerify
                         case "tcols": o.TileColumnsLog2 = int.Parse(t[1]); break;
                         case "trows": o.TileRowsLog2 = int.Parse(t[1]); break;
                         case "auto": o.AutoTiling = true; break;
+                        case "quality": o.Quality = int.Parse(t[1]); break;
+                        case "qalpha": o.QualityAlpha = int.Parse(t[1]); break;
+                        case "target": o.TargetSize = int.Parse(t[1]); break;
                         case "irot": o.Rotation = int.Parse(t[1]); break;
                         case "prem": o.PremultiplyAlpha = true; break;
                     }
@@ -1056,7 +1059,28 @@ public sealed class Av1HbdVerify
                 using var f = dec.Decode(c.ItemData(id)!, 0, isKeyframe: true);
                 var ctx = ctxField.GetValue(dec)!;
                 int cols = (int)ctx.GetType().GetField("TileCols")!.GetValue(ctx)!, rows = (int)ctx.GetType().GetField("TileRows")!.GetValue(ctx)!;
-                log.AppendLine($"{Path.GetFileName(file)} {cols}x{rows}");
+                var fh = ctx.GetType().GetField("FrameHeader")!.GetValue(ctx)!;
+                int qidx = Convert.ToInt32(fh.GetType().GetField("QuantBaseQIdx")!.GetValue(fh));
+                string alpha = "";
+                foreach (int aid in c.ReferencesTo(c.PrimaryId, "auxl"))
+                {
+                    int aitem = c.Items[aid].Type == "grid" ? c.ReferencesFrom(aid, "dimg")[0] : aid;
+                    var adec = new Av1Decoder();
+                    using var af = adec.Decode(c.ItemData(aitem)!, 0, isKeyframe: true);
+                    var actx = ctxField.GetValue(adec)!;
+                    var afh = actx.GetType().GetField("FrameHeader")!.GetValue(actx)!;
+                    alpha = $" aq={Convert.ToInt32(afh.GetType().GetField("QuantBaseQIdx")!.GetValue(afh))}";
+                }
+                foreach (var tm in c.Items.Values.Where(i => i.Type == "tmap"))
+                {
+                    int gid = c.ReferencesFrom(tm.Id, "dimg")[1];
+                    var gdec = new Av1Decoder();
+                    using var gf = gdec.Decode(c.ItemData(gid)!, 0, isKeyframe: true);
+                    var gctx = ctxField.GetValue(gdec)!;
+                    var gfh = gctx.GetType().GetField("FrameHeader")!.GetValue(gctx)!;
+                    alpha += $" gq={Convert.ToInt32(gfh.GetType().GetField("QuantBaseQIdx")!.GetValue(gfh))}";
+                }
+                log.AppendLine($"{Path.GetFileName(file)} {cols}x{rows} q={qidx}{alpha}");
             }
             catch (Exception e) { log.AppendLine($"{Path.GetFileName(file)} ERROR {e.Message}"); }
         }

@@ -165,6 +165,27 @@ public sealed class AvifEncodeOptions
     /// <summary>Choose the tiling automatically (avifenc --autotiling; overrides the log2 values): up to 8 tiles, about
     /// one per 512x512 pixels, more along the longer dimension.</summary>
     public bool AutoTiling { get; set; }
+
+    /// <summary>Quality 0..100 on libavif's scale (avifenc -q; overrides <see cref="Qp"/>): mapped to a quantizer as
+    /// libavif does (its default libaom tune=iq table; the linear formula for the identity matrix) and to a base
+    /// q-index through libaom's quantizer table. 100 = lossless AV1 coding of the YUV samples (the matrix is kept; set
+    /// <see cref="Lossless"/> for avifenc --lossless, which also codes RGB with the identity matrix).</summary>
+    public int? Quality { get; set; }
+
+    /// <summary>Alpha quality 0..100 (avifenc --qalpha; 100 = lossless alpha). Null: <see cref="Quality"/> when set
+    /// (as avifenc), otherwise alpha is coded at half the colour q-index.</summary>
+    public int? QualityAlpha { get; set; }
+
+    /// <summary>Gain map quality 0..100 (avifenc / avifgainmaputil --qgain-map). Null: <see cref="GainMapLossless"/> /
+    /// <see cref="GainMapQp"/>, else <see cref="Quality"/> when set.</summary>
+    public int? QualityGainMap { get; set; }
+
+    /// <summary>Target file size in bytes (avifenc --target-size): binary search over quality 0..100 (10..100 when
+    /// progressive) for the encode closest to it; <see cref="Quality"/> / <see cref="QualityAlpha"/> /
+    /// <see cref="QualityGainMap"/> that are set stay fixed. Up to ~7 encodes.</summary>
+    public int? TargetSize { get; set; }
+
+    internal AvifEncodeOptions Clone() => (AvifEncodeOptions)MemberwiseClone();
 }
 
 /// <summary>Film grain for one AVIF encode: explicit parameters, or denoise-and-estimate (Level &lt; 0 = all-intra estimate).</summary>
@@ -905,10 +926,78 @@ public static partial class HeifCoder
     public static byte[] EncodeAvif(ImageFrame image, AvifEncodeOptions? options = null)
     {
         options ??= new AvifEncodeOptions();
+        if (options.TargetSize is { } target)
+            return SearchTargetSize(options, target, o => EncodeAvif(image, o));
         if (options.Grid is { } grid && (grid.Columns != 1 || grid.Rows != 1))
             return EncodeAvifGrid(image, options, grid.Columns, grid.Rows);
         using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, (int)image.Columns, (int)image.Rows));
         return EncodeAvifCore(image, options, forceColor: false, forceAlpha: false);
+    }
+
+    // Quality / QualityAlpha -> q-index overrides (null = the Qp path); alpha 0 = lossless. libavif picks libaom's tune=iq
+    // (and its quantizer table) only for colour in all-intra still images and layered images, not for identity-matrix
+    // colour, alpha (tune=psnr) or image sequences (good-quality mode, tune=ssim): those use the linear formula.
+    private static (int? QIdx, int? AlphaQIdx, bool Lossless) QualityQIndices(AvifEncodeOptions o, Av1.Av1ObuWriter.Av1ColorDesc color,
+        bool sequence = false)
+    {
+        bool linear = color.Matrix == 0 || sequence;
+        int? q = o.Quality is { } c && c < 100 ? QualityToQIndex(c, linear) : null;
+        int? qa = (o.QualityAlpha ?? o.Quality) is { } a ? QualityToQIndex(a, identityMatrix: true) : null;
+        return (q, qa, o.Quality >= 100);
+    }
+
+    // avifenc --target-size: binary search on quality (colour, alpha and gain map unless fixed) for the encode whose
+    // size is closest to the target; an exact hit ends the search.
+    private static byte[] SearchTargetSize(AvifEncodeOptions options, int target, Func<AvifEncodeOptions, byte[]> encode)
+    {
+        bool fixColor = options.Quality != null, fixAlpha = options.QualityAlpha != null, fixGainMap = options.QualityGainMap != null || options.GainMap == null;
+        if (fixColor && fixAlpha && fixGainMap)
+            throw new ArgumentException("TargetSize needs at least one of Quality / QualityAlpha / QualityGainMap left unset.", nameof(options));
+        int lo = options.Progressive ? 10 : 0, hi = 100;
+        byte[]? closest = null;
+        long closestDiff = 0;
+        while (lo <= hi)
+        {
+            int q = (lo + hi) / 2;
+            var o = options.Clone();
+            o.TargetSize = null;
+            if (!fixColor) o.Quality = q;
+            if (!fixAlpha) o.QualityAlpha = q;
+            if (!fixGainMap) o.QualityGainMap = q;
+            byte[] data = encode(o);
+            if (data.Length == target) return data;
+            long diff;
+            if (data.Length > target) { diff = data.Length - (long)target; hi = q - 1; }
+            else { diff = target - (long)data.Length; lo = q + 1; }
+            if (closest == null || diff < closestDiff) { closest = data; closestDiff = diff; }
+        }
+        return closest!;
+    }
+
+    // libaom av1_quantize.c quantizer_to_qindex.
+    private static readonly int[] QuantizerToQIndex =
+    [
+        0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100,
+        104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204,
+        208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 249, 255,
+    ];
+
+    // libavif codec_aom.c tuneIqQualityToQuantizer (its default tuning with libaom >= 3.13 for non-identity matrices).
+    private static readonly int[] TuneIqQualityToQuantizer =
+    [
+        63, 63, 63, 62, 62, 62, 61, 61, 60, 60, 59, 59, 58, 58, 57, 57, 56, 56, 55, 55, 54, 54, 53, 53, 52, 52, 51, 51, 50, 50,
+        49, 49, 48, 48, 47, 46, 46, 45, 45, 44, 43, 43, 42, 42, 41, 40, 40, 39, 39, 38, 37, 37, 36, 36, 35, 34, 33, 33, 32, 31,
+        30, 30, 29, 28, 27, 27, 26, 25, 24, 24, 23, 22, 21, 21, 20, 19, 18, 18, 17, 16, 15, 15, 14, 13, 12, 12, 11, 10, 9, 9,
+        8, 7, 6, 6, 5, 4, 3, 3, 2, 1, 0,
+    ];
+
+    // Quality 0..99 -> base q-index (libavif aomQualityToQuantizer, then libaom's quantizer table); 100 = lossless (0).
+    internal static int QualityToQIndex(int quality, bool identityMatrix)
+    {
+        quality = Math.Clamp(quality, 0, 100);
+        if (quality == 100) return 0;
+        int quantizer = identityMatrix ? ((100 - quality) * 63 + 50) / 100 : TuneIqQualityToQuantizer[quality];
+        return Math.Max(QuantizerToQIndex[quantizer], 1);
     }
 
     // libavif: tile log2 values clamped to 0..6; autoTiling = avifSetTileConfiguration(8 threads, first cell size).
@@ -981,12 +1070,15 @@ public static partial class HeifCoder
             throw new ArgumentOutOfRangeException(nameof(options), "DenoiseBlockSize must be 8, 16 or 32.");
         var grain = new AvifGrainRequest(options.FilmGrain, denoise, options.DenoiseUseRequestedLevel ? options.DenoiseNoiseLevel / 10.0f : -1,
             options.DenoiseBlockSize, options.DenoiseApply);
+        // Quality (libavif scale) overrides Qp; quality 100 = lossless AV1 coding (matrix unchanged).
+        var (qIdx, aQIdx, qualityLossless) = QualityQIndices(options, color);
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
-               && options.FilmGrain == null && !denoise && !options.Progressive && !forceColor && !forceAlpha
+               && options.FilmGrain == null && !denoise && !options.Progressive && !forceColor && !forceAlpha && qIdx == null && aQIdx == null
+               && !qualityLossless
             ? EncodeAvif8(image, options.Qp, color, extras)
-            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless, grain,
+            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless || qualityLossless, grain,
                 options.Progressive && image.Columns >= 16 && image.Rows >= 16,   // a sub-8px base layer is pointless
-                forceColor: forceColor, forceAlpha: forceAlpha);
+                forceColor: forceColor, forceAlpha: forceAlpha, qIdxOverride: qIdx, alphaQIdxOverride: aQIdx);
     }
 
     /// <summary>
@@ -1002,6 +1094,8 @@ public static partial class HeifCoder
     public static byte[] EncodeAvifSequence(ImageSequence sequence, AvifEncodeOptions? options = null)
     {
         options ??= new AvifEncodeOptions();
+        if (options.TargetSize is { } target)
+            return SearchTargetSize(options, target, o => EncodeAvifSequence(sequence, o));
         if (sequence.Count == 0) throw new ArgumentException("The sequence has no frames.", nameof(sequence));
         if (options.Progressive) throw new NotSupportedException("Progressive (layered) coding applies to still AVIF images.");
         var first = sequence[0];
@@ -1053,8 +1147,10 @@ public static partial class HeifCoder
         bool forceMono = layout == Av1.Av1PixelLayout.I400;   // avifenc -y 400: luma from RGB, chroma dropped
         bool mono = forceMono || (!anyColour && !(!options.Lossless && color.Matrix is 0 or 16 or 17));
         var codedLayout = mono ? Av1.Av1PixelLayout.I400 : layout;
-        int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
-        int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
+        var (qIdxQ, aQIdxQ, qualityLossless) = QualityQIndices(options, color, sequence: true);
+        bool lossless = options.Lossless || qualityLossless;
+        int baseQIdx = qIdxQ ?? Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        int alphaQIdx = aQIdxQ ?? (lossless ? 0 : Math.Clamp(baseQIdx / 2, 4, 255));
         int gssX = layout == Av1.Av1PixelLayout.I444 ? 0 : 1, gssY = layout == Av1.Av1PixelLayout.I420 ? 1 : 0;
         int max = (1 << bd) - 1;
 
@@ -1109,7 +1205,7 @@ public static partial class HeifCoder
 
                 (byte[] cSeq, byte[] cFrame) cObus;
                 using (Av1.Av1ObuWriter.UseFilmGrain(grain?.ToAv1(mono, mono ? 1 : gssX, mono ? 1 : gssY), !mono && gssX == 1 && gssY == 1))
-                    cObus = options.Lossless
+                    cObus = lossless
                         ? Av1.Av1StillImageEncoder.BuildLosslessObus(yP, uP, vP, mono, w, h, bd, codedLayout,
                             mono && color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color)
                         : mono ? Av1.Av1StillImageEncoder.BuildMonochromeObus(yP, w, h, baseQIdx, bd, color)
@@ -1117,12 +1213,8 @@ public static partial class HeifCoder
                 sq.ColorSamples.Add([.. td, .. cObus.cSeq, .. cObus.cFrame]);
                 if (alpha != null)
                 {
-                    (byte[] aSeq, byte[] aFrame) aObus;
-                    using (new Av1.Av1ObuWriter.SuppressFilmGrain(true))
-                        aObus = options.Lossless
-                            ? Av1.Av1StillImageEncoder.BuildLosslessObus(alpha, default, default, true, w, h, bd, Av1.Av1PixelLayout.I400, null)
-                            : Av1.Av1StillImageEncoder.BuildMonochromeObus(alpha, w, h, alphaQIdx, bd);
-                    sq.AlphaSamples!.Add([.. td, .. aObus.aSeq, .. aObus.aFrame]);
+                    var aObus = Av1.Av1StillImageEncoder.BuildAlphaObus(alpha, w, h, alphaQIdx, bd);
+                    sq.AlphaSamples!.Add([.. td, .. aObus.SeqObu, .. aObus.FrameObu]);
                 }
             }
         }
@@ -1300,7 +1392,7 @@ public static partial class HeifCoder
     private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout,
         Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras, bool lossless = false, AvifGrainRequest? request = null,
         bool progressive = false, (int W, int H)? scaleYuvTo = null, bool libavifFloatYuv = false, bool forceColor = false,
-        bool forceAlpha = false)
+        bool forceAlpha = false, int? qIdxOverride = null, int? alphaQIdxOverride = null)
     {
         // Film grain rides on the colour stream only: the ambient scope is read by the colour builders' headers and
         // suppressed around the alpha builds. Denoising (libaom aom_denoise_and_model_run) replaces the colour planes
@@ -1344,7 +1436,9 @@ public static partial class HeifCoder
         colour |= forceColor;
         nonOpaque |= forceAlpha && alpha != null;
 
-        int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        int baseQIdx = qIdxOverride ?? Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        if (progressive && alphaQIdxOverride == 0 && hasAlpha)
+            throw new NotSupportedException("Progressive (layered) encoding with lossless alpha is not supported.");
         if (extras.Premultiplied && hasAlpha && nonOpaque && alpha != null)
         {
             double amax = (1 << bd) - 1;
@@ -1365,11 +1459,11 @@ public static partial class HeifCoder
         }
         if (hasAlpha && nonOpaque && alpha != null && forceMono)
         {
-            int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
+            int alphaQIdx = alphaQIdxOverride ?? Math.Clamp(baseQIdx / 2, 4, 255);
             ushort[] yM = monoLuma ?? GreyLuma(r, w, h, bd, color);
             if (lossless)
                 return Av1.Av1StillImageEncoder.EncodeAvifLossless(yM, default, default, true, alpha, true, w, h, bd, Av1.Av1PixelLayout.I400,
-                    color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color, extras);
+                    color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color, extras, alphaQIdxOverride ?? 0);
             ushort[]? mU = null, mV = null;
             Denoise(ref yM, ref mU, ref mV, 1, 1);
             using (Grain(true))
@@ -1380,12 +1474,13 @@ public static partial class HeifCoder
         }
         if (hasAlpha && nonOpaque && alpha != null)
         {
-            int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
+            int alphaQIdx = alphaQIdxOverride ?? Math.Clamp(baseQIdx / 2, 4, 255);
             RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yA, out ushort[] uA0, out ushort[] vA0);
             ushort[]? uA = uA0, vA = vA0;
             Denoise(ref yA, ref uA, ref vA, gssX, gssY);
             if (lossless)
-                return Av1.Av1StillImageEncoder.EncodeAvifLossless(yA, uA!, vA!, false, alpha, true, w, h, bd, layout, color, extras);
+                return Av1.Av1StillImageEncoder.EncodeAvifLossless(yA, uA!, vA!, false, alpha, true, w, h, bd, layout, color, extras,
+                    alphaQIdxOverride ?? 0);
             using (Grain(false))
                 return progressive
                     ? Av1.Av1StillImageEncoder.EncodeAvifLayered(ProgressiveLayers(yA, uA, vA, alpha, w, h, gssX, gssY, baseQIdx, alphaQIdx),
@@ -1799,6 +1894,7 @@ public static partial class HeifCoder
             FullRange = color.FullRange, Rotation = 0, Mirror = null, Lossless = options.Lossless, PremultiplyAlpha = options.PremultiplyAlpha,
             FilmGrain = options.FilmGrain, DenoiseNoiseLevel = options.DenoiseNoiseLevel, DenoiseUseRequestedLevel = options.DenoiseUseRequestedLevel,
             DenoiseBlockSize = options.DenoiseBlockSize, DenoiseApply = options.DenoiseApply,
+            Quality = options.Quality, QualityAlpha = options.QualityAlpha,
         };
         var cells = new Av1.AvifGridCells { Columns = cols, Rows = rows, CellWidth = cellW, CellHeight = cellH, Alpha = alpha ? [] : null };
         using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, cellW, cellH));   // libavif: from the first cell

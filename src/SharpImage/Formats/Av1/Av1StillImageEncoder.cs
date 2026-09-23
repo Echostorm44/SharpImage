@@ -588,14 +588,12 @@ internal static class Av1StillImageEncoder
     /// <summary>Lossless AVIF: colour (any layout) or monochrome, plus an optional lossless alpha item.</summary>
     internal static byte[] EncodeAvifLossless(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v,
         bool monochrome, ReadOnlySpan<ushort> alpha, bool hasAlpha, int width, int height, int bitDepth, Av1PixelLayout layout,
-        Av1ObuWriter.Av1ColorDesc? color, AvifContainerExtras? extras)
+        Av1ObuWriter.Av1ColorDesc? color, AvifContainerExtras? extras, int alphaQIdx = 0)
     {
         (byte[] cSeq, byte[] cFrame) = BuildLosslessObus(luma, u, v, monochrome, width, height, bitDepth, layout, color);
         if (!hasAlpha)
             return Av1AvifWriter.BuildAvif(cSeq, cFrame, width, height, monochrome, bitDepth, layout, color, extras);
-        byte[] aSeq, aFrame;
-        using (new Av1ObuWriter.SuppressFilmGrain(true))   // grain is signalled on the colour item only
-            (aSeq, aFrame) = BuildLosslessObus(alpha, default, default, true, width, height, bitDepth, Av1PixelLayout.I400, null);
+        (byte[] aSeq, byte[] aFrame) = BuildAlphaObus(alpha, width, height, alphaQIdx, bitDepth);
         return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, monochrome, bitDepth, layout, color, extras);
     }
 
@@ -614,10 +612,18 @@ internal static class Av1StillImageEncoder
     {
         (byte[] cSeq, byte[] cFrame) = BuildColorObus(luma, u, v, width, height, baseQIdx, bitDepth, layout, color);
         // Alpha: no colour description, always full range (AVIF forbids limited-range alpha).
-        byte[] aSeq, aFrame;
-        using (new Av1ObuWriter.SuppressFilmGrain(true))   // grain is signalled on the colour item only
-            (aSeq, aFrame) = BuildMonochromeObus(alpha, width, height, alphaQIdx, bitDepth);
+        (byte[] aSeq, byte[] aFrame) = BuildAlphaObus(alpha, width, height, alphaQIdx, bitDepth);
         return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: false, bitDepth, layout, color, extras);
+    }
+
+    /// <summary>The alpha item's OBUs: lossless (4x4 WHT, base_q_idx 0) when <paramref name="alphaQIdx"/> is 0 (libavif
+    /// quality 100, avifenc's default --qalpha), else a lossy monochrome frame. Film grain never applies to alpha.</summary>
+    internal static (byte[] SeqObu, byte[] FrameObu) BuildAlphaObus(ReadOnlySpan<ushort> alpha, int width, int height, int alphaQIdx, int bitDepth)
+    {
+        using (new Av1ObuWriter.SuppressFilmGrain(true))
+            return alphaQIdx <= 0
+                ? BuildLosslessObus(alpha, default, default, true, width, height, bitDepth, Av1PixelLayout.I400, null)
+                : BuildMonochromeObus(alpha, width, height, alphaQIdx, bitDepth);
     }
 
     /// <summary>Monochrome (4:0:0) colour + alpha: both items coded as monochrome AV1 at the same depth; the colour item
@@ -626,9 +632,7 @@ internal static class Av1StillImageEncoder
         int baseQIdx, int alphaQIdx, int bitDepth, Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
     {
         (byte[] cSeq, byte[] cFrame) = BuildMonochromeObus(luma, width, height, baseQIdx, bitDepth, color);
-        byte[] aSeq, aFrame;
-        using (new Av1ObuWriter.SuppressFilmGrain(true))   // grain is signalled on the colour item only
-            (aSeq, aFrame) = BuildMonochromeObus(alpha, width, height, alphaQIdx, bitDepth);
+        (byte[] aSeq, byte[] aFrame) = BuildAlphaObus(alpha, width, height, alphaQIdx, bitDepth);
         return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: true, bitDepth,
             Av1PixelLayout.I400, color, extras);
     }
