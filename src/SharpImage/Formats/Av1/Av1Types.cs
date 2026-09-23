@@ -688,21 +688,23 @@ public struct Av1SegmentationData
 /// AV1 segmentation data set for all segments.
 /// Maps to dav1d Dav1dSegmentationDataSet (headers.h).
 /// </summary>
-public unsafe struct Av1SegmentationDataSet
+public struct Av1SegmentationDataSet
 {
-    public fixed byte SegmentDataStorage[Av1Constants.MaxSegments * 8]; // Av1SegmentationData[8]
+    // The eight segments inline (Av1SegmentationData is 10 bytes; the former 8-byte-per-segment fixed buffer let
+    // segments 6-7 overrun into Preskip/LastActiveSegId and past the struct).
+    public Av1SegmentationDataArray SegmentData;
     public byte Preskip;
     public sbyte LastActiveSegId;
 
-    /// <summary>Gets a reference to segment data by index.</summary>
-    public Span<Av1SegmentationData> Segments
-    {
-        get
-        {
-            fixed (byte* p = SegmentDataStorage)
-                return new Span<Av1SegmentationData>(p, Av1Constants.MaxSegments);
-        }
-    }
+    /// <summary>The per-segment feature data (a view over <see cref="SegmentData"/>).</summary>
+    [System.Diagnostics.CodeAnalysis.UnscopedRef]
+    public Span<Av1SegmentationData> Segments => SegmentData;
+}
+
+[System.Runtime.CompilerServices.InlineArray(Av1Constants.MaxSegments)]
+public struct Av1SegmentationDataArray
+{
+    private Av1SegmentationData _first;
 }
 
 // ============================================================================
@@ -814,6 +816,7 @@ public struct Av1Block
     public byte Partition;    // Av1BlockPartition
     public byte Intra;        // 1 = intra, 0 = inter
     public byte SegId;
+    public byte SegPred;      // segment id was temporally predicted (dav1d seg_pred; context for later blocks)
     public byte SkipMode;
     public byte Skip;
     public byte UvTx;         // UV transform size

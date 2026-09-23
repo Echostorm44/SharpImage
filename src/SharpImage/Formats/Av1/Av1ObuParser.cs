@@ -838,7 +838,11 @@ public static class Av1ObuParser
                     }
                 }
             }
-            // else: keep segmentation data from primary reference frame (handled by caller)
+            else
+            {
+                // segmentation_update_data = 0: the primary reference frame's segment features carry over.
+                hdr.SegmentationData = refFrames[hdr.GetRefIdx(hdr.PrimaryRefFrame)].SegmentationData;
+            }
         }
         else
         {

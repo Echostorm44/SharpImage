@@ -732,9 +732,29 @@ public static class Av1Decode
         b.Partition = (byte)bp;
         b.BlockSize = (byte)bs;
 
-        // === Segment ID ===
-        // Simplified: for keyframes without segmentation, seg_id = 0
+        // === Segment ID, before skip (dav1d decode_b: no map update, or preskip features) ===
         b.SegId = 0;
+        b.SegPred = 0;
+        if (fh.SegmentationEnabled)
+        {
+            if (!fh.SegmentationUpdateMap)
+            {
+                b.SegId = ctx.PrevSegMap != null ? PrevFrameSegId(ctx, t.By, t.Bx, w4, h4) : (byte)0;
+            }
+            else if (fh.SegmentationData.Preskip != 0)
+            {
+                if (fh.SegmentationTemporal &&
+                    msac.DecodeBoolAdapt(ts.Cdf.Mode.SegPred[t.Above.SegPred[bx4] + t.Left.SegPred[by4]]) != 0)
+                {
+                    b.SegPred = 1;
+                    b.SegId = ctx.PrevSegMap != null ? PrevFrameSegId(ctx, t.By, t.Bx, w4, h4) : (byte)0;
+                }
+                else
+                {
+                    b.SegId = ReadSegId(ref msac, ts, ctx, fh, t.By, t.Bx, haveTop, haveLeft);
+                }
+            }
+        }
 
         // === Skip Mode ===
         b.SkipMode = 0;
@@ -777,6 +797,26 @@ public static class Av1Decode
             Av1Msac.TraceLabel = null;
             if (DbgFirstBlock && t.Bx == 0 && t.By == 0)
                 AvDbg.W($"[DBG-BLK] Post-skip[{b.Skip}]: dif={msac.DebugDif:X16} rng={msac.DebugRng:X4} sctx={sctx}");
+        }
+
+        // === Segment ID, after skip (map update without preskip features) ===
+        if (fh.SegmentationEnabled && fh.SegmentationUpdateMap && fh.SegmentationData.Preskip == 0)
+        {
+            if (b.Skip == 0 && fh.SegmentationTemporal &&
+                msac.DecodeBoolAdapt(ts.Cdf.Mode.SegPred[t.Above.SegPred[bx4] + t.Left.SegPred[by4]]) != 0)
+            {
+                b.SegPred = 1;
+                b.SegId = ctx.PrevSegMap != null ? PrevFrameSegId(ctx, t.By, t.Bx, w4, h4) : (byte)0;
+            }
+            else if (b.Skip != 0)
+            {
+                b.SegId = CurFrameSegIdPred(ctx, t.By, t.Bx, haveTop, haveLeft, out _);
+            }
+            else
+            {
+                b.SegId = ReadSegId(ref msac, ts, ctx, fh, t.By, t.Bx, haveTop, haveLeft);
+            }
+            segF = fh.SegmentationData.Segments[b.SegId];
         }
 
         // === CDEF index ===
@@ -1071,7 +1111,7 @@ public static class Av1Decode
             for (int i = 0; i < bw4; i++) t.Above.Intra[bx4 + i] = 0;
             for (int i = 0; i < bw4; i++) t.Above.Skip[bx4 + i] = b.Skip;
             for (int i = 0; i < bw4; i++) t.Above.SkipMode[bx4 + i] = b.SkipMode;
-            for (int i = 0; i < bw4; i++) t.Above.SegPred[bx4 + i] = 0;
+            for (int i = 0; i < bw4; i++) t.Above.SegPred[bx4 + i] = b.SegPred;
             for (int i = 0; i < bw4; i++) t.Above.PalSz[bx4 + i] = 0;
             for (int i = 0; i < bw4; i++) t.PalSzUv[0, bx4 + i] = 0;   // dav1d t->pal_sz_uv (palette cache)
             for (int i = 0; i < bw4; i++) t.Above.TxIntra[bx4 + i] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 2];
@@ -1084,7 +1124,7 @@ public static class Av1Decode
             for (int j = 0; j < bh4; j++) t.Left.Intra[by4 + j] = 0;
             for (int j = 0; j < bh4; j++) t.Left.Skip[by4 + j] = b.Skip;
             for (int j = 0; j < bh4; j++) t.Left.SkipMode[by4 + j] = b.SkipMode;
-            for (int j = 0; j < bh4; j++) t.Left.SegPred[by4 + j] = 0;
+            for (int j = 0; j < bh4; j++) t.Left.SegPred[by4 + j] = b.SegPred;
             for (int j = 0; j < bh4; j++) t.Left.PalSz[by4 + j] = 0;
             for (int j = 0; j < bh4; j++) t.PalSzUv[1, by4 + j] = 0;
             for (int j = 0; j < bh4; j++) t.Left.TxIntra[by4 + j] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 3];
@@ -1132,6 +1172,11 @@ public static class Av1Decode
                     rrow[t.Bx + bw4 - 1] = tmpl;
             }
         }
+
+        // This block's segment id into the frame's segment map (dav1d: over the whole bw4 x bh4 block).
+        if (fh.SegmentationEnabled && fh.SegmentationUpdateMap && ctx.CurSegMap != null)
+            for (int y = 0; y < bh4; y++)
+                ctx.CurSegMap.AsSpan((t.By + y) * ctx.B4Stride + t.Bx, bw4).Fill(b.SegId);
 
         // Fill CDEF noskip_mask for non-skip blocks (dav1d decode.c:1993-1999).
         // Common to intra and inter blocks — gates which 8x8 blocks CDEF filters. The mask covers one SB128
@@ -1643,7 +1688,7 @@ public static class Av1Decode
             t.Above.Intra[bx4 + i] = 0;
             t.Above.Skip[bx4 + i] = b.Skip;
             t.Above.SkipMode[bx4 + i] = 0;
-            t.Above.SegPred[bx4 + i] = 0;
+            t.Above.SegPred[bx4 + i] = b.SegPred;
             t.Above.PalSz[bx4 + i] = 0;
             t.PalSzUv[0, bx4 + i] = 0;
             t.Above.TxIntra[bx4 + i] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 2];
@@ -1654,7 +1699,7 @@ public static class Av1Decode
             t.Left.Intra[by4 + j] = 0;
             t.Left.Skip[by4 + j] = b.Skip;
             t.Left.SkipMode[by4 + j] = 0;
-            t.Left.SegPred[by4 + j] = 0;
+            t.Left.SegPred[by4 + j] = b.SegPred;
             t.Left.PalSz[by4 + j] = 0;
             t.PalSzUv[1, by4 + j] = 0;
             t.Left.TxIntra[by4 + j] = (sbyte)Av1Tables.BlockDimensions[(int)bs, 3];
@@ -2083,51 +2128,61 @@ public static class Av1Decode
         { 4, 4, 3, 2 },  // TX_64X64
     };
 
+    // dav1d read_vartx_tree (switchable branch): one transform tree per maximum-size transform tiling the block
+    // (two for 64x128/128x64, four for 128x128), each read by read_tx_tree.
     private static void ReadVarTxTree(Av1TaskContext t, Av1DecoderContext ctx, ref Av1Msac msac, ref Av1Block b,
-        Av1BlockSize bs, byte tx, int bx4, int by4, int depth, int xOff = 0, int yOff = 0)
+        Av1BlockSize bs, byte maxTx, int bx4, int by4, int depth)
     {
-        var ts = t.TileState!;
-        ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
-        int txw = tDim.W, txh = tDim.H;
+        ref readonly var ytx = ref Av1Tables.TxfmDimensions[maxTx];
+        int bw4 = Av1Tables.BlockDimensions[(int)bs, 0], bh4 = Av1Tables.BlockDimensions[(int)bs, 1];
+        for (int y = 0, yOff = 0; y < bh4; y += ytx.H, yOff++)
+            for (int x = 0, xOff = 0; x < bw4; x += ytx.W, xOff++)
+                ReadTxTree(t, ctx, ref msac, ref b, maxTx, depth, xOff, yOff, t.Bx + x, t.By + y);
+    }
 
-        if (depth < 2 && txw * txh > 1)
+    // dav1d read_tx_tree: a split flag below depth 2, recursion into the sub-transforms that start inside the frame
+    // (positions tracked per sub-tree), and the leaf's log2 size into the above/left tx contexts.
+    private static void ReadTxTree(Av1TaskContext t, Av1DecoderContext ctx, ref Av1Msac msac, ref Av1Block b,
+        byte from, int depth, int xOff, int yOff, int bx, int by)
+    {
+        int bx4 = bx & 31, by4 = by & 31;
+        ref readonly var tDim = ref Av1Tables.TxfmDimensions[from];
+        int txw = tDim.Lw, txh = tDim.Lh;
+        bool isSplit = false;
+        if (depth < 2 && from > (byte)Av1TxSize.Tx4x4)
         {
-            // dav1d: cat = 2 * (TX_64X64 - t_dim->max) - depth
             int cat = 2 * ((int)Av1TxSize.Tx64x64 - tDim.Max) - depth;
-            // dav1d compares log2 dims: a->tx[bx4] < t_dim->lw, l->tx[by4] < t_dim->lh
-            int txwLog = tDim.Lw, txhLog = tDim.Lh;
-            int txCtx = 0;
-            if (t.Above.Tx[bx4] < txwLog) txCtx++;
-            if (t.Left.Tx[by4] < txhLog) txCtx++;
-            if (t.Bx == 0 && t.By == 0) AvDbg.W($"[VARTX] tx={tx} depth={depth} cat={cat} ctx={txCtx} aTx={t.Above.Tx[bx4]}(<{txwLog}={t.Above.Tx[bx4]<txwLog}) lTx={t.Left.Tx[by4]}(<{txhLog}={t.Left.Tx[by4]<txhLog}) rng={msac.DebugRng:X4}");
-            int vartxSplit = (int)msac.DecodeBoolAdapt(ts.Cdf.GetTxPartCdf(cat, txCtx));
-
-            if (vartxSplit != 0)
+            int a = t.Above.Tx[bx4] < txw ? 1 : 0;
+            int l = t.Left.Tx[by4] < txh ? 1 : 0;
+            isSplit = msac.DecodeBoolAdapt(t.TileState!.Cdf.GetTxPartCdf(cat, a + l)) != 0;
+            if (isSplit)
             {
-                // Record split decision (dav1d: masks[depth] |= 1 << (y_off * 4 + x_off))
                 if (depth == 0) b.TxSplit0 |= (byte)(1 << (yOff * 4 + xOff));
                 else b.TxSplit1 |= (ushort)(1 << (yOff * 4 + xOff));
-
-                ref readonly var subDim = ref Av1Tables.TxfmDimensions[tDim.Sub];
-                int sw = subDim.W, sh = subDim.H;
-                byte subTx = tDim.Sub;
-                // dav1d read_tx_tree recursion: 1st always, 2nd if wide, 3rd+4th only if tall
-                ReadVarTxTree(t, ctx, ref msac, ref b, bs, subTx, bx4, by4, depth + 1, xOff * 2, yOff * 2);
-                if (txw >= txh && t.Bx + sw < ctx.Bw)
-                    ReadVarTxTree(t, ctx, ref msac, ref b, bs, subTx, bx4 + sw, by4, depth + 1, xOff * 2 + 1, yOff * 2);
-                if (txh >= txw && t.By + sh < ctx.Bh)
-                {
-                    ReadVarTxTree(t, ctx, ref msac, ref b, bs, subTx, bx4, by4 + sh, depth + 1, xOff * 2, yOff * 2 + 1);
-                    if (txw >= txh && t.Bx + sw < ctx.Bw)
-                        ReadVarTxTree(t, ctx, ref msac, ref b, bs, subTx, bx4 + sw, by4 + sh, depth + 1, xOff * 2 + 1, yOff * 2 + 1);
-                }
-                return;
             }
         }
 
-        // No split — store the transform size at this leaf (dav1d: log2 dims)
-        Av1BlockContextManaged.Fill(t.Above.Tx, bx4, txw, (sbyte)tDim.Lw);
-        Av1BlockContextManaged.Fill(t.Left.Tx, by4, txh, (sbyte)tDim.Lh);
+        if (isSplit && tDim.Max > (int)Av1TxSize.Tx8x8)
+        {
+            byte sub = tDim.Sub;
+            ref readonly var subDim = ref Av1Tables.TxfmDimensions[sub];
+            int txsw = subDim.W, txsh = subDim.H;
+            ReadTxTree(t, ctx, ref msac, ref b, sub, depth + 1, xOff * 2, yOff * 2, bx, by);
+            if (txw >= txh && bx + txsw < ctx.Bw)
+                ReadTxTree(t, ctx, ref msac, ref b, sub, depth + 1, xOff * 2 + 1, yOff * 2, bx + txsw, by);
+            if (txh >= txw && by + txsh < ctx.Bh)
+            {
+                ReadTxTree(t, ctx, ref msac, ref b, sub, depth + 1, xOff * 2, yOff * 2 + 1, bx, by + txsh);
+                if (txw >= txh && bx + txsw < ctx.Bw)
+                    ReadTxTree(t, ctx, ref msac, ref b, sub, depth + 1, xOff * 2 + 1, yOff * 2 + 1, bx + txsw, by + txsh);
+            }
+        }
+        else
+        {
+            // An 8x8 (or smaller) split codes 4x4 transforms without further symbols.
+            Av1BlockContextManaged.Fill(t.Above.Tx, bx4, tDim.W, (sbyte)(isSplit ? 0 : txw));
+            Av1BlockContextManaged.Fill(t.Left.Tx, by4, tDim.H, (sbyte)(isSplit ? 0 : txh));
+        }
     }
 
     /// <summary>Decode MV residual (port of dav1d read_mv_residual).</summary>
@@ -2187,6 +2242,63 @@ public static class Av1Decode
     /// Update above/left neighbor contexts after reconstruction completes.
     /// Must be called AFTER recon_b_intra, matching dav1d's ordering (decode.c:1253).
     /// </summary>
+    // dav1d get_prev_frame_segid: the smallest id the reference map holds under the (frame-clipped) block.
+    private static byte PrevFrameSegId(Av1DecoderContext ctx, int by, int bx, int w4, int h4)
+    {
+        var map = ctx.PrevSegMap!;
+        int segId = 8, off = by * ctx.B4Stride + bx;
+        do
+        {
+            for (int x = 0; x < w4; x++) segId = Math.Min(segId, map[off + x]);
+            off += ctx.B4Stride;
+        } while (--h4 > 0 && segId != 0);
+        if (segId >= 8) throw new InvalidDataException("AV1 reference segmentation map holds an invalid segment id.");
+        return (byte)segId;
+    }
+
+    // dav1d get_cur_frame_segid: the spatial prediction from the left / above / above-left ids and its context.
+    private static byte CurFrameSegIdPred(Av1DecoderContext ctx, int by, int bx, bool haveTop, bool haveLeft, out int segCtx)
+    {
+        var map = ctx.CurSegMap!;
+        int stride = ctx.B4Stride, off = by * stride + bx;
+        if (haveLeft && haveTop)
+        {
+            int l = map[off - 1], a = map[off - stride], al = map[off - stride - 1];
+            segCtx = l == a && al == l ? 2 : l == a || al == l || a == al ? 1 : 0;
+            return (byte)(a == al ? a : l);
+        }
+        segCtx = 0;
+        return haveLeft ? map[off - 1] : haveTop ? map[off - stride] : (byte)0;
+    }
+
+    // Coded segment id: a symbol relative to the spatial prediction (dav1d neg_deinterleave), capped as dav1d does.
+    private static byte ReadSegId(ref Av1Msac msac, Av1TileState ts, Av1DecoderContext ctx, Av1DecoderFrameHeader fh,
+        int by, int bx, bool haveTop, bool haveLeft)
+    {
+        int pred = CurFrameSegIdPred(ctx, by, bx, haveTop, haveLeft, out int segCtx);
+        int diff = (int)msac.DecodeSymbolAdapt8(ts.Cdf.Mode.SegId[segCtx], Av1Constants.MaxSegments - 1);
+        int last = fh.SegmentationData.LastActiveSegId;
+        int id = NegDeinterleave(diff, pred, last + 1);
+        if (id > last) id = 0;
+        if (id >= Av1Constants.MaxSegments) id = 0;
+        return (byte)id;
+    }
+
+    private static int NegDeinterleave(int diff, int reference, int max)
+    {
+        if (reference == 0) return diff;
+        if (reference >= max - 1) return max - diff - 1;
+        if (2 * reference < max)
+        {
+            if (diff <= 2 * reference)
+                return (diff & 1) != 0 ? reference + ((diff + 1) >> 1) : reference - (diff >> 1);
+            return diff;
+        }
+        if (diff <= 2 * (max - reference - 1))
+            return (diff & 1) != 0 ? reference + ((diff + 1) >> 1) : reference - (diff >> 1);
+        return max - (diff + 1);
+    }
+
     public static void UpdateIntraBlockContext(
         Av1TaskContext t, Av1DecoderContext ctx, Av1BlockSize bs, ref Av1Block b,
         int bx4, int by4, int cbx4, int cby4, int cbw4, int cbh4,
@@ -2212,7 +2324,7 @@ public static class Av1Decode
                 Av1BlockContextManaged.Fill(t.Above.Tx, off, count, (sbyte)tDim.Lw);
                 Av1BlockContextManaged.Fill(t.Above.Mode, off, count, yModeNoFilt);
                 Av1BlockContextManaged.Fill(t.Above.PalSz, off, count, b.PalSzY);
-                Av1BlockContextManaged.Fill(t.Above.SegPred, off, count, 0);
+                Av1BlockContextManaged.Fill(t.Above.SegPred, off, count, b.SegPred);
                 Av1BlockContextManaged.Fill(t.Above.SkipMode, off, count, 0);
                 Av1BlockContextManaged.Fill(t.Above.Intra, off, count, 1);
                 Av1BlockContextManaged.Fill(t.Above.Skip, off, count, b.Skip);
@@ -2237,7 +2349,7 @@ public static class Av1Decode
                 Av1BlockContextManaged.Fill(t.Left.Tx, off, count, (sbyte)tDim.Lh);
                 Av1BlockContextManaged.Fill(t.Left.Mode, off, count, yModeNoFilt);
                 Av1BlockContextManaged.Fill(t.Left.PalSz, off, count, b.PalSzY);
-                Av1BlockContextManaged.Fill(t.Left.SegPred, off, count, 0);
+                Av1BlockContextManaged.Fill(t.Left.SegPred, off, count, b.SegPred);
                 Av1BlockContextManaged.Fill(t.Left.SkipMode, off, count, 0);
                 Av1BlockContextManaged.Fill(t.Left.Intra, off, count, 1);
                 Av1BlockContextManaged.Fill(t.Left.Skip, off, count, b.Skip);

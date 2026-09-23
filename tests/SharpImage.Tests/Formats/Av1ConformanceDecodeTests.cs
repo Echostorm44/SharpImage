@@ -236,6 +236,41 @@ public sealed class Av1ConformanceDecodeTests
         await Assert.That(Hex(MD5.HashData(all.ToArray()))).IsEqualTo(md5);
     }
 
+    // Frame-level features, libaom streams checked against libdav1d frame by frame: segmentation maps (spatial ids,
+    // inherited maps and data, aq-mode 1/3 with delta-q and delta-lf), 2x2 tiles, monochrome, reference scaling (fixed
+    // and random resize), super-resolution (fixed, random, 10-bit 4:4:4, combined with resize; loop restoration in the
+    // upscaled domain) and switch frames. Output sizes may change per frame; 4:0:0 hashes the luma plane only.
+    [Test]
+    [Arguments("libaom_seg_aq1_deltaq_lf.obu", 10, "58b86c5eba726f5148b9ef1100d84c5d")]
+    [Arguments("libaom_seg_aq3_realtime.obu", 16, "2f81adb9f6da42d1bbb06f30e2ec1fac")]
+    [Arguments("libaom_seg_aq1_inherit.obu", 16, "3d1c1e072fe56d925b1f872c3829e9c2")]
+    [Arguments("libaom_inter_tiles_2x2.obu", 8, "b396bcf8f5273155ef97cd076a6a92a1")]
+    [Arguments("libaom_inter_mono.obu", 10, "244a418db445601cb95647c78b6d57f6")]
+    [Arguments("libaom_resize_fixed.obu", 12, "05a2d5c0a1200b4981bbedfd71a8d97e")]
+    [Arguments("libaom_resize_random.obu", 12, "ecb4035a6ce4d36aed04f95c912eb1bd")]
+    [Arguments("libaom_superres_fixed.obu", 12, "64900fb494a2d6237c29cb2a55a010c5")]
+    [Arguments("libaom_superres_random.obu", 12, "5b0b1ea791404c2b00331a932e8592c8")]
+    [Arguments("libaom_superres_444_10.obu", 10, "f7c88ff88403a8856686b4b13a91a254")]
+    [Arguments("libaom_superres_resize.obu", 10, "e873451d202e0a1ba6d3580479dd1068")]
+    [Arguments("libaom_sframe.obu", 12, "93b67a308863688d5c1280d1d0bc3f52")]
+    public async Task FeatureStream_ByteExactVsDav1d(string file, int frames, string md5)
+    {
+        byte[] data = File.ReadAllBytes(Asset(file));
+        var dec = new Av1Decoder();
+        using var all = new MemoryStream();
+        int shown = 0, tu = 0;
+        foreach (var (off, len) in TemporalUnits(data))
+        {
+            using var f = dec.Decode(data.AsSpan(off, len), tu++, false);
+            if (f == null) continue;
+            var planes = NativePlanes(f);
+            all.Write(dec.Monochrome ? planes.AsSpan(0, f.Width * f.Height * (f.BitDepth > 8 ? 2 : 1)) : planes);
+            shown++;
+        }
+        await Assert.That(shown).IsEqualTo(frames);
+        await Assert.That(Hex(MD5.HashData(all.ToArray()))).IsEqualTo(md5);
+    }
+
     // Splits a low-overhead OBU stream at its temporal delimiters.
     private static List<(int Off, int Len)> TemporalUnits(byte[] d)
     {

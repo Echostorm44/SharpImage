@@ -2283,22 +2283,26 @@ public static class Av1Reconstruction
             for (int initX = 0; initX < bw4; initX += 16)
             {
                 // ── Luma coefficient coding & inverse transforms ──
+                // dav1d recon_b_inter: t->by/t->bx follow the transform position (chunk offset included) so the tree
+                // reader's frame-edge tests and context fills see the right place.
                 int yOff = initY != 0 ? 1 : 0;
                 int saveBx = t.Bx, saveBy = t.By;
 
+                t.By = saveBy + initY;
                 for (int y = initY; y < Math.Min(h4, initY + 16); y += ytDim.H, yOff++)
                 {
                     int xOff = initX != 0 ? 1 : 0;
+                    t.Bx = saveBx + initX;
                     for (int x = initX; x < Math.Min(w4, initX + 16); x += ytDim.W, xOff++)
                     {
-                        int lDstOff = yDstOff + (initY + y) * 4 * yStride + x * 4;
+                        int lDstOff = yDstOff + y * 4 * yStride + x * 4;
                         ReadCoefTree(t, ref msac, ctx, bs, ref b, b.MaxYTx, 0, txSplit,
                             xOff, yOff, yPlane, yStride, lDstOff);
                         t.Bx += ytDim.W;
                     }
-                    t.Bx = saveBx;
                     t.By += ytDim.H;
                 }
+                t.Bx = saveBx;
                 t.By = saveBy;
 
                 // ── Chroma coefficient coding & inverse transforms ──
@@ -2311,8 +2315,10 @@ public static class Av1Reconstruction
                         var leftCoef = pl == 0 ? t.Left.CCoef0 : t.Left.CCoef1;
                         int saveBx2 = t.Bx, saveBy2 = t.By;
 
+                        t.By = saveBy2 + initY;
                         for (int y = initY >> ssVer; y < Math.Min(ch4, (initY + 16) >> ssVer); y += uvtDim.H)
                         {
+                            t.Bx = saveBx2 + initX;
                             for (int x = initX >> ssHor; x < Math.Min(cw4, (initX + 16) >> ssHor); x += uvtDim.W)
                             {
                                 // txtp comes from the luma txtp map (dav1d: txtp_map read, recon_tmpl.c:1954)

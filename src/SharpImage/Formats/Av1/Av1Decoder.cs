@@ -557,7 +557,7 @@ internal sealed class Av1Decoder
         if (ctx.RestorePlanes != 0)
         {
             int sb128h2 = (bh + 31) >> 5;
-            int lrMaskCount = sb128h2 * sb128w;
+            int lrMaskCount = sb128h2 * ((fh.SuperResUpscaledWidth + 127) >> 7);
             if (ctx.LrMasks == null || ctx.LrMasks.Length < lrMaskCount)
             {
                 ctx.LrMasks = new Av1RestorationInfo[lrMaskCount];
@@ -571,7 +571,7 @@ internal sealed class Av1Decoder
                     Array.Clear(ctx.LrMasks[i].Lr);
             }
         }
-        ctx.SrSb128W = sb128w;
+        ctx.SrSb128W = (fh.SuperResUpscaledWidth + 127) >> 7;   // dav1d sr_sb128w
 
         // Parse tile sizes from tile groups and assign per-tile data ranges
         SetupTileData();
@@ -628,6 +628,28 @@ internal sealed class Av1Decoder
         ctx.CurrentStrides[0] = yStride;
         ctx.YStride = yStride;
 
+        // Super-resolution: LR, its line buffers and the output run on the upscaled picture (dav1d sr_cur).
+        int srW = frameHdr.SuperResUpscaledWidth;
+        ctx.SuperRes = srW != width;
+        ctx.LrYStride = ctx.SuperRes ? (srW + 63) & ~63 : yStride;
+        ctx.LrUvStride = hasChroma ? (ctx.SuperRes ? ((ctx.LrYStride >> ssHor) + 63) & ~63 : uvStride) : 0;
+        if (ctx.SuperRes)
+        {
+            // dav1d scale_fac / get_upscale_x0 on the coded (cur.p.w) and upscaled widths, luma then chroma.
+            static int ScaleFac(int refSz, int thisSz) => ((refSz << 14) + (thisSz >> 1)) / thisSz;
+            static int UpscaleX0(int inW, int outW, int step)
+            {
+                int err = outW * step - (inW << 14);
+                int x0 = (-((outW - inW) << 13) + (outW >> 1)) / outW + 128 - (err / 2);
+                return x0 & 0x3fff;
+            }
+            int inCw = (width + ssHor) >> ssHor, outCw = (srW + ssHor) >> ssHor;
+            ctx.ResizeStep[0] = ScaleFac(width, srW);
+            ctx.ResizeStep[1] = ScaleFac(inCw, outCw);
+            ctx.ResizeStart[0] = UpscaleX0(width, srW, ctx.ResizeStep[0]);
+            ctx.ResizeStart[1] = UpscaleX0(inCw, outCw, ctx.ResizeStep[1]);
+        }
+
         if (hasChroma)
         {
             ctx.CurrentPlanes[1] = ArrayPool<ushort>.Shared.Rent(uvSize);
@@ -643,8 +665,8 @@ internal sealed class Av1Decoder
         {
             // 12 rows per SB row; the per-SB-row snapshot below copies 24 for 128x128 superblocks.
             int numLines = seqHdr.Sb128 ? 24 : 12;
-            int yLpfSize = yStride * numLines;
-            int uvLpfSize = uvStride * numLines;
+            int yLpfSize = ctx.LrYStride * numLines;
+            int uvLpfSize = ctx.LrUvStride * numLines;
             if (ctx.LrLpfLine[0] == null || ctx.LrLpfLine[0].Length < yLpfSize)
                 ctx.LrLpfLine[0] = new ushort[yLpfSize];
             if (hasChroma)
@@ -778,6 +800,26 @@ internal sealed class Av1Decoder
             }
         }
 
+        // Segmentation maps (dav1d decode_frame_init): the primary reference's map when this frame predicts from it
+        // (temporal update or no update) and it has the same size, then either a fresh map to write, that reference map
+        // reused, or a zeroed one.
+        ctx.PrevSegMap = null;
+        ctx.CurSegMap = null;
+        if (fh.SegmentationEnabled)
+        {
+            if (fh.SegmentationTemporal || !fh.SegmentationUpdateMap)
+            {
+                var pri = ctx.RefFrames[fh.GetRefIdx(fh.PrimaryRefFrame)];
+                if (((pri.CodedWidth + 7) >> 3) == ((fh.CodedWidth + 7) >> 3) && ((pri.Height + 7) >> 3) == ((fh.Height + 7) >> 3))
+                    ctx.PrevSegMap = pri.SegmentMap;
+            }
+            int segSize = ctx.B4Stride * (((ctx.Bh + 31) >> 5) << 5);   // dav1d b4_stride * 32 * sb128h
+            if (fh.SegmentationUpdateMap)
+                ctx.CurSegMap = new byte[segSize];
+            else
+                ctx.CurSegMap = ctx.PrevSegMap ?? new byte[segSize];
+        }
+
         // Initialize refmvs frame for inter prediction (dav1d: dav1d_submit_frame ref_mvs setup +
         // dav1d_refmvs_init_frame): the reference order hints, a fresh motion field for this frame (kept by the
         // reference slots it refreshes), and the saved motion fields of same-size inter references.
@@ -799,7 +841,7 @@ internal sealed class Av1Decoder
                 for (int i = 0; i < 7; i++)
                 {
                     var rfr = ctx.RefFrames[fh.GetRefIdx(i)];
-                    if (rfr.TemporalMvs != null && ((rfr.Width + 7) >> 3) == ((fh.CodedWidth + 7) >> 3)
+                    if (rfr.TemporalMvs != null && ((rfr.CodedWidth + 7) >> 3) == ((fh.CodedWidth + 7) >> 3)
                         && ((rfr.Height + 7) >> 3) == ((fh.Height + 7) >> 3))
                         rpRefs[i] = rfr.TemporalMvs;
                     for (int m = 0; m < 7; m++) refRefPoc[i, m] = rfr.RefPoc[m];
@@ -809,7 +851,7 @@ internal sealed class Av1Decoder
             else Av1RefMvs.InitFrame(ctx.RefMvs, seqHdr, fh, ctx.CurrentRefPoc, ctx.CurrentRp, null, null);
         }
         else Av1RefMvs.InitFrame(ctx.RefMvs, seqHdr, fh, ctx.CurrentRefPoc, null, null, null);
-        Av1Decode.BlockTrace?.WriteLine($"F type={fh.FrameType} show={fh.ShowFrame} off={fh.FrameOffset} urfm={fh.UseRefFrameMvs} ohb={seqHdr.OrderHintNBits} n={ctx.RefMvs.MfmvCount} refpoc={string.Join(',', ctx.CurrentRefPoc)} refidx={string.Join(',', Enumerable.Range(0, 7).Select(i => fh.GetRefIdx(i)))} tm={string.Join(',', ctx.RefFrames.Select(r => r.TemporalMvs != null ? 1 : 0))} refresh={fh.RefreshFrameFlags} lf={fh.LfLevelY0},{fh.LfLevelY1},{fh.LfLevelU},{fh.LfLevelV} mrd={fh.LfModeRefDeltaEnabled} cdef={fh.CdefNBits}/{fh.CdefYStrength0} lr={fh.GetLrType(0)},{fh.GetLrType(1)},{fh.GetLrType(2)} dlf={fh.DeltaLfPresent} slotY0={string.Join(',', ctx.RefFrames.Select(r => r.Planes[0] == null ? -1 : r.Planes[0]![0]))} oh={string.Join(',', ctx.RefFrames.Select(r => r.OrderHint))}");
+        Av1Decode.BlockTrace?.WriteLine($"F type={fh.FrameType} show={fh.ShowFrame} off={fh.FrameOffset} urfm={fh.UseRefFrameMvs} ohb={seqHdr.OrderHintNBits} n={ctx.RefMvs.MfmvCount} refpoc={string.Join(',', ctx.CurrentRefPoc)} refidx={string.Join(',', Enumerable.Range(0, 7).Select(i => fh.GetRefIdx(i)))} tm={string.Join(',', ctx.RefFrames.Select(r => r.TemporalMvs != null ? 1 : 0))} refresh={fh.RefreshFrameFlags} lf={fh.LfLevelY0},{fh.LfLevelY1},{fh.LfLevelU},{fh.LfLevelV} mrd={fh.LfModeRefDeltaEnabled} cdef={fh.CdefNBits}/{fh.CdefYStrength0} lr={fh.GetLrType(0)},{fh.GetLrType(1)},{fh.GetLrType(2)} dlf={fh.DeltaLfPresent} cw={fh.CodedWidth}/{fh.SuperResUpscaledWidth} seg={(fh.SegmentationEnabled ? 1 : 0)}{(fh.SegmentationUpdateMap ? 1 : 0)}{(fh.SegmentationTemporal ? 1 : 0)}{(fh.SegmentationUpdateData ? 1 : 0)} slotY0={string.Join(',', ctx.RefFrames.Select(r => r.Planes[0] == null ? -1 : r.Planes[0]![0]))} oh={string.Join(',', ctx.RefFrames.Select(r => r.OrderHint))}");
 
         // Process tile rows by superblock rows
         for (int tileRow = 0; tileRow < fh.TileRows; tileRow++)
@@ -951,7 +993,7 @@ internal sealed class Av1Decoder
             {
                 var line = ctx.LrLpfLine[p];
                 if (line == null) { ctx.LrLpfSnap[p] = null; continue; }
-                int snapSize = sbh * numLines * (p == 0 ? ctx.YStride : ctx.UvStride);
+                int snapSize = sbh * numLines * (p == 0 ? ctx.LrYStride : ctx.LrUvStride);
                 if (ctx.LrLpfSnap[p] == null || ctx.LrLpfSnap[p]!.Length < snapSize)
                     ctx.LrLpfSnap[p] = new ushort[snapSize];
             }
@@ -963,7 +1005,7 @@ internal sealed class Av1Decoder
                     var line = ctx.LrLpfLine[p];
                     var snap = ctx.LrLpfSnap[p];
                     if (line == null || snap == null) continue;
-                    int stride = p == 0 ? ctx.YStride : ctx.UvStride;
+                    int stride = p == 0 ? ctx.LrYStride : ctx.LrUvStride;
                     Array.Copy(line, 0, snap, sby * numLines * stride, numLines * stride);
                 }
             }
@@ -996,6 +1038,9 @@ internal sealed class Av1Decoder
                 AvDbg.W($"[POST-CDEF] Dumped {w}x{h} Y plane to {dumpPath}");
             }
         }
+
+        // === Super-resolution upscale (dav1d filter_sbrow_resize over the whole frame, after deblock + CDEF) ===
+        if (ctx.SuperRes) UpscaleSuperRes(ssHor, ssVer, hasChroma);
 
         // === Loop Restoration ===
         if (ctx.RestorePlanes != 0 && System.Environment.GetEnvironmentVariable("AV1_NOLR") == "1") { AvDbg.W("[LR] skipped (probe)"); }
@@ -1297,13 +1342,31 @@ internal sealed class Av1Decoder
 
             var frameType = fh.GetLrType(p);
 
-            // No super-resolution path (fh.Width[0] == fh.Width[1])
+            if (ctx.SuperRes)
+            {
+                // Units live in the upscaled picture: read those whose left edge maps into this superblock.
+                int srW = (fh.SuperResUpscaledWidth + ssHor) >> ssHor;
+                int nUnits = Math.Max(1, (srW + halfUnit) >> unitSizeLog2);
+                int d = fh.SuperResScaleDenominator;
+                int rnd = unitSize * 8 - 1, shift = unitSizeLog2 + 3;
+                int x0 = ((4 * t.Bx * d >> ssHor) + rnd) >> shift;
+                int x1 = ((4 * (t.Bx + sbStep) * d >> ssHor) + rnd) >> shift;
+                for (int ux = x0; ux < Math.Min(x1, nUnits); ux++)
+                {
+                    int pxX = ux << (unitSizeLog2 + ssHor);
+                    int srSbIdx = (t.By >> 5) * ctx.SrSb128W + (pxX >> 7);
+                    int srUnitIdx = ((t.By & 16) >> 3) + ((pxX & 64) >> 6);
+                    Av1Decode.ReadRestorationInfo(ref msac, ts, ref ctx.LrMasks![srSbIdx].Lr[p, srUnitIdx], p, frameType);
+                }
+                continue;
+            }
+
             int x = 4 * t.Bx >> ssHor;
             if ((x & mask) != 0) continue;
             int w = (fh.CodedWidth + ssHor) >> ssHor;
             if (x != 0 && x + halfUnit > w) continue;
 
-            int sbIdx = (t.By >> 5) * ctx.Sb128W + (t.Bx >> 5);
+            int sbIdx = (t.By >> 5) * ctx.SrSb128W + (t.Bx >> 5);
             int unitIdx = ((t.By & 16) >> 3) + ((t.Bx & 16) >> 4);
 
             if (ctx.LrMasks != null && sbIdx < ctx.LrMasks.Length)
@@ -1666,9 +1729,10 @@ internal sealed class Av1Decoder
             int yStripe = (sby << (6 + sb128)) - offset;
 
             // dav1d copy_lpf src = plane advanced to SB-row top, minus offset = y_stripe.
-            BackupLpf(ctx.LrLpfLine[0]!, yStride,
+            BackupLpf(ctx.LrLpfLine[0]!, ctx.LrYStride,
                 ctx.CurrentPlanes[0]!, yStripe * yStride, yStride,
-                ssVer: 0, sb128, yStripe, rowH, w, h);
+                ssVer: 0, sb128, yStripe, rowH, w, h,
+                ctx.SuperRes ? fh.SuperResUpscaledWidth : 0, ctx.ResizeStep[0], ctx.ResizeStart[0], ctx.BitDepth);
         }
 
         if (hasChroma && (restorePlanes & 6) != 0)
@@ -1680,13 +1744,15 @@ internal sealed class Av1Decoder
             int yStripe = (sby << ((6 - ssVer) + sb128)) - offsetUv;
 
             if ((restorePlanes & 2) != 0)
-                BackupLpf(ctx.LrLpfLine[1]!, uvStride,
+                BackupLpf(ctx.LrLpfLine[1]!, ctx.LrUvStride,
                     ctx.CurrentPlanes[1]!, yStripe * uvStride, uvStride,
-                    ssVer, sb128, yStripe, rowH, w, h);
+                    ssVer, sb128, yStripe, rowH, w, h,
+                    ctx.SuperRes ? (fh.SuperResUpscaledWidth + ssHor) >> ssHor : 0, ctx.ResizeStep[ssHor], ctx.ResizeStart[ssHor], ctx.BitDepth);
             if ((restorePlanes & 4) != 0)
-                BackupLpf(ctx.LrLpfLine[2]!, uvStride,
+                BackupLpf(ctx.LrLpfLine[2]!, ctx.LrUvStride,
                     ctx.CurrentPlanes[2]!, yStripe * uvStride, uvStride,
-                    ssVer, sb128, yStripe, rowH, w, h);
+                    ssVer, sb128, yStripe, rowH, w, h,
+                    ctx.SuperRes ? (fh.SuperResUpscaledWidth + ssHor) >> ssHor : 0, ctx.ResizeStep[ssHor], ctx.ResizeStart[ssHor], ctx.BitDepth);
         }
     }
 
@@ -1696,7 +1762,8 @@ internal sealed class Av1Decoder
     /// </summary>
     private static void BackupLpf(ushort[] dst, int dstStride,
         ushort[] src, int srcOffset, int srcStride,
-        int ssVer, int sb128, int row, int rowH, int srcW, int h)
+        int ssVer, int sb128, int row, int rowH, int srcW, int h,
+        int resizeDstW = 0, int resizeStep = 0, int resizeStart = 0, int bitDepth = 8)
     {
         int dstOff = 0;
 
@@ -1720,6 +1787,28 @@ internal sealed class Av1Decoder
         int stripeH = (64 - 8 * (row == 0 ? 1 : 0)) >> ssVer;
         // Advance src to stripe_h - 2 rows in (the last 2 rows of the stripe)
         int srcOff = srcOffset + (stripeH - 2) * srcStride;
+
+        if (resizeDstW > 0)
+        {
+            // Super-resolution: the saved rows are upscaled like the picture they border (dav1d mc.resize path; a
+            // 3-line stripe end repeats its last upscaled row).
+            while (row + stripeH <= rowH)
+            {
+                int nLines = 4 - (row + stripeH + 1 == h ? 1 : 0);
+                Av1MotionComp.Resize(dst.AsSpan(dstOff), dstStride, src.AsSpan(srcOff), srcStride,
+                    resizeDstW, nLines, srcW, resizeStep, resizeStart, bitDepth);
+                row += stripeH;
+                stripeH = 64 >> ssVer;
+                srcOff += stripeH * srcStride;
+                dstOff += nLines * dstStride;
+                if (nLines == 3)
+                {
+                    Array.Copy(dst, dstOff - dstStride, dst, dstOff, resizeDstW);
+                    dstOff += dstStride;
+                }
+            }
+            return;
+        }
 
         while (row + stripeH <= rowH)
         {
@@ -1748,6 +1837,29 @@ internal sealed class Av1Decoder
     /// Apply loop restoration for one SB row.
     /// Ported from dav1d dav1d_lr_sbrow / lr_sbrow / lr_stripe (lr_apply_tmpl.c).
     /// </summary>
+    // Upscales the deblocked + CDEF-filtered coded-width planes to the super-resolution width and makes them the
+    // frame's planes, so loop restoration, the output and the references see the upscaled picture (dav1d sr_cur).
+    private void UpscaleSuperRes(int ssHor, int ssVer, bool hasChroma)
+    {
+        var fh = frameHdr;
+        int srW = fh.SuperResUpscaledWidth;
+        for (int p = 0; p < (hasChroma ? 3 : 1); p++)
+        {
+            int sh = p == 0 ? 0 : ssHor, sv = p == 0 ? 0 : ssVer;
+            int dstStride = p == 0 ? ctx.LrYStride : ctx.LrUvStride;
+            int rows = (fh.Height + sv) >> sv;
+            int allocRows = ((((fh.Height + 63) & ~63) + (1 << sv) - 1) >> sv);
+            var dst = ArrayPool<ushort>.Shared.Rent(dstStride * allocRows);
+            Av1MotionComp.Resize(dst, dstStride, ctx.CurrentPlanes[p], ctx.CurrentStrides[p],
+                (srW + sh) >> sh, rows, (4 * ctx.Bw + sh) >> sh, ctx.ResizeStep[sh], ctx.ResizeStart[sh], ctx.BitDepth);
+            ArrayPool<ushort>.Shared.Return(ctx.CurrentPlanes[p]!);
+            ctx.CurrentPlanes[p] = dst;
+            ctx.CurrentStrides[p] = dstStride;
+        }
+        ctx.YStride = ctx.LrYStride;
+        if (hasChroma) ctx.UvStride = ctx.LrUvStride;
+    }
+
     private void ApplyLoopRestoration(int sby, int ssHor, int ssVer, bool hasChroma)
     {
         var fh = frameHdr;
@@ -1761,7 +1873,7 @@ internal sealed class Av1Decoder
         if ((restorePlanes & 1) != 0)
         {
             int h = fh.Height;
-            int w = fh.CodedWidth;
+            int w = fh.SuperResUpscaledWidth;
             int nextRowY = (sby + 1) << (6 + sb128);
             int rowH = Math.Min(nextRowY - 8 * notLast, h);
             int yStripe = (sby << (6 + sb128)) - offsetY;
@@ -1775,7 +1887,7 @@ internal sealed class Av1Decoder
         if (hasChroma && (restorePlanes & 6) != 0)
         {
             int h = (fh.Height + ssVer) >> ssVer;
-            int w = (fh.CodedWidth + ssHor) >> ssHor;
+            int w = (fh.SuperResUpscaledWidth + ssHor) >> ssHor;
             int nextRowY = (sby + 1) << ((6 - ssVer) + sb128);
             int rowH = Math.Min(nextRowY - ((8 >> ssVer) * notLast), h);
             int offsetUv = offsetY >> ssVer;
@@ -2035,7 +2147,8 @@ internal sealed class Av1Decoder
             if ((refreshFlags & (1 << i)) != 0)
             {
                 var refFrame = ctx.RefFrames[i];
-                refFrame.Width = fh.CodedWidth;
+                refFrame.Width = fh.SuperResUpscaledWidth;
+                refFrame.CodedWidth = fh.CodedWidth;
                 refFrame.Height = fh.Height;
                 refFrame.RenderWidth = fh.RenderWidth;
                 refFrame.RenderHeight = fh.RenderHeight;
@@ -2043,6 +2156,8 @@ internal sealed class Av1Decoder
                 refFrame.OrderHint = fh.FrameOffset;
                 refFrame.FilmGrain = fh.FilmGrain;
                 refFrame.FilmGrainPresent = fh.FilmGrainPresent;
+                refFrame.SegmentMap = ctx.CurSegMap;
+                refFrame.SegmentationData = fh.SegmentationData;
                 refFrame.Valid = true;
 
                 // Copy current frame planes to reference
@@ -2074,9 +2189,9 @@ internal sealed class Av1Decoder
             int stride = ctx.CurrentStrides[plane];
             int height = plane == 0 ? frameHdr.Height :
                 (ctx.PixelLayout == Av1PixelLayout.I420 ? (frameHdr.Height + 1) >> 1 : frameHdr.Height);
-            int width = plane == 0 ? frameHdr.CodedWidth :
-                (ctx.PixelLayout == Av1PixelLayout.I444 ? frameHdr.CodedWidth :
-                 (frameHdr.CodedWidth + 1) >> 1);
+            int width = plane == 0 ? frameHdr.SuperResUpscaledWidth :
+                (ctx.PixelLayout == Av1PixelLayout.I444 ? frameHdr.SuperResUpscaledWidth :
+                 (frameHdr.SuperResUpscaledWidth + 1) >> 1);
 
             int bufSize = stride * height;
             if (refFrame.Planes[plane] == null || refFrame.Planes[plane]!.Length < bufSize)
@@ -2113,6 +2228,7 @@ internal sealed class Av1Decoder
                 if (i == refIdx) continue;
                 var dst = ctx.RefFrames[i];
                 dst.Width = refFrame.Width;
+                dst.CodedWidth = refFrame.CodedWidth;
                 dst.Height = refFrame.Height;
                 dst.RenderWidth = refFrame.RenderWidth;
                 dst.RenderHeight = refFrame.RenderHeight;
@@ -2120,6 +2236,8 @@ internal sealed class Av1Decoder
                 dst.OrderHint = refFrame.OrderHint;
                 dst.FilmGrain = refFrame.FilmGrain;
                 dst.FilmGrainPresent = refFrame.FilmGrainPresent;
+                dst.SegmentMap = refFrame.SegmentMap;
+                dst.SegmentationData = refFrame.SegmentationData;
                 dst.TemporalMvs = null;   // dav1d drops the other slots' refmvs
                 dst.Valid = true;
 

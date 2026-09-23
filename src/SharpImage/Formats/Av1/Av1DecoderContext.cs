@@ -101,8 +101,15 @@ public sealed class Av1ReferenceFrame
     /// <summary>Order hint of the reference frame.</summary>
     public int OrderHint;
 
-    /// <summary>Segmentation map for this reference frame (if any).</summary>
+    /// <summary>The frame's coded (pre-super-resolution) width, dav1d ref_coded_width: what motion-field and segment-map
+    /// reuse compare against (Width is the upscaled picture width).</summary>
+    public int CodedWidth;
+
+    /// <summary>Segmentation map for this reference frame (if any): dav1d refs[].segmap, b4_stride-wide.</summary>
     public byte[]? SegmentMap;
+
+    /// <summary>The segment features of the frame stored here (frames with segmentation_update_data = 0 inherit them).</summary>
+    public Av1SegmentationDataSet SegmentationData;
 
     /// <summary>
     /// Decoded pixel data per plane. Samples are stored as ushort[] for all bit depths
@@ -251,6 +258,12 @@ public sealed class Av1DecoderContext : IDisposable
     public Av1RefMvsTemporalBlock[]? CurrentRp;
     public byte[] CurrentRefPoc = new byte[7];
 
+    /// <summary>
+    /// This frame's segment ids (dav1d f->cur_segmap, B4Stride x 32 * sb128 rows; null without segmentation) and the
+    /// primary reference frame's map it may predict from (f->prev_segmap).
+    /// </summary>
+    public byte[]? CurSegMap, PrevSegMap;
+
     /// <summary>The CDFs the current frame started from (dav1d f->in_cdf).</summary>
     public Av1CdfContext? InCdf;
 
@@ -318,6 +331,16 @@ public sealed class Av1DecoderContext : IDisposable
     /// <summary>Width of the sr_sb128 row for LR mask indexing.
     /// dav1d: f->sr_sb128w.</summary>
     public int SrSb128W;
+
+    /// <summary>
+    /// Super-resolution (frame header width[0] != width[1]): loop restoration, its line buffers, the output and the
+    /// references work on the upscaled picture. LrYStride/LrUvStride are the strides of those upscaled planes (the plain
+    /// strides without super-res); ResizeStep/ResizeStart are dav1d f->resize_step/resize_start for luma [0] and
+    /// subsampled chroma [1].
+    /// </summary>
+    public bool SuperRes;
+    public int LrYStride, LrUvStride;
+    public int[] ResizeStep = new int[2], ResizeStart = new int[2];
 
     /// <summary>Luma plane stride (convenience alias for CurrentStrides[0]).</summary>
     public int YStride;
