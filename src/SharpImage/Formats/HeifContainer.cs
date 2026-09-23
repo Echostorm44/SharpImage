@@ -29,6 +29,10 @@ internal sealed class HeifContainer
     public int PrimaryId { get; private set; } = 1;
     public Dictionary<int, HeifItem> Items { get; } = [];
     public List<(string Type, int From, List<int> To)> References { get; } = [];
+    /// <summary>Entity groups from 'grpl' (grouping type, group id, entity ids in order), e.g. 'altr'.</summary>
+    public List<(string Type, uint GroupId, List<uint> Entities)> Groups { get; } = [];
+    /// <summary>ftyp major + compatible brands.</summary>
+    public List<string> Brands { get; } = [];
 
     private HeifContainer(byte[] data) => this.data = data;
 
@@ -39,6 +43,11 @@ internal sealed class HeifContainer
         var c = new HeifContainer(data);
         foreach (var (type, off, len) in Children(data, 0, data.Length))
         {
+            if (type == "ftyp" && c.Brands.Count == 0 && len >= 8)
+            {
+                c.Brands.Add(Encoding.ASCII.GetString(data, off, 4));
+                for (int p = off + 8; p + 4 <= off + len; p += 4) c.Brands.Add(Encoding.ASCII.GetString(data, p, 4));
+            }
             if (type == "meta") { c.ParseMeta(off + 4, len - 4); break; }
         }
         return c;
@@ -127,6 +136,22 @@ internal sealed class HeifContainer
             if (type == "iloc") ParseIloc(bOff, bLen);
             else if (type == "iref") ParseIref(bOff, bLen);
             else if (type == "iprp") ParseIprp(bOff, bLen);
+            else if (type == "grpl") ParseGrpl(bOff, bLen);
+        }
+    }
+
+    // GroupsListBox: EntityToGroupBoxes (full boxes named by grouping_type): group_id, num_entities, entity_ids.
+    private void ParseGrpl(int off, int len)
+    {
+        foreach (var (type, gOff, gLen) in Children(data, off, len))
+        {
+            if (gLen < 12) throw new InvalidDataException("Truncated EntityToGroupBox.");
+            uint groupId = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(gOff + 4));
+            uint n = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(gOff + 8));
+            if (n > (uint)(gLen - 12) / 4) throw new InvalidDataException("Truncated EntityToGroupBox.");
+            var ids = new List<uint>((int)n);
+            for (int i = 0; i < n; i++) ids.Add(BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(gOff + 12 + 4 * i)));
+            Groups.Add((type, groupId, ids));
         }
     }
 

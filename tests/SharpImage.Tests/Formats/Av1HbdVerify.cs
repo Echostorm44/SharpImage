@@ -787,6 +787,50 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(dir, "manifest.txt"), log.ToString());
     }
 
+    // Gain map probe (trigger hbd_gm.txt naming a scratch subdir): HeifCoder.DecodeGainMap on every *.avif; the gain map
+    // image dumped as name.gm.rgba64, metadata lines in manifest.txt (fractions as n/d, like avifgainmaputil).
+    [Test, NotInParallel]
+    public void GainMapProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_gm.txt");
+        if (!File.Exists(trig)) return;
+        string dir = Path.Combine(Scratch, File.ReadAllText(trig).Trim());
+        File.Delete(trig);
+        var log = new System.Text.StringBuilder();
+        foreach (var file in Directory.GetFiles(dir, "*.avif"))
+        {
+            string name = Path.GetFileNameWithoutExtension(file);
+            try
+            {
+                var gm = HeifCoder.DecodeGainMap(File.ReadAllBytes(file));
+                if (gm == null) { log.AppendLine($"{name} NONE"); continue; }
+                string F(GainMapFraction[] a) => string.Join(" ", a.Select(f => $"{f.Numerator}/{f.Denominator}"));
+                log.AppendLine($"{name} base={gm.BaseHdrHeadroom.Numerator}/{gm.BaseHdrHeadroom.Denominator} alt={gm.AlternateHdrHeadroom.Numerator}/{gm.AlternateHdrHeadroom.Denominator}" +
+                    $" min={F(gm.Min)} max={F(gm.Max)} boff={F(gm.BaseOffset)} aoff={F(gm.AlternateOffset)}" +
+                    $" gamma={string.Join(" ", gm.Gamma.Select(f => $"{f.Numerator}/{f.Denominator}"))} usebase={gm.UseBaseColorSpace}" +
+                    $" altcicp={gm.AlternateCicp} altclli={gm.AlternateContentLightLevel} altpixi={gm.AlternatePlaneCount}x{gm.AlternateDepth}" +
+                    $" icc={gm.AlternateIccProfile?.Length ?? 0} img={gm.Image!.Columns}x{gm.Image.Rows} depth={gm.ImageDepth}");
+                var f = gm.Image;
+                int w = (int)f.Columns, h = (int)f.Rows, ch = f.NumberOfChannels;
+                var buf = new byte[w * h * 8];
+                for (int y = 0; y < h; y++)
+                {
+                    var row = f.GetPixelRow(y);
+                    for (int x = 0; x < w; x++)
+                        for (int k = 0; k < 4; k++)
+                        {
+                            ushort v = k < 3 ? row[x * ch + Math.Min(k, ch - 1 - (f.HasAlpha ? 1 : 0))] : (ushort)65535;
+                            buf[(y * w + x) * 8 + k * 2] = (byte)v;
+                            buf[(y * w + x) * 8 + k * 2 + 1] = (byte)(v >> 8);
+                        }
+                }
+                File.WriteAllBytes(Path.Combine(dir, $"{name}.gm.rgba64"), buf);
+            }
+            catch (Exception e) { log.AppendLine($"{name} ERROR {e.GetType().Name}: {e.Message}"); }
+        }
+        File.WriteAllText(Path.Combine(dir, "manifest.txt"), log.ToString());
+    }
+
     // Track probe (trigger hbd_track.txt = "file|trackIndex"): decodes every sample of one sequence track with one
     // decoder, dumping each frame's native planes to track_ours_{i}.yuv and the block trace to trace_ours.txt.
     [Test, NotInParallel]

@@ -132,7 +132,7 @@ public sealed class AvifEncodeOptions
 /// <summary>Film grain for one AVIF encode: explicit parameters, or denoise-and-estimate (Level &lt; 0 = all-intra estimate).</summary>
 internal sealed record AvifGrainRequest(AvifFilmGrain? Explicit, bool Denoise, float Level, int BlockSize, bool Apply);
 
-public static class HeifCoder
+public static partial class HeifCoder
 {
     // AVIF ftypes
     private static readonly string[] AvifBrands = [ "avif", "avis", "avio" ];
@@ -402,26 +402,11 @@ public static class HeifCoder
         var c = HeifContainer.Parse(data);
         var primary = c.Primary ?? throw new InvalidDataException("AVIF/HEIC has no primary item.");
         int pid = primary.Id;
+        // libavif validates the gain map of every file carrying the 'tmap' brand; invalid gain map metadata fails the decode.
+        FindGainMap(c, decodeImage: false);
 
         // ---- colour image: a coded item, or a 'grid' of coded tiles (ISO/IEC 23008-12 6.6.2.3) ----------------------
-        List<int> tiles;
-        int rows = 1, cols = 1, outW, outH;
-        if (primary.Type == "grid")
-        {
-            (rows, cols, outW, outH) = ParseImageGrid(c.ItemData(pid) ?? throw new InvalidDataException("Grid item has no data."));
-            tiles = c.ReferencesFrom(pid, "dimg");
-            if (tiles.Count != rows * cols || new HashSet<int>(tiles).Count != tiles.Count)
-                throw new InvalidDataException($"Invalid image grid: {tiles.Count} distinct dimg tiles for a {rows}x{cols} grid.");
-        }
-        else
-        {
-            tiles = [pid];
-            (outW, outH) = c.Ispe(pid) ?? (0, 0);
-        }
-
-        string codec = c.Items.TryGetValue(tiles[0], out var t0) ? t0.Type : "";
-        if (codec is not ("av01" or "hvc1"))
-            throw new NotSupportedException($"AVIF/HEIC coded item type '{codec}' is not supported.");
+        var (tiles, rows, cols, outW, outH, codec) = ResolveImageTiles(c, pid);
         var nclx = Nclx(c, pid);
 
         // Premultiplied alpha ('prem' colour -> alpha): libavif un-premultiplies during/after YUV->RGB. For a single
@@ -433,34 +418,7 @@ public static class HeifCoder
         if (premAlphaId >= 0 && tiles.Count == 1 && codec == "av01" && c.Items.TryGetValue(premAlphaId, out var pai) && pai.Type == "av01")
             premAlpha = DecodeAlphaNative(c, premAlphaId);
 
-        ImageFrame frame;
-        if (codec == "av01" && tiles.Count > 1)
-        {
-            // AV1 grid: stitch the tiles' YUV planes, then convert once — chroma upsampling crosses tile seams exactly
-            // as in libavif (which reassembles the YUV image before avifImageYUVToRGB).
-            frame = new ImageFrame();
-            frame.Initialize(outW, outH, ColorspaceType.SRGB, false);
-            DecodeAv1GridInto(c, tiles, cols, outW, outH, nclx, frame);
-        }
-        else
-        {
-        var tileFrames = new ImageFrame[tiles.Count];
-        for (int i = 0; i < tiles.Count; i++)
-            tileFrames[i] = DecodeCodedItem(c, tiles[i], codec, nclx, premAlpha);
-        int tw = (int)tileFrames[0].Columns, th = (int)tileFrames[0].Rows;
-        if (outW <= 0 || outH <= 0) (outW, outH) = (tw * cols, th * rows);
-        if (tiles.Count > 1 && (tw * cols < outW || th * rows < outH))
-            throw new InvalidDataException("Image grid tiles do not cover the output size.");
-
-        if (tiles.Count == 1 && tw == outW && th == outH) frame = tileFrames[0];
-        else
-        {
-            frame = new ImageFrame();
-            frame.Initialize(outW, outH, ColorspaceType.SRGB, false);
-            for (int i = 0; i < tiles.Count; i++) Blit(tileFrames[i], frame, (i % cols) * tw, (i / cols) * th, alphaOnly: false);
-            frame.Metadata.Cicp = tileFrames[0].Metadata.Cicp;
-        }
-        }
+        ImageFrame frame = DecodeImageTiles(c, tiles, rows, cols, outW, outH, codec, nclx, premAlpha);
 
         // ---- alpha: an auxl alpha item (or alpha grid) of the primary; else per-tile alpha items -------------------
         int alphaId = -1;
@@ -532,6 +490,61 @@ public static class HeifCoder
         int? irot = c.Property(pid, "irot") is { Len: >= 1 } ir ? data[ir.Off] & 3 : null;
         int? imir = c.Property(pid, "imir") is { Len: >= 1 } im ? data[im.Off] & 1 : null;
         return ApplyHeifTransforms(frame, clap, irot, imir);
+    }
+
+    // The coded tiles of an image item: the item itself, or a 'grid' item's dimg tiles (validated like libavif).
+    private static (List<int> Tiles, int Rows, int Cols, int OutW, int OutH, string Codec) ResolveImageTiles(HeifContainer c, int id)
+    {
+        var item = c.Items.GetValueOrDefault(id) ?? throw new InvalidDataException($"Item {id} does not exist.");
+        List<int> tiles;
+        int rows = 1, cols = 1, outW, outH;
+        if (item.Type == "grid")
+        {
+            (rows, cols, outW, outH) = ParseImageGrid(c.ItemData(id) ?? throw new InvalidDataException("Grid item has no data."));
+            tiles = c.ReferencesFrom(id, "dimg");
+            if (tiles.Count != rows * cols || new HashSet<int>(tiles).Count != tiles.Count)
+                throw new InvalidDataException($"Invalid image grid: {tiles.Count} distinct dimg tiles for a {rows}x{cols} grid.");
+        }
+        else
+        {
+            tiles = [id];
+            (outW, outH) = c.Ispe(id) ?? (0, 0);
+        }
+
+        string codec = c.Items.TryGetValue(tiles[0], out var t0) ? t0.Type : "";
+        if (codec is not ("av01" or "hvc1"))
+            throw new NotSupportedException($"AVIF/HEIC coded item type '{codec}' is not supported.");
+        return (tiles, rows, cols, outW, outH, codec);
+    }
+
+    // Decodes the colour of resolved tiles to one RGB frame (AV1 grids stitched in YUV, as libavif does).
+    private static ImageFrame DecodeImageTiles(HeifContainer c, List<int> tiles, int rows, int cols, int outW, int outH, string codec,
+        (int Cp, int Tc, int Mc, bool Full)? nclx, ushort[]? premAlpha)
+    {
+        ImageFrame frame;
+        if (codec == "av01" && tiles.Count > 1)
+        {
+            // AV1 grid: stitch the tiles' YUV planes, then convert once — chroma upsampling crosses tile seams exactly
+            // as in libavif (which reassembles the YUV image before avifImageYUVToRGB).
+            frame = new ImageFrame();
+            frame.Initialize(outW, outH, ColorspaceType.SRGB, false);
+            DecodeAv1GridInto(c, tiles, cols, outW, outH, nclx, frame);
+            return frame;
+        }
+        var tileFrames = new ImageFrame[tiles.Count];
+        for (int i = 0; i < tiles.Count; i++)
+            tileFrames[i] = DecodeCodedItem(c, tiles[i], codec, nclx, premAlpha);
+        int tw = (int)tileFrames[0].Columns, th = (int)tileFrames[0].Rows;
+        if (outW <= 0 || outH <= 0) (outW, outH) = (tw * cols, th * rows);
+        if (tiles.Count > 1 && (tw * cols < outW || th * rows < outH))
+            throw new InvalidDataException("Image grid tiles do not cover the output size.");
+
+        if (tiles.Count == 1 && tw == outW && th == outH) return tileFrames[0];
+        frame = new ImageFrame();
+        frame.Initialize(outW, outH, ColorspaceType.SRGB, false);
+        for (int i = 0; i < tiles.Count; i++) Blit(tileFrames[i], frame, (i % cols) * tw, (i / cols) * th, alphaOnly: false);
+        frame.Metadata.Cicp = tileFrames[0].Metadata.Cicp;
+        return frame;
     }
 
     // Decodes an AV1 image grid: every tile to YUV, the planes stitched at the tile offsets (clipped to the grid's
