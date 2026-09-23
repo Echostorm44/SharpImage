@@ -121,6 +121,35 @@ public sealed class Av1ConformanceDecodeTests
         await Assert.That(worst).IsEqualTo(0);
     }
 
+    // Film grain synthesis (libaom film-grain-test vectors and denoise-estimated grain; 8/10/12-bit, 4:2:0/4:2:2/4:4:4/
+    // mono, overlap, chroma-from-luma, restricted-range clipping). Golden MD5s are libdav1d with grain applied (its
+    // default, as in libavif) and with -filmgrain 0.
+    [Test]
+    [Arguments("libaom_fg_8bit_420_t1.avif", "6cb70caebbe965ce864fa53ce336540a", "cc123a27dca6cda8fa63a9a07eb7dce2")]
+    [Arguments("libaom_fg_8bit_420_t2.avif", "c5baccfaccab622c2355eee2391f33a9", "38dd472a45988b46b0218df6d738aff7")]
+    [Arguments("libaom_fg_8bit_420_t10.avif", "e67b4757c814f69b801c7ef7c4599c10", "2c5094fc5e65da9d7b2d6c3e83c83a9b")]
+    [Arguments("libaom_fg_8bit_420_t16.avif", "f6e6cc4767a3b6646de1d6c9d6b13dc7", "2c5094fc5e65da9d7b2d6c3e83c83a9b")]
+    [Arguments("libaom_fg_8bit_444_t4.avif", "8b709bbb38d6ed37d1f53a7c6ef5b0b9", "8c47ef8746b021fdbd51fa4ca2c7d116")]
+    [Arguments("libaom_fg_8bit_gray_t7.avif", "386322dc3c21bba0630aad03c8906518", "a6bcb75b67562f15b1271bbc4862b47b")]
+    [Arguments("libaom_fg_10bit_420_t3.avif", "21b95fd1ad75b5ce25d4355086511a8c", "e8daa98656d71913a004f6a8bc7d87cd")]
+    [Arguments("libaom_fg_10bit_422_t5.avif", "6026b74253fb2d86b1f1397496f1e223", "07e5f116e8fc3271e0ae4faacf56c72f")]
+    [Arguments("libaom_fg_12bit_444_t6.avif", "84a3bd7be6558581dd92ba69e92a72df", "04ee575d9a691887bb0386e032aa4863")]
+    [Arguments("libaom_fg_8bit_420_denoise.avif", "f0016b78fb479da761ff9be5ad0cb088", "f65dd6be5efcb92f90913727498570a0")]
+    [Arguments("libaom_fg_10bit_420_denoise.avif", "195dd23512a9ad30e9aee10e38450888", "39c0837a3d8ef2f8148a00f2e9aaff0a")]
+    public async Task FilmGrain_ByteExactVsDav1d(string file, string md5, string md5NoGrain)
+    {
+        byte[] item = PrimaryItemData(File.ReadAllBytes(Asset(file)));
+        // Monochrome streams hash the Y plane only (ffmpeg pix_fmt gray).
+        static byte[] Planes(Av1Decoder d, DecodedVideoFrame f) =>
+            d.Monochrome ? NativePlanes(f).AsSpan(0, f.Width * f.Height * (f.BitDepth > 8 ? 2 : 1)).ToArray() : NativePlanes(f);
+        var dg = new Av1Decoder();
+        using (var yuv = dg.Decode(item, 0, isKeyframe: true))
+            await Assert.That(Hex(MD5.HashData(Planes(dg, yuv!)))).IsEqualTo(md5);
+        var dn = new Av1Decoder { ApplyFilmGrain = false };
+        using (var plain = dn.Decode(item, 0, isKeyframe: true))
+            await Assert.That(Hex(MD5.HashData(Planes(dn, plain!)))).IsEqualTo(md5NoGrain);
+    }
+
     // Planes as ffmpeg writes raw video: Y, U, V tightly packed; u16 LE for >8-bit, u8 otherwise.
     private static byte[] NativePlanes(DecodedVideoFrame f)
     {

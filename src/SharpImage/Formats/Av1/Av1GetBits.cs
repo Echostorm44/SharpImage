@@ -30,6 +30,9 @@ public ref struct Av1GetBits
     /// <summary>True if reading went past the end of data.</summary>
     public readonly bool Error => error;
 
+    /// <summary>Flags a semantic error found while parsing (reported like an overread).</summary>
+    public void MarkError() => error = true;
+
     /// <summary>Current bit position relative to start of data.</summary>
     public readonly int BitsRead => position * 8 - bitsLeft;
 

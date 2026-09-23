@@ -1929,6 +1929,8 @@ internal sealed class Av1Decoder
                 refFrame.RenderHeight = fh.RenderHeight;
                 refFrame.FrameType = fh.FrameType;
                 refFrame.OrderHint = fh.FrameOffset;
+                refFrame.FilmGrain = fh.FilmGrain;
+                refFrame.FilmGrainPresent = fh.FilmGrainPresent;
                 refFrame.Valid = true;
 
                 // Copy current frame planes to reference
@@ -2011,6 +2013,8 @@ internal sealed class Av1Decoder
                 dst.RenderHeight = refFrame.RenderHeight;
                 dst.FrameType = refFrame.FrameType;
                 dst.OrderHint = refFrame.OrderHint;
+                dst.FilmGrain = refFrame.FilmGrain;
+                dst.FilmGrainPresent = refFrame.FilmGrainPresent;
                 dst.Valid = true;
 
                 for (int p = 0; p < 3; p++)
@@ -2038,63 +2042,26 @@ internal sealed class Av1Decoder
         return ExtractReferenceFrame(refFrame, presentationTimeTicks);
     }
 
+    /// <summary>Whether film grain signalled in the stream is synthesized onto output frames (default on, as dav1d and
+    /// libavif do). Off returns the grain-free reconstruction.</summary>
+    public bool ApplyFilmGrain { get; set; } = true;
+
+    private (ushort[], ushort[]?, ushort[]?) WithFilmGrain(in Av1FilmGrainData fg, int w, int h, int ssHor, int ssVer,
+        ushort[] y, int strideY, ushort[]? u, ushort[]? v, int strideUv)
+    {
+        var gy = (ushort[])y.Clone();
+        var gu = u == null ? null : (ushort[])u.Clone();
+        var gv = v == null ? null : (ushort[])v.Clone();
+        Av1FilmGrain.Apply(fg, ctx.BitDepth, ssHor, ssVer, seqHdr.MatrixCoefficients == Av1MatrixCoefficients.Identity,
+            w, h, y, strideY, u, v, strideUv, gy, gu, gv);
+        return (gy, gu, gv);
+    }
+
     private DecodedVideoFrame? ExtractReferenceFrame(Av1ReferenceFrame refFrame, long presentationTimeTicks)
     {
-        int w = refFrame.Width;
-        int h = refFrame.Height;
-        int ySize = w * h;
-        int uvW = (w + 1) >> 1;
-        int uvH = (h + 1) >> 1;
-        int uvSize = uvW * uvH;
-        int totalSize = ySize + uvSize * 2;
-
-        byte[] outputBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
-        int yOff = 0, uOff = ySize, vOff = ySize + uvSize;
-
-        // High-bit-depth samples are downshifted to 8-bit for the byte output buffer.
-        int bdShift = ctx.BitDepth - 8;
-        int bdRound = bdShift > 0 ? (1 << (bdShift - 1)) : 0; // round on high-bit-depth->8 downshift (matches reference)
-
-        // Copy Y
-        if (refFrame.Planes[0] != null)
-        {
-            var src = refFrame.Planes[0]!;
-            for (int y = 0; y < h; y++)
-            {
-                int so = y * refFrame.Strides[0], doff = yOff + y * w;
-                for (int x = 0; x < w; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (src[so + x] + bdRound) >> bdShift);
-            }
-        }
-
-        // Copy U
-        if (refFrame.Planes[1] != null)
-        {
-            var src = refFrame.Planes[1]!;
-            for (int y = 0; y < uvH; y++)
-            {
-                int so = y * refFrame.Strides[1], doff = uOff + y * uvW;
-                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (src[so + x] + bdRound) >> bdShift);
-            }
-        }
-
-        // Copy V
-        if (refFrame.Planes[2] != null)
-        {
-            var src = refFrame.Planes[2]!;
-            for (int y = 0; y < uvH; y++)
-            {
-                int so = y * refFrame.Strides[2], doff = vOff + y * uvW;
-                for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (src[so + x] + bdRound) >> bdShift);
-            }
-        }
-
         isReady = true;
-        return new DecodedVideoFrame(
-            w, h, PixelFormat.Yuv420P, presentationTimeTicks,
-            outputBuffer,
-            yOff, w,
-            uOff, uvW,
-            vOff, uvW);
+        return BuildOutputFrame(refFrame.Width, refFrame.Height, refFrame.Planes[0], refFrame.Planes[1], refFrame.Planes[2],
+            refFrame.Strides, refFrame.FilmGrainPresent, refFrame.FilmGrain, presentationTimeTicks);
     }
 
     // ======================================================================
@@ -2109,6 +2076,13 @@ internal sealed class Av1Decoder
             AvDbg.W("[EXTRACT] w or h is 0");
             return null;
         }
+        return BuildOutputFrame(w, h, ctx.CurrentPlanes[0], ctx.CurrentPlanes[1], ctx.CurrentPlanes[2], ctx.CurrentStrides,
+            frameHdr.FilmGrainPresent, frameHdr.FilmGrain, presentationTimeTicks);
+    }
+
+    private DecodedVideoFrame? BuildOutputFrame(int w, int h, ushort[]? yPlane, ushort[]? uPlane, ushort[]? vPlane,
+        int[] strides, bool filmGrain, in Av1FilmGrainData fg, long presentationTimeTicks)
+    {
 
         // Chroma subsampling from the actual pixel layout (was hardcoded to 4:2:0, corrupting 4:4:4 / 4:2:2 output).
         int ssHor = ctx.PixelLayout != Av1PixelLayout.I444 ? 1 : 0;
@@ -2122,15 +2096,15 @@ internal sealed class Av1Decoder
         byte[] outputBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
         int yOff = 0, uOff = ySize, vOff = ySize + uvSize;
 
-        var yPlane = ctx.CurrentPlanes[0];
-        var uPlane = ctx.CurrentPlanes[1];
-        var vPlane = ctx.CurrentPlanes[2];
-
         if (yPlane == null) {
             AvDbg.W("[EXTRACT] yPlane is NULL - skipping frame");
             ArrayPool<byte>.Shared.Return(outputBuffer);
             return null;
         }
+
+        // Film grain is synthesized on the output copy only; the reference planes stay grain-free (spec 7.18.3).
+        if (filmGrain && ApplyFilmGrain)
+            (yPlane, uPlane, vPlane) = WithFilmGrain(fg, w, h, ssHor, ssVer, yPlane, strides[0], uPlane, vPlane, strides[1]);
 
         // High-bit-depth samples are downshifted to 8-bit for the byte output buffer.
         int bdShift = ctx.BitDepth - 8;
@@ -2140,7 +2114,7 @@ internal sealed class Av1Decoder
         {
             for (int y = 0; y < h; y++)
             {
-                int so = y * ctx.CurrentStrides[0], doff = yOff + y * w;
+                int so = y * strides[0], doff = yOff + y * w;
                 for (int x = 0; x < w; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (yPlane[so + x] + bdRound) >> bdShift);
             }
         }
@@ -2149,7 +2123,7 @@ internal sealed class Av1Decoder
         {
             for (int y = 0; y < uvH; y++)
             {
-                int so = y * ctx.CurrentStrides[1], doff = uOff + y * uvW;
+                int so = y * strides[1], doff = uOff + y * uvW;
                 for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (uPlane[so + x] + bdRound) >> bdShift);
             }
         }
@@ -2158,7 +2132,7 @@ internal sealed class Av1Decoder
         {
             for (int y = 0; y < uvH; y++)
             {
-                int so = y * ctx.CurrentStrides[2], doff = vOff + y * uvW;
+                int so = y * strides[2], doff = vOff + y * uvW;
                 for (int x = 0; x < uvW; x++) outputBuffer[doff + x] = (byte)Math.Min(255, (vPlane[so + x] + bdRound) >> bdShift);
             }
         }
@@ -2185,9 +2159,9 @@ internal sealed class Av1Decoder
                     for (int yy = 0; yy < ph; yy++)
                         for (int xx = 0; xx < pw; xx++) bw.Write(pl[yy * stride + xx]);
                 }
-                WritePlane(yPlane, ctx.CurrentStrides[0], w, h);
-                WritePlane(uPlane, ctx.CurrentStrides[1], uvW, uvH);
-                WritePlane(vPlane, ctx.CurrentStrides[2], uvW, uvH);
+                WritePlane(yPlane, strides[0], w, h);
+                WritePlane(uPlane, strides[1], uvW, uvH);
+                WritePlane(vPlane, strides[2], uvW, uvH);
             }
         }
 
@@ -2209,9 +2183,9 @@ internal sealed class Av1Decoder
                 if (pl == null) return;
                 for (int yy = 0; yy < ph; yy++) Array.Copy(pl, yy * stride, native, off + yy * pw, pw);
             }
-            CopyPlane(yPlane, ctx.CurrentStrides[0], yOff, w, h);
-            CopyPlane(uPlane, ctx.CurrentStrides[1], uOff, uvW, uvH);
-            CopyPlane(vPlane, ctx.CurrentStrides[2], vOff, uvW, uvH);
+            CopyPlane(yPlane, strides[0], yOff, w, h);
+            CopyPlane(uPlane, strides[1], uOff, uvW, uvH);
+            CopyPlane(vPlane, strides[2], vOff, uvW, uvH);
             y16 = new ReadOnlyMemory<ushort>(native, yOff, ySize);
             if (uPlane != null) u16 = new ReadOnlyMemory<ushort>(native, uOff, uvSize);
             if (vPlane != null) v16 = new ReadOnlyMemory<ushort>(native, vOff, uvSize);

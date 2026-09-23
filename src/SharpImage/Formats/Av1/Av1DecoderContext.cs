@@ -114,6 +114,10 @@ public sealed class Av1ReferenceFrame
     /// <summary>Stride in bytes for each plane.</summary>
     public int[] Strides = new int[3];
 
+    /// <summary>Film grain parameters of the frame stored here (load_grain_params / show_existing_frame).</summary>
+    public Av1FilmGrainData FilmGrain;
+    public bool FilmGrainPresent;
+
     /// <summary>CDF context snapshot from this reference frame (for CDF update).</summary>
     public Av1CdfContext? CdfSnapshot;
 

@@ -1,17 +1,13 @@
-// AV1 Film Grain Synthesis
-// Ported from dav1d filmgrain_tmpl.c + fg_apply_tmpl.c (BSD-2)
-// Generates and applies film grain noise per AV1 spec
+// AV1 film grain synthesis (spec 7.18.3), a direct port of dav1d filmgrain_tmpl.c + fg_apply_tmpl.c (BSD-2) for
+// 8/10/12-bit and every chroma layout. Output is bit-exact with dav1d's C reference (which libavif and ffmpeg use).
 
 using System;
 using System.Runtime.CompilerServices;
 
 namespace SharpImage.Formats.Av1;
 
-/// <summary>
-/// AV1 film grain synthesis — generates grain lookup tables and applies
-/// grain noise to decoded frames. Supports luma, chroma (420/422/444),
-/// overlap blending, and chroma-from-luma scaling.
-/// </summary>
+/// <summary>AV1 film grain synthesis: grain LUT generation (Gaussian PRNG + auto-regressive filter), piecewise-linear
+/// scaling, and 32x32 block application with overlap blending — applied to the decoded frame before output.</summary>
 public static class Av1FilmGrain
 {
     private const int GrainWidth = 82;
@@ -19,686 +15,368 @@ public static class Av1FilmGrain
     private const int SubGrainWidth = 44;
     private const int SubGrainHeight = 38;
     private const int FgBlockSize = 32;
-    private const int ScalingSize = 256; // 8-bit only
 
-    // Overlap blending weights for luma: w[x][0], w[x][1]
-    private static readonly int[,] LumaOverlapW = { { 27, 17 }, { 17, 27 } };
-
-    // Overlap blending weights for chroma: w[sub][x][0..1]
-    // sub=0 → no subsampling (same as luma), sub=1 → subsampled (single row)
-    private static readonly int[,,] ChromaOverlapW =
+    /// <summary>Plain-array copy of <see cref="Av1FilmGrainData"/> (fixed buffers are awkward in loops).</summary>
+    private sealed class Params
     {
-        { { 27, 17 }, { 17, 27 } },
-        { { 23, 22 }, {  0,  0 } }, // only [0] used when subsampled
-    };
+        public uint Seed;
+        public int NumYPoints, Csfl, ScalingShift, ArLag, ArShift, GrainScaleShift, Overlap, ClipRestricted;
+        public byte[] YPoints = new byte[28];
+        public int[] NumUvPoints = new int[2];
+        public byte[][] UvPoints = { new byte[20], new byte[20] };
+        public int[] ArY = new int[24];
+        public int[][] ArUv = { new int[28], new int[28] };
+        public int[] UvMult = new int[2], UvLumaMult = new int[2], UvOffset = new int[2];
+    }
 
-    /// <summary>16-bit LFSR pseudo-random number generator (AV1 spec).</summary>
+    private static unsafe Params Load(in Av1FilmGrainData d)
+    {
+        var p = new Params
+        {
+            Seed = d.Seed, NumYPoints = d.NumYPoints, Csfl = d.ChromaScalingFromLuma, ScalingShift = d.ScalingShift,
+            ArLag = d.ArCoeffLag, ArShift = (int)d.ArCoeffShift, GrainScaleShift = d.GrainScaleShift,
+            Overlap = d.OverlapFlag, ClipRestricted = d.ClipToRestrictedRange,
+        };
+        p.NumUvPoints[0] = d.NumUvPoints0; p.NumUvPoints[1] = d.NumUvPoints1;
+        p.UvMult[0] = d.UvMult0; p.UvMult[1] = d.UvMult1;
+        p.UvLumaMult[0] = d.UvLumaMult0; p.UvLumaMult[1] = d.UvLumaMult1;
+        p.UvOffset[0] = d.UvOffset0; p.UvOffset[1] = d.UvOffset1;
+        var c = d;
+        for (int i = 0; i < 28; i++) p.YPoints[i] = c.YPoints[i];
+        for (int i = 0; i < 40; i++) p.UvPoints[i / 20][i % 20] = c.UvPoints[i];
+        for (int i = 0; i < 24; i++) p.ArY[i] = c.ArCoeffsY[i];
+        for (int i = 0; i < 56; i++) p.ArUv[i / 28][i % 28] = c.ArCoeffsUv[i];
+        return p;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int GetRandomNumber(int bits, ref uint state)
     {
         int r = (int)state;
         uint bit = (uint)(((r >> 0) ^ (r >> 1) ^ (r >> 3) ^ (r >> 12)) & 1);
-        state = (state >> 1) | (bit << 15);
+        state = (uint)(r >> 1) | (bit << 15);
         return (int)((state >> (16 - bits)) & ((1u << bits) - 1));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int Round2(int x, int shift)
-    {
-        return (x + ((1 << shift) >> 1)) >> shift;
-    }
+    private static int Round2(int x, int shift) => (x + ((1 << shift) >> 1)) >> shift;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int Clamp(int v, int min, int max)
+    private static int Clip(int v, int min, int max) => v < min ? min : v > max ? max : v;
+
+    private static void GenerateGrainY(short[] buf, Params d, int bd)
     {
-        return v < min ? min : v > max ? max : v;
-    }
-
-    // ========================================================================
-    // Grain LUT Generation
-    // ========================================================================
-
-    /// <summary>
-    /// Generates the luma grain lookup table (73×82).
-    /// PRNG → Gaussian → auto-regressive filter.
-    /// </summary>
-    public static unsafe void GenerateGrainY(
-        short[] grainLut, // [GrainHeight * GrainWidth]
-        in Av1FilmGrainData data)
-    {
-        uint seed = data.Seed;
-        int shift = 4 + data.GrainScaleShift; // bitdepth_min_8 = 0 for 8-bit
-        int grainMin = -128, grainMax = 127;
-
-        // Phase 1: PRNG → Gaussian sequence → round
+        int bdMin8 = bd - 8;
+        uint seed = d.Seed;
+        int shift = 4 - bdMin8 + d.GrainScaleShift;
+        int grainCtr = 128 << bdMin8, grainMin = -grainCtr, grainMax = grainCtr - 1;
         for (int y = 0; y < GrainHeight; y++)
-        {
             for (int x = 0; x < GrainWidth; x++)
-            {
-                int value = GetRandomNumber(11, ref seed);
-                grainLut[y * GrainWidth + x] = (short)Round2(
-                    GaussianSequence[value], shift);
-            }
-        }
+                buf[y * GrainWidth + x] = (short)Round2(GaussianSequence[GetRandomNumber(11, ref seed)], shift);
 
-        // Phase 2: Auto-regressive filter
-        int arPad = 3;
-        int arLag = data.ArCoeffLag;
-
+        const int arPad = 3;
+        int arLag = d.ArLag;
         for (int y = arPad; y < GrainHeight; y++)
-        {
             for (int x = arPad; x < GrainWidth - arPad; x++)
             {
-                int coeffIdx = 0;
-                int sum = 0;
-
+                int ci = 0, sum = 0;
                 for (int dy = -arLag; dy <= 0; dy++)
-                {
                     for (int dx = -arLag; dx <= arLag; dx++)
                     {
-                        if (dx == 0 && dy == 0)
-                            goto DoneAr;
-                        sum += data.ArCoeffsY[coeffIdx++] *
-                               grainLut[(y + dy) * GrainWidth + (x + dx)];
+                        if (dx == 0 && dy == 0) goto done;
+                        sum += d.ArY[ci++] * buf[(y + dy) * GrainWidth + x + dx];
                     }
-                }
-                DoneAr:
-
-                int grain = grainLut[y * GrainWidth + x] +
-                            Round2(sum, (int)data.ArCoeffShift);
-                grainLut[y * GrainWidth + x] = (short)Clamp(grain, grainMin, grainMax);
+                done:
+                int grain = buf[y * GrainWidth + x] + Round2(sum, d.ArShift);
+                buf[y * GrainWidth + x] = (short)Clip(grain, grainMin, grainMax);
             }
-        }
     }
 
-    /// <summary>
-    /// Generates a chroma grain lookup table with luma correlation.
-    /// </summary>
-    public static unsafe void GenerateGrainUv(
-        short[] grainLut,    // chroma grain [GrainHeight * GrainWidth]
-        short[] grainLutY,   // luma grain [GrainHeight * GrainWidth]
-        in Av1FilmGrainData data,
-        int uv,              // 0 = Cb, 1 = Cr
-        int subx, int suby)
+    private static void GenerateGrainUv(short[] buf, short[] bufY, Params d, int uv, int subx, int suby, int bd)
     {
-        uint seed = data.Seed ^ (uint)(uv != 0 ? 0x49d8 : 0xb524);
-        int shift = 4 + data.GrainScaleShift;
-        int grainMin = -128, grainMax = 127;
-
+        int bdMin8 = bd - 8;
+        uint seed = d.Seed ^ (uint)(uv != 0 ? 0x49d8 : 0xb524);
+        int shift = 4 - bdMin8 + d.GrainScaleShift;
+        int grainCtr = 128 << bdMin8, grainMin = -grainCtr, grainMax = grainCtr - 1;
         int chromaW = subx != 0 ? SubGrainWidth : GrainWidth;
         int chromaH = suby != 0 ? SubGrainHeight : GrainHeight;
-
-        // Phase 1: PRNG → Gaussian → round
         for (int y = 0; y < chromaH; y++)
-        {
             for (int x = 0; x < chromaW; x++)
-            {
-                int value = GetRandomNumber(11, ref seed);
-                grainLut[y * GrainWidth + x] = (short)Round2(
-                    GaussianSequence[value], shift);
-            }
-        }
+                buf[y * GrainWidth + x] = (short)Round2(GaussianSequence[GetRandomNumber(11, ref seed)], shift);
 
-        // Phase 2: Auto-regressive filter with luma correlation
-        int arPad = 3;
-        int arLag = data.ArCoeffLag;
-        // UV AR coefficients are stored as [2][28], uv selects which plane
-        int arCoeffBase = uv * 28;
-
+        const int arPad = 3;
+        int arLag = d.ArLag;
+        int[] coeff = d.ArUv[uv];
         for (int y = arPad; y < chromaH; y++)
-        {
             for (int x = arPad; x < chromaW - arPad; x++)
             {
-                int coeffIdx = 0;
-                int sum = 0;
-
+                int ci = 0, sum = 0;
                 for (int dy = -arLag; dy <= 0; dy++)
-                {
                     for (int dx = -arLag; dx <= arLag; dx++)
                     {
                         if (dx == 0 && dy == 0)
                         {
-                            // Add luma correlation at the current pixel
-                            if (data.NumYPoints == 0)
-                                goto DoneAr;
-
+                            // The current pixel adds the (subsampled) luma grain contribution.
+                            if (d.NumYPoints == 0) goto done;
                             int luma = 0;
-                            int lumaX = ((x - arPad) << subx) + arPad;
-                            int lumaY = ((y - arPad) << suby) + arPad;
+                            int lumaX = ((x - arPad) << subx) + arPad, lumaY = ((y - arPad) << suby) + arPad;
                             for (int i = 0; i <= suby; i++)
                                 for (int j = 0; j <= subx; j++)
-                                    luma += grainLutY[(lumaY + i) * GrainWidth + (lumaX + j)];
+                                    luma += bufY[(lumaY + i) * GrainWidth + lumaX + j];
                             luma = Round2(luma, subx + suby);
-                            sum += luma * data.ArCoeffsUv[arCoeffBase + coeffIdx];
-                            goto DoneAr;
+                            sum += luma * coeff[ci];
+                            goto done;
                         }
-                        sum += data.ArCoeffsUv[arCoeffBase + coeffIdx++] *
-                               grainLut[(y + dy) * GrainWidth + (x + dx)];
+                        sum += coeff[ci++] * buf[(y + dy) * GrainWidth + x + dx];
+                    }
+                done:
+                int grain = buf[y * GrainWidth + x] + Round2(sum, d.ArShift);
+                buf[y * GrainWidth + x] = (short)Clip(grain, grainMin, grainMax);
+            }
+    }
+
+    /// <summary>Piecewise-linear scaling function over all 2^bd sample values (dav1d generate_scaling).</summary>
+    private static void GenerateScaling(int bd, byte[] points, int num, byte[] scaling)
+    {
+        int shiftX = bd - 8, size = 1 << bd;
+        if (num == 0) { Array.Clear(scaling, 0, size); return; }
+        Array.Fill(scaling, points[1], 0, points[0] << shiftX);
+        for (int i = 0; i < num - 1; i++)
+        {
+            int bx = points[i * 2], by = points[i * 2 + 1], ex = points[i * 2 + 2], ey = points[i * 2 + 3];
+            int dx = ex - bx, dy = ey - by;
+            int delta = dy * ((0x10000 + (dx >> 1)) / dx);
+            for (int x = 0, dd = 0x8000; x < dx; x++)
+            {
+                scaling[(bx + x) << shiftX] = (byte)(by + (dd >> 16));
+                dd += delta;
+            }
+        }
+        int n = points[(num - 1) * 2] << shiftX;
+        Array.Fill(scaling, points[(num - 1) * 2 + 1], n, size - n);
+        if (bd > 8)
+        {
+            int pad = 1 << shiftX, rnd = pad >> 1;
+            for (int i = 0; i < num - 1; i++)
+            {
+                int bx = points[i * 2] << shiftX, ex = points[i * 2 + 2] << shiftX, dx = ex - bx;
+                for (int x = 0; x < dx; x += pad)
+                {
+                    int range = scaling[bx + x + pad] - scaling[bx + x];
+                    for (int k = 1, r = rnd; k < pad; k++)
+                    {
+                        r += range;
+                        scaling[bx + x + k] = (byte)(scaling[bx + x] + (r >> shiftX));
                     }
                 }
-                DoneAr:
-
-                int grain = grainLut[y * GrainWidth + x] +
-                            Round2(sum, (int)data.ArCoeffShift);
-                grainLut[y * GrainWidth + x] = (short)Clamp(grain, grainMin, grainMax);
             }
         }
     }
 
-    // ========================================================================
-    // Scaling LUT Generation
-    // ========================================================================
-
-    /// <summary>
-    /// Generates a 256-entry scaling lookup table from piecewise-linear points.
-    /// </summary>
-    public static unsafe void GenerateScaling(
-        ReadOnlySpan<byte> pointPairs, // [numPoints * 2] — value,scaling pairs
-        int numPoints,
-        Span<byte> scaling)            // [ScalingSize = 256]
-    {
-        if (numPoints == 0)
-        {
-            scaling.Clear();
-            return;
-        }
-
-        // Fill leading entries with first point's scaling value
-        byte firstVal = pointPairs[0]; // x coordinate
-        byte firstScale = pointPairs[1]; // y value
-        scaling[..firstVal].Fill(firstScale);
-
-        // Linearly interpolate between points
-        for (int i = 0; i < numPoints - 1; i++)
-        {
-            int bx = pointPairs[i * 2];
-            int by = pointPairs[i * 2 + 1];
-            int ex = pointPairs[(i + 1) * 2];
-            int ey = pointPairs[(i + 1) * 2 + 1];
-            int dx = ex - bx;
-            int dy = ey - by;
-            int delta = dy * ((0x10000 + (dx >> 1)) / dx);
-            int d = 0x8000;
-            for (int x = 0; x < dx; x++)
-            {
-                scaling[bx + x] = (byte)(by + (d >> 16));
-                d += delta;
-            }
-        }
-
-        // Fill trailing entries with last point's scaling value
-        int lastX = pointPairs[(numPoints - 1) * 2];
-        byte lastScale = pointPairs[(numPoints - 1) * 2 + 1];
-        scaling[lastX..ScalingSize].Fill(lastScale);
-    }
-
-    // ========================================================================
-    // Grain Application
-    // ========================================================================
-
-    /// <summary>
-    /// Samples the grain LUT for a given block position, accounting for random offsets.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static short SampleLut(
-        short[] grainLut,
-        int offset00, int offset01, int offset10, int offset11,
-        int subx, int suby,
-        int bx, int by, int x, int y)
+    private static int SampleLut(short[] lut, int[,] offsets, int subx, int suby, int bx, int by, int x, int y)
     {
-        int randval = (bx == 0)
-            ? (by == 0 ? offset00 : offset01)
-            : (by == 0 ? offset10 : offset11);
+        int randval = offsets[bx, by];
         int offx = 3 + (2 >> subx) * (3 + (randval >> 4));
         int offy = 3 + (2 >> suby) * (3 + (randval & 0xF));
-        return grainLut[(offy + y + (FgBlockSize >> suby) * by) * GrainWidth +
-                        (offx + x + (FgBlockSize >> subx) * bx)];
+        return lut[(offy + y + (FgBlockSize >> suby) * by) * GrainWidth + offx + x + (FgBlockSize >> subx) * bx];
     }
 
-    /// <summary>
-    /// Applies film grain to one row of 32×32 luma blocks.
-    /// </summary>
-    public static void ApplyGrainY(
-        Span<byte> dst, ReadOnlySpan<byte> src, int stride,
-        in Av1FilmGrainData data, int pw,
-        ReadOnlySpan<byte> scaling, short[] grainLut,
-        int bh, int rowNum)
+    private static void RowSeeds(Params d, int rowNum, int rows, uint[] seed)
     {
-        int rows = 1 + ((data.OverlapFlag != 0 && rowNum > 0) ? 1 : 0);
-        int grainMin = -128, grainMax = 127;
-
-        int minValue, maxValue;
-        if (data.ClipToRestrictedRange != 0)
-        {
-            minValue = 16;
-            maxValue = 235;
-        }
-        else
-        {
-            minValue = 0;
-            maxValue = 255;
-        }
-
-        // Per-row seeds: seed[0] = current row, seed[1] = previous row
-        Span<uint> seed = stackalloc uint[2];
         for (int i = 0; i < rows; i++)
         {
-            seed[i] = data.Seed;
+            seed[i] = d.Seed;
             seed[i] ^= (uint)((((rowNum - i) * 37 + 178) & 0xFF) << 8);
             seed[i] ^= (uint)(((rowNum - i) * 173 + 105) & 0xFF);
         }
+    }
 
-        // Per-block random offsets: [2 col][2 row]
-        int off00 = 0, off01 = 0, off10 = 0, off11 = 0;
+    private static readonly int[,] WLuma = { { 27, 17 }, { 17, 27 } };
+    private static readonly int[,,] WChroma = { { { 27, 17 }, { 17, 27 } }, { { 23, 22 }, { 0, 0 } } };
+
+    // fgy_32x32xn: one 32-row strip of luma starting at element 'off'.
+    private static void FgY(ushort[] dst, ushort[] src, int off, int stride, Params d, int pw, byte[] scaling,
+                            short[] lut, int bh, int rowNum, int bd)
+    {
+        int rows = 1 + (d.Overlap != 0 && rowNum > 0 ? 1 : 0);
+        int bdMin8 = bd - 8, grainCtr = 128 << bdMin8, grainMin = -grainCtr, grainMax = grainCtr - 1;
+        int minV = 0, maxV = (1 << bd) - 1;
+        if (d.ClipRestricted != 0) { minV = 16 << bdMin8; maxV = 235 << bdMin8; }
+        var seed = new uint[2];
+        RowSeeds(d, rowNum, rows, seed);
+        var offsets = new int[2, 2];
 
         for (int bx = 0; bx < pw; bx += FgBlockSize)
         {
             int bw = Math.Min(FgBlockSize, pw - bx);
+            if (d.Overlap != 0 && bx != 0)
+                for (int i = 0; i < rows; i++) offsets[1, i] = offsets[0, i];
+            for (int i = 0; i < rows; i++) offsets[0, i] = GetRandomNumber(8, ref seed[i]);
+            int ystart = d.Overlap != 0 && rowNum != 0 ? Math.Min(2, bh) : 0;
+            int xstart = d.Overlap != 0 && bx != 0 ? Math.Min(2, bw) : 0;
 
-            if (data.OverlapFlag != 0 && bx > 0)
+            void Add(int x, int y, int grain)
             {
-                // Shift previous offsets left
-                off10 = off00;
-                off11 = off01;
+                int i = off + y * stride + x + bx;
+                int noise = Round2(scaling[src[i]] * grain, d.ScalingShift);
+                dst[i] = (ushort)Clip(src[i] + noise, minV, maxV);
             }
 
-            // Update current offsets
-            off00 = GetRandomNumber(8, ref seed[0]);
-            if (rows > 1)
-                off01 = GetRandomNumber(8, ref seed[1]);
-
-            int ystart = (data.OverlapFlag != 0 && rowNum > 0) ? Math.Min(2, bh) : 0;
-            int xstart = (data.OverlapFlag != 0 && bx > 0) ? Math.Min(2, bw) : 0;
-
-            // Main region (no overlap)
             for (int y = ystart; y < bh; y++)
             {
-                for (int x = xstart; x < bw; x++)
-                {
-                    int grain = SampleLut(grainLut, off00, off01, off10, off11, 0, 0, 0, 0, x, y);
-                    int srcIdx = y * stride + bx + x;
-                    int noise = Round2(scaling[src[srcIdx]] * grain, data.ScalingShift);
-                    dst[srcIdx] = (byte)Clamp(src[srcIdx] + noise, minValue, maxValue);
-                }
-
-                // Overlapped column
+                for (int x = xstart; x < bw; x++) Add(x, y, SampleLut(lut, offsets, 0, 0, 0, 0, x, y));
                 for (int x = 0; x < xstart; x++)
                 {
-                    int grain = SampleLut(grainLut, off00, off01, off10, off11, 0, 0, 0, 0, x, y);
-                    int old = SampleLut(grainLut, off00, off01, off10, off11, 0, 0, 1, 0, x, y);
-                    grain = Round2(old * LumaOverlapW[x, 0] + grain * LumaOverlapW[x, 1], 5);
-                    grain = Clamp(grain, grainMin, grainMax);
-                    int srcIdx = y * stride + bx + x;
-                    int noise = Round2(scaling[src[srcIdx]] * grain, data.ScalingShift);
-                    dst[srcIdx] = (byte)Clamp(src[srcIdx] + noise, minValue, maxValue);
+                    int grain = SampleLut(lut, offsets, 0, 0, 0, 0, x, y);
+                    int old = SampleLut(lut, offsets, 0, 0, 1, 0, x, y);
+                    grain = Clip(Round2(old * WLuma[x, 0] + grain * WLuma[x, 1], 5), grainMin, grainMax);
+                    Add(x, y, grain);
                 }
             }
-
-            // Overlapped row (sans corner)
             for (int y = 0; y < ystart; y++)
             {
                 for (int x = xstart; x < bw; x++)
                 {
-                    int grain = SampleLut(grainLut, off00, off01, off10, off11, 0, 0, 0, 0, x, y);
-                    int old = SampleLut(grainLut, off00, off01, off10, off11, 0, 0, 0, 1, x, y);
-                    grain = Round2(old * LumaOverlapW[y, 0] + grain * LumaOverlapW[y, 1], 5);
-                    grain = Clamp(grain, grainMin, grainMax);
-                    int srcIdx = y * stride + bx + x;
-                    int noise = Round2(scaling[src[srcIdx]] * grain, data.ScalingShift);
-                    dst[srcIdx] = (byte)Clamp(src[srcIdx] + noise, minValue, maxValue);
+                    int grain = SampleLut(lut, offsets, 0, 0, 0, 0, x, y);
+                    int old = SampleLut(lut, offsets, 0, 0, 0, 1, x, y);
+                    grain = Clip(Round2(old * WLuma[y, 0] + grain * WLuma[y, 1], 5), grainMin, grainMax);
+                    Add(x, y, grain);
                 }
-
-                // Doubly-overlapped corner
                 for (int x = 0; x < xstart; x++)
                 {
-                    // Blend top with top-left
-                    int top = SampleLut(grainLut, off00, off01, off10, off11, 0, 0, 0, 1, x, y);
-                    int old = SampleLut(grainLut, off00, off01, off10, off11, 0, 0, 1, 1, x, y);
-                    top = Round2(old * LumaOverlapW[x, 0] + top * LumaOverlapW[x, 1], 5);
-                    top = Clamp(top, grainMin, grainMax);
-
-                    // Blend current with left
-                    int grain = SampleLut(grainLut, off00, off01, off10, off11, 0, 0, 0, 0, x, y);
-                    old = SampleLut(grainLut, off00, off01, off10, off11, 0, 0, 1, 0, x, y);
-                    grain = Round2(old * LumaOverlapW[x, 0] + grain * LumaOverlapW[x, 1], 5);
-                    grain = Clamp(grain, grainMin, grainMax);
-
-                    // Mix rows
-                    grain = Round2(top * LumaOverlapW[y, 0] + grain * LumaOverlapW[y, 1], 5);
-                    grain = Clamp(grain, grainMin, grainMax);
-                    int srcIdx = y * stride + bx + x;
-                    int noise = Round2(scaling[src[srcIdx]] * grain, data.ScalingShift);
-                    dst[srcIdx] = (byte)Clamp(src[srcIdx] + noise, minValue, maxValue);
+                    int top = SampleLut(lut, offsets, 0, 0, 0, 1, x, y);
+                    int old = SampleLut(lut, offsets, 0, 0, 1, 1, x, y);
+                    top = Clip(Round2(old * WLuma[x, 0] + top * WLuma[x, 1], 5), grainMin, grainMax);
+                    int grain = SampleLut(lut, offsets, 0, 0, 0, 0, x, y);
+                    old = SampleLut(lut, offsets, 0, 0, 1, 0, x, y);
+                    grain = Clip(Round2(old * WLuma[x, 0] + grain * WLuma[x, 1], 5), grainMin, grainMax);
+                    grain = Clip(Round2(top * WLuma[y, 0] + grain * WLuma[y, 1], 5), grainMin, grainMax);
+                    Add(x, y, grain);
                 }
             }
         }
     }
 
-    /// <summary>
-    /// Applies film grain to one row of chroma blocks (handles 420/422/444).
-    /// </summary>
-    public static void ApplyGrainUv(
-        Span<byte> dst, ReadOnlySpan<byte> src, int stride,
-        in Av1FilmGrainData data, int pw,
-        ReadOnlySpan<byte> scaling, short[] grainLut,
-        int bh, int rowNum,
-        ReadOnlySpan<byte> lumaRow, int lumaStride,
-        int uv, bool isIdentityMatrix,
-        int sx, int sy)
+    // fguv_32x32xn: one strip of a chroma plane. Luma is the un-grained source strip; lumaW is the luma width, for the
+    // odd-width padding dav1d gets by replicating the last luma column.
+    private static void FgUv(ushort[] dst, ushort[] src, int off, int stride, Params d, int pw, byte[] scaling,
+                             short[] lut, int bh, int rowNum, ushort[] luma, int lumaOff, int lumaStride, int lumaW,
+                             int uv, bool isId, int sx, int sy, int bd)
     {
-        int rows = 1 + ((data.OverlapFlag != 0 && rowNum > 0) ? 1 : 0);
-        int grainMin = -128, grainMax = 127;
-
-        int minValue, maxValue;
-        if (data.ClipToRestrictedRange != 0)
-        {
-            minValue = 16;
-            maxValue = (isIdentityMatrix ? 235 : 240);
-        }
-        else
-        {
-            minValue = 0;
-            maxValue = 255;
-        }
-
-        Span<uint> seed = stackalloc uint[2];
-        for (int i = 0; i < rows; i++)
-        {
-            seed[i] = data.Seed;
-            seed[i] ^= (uint)((((rowNum - i) * 37 + 178) & 0xFF) << 8);
-            seed[i] ^= (uint)(((rowNum - i) * 173 + 105) & 0xFF);
-        }
-
-        int off00 = 0, off01 = 0, off10 = 0, off11 = 0;
-        int uvMult = uv == 0 ? data.UvMult0 : data.UvMult1;
-        int uvLumaMult = uv == 0 ? data.UvLumaMult0 : data.UvLumaMult1;
-        int uvOffset = uv == 0 ? data.UvOffset0 : data.UvOffset1;
+        int rows = 1 + (d.Overlap != 0 && rowNum > 0 ? 1 : 0);
+        int bdMin8 = bd - 8, grainCtr = 128 << bdMin8, grainMin = -grainCtr, grainMax = grainCtr - 1;
+        int bdMax = (1 << bd) - 1, minV = 0, maxV = bdMax;
+        if (d.ClipRestricted != 0) { minV = 16 << bdMin8; maxV = (isId ? 235 : 240) << bdMin8; }
+        var seed = new uint[2];
+        RowSeeds(d, rowNum, rows, seed);
+        var offsets = new int[2, 2];
+        int uvMult = d.UvMult[uv], uvLumaMult = d.UvLumaMult[uv], uvOffset = d.UvOffset[uv] * (1 << bdMin8);
 
         for (int bx = 0; bx < pw; bx += FgBlockSize >> sx)
         {
             int bw = Math.Min(FgBlockSize >> sx, pw - bx);
+            if (d.Overlap != 0 && bx != 0)
+                for (int i = 0; i < rows; i++) offsets[1, i] = offsets[0, i];
+            for (int i = 0; i < rows; i++) offsets[0, i] = GetRandomNumber(8, ref seed[i]);
+            int ystart = d.Overlap != 0 && rowNum != 0 ? Math.Min(2 >> sy, bh) : 0;
+            int xstart = d.Overlap != 0 && bx != 0 ? Math.Min(2 >> sx, bw) : 0;
 
-            if (data.OverlapFlag != 0 && bx > 0)
+            void Add(int x, int y, int grain)
             {
-                off10 = off00;
-                off11 = off01;
+                int lx = (bx + x) << sx, lrow = lumaOff + (y << sy) * lumaStride;
+                int avg = luma[lrow + lx];
+                if (sx != 0) avg = (avg + luma[lrow + Math.Min(lx + 1, lumaW - 1)] + 1) >> 1;
+                int i = off + y * stride + bx + x;
+                int val = avg;
+                if (d.Csfl == 0)
+                {
+                    int combined = avg * uvLumaMult + src[i] * uvMult;
+                    val = Clip((combined >> 6) + uvOffset, 0, bdMax);
+                }
+                int noise = Round2(scaling[val] * grain, d.ScalingShift);
+                dst[i] = (ushort)Clip(src[i] + noise, minV, maxV);
             }
 
-            off00 = GetRandomNumber(8, ref seed[0]);
-            if (rows > 1)
-                off01 = GetRandomNumber(8, ref seed[1]);
-
-            int ystart = (data.OverlapFlag != 0 && rowNum > 0) ? Math.Min(2 >> sy, bh) : 0;
-            int xstart = (data.OverlapFlag != 0 && bx > 0) ? Math.Min(2 >> sx, bw) : 0;
-
-            // Main region
             for (int y = ystart; y < bh; y++)
             {
-                for (int x = xstart; x < bw; x++)
-                {
-                    int grain = SampleLut(grainLut, off00, off01, off10, off11, sx, sy, 0, 0, x, y);
-                    AddNoiseUv(dst, src, stride, lumaRow, lumaStride, data,
-                        scaling, bx, x, y, grain, sx, sy, uvMult, uvLumaMult, uvOffset,
-                        minValue, maxValue);
-                }
-
-                // Overlapped column
+                for (int x = xstart; x < bw; x++) Add(x, y, SampleLut(lut, offsets, sx, sy, 0, 0, x, y));
                 for (int x = 0; x < xstart; x++)
                 {
-                    int grain = SampleLut(grainLut, off00, off01, off10, off11, sx, sy, 0, 0, x, y);
-                    int old = SampleLut(grainLut, off00, off01, off10, off11, sx, sy, 1, 0, x, y);
-                    grain = Round2(old * ChromaOverlapW[sx, x, 0] + grain * ChromaOverlapW[sx, x, 1], 5);
-                    grain = Clamp(grain, grainMin, grainMax);
-                    AddNoiseUv(dst, src, stride, lumaRow, lumaStride, data,
-                        scaling, bx, x, y, grain, sx, sy, uvMult, uvLumaMult, uvOffset,
-                        minValue, maxValue);
+                    int grain = SampleLut(lut, offsets, sx, sy, 0, 0, x, y);
+                    int old = SampleLut(lut, offsets, sx, sy, 1, 0, x, y);
+                    grain = Clip(Round2(old * WChroma[sx, x, 0] + grain * WChroma[sx, x, 1], 5), grainMin, grainMax);
+                    Add(x, y, grain);
                 }
             }
-
-            // Overlapped row
             for (int y = 0; y < ystart; y++)
             {
                 for (int x = xstart; x < bw; x++)
                 {
-                    int grain = SampleLut(grainLut, off00, off01, off10, off11, sx, sy, 0, 0, x, y);
-                    int old = SampleLut(grainLut, off00, off01, off10, off11, sx, sy, 0, 1, x, y);
-                    grain = Round2(old * ChromaOverlapW[sy, y, 0] + grain * ChromaOverlapW[sy, y, 1], 5);
-                    grain = Clamp(grain, grainMin, grainMax);
-                    AddNoiseUv(dst, src, stride, lumaRow, lumaStride, data,
-                        scaling, bx, x, y, grain, sx, sy, uvMult, uvLumaMult, uvOffset,
-                        minValue, maxValue);
+                    int grain = SampleLut(lut, offsets, sx, sy, 0, 0, x, y);
+                    int old = SampleLut(lut, offsets, sx, sy, 0, 1, x, y);
+                    grain = Clip(Round2(old * WChroma[sy, y, 0] + grain * WChroma[sy, y, 1], 5), grainMin, grainMax);
+                    Add(x, y, grain);
                 }
-
-                // Doubly-overlapped corner
                 for (int x = 0; x < xstart; x++)
                 {
-                    int top = SampleLut(grainLut, off00, off01, off10, off11, sx, sy, 0, 1, x, y);
-                    int old = SampleLut(grainLut, off00, off01, off10, off11, sx, sy, 1, 1, x, y);
-                    top = Round2(old * ChromaOverlapW[sx, x, 0] + top * ChromaOverlapW[sx, x, 1], 5);
-                    top = Clamp(top, grainMin, grainMax);
-
-                    int grain = SampleLut(grainLut, off00, off01, off10, off11, sx, sy, 0, 0, x, y);
-                    old = SampleLut(grainLut, off00, off01, off10, off11, sx, sy, 1, 0, x, y);
-                    grain = Round2(old * ChromaOverlapW[sx, x, 0] + grain * ChromaOverlapW[sx, x, 1], 5);
-                    grain = Clamp(grain, grainMin, grainMax);
-
-                    grain = Round2(top * ChromaOverlapW[sy, y, 0] + grain * ChromaOverlapW[sy, y, 1], 5);
-                    grain = Clamp(grain, grainMin, grainMax);
-                    AddNoiseUv(dst, src, stride, lumaRow, lumaStride, data,
-                        scaling, bx, x, y, grain, sx, sy, uvMult, uvLumaMult, uvOffset,
-                        minValue, maxValue);
+                    int top = SampleLut(lut, offsets, sx, sy, 0, 1, x, y);
+                    int old = SampleLut(lut, offsets, sx, sy, 1, 1, x, y);
+                    top = Clip(Round2(old * WChroma[sx, x, 0] + top * WChroma[sx, x, 1], 5), grainMin, grainMax);
+                    int grain = SampleLut(lut, offsets, sx, sy, 0, 0, x, y);
+                    old = SampleLut(lut, offsets, sx, sy, 1, 0, x, y);
+                    grain = Clip(Round2(old * WChroma[sx, x, 0] + grain * WChroma[sx, x, 1], 5), grainMin, grainMax);
+                    grain = Clip(Round2(top * WChroma[sy, y, 0] + grain * WChroma[sy, y, 1], 5), grainMin, grainMax);
+                    Add(x, y, grain);
                 }
             }
         }
     }
 
     /// <summary>
-    /// Computes scaled noise and applies to a single chroma pixel.
+    /// Applies film grain (dav1d_apply_grain). The dst planes must start as copies of the source planes (planes
+    /// without grain are left untouched); the sources are only read. Chroma planes are null for monochrome.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void AddNoiseUv(
-        Span<byte> dst, ReadOnlySpan<byte> src, int stride,
-        ReadOnlySpan<byte> lumaRow, int lumaStride,
-        in Av1FilmGrainData data, ReadOnlySpan<byte> scaling,
-        int bx, int x, int y, int grain,
-        int sx, int sy,
-        int uvMult, int uvLumaMult, int uvOffset,
-        int minValue, int maxValue)
+    public static void Apply(in Av1FilmGrainData data, int bitDepth, int ssx, int ssy, bool isIdentityMatrix,
+                             int w, int h, ushort[] srcY, int strideY, ushort[]? srcU, ushort[]? srcV, int strideUv,
+                             ushort[] dstY, ushort[]? dstU, ushort[]? dstV)
     {
-        int lx = (bx + x) << sx;
-        int ly = y << sy;
-        int avg = lumaRow[ly * lumaStride + lx];
-        if (sx != 0)
-            avg = (avg + lumaRow[ly * lumaStride + lx + 1] + 1) >> 1;
+        var d = Load(data);
+        int bd = bitDepth;
+        var lutY = new short[(GrainHeight + 1) * GrainWidth];
+        var lutU = new short[(GrainHeight + 1) * GrainWidth];
+        var lutV = new short[(GrainHeight + 1) * GrainWidth];
+        var scY = new byte[1 << bd];
+        var scU = new byte[1 << bd];
+        var scV = new byte[1 << bd];
+        bool chroma = srcU != null && srcV != null && dstU != null && dstV != null;
 
-        int srcIdx = y * stride + bx + x;
-        int val;
-        if (data.ChromaScalingFromLuma != 0)
+        GenerateGrainY(lutY, d, bd);
+        if (chroma && (d.NumUvPoints[0] != 0 || d.Csfl != 0)) GenerateGrainUv(lutU, lutY, d, 0, ssx, ssy, bd);
+        if (chroma && (d.NumUvPoints[1] != 0 || d.Csfl != 0)) GenerateGrainUv(lutV, lutY, d, 1, ssx, ssy, bd);
+        if (d.NumYPoints != 0 || d.Csfl != 0) GenerateScaling(bd, d.YPoints, d.NumYPoints, scY);
+        if (d.NumUvPoints[0] != 0) GenerateScaling(bd, d.UvPoints[0], d.NumUvPoints[0], scU);
+        if (d.NumUvPoints[1] != 0) GenerateScaling(bd, d.UvPoints[1], d.NumUvPoints[1], scV);
+
+        int cpw = (w + ssx) >> ssx;
+        int strips = (h + FgBlockSize - 1) / FgBlockSize;
+        for (int row = 0; row < strips; row++)
         {
-            val = avg;
-        }
-        else
-        {
-            int combined = avg * uvLumaMult + src[srcIdx] * uvMult;
-            val = Clamp((combined >> 6) + uvOffset, 0, 255);
-        }
-        int noise = Round2(scaling[val] * grain, data.ScalingShift);
-        dst[srcIdx] = (byte)Clamp(src[srcIdx] + noise, minValue, maxValue);
-    }
+            int lumaOff = row * FgBlockSize * strideY;
+            int bhY = Math.Min(h - row * FgBlockSize, FgBlockSize);
+            if (d.NumYPoints != 0)
+                FgY(dstY, srcY, lumaOff, strideY, d, w, scY, lutY, bhY, row, bd);
 
-    // ========================================================================
-    // Frame-Level Entry Points
-    // ========================================================================
-
-    /// <summary>
-    /// Prepares grain LUTs and scaling tables for a frame.
-    /// Call once per frame before ApplyGrainRow.
-    /// </summary>
-    /// <param name="grainLutY">Luma grain [GrainHeight * GrainWidth].</param>
-    /// <param name="grainLutCb">Cb grain [GrainHeight * GrainWidth].</param>
-    /// <param name="grainLutCr">Cr grain [GrainHeight * GrainWidth].</param>
-    /// <param name="scalingY">Luma scaling [256].</param>
-    /// <param name="scalingCb">Cb scaling [256].</param>
-    /// <param name="scalingCr">Cr scaling [256].</param>
-    public static unsafe void PrepGrain(
-        in Av1FilmGrainData data,
-        int subx, int suby,
-        short[] grainLutY, short[] grainLutCb, short[] grainLutCr,
-        byte[] scalingY, byte[] scalingCb, byte[] scalingCr)
-    {
-        // Generate grain LUTs
-        GenerateGrainY(grainLutY, in data);
-
-        if (data.NumUvPoints0 > 0 || data.ChromaScalingFromLuma != 0)
-            GenerateGrainUv(grainLutCb, grainLutY, in data, 0, subx, suby);
-        if (data.NumUvPoints1 > 0 || data.ChromaScalingFromLuma != 0)
-            GenerateGrainUv(grainLutCr, grainLutY, in data, 1, subx, suby);
-
-        // Generate scaling LUTs
-        fixed (byte* yp = data.YPoints)
-        {
-            if (data.NumYPoints > 0 || data.ChromaScalingFromLuma != 0)
-                GenerateScaling(new ReadOnlySpan<byte>(yp, data.NumYPoints * 2),
-                    data.NumYPoints, scalingY);
-        }
-        fixed (byte* uvp = data.UvPoints)
-        {
-            if (data.NumUvPoints0 > 0)
-                GenerateScaling(new ReadOnlySpan<byte>(uvp, data.NumUvPoints0 * 2),
-                    data.NumUvPoints0, scalingCb);
-            if (data.NumUvPoints1 > 0)
-                GenerateScaling(new ReadOnlySpan<byte>(uvp + 20, data.NumUvPoints1 * 2),
-                    data.NumUvPoints1, scalingCr);
-        }
-    }
-
-    /// <summary>
-    /// Applies grain to one row of 32-pixel-high blocks for the entire frame width.
-    /// </summary>
-    public static void ApplyGrainRow(
-        Span<byte> dstY, ReadOnlySpan<byte> srcY, int yStride,
-        Span<byte> dstCb, ReadOnlySpan<byte> srcCb,
-        Span<byte> dstCr, ReadOnlySpan<byte> srcCr, int uvStride,
-        in Av1FilmGrainData data,
-        int frameWidth, int frameHeight,
-        int subx, int suby, bool isIdentityMatrix,
-        byte[] scalingY, byte[] scalingCb, byte[] scalingCr,
-        short[] grainLutY, short[] grainLutCb, short[] grainLutCr,
-        int row)
-    {
-        int yOff = row * FgBlockSize * yStride;
-
-        // Luma grain
-        if (data.NumYPoints > 0)
-        {
-            int bh = Math.Min(frameHeight - row * FgBlockSize, FgBlockSize);
-            ApplyGrainY(
-                dstY[yOff..], srcY[yOff..], yStride,
-                in data, frameWidth, scalingY, grainLutY,
-                bh, row);
-        }
-
-        bool needChroma = data.NumUvPoints0 > 0 || data.NumUvPoints1 > 0 ||
-                          data.ChromaScalingFromLuma != 0;
-        if (!needChroma) return;
-
-        int bh2 = (Math.Min(frameHeight - row * FgBlockSize, FgBlockSize) + suby) >> suby;
-        int cpw = (frameWidth + subx) >> subx;
-        int uvOff = (row * FgBlockSize * uvStride) >> suby;
-
-        // Extend luma padding pixel if width is odd and subsampled
-        // (handled by caller copying src→dst for unmodified planes)
-
-        if (data.ChromaScalingFromLuma != 0)
-        {
+            if (!chroma || (d.NumUvPoints[0] == 0 && d.NumUvPoints[1] == 0 && d.Csfl == 0)) continue;
+            int bh = (bhY + ssy) >> ssy;
+            int uvOff = (row * FgBlockSize >> ssy) * strideUv;
             for (int pl = 0; pl < 2; pl++)
             {
-                var dstUv = pl == 0 ? dstCb[uvOff..] : dstCr[uvOff..];
-                var srcUv = pl == 0 ? srcCb[uvOff..] : srcCr[uvOff..];
-                var grainLut = pl == 0 ? grainLutCb : grainLutCr;
-                ApplyGrainUv(
-                    dstUv, srcUv, uvStride,
-                    in data, cpw, scalingY, grainLut,
-                    bh2, row,
-                    srcY[yOff..], yStride,
-                    pl, isIdentityMatrix, subx, suby);
+                if (d.Csfl == 0 && d.NumUvPoints[pl] == 0) continue;
+                FgUv(pl == 0 ? dstU! : dstV!, pl == 0 ? srcU! : srcV!, uvOff, strideUv, d, cpw,
+                     d.Csfl != 0 ? scY : pl == 0 ? scU : scV, pl == 0 ? lutU : lutV, bh, row,
+                     srcY, lumaOff, strideY, w, pl, isIdentityMatrix, ssx, ssy, bd);
             }
-        }
-        else
-        {
-            if (data.NumUvPoints0 > 0)
-            {
-                ApplyGrainUv(
-                    dstCb[uvOff..], srcCb[uvOff..], uvStride,
-                    in data, cpw, scalingCb, grainLutCb,
-                    bh2, row,
-                    srcY[yOff..], yStride,
-                    0, isIdentityMatrix, subx, suby);
-            }
-            if (data.NumUvPoints1 > 0)
-            {
-                ApplyGrainUv(
-                    dstCr[uvOff..], srcCr[uvOff..], uvStride,
-                    in data, cpw, scalingCr, grainLutCr,
-                    bh2, row,
-                    srcY[yOff..], yStride,
-                    1, isIdentityMatrix, subx, suby);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Full-frame film grain application entry point.
-    /// Allocates grain LUTs and scaling tables, then processes all rows.
-    /// </summary>
-    public static void ApplyGrain(
-        Span<byte> dstY, ReadOnlySpan<byte> srcY, int yStride,
-        Span<byte> dstCb, ReadOnlySpan<byte> srcCb,
-        Span<byte> dstCr, ReadOnlySpan<byte> srcCr, int uvStride,
-        in Av1FilmGrainData data,
-        int frameWidth, int frameHeight,
-        int subx, int suby, bool isIdentityMatrix)
-    {
-        // Allocate grain LUTs (3 planes × GrainHeight × GrainWidth)
-        var grainLutY = new short[GrainHeight * GrainWidth];
-        var grainLutCb = new short[GrainHeight * GrainWidth];
-        var grainLutCr = new short[GrainHeight * GrainWidth];
-
-        // Allocate scaling LUTs (3 × 256)
-        var scalingY = new byte[ScalingSize];
-        var scalingCb = new byte[ScalingSize];
-        var scalingCr = new byte[ScalingSize];
-
-        // Prepare grain and scaling tables
-        PrepGrain(in data, subx, suby,
-            grainLutY, grainLutCb, grainLutCr,
-            scalingY, scalingCb, scalingCr);
-
-        // Copy unmodified planes (when no grain points specified)
-        if (data.NumYPoints == 0)
-            srcY[..(frameHeight * yStride)].CopyTo(dstY);
-
-        if (data.ChromaScalingFromLuma == 0)
-        {
-            int uvHeight = (frameHeight + suby) >> suby;
-            if (data.NumUvPoints0 == 0)
-                srcCb[..(uvHeight * uvStride)].CopyTo(dstCb);
-            if (data.NumUvPoints1 == 0)
-                srcCr[..(uvHeight * uvStride)].CopyTo(dstCr);
-        }
-
-        // Apply grain row by row
-        int totalRows = (frameHeight + FgBlockSize - 1) / FgBlockSize;
-        for (int row = 0; row < totalRows; row++)
-        {
-            ApplyGrainRow(
-                dstY, srcY, yStride,
-                dstCb, srcCb, dstCr, srcCr, uvStride,
-                in data, frameWidth, frameHeight,
-                subx, suby, isIdentityMatrix,
-                scalingY, scalingCb, scalingCr,
-                grainLutY, grainLutCb, grainLutCr,
-                row);
         }
     }
 

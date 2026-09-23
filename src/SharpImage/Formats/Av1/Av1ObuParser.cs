@@ -582,6 +582,8 @@ public static class Av1ObuParser
         // Film grain
         if (seqHdr.FilmGrainPresent && (hdr.ShowFrame || hdr.ShowableFrame))
             ParseFilmGrain(hdr, seqHdr, refFrames, ref gb);
+        else
+            hdr.FilmGrainPresent = false;   // the header object is reused across frames
 
         if (gb.Error) return ParseResult.InvalidData;
 
@@ -973,12 +975,17 @@ public static class Av1ObuParser
 
         if (!hdr.FilmGrainUpdate)
         {
-            // Copy film grain data from a reference frame
-            // (deferred to when we have full reference frame header storage)
+            // load_grain_params(film_grain_params_ref_idx): the reference must be one of this frame's refs.
+            int refIdx = (int)gb.GetBits(3);
+            bool used = false;
+            for (int i = 0; i < 7; i++) used |= hdr.GetRefIdx(i) == refIdx;
+            if (!used || !refFrames[refIdx].Valid) { gb.MarkError(); return; }
+            hdr.FilmGrain = refFrames[refIdx].FilmGrain;
             hdr.FilmGrain.Seed = seed;
             return;
         }
 
+        hdr.FilmGrain = default;
         ref var fgd = ref hdr.FilmGrain;
         fgd.Seed = seed;
 
