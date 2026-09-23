@@ -1003,6 +1003,9 @@ public sealed class Av1HbdVerify
                         case "cp": o.ColorPrimaries = int.Parse(t[1]); break;
                         case "tc": o.TransferCharacteristics = int.Parse(t[1]); break;
                         case "g": { var gg = t[1].Split('x'); o.Grid = (int.Parse(gg[0]), int.Parse(gg[1])); break; }
+                        case "tcols": o.TileColumnsLog2 = int.Parse(t[1]); break;
+                        case "trows": o.TileRowsLog2 = int.Parse(t[1]); break;
+                        case "auto": o.AutoTiling = true; break;
                         case "irot": o.Rotation = int.Parse(t[1]); break;
                         case "prem": o.PremultiplyAlpha = true; break;
                     }
@@ -1029,6 +1032,35 @@ public sealed class Av1HbdVerify
             catch (Exception e) { log.AppendLine($"{Path.GetFileName(p[1])} ERROR {e.GetType().Name}: {e.Message}"); }
         }
         File.WriteAllText(Path.Combine(dir, "enc_manifest.txt"), log.ToString());
+    }
+
+    // Tile probe (trigger hbd_tiles.txt naming a scratch subdir): the AV1 tile columns x rows of every *.avif's primary
+    // (or first grid cell) item, read back by our decoder, into tiles.txt.
+    [Test, NotInParallel]
+    public void TileProbe()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_tiles.txt");
+        if (!File.Exists(trig)) return;
+        string dir = Path.Combine(Scratch, File.ReadAllText(trig).Trim());
+        File.Delete(trig);
+        var log = new System.Text.StringBuilder();
+        var ctxField = typeof(Av1Decoder).GetField("ctx", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        foreach (var file in Directory.GetFiles(dir, "*.avif").OrderBy(f => f))
+        {
+            try
+            {
+                var c = HeifContainer.Parse(File.ReadAllBytes(file));
+                int id = c.PrimaryId;
+                if (c.Items[id].Type == "grid") id = c.ReferencesFrom(id, "dimg")[0];
+                var dec = new Av1Decoder();
+                using var f = dec.Decode(c.ItemData(id)!, 0, isKeyframe: true);
+                var ctx = ctxField.GetValue(dec)!;
+                int cols = (int)ctx.GetType().GetField("TileCols")!.GetValue(ctx)!, rows = (int)ctx.GetType().GetField("TileRows")!.GetValue(ctx)!;
+                log.AppendLine($"{Path.GetFileName(file)} {cols}x{rows}");
+            }
+            catch (Exception e) { log.AppendLine($"{Path.GetFileName(file)} ERROR {e.Message}"); }
+        }
+        File.WriteAllText(Path.Combine(dir, "tiles.txt"), log.ToString());
     }
 
     // Tone map probe (trigger hbd_tm.txt: lines "file|headroom|outName[|cp/tc|depth]"): HeifCoder.DecodeToneMapped, the

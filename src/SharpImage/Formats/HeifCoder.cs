@@ -154,6 +154,17 @@ public sealed class AvifEncodeOptions
     /// item over hidden cell items (and an alpha grid). Cell sizes follow avifenc: ceil(size / count), at least 64 px
     /// (MIAF), even along subsampled axes; the last row / column may be smaller. Null or 1x1: a single coded item.</summary>
     public (int Columns, int Rows)? Grid { get; set; }
+
+    /// <summary>log2 of the number of AV1 tile columns (avifenc --tilecolslog2, 0..6): more tiles decode in parallel at
+    /// some compression cost. Clamped to what the frame size allows (at least the tiles AV1 requires).</summary>
+    public int TileColumnsLog2 { get; set; }
+
+    /// <summary>log2 of the number of AV1 tile rows (avifenc --tilerowslog2, 0..6).</summary>
+    public int TileRowsLog2 { get; set; }
+
+    /// <summary>Choose the tiling automatically (avifenc --autotiling; overrides the log2 values): up to 8 tiles, about
+    /// one per 512x512 pixels, more along the longer dimension.</summary>
+    public bool AutoTiling { get; set; }
 }
 
 /// <summary>Film grain for one AVIF encode: explicit parameters, or denoise-and-estimate (Level &lt; 0 = all-intra estimate).</summary>
@@ -896,7 +907,32 @@ public static partial class HeifCoder
         options ??= new AvifEncodeOptions();
         if (options.Grid is { } grid && (grid.Columns != 1 || grid.Rows != 1))
             return EncodeAvifGrid(image, options, grid.Columns, grid.Rows);
+        using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, (int)image.Columns, (int)image.Rows));
         return EncodeAvifCore(image, options, forceColor: false, forceAlpha: false);
+    }
+
+    // libavif: tile log2 values clamped to 0..6; autoTiling = avifSetTileConfiguration(8 threads, first cell size).
+    private static (int Cols, int Rows) ResolveTiling(AvifEncodeOptions o, int w, int h)
+    {
+        if (!o.AutoTiling) return (Math.Clamp(o.TileColumnsLog2, 0, 6), Math.Clamp(o.TileRowsLog2, 0, 6));
+        const int threads = 8;
+        const long minTileArea = 512 * 512, maxTiles = 32;
+        long tiles = Math.Min(((long)w * h + minTileArea - 1) / minTileArea, maxTiles);
+        tiles = Math.Min(tiles, threads);
+        int tilesLog2 = 0;
+        while ((2L << tilesLog2) <= tiles) tilesLog2++;   // floorLog2
+        static (int D1, int D2) Split(long dim1, long dim2, int tilesLog2)
+        {
+            long ratio = dim1 / dim2;
+            int diffLog2 = 0;
+            while ((2L << diffLog2) <= ratio) diffLog2++;
+            int subtract = Math.Max(tilesLog2 - diffLog2, 0);
+            int d2 = subtract / 2;
+            return (tilesLog2 - d2, d2);
+        }
+        if (w >= h) { var (c, r) = Split(w, h, tilesLog2); return (c, r); }
+        var (rr, cc) = Split(h, w, tilesLog2);
+        return (cc, rr);
     }
 
     // forceColor / forceAlpha: grid cells must share one chroma format and all carry alpha (MIAF), so a grey or opaque
@@ -981,13 +1017,16 @@ public static partial class HeifCoder
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
         var color = ResolveAvifColor(first, options, bd);
         if (options.Lossless && options.MatrixCoefficients == null) color = color with { Matrix = 0 };
+        if (options.ChromaSubsampling == AvifChromaSubsampling.Yuv400 && color.Matrix == 0) color = color with { Matrix = 6 };
         var layout = options.ChromaSubsampling switch
         {
             AvifChromaSubsampling.Yuv422 => Av1.Av1PixelLayout.I422,
             AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
             AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
+            AvifChromaSubsampling.Yuv400 => Av1.Av1PixelLayout.I400,
             _ => color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
         };
+        using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, w, h));
         if (color.Matrix == 0 && layout != Av1.Av1PixelLayout.I444)
             throw new ArgumentException("The identity matrix (MatrixCoefficients 0) requires 4:4:4 chroma.", nameof(options));
         bool denoise = options.DenoiseNoiseLevel > 0;
@@ -1011,7 +1050,8 @@ public static partial class HeifCoder
         bool hasAlpha = anyTranslucent;
         extras.Premultiplied = options.PremultiplyAlpha && hasAlpha;
         // Grey sequences are coded 4:0:0 like stills; identity / YCgCo-R keep the colour path (they carry exact RGB).
-        bool mono = !anyColour && !(!options.Lossless && color.Matrix is 0 or 16 or 17);
+        bool forceMono = layout == Av1.Av1PixelLayout.I400;   // avifenc -y 400: luma from RGB, chroma dropped
+        bool mono = forceMono || (!anyColour && !(!options.Lossless && color.Matrix is 0 or 16 or 17));
         var codedLayout = mono ? Av1.Av1PixelLayout.I400 : layout;
         int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
         int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
@@ -1037,7 +1077,9 @@ public static partial class HeifCoder
                     }
                 ushort[] yP;
                 ushort[]? uP = null, vP = null;
-                if (mono)
+                if (mono && forceMono && anyColour)
+                    yP = MonoLumaLibavif(r, g, b, w, h, bd, color, first.Depth is >= 1 and <= 16 ? first.Depth : 16);
+                else if (mono)
                 {
                     yP = new ushort[w * h];
                     for (int i = 0; i < yP.Length; i++)
@@ -1759,6 +1801,7 @@ public static partial class HeifCoder
             DenoiseBlockSize = options.DenoiseBlockSize, DenoiseApply = options.DenoiseApply,
         };
         var cells = new Av1.AvifGridCells { Columns = cols, Rows = rows, CellWidth = cellW, CellHeight = cellH, Alpha = alpha ? [] : null };
+        using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, cellW, cellH));   // libavif: from the first cell
         for (int gy = 0; gy < rows; gy++)
             for (int gx = 0; gx < cols; gx++)
             {

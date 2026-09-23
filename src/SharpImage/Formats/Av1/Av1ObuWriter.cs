@@ -290,16 +290,32 @@ internal static class Av1ObuWriter
         return 31;
     }
 
+    [ThreadStatic] private static (int Cols, int Rows) t_tileLog2Request;
+
+    internal readonly struct TilingScope : IDisposable
+    {
+        private readonly (int, int) prev;
+        public TilingScope((int Cols, int Rows) log2) { prev = t_tileLog2Request; t_tileLog2Request = log2; }
+        public void Dispose() => t_tileLog2Request = prev;
+    }
+
+    /// <summary>Requests log2 tile columns / rows (aomenc --tile-columns / --tile-rows, avifenc --tilecolslog2 /
+    /// --tilerowslog2) for everything encoded in the scope; each is clamped to what tile_info() allows, as libaom's
+    /// av1_set_tile_info does.</summary>
+    internal static TilingScope UseTiling((int Cols, int Rows) log2) => new(log2);
+
     /// <summary>The uniform tile layout for a frame of <paramref name="sbCols"/> x <paramref name="sbRows"/> 64x64
-    /// superblocks with the fewest tiles the syntax allows: tiles at most 4096 px wide (MAX_TILE_WIDTH) and at most
-    /// 4096*2304 px in area (MAX_TILE_AREA) — tile_info() starts TileColsLog2 / TileRowsLog2 at exactly these minima.
-    /// Start arrays carry a final entry = sbCols / sbRows.</summary>
+    /// superblocks: the requested log2 tile counts (default 0) clamped as libaom does — columns to [minLog2TileCols,
+    /// maxLog2TileCols], rows to [max(minLog2Tiles - cols, 0), maxLog2TileRows] — where the minima keep tiles at most 4096
+    /// px wide (MAX_TILE_WIDTH) and 4096*2304 px in area (MAX_TILE_AREA). Start arrays carry a final entry = sbCols /
+    /// sbRows.</summary>
     internal static (int ColsLog2, int RowsLog2, int[] ColStartSb, int[] RowStartSb) TileLayout(int sbCols, int sbRows)
     {
         const int maxTileWidthSb = 4096 >> 6, maxTileAreaSb = (4096 * 2304) >> 12;
         int minLog2Cols = TileLog2(maxTileWidthSb, sbCols);
         int minLog2Tiles = Math.Max(minLog2Cols, TileLog2(maxTileAreaSb, sbRows * sbCols));
-        int colsLog2 = minLog2Cols, rowsLog2 = Math.Max(minLog2Tiles - colsLog2, 0);
+        int colsLog2 = Math.Min(Math.Max(t_tileLog2Request.Cols, minLog2Cols), TileMaxLog2(sbCols));
+        int rowsLog2 = Math.Min(Math.Max(t_tileLog2Request.Rows, Math.Max(minLog2Tiles - colsLog2, 0)), TileMaxLog2(sbRows));
         static int[] Starts(int sb, int log2)
         {
             int size = (sb + (1 << log2) - 1) >> log2;
@@ -511,13 +527,21 @@ internal static class Av1ObuWriter
         // refresh_context skipped (reduced still).
 
     tileInfo:
-        // tile_info (uniform spacing): the log2 tile counts start at the syntax minima (TileLayout) and the loop reads
-        // an "increment" bit while below the maximum — one 0 bit per axis stops exactly at the minimum. Frames over
-        // 4096 px wide or 2304 superblocks therefore always carry the multiple tiles the decoder will expect.
+        // tile_info (uniform spacing): the log2 tile counts start at the syntax minima and the loop reads an "increment"
+        // bit while below the maximum — one 1 bit per step up to the chosen count (TileLayout), then a 0 unless already
+        // at the maximum. Frames over 4096 px wide or 2304 superblocks always carry at least the tiles the decoder
+        // expects.
         w.PutBool(true);          // uniform_tile_spacing_flag
         var layout = TileLayout(sbCols, sbRows);
-        if (layout.ColsLog2 < TileMaxLog2(sbCols)) w.PutBool(false);   // stop incrementing tile cols
-        if (layout.RowsLog2 < TileMaxLog2(sbRows)) w.PutBool(false);   // stop incrementing tile rows
+        {
+            const int maxTileWidthSb = 4096 >> 6, maxTileAreaSb = (4096 * 2304) >> 12;
+            int minLog2Cols = TileLog2(maxTileWidthSb, sbCols);
+            int minLog2Tiles = Math.Max(minLog2Cols, TileLog2(maxTileAreaSb, sbRows * sbCols));
+            for (int i = minLog2Cols; i < layout.ColsLog2; i++) w.PutBool(true);      // increment_tile_cols_log2
+            if (layout.ColsLog2 < TileMaxLog2(sbCols)) w.PutBool(false);
+            for (int i = Math.Max(minLog2Tiles - layout.ColsLog2, 0); i < layout.RowsLog2; i++) w.PutBool(true);   // increment_tile_rows_log2
+            if (layout.RowsLog2 < TileMaxLog2(sbRows)) w.PutBool(false);
+        }
         if (layout.ColsLog2 + layout.RowsLog2 > 0)
         {
             w.PutBits(0, layout.ColsLog2 + layout.RowsLog2);   // context_update_tile_id = 0
