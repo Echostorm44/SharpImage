@@ -32,6 +32,9 @@ public enum AvifChromaSubsampling
     Yuv422,
     /// <summary>4:4:4 — full-resolution chroma (AV1 High profile; Professional at 12-bit).</summary>
     Yuv444,
+    /// <summary>4:0:0 — monochrome: luma computed from RGB with the matrix coefficients, chroma dropped (avifenc
+    /// -y 400). Grayscale sources are always coded this way.</summary>
+    Yuv400,
 }
 
 /// <summary>
@@ -892,12 +895,16 @@ public static partial class HeifCoder
         var color = ResolveAvifColor(image, options, bd);
         if (options.Lossless && options.MatrixCoefficients == null)
             color = color with { Matrix = 0 };   // identity (GBR) at 4:4:4 — exact RGB
+        // 4:0:0 cannot use the identity matrix: avifenc resets it to BT.601.
+        if (options.ChromaSubsampling == AvifChromaSubsampling.Yuv400 && color.Matrix == 0)
+            color = color with { Matrix = 6 };
         // The identity matrix (RGB coded as GBR) is only defined for 4:4:4 — Auto picks it, explicit subsampling fails.
         var layout = options.ChromaSubsampling switch
         {
             AvifChromaSubsampling.Yuv422 => Av1.Av1PixelLayout.I422,
             AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
             AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
+            AvifChromaSubsampling.Yuv400 => Av1.Av1PixelLayout.I400,
             // Auto: 4:4:4 for identity and for lossless (subsampled chroma cannot be lossless; avifenc --lossless), else 4:2:0.
             _ => color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
         };
@@ -1285,6 +1292,29 @@ public static partial class HeifCoder
             }
         }
         else extras.Premultiplied = false;   // nothing to signal without a coded alpha item
+        // 4:0:0 requested for a colour source (avifenc -y 400): luma from RGB with the matrix, chroma dropped.
+        bool forceMono = layout == Av1.Av1PixelLayout.I400;
+        ushort[]? monoLuma = null;
+        if (forceMono && colour)
+        {
+            monoLuma = MonoLumaLibavif(r, g, b, w, h, bd, color, image.Depth is >= 1 and <= 16 ? image.Depth : 16);
+            colour = false;
+        }
+        if (hasAlpha && nonOpaque && alpha != null && forceMono)
+        {
+            int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
+            ushort[] yM = monoLuma ?? GreyLuma(r, w, h, bd, color);
+            if (lossless)
+                return Av1.Av1StillImageEncoder.EncodeAvifLossless(yM, default, default, true, alpha, true, w, h, bd, Av1.Av1PixelLayout.I400,
+                    color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color, extras);
+            ushort[]? mU = null, mV = null;
+            Denoise(ref yM, ref mU, ref mV, 1, 1);
+            using (Grain(true))
+                return progressive
+                    ? Av1.Av1StillImageEncoder.EncodeAvifLayered(ProgressiveLayers(yM, null, null, alpha, w, h, 1, 1, baseQIdx, alphaQIdx),
+                        true, bd, Av1.Av1PixelLayout.I400, color, extras)
+                    : Av1.Av1StillImageEncoder.EncodeAvifMonochromeWithAlpha(yM, alpha, w, h, baseQIdx, alphaQIdx, bd, color, extras);
+        }
         if (hasAlpha && nonOpaque && alpha != null)
         {
             int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
@@ -1302,11 +1332,11 @@ public static partial class HeifCoder
 
         // Identity / YCgCo-R carry exact RGB, so lossy grey content keeps the colour (4:4:4) path; lossless grey is
         // coded as 4:0:0 like libavif (the single plane is exact already).
-        if (colour || (!lossless && color.Matrix is 0 or 16 or 17))
+        if (!forceMono && (colour || (!lossless && color.Matrix is 0 or 16 or 17)))
         {
             ushort[] yP, uP0, vP0;
             if (libavifFloatYuv && color.Matrix is not (8 or 16 or 17))
-                RgbToYuvAvifFloat(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0);
+                RgbToYuvAvifFloat(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0, image.Depth is >= 1 and <= 16 ? image.Depth : 16);
             else
                 RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0);
             ushort[]? uP = uP0, vP = vP0;
@@ -1322,10 +1352,7 @@ public static partial class HeifCoder
         }
 
         // Grey: 4:0:0 luma (Y = the grey value; limited range maps it into [16, 235] << (bd - 8)).
-        int max = (1 << bd) - 1;
-        var luma = new ushort[w * h];
-        for (int i = 0; i < luma.Length; i++)
-            luma[i] = (ushort)Math.Clamp((int)Math.Round(color.FullRange ? r[i] : r[i] / max * (219 << (bd - 8)) + (16 << (bd - 8))), 0, max);
+        var luma = monoLuma ?? GreyLuma(r, w, h, bd, color);
         {
             ushort[]? su = null, sv = null;
             ScaleYuv(ref luma, ref su, ref sv, 1, 1);
@@ -1394,14 +1421,57 @@ public static partial class HeifCoder
     // the normalised domain, then unorm = round(v * range + bias). Identity codes G/B/R with the luma range; YCgCo
     // (8) uses H.273 eqs 44-46; YCgCo-Re/Ro (16/17) are the integer lifting transforms on RGB quantised to
     // bd-2 / bd-1 bits. r/g/b arrive in coded-depth units [0, 2^bd - 1].
-    // libavif avifImageRGBToYUV's built-in path operation for operation (float, 2x2 blocks, chroma averaged in block
-    // order, avifRoundf), for the kr/kb matrices and identity. Samples are the native-depth integers (r/g/b as read by
-    // ReadRgbPlanes, rounded). Used where the coded YUV must equal libavif's exactly (lossless gain maps).
-    private static void RgbToYuvAvifFloat(double[] r, double[] g, double[] b, int w, int h, int bd, Av1.Av1PixelLayout layout,
-        Av1.Av1ObuWriter.Av1ColorDesc color, out ushort[] y, out ushort[] u, out ushort[] v)
+    // Colour source -> 4:0:0 luma exactly as libavif's avifImageRGBToYUV: libyuv's J400 ((77r + 150g + 29b + 128) >> 8,
+    // verified against the libyuv binary) for 8-bit full-range BT.601 / BT.470BG, else the float path's Y.
+    private static ushort[] MonoLumaLibavif(double[] r, double[] g, double[] b, int w, int h, int bd, Av1.Av1ObuWriter.Av1ColorDesc color,
+        int srcDepth)
+    {
+        // libavif's libyuv path needs 8-bit RGB: an 8-bit source (every 16-bit sample a multiple of 257).
+        bool eightBitSource = srcDepth == 8;
+        if (!eightBitSource && bd == 8)
+        {
+            eightBitSource = true;
+            for (int i = 0; i < r.Length && eightBitSource; i++)
+                eightBitSource = Math.Abs(r[i] - Math.Round(r[i])) < 1e-6 && Math.Abs(g[i] - Math.Round(g[i])) < 1e-6 && Math.Abs(b[i] - Math.Round(b[i])) < 1e-6;
+        }
+        if (bd == 8 && eightBitSource && color.Matrix is 5 or 6 && color.FullRange)
+        {
+            var y = new ushort[w * h];
+            for (int i = 0; i < y.Length; i++)
+                y[i] = (ushort)((77 * (int)Math.Round(r[i]) + 150 * (int)Math.Round(g[i]) + 29 * (int)Math.Round(b[i]) + 128) >> 8);
+            return y;
+        }
+        RgbToYuvAvifFloat(r, g, b, w, h, bd, Av1.Av1PixelLayout.I444, color, out var yf, out _, out _, srcDepth);
+        return yf;
+    }
+
+    // Grey source -> 4:0:0 luma (Y = the grey value; limited range maps it into [16, 235] << (bd - 8)).
+    private static ushort[] GreyLuma(double[] r, int w, int h, int bd, Av1.Av1ObuWriter.Av1ColorDesc color)
     {
         int max = (1 << bd) - 1;
-        float maxF = max;
+        var luma = new ushort[w * h];
+        for (int i = 0; i < luma.Length; i++)
+            luma[i] = (ushort)Math.Clamp((int)Math.Round(color.FullRange ? r[i] : r[i] / max * (219 << (bd - 8)) + (16 << (bd - 8))), 0, max);
+        return luma;
+    }
+
+    // libavif avifImageRGBToYUV's built-in path operation for operation (float, 2x2 blocks, chroma averaged in block
+    // order, avifRoundf), for the kr/kb matrices and identity. The RGB samples are taken at the source's depth
+    // (srcDepth: ImageFrame.Depth, 16 when unknown — exact for 8-bit sources too), as libavif's avifRGBImage holds them,
+    // and normalised by that depth's maximum. Used where the coded YUV must equal libavif's exactly (lossless gain maps,
+    // 4:0:0 from colour).
+    private static void RgbToYuvAvifFloat(double[] r, double[] g, double[] b, int w, int h, int bd, Av1.Av1PixelLayout layout,
+        Av1.Av1ObuWriter.Av1ColorDesc color, out ushort[] y, out ushort[] u, out ushort[] v, int srcDepth = 16)
+    {
+        int max = (1 << bd) - 1;
+        int srcMax = (1 << Math.Clamp(srcDepth, 1, 16)) - 1;
+        float srcMaxF = srcMax;
+        float Src(double x)
+        {
+            int u16 = (int)Math.Round(x * 65535.0 / max);
+            int q = srcMax == 65535 ? u16 : (int)((u16 * (long)srcMax + 32767) / 65535);
+            return q / srcMaxF;
+        }
         bool full = color.FullRange;
         float biasY = full ? 0.0f : 16 << (bd - 8), rangeY = full ? max : 219 << (bd - 8);
         float biasUV = 1 << (bd - 1), rangeUV = full ? max : 224 << (bd - 8);
@@ -1424,7 +1494,7 @@ public static partial class HeifCoder
                     for (int bi = 0; bi < bw; bi++)
                     {
                         int i = (oj + bj) * w + oi + bi;
-                        float R = (int)Math.Round(r[i]) / maxF, G = (int)Math.Round(g[i]) / maxF, B = (int)Math.Round(b[i]) / maxF;
+                        float R = Src(r[i]), G = Src(g[i]), B = Src(b[i]);
                         float Y, U, V;
                         if (identity) { Y = G; U = B; V = R; }
                         else

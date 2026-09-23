@@ -620,6 +620,19 @@ internal static class Av1StillImageEncoder
         return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: false, bitDepth, layout, color, extras);
     }
 
+    /// <summary>Monochrome (4:0:0) colour + alpha: both items coded as monochrome AV1 at the same depth; the colour item
+    /// carries the colour description, the alpha item none (always full range).</summary>
+    internal static byte[] EncodeAvifMonochromeWithAlpha(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> alpha, int width, int height,
+        int baseQIdx, int alphaQIdx, int bitDepth, Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
+    {
+        (byte[] cSeq, byte[] cFrame) = BuildMonochromeObus(luma, width, height, baseQIdx, bitDepth, color);
+        byte[] aSeq, aFrame;
+        using (new Av1ObuWriter.SuppressFilmGrain(true))   // grain is signalled on the colour item only
+            (aSeq, aFrame) = BuildMonochromeObus(alpha, width, height, alphaQIdx, bitDepth);
+        return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: true, bitDepth,
+            Av1PixelLayout.I400, color, extras);
+    }
+
     /// <summary>One layer of a layered (progressive) still image: planes at the layer's size and its quantizers.</summary>
     internal readonly record struct LayerInput(ushort[] Y, ushort[]? U, ushort[]? V, ushort[]? Alpha, int Width, int Height,
         int QIdx, int AlphaQIdx);
