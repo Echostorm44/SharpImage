@@ -212,6 +212,10 @@ public sealed class AvifEncodeOptions
     /// <see cref="Grid"/>.</summary>
     public IList<AvifLayer>? Layers { get; set; }
 
+    /// <summary>Sharp RGB -> YUV 4:2:0 (avifenc --sharpyuv, libsharpyuv): chroma and luma refined together in linear light
+    /// so upsampled colour edges stay crisp. Applies to 4:2:0 with the kr/kb matrices; ignored otherwise.</summary>
+    public bool SharpYuv { get; set; }
+
     internal AvifEncodeOptions Clone() => (AvifEncodeOptions)MemberwiseClone();
 }
 
@@ -1188,11 +1192,11 @@ public static partial class HeifCoder
         var (qIdx, aQIdx, qualityLossless) = QualityQIndices(options, color);
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
                && options.FilmGrain == null && !denoise && !options.Progressive && !forceColor && !forceAlpha && qIdx == null && aQIdx == null
-               && !qualityLossless
+               && !qualityLossless && !options.SharpYuv
             ? EncodeAvif8(image, options.Qp, color, extras)
             : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless || qualityLossless, grain,
                 options.Progressive && image.Columns >= 16 && image.Rows >= 16,   // a sub-8px base layer is pointless
-                forceColor: forceColor, forceAlpha: forceAlpha, qIdxOverride: qIdx, alphaQIdxOverride: aQIdx);
+                forceColor: forceColor, forceAlpha: forceAlpha, qIdxOverride: qIdx, alphaQIdxOverride: aQIdx, sharpYuv: options.SharpYuv);
     }
 
     /// <summary>
@@ -1506,7 +1510,7 @@ public static partial class HeifCoder
     private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout,
         Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras, bool lossless = false, AvifGrainRequest? request = null,
         bool progressive = false, (int W, int H)? scaleYuvTo = null, bool libavifFloatYuv = false, bool forceColor = false,
-        bool forceAlpha = false, int? qIdxOverride = null, int? alphaQIdxOverride = null)
+        bool forceAlpha = false, int? qIdxOverride = null, int? alphaQIdxOverride = null, bool sharpYuv = false)
     {
         // Film grain rides on the colour stream only: the ambient scope is read by the colour builders' headers and
         // suppressed around the alpha builds. Denoising (libaom aom_denoise_and_model_run) replaces the colour planes
@@ -1589,7 +1593,9 @@ public static partial class HeifCoder
         if (hasAlpha && nonOpaque && alpha != null)
         {
             int alphaQIdx = alphaQIdxOverride ?? Math.Clamp(baseQIdx / 2, 4, 255);
-            RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yA, out ushort[] uA0, out ushort[] vA0);
+            ushort[] yA, uA0, vA0;
+            if (!(sharpYuv && TrySharpYuv(image, r, g, b, w, h, bd, layout, color, out yA, out uA0, out vA0)))
+                RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out yA, out uA0, out vA0);
             ushort[]? uA = uA0, vA = vA0;
             Denoise(ref yA, ref uA, ref vA, gssX, gssY);
             if (lossless)
@@ -1607,7 +1613,8 @@ public static partial class HeifCoder
         if (!forceMono && (colour || (!lossless && color.Matrix is 0 or 16 or 17)))
         {
             ushort[] yP, uP0, vP0;
-            if (libavifFloatYuv && color.Matrix is not (8 or 16 or 17))
+            if (sharpYuv && TrySharpYuv(image, r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0)) { }
+            else if (libavifFloatYuv && color.Matrix is not (8 or 16 or 17))
                 RgbToYuvAvifFloat(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0, image.Depth is >= 1 and <= 16 ? image.Depth : 16);
             else
                 RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0);
@@ -1715,6 +1722,41 @@ public static partial class HeifCoder
         }
         RgbToYuvAvifFloat(r, g, b, w, h, bd, Av1.Av1PixelLayout.I444, color, out var yf, out _, out _, srcDepth);
         return yf;
+    }
+
+    // avifenc --sharpyuv: libsharpyuv for 4:2:0 with kr/kb coefficients, fed the RGB at the source's depth (8-bit when
+    // every sample is 8-bit representable, as avifenc reads such a PNG; else the frame's depth, 16 when unknown).
+    private static bool TrySharpYuv(ImageFrame image, double[] r, double[] g, double[] b, int w, int h, int bd, Av1.Av1PixelLayout layout,
+        Av1.Av1ObuWriter.Av1ColorDesc color, out ushort[] y, out ushort[] u, out ushort[] v)
+    {
+        y = u = v = [];
+        if (layout != Av1.Av1PixelLayout.I420 || color.Matrix is 0 or 8 or 16 or 17) return false;
+        int max = (1 << bd) - 1;
+        var r16 = new ushort[r.Length];
+        var g16 = new ushort[r.Length];
+        var b16 = new ushort[r.Length];
+        bool eightBit = true;
+        for (int i = 0; i < r.Length; i++)
+        {
+            r16[i] = (ushort)Math.Round(r[i] * 65535.0 / max);
+            g16[i] = (ushort)Math.Round(g[i] * 65535.0 / max);
+            b16[i] = (ushort)Math.Round(b[i] * 65535.0 / max);
+            eightBit &= r16[i] % 257 == 0 && g16[i] % 257 == 0 && b16[i] % 257 == 0;
+        }
+        int srcDepth = image.Depth is 8 or 10 or 12 ? image.Depth : eightBit ? 8 : 16;
+        if (srcDepth < 16)
+        {
+            uint smax = (1u << srcDepth) - 1;
+            for (int i = 0; i < r16.Length; i++)
+            {
+                r16[i] = (ushort)((r16[i] * smax + 32767) / 65535);
+                g16[i] = (ushort)((g16[i] * smax + 32767) / 65535);
+                b16[i] = (ushort)((b16[i] * smax + 32767) / 65535);
+            }
+        }
+        (float kr, float kb) = color.Matrix == 12 ? ChromaDerivedKrKb(color.Primaries) : MatrixKrKb(color.Matrix);
+        SharpImage.Formats.SharpYuv.Convert(r16, g16, b16, w, h, srcDepth, bd, kr, kb, color.FullRange, color.Transfer, out y, out u, out v);
+        return true;
     }
 
     // Grey source -> 4:0:0 luma (Y = the grey value; limited range maps it into [16, 235] << (bd - 8)).

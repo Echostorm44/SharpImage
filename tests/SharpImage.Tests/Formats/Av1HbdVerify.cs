@@ -1009,6 +1009,7 @@ public sealed class Av1HbdVerify
                         case "quality": o.Quality = int.Parse(t[1]); break;
                         case "qalpha": o.QualityAlpha = int.Parse(t[1]); break;
                         case "target": o.TargetSize = int.Parse(t[1]); break;
+                        case "sharp": o.SharpYuv = true; break;
                         case "layers":
                             o.Layers = t[1].Split(',').Select(spec =>
                             {
