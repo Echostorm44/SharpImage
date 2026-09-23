@@ -620,6 +620,60 @@ internal static class Av1StillImageEncoder
         return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: false, bitDepth, layout, color, extras);
     }
 
+    /// <summary>One layer of a layered (progressive) still image: planes at the layer's size and its quantizers.</summary>
+    internal readonly record struct LayerInput(ushort[] Y, ushort[]? U, ushort[]? V, ushort[]? Alpha, int Width, int Height,
+        int QIdx, int AlphaQIdx);
+
+    /// <summary>
+    /// Layered AVIF (avifenc --progressive / --layered): each layer is coded as its own frame (a key frame for the base,
+    /// intra-only frames above it) in one temporal unit with spatial-id extensions; the item's payload concatenates them
+    /// and 'a1lx' records the per-layer sizes. Alpha, when present, is layered the same way.
+    /// </summary>
+    internal static byte[] EncodeAvifLayered(IReadOnlyList<LayerInput> layers, bool monochrome, int bitDepth,
+        Av1PixelLayout layout, Av1ObuWriter.Av1ColorDesc? color, AvifContainerExtras? extras)
+    {
+        var ls = new Av1ObuWriter.LayeredStream
+        {
+            Layers = layers.Count, MaxWidth = layers[^1].Width, MaxHeight = layers[^1].Height,
+            Widths = layers.Select(l => l.Width).ToArray(), Heights = layers.Select(l => l.Height).ToArray(),
+        };
+        (byte[] Data, long[] Sizes) Build(bool alpha)
+        {
+            byte[]? seq = null;
+            var frames = new List<byte[]>();
+            using (Av1ObuWriter.UseLayers(ls))
+            using (new Av1ObuWriter.SuppressFilmGrain(alpha))
+            {
+                for (int i = 0; i < layers.Count; i++)
+                {
+                    ls.Current = i;
+                    var l = layers[i];
+                    var (s, f) = alpha ? BuildMonochromeObus(l.Alpha!, l.Width, l.Height, l.AlphaQIdx, bitDepth)
+                        : monochrome ? BuildMonochromeObus(l.Y, l.Width, l.Height, l.QIdx, bitDepth, color)
+                        : BuildColorObus(l.Y, l.U!, l.V!, l.Width, l.Height, l.QIdx, bitDepth, layout, color);
+                    seq ??= s;
+                    frames.Add(f);
+                }
+            }
+            var sizes = new long[layers.Count];
+            sizes[0] = seq!.Length + frames[0].Length;
+            for (int i = 1; i < frames.Count; i++) sizes[i] = frames[i].Length;
+            var data = new byte[sizes.Sum()];
+            int o = 0;
+            foreach (var part in new[] { seq }.Concat(frames)) { part.CopyTo(data, o); o += part.Length; }
+            return (data, sizes);
+        }
+
+        extras ??= new AvifContainerExtras();
+        var (cData, cSizes) = Build(false);
+        extras.ColorLayerSizes = cSizes;
+        if (layers[0].Alpha == null)
+            return Av1AvifWriter.BuildAvif(cData, [], ls.MaxWidth, ls.MaxHeight, monochrome, bitDepth, layout, color, extras);
+        var (aData, aSizes) = Build(true);
+        extras.AlphaLayerSizes = aSizes;
+        return Av1AvifWriter.BuildAvifWithAlpha(cData, [], aData, [], ls.MaxWidth, ls.MaxHeight, monochrome, bitDepth, layout, color, extras);
+    }
+
     // Per-superblock recursive-partition state for I420 colour. Extends the grayscale scheme with two chroma
     // planes (half resolution): chroma follows the luma partition tree, each leaf coding U/V at half the luma
     // block size (down to 4x4 chroma for an 8x8 luma leaf).

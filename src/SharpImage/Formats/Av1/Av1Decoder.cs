@@ -1507,7 +1507,9 @@ internal sealed class Av1Decoder
                                 int yOff = py * yStride + px;
                                 PrepareCdefLeft(leftBuf, yBak, yOff, yStride, 8, blockEdges);
                                 int topOff = py >= 2 ? (py - 2) * yStride + px : yOff;
-                                int botOff = py + 8 < frameHeight ? (py + 8) * yStride + px : yOff + 7 * yStride;
+                                // dav1d reads the two rows below whenever CDEF_HAVE_BOTTOM is set: they are reconstructed
+                                // (blocks cover the MI grid) even past the displayed height.
+                                int botOff = (blockEdges & Av1Cdef.EdgeFlags.Bottom) != 0 ? (py + 8) * yStride + px : yOff + 7 * yStride;
                                 int lumaDir = yPriLvl != 0 ? dir : 0;
 
                                 Av1Cdef.FilterBlock(
@@ -1539,7 +1541,7 @@ internal sealed class Av1Decoder
                                 int uvOff = cpy * uvStride + cpx;
                                 PrepareCdefLeft(leftBuf, uvSrc, uvOff, uvStride, chH, blockEdges);
                                 int topOff = cpy >= 2 ? (cpy - 2) * uvStride + cpx : uvOff;
-                                int botOff = cpy + chH < chromaHeight ?
+                                int botOff = (blockEdges & Av1Cdef.EdgeFlags.Bottom) != 0 ?
                                     (cpy + chH) * uvStride + cpx : uvOff + (chH - 1) * uvStride;
 
                                 Av1Cdef.FilterBlock(

@@ -47,6 +47,12 @@ public sealed class Av1ConformanceDecodeTests
     [Arguments("libavif_prog_12_420_odd.avif", 257, 131, "b415524172d7eeaf5fe3f4b7bb687b11")]
     [Arguments("libavif_prog_8_420_alpha.avif", 161, 97, "7ddeeb444b0ef83681bd4b24abb3d4cc")]
     [Arguments("libavif_layered3_8_444.avif", 300, 200, "be1a3510a9a06d261282eb6f2590a969")]
+    // Our own progressive encodes (key-frame base layer + intra-only full layer), and a height-97 (8k+1) 4:2:0 image
+    // whose second-to-last chroma block row reads the reconstructed rows below the display for CDEF.
+    [Arguments("sharpimage_prog_8_420.avif", 384, 256, "50e8977cdbe26cbb0683c558ceddbbde")]
+    [Arguments("sharpimage_prog_10_444_odd.avif", 257, 131, "342bd08c58216304fbe65bf69c2feb54")]
+    [Arguments("sharpimage_prog_8_420_alpha.avif", 161, 97, "8d9d24ca19086ab86792e77ac7215ba6")]
+    [Arguments("sharpimage_8bit_420_161x97_alpha.avif", 161, 97, "32a58361083b576d7948347201e211e6")]
     public async Task DecodesByteExactVsDav1d(string file, int w, int h, string md5)
     {
         byte[] item = PrimaryItemData(File.ReadAllBytes(Asset(file)));

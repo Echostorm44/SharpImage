@@ -23,6 +23,8 @@ internal sealed class AvifContainerExtras
     public (ushort MaxCll, ushort MaxPall)? Clli;
     public byte[]? Mdcv;                     // mdcv payload (24 bytes: display primaries, white point, max/min luminance)
     public bool Premultiplied;               // colour is premultiplied by alpha: iref 'prem' colour -> alpha
+    public long[]? ColorLayerSizes;          // layered (progressive) colour item: byte size of each layer -> 'a1lx'
+    public long[]? AlphaLayerSizes;          // layered alpha item
 
     internal bool HasItems => Exif != null || Xmp != null;
 }
@@ -102,6 +104,22 @@ internal static class Av1AvifWriter
     // One container builder for every layout. Item IDs: 1 = colour (primary), 2 = alpha (if any), then Exif, XMP.
     // Property order: ispe, pixi, av1C, [colr prof], colr nclx, [pasp, clli, mdcv, clap, irot, imir], then the alpha
     // item's av1C / auxC / pixi. With no extras this reproduces the original single/2-item byte layout exactly.
+    // AV1LayeredImageIndexingProperty: the sizes of all layers but the last (libavif writes it non-essential and, like
+    // it, no 'lsel', so the default presentation is the full image and progressive readers get every layer).
+    private static byte[] A1lx(long[] sizes)
+    {
+        bool large = false;
+        for (int i = 0; i < sizes.Length - 1; i++) large |= sizes[i] > 0xFFFF;
+        var b = new List<byte> { (byte)(large ? 1 : 0) };
+        for (int i = 0; i < 3; i++)
+        {
+            long s = i < sizes.Length - 1 ? sizes[i] : 0;
+            if (large) b.AddRange(U32((uint)s));
+            else b.AddRange(U16((ushort)s));
+        }
+        return Box("a1lx", b.ToArray());
+    }
+
     private static byte[] BuildContainer(byte[] colorData, byte[]? alphaData, int width, int height, int bitDepth,
         Av1PixelLayout layout, Av1ObuWriter.Av1ColorDesc? color, AvifContainerExtras? x)
     {
@@ -124,6 +142,7 @@ internal static class Av1AvifWriter
         if (x?.Pasp is { } pasp) assoc1.Add((Add(Box("pasp", Concat(U32(pasp.H), U32(pasp.V)))), false));
         if (x?.Clli is { } clli) assoc1.Add((Add(Box("clli", Concat(U16(clli.MaxCll), U16(clli.MaxPall)))), false));
         if (x?.Mdcv is { Length: 24 } mdcv) assoc1.Add((Add(Box("mdcv", mdcv)), false));
+        if (x?.ColorLayerSizes is { Length: > 1 } cls) assoc1.Add((Add(A1lx(cls)), false));
         var transforms = new List<(int Index, bool Essential)>();   // shared with the alpha item (libavif >= 1.3)
         if (x?.Clap is { Length: 8 } clap)
         {
@@ -144,6 +163,7 @@ internal static class Av1AvifWriter
             byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
             assoc2.Add((Add(FullBox("auxC", 0, 0, auxUrn)), true));
             assoc2.Add((Add(FullBox("pixi", 0, 0, new byte[] { 1, (byte)bitDepth })), false));
+            if (x?.AlphaLayerSizes is { Length: > 1 } als) assoc2.Add((Add(A1lx(als)), false));
             assoc2.AddRange(transforms);   // the alpha plane is transformed exactly like the colour image
         }
 

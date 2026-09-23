@@ -33,12 +33,14 @@ internal static class Av1ObuWriter
         public readonly Av1PixelLayout Layout; // chroma layout of a colour stream (ignored when Monochrome)
         public readonly Av1ColorDesc Color;
         public readonly Av1FilmGrainData? FilmGrain;   // the ambient film grain when this stream was configured
+        public readonly LayeredStream? Layered;        // the ambient layered (progressive) stream, if any
 
         public SeqConfig(int width, int height, bool monochrome, bool enableFilterIntra = false, int bitDepth = 8,
             Av1PixelLayout layout = Av1PixelLayout.I420, Av1ColorDesc? color = null)
         {
             Color = color ?? Av1ColorDesc.Legacy;
             FilmGrain = ActiveFilmGrain;
+            Layered = t_layered;
             Width = width;
             Height = height;
             Monochrome = monochrome;
@@ -129,9 +131,115 @@ internal static class Av1ObuWriter
         w.PutBool(fg.ClipToRestrictedRange != 0);
     }
 
+    /// <summary>
+    /// A spatially layered still image (progressive AVIF, as avifenc --progressive / --layered): one key frame (layer 0)
+    /// then an intra-only frame per further layer, all shown in one temporal unit with OBU extension spatial ids and one
+    /// operating point per decodable prefix of layers. While the scope is active the writers emit the non-reduced
+    /// sequence header, explicit per-layer frame sizes and extension headers for <see cref="Current"/>.
+    /// </summary>
+    internal sealed class LayeredStream
+    {
+        public int Layers, MaxWidth, MaxHeight, Current;
+        public int[] Widths = [], Heights = [];
+    }
+
+    [ThreadStatic] private static LayeredStream? t_layered;
+
+    internal readonly struct LayeredScope : IDisposable
+    {
+        private readonly LayeredStream? prev;
+        public LayeredScope(LayeredStream? s) { prev = t_layered; t_layered = s; }
+        public void Dispose() => t_layered = prev;
+    }
+
+    internal static LayeredScope UseLayers(LayeredStream? s) => new(s);
+
+    // Non-reduced sequence header for a layered stream (spec 5.5): no timing info, one operating point per prefix of
+    // spatial layers (op 0 = all), explicit max frame size, order hints off (intra frames only), screen-content tools
+    // and integer MV "select" (as the reduced header implies, so frame headers code the same fields).
+    private static void WriteLayeredSequenceStart(Av1BitWriter w, in SeqConfig cfg, LayeredStream ls, int seqProfile)
+    {
+        w.PutBits((uint)seqProfile, 3);
+        w.PutBool(false);         // still_picture = 0 (several frames)
+        w.PutBool(false);         // reduced_still_picture_header = 0
+        w.PutBool(false);         // timing_info_present_flag
+        w.PutBool(false);         // initial_display_delay_present_flag
+        w.PutBits((uint)(ls.Layers - 1), 5);   // operating_points_cnt_minus_1
+        for (int op = 0; op < ls.Layers; op++)
+        {
+            int top = ls.Layers - 1 - op;     // highest spatial layer of this operating point
+            uint idc = (uint)((((1 << (top + 1)) - 1) << 8) | 1);
+            w.PutBits(idc, 12);               // operating_point_idc
+            int level = SeqLevelIdx(ls.Widths[top], ls.Heights[top]);
+            w.PutBits((uint)level, 5);        // seq_level_idx
+            if (level > 7) w.PutBool(false);  // seq_tier
+        }
+        int widthBits = BitsFor(ls.MaxWidth - 1), heightBits = BitsFor(ls.MaxHeight - 1);
+        w.PutBits((uint)(widthBits - 1), 4);
+        w.PutBits((uint)(heightBits - 1), 4);
+        w.PutBits((uint)(ls.MaxWidth - 1), widthBits);
+        w.PutBits((uint)(ls.MaxHeight - 1), heightBits);
+        w.PutBool(false);         // frame_id_numbers_present_flag
+        w.PutBool(false);         // use_128x128_superblock
+        w.PutBool(cfg.EnableFilterIntra);
+        w.PutBool(Av1StillImageEncoder.UseIntraEdgeFilter);
+        w.PutBool(false);         // enable_interintra_compound
+        w.PutBool(false);         // enable_masked_compound
+        w.PutBool(false);         // enable_warped_motion
+        w.PutBool(false);         // enable_dual_filter
+        w.PutBool(false);         // enable_order_hint
+        w.PutBool(true);          // seq_choose_screen_content_tools (SELECT)
+        w.PutBool(true);          // seq_choose_integer_mv (SELECT)
+    }
+
+    // uncompressed_header() fields a reduced still picture implies, for layer ls.Current: a key frame for the base
+    // layer, intra-only frames above it; every frame shown and explicitly sized (render size = the full image).
+    private static void WriteLayeredFramePrefix(Av1BitWriter w, LayeredStream ls, bool screenContentTools)
+    {
+        bool key = ls.Current == 0;
+        w.PutBool(false);                      // show_existing_frame
+        w.PutBits(key ? 0u : 2u, 2);           // frame_type: KEY_FRAME / INTRA_ONLY_FRAME
+        w.PutBool(true);                       // show_frame
+        if (!key) w.PutBool(false);            // error_resilient_mode (implied 1 for a shown key frame)
+        w.PutBool(false);                      // disable_cdf_update
+        w.PutBool(screenContentTools);         // allow_screen_content_tools (SELECT)
+        if (screenContentTools) w.PutBool(false);   // force_integer_mv (SELECT; intra overrides it to 1)
+        w.PutBool(true);                       // frame_size_override_flag
+        // order_hint: 0 bits; primary_ref_frame: none (intra).
+        if (!key) w.PutBits(1u << ls.Current, 8);   // refresh_frame_flags (a key frame refreshes all)
+        int fw = ls.Widths[ls.Current], fh = ls.Heights[ls.Current];
+        w.PutBits((uint)(fw - 1), BitsFor(ls.MaxWidth - 1));    // frame_width_minus_1
+        w.PutBits((uint)(fh - 1), BitsFor(ls.MaxHeight - 1));   // frame_height_minus_1
+        bool renderDiff = fw != ls.MaxWidth || fh != ls.MaxHeight;
+        w.PutBool(renderDiff);                 // render_and_frame_size_different
+        if (renderDiff)
+        {
+            w.PutBits((uint)(ls.MaxWidth - 1), 16);
+            w.PutBits((uint)(ls.MaxHeight - 1), 16);
+        }
+        if (screenContentTools) w.PutBool(false);   // allow_intrabc
+        w.PutBool(true);                       // disable_frame_end_update_cdf (coded when not reduced)
+    }
+
+    /// <summary>Wraps a payload in an OBU with an extension header (temporal_id, spatial_id).</summary>
+    internal static byte[] WrapObuExtension(Av1ObuType type, ReadOnlySpan<byte> payload, int temporalId, int spatialId)
+    {
+        var sizeWriter = new Av1BitWriter();
+        sizeWriter.PutUleb128((uint)payload.Length);
+        byte[] sizeBytes = sizeWriter.ToArray();
+        var outBytes = new byte[2 + sizeBytes.Length + payload.Length];
+        outBytes[0] = (byte)(((int)type << 3) | 0b110);                   // extension + has_size
+        outBytes[1] = (byte)((temporalId << 5) | ((spatialId & 3) << 3));  // temporal_id(3) spatial_id(2) reserved(3)
+        sizeBytes.CopyTo(outBytes, 2);
+        payload.CopyTo(outBytes.AsSpan(2 + sizeBytes.Length));
+        return outBytes;
+    }
+
     /// <summary>Wraps a payload in an OBU: header byte + leb128 size + payload. No extension header.</summary>
     internal static byte[] WrapObu(Av1ObuType type, ReadOnlySpan<byte> payload)
     {
+        if (t_layered is { } ls && type is Av1ObuType.Frame or Av1ObuType.FrameHeader or Av1ObuType.TileGroup)
+            return WrapObuExtension(type, payload, 0, ls.Current);
         // forbidden(0) | type(4) | extension(0) | has_size(1) | reserved(0)
         byte hdr = (byte)(((int)type << 3) | 0b10);
         var sizeWriter = new Av1BitWriter();
@@ -228,6 +336,11 @@ internal static class Av1ObuWriter
 
         // seq_profile: 0 (Main) covers 8/10-bit 4:2:0 + mono; 12-bit needs 2 (Professional).
         int seqProfile = SeqProfile(cfg);
+        if (cfg.Layered is { } layered)
+        {
+            WriteLayeredSequenceStart(w, cfg, layered, seqProfile);
+            goto afterTools;
+        }
         w.PutBits((uint)seqProfile, 3);
         w.PutBool(true);          // still_picture = 1
         w.PutBool(true);          // reduced_still_picture_header = 1
@@ -250,6 +363,7 @@ internal static class Av1ObuWriter
         w.PutBool(Av1StillImageEncoder.UseIntraEdgeFilter);  // enable_intra_edge_filter
 
         // reduced still → inter tools block skipped; screen_content_tools/force_integer_mv default Adaptive.
+    afterTools:
         w.PutBool(false);         // enable_superres = 0
         w.PutBool(true);          // enable_cdef = 1 (frame header carries cdef_params; strengths may be 0 = no-op)
         w.PutBool(false);         // enable_restoration = 0
@@ -351,6 +465,12 @@ internal static class Av1ObuWriter
 
         var w = new Av1BitWriter();
 
+        if (t_layered is { } layered)
+        {
+            WriteLayeredFramePrefix(w, layered, screenContentTools);
+            goto tileInfo;
+        }
+
         // reduced_still_picture_header ⇒ show_existing_frame / frame_type / show_frame / error_resilient are all
         // implied; nothing is written until here.
         w.PutBool(false);         // disable_cdf_update = 0 (adaptive CDFs; disable_frame_end_update_cdf inferred 1 in reduced still picture)
@@ -368,6 +488,7 @@ internal static class Av1ObuWriter
             w.PutBool(false);     // allow_intra_bc = 0 (read for intra when screen tools on & !superres)
         // refresh_context skipped (reduced still).
 
+    tileInfo:
         // tile_info (uniform spacing): the log2 tile counts start at the syntax minima (TileLayout) and the loop reads
         // an "increment" bit while below the maximum — one 0 bit per axis stops exactly at the minimum. Frames over
         // 4096 px wide or 2304 superblocks therefore always carry the multiple tiles the decoder will expect.

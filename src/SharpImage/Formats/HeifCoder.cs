@@ -121,6 +121,12 @@ public sealed class AvifEncodeOptions
     /// <summary>Encode the denoised planes (--enable-dnl-denoising, default on). Off keeps the source planes but still
     /// signals the estimated grain.</summary>
     public bool DenoiseApply { get; set; } = true;
+
+    /// <summary>Progressive (layered) AVIF, as avifenc --progressive: a half-size, low-quality base layer (quality 10)
+    /// followed by the full image at <see cref="Qp"/>, in one item with an 'a1lx' layer index. Progressive readers
+    /// (<see cref="HeifCoder.DecodeProgressive"/>, libavif allowProgressive) can show the preview first; every other
+    /// reader decodes the full image. Not available with <see cref="Lossless"/>.</summary>
+    public bool Progressive { get; set; }
 }
 
 /// <summary>Film grain for one AVIF encode: explicit parameters, or denoise-and-estimate (Level &lt; 0 = all-intra estimate).</summary>
@@ -731,14 +737,17 @@ public static class HeifCoder
             throw new ArgumentException("Film grain / denoising cannot be combined with lossless coding.", nameof(options));
         if (options.FilmGrain != null && denoise)
             throw new ArgumentException("Set either FilmGrain or DenoiseNoiseLevel, not both.", nameof(options));
+        if (options.Progressive && options.Lossless)
+            throw new ArgumentException("Progressive (layered) encoding cannot be combined with lossless coding.", nameof(options));
         if (denoise && options.DenoiseBlockSize is not (8 or 16 or 32))
             throw new ArgumentOutOfRangeException(nameof(options), "DenoiseBlockSize must be 8, 16 or 32.");
         var grain = new AvifGrainRequest(options.FilmGrain, denoise, options.DenoiseUseRequestedLevel ? options.DenoiseNoiseLevel / 10.0f : -1,
             options.DenoiseBlockSize, options.DenoiseApply);
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
-               && options.FilmGrain == null && !denoise
+               && options.FilmGrain == null && !denoise && !options.Progressive
             ? EncodeAvif8(image, options.Qp, color, extras)
-            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless, grain);
+            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless, grain,
+                options.Progressive && image.Columns >= 16 && image.Rows >= 16);   // a sub-8px base layer is pointless
     }
 
     // Container content carried over from the image: the ICC profile (colr 'prof'), Exif (as raw TIFF, the
@@ -859,7 +868,8 @@ public static class HeifCoder
     // full precision and coded through the multi-superblock encoder (which handles every size 8..4096). The 8-bit
     // 4:2:0 case keeps its original byte path (EncodeAvif8) so its output is unchanged.
     private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout,
-        Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras, bool lossless = false, AvifGrainRequest? request = null)
+        Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras, bool lossless = false, AvifGrainRequest? request = null,
+        bool progressive = false)
     {
         // Film grain rides on the colour stream only: the ambient scope is read by the colour builders' headers and
         // suppressed around the alpha builds. Denoising (libaom aom_denoise_and_model_run) replaces the colour planes
@@ -940,7 +950,10 @@ public static class HeifCoder
             if (lossless)
                 return Av1.Av1StillImageEncoder.EncodeAvifLossless(yA, uA!, vA!, false, alpha, true, w, h, bd, layout, color, extras);
             using (Grain(false))
-                return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA!, vA!, alpha, w, h, baseQIdx, alphaQIdx, bd, layout, color, extras);
+                return progressive
+                    ? Av1.Av1StillImageEncoder.EncodeAvifLayered(ProgressiveLayers(yA, uA, vA, alpha, w, h, gssX, gssY, baseQIdx, alphaQIdx),
+                        false, bd, layout, color, extras)
+                    : Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA!, vA!, alpha, w, h, baseQIdx, alphaQIdx, bd, layout, color, extras);
         }
 
         // Identity / YCgCo-R carry exact RGB, so lossy grey content keeps the colour (4:4:4) path; lossless grey is
@@ -953,7 +966,10 @@ public static class HeifCoder
             if (lossless)
                 return Av1.Av1StillImageEncoder.EncodeAvifLossless(yP, uP!, vP!, false, default, false, w, h, bd, layout, color, extras);
             using (Grain(false))
-                return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP!, vP!, w, h, baseQIdx, bd, layout, color, extras);
+                return progressive
+                    ? Av1.Av1StillImageEncoder.EncodeAvifLayered(ProgressiveLayers(yP, uP, vP, null, w, h, gssX, gssY, baseQIdx, 0),
+                        false, bd, layout, color, extras)
+                    : Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP!, vP!, w, h, baseQIdx, bd, layout, color, extras);
         }
 
         // Grey: 4:0:0 luma (Y = the grey value; limited range maps it into [16, 235] << (bd - 8)).
@@ -967,7 +983,57 @@ public static class HeifCoder
         ushort[]? noU = null, noV = null;
         Denoise(ref luma, ref noU, ref noV, 1, 1);
         using (Grain(true))
-            return Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx, bd, color, extras);
+            return progressive
+                ? Av1.Av1StillImageEncoder.EncodeAvifLayered(ProgressiveLayers(luma, null, null, null, w, h, 1, 1, baseQIdx, 0),
+                    true, bd, Av1.Av1PixelLayout.I400, color, extras)
+                : Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx, bd, color, extras);
+    }
+
+    // avifenc --progressive: layer 0 = the image scaled by 1/2 (ceil, like libaom's AOME_ONETWO scale mode) at quality
+    // 10 (libavif quantizer 57 -> aom qindex 228), alpha at its own quality; layer 1 = the full image. The base layer is
+    // area-averaged per plane (encoder-side, non-normative, as libaom's resizer is).
+    private static List<Av1.Av1StillImageEncoder.LayerInput> ProgressiveLayers(ushort[] y, ushort[]? u, ushort[]? v,
+        ushort[]? alpha, int w, int h, int ssX, int ssY, int qIdx, int alphaQIdx)
+    {
+        const int baseQIdx = 228;
+        int w0 = (w + 1) / 2, h0 = (h + 1) / 2;
+        int cw = (w + ssX) >> ssX, ch = (h + ssY) >> ssY, cw0 = (w0 + ssX) >> ssX, ch0 = (h0 + ssY) >> ssY;
+        var layer0 = new Av1.Av1StillImageEncoder.LayerInput(
+            AreaScale(y, w, h, w0, h0),
+            u == null ? null : AreaScale(u, cw, ch, cw0, ch0),
+            v == null ? null : AreaScale(v, cw, ch, cw0, ch0),
+            alpha == null ? null : AreaScale(alpha, w, h, w0, h0),
+            w0, h0, Math.Max(qIdx, baseQIdx), alphaQIdx);
+        var layer1 = new Av1.Av1StillImageEncoder.LayerInput(y, u, v, alpha, w, h, qIdx, alphaQIdx);
+        return [layer0, layer1];
+    }
+
+    // Area-average resampling of one plane (each output sample is the coverage-weighted mean of the source samples
+    // under it), rounded to the nearest code.
+    private static ushort[] AreaScale(ushort[] src, int sw, int sh, int dw, int dh)
+    {
+        var dst = new ushort[dw * dh];
+        double fx = (double)sw / dw, fy = (double)sh / dh;
+        for (int j = 0; j < dh; j++)
+        {
+            double y0 = j * fy, y1 = y0 + fy;
+            for (int i = 0; i < dw; i++)
+            {
+                double x0 = i * fx, x1 = x0 + fx, sum = 0, wsum = 0;
+                for (int sy = (int)y0; sy < Math.Min(sh, (int)Math.Ceiling(y1)); sy++)
+                {
+                    double wy = Math.Min(sy + 1, y1) - Math.Max(sy, y0);
+                    for (int sx = (int)x0; sx < Math.Min(sw, (int)Math.Ceiling(x1)); sx++)
+                    {
+                        double wgt = wy * (Math.Min(sx + 1, x1) - Math.Max(sx, x0));
+                        sum += src[sy * sw + sx] * wgt;
+                        wsum += wgt;
+                    }
+                }
+                dst[j * dw + i] = (ushort)Math.Round(sum / wsum);
+            }
+        }
+        return dst;
     }
 
     // RGB -> Y'CbCr for AVIF at any depth / layout / CICP matrix / range, following libavif's avifImageRGBToYUV:
@@ -1661,8 +1727,11 @@ public static class HeifCoder
             return a;
         }
         var y = LibyuvScale.ScalePlane(Src(f.YPlane, f.YPlane16, f.YStride, f.Width, f.Height), f.YStride, f.Width, f.Height, w, h, hbd);
-        var u = LibyuvScale.ScalePlane(Src(f.UPlane, f.UPlane16, f.UStride, scw, sch), f.UStride, scw, sch, dcw, dch, hbd);
-        var v = LibyuvScale.ScalePlane(Src(f.VPlane, f.VPlane16, f.VStride, scw, sch), f.VStride, scw, sch, dcw, dch, hbd);
+        // Monochrome (e.g. alpha) frames carry no native chroma: keep them neutral at the new size.
+        bool mono = hbd && f.UPlane16.IsEmpty;
+        ushort[] Neutral() { var n = new ushort[dcw * dch]; Array.Fill(n, (ushort)(1 << (f.BitDepth - 1))); return n; }
+        var u = mono ? Neutral() : LibyuvScale.ScalePlane(Src(f.UPlane, f.UPlane16, f.UStride, scw, sch), f.UStride, scw, sch, dcw, dch, hbd);
+        var v = mono ? Neutral() : LibyuvScale.ScalePlane(Src(f.VPlane, f.VPlane16, f.VStride, scw, sch), f.VStride, scw, sch, dcw, dch, hbd);
         int ySize = w * h, cSize = dcw * dch;
         byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(ySize + 2 * cSize);
         int bdShift = f.BitDepth - 8, bdRound = bdShift > 0 ? 1 << (bdShift - 1) : 0;
@@ -1674,8 +1743,11 @@ public static class HeifCoder
             var native = new ushort[ySize + 2 * cSize];
             y.CopyTo(native, 0); u.CopyTo(native, ySize); v.CopyTo(native, ySize + cSize);
             y16 = new ReadOnlyMemory<ushort>(native, 0, ySize);
-            u16 = new ReadOnlyMemory<ushort>(native, ySize, cSize);
-            v16 = new ReadOnlyMemory<ushort>(native, ySize + cSize, cSize);
+            if (!mono)
+            {
+                u16 = new ReadOnlyMemory<ushort>(native, ySize, cSize);
+                v16 = new ReadOnlyMemory<ushort>(native, ySize + cSize, cSize);
+            }
         }
         return new Av1.DecodedVideoFrame(w, h, f.Format, f.PresentationTimeTicks, buf, 0, w, ySize, dcw, ySize + cSize, dcw)
         {

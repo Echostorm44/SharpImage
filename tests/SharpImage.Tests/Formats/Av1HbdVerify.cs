@@ -678,6 +678,31 @@ public sealed class Av1HbdVerify
         }
     }
 
+    // Progressive encode probe (trigger hbd_progenc.txt): writes progressive AVIFs made by our encoder to progenc/.
+    [Test, NotInParallel]
+    public void ProgressiveEncode()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_progenc.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string dir = Path.Combine(Scratch, "progenc");
+        Directory.CreateDirectory(dir);
+        var full = FormatRegistry.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", "sample1.dng"));
+        ImageFrame Crop(int w, int h) => Geometry.Crop(full, ((int)full.Columns - w) / 2, ((int)full.Rows - h) / 2, w, h);
+        var cases = new (string Name, ImageFrame Img, AvifEncodeOptions O)[]
+        {
+            ("ours_prog_8_420", Crop(384, 256), new AvifEncodeOptions { BitDepth = 8, Progressive = true }),
+            ("ours_prog_10_444_odd", Crop(257, 131), new AvifEncodeOptions { BitDepth = 10, ChromaSubsampling = AvifChromaSubsampling.Yuv444, Progressive = true }),
+            ("ours_prog_12_422", Crop(200, 120), new AvifEncodeOptions { BitDepth = 12, ChromaSubsampling = AvifChromaSubsampling.Yuv422, Progressive = true }),
+            ("ours_prog_8_gray", Gradient(160, 97, alpha: false, gray: true), new AvifEncodeOptions { BitDepth = 8, Progressive = true }),
+            ("ours_prog_8_420_alpha", Gradient(161, 97, alpha: true, gray: false), new AvifEncodeOptions { BitDepth = 8, Progressive = true }),
+            ("ours_prog_8_420_grain", Crop(256, 160), new AvifEncodeOptions { BitDepth = 8, Progressive = true, FilmGrain = AvifFilmGrain.TestVector(1) }),
+            ("ours_single_8_420_alpha", Gradient(161, 97, alpha: true, gray: false), new AvifEncodeOptions { BitDepth = 8 }),
+        };
+        foreach (var c in cases)
+            File.WriteAllBytes(Path.Combine(dir, c.Name + ".avif"), HeifCoder.EncodeAvif(c.Img, c.O));
+    }
+
     // Progressive decode probe (trigger hbd_prog.txt): HeifCoder.DecodeProgressive on every prog/*.avif, each layer
     // dumped as raw 16-bit RGBA (name_Li.ours.rgba64, little-endian) with a manifest "name layers WxH".
     [Test, NotInParallel]
@@ -685,8 +710,9 @@ public sealed class Av1HbdVerify
     {
         string trig = Path.Combine(Scratch, "corpus", "hbd_prog.txt");
         if (!File.Exists(trig)) return;
+        string sub = File.ReadAllText(trig).Trim();
         File.Delete(trig);
-        string dir = Path.Combine(Scratch, "prog");
+        string dir = Path.Combine(Scratch, sub.Length > 0 ? sub : "prog");
         var log = new System.Text.StringBuilder();
         foreach (var file in Directory.GetFiles(dir, "*.avif"))
         {
