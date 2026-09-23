@@ -1469,7 +1469,7 @@ public static class Av1Decode
     }
 
     /// <summary>Context for compound prediction flag (dav1d: get_comp_ctx in env.h:156).</summary>
-    private static int GetCompCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    internal static int GetCompCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
     {
         if (haveTop) {
             if (haveLeft) {
@@ -1524,7 +1524,7 @@ public static class Av1Decode
     }
 
     /// <summary>Forward ref 2 context (dav1d: av1_get_fwd_ref_2_ctx = av1_get_ref_5_ctx).</summary>
-    private static int GetFwdRef2Ctx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    internal static int GetFwdRef2Ctx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
     {
         int c2 = 0, c3 = 0;
         if (haveTop && above.Intra[bx4] == 0) {
@@ -1539,7 +1539,7 @@ public static class Av1Decode
     }
 
     /// <summary>Backward ref context (dav1d: av1_get_bwd_ref_ctx = av1_get_ref_2_ctx).</summary>
-    private static int GetBwdRefCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    internal static int GetBwdRefCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
     {
         int c4 = 0, c5 = 0, c6 = 0;
         if (haveTop && above.Intra[bx4] == 0) {
@@ -1555,7 +1555,7 @@ public static class Av1Decode
     }
 
     /// <summary>Backward ref 1 context (dav1d: av1_get_bwd_ref_1_ctx = av1_get_ref_6_ctx).</summary>
-    private static int GetBwdRef1Ctx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    internal static int GetBwdRef1Ctx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
     {
         int c4 = 0, c5 = 0, c6 = 0;
         if (haveTop && above.Intra[bx4] == 0) {
@@ -2552,7 +2552,7 @@ public static class Av1Decode
     private static bool HasUniComp(Av1BlockContextManaged e, int off) => (e.Ref0[off] < 4) == (e.Ref1[off] < 4);
 
     /// <summary>Compound direction context (dav1d get_comp_dir_ctx).</summary>
-    private static int GetCompDirCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
+    internal static int GetCompDirCtx(Av1BlockContextManaged above, Av1BlockContextManaged left, int by4, int bx4, bool haveTop, bool haveLeft)
     {
         if (haveTop && haveLeft)
         {

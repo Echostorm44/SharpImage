@@ -2278,6 +2278,25 @@ internal sealed class Av1Decoder
     /// <summary>The last parsed frame header (diagnostics).</summary>
     internal Av1DecoderFrameHeader CurrentFrameHeader => frameHdr;
 
+    /// <summary>Reference slot <paramref name="slot"/> (post-filter reconstruction, before film grain) as a tightly
+    /// packed picture — the image sequence encoder predicts its inter frames from exactly what the decoder holds.</summary>
+    internal Av1InterEncoder.Picture ReferencePicture(int slot, bool mono, int ssX, int ssY)
+    {
+        var r = ctx.RefFrames[slot];
+        if (!r.Valid || r.Planes[0] == null) throw new InvalidOperationException($"Reference slot {slot} is empty.");
+        int w = r.Width, h = r.Height, cw = (w + ssX) >> ssX, ch = (h + ssY) >> ssY;
+        ushort[] Plane(int p, int pw, int ph)
+        {
+            var o = new ushort[pw * ph];
+            for (int y = 0; y < ph; y++) r.Planes[p]!.AsSpan(y * r.Strides[p], pw).CopyTo(o.AsSpan(y * pw));
+            return o;
+        }
+        return new Av1InterEncoder.Picture
+        {
+            Y = Plane(0, w, h), U = mono ? null : Plane(1, cw, ch), V = mono ? null : Plane(2, cw, ch), Width = w, Height = h,
+        };
+    }
+
     private (ushort[], ushort[]?, ushort[]?) WithFilmGrain(in Av1FilmGrainData fg, int w, int h, int ssHor, int ssVer,
         ushort[] y, int strideY, ushort[]? u, ushort[]? v, int strideUv)
     {

@@ -1338,100 +1338,212 @@ public static partial class HeifCoder
             ColorSamples = [], AlphaSamples = hasAlpha ? [] : null, ColorSync = [], AlphaSync = hasAlpha ? [] : null,
         };
         if (options.KeyframeInterval < 0) throw new ArgumentOutOfRangeException(nameof(options), "KeyframeInterval must be >= 0.");
-        // Inter frames reference the previous frame as the decoder reconstructs it (before film grain synthesis).
+
+        // Every frame's coded planes first: the group coder looks ahead (a hidden ALTREF codes a later frame early).
+        var coded = new List<(ushort[] Y, ushort[]? U, ushort[]? V, ushort[]? A, AvifFilmGrain? Grain)>();
+        int frameIndex = 0;
+        foreach (var (r, g, b, a0) in frames)
+        {
+            var frameImage = sequence.Frames[frameIndex++];
+            ushort[]? alpha = hasAlpha ? a0 ?? Enumerable.Repeat((ushort)max, w * h).ToArray() : null;
+            if (extras.Premultiplied && alpha != null)
+                for (int i = 0; i < r.Length; i++)
+                {
+                    double k = alpha[i] / (double)max;
+                    if (k < 1) { r[i] *= k; g[i] *= k; b[i] *= k; }
+                }
+            ushort[] yP;
+            ushort[]? uP = null, vP = null;
+            if (mono && forceMono && anyColour)
+                yP = MonoLumaLibavif(r, g, b, w, h, bd, color, first.Depth is >= 1 and <= 16 ? first.Depth : 16);
+            else if (mono)
+                yP = GreyLumaLibavif(frameImage, bd, color.FullRange, SourceRgbDepth(frameImage), extras.Premultiplied && alpha != null);
+            else
+            {
+                RgbToYuvLibavif(frameImage, bd, layout, color, SourceRgbDepth(frameImage), extras.Premultiplied && alpha != null, r, g, b,
+                    out yP, out var u0, out var v0);
+                uP = u0;
+                vP = v0;
+            }
+
+            AvifFilmGrain? grain = options.FilmGrain;
+            if (denoise)
+            {
+                float level = options.DenoiseUseRequestedLevel ? options.DenoiseNoiseLevel / 10.0f
+                    : Av1.Av1NoiseModel.AllIntraNoiseLevel(yP, w, h, bd);
+                grain = Av1.Av1NoiseModel.DenoiseAndModel(yP, uP, vP, w, h, mono ? 1 : gssX, mono ? 1 : gssY, bd, level,
+                    options.DenoiseBlockSize, out var den);
+                if (grain != null && options.DenoiseApply)
+                {
+                    yP = den[0]!;
+                    uP = den[1];
+                    vP = den[2];
+                }
+            }
+            coded.Add((yP, uP, vP, alpha, grain));
+        }
+        frames.Clear();
+
+        int n = coded.Count;
+        var cSamples = new byte[n][];
+        var cSync = new bool[n];
+        // The decoder model: inter frames predict from exactly what a decoder holds in its reference slots (the
+        // reconstruction before film grain synthesis).
         var colorDec = new Av1.Av1Decoder { ApplyFilmGrain = false };
-        var alphaDec = hasAlpha ? new Av1.Av1Decoder { ApplyFilmGrain = false } : null;
-        Av1.Av1InterEncoder.Picture? refC = null, refA = null;
-        int sinceKey = 0, lastKeyBytes = 0;
         var noCdef = new Av1.Av1ObuWriter.CdefParams(3, 0, [0], [0]);
         byte[] td = [0x12, 0x00];   // temporal delimiter: every sample is one complete temporal unit (as libavif writes)
         var ls = new Av1.Av1ObuWriter.LayeredStream
         {
             Layers = 1, Sequence = true, MaxWidth = w, MaxHeight = h, Widths = [w], Heights = [h],
         };
+        int lf = InterLoopFilterLevel(baseQIdx, bd);
+        int arfQIdx = BoostedQIdx(baseQIdx, bd, SequenceArfQuantizerScale);
         using (Av1.Av1ObuWriter.UseLayers(ls))
         {
-            int frameIndex = 0;
-            foreach (var (r, g, b, a0) in frames)
+            int lastKeyBytes = 0, sinceKey = 0, lastSlot = 0, goldenSlot = 0;
+
+            Av1.Av1ObuWriter.FilmGrainScope Grain(int i)
+                => Av1.Av1ObuWriter.UseFilmGrain(coded[i].Grain?.ToAv1(mono, mono ? 1 : gssX, mono ? 1 : gssY), !mono && gssX == 1 && gssY == 1);
+
+            void Key(int i)
             {
-                var frameImage = sequence.Frames[frameIndex++];
-                ushort[]? alpha = hasAlpha ? a0 ?? Enumerable.Repeat((ushort)max, w * h).ToArray() : null;
-                if (extras.Premultiplied && alpha != null)
-                    for (int i = 0; i < r.Length; i++)
-                    {
-                        double k = alpha[i] / (double)max;
-                        if (k < 1) { r[i] *= k; g[i] *= k; b[i] *= k; }
-                    }
-                ushort[] yP;
-                ushort[]? uP = null, vP = null;
-                if (mono && forceMono && anyColour)
-                    yP = MonoLumaLibavif(r, g, b, w, h, bd, color, first.Depth is >= 1 and <= 16 ? first.Depth : 16);
-                else if (mono)
-                    yP = GreyLumaLibavif(frameImage, bd, color.FullRange, SourceRgbDepth(frameImage), extras.Premultiplied && alpha != null);
-                else
-                {
-                    RgbToYuvLibavif(frameImage, bd, layout, color, SourceRgbDepth(frameImage), extras.Premultiplied && alpha != null, r, g, b,
-                        out yP, out var u0, out var v0);
-                    uP = u0;
-                    vP = v0;
-                }
+                var (yP, uP, vP, _, _) = coded[i];
+                (byte[] cSeq, byte[] cFrame) cObus;
+                using (Grain(i))
+                    cObus = lossless
+                        ? Av1.Av1StillImageEncoder.BuildLosslessObus(yP, uP, vP, mono, w, h, bd, codedLayout,
+                            mono && color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color)
+                        : mono ? Av1.Av1StillImageEncoder.BuildMonochromeObus(yP, w, h, KeyFrameQIdx(baseQIdx, bd), bd, color)
+                        : Av1.Av1StillImageEncoder.BuildColorObus(yP, uP!, vP!, w, h, KeyFrameQIdx(baseQIdx, bd), bd, layout, color);
+                cSamples[i] = [.. td, .. cObus.cSeq, .. cObus.cFrame];
+                cSync[i] = true;
+                lastKeyBytes = cObus.cFrame.Length;
+                sinceKey = 1;
+                lastSlot = goldenSlot = 0;   // a key frame refreshes every slot
+                if (!lossless) Decode(cSamples[i], true);
+            }
 
-                AvifFilmGrain? grain = options.FilmGrain;
-                if (denoise)
-                {
-                    float level = options.DenoiseUseRequestedLevel ? options.DenoiseNoiseLevel / 10.0f
-                        : Av1.Av1NoiseModel.AllIntraNoiseLevel(yP, w, h, bd);
-                    grain = Av1.Av1NoiseModel.DenoiseAndModel(yP, uP, vP, w, h, mono ? 1 : gssX, mono ? 1 : gssY, bd, level,
-                        options.DenoiseBlockSize, out var den);
-                    if (grain != null && options.DenoiseApply)
-                    {
-                        yP = den[0]!;
-                        uP = den[1];
-                        vP = den[2];
-                    }
-                }
+            void Decode(byte[] tu, bool key)
+            {
+                Av1.Av1Decoder.LastDecodeError = null;
+                using var f = colorDec.Decode(tu, 0, key);
+                if (Av1.Av1Decoder.LastDecodeError is { } err) throw new InvalidOperationException("Reference decode failed: " + err);
+            }
 
-                // Key frame: the first, every KeyframeInterval-th, and scene cuts (an inter frame about as large as a key
-                // frame). Lossless sequences stay all-intra.
-                bool key = lossless || refC == null || (options.KeyframeInterval > 0 && sinceKey >= options.KeyframeInterval);
-                byte[] cSample;
-                int lf = InterLoopFilterLevel(baseQIdx, bd);
-                using (Av1.Av1ObuWriter.UseFilmGrain(grain?.ToAv1(mono, mono ? 1 : gssX, mono ? 1 : gssY), !mono && gssX == 1 && gssY == 1))
+            // One inter frame of source frame i reading LAST / GOLDEN / ALTREF from the given slots (ALTREF -1: none),
+            // replacing the slots in refresh; hidden frames stay showable.
+            byte[] Inter(int i, int last, int golden, int arf, int refresh, bool show, int qIdx)
+            {
+                var pics = new Dictionary<int, Av1.Av1InterEncoder.Picture>();
+                Av1.Av1InterEncoder.Picture Slot(int sl)
                 {
-                    byte[]? interObu = null;
-                    if (!key)
+                    if (!pics.TryGetValue(sl, out var pic)) pics[sl] = pic = colorDec.ReferencePicture(sl, mono, gssX, gssY);
+                    return pic;
+                }
+                var refs = new Av1.Av1InterEncoder.Picture?[7];
+                refs[0] = Slot(last);
+                if (golden != last) refs[3] = Slot(golden);
+                if (arf >= 0 && arf != last && arf != golden) refs[6] = Slot(arf);
+                int alt = arf >= 0 ? arf : golden;
+                ls.RefFrameIdx = [last, last, last, golden, alt, alt, alt];
+                ls.RefreshFlags = refresh;
+                ls.ShowFrame = show;
+                ls.ReferenceSelect = SequenceCompound && refs[6] != null;   // compound (past + ALTREF) prediction
+                ls.InterFrame = true;
+                try
+                {
+                    var (yP, uP, vP, _, _) = coded[i];
+                    using (Grain(i))
+                        return Av1.Av1InterEncoder.EncodeFrameObu(new Av1.Av1InterEncoder.Picture { Y = yP, U = uP, V = vP, Width = w, Height = h },
+                            refs, bd, codedLayout, qIdx, noCdef, lf);
+                }
+                finally
+                {
+                    ls.InterFrame = false;
+                    ls.ShowFrame = true;
+                    ls.ReferenceSelect = false;
+                    ls.RefreshFlags = 1;
+                    ls.RefFrameIdx = new int[7];
+                }
+            }
+
+            // A slot other than the ones given (8 slots; at most three are live).
+            static int FreeSlot(int a, int b)
+            {
+                for (int sl = 0; ; sl++) if (sl != a && sl != b) return sl;
+            }
+
+            // A shown inter frame from LAST / GOLDEN (/ ALTREF); false when it is a scene cut (about as large as a key
+            // frame) — the caller codes a key frame instead.
+            bool Shown(int i, int arf, byte[]? prefix)
+            {
+                int ws = FreeSlot(goldenSlot, arf >= 0 ? arf : goldenSlot);
+                byte[] obu = Inter(i, lastSlot, goldenSlot, arf, 1 << ws, true, baseQIdx);
+                if (obu.Length > lastKeyBytes * 9 / 10) return false;
+                Decode([.. td, .. obu], false);
+                lastSlot = ws;
+                cSamples[i] = prefix == null ? [.. td, .. obu] : [.. td, .. prefix, .. obu];
+                sinceKey++;
+                return true;
+            }
+
+            int fi = 0;
+            while (fi < n)
+            {
+                if (lossless || fi == 0 || (options.KeyframeInterval > 0 && sinceKey >= options.KeyframeInterval))
+                {
+                    Key(fi++);
+                    continue;
+                }
+                // Frames until the next forced key frame, grouped like libaom's GF groups: the group's last frame is
+                // coded first as a hidden ALTREF at a lower q-index (predicted from the past), the frames before it
+                // predict from LAST, GOLDEN and that ALTREF, and the ALTREF is then shown as is (show_existing_frame).
+                int limit = n - fi;
+                if (options.KeyframeInterval > 0) limit = Math.Min(limit, options.KeyframeInterval - sinceKey);
+                int gf = Math.Min(limit, SequenceMaxGfInterval);
+                if (gf >= SequenceMinArfGroup)
+                {
+                    int arfIdx = fi + gf - 1;
+                    int arfSlot = FreeSlot(lastSlot, goldenSlot);
+                    byte[] arf = Inter(arfIdx, lastSlot, goldenSlot, -1, 1 << arfSlot, false, arfQIdx);
+                    if (arf.Length <= lastKeyBytes * 9 / 10)
                     {
-                        ls.InterFrame = true;
-                        try
+                        Decode([.. td, .. arf], false);
+                        bool cut = false;
+                        for (int k = fi; k < arfIdx && !cut; k++)
                         {
-                            interObu = Av1.Av1InterEncoder.EncodeFrameObu(new Av1.Av1InterEncoder.Picture { Y = yP, U = uP, V = vP, Width = w, Height = h },
-                                refC!, bd, codedLayout, baseQIdx, noCdef, lf);
+                            if (!Shown(k, arfSlot, k == fi ? arf : null))
+                            {
+                                Key(k);
+                                fi = k + 1;
+                                cut = true;
+                            }
                         }
-                        finally { ls.InterFrame = false; }
-                        if (interObu.Length > lastKeyBytes * 9 / 10) interObu = null;
+                        if (cut) continue;
+                        cSamples[arfIdx] = [.. td, .. Av1.Av1ObuWriter.ShowExistingFrameObu(arfSlot)];
+                        lastSlot = goldenSlot = arfSlot;
+                        sinceKey++;
+                        fi = arfIdx + 1;
+                        continue;
                     }
-                    if (interObu != null) cSample = [.. td, .. interObu];
-                    else
-                    {
-                        key = true;
-                        (byte[] cSeq, byte[] cFrame) cObus = lossless
-                            ? Av1.Av1StillImageEncoder.BuildLosslessObus(yP, uP, vP, mono, w, h, bd, codedLayout,
-                                mono && color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color)
-                            : mono ? Av1.Av1StillImageEncoder.BuildMonochromeObus(yP, w, h, KeyFrameQIdx(baseQIdx, bd), bd, color)
-                            : Av1.Av1StillImageEncoder.BuildColorObus(yP, uP!, vP!, w, h, KeyFrameQIdx(baseQIdx, bd), bd, layout, color);
-                        cSample = [.. td, .. cObus.cSeq, .. cObus.cFrame];
-                        lastKeyBytes = cObus.cFrame.Length;
-                    }
+                    // The group's last frame is a new scene: code frame by frame (a cut becomes a key frame).
                 }
-                sinceKey = key ? 1 : sinceKey + 1;
-                sq.ColorSamples.Add(cSample);
-                sq.ColorSync!.Add(key);
-                if (!lossless) refC = DecodedPicture(colorDec, cSample, key, mono, gssX, gssY);
-                if (alpha != null)
+                if (!Shown(fi, -1, null)) Key(fi);
+                fi++;
+            }
+
+            sq.ColorSamples.AddRange(cSamples);
+            sq.ColorSync!.AddRange(cSync);
+
+            if (hasAlpha)
+            {
+                // The alpha track keeps the colour track's key frames; the others are inter frames from the previous one.
+                var alphaDec = new Av1.Av1Decoder { ApplyFilmGrain = false };
+                for (int i = 0; i < n; i++)
                 {
-                    // The alpha track keeps the colour track's key frames.
+                    var alpha = coded[i].A!;
                     byte[] aSample;
-                    if (key)
+                    if (cSync[i])
                     {
                         var aObus = Av1.Av1StillImageEncoder.BuildAlphaObus(alpha, w, h, lossless ? alphaQIdx : KeyFrameQIdx(alphaQIdx, bd), bd);
                         aSample = [.. td, .. aObus.SeqObu, .. aObus.FrameObu];
@@ -1442,13 +1554,18 @@ public static partial class HeifCoder
                         try
                         {
                             aSample = [.. td, .. Av1.Av1InterEncoder.EncodeFrameObu(new Av1.Av1InterEncoder.Picture { Y = alpha, Width = w, Height = h },
-                                refA!, bd, Av1.Av1PixelLayout.I400, Math.Max(alphaQIdx, 1), noCdef, InterLoopFilterLevel(alphaQIdx, bd))];
+                                alphaDec.ReferencePicture(0, true, 1, 1), bd, Av1.Av1PixelLayout.I400, Math.Max(alphaQIdx, 1), noCdef,
+                                InterLoopFilterLevel(alphaQIdx, bd))];
                         }
                         finally { ls.InterFrame = false; }
                     }
                     sq.AlphaSamples!.Add(aSample);
-                    sq.AlphaSync!.Add(key);
-                    if (!lossless) refA = DecodedPicture(alphaDec!, aSample, key, true, 1, 1);
+                    sq.AlphaSync!.Add(cSync[i]);
+                    if (!lossless)
+                    {
+                        using var f = alphaDec.Decode(aSample, 0, cSync[i]);
+                        if (f == null) throw new InvalidOperationException("Reference decode failed: " + Av1.Av1Decoder.LastDecodeError);
+                    }
                 }
             }
         }
@@ -1472,7 +1589,16 @@ public static partial class HeifCoder
     // frames sit at the q-index whose quantizer is ~0.43x the cq level's (av1_compute_qdelta: the smallest q-index
     // reaching each q, q = ac_quant / 4, 16, 64 for 8, 10, 12 bits) — cq 52/76/100/128/152 -> 19/29/42/69/101
     // against libaom's 19/30/43/69/100.
-    internal static int KeyFrameQIdx(int cqIdx, int bd)
+    internal static int KeyFrameQIdx(int cqIdx, int bd) => BoostedQIdx(cqIdx, bd, 0.43);
+
+    // Sequence GF groups (libaom good-quality defaults: min / max GF interval 4 / 16) and the hidden ALTREF's
+    // quantizer relative to the cq level (lower than the inter frames, higher than a key frame).
+    internal static int SequenceMaxGfInterval = 16, SequenceMinArfGroup = 4;
+    internal static double SequenceArfQuantizerScale = 0.6;
+    internal static bool SequenceCompound = true;
+
+    // The q-index whose quantizer is `scale` x the cq level's (av1_compute_qdelta).
+    internal static int BoostedQIdx(int cqIdx, int bd, double scale0)
     {
         if (cqIdx == 0) return 0;
         int bdIdx = bd == 8 ? 0 : bd == 10 ? 1 : 2;
@@ -1483,7 +1609,7 @@ public static partial class HeifCoder
             return 255;
         }
         double qv = Av1.Av1Tables.DequantTable[bdIdx, cqIdx, 1] / scale;
-        return Math.Clamp(cqIdx + FindQIdx(qv * 0.43) - FindQIdx(qv), 1, 255);
+        return Math.Clamp(cqIdx + FindQIdx(qv * scale0) - FindQIdx(qv), 1, 255);
     }
 
     // libaom picklpf.c LPF_PICK_FROM_Q for inter frames: the deblocking level guessed from the AC quantizer.
@@ -1497,35 +1623,6 @@ public static partial class HeifCoder
             _ => ((long)q * 20723 + 16242526 + (1 << 21)) >> 22,
         };
         return (int)Math.Clamp(guess, 0, 63);
-    }
-
-    // Decodes one coded sample and returns the reconstruction (the next inter frame's reference).
-    private static Av1.Av1InterEncoder.Picture DecodedPicture(Av1.Av1Decoder dec, byte[] sample, bool key, bool mono, int ssX, int ssY)
-    {
-        using var f = dec.Decode(sample, 0, key) ?? throw new InvalidOperationException("Reference decode failed: " + Av1.Av1Decoder.LastDecodeError);
-        int w = f.Width, h = f.Height;
-        ushort[] Plane(int pl, int pw, int ph)
-        {
-            var o = new ushort[pw * ph];
-            int stride = pl == 0 ? f.YStride : pl == 1 ? f.UStride : f.VStride;
-            if (f.BitDepth > 8)
-            {
-                var src = (pl == 0 ? f.YPlane16 : pl == 1 ? f.UPlane16 : f.VPlane16).Span;
-                for (int y = 0; y < ph; y++) src.Slice(y * stride, pw).CopyTo(o.AsSpan(y * pw));
-            }
-            else
-            {
-                var src = (pl == 0 ? f.YPlane : pl == 1 ? f.UPlane : f.VPlane).Span;
-                for (int y = 0; y < ph; y++)
-                    for (int x = 0; x < pw; x++) o[y * pw + x] = src[y * stride + x];
-            }
-            return o;
-        }
-        int cw = (w + ssX) >> ssX, ch = (h + ssY) >> ssY;
-        return new Av1.Av1InterEncoder.Picture
-        {
-            Y = Plane(0, w, h), U = mono ? null : Plane(1, cw, ch), V = mono ? null : Plane(2, cw, ch), Width = w, Height = h,
-        };
     }
 
     // The frame's samples as RGB in coded-depth units [0, 2^bd - 1] plus the alpha plane (null without an alpha

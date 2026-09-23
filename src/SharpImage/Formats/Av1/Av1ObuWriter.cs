@@ -157,9 +157,30 @@ internal static class Av1ObuWriter
         /// </summary>
         public bool InterFrame;
         public int RefreshFlags = 1;
+
+        /// <summary>Inter frames: the slot each of LAST..ALTREF reads (ref_frame_idx).</summary>
+        public int[] RefFrameIdx = new int[7];
+
+        /// <summary>Inter frames: false codes a hidden frame (showable later through show_existing_frame).</summary>
+        public bool ShowFrame = true;
+
+        /// <summary>Inter frames: reference_select — blocks may use compound (two-reference) prediction.</summary>
+        public bool ReferenceSelect;
+    }
+
+    /// <summary>A temporal unit's OBU_FRAME_HEADER with show_existing_frame = 1: displays reference slot
+    /// <paramref name="slot"/> (a hidden, showable inter frame) without coding anything.</summary>
+    internal static byte[] ShowExistingFrameObu(int slot)
+    {
+        var w = new Av1BitWriter();
+        w.PutBool(true);                  // show_existing_frame
+        w.PutBits((uint)slot, 3);         // frame_to_show_map_idx
+        w.TrailingBits();
+        return WrapObu(Av1ObuType.FrameHeader, w.ToArray());
     }
 
     [ThreadStatic] private static LayeredStream? t_layered;
+    internal static bool CurrentReferenceSelect => t_layered is { Sequence: true, InterFrame: true, ReferenceSelect: true };
 
     internal readonly struct LayeredScope : IDisposable
     {
@@ -223,7 +244,8 @@ internal static class Av1ObuWriter
         {
             w.PutBool(false);                  // show_existing_frame
             w.PutBits(1, 2);                   // frame_type: INTER_FRAME
-            w.PutBool(true);                   // show_frame
+            w.PutBool(ls.ShowFrame);           // show_frame
+            if (!ls.ShowFrame) w.PutBool(true);   // showable_frame (shown later by show_existing_frame)
             w.PutBool(false);                  // error_resilient_mode
             w.PutBool(false);                  // disable_cdf_update
             w.PutBool(screenContentTools);     // allow_screen_content_tools (SELECT)
@@ -232,8 +254,8 @@ internal static class Av1ObuWriter
             // order_hint: 0 bits (enable_order_hint = 0)
             w.PutBits(7, 3);                   // primary_ref_frame = PRIMARY_REF_NONE: default CDFs, no inherited state
             w.PutBits((uint)ls.RefreshFlags, 8);   // refresh_frame_flags
-            // frame_refs_short_signaling absent (no order hints); every reference is slot 0.
-            for (int i = 0; i < 7; i++) w.PutBits(0, 3);   // ref_frame_idx[i]
+            // frame_refs_short_signaling absent (no order hints).
+            for (int i = 0; i < 7; i++) w.PutBits((uint)ls.RefFrameIdx[i], 3);   // ref_frame_idx[i]
             // frame_size(): the sequence maximum (no override), no superres; render_size():
             w.PutBool(false);                  // render_and_frame_size_different
             w.PutBool(false);                  // allow_high_precision_mv (quarter-pel)
@@ -604,7 +626,7 @@ internal static class Av1ObuWriter
         {
             // loop_filter_params / cdef_params / lr_params / read_tx_mode are all skipped for a coded-lossless frame.
             bool interLl = t_layered is { Sequence: true, InterFrame: true };
-            if (interLl) w.PutBool(false);   // reference_select = 0
+            if (interLl) w.PutBool(t_layered!.ReferenceSelect);   // reference_select
             w.PutBool(reducedTxSet);  // reduced_tx_set
             if (interLl) for (int r = 0; r < 7; r++) w.PutBool(false);   // is_global
             WriteFilmGrainParams(w, monochrome, interLl);
@@ -645,7 +667,7 @@ internal static class Av1ObuWriter
         bool inter = t_layered is { Sequence: true, InterFrame: true };
         // frame_reference_mode: reference_select (inter frames); skip_mode / allow_warped_motion are absent (no order
         // hints, warped motion disabled).
-        if (inter) w.PutBool(false);   // reference_select = 0: single references
+        if (inter) w.PutBool(t_layered!.ReferenceSelect);   // reference_select: compound references allowed
         w.PutBool(reducedTxSet);  // reduced_tx_set (0 = full Intra1 set with V_DCT/H_DCT for sub-16x16 luma)
 
         // global_motion_params (inter frames): is_global = 0 for LAST..ALTREF.

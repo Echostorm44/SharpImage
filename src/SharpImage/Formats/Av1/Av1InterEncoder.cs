@@ -26,6 +26,10 @@ internal static class Av1InterEncoder
         public required int Width, Height;
     }
 
+    // TX_MODE_SELECT: inter blocks choose a transform split tree (var-tx, up to two levels below the largest
+    // transform) by rate-distortion instead of always using the largest transform.
+    internal static bool UseVarTx = true;
+
     // Motion search: full-pel radius around the best predictor (in luma pixels), then half- and quarter-pel.
     internal static int SearchRange = 24;
 
@@ -36,13 +40,24 @@ internal static class Av1InterEncoder
     /// </summary>
     internal static byte[] EncodeFrameObu(Picture src, Picture reference, int bitDepth, Av1PixelLayout layout, int baseQIdx,
         Av1ObuWriter.CdefParams cdef, int lfLevel)
+        => EncodeFrameObu(src, [reference, null, null, null, null, null, null], bitDepth, layout, baseQIdx, cdef, lfLevel);
+
+    /// <summary>
+    /// As above with several references: <paramref name="refs"/>[i] is the picture reference i (LAST, LAST2, LAST3,
+    /// GOLDEN, BWDREF, ALTREF2, ALTREF) reads, or null when blocks should not use it (not coded / a duplicate slot).
+    /// Each block picks the reference (and motion vector) with the lowest rate-distortion cost.
+    /// </summary>
+    internal static byte[] EncodeFrameObu(Picture src, Picture?[] refs, int bitDepth, Av1PixelLayout layout, int baseQIdx,
+        Av1ObuWriter.CdefParams cdef, int lfLevel)
     {
+        var reference = refs;
         int w = src.Width, h = src.Height;
         int sbCols = (w + 63) >> 6, sbRows = (h + 63) >> 6;
         bool mono = layout == Av1PixelLayout.I400;
-        byte[] hdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, mono, txModeSelect: false,
+        byte[] hdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, mono, txModeSelect: UseVarTx,
             cdef, lfLevel, screenContentTools: false, reducedTxSet: true);
         var enc = new FrameCoder(src, reference, bitDepth, layout, baseQIdx);
+        enc.ReferenceSelect = Av1ObuWriter.CurrentReferenceSelect;
         var tl = Av1ObuWriter.TileLayout(sbCols, sbRows);
         var tiles = new List<byte[]>();
         for (int tr = 0; tr < (1 << tl.RowsLog2) && tl.RowStartSb[tr] < sbRows; tr++)
@@ -63,8 +78,15 @@ internal static class Av1InterEncoder
         public int Bx, By, Bs, EdgeIdx;
         public Av1EdgeFlags Edge;
         public Av1MotionVector Mv;
+        public int Ref;               // 0 = LAST .. 6 = ALTREF
+        public int Ref1 = -1;         // compound: the second reference (average of both predictions), else -1
+        public Av1MotionVector Mv1;
         public bool Skip;
-        public List<int[]> LumaLevels = [], ULevels = [], VLevels = [];
+        public List<int[]> ULevels = [], VLevels = [];
+        // Luma transform blocks (var-tx leaves) keyed by absolute 4x4 position, and the split flags per tree node as
+        // the decoder stores them (depth 0 / 1 bit masks indexed yOff * 4 + xOff).
+        public Dictionary<(int Bx, int By), int[]> LumaTx = [];
+        public int Split0, Split1;
     }
 
     // Analysis tree: a leaf, a coded split (NONE vs SPLIT chosen), or an implicit / edge split.
@@ -77,7 +99,9 @@ internal static class Av1InterEncoder
 
     private sealed class FrameCoder
     {
-        public readonly Picture Src, Ref;
+        public readonly Picture Src;
+        public readonly Picture?[] Refs;
+        private Picture Ref;          // the reference the current search / prediction reads
         public readonly int W, H, Bd, SsX, SsY, CW, CH, Bw, Bh, PadW, PadH, BdIdx;
         public readonly Av1PixelLayout Layout;
         public readonly bool Mono;
@@ -85,12 +109,14 @@ internal static class Av1InterEncoder
         public readonly double Lambda, LambdaSad;
         public readonly ushort[] SrcY, SrcU, SrcV;          // padded to PadW x PadH (edge-replicated)
         public readonly Av1RefMvsFrame Rf = new();
+        public bool ReferenceSelect;  // the frame header's reference_select (a comp_mode bit precedes each reference)
         public readonly Av1DecoderFrameHeader Fh;
         public readonly ushort[] Emu = new ushort[(128 + 16) * 192];
 
-        public FrameCoder(Picture src, Picture reference, int bitDepth, Av1PixelLayout layout, int baseQIdx)
+        public FrameCoder(Picture src, Picture?[] refs, int bitDepth, Av1PixelLayout layout, int baseQIdx)
         {
-            Src = src; Ref = reference; Bd = bitDepth; Layout = layout; BaseQIdx = baseQIdx;
+            Src = src; Refs = refs; Ref = Array.Find(refs, r => r != null) ?? throw new ArgumentException("No reference.");
+            Av1MotionComp.McBitDepth = bitDepth; Bd = bitDepth; Layout = layout; BaseQIdx = baseQIdx;
             W = src.Width; H = src.Height;
             Mono = layout == Av1PixelLayout.I400;
             SsX = layout is Av1PixelLayout.I420 or Av1PixelLayout.I422 ? 1 : 0;
@@ -239,10 +265,147 @@ internal static class Av1InterEncoder
         // The best motion vector (and its residual) for a square block, with its rate-distortion cost.
         private Leaf EvaluateLeaf(int bs, int bx, int by, Av1EdgeFlags edge, int edgeIdx, out double bestJ)
         {
+            bestJ = double.MaxValue;
+            Leaf? best = null;
+            var single = new Av1MotionVector?[7];
+            for (int r = 0; r < 7; r++)
+            {
+                if (Refs[r] == null) continue;
+                Ref = Refs[r]!;
+                var leaf = EvaluateLeafRef(bs, bx, by, edge, edgeIdx, r, out double j);
+                single[r] = leaf.Mv;
+                if (j < bestJ) { bestJ = j; best = leaf; }
+            }
+            // Compound (bidirectional): a forward reference averaged with ALTREF.
+            if (ReferenceSelect && Refs[6] != null)
+                foreach (int r0 in (ReadOnlySpan<int>)[0, 3])
+                {
+                    if (Refs[r0] == null) continue;
+                    var leaf = EvaluateCompound(bs, bx, by, edge, edgeIdx, r0, 6, single[r0]!.Value, single[6]!.Value, out double j);
+                    if (leaf != null && j < bestJ) { bestJ = j; best = leaf; }
+                }
+            return best!;
+        }
+
+        private Leaf? EvaluateCompound(int bs, int bx, int by, Av1EdgeFlags edge, int edgeIdx, int r0, int r1,
+            Av1MotionVector s0, Av1MotionVector s1, out double bestJ)
+        {
+            int n = 4 * Av1Tables.BlockDimensions[bs, 0];
+            Span<Av1RefMvsCandidate> stack = stackalloc Av1RefMvsCandidate[8];
+            Av1RefMvs.FindRefMvs(rt, stack, out int nCand, out int cctx, out _,
+                new Av1RefMvsRefPair { Ref0 = (sbyte)(r0 + 1), Ref1 = (sbyte)(r1 + 1) }, bs, edge, by, bx);
+            double refBits = CompRefBits(r0, r1, bx, by);
+            var pairs = new List<(Av1MotionVector, Av1MotionVector)> { (s0, s1), (default, default) };
+            for (int i = 0; i < Math.Min(Math.Max(nCand, 2), 4); i++)
+            {
+                var a = stack[i].Mv.Mv0; var b = stack[i].Mv.Mv1;
+                FixQuarter(ref a); FixQuarter(ref b);
+                pairs.Add((a, b));
+                if (i == 0) { pairs.Add((a, s1)); pairs.Add((s0, b)); }
+            }
+            bestJ = double.MaxValue;
+            Leaf? best = null;
+            var seen = new HashSet<(Av1MotionVector, Av1MotionVector)>();
+            foreach (var (m0, m1) in pairs)
+            {
+                if (!seen.Add((m0, m1)) || !MvInRange(m0) || !MvInRange(m1)) continue;
+                var (mode, _, bits) = CompSyntax(stack, nCand, cctx, m0, m1);
+                if (mode < 0) continue;
+                var leaf = new Leaf { Bx = bx, By = by, Bs = bs, EdgeIdx = edgeIdx, Edge = edge, Mv = m0, Mv1 = m1, Ref = r0, Ref1 = r1 };
+                double j = CodeResidual(leaf, n, refBits + bits);
+                if (j < bestJ) { bestJ = j; best = leaf; }
+            }
+            return best;
+        }
+
+        // Cost of comp_mode = 1 + a bidirectional pair (forward r0 in LAST..GOLDEN, backward r1 in BWDREF..ALTREF).
+        private double CompRefBits(int r0, int r1, int bx, int by)
+        {
+            int bx4 = bx & 31, by4 = by & 31;
+            bool haveLeft = bx > colStart, haveTop = by > rowStart;
+            var m = cdf.Mode;
+            double b = Av1CoeffEncode.SymBits(m.Comp[Av1Decode.GetCompCtx(above, left, by4, bx4, haveTop, haveLeft)], 1)
+                + Av1CoeffEncode.SymBits(m.CompDir[Av1Decode.GetCompDirCtx(above, left, by4, bx4, haveTop, haveLeft)], 1)
+                + Av1CoeffEncode.SymBits(m.CompFwdRef[0 * 3 + Av1Decode.GetFwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r0 >= 2 ? 1 : 0)
+                + (r0 >= 2 ? Av1CoeffEncode.SymBits(m.CompFwdRef[2 * 3 + Av1Decode.GetFwdRef2Ctx(above, left, by4, bx4, haveTop, haveLeft)], r0 - 2)
+                    : Av1CoeffEncode.SymBits(m.CompFwdRef[1 * 3 + Av1Decode.GetFwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)], r0))
+                + Av1CoeffEncode.SymBits(m.CompBwdRef[0 * 3 + Av1Decode.GetBwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r1 == 6 ? 1 : 0);
+            if (r1 != 6) b += Av1CoeffEncode.SymBits(m.CompBwdRef[1 * 3 + Av1Decode.GetBwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)], r1 - 4);
+            return b;
+        }
+
+        // The cheapest compound inter mode (+ DRL index) that reproduces (m0, m1) against the compound stack, and its
+        // approximate bits; mode -1 when none can (a NEWMV half needs quarter-pel parity with its reference).
+        private (int Mode, int Drl, double Bits) CompSyntax(ReadOnlySpan<Av1RefMvsCandidate> stack, int nCand, int cctx,
+            Av1MotionVector m0, Av1MotionVector m1)
+        {
+            var cm = cdf.Mode.CompInterMode[cctx];
+            int bestMode = -1, bestDrl = 0;
+            double best = double.MaxValue;
+            void Consider(int mode, int drl, double extra)
+            {
+                double b = Av1CoeffEncode.SymBits(cm, mode) + extra;
+                if (b < best) { best = b; bestMode = mode; bestDrl = drl; }
+            }
+            var st = new Av1MotionVector[8, 2];
+            for (int d = 0; d < 8; d++) { st[d, 0] = stack[d].Mv.Mv0; st[d, 1] = stack[d].Mv.Mv1; }
+            Av1MotionVector Near(int d, int idx) { var v = st[d, idx]; FixQuarter(ref v); return v; }
+            Av1MotionVector Raw(int d, int idx) => st[d, idx];
+            bool Parity(Av1MotionVector a, Av1MotionVector r) => ((a.X - r.X) & 1) == 0 && ((a.Y - r.Y) & 1) == 0;
+            double NewBits(Av1MotionVector a, Av1MotionVector r) => MvBits(a, r);
+            // DRL bits: NEWMV_NEWMV codes drl 0..2 (bits at stack 0, 1); NEAR modes code drl 1..3 (bits at 1, 2).
+            double DrlNew(int d) => (nCand > 1 ? 1 : 0) + (d >= 1 && nCand > 2 ? 1 : 0);
+            double DrlNear(int d) => (nCand > 2 ? 1 : 0) + (d >= 2 && nCand > 3 ? 1 : 0);
+            if (m0.Equals(Near(0, 0)) && m1.Equals(Near(0, 1))) Consider((int)Av1CompInterPredMode.NearestNearest, 0, 0);
+            if (m0.X == 0 && m0.Y == 0 && m1.X == 0 && m1.Y == 0) Consider((int)Av1CompInterPredMode.GlobalGlobal, 0, 0);
+            int maxNear = nCand > 2 ? Math.Min(nCand - 1, 3) : 1;
+            for (int d = 1; d <= maxNear; d++)
+            {
+                bool n0 = m0.Equals(Near(d, 0)), n1 = m1.Equals(Near(d, 1));
+                if (n0 && n1) Consider((int)Av1CompInterPredMode.NearNear, d, DrlNear(d));
+                if (n0 && Parity(m1, Raw(d, 1))) Consider((int)Av1CompInterPredMode.NearNew, d, DrlNear(d) + NewBits(m1, Raw(d, 1)));
+                if (n1 && Parity(m0, Raw(d, 0))) Consider((int)Av1CompInterPredMode.NewNear, d, DrlNear(d) + NewBits(m0, Raw(d, 0)));
+            }
+            if (m0.Equals(Near(0, 0)) && Parity(m1, Raw(0, 1)))
+                Consider((int)Av1CompInterPredMode.NearestNew, 0, NewBits(m1, Raw(0, 1)));
+            if (m1.Equals(Near(0, 1)) && Parity(m0, Raw(0, 0)))
+                Consider((int)Av1CompInterPredMode.NewNearest, 0, NewBits(m0, Raw(0, 0)));
+            int maxNew = nCand > 1 ? Math.Min(nCand, 3) : 1;
+            for (int d = 0; d < maxNew; d++)
+                if (Parity(m0, Raw(d, 0)) && Parity(m1, Raw(d, 1)))
+                    Consider((int)Av1CompInterPredMode.NewNew, d, DrlNew(d) + NewBits(m0, Raw(d, 0)) + NewBits(m1, Raw(d, 1)));
+            return (bestMode, bestDrl, best);
+        }
+
+        // Approximate cost of signalling single reference r (read_ref_frames, single branch) with the current contexts.
+        private double RefBits(int r, int bx, int by)
+        {
+            int bx4 = bx & 31, by4 = by & 31;
+            bool haveLeft = bx > colStart, haveTop = by > rowStart;
+            var m = cdf.Mode;
+            double b = Av1CoeffEncode.SymBits(m.Ref[Av1Decode.GetRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r >= 4 ? 1 : 0);
+            if (ReferenceSelect) b += Av1CoeffEncode.SymBits(m.Comp[Av1Decode.GetCompCtx(above, left, by4, bx4, haveTop, haveLeft)], 0);
+            if (r >= 4)
+            {
+                b += Av1CoeffEncode.SymBits(m.Ref[1 * 3 + Av1Decode.GetBwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r == 6 ? 1 : 0);
+                if (r != 6) b += Av1CoeffEncode.SymBits(m.Ref[5 * 3 + Av1Decode.GetBwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)], r - 4);
+            }
+            else
+            {
+                b += Av1CoeffEncode.SymBits(m.Ref[2 * 3 + Av1Decode.GetFwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r >= 2 ? 1 : 0);
+                b += r >= 2 ? Av1CoeffEncode.SymBits(m.Ref[4 * 3 + Av1Decode.GetFwdRef2Ctx(above, left, by4, bx4, haveTop, haveLeft)], r - 2)
+                    : Av1CoeffEncode.SymBits(m.Ref[3 * 3 + Av1Decode.GetFwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)], r);
+            }
+            return b;
+        }
+
+        private Leaf EvaluateLeafRef(int bs, int bx, int by, Av1EdgeFlags edge, int edgeIdx, int refIdx, out double bestJ)
+        {
             int n = 4 * Av1Tables.BlockDimensions[bs, 0];
             Span<Av1RefMvsCandidate> stack = stackalloc Av1RefMvsCandidate[8];
             Av1RefMvs.FindRefMvs(rt, stack, out int nCand, out int modeCtx, out _,
-                new Av1RefMvsRefPair { Ref0 = 1, Ref1 = -1 }, bs, edge, by, bx);
+                new Av1RefMvsRefPair { Ref0 = (sbyte)(refIdx + 1), Ref1 = -1 }, bs, edge, by, bx);
+            double refBits = RefBits(refIdx, bx, by);
 
             // Candidate predictors: zero (GLOBALMV), the stack (NEAREST / NEAR), then a motion search seeded by them.
             var cands = new List<Av1MotionVector> { default };
@@ -261,8 +424,8 @@ internal static class Av1InterEncoder
             foreach (var mv in cands)
             {
                 if (!MvInRange(mv)) continue;
-                var leaf = new Leaf { Bx = bx, By = by, Bs = bs, EdgeIdx = edgeIdx, Edge = edge, Mv = mv };
-                double modeBits = ModeBits(stack, nCand, modeCtx, mv);
+                var leaf = new Leaf { Bx = bx, By = by, Bs = bs, EdgeIdx = edgeIdx, Edge = edge, Mv = mv, Ref = refIdx };
+                double modeBits = refBits + ModeBits(stack, nCand, modeCtx, mv);
                 double j = CodeResidual(leaf, n, modeBits);
                 if (j < bestJ) { bestJ = j; best = leaf; }
             }
@@ -444,7 +607,7 @@ internal static class Av1InterEncoder
 
         // The decoder's unscaled single-reference prediction (Av1Reconstruction.Mc, same-size path) for one plane of a
         // block at 4x4-unit position (bx, by) of luma-sized bw4 x bh4 units... (w, h are the plane block size in px).
-        private void McPlane(int pl, int bx4, int by4, int w, int h, Av1MotionVector mv, ushort[] dst, int dstStride)
+        private void McPlane(int pl, int bx4, int by4, int w, int h, Av1MotionVector mv, ushort[]? dst, int dstStride, short[]? prep = null)
         {
             int ssH = pl != 0 ? SsX : 0, ssV = pl != 0 ? SsY : 0;
             int hMul = 4 >> ssH, vMul = 4 >> ssV;
@@ -469,8 +632,31 @@ internal static class Av1InterEncoder
                 src = plane.AsSpan(pw * (dy - 3) + (dx - 3));
                 srcStride = pw;
             }
-            Av1MotionComp.Put8Tap(dst, dstStride, src, srcStride, w, h, mx << (ssH == 0 ? 1 : 0), my << (ssV == 0 ? 1 : 0),
-                Av1MotionComp.PackedFilterType((int)Av1Filter2d.EightTapRegular));
+            if (prep != null)
+                Av1MotionComp.Prep8Tap(prep, src, srcStride, w, h, mx << (ssH == 0 ? 1 : 0), my << (ssV == 0 ? 1 : 0),
+                    Av1MotionComp.PackedFilterType((int)Av1Filter2d.EightTapRegular));
+            else
+                Av1MotionComp.Put8Tap(dst!, dstStride, src, srcStride, w, h, mx << (ssH == 0 ? 1 : 0), my << (ssV == 0 ? 1 : 0),
+                    Av1MotionComp.PackedFilterType((int)Av1Filter2d.EightTapRegular));
+        }
+
+        private readonly short[] prep0 = new short[64 * 64], prep1 = new short[64 * 64];
+
+        // The decoder's inter prediction of one plane of the leaf (w x h, packed): single reference (put), or the
+        // compound average of both references' intermediate-precision predictions (prep + avg).
+        private void Predict(Leaf leaf, int pl, int w, int h, ushort[] dst)
+        {
+            if (leaf.Ref1 < 0)
+            {
+                Ref = Refs[leaf.Ref]!;
+                McPlane(pl, leaf.Bx, leaf.By, w, h, leaf.Mv, dst, w);
+                return;
+            }
+            Ref = Refs[leaf.Ref]!;
+            McPlane(pl, leaf.Bx, leaf.By, w, h, leaf.Mv, null, w, prep0);
+            Ref = Refs[leaf.Ref1]!;
+            McPlane(pl, leaf.Bx, leaf.By, w, h, leaf.Mv1, null, w, prep1);
+            Av1MotionComp.Avg(dst, w, prep0, prep1, w, h);
         }
 
         // Predicts the block with leaf.Mv, transforms / quantizes the residual (largest transform), and returns
@@ -481,10 +667,23 @@ internal static class Av1InterEncoder
             int bs = leaf.Bs;
             int ytx = Av1Tables.MaxTxfmSizeForBlockSize[bs, 0];
             var pred = new ushort[n * n];
-            McPlane(0, leaf.Bx, leaf.By, n, n, leaf.Mv, pred, n);
+            Predict(leaf, 0, n, n, pred);
             double dSkip = 0, dCoded = 0, coefBits = 0;
-            var lumaLv = new List<int[]>();
-            ResidualPlane(SrcY, PadW, px, py, n, n, ytx, pred, 0, lumaLv, ref dSkip, ref dCoded, ref coefBits);
+            var lumaTx = new Dictionary<(int, int), int[]>();
+            int split0 = 0, split1 = 0;
+            {
+                // One tree per largest transform tiling the block (a single one for blocks up to 64x64).
+                ref readonly var mt = ref Av1Tables.TxfmDimensions[ytx];
+                int bw4 = Av1Tables.BlockDimensions[bs, 0], bh4 = Av1Tables.BlockDimensions[bs, 1];
+                for (int y = 0, yOff = 0; y < bh4; y += mt.H, yOff++)
+                    for (int x = 0, xOff = 0; x < bw4; x += mt.W, xOff++)
+                    {
+                        var node = LumaTree(ytx, 0, xOff, yOff, leaf.Bx + x, leaf.By + y, leaf.Bx, leaf.By, pred, n);
+                        dSkip += node.DSkip; dCoded += node.DCoded; coefBits += node.Bits;
+                        foreach (var kv in node.Leaves) lumaTx[kv.Key] = kv.Value;
+                        split0 |= node.S0; split1 |= node.S1;
+                    }
+            }
             var uLv = new List<int[]>();
             var vLv = new List<int[]>();
             if (!Mono)
@@ -492,12 +691,12 @@ internal static class Av1InterEncoder
                 int cw = n >> SsX, ch = n >> SsY;
                 int uvtx = Av1Tables.MaxTxfmSizeForBlockSize[bs, (int)Layout];
                 var cp = new ushort[cw * ch];
-                McPlane(1, leaf.Bx, leaf.By, cw, ch, leaf.Mv, cp, cw);
+                Predict(leaf, 1, cw, ch, cp);
                 ResidualPlane(SrcU, PadW >> SsX, px >> SsX, py >> SsY, cw, ch, uvtx, cp, 1, uLv, ref dSkip, ref dCoded, ref coefBits);
-                McPlane(2, leaf.Bx, leaf.By, cw, ch, leaf.Mv, cp, cw);
+                Predict(leaf, 2, cw, ch, cp);
                 ResidualPlane(SrcV, PadW >> SsX, px >> SsX, py >> SsY, cw, ch, uvtx, cp, 2, vLv, ref dSkip, ref dCoded, ref coefBits);
             }
-            bool anyCoef = lumaLv.Exists(HasNonZero) || uLv.Exists(HasNonZero) || vLv.Exists(HasNonZero);
+            bool anyCoef = lumaTx.Values.Any(HasNonZero) || uLv.Exists(HasNonZero) || vLv.Exists(HasNonZero);
             double skipBits1 = Av1CoeffEncode.SymBits(cdf.GetSkipCdf(0), 1), skipBits0 = Av1CoeffEncode.SymBits(cdf.GetSkipCdf(0), 0);
             double jSkip = dSkip + Lambda * (modeBits + skipBits1);
             double jCoded = dCoded + Lambda * (modeBits + skipBits0 + coefBits);
@@ -506,17 +705,83 @@ internal static class Av1InterEncoder
                 leaf.Skip = true;
                 return jSkip;
             }
-            leaf.LumaLevels = lumaLv; leaf.ULevels = uLv; leaf.VLevels = vLv;
+            leaf.LumaTx = lumaTx; leaf.Split0 = split0; leaf.Split1 = split1; leaf.ULevels = uLv; leaf.VLevels = vLv;
             return jCoded;
         }
 
         private static bool HasNonZero(int[] a) { foreach (int v in a) if (v != 0) return true; return false; }
 
+        private sealed class TxNode
+        {
+            public double DSkip, DCoded, Bits;
+            public Dictionary<(int, int), int[]> Leaves = [];
+            public int S0, S1;
+        }
+
+        // The rate-distortion best transform tree for luma transform `tx` at absolute 4x4 position (bx, by) of the
+        // block at (blkX, blkY): coded whole, or (below depth 2, above 4x4) split into its four sub-transforms that
+        // start inside the frame (dav1d read_tx_tree / read_coef_tree); an 8x8 split codes four 4x4 transforms.
+        private TxNode LumaTree(int tx, int depth, int xOff, int yOff, int bx, int by, int blkX, int blkY, ushort[] pred, int predW)
+        {
+            ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+            bool canSplit = UseVarTx && depth < 2 && tx > (int)Av1TxSize.Tx4x4;
+            int cat = 2 * ((int)Av1TxSize.Tx64x64 - tDim.Max) - depth;
+            var whole = new TxNode();
+            {
+                double ds = 0, dc = 0, bits = 0;
+                var lv = new List<int[]>();
+                ResidualPlane(SrcY, PadW, bx * 4, by * 4, tDim.W * 4, tDim.H * 4, tx, pred, 0, lv, ref ds, ref dc, ref bits,
+                    ((by - blkY) * 4) * predW + (bx - blkX) * 4, predW);
+                whole.DSkip = ds; whole.DCoded = dc;
+                whole.Bits = bits + (canSplit ? Av1CoeffEncode.SymBits(cdf.GetTxPartCdf(cat, 1), 0) : 0);
+                whole.Leaves[(bx, by)] = lv[0];
+            }
+            if (!canSplit) return whole;
+            var split = new TxNode { Bits = Av1CoeffEncode.SymBits(cdf.GetTxPartCdf(cat, 1), 1) };
+            if (depth == 0) split.S0 |= 1 << (yOff * 4 + xOff); else split.S1 |= 1 << (yOff * 4 + xOff);
+            int sub = tDim.Sub;
+            ref readonly var sd = ref Av1Tables.TxfmDimensions[sub];
+            int txw = tDim.Lw, txh = tDim.Lh;
+            bool deeper = tDim.Max > (int)Av1TxSize.Tx8x8;
+            void Child(int cx, int cy, int dx, int dy)
+            {
+                // Below an 8x8 split there are no more symbols: the 4x4 children are plain leaves.
+                var c = deeper
+                    ? LumaTree(sub, depth + 1, xOff * 2 + dx, yOff * 2 + dy, cx, cy, blkX, blkY, pred, predW)
+                    : LumaLeafOnly(sub, cx, cy, blkX, blkY, pred, predW);
+                split.DSkip += c.DSkip; split.DCoded += c.DCoded; split.Bits += c.Bits;
+                foreach (var kv in c.Leaves) split.Leaves[kv.Key] = kv.Value;
+                split.S0 |= c.S0; split.S1 |= c.S1;
+            }
+            Child(bx, by, 0, 0);
+            if (txw >= txh && bx + sd.W < Bw) Child(bx + sd.W, by, 1, 0);
+            if (txh >= txw && by + sd.H < Bh)
+            {
+                Child(bx, by + sd.H, 0, 1);
+                if (txw >= txh && bx + sd.W < Bw) Child(bx + sd.W, by + sd.H, 1, 1);
+            }
+            return whole.DCoded + Lambda * whole.Bits <= split.DCoded + Lambda * split.Bits ? whole : split;
+        }
+
+        private TxNode LumaLeafOnly(int tx, int bx, int by, int blkX, int blkY, ushort[] pred, int predW)
+        {
+            ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+            var node = new TxNode();
+            double ds = 0, dc = 0, bits = 0;
+            var lv = new List<int[]>();
+            ResidualPlane(SrcY, PadW, bx * 4, by * 4, tDim.W * 4, tDim.H * 4, tx, pred, 0, lv, ref ds, ref dc, ref bits,
+                ((by - blkY) * 4) * predW + (bx - blkX) * 4, predW);
+            node.DSkip = ds; node.DCoded = dc; node.Bits = bits;
+            node.Leaves[(bx, by)] = lv[0];
+            return node;
+        }
+
         // One plane of a block: per transform block (raster), forward + quantize the residual against pred, and add
         // the skip / coded distortions and the coefficient bits.
         private void ResidualPlane(ushort[] src, int srcW, int px, int py, int w, int h, int tx, ushort[] pred, int plane,
-            List<int[]> levelsOut, ref double dSkip, ref double dCoded, ref double coefBits)
+            List<int[]> levelsOut, ref double dSkip, ref double dCoded, ref double coefBits, int predOff = 0, int predStride = -1)
         {
+            if (predStride < 0) predStride = w;
             ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
             int tw = tDim.W * 4, th = tDim.H * 4;
             int rcCount = Math.Min(tw, 32) * Math.Min(th, 32);
@@ -534,7 +799,7 @@ internal static class Av1InterEncoder
                         for (int x = 0; x < tw; x++)
                         {
                             int s = src[(py + ty + y) * srcW + px + txo + x];
-                            int p = pred[(ty + y) * w + txo + x];
+                            int p = pred[predOff + (ty + y) * predStride + txo + x];
                             res[y * tw + x] = s - p;
                             if (x < vw && y < vh) ss += (long)(s - p) * (s - p);
                             recon[y * tw + x] = (ushort)p;
@@ -592,15 +857,24 @@ internal static class Av1InterEncoder
 
         // The mode analysis assumes for the refmvs "mf" flags: GLOBALMV for a zero vector, NEWMV otherwise (the flags
         // only steer temporal projection, which these frames do not use; the written mode re-splats the exact value).
-        private static int InterModeFor(Leaf leaf) =>
-            leaf.Mv.X == 0 && leaf.Mv.Y == 0 ? (int)Av1InterPredMode.GlobalMv : (int)Av1InterPredMode.NewMv;
+        private static int InterModeFor(Leaf leaf) => leaf.Ref1 >= 0
+            ? (leaf.Mv.X == 0 && leaf.Mv.Y == 0 && leaf.Mv1.X == 0 && leaf.Mv1.Y == 0 ? (int)Av1CompInterPredMode.GlobalGlobal : (int)Av1CompInterPredMode.NewNew)
+            : leaf.Mv.X == 0 && leaf.Mv.Y == 0 ? (int)Av1InterPredMode.GlobalMv : (int)Av1InterPredMode.NewMv;
 
         private static Av1RefMvsBlock TemplateFor(Leaf leaf, int interMode)
         {
             int bw4 = Av1Tables.BlockDimensions[leaf.Bs, 0], bh4 = Av1Tables.BlockDimensions[leaf.Bs, 1];
+            if (leaf.Ref1 >= 0)   // dav1d splat_tworef_mv
+                return new Av1RefMvsBlock
+                {
+                    Ref = new Av1RefMvsRefPair { Ref0 = (sbyte)(leaf.Ref + 1), Ref1 = (sbyte)(leaf.Ref1 + 1) },
+                    Mv = new Av1RefMvsMvPair { Mv0 = leaf.Mv, Mv1 = leaf.Mv1 },
+                    Bs = (byte)leaf.Bs,
+                    Mf = (byte)((interMode == (int)Av1CompInterPredMode.GlobalGlobal ? 1 : 0) | (((1 << interMode) & 0xbc) != 0 ? 2 : 0)),
+                };
             return new Av1RefMvsBlock
             {
-                Ref = new Av1RefMvsRefPair { Ref0 = 1, Ref1 = -1 },
+                Ref = new Av1RefMvsRefPair { Ref0 = (sbyte)(leaf.Ref + 1), Ref1 = -1 },
                 Mv = new Av1RefMvsMvPair { Mv0 = leaf.Mv },
                 Bs = (byte)leaf.Bs,
                 Mf = (byte)((interMode == (int)Av1InterPredMode.GlobalMv && Math.Min(bw4, bh4) >= 2 ? 1 : 0) |
@@ -680,82 +954,117 @@ internal static class Av1InterEncoder
             int cbx4 = bx4 >> SsX, cby4 = by4 >> SsY, cbw4 = (bw4 + SsX) >> SsX, cbh4 = (bh4 + SsY) >> SsY;
             var m = cdf.Mode;
 
-            // skip (inter frame), then is_inter, then the single reference LAST.
+            // skip (inter frame), then is_inter, then the single reference (read_ref_frames).
             int sctx = above.Skip[bx4] + left.Skip[by4];
             msac.EncodeBoolAdapt(cdf.GetSkipCdf(sctx), leaf.Skip ? 1u : 0u);
             int ictx = Av1Decode.GetIntraCtx(above, left, by4, bx4, haveTop, haveLeft);
             msac.EncodeBoolAdapt(cdf.GetIntraCdf(ictx), 1);   // is_inter
-            msac.EncodeBoolAdapt(m.Ref[Av1Decode.GetRefCtx(above, left, by4, bx4, haveTop, haveLeft)], 0);
-            msac.EncodeBoolAdapt(m.Ref[2 * 3 + Av1Decode.GetFwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)], 0);
-            msac.EncodeBoolAdapt(m.Ref[3 * 3 + Av1Decode.GetFwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)], 0);
-
-            Span<Av1RefMvsCandidate> stack = stackalloc Av1RefMvsCandidate[8];
-            Av1RefMvs.FindRefMvs(rt, stack, out int nCand, out int modeCtx, out _,
-                new Av1RefMvsRefPair { Ref0 = 1, Ref1 = -1 }, bs, leaf.Edge, byAbs, bxAbs);
-
-            // The cheapest syntax that reproduces leaf.Mv against this stack.
-            var target = leaf.Mv;
-            var nearest = stack[0].Mv.Mv0;
-            Av1RefMvs.FixMvPrecision(Fh, ref nearest);
-            int mode, drl = 0;
-            if (target.Equals(nearest)) mode = (int)Av1InterPredMode.NearestMv;
+            int mode;
+            if (leaf.Ref1 >= 0) mode = WriteCompound(leaf, bs, bx4, by4, haveTop, haveLeft);
             else
             {
-                mode = -1;
-                int maxDrl = nCand > 2 ? Math.Min(nCand - 1, 3) : 1;
-                for (int d = 1; d <= maxDrl && mode < 0; d++)
+                if (ReferenceSelect && Math.Min(bw4, bh4) > 1)
+                    msac.EncodeBoolAdapt(m.Comp[Av1Decode.GetCompCtx(above, left, by4, bx4, haveTop, haveLeft)], 0);   // single
+                int r = leaf.Ref;
+                msac.EncodeBoolAdapt(m.Ref[Av1Decode.GetRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r >= 4 ? 1u : 0u);
+                if (r >= 4)
                 {
-                    var near = stack[d].Mv.Mv0;
-                    if (d < 2) Av1RefMvs.FixMvPrecision(Fh, ref near);
-                    if (target.Equals(near)) { mode = (int)Av1InterPredMode.NearMv; drl = d; }
+                    msac.EncodeBoolAdapt(m.Ref[1 * 3 + Av1Decode.GetBwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r == 6 ? 1u : 0u);
+                    if (r != 6) msac.EncodeBoolAdapt(m.Ref[5 * 3 + Av1Decode.GetBwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)], (uint)(r - 4));
                 }
-                if (mode < 0 && target.X == 0 && target.Y == 0) mode = (int)Av1InterPredMode.GlobalMv;
-                if (mode < 0) mode = (int)Av1InterPredMode.NewMv;
-            }
-
-            if (mode == (int)Av1InterPredMode.NewMv)
-            {
-                msac.EncodeBoolAdapt(m.NewmvMode[modeCtx & 7], 0);
-                // Reference MV: the stack entry (DRL) with the cheapest residual that keeps quarter-pel parity.
-                int drls = nCand > 1 ? Math.Min(nCand, 3) : 1;
-                double bestBits = double.MaxValue;
-                Av1MotionVector refMv = default;
-                for (int d = 0; d < drls; d++)
-                {
-                    var r = stack[nCand > 1 ? d : 0].Mv.Mv0;
-                    if (nCand <= 1) Av1RefMvs.FixMvPrecision(Fh, ref r);
-                    if (((target.X - r.X) & 1) != 0 || ((target.Y - r.Y) & 1) != 0) continue;
-                    double b = MvBits(target, r) + d;
-                    if (b < bestBits) { bestBits = b; refMv = r; drl = d; }
-                }
-                if (bestBits == double.MaxValue) throw new InvalidOperationException("No quarter-pel reference MV for NEWMV.");
-                if (nCand > 1)
-                {
-                    msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 0)], drl >= 1 ? 1u : 0u);
-                    if (drl >= 1 && nCand > 2)
-                        msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 1)], drl >= 2 ? 1u : 0u);
-                }
-                WriteMvResidual(target, refMv);
-            }
-            else
-            {
-                msac.EncodeBoolAdapt(m.NewmvMode[modeCtx & 7], 1);
-                if (mode == (int)Av1InterPredMode.GlobalMv)
-                    msac.EncodeBoolAdapt(m.GlobalmvMode[(modeCtx >> 3) & 1], 0);
                 else
                 {
-                    msac.EncodeBoolAdapt(m.GlobalmvMode[(modeCtx >> 3) & 1], 1);
-                    if (mode == (int)Av1InterPredMode.NearMv)
+                    msac.EncodeBoolAdapt(m.Ref[2 * 3 + Av1Decode.GetFwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r >= 2 ? 1u : 0u);
+                    if (r >= 2) msac.EncodeBoolAdapt(m.Ref[4 * 3 + Av1Decode.GetFwdRef2Ctx(above, left, by4, bx4, haveTop, haveLeft)], (uint)(r - 2));
+                    else msac.EncodeBoolAdapt(m.Ref[3 * 3 + Av1Decode.GetFwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)], (uint)r);
+                }
+
+                Span<Av1RefMvsCandidate> stack = stackalloc Av1RefMvsCandidate[8];
+                Av1RefMvs.FindRefMvs(rt, stack, out int nCand, out int modeCtx, out _,
+                    new Av1RefMvsRefPair { Ref0 = (sbyte)(r + 1), Ref1 = -1 }, bs, leaf.Edge, byAbs, bxAbs);
+
+                // The cheapest syntax that reproduces leaf.Mv against this stack.
+                var target = leaf.Mv;
+                var nearest = stack[0].Mv.Mv0;
+                Av1RefMvs.FixMvPrecision(Fh, ref nearest);
+                int drl = 0;
+                if (target.Equals(nearest)) mode = (int)Av1InterPredMode.NearestMv;
+                else
+                {
+                    mode = -1;
+                    int maxDrl = nCand > 2 ? Math.Min(nCand - 1, 3) : 1;
+                    for (int d = 1; d <= maxDrl && mode < 0; d++)
                     {
-                        msac.EncodeBoolAdapt(m.RefmvMode[(modeCtx >> 4) & 15], 1);
-                        if (nCand > 2)
-                        {
-                            msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 1)], drl >= 2 ? 1u : 0u);
-                            if (drl >= 2 && nCand > 3)
-                                msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 2)], drl >= 3 ? 1u : 0u);
-                        }
+                        var near = stack[d].Mv.Mv0;
+                        if (d < 2) Av1RefMvs.FixMvPrecision(Fh, ref near);
+                        if (target.Equals(near)) { mode = (int)Av1InterPredMode.NearMv; drl = d; }
                     }
-                    else msac.EncodeBoolAdapt(m.RefmvMode[(modeCtx >> 4) & 15], 0);
+                    if (mode < 0 && target.X == 0 && target.Y == 0) mode = (int)Av1InterPredMode.GlobalMv;
+                    if (mode < 0) mode = (int)Av1InterPredMode.NewMv;
+                }
+
+                if (mode == (int)Av1InterPredMode.NewMv)
+                {
+                    msac.EncodeBoolAdapt(m.NewmvMode[modeCtx & 7], 0);
+                    // Reference MV: the stack entry (DRL) with the cheapest residual that keeps quarter-pel parity.
+                    int drls = nCand > 1 ? Math.Min(nCand, 3) : 1;
+                    double bestBits = double.MaxValue;
+                    Av1MotionVector refMv = default;
+                    for (int d = 0; d < drls; d++)
+                    {
+                        var rm = stack[nCand > 1 ? d : 0].Mv.Mv0;
+                        if (nCand <= 1) Av1RefMvs.FixMvPrecision(Fh, ref rm);
+                        if (((target.X - rm.X) & 1) != 0 || ((target.Y - rm.Y) & 1) != 0) continue;
+                        double b = MvBits(target, rm) + d;
+                        if (b < bestBits) { bestBits = b; refMv = rm; drl = d; }
+                    }
+                    if (bestBits == double.MaxValue) throw new InvalidOperationException("No quarter-pel reference MV for NEWMV.");
+                    if (nCand > 1)
+                    {
+                        msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 0)], drl >= 1 ? 1u : 0u);
+                        if (drl >= 1 && nCand > 2)
+                            msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 1)], drl >= 2 ? 1u : 0u);
+                    }
+                    WriteMvResidual(target, refMv);
+                }
+                else
+                {
+                    msac.EncodeBoolAdapt(m.NewmvMode[modeCtx & 7], 1);
+                    if (mode == (int)Av1InterPredMode.GlobalMv)
+                        msac.EncodeBoolAdapt(m.GlobalmvMode[(modeCtx >> 3) & 1], 0);
+                    else
+                    {
+                        msac.EncodeBoolAdapt(m.GlobalmvMode[(modeCtx >> 3) & 1], 1);
+                        if (mode == (int)Av1InterPredMode.NearMv)
+                        {
+                            msac.EncodeBoolAdapt(m.RefmvMode[(modeCtx >> 4) & 15], 1);
+                            if (nCand > 2)
+                            {
+                                msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 1)], drl >= 2 ? 1u : 0u);
+                                if (drl >= 2 && nCand > 3)
+                                    msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 2)], drl >= 3 ? 1u : 0u);
+                            }
+                        }
+                        else msac.EncodeBoolAdapt(m.RefmvMode[(modeCtx >> 4) & 15], 0);
+                    }
+                }
+            }
+
+            // Transform size (read_vartx_tree): the split tree for a coded block, the block size for a skipped one.
+            int maxTx = Av1Tables.MaxTxfmSizeForBlockSize[bs, 0];
+            if (UseVarTx)
+            {
+                if (leaf.Skip)
+                {
+                    Av1BlockContextManaged.Fill(above.Tx, bx4, bw4, (sbyte)Av1Tables.BlockDimensions[bs, 2]);
+                    Av1BlockContextManaged.Fill(left.Tx, by4, bh4, (sbyte)Av1Tables.BlockDimensions[bs, 3]);
+                }
+                else
+                {
+                    ref readonly var mt = ref Av1Tables.TxfmDimensions[maxTx];
+                    for (int y = 0, yOff = 0; y < bh4; y += mt.H, yOff++)
+                        for (int x = 0, xOff = 0; x < bw4; x += mt.W, xOff++)
+                            WriteTxTree(leaf, maxTx, 0, xOff, yOff, bxAbs + x, byAbs + y);
                 }
             }
 
@@ -783,13 +1092,13 @@ internal static class Av1InterEncoder
                 for (int initY = 0; initY < bh4; initY += 16)
                     for (int initX = 0; initX < bw4; initX += 16)
                     {
-                        for (int y = initY; y < Math.Min(h4, initY + 16); y += yt.H)
-                            for (int x = initX; x < Math.Min(w4, initX + 16); x += yt.W)
-                            {
-                                int[] lv = leaf.LumaLevels[(y / yt.H) * ntw + x / yt.W];
-                                WriteCoefs(ytx, bs, 0, lv, above.LCoef, bx4 + x, left.LCoef, by4 + y,
-                                    Math.Min(yt.W, Bw - (bxAbs + x)), Math.Min(yt.H, Bh - (byAbs + y)));
-                            }
+                        int yOffC = initY != 0 ? 1 : 0;
+                        for (int y = initY; y < Math.Min(h4, initY + 16); y += yt.H, yOffC++)
+                        {
+                            int xOffC = initX != 0 ? 1 : 0;
+                            for (int x = initX; x < Math.Min(w4, initX + 16); x += yt.W, xOffC++)
+                                WriteCoefTree(leaf, bs, ytx, 0, xOffC, yOffC, bxAbs + x, byAbs + y);
+                        }
                         if (hasChroma)
                         {
                             int nctw = cbw4 / uvt.W;
@@ -812,16 +1121,17 @@ internal static class Av1InterEncoder
             }
 
             // Context update (DecodeBlock, inter branch).
+            byte compType = leaf.Ref1 >= 0 ? (byte)Av1CompInterType.Average : (byte)0;
             for (int i = 0; i < bw4; i++)
             {
-                above.Mode[bx4 + i] = (byte)mode; above.CompType[bx4 + i] = 0; above.Ref0[bx4 + i] = 0; above.Ref1[bx4 + i] = -1;
+                above.Mode[bx4 + i] = (byte)mode; above.CompType[bx4 + i] = compType; above.Ref0[bx4 + i] = (sbyte)leaf.Ref; above.Ref1[bx4 + i] = (sbyte)leaf.Ref1;
                 above.Filter0[bx4 + i] = Av1Tables.FilterDir[0, 0]; above.Filter1[bx4 + i] = Av1Tables.FilterDir[0, 1];
                 above.Intra[bx4 + i] = 0; above.Skip[bx4 + i] = leaf.Skip ? (byte)1 : (byte)0; above.SkipMode[bx4 + i] = 0;
                 above.SegPred[bx4 + i] = 0; above.PalSz[bx4 + i] = 0; above.TxIntra[bx4 + i] = (sbyte)Av1Tables.BlockDimensions[bs, 2];
             }
             for (int j = 0; j < bh4; j++)
             {
-                left.Mode[by4 + j] = (byte)mode; left.CompType[by4 + j] = 0; left.Ref0[by4 + j] = 0; left.Ref1[by4 + j] = -1;
+                left.Mode[by4 + j] = (byte)mode; left.CompType[by4 + j] = compType; left.Ref0[by4 + j] = (sbyte)leaf.Ref; left.Ref1[by4 + j] = (sbyte)leaf.Ref1;
                 left.Filter0[by4 + j] = Av1Tables.FilterDir[0, 0]; left.Filter1[by4 + j] = Av1Tables.FilterDir[0, 1];
                 left.Intra[by4 + j] = 0; left.Skip[by4 + j] = leaf.Skip ? (byte)1 : (byte)0; left.SkipMode[by4 + j] = 0;
                 left.SegPred[by4 + j] = 0; left.PalSz[by4 + j] = 0; left.TxIntra[by4 + j] = (sbyte)Av1Tables.BlockDimensions[bs, 3];
@@ -836,6 +1146,105 @@ internal static class Av1InterEncoder
             var tmpl = TemplateFor(leaf, mode);
             int r0 = (byAbs & 31) + 5;
             Av1RefMvs.SplatMv(rt.R, r0, in tmpl, bxAbs, bw4, bh4);
+        }
+
+        // comp_mode = 1, the bidirectional reference pair, the compound inter mode + DRL and the NEWMV halves
+        // (read_ref_frames / DecodeBlockInter compound branch). Returns the compound mode (the context's Mode byte).
+        private int WriteCompound(Leaf leaf, int bs, int bx4, int by4, bool haveTop, bool haveLeft)
+        {
+            var m = cdf.Mode;
+            int r0 = leaf.Ref, r1 = leaf.Ref1;
+            msac.EncodeBoolAdapt(m.Comp[Av1Decode.GetCompCtx(above, left, by4, bx4, haveTop, haveLeft)], 1);
+            msac.EncodeBoolAdapt(m.CompDir[Av1Decode.GetCompDirCtx(above, left, by4, bx4, haveTop, haveLeft)], 1);   // bidirectional
+            msac.EncodeBoolAdapt(m.CompFwdRef[0 * 3 + Av1Decode.GetFwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r0 >= 2 ? 1u : 0u);
+            if (r0 >= 2) msac.EncodeBoolAdapt(m.CompFwdRef[2 * 3 + Av1Decode.GetFwdRef2Ctx(above, left, by4, bx4, haveTop, haveLeft)], (uint)(r0 - 2));
+            else msac.EncodeBoolAdapt(m.CompFwdRef[1 * 3 + Av1Decode.GetFwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)], (uint)r0);
+            msac.EncodeBoolAdapt(m.CompBwdRef[0 * 3 + Av1Decode.GetBwdRefCtx(above, left, by4, bx4, haveTop, haveLeft)], r1 == 6 ? 1u : 0u);
+            if (r1 != 6) msac.EncodeBoolAdapt(m.CompBwdRef[1 * 3 + Av1Decode.GetBwdRef1Ctx(above, left, by4, bx4, haveTop, haveLeft)], (uint)(r1 - 4));
+
+            Span<Av1RefMvsCandidate> stack = stackalloc Av1RefMvsCandidate[8];
+            Av1RefMvs.FindRefMvs(rt, stack, out int nCand, out int cctx, out _,
+                new Av1RefMvsRefPair { Ref0 = (sbyte)(r0 + 1), Ref1 = (sbyte)(r1 + 1) }, bs, leaf.Edge, leaf.By, leaf.Bx);
+            var (mode, drl, _) = CompSyntax(stack, nCand, cctx, leaf.Mv, leaf.Mv1);
+            if (mode < 0) throw new InvalidOperationException("No compound syntax for the chosen motion vectors.");
+            msac.EncodeSymbolAdapt(m.CompInterMode[cctx], mode, (int)Av1CompInterPredMode.Count - 1);
+            int im0 = Av1Tables.CompInterPredModes[mode, 0], im1 = Av1Tables.CompInterPredModes[mode, 1];
+            if (mode == (int)Av1CompInterPredMode.NewNew)
+            {
+                if (nCand > 1)
+                {
+                    msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 0)], drl >= 1 ? 1u : 0u);
+                    if (drl >= 1 && nCand > 2) msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 1)], drl >= 2 ? 1u : 0u);
+                }
+            }
+            else if (im0 == (int)Av1InterPredMode.NearMv || im1 == (int)Av1InterPredMode.NearMv)
+            {
+                if (nCand > 2)
+                {
+                    msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 1)], drl >= 2 ? 1u : 0u);
+                    if (drl >= 2 && nCand > 3) msac.EncodeBoolAdapt(m.DrlBit[Av1RefMvs.GetDrlContext(stack, 2)], drl >= 3 ? 1u : 0u);
+                }
+            }
+            if (im0 == (int)Av1InterPredMode.NewMv) WriteMvResidual(leaf.Mv, stack[drl].Mv.Mv0);
+            if (im1 == (int)Av1InterPredMode.NewMv) WriteMvResidual(leaf.Mv1, stack[drl].Mv.Mv1);
+            return mode;
+        }
+
+        // dav1d read_tx_tree, encoder side: the split flag (below depth 2, above 4x4), the recursion into sub-transforms
+        // that start inside the frame, and the leaf's log2 size into the above / left tx contexts.
+        private void WriteTxTree(Leaf leaf, int tx, int depth, int xOff, int yOff, int bx, int by)
+        {
+            int bx4 = bx & 31, by4 = by & 31;
+            ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+            int txw = tDim.Lw, txh = tDim.Lh;
+            bool isSplit = false;
+            if (depth < 2 && tx > (int)Av1TxSize.Tx4x4)
+            {
+                int cat = 2 * ((int)Av1TxSize.Tx64x64 - tDim.Max) - depth;
+                int a = above.Tx[bx4] < txw ? 1 : 0, l = left.Tx[by4] < txh ? 1 : 0;
+                isSplit = ((depth == 0 ? leaf.Split0 : leaf.Split1) >> (yOff * 4 + xOff) & 1) != 0;
+                msac.EncodeBoolAdapt(cdf.GetTxPartCdf(cat, a + l), isSplit ? 1u : 0u);
+            }
+            if (isSplit && tDim.Max > (int)Av1TxSize.Tx8x8)
+            {
+                int sub = tDim.Sub;
+                ref readonly var sd = ref Av1Tables.TxfmDimensions[sub];
+                WriteTxTree(leaf, sub, depth + 1, xOff * 2, yOff * 2, bx, by);
+                if (txw >= txh && bx + sd.W < Bw) WriteTxTree(leaf, sub, depth + 1, xOff * 2 + 1, yOff * 2, bx + sd.W, by);
+                if (txh >= txw && by + sd.H < Bh)
+                {
+                    WriteTxTree(leaf, sub, depth + 1, xOff * 2, yOff * 2 + 1, bx, by + sd.H);
+                    if (txw >= txh && bx + sd.W < Bw) WriteTxTree(leaf, sub, depth + 1, xOff * 2 + 1, yOff * 2 + 1, bx + sd.W, by + sd.H);
+                }
+            }
+            else
+            {
+                Av1BlockContextManaged.Fill(above.Tx, bx4, tDim.W, (sbyte)(isSplit ? 0 : txw));
+                Av1BlockContextManaged.Fill(left.Tx, by4, tDim.H, (sbyte)(isSplit ? 0 : txh));
+            }
+        }
+
+        // dav1d read_coef_tree, encoder side: the coefficients of each transform leaf in tree order.
+        private void WriteCoefTree(Leaf leaf, int bs, int tx, int depth, int xOff, int yOff, int bx, int by)
+        {
+            ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+            int txw = tDim.W, txh = tDim.H;
+            int mask = depth == 0 ? leaf.Split0 : depth == 1 ? leaf.Split1 : 0;
+            if (depth < 2 && (mask >> (yOff * 4 + xOff) & 1) != 0)
+            {
+                int sub = tDim.Sub;
+                ref readonly var sd = ref Av1Tables.TxfmDimensions[sub];
+                WriteCoefTree(leaf, bs, sub, depth + 1, xOff * 2, yOff * 2, bx, by);
+                if (txw >= txh && bx + sd.W < Bw) WriteCoefTree(leaf, bs, sub, depth + 1, xOff * 2 + 1, yOff * 2, bx + sd.W, by);
+                if (txh >= txw && by + sd.H < Bh)
+                {
+                    WriteCoefTree(leaf, bs, sub, depth + 1, xOff * 2, yOff * 2 + 1, bx, by + sd.H);
+                    if (txw >= txh && bx + sd.W < Bw) WriteCoefTree(leaf, bs, sub, depth + 1, xOff * 2 + 1, yOff * 2 + 1, bx + sd.W, by + sd.H);
+                }
+                return;
+            }
+            WriteCoefs(tx, bs, 0, leaf.LumaTx[(bx, by)], above.LCoef, bx & 31, left.LCoef, by & 31,
+                Math.Min(txw, Bw - bx), Math.Min(txh, Bh - by));
         }
 
         private static void FillCoefCtx(byte[] arr, int off, int n, byte v)

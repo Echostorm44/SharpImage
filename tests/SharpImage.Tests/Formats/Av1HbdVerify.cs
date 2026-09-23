@@ -1623,6 +1623,38 @@ public sealed class Av1HbdVerify
                     }
                     continue;
                 }
+                if (t[0] == "obuq")
+                {
+                    // obuq <stream.obu> <sizes>: every frame's base_q_idx (hidden frames too; 's' shown, 'h' hidden,
+                    // 'x' show_existing), one OBU at a time.
+                    byte[] obu = File.ReadAllBytes(t[1]);
+                    var sizes = t[2].Split(',').Select(int.Parse).ToArray();
+                    var dec = new Av1Decoder();
+                    int off = 0;
+                    for (int si = 0; si < sizes.Length; si++)
+                    {
+                        int end = off + sizes[si], p = off;
+                        log.Append('|');
+                        while (p < end)
+                        {
+                            int start = p, hb = obu[p++];
+                            if ((hb & 4) != 0) p++;
+                            ulong len = 0; int sh = 0;
+                            while (true) { byte x = obu[p++]; len |= (ulong)(x & 0x7f) << sh; sh += 7; if (x < 0x80) break; }
+                            p += (int)len;
+                            int type = (hb >> 3) & 15;
+                            using var f = dec.Decode(obu.AsSpan(start, p - start), si, si == 0 && type == 1);
+                            if (type is 3 or 6)
+                            {
+                                var fh = dec.CurrentFrameHeader;
+                                log.Append(fh.ShowExistingFrame ? "x " : $"{(fh.ShowFrame ? 's' : 'h')}{fh.QuantBaseQIdx} ");
+                            }
+                        }
+                        off = end;
+                    }
+                    log.AppendLine();
+                    continue;
+                }
                 if (t[0] == "obudec")
                 {
                     // obudec <stream.obu> <sizes (comma list)> <out.yuv>: decode sample by sample, write every frame's
@@ -1708,6 +1740,16 @@ public sealed class Av1HbdVerify
                     if (t.Length > 8) so.BitDepth = int.Parse(t[8]);
                     if (t.Length > 9) so.ChromaSubsampling = Enum.Parse<AvifChromaSubsampling>(t[9]);
                     if (t.Length > 11) so.TileColumnsLog2 = int.Parse(t[11]);
+                    // t[12]: tuning overrides "Type.Field=value;..." (internal static fields, e.g. HeifCoder.SequenceArfQuantizerScale=0.5)
+                    if (t.Length > 12 && t[12] != "-")
+                        foreach (var kv in t[12].Split(';'))
+                        {
+                            var (lhs, val) = (kv[..kv.IndexOf('=')], kv[(kv.IndexOf('=') + 1)..]);
+                            var typeName = lhs[..lhs.LastIndexOf('.')];
+                            var type = typeof(HeifCoder).Assembly.GetTypes().First(x => x.Name == typeName);
+                            var fld = type.GetField(lhs[(lhs.LastIndexOf('.') + 1)..], System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public)!;
+                            fld.SetValue(null, Convert.ChangeType(val, fld.FieldType, System.Globalization.CultureInfo.InvariantCulture));
+                        }
                     var sw2 = System.Diagnostics.Stopwatch.StartNew();
                     byte[] avif = HeifCoder.EncodeAvifSequence(seq, so);
                     File.WriteAllBytes(t[1], avif);
