@@ -230,6 +230,11 @@ public sealed class AvifEncodeOptions
     /// so upsampled colour edges stay crisp. Applies to 4:2:0 with the kr/kb matrices; ignored otherwise.</summary>
     public bool SharpYuv { get; set; }
 
+    /// <summary>libavif avifRGBImage.avoidLibYUV: convert RGB to YUV with libavif's built-in float path everywhere
+    /// instead of libyuv's 8-bit fixed-point converters (which libavif, and so the default here, uses for 8-bit RGB to
+    /// 8-bit BT.601 YUV). More precise, slower, and no longer identical to avifenc's output.</summary>
+    public bool AvoidLibyuv { get; set; }
+
     /// <summary>Store 16-bit samples through a Sample Transform (avifenc -d 8,8 / 12,4 / 12,8): readers without Sample
     /// Transform support see the base image, this decoder (and avifdec --sato) the full 16 bits.</summary>
     public AvifBitDepthExtension BitDepthExtension { get; set; }
@@ -476,6 +481,8 @@ public static partial class HeifCoder
     // avifImageYUVToRGB does for an RGB image of that depth) and stores that value scaled to 16 bits — so code working
     // on libavif's native-depth RGB (gain map tone mapping) sees exactly its samples.
     [ThreadStatic] private static bool t_nativeDepthRgb;
+    // AvifEncodeOptions.AvoidLibyuv for the encode running on this thread.
+    [ThreadStatic] private static bool t_avoidLibyuv;
 
     // libavif avifCodecDecodeInputFillFromDecoderItem: an item is progressive when it has 'a1lx' and no 'lsel' selecting
     // a specific layer; its layer count follows from the a1lx sizes (a zero size ends the list; a remainder is the last).
@@ -984,6 +991,14 @@ public static partial class HeifCoder
     public static byte[] EncodeAvif(ImageFrame image, AvifEncodeOptions? options = null)
     {
         options ??= new AvifEncodeOptions();
+        bool prevAvoid = t_avoidLibyuv;
+        t_avoidLibyuv = options.AvoidLibyuv;
+        try { return EncodeAvifEntry(image, options); }
+        finally { t_avoidLibyuv = prevAvoid; }
+    }
+
+    private static byte[] EncodeAvifEntry(ImageFrame image, AvifEncodeOptions options)
+    {
         if (options.TargetSize is { } target)
             return SearchTargetSize(options, target, o => EncodeAvif(image, o));
         if (options.BitDepthExtension != AvifBitDepthExtension.None)
@@ -1058,8 +1073,9 @@ public static partial class HeifCoder
             var (r, g, b, a) = planes[i];
             ushort[] y;
             ushort[]? u = null, v = null;
-            if (mono) y = anyColour ? MonoLumaLibavif(r, g, b, w, h, bd, color, sources[i].Depth is >= 1 and <= 16 ? sources[i].Depth : 16) : GreyLuma(r, w, h, bd, color);
-            else { RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out y, out var u0, out var v0); u = u0; v = v0; }
+            if (mono) y = anyColour ? MonoLumaLibavif(r, g, b, w, h, bd, color, sources[i].Depth is >= 1 and <= 16 ? sources[i].Depth : 16)
+                : GreyLumaLibavif(sources[i], bd, color.FullRange, SourceRgbDepth(sources[i]), false);
+            else { RgbToYuvLibavif(sources[i], bd, layout, color, SourceRgbDepth(sources[i]), false, r, g, b, out y, out var u0, out var v0); u = u0; v = v0; }
             ushort[]? alpha = anyTranslucent ? a ?? Enumerable.Repeat((ushort)max, w * h).ToArray() : null;
             int lw = (int)(((long)w * l.ScaleNumerator + l.ScaleDenominator - 1) / l.ScaleDenominator);
             int lh = (int)(((long)h * l.ScaleNumerator + l.ScaleDenominator - 1) / l.ScaleDenominator);
@@ -1203,7 +1219,7 @@ public static partial class HeifCoder
         if (color.Matrix == 0 && layout != Av1.Av1PixelLayout.I444)
             throw new ArgumentException("The identity matrix (MatrixCoefficients 0) requires 4:4:4 chroma.", nameof(options));
 
-        // 8-bit 4:2:0 BT.601 full range keeps the original byte pipeline (RgbToI420); everything else goes through
+        // 8-bit 4:2:0 BT.601 full range keeps the original byte pipeline (EncodeAvif8); everything else goes through
         // the general matrix/range/layout path.
         bool bt601Full = color.Matrix is 5 or 6 && color.FullRange;
         var extras = AvifExtras(image, options);
@@ -1244,6 +1260,14 @@ public static partial class HeifCoder
     public static byte[] EncodeAvifSequence(ImageSequence sequence, AvifEncodeOptions? options = null)
     {
         options ??= new AvifEncodeOptions();
+        bool prevAvoid = t_avoidLibyuv;
+        t_avoidLibyuv = options.AvoidLibyuv;
+        try { return EncodeAvifSequenceEntry(sequence, options); }
+        finally { t_avoidLibyuv = prevAvoid; }
+    }
+
+    private static byte[] EncodeAvifSequenceEntry(ImageSequence sequence, AvifEncodeOptions options)
+    {
         if (options.TargetSize is { } target)
             return SearchTargetSize(options, target, o => EncodeAvifSequence(sequence, o));
         if (sequence.Count == 0) throw new ArgumentException("The sequence has no frames.", nameof(sequence));
@@ -1312,8 +1336,10 @@ public static partial class HeifCoder
         };
         using (Av1.Av1ObuWriter.UseLayers(ls))
         {
+            int frameIndex = 0;
             foreach (var (r, g, b, a0) in frames)
             {
+                var frameImage = sequence.Frames[frameIndex++];
                 ushort[]? alpha = hasAlpha ? a0 ?? Enumerable.Repeat((ushort)max, w * h).ToArray() : null;
                 if (extras.Premultiplied && alpha != null)
                     for (int i = 0; i < r.Length; i++)
@@ -1326,14 +1352,11 @@ public static partial class HeifCoder
                 if (mono && forceMono && anyColour)
                     yP = MonoLumaLibavif(r, g, b, w, h, bd, color, first.Depth is >= 1 and <= 16 ? first.Depth : 16);
                 else if (mono)
-                {
-                    yP = new ushort[w * h];
-                    for (int i = 0; i < yP.Length; i++)
-                        yP[i] = (ushort)Math.Clamp((int)Math.Round(color.FullRange ? r[i] : r[i] / max * (219 << (bd - 8)) + (16 << (bd - 8))), 0, max);
-                }
+                    yP = GreyLumaLibavif(frameImage, bd, color.FullRange, SourceRgbDepth(frameImage), extras.Premultiplied && alpha != null);
                 else
                 {
-                    RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out yP, out var u0, out var v0);
+                    RgbToYuvLibavif(frameImage, bd, layout, color, SourceRgbDepth(frameImage), extras.Premultiplied && alpha != null, r, g, b,
+                        out yP, out var u0, out var v0);
                     uP = u0;
                     vP = v0;
                 }
@@ -1623,7 +1646,7 @@ public static partial class HeifCoder
         if (hasAlpha && nonOpaque && alpha != null && forceMono)
         {
             int alphaQIdx = alphaQIdxOverride ?? Math.Clamp(baseQIdx / 2, 4, 255);
-            ushort[] yM = monoLuma ?? GreyLuma(r, w, h, bd, color);
+            ushort[] yM = monoLuma ?? GreyLumaLibavif(image, bd, color.FullRange, SourceRgbDepth(image), extras.Premultiplied);
             if (lossless)
                 return Av1.Av1StillImageEncoder.EncodeAvifLossless(yM, default, default, true, alpha, true, w, h, bd, Av1.Av1PixelLayout.I400,
                     color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color, extras, alphaQIdxOverride ?? 0);
@@ -1640,7 +1663,7 @@ public static partial class HeifCoder
             int alphaQIdx = alphaQIdxOverride ?? Math.Clamp(baseQIdx / 2, 4, 255);
             ushort[] yA, uA0, vA0;
             if (!(sharpYuv && TrySharpYuv(image, r, g, b, w, h, bd, layout, color, out yA, out uA0, out vA0)))
-                RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out yA, out uA0, out vA0);
+                RgbToYuvLibavif(image, bd, layout, color, SourceRgbDepth(image), extras.Premultiplied, r, g, b, out yA, out uA0, out vA0);
             ushort[]? uA = uA0, vA = vA0;
             Denoise(ref yA, ref uA, ref vA, gssX, gssY);
             if (lossless)
@@ -1663,7 +1686,7 @@ public static partial class HeifCoder
             else if (libavifFloatYuv && color.Matrix is not (8 or 16 or 17))
                 RgbToYuvAvifFloat(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0, image.Depth is >= 1 and <= 16 ? image.Depth : 16);
             else
-                RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out yP, out uP0, out vP0);
+                RgbToYuvLibavif(image, bd, layout, color, SourceRgbDepth(image), extras.Premultiplied, r, g, b, out yP, out uP0, out vP0);
             ushort[]? uP = uP0, vP = vP0;
             ScaleYuv(ref yP, ref uP, ref vP, gssX, gssY);
             Denoise(ref yP, ref uP, ref vP, gssX, gssY);
@@ -1677,7 +1700,8 @@ public static partial class HeifCoder
         }
 
         // Grey: 4:0:0 luma (Y = the grey value; limited range maps it into [16, 235] << (bd - 8)).
-        var luma = monoLuma ?? (srcYuv != null ? srcYuv.Planes.Value[0].ToArray() : GreyLuma(r, w, h, bd, color));
+        var luma = monoLuma ?? (srcYuv != null ? srcYuv.Planes.Value[0].ToArray()
+            : GreyLumaLibavif(image, bd, color.FullRange, SourceRgbDepth(image), extras.Premultiplied));
         {
             ushort[]? su = null, sv = null;
             ScaleYuv(ref luma, ref su, ref sv, 1, 1);
@@ -1988,8 +2012,7 @@ public static partial class HeifCoder
         bool hasAlpha = image.HasAlpha;
         int alphaOff = channels - 1; // alpha is the last channel (idx 1 for gray+A, 3 for RGBA)
 
-        // Extract tightly-packed RGB and luma; detect whether the image has real colour and non-opaque alpha.
-        var rgb = new byte[w * h * 3];
+        // Extract luma; detect whether the image has real colour and non-opaque alpha.
         var luma = new byte[w * h];
         var alpha = hasAlpha ? new byte[w * h] : null;
         bool colour = false;
@@ -2008,10 +2031,6 @@ public static partial class HeifCoder
                     colour = true;
                 }
 
-                int d = (y * w + x) * 3;
-                rgb[d] = (byte)r;
-                rgb[d + 1] = (byte)g;
-                rgb[d + 2] = (byte)b;
                 luma[y * w + x] = (byte)r;
                 if (alpha != null)
                 {
@@ -2030,7 +2049,7 @@ public static partial class HeifCoder
         if (hasAlpha && nonOpaque && alpha != null)
         {
             int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
-            RgbToI420(rgb, w, h, out byte[] yA, out byte[] uA, out byte[] vA);
+            I420Libavif(image, color, out byte[] yA, out byte[] uA, out byte[] vA);
             return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx, color, extras);
         }
 
@@ -2039,7 +2058,7 @@ public static partial class HeifCoder
             // Colour: single-block I420 for <=64px, multi-superblock I420 for larger frames. I420 chroma is
             // ceil(w/2) x ceil(h/2) — odd luma dimensions are supported (the last chroma sample averages the
             // partial 2x2 group at the edge).
-            RgbToI420(rgb, w, h, out byte[] yP, out byte[] uP, out byte[] vP);
+            I420Libavif(image, color, out byte[] yP, out byte[] uP, out byte[] vP);
             if (multiSb)
                 return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx, color, extras);
             if ((w & 1) != 0 || (h & 1) != 0)
@@ -2159,39 +2178,19 @@ public static partial class HeifCoder
 
     // BT.601 full-range RGB→YUV (the inverse of ConvertYuvToRgb's full-range BT.601 path) with I420 chroma
     // subsampling: w x h luma, (w/2) x (h/2) U and V (2x2 box average). Requires even dimensions.
-    private static void RgbToI420(byte[] rgb, int w, int h, out byte[] y, out byte[] u, out byte[] v)
+    // 8-bit 4:2:0 planes as libavif converts them (libyuv J420 / I420 for 8-bit sources, else its float path).
+    private static void I420Libavif(ImageFrame image, Av1.Av1ObuWriter.Av1ColorDesc color, out byte[] y, out byte[] u, out byte[] v)
     {
-        int cw = (w + 1) >> 1, chh = (h + 1) >> 1;   // ceil — odd dims keep a partial edge chroma sample
-        y = new byte[w * h];
-        u = new byte[cw * chh];
-        v = new byte[cw * chh];
-        var uf = new double[cw * chh];
-        var vf = new double[cw * chh];
-        var cnt = new int[cw * chh];
-
-        for (int yy = 0; yy < h; yy++)
+        RgbToYuvLibavif(image, 8, Av1.Av1PixelLayout.I420, color, SourceRgbDepth(image), false, [], [], [], out var y16, out var u16, out var v16);
+        static byte[] Narrow(ushort[] p)
         {
-            for (int xx = 0; xx < w; xx++)
-            {
-                int o = (yy * w + xx) * 3;
-                double r = rgb[o], g = rgb[o + 1], b = rgb[o + 2];
-                double luma = 0.299 * r + 0.587 * g + 0.114 * b;
-                double cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0;
-                double cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0;
-                y[yy * w + xx] = (byte)Math.Clamp((int)Math.Round(luma), 0, 255);
-                int ci = (yy >> 1) * cw + (xx >> 1);
-                uf[ci] += cb;
-                vf[ci] += cr;
-                cnt[ci]++;
-            }
+            var r = new byte[p.Length];
+            for (int i = 0; i < p.Length; i++) r[i] = (byte)p[i];
+            return r;
         }
-
-        for (int i = 0; i < cw * chh; i++)
-        {
-            int n = cnt[i] > 0 ? cnt[i] : 1;   // edge groups may have 1 or 2 samples for odd dims
-            u[i] = (byte)Math.Clamp((int)Math.Round(uf[i] / n), 0, 255);
-            v[i] = (byte)Math.Clamp((int)Math.Round(vf[i] / n), 0, 255);
-        }
+        y = Narrow(y16);
+        u = Narrow(u16);
+        v = Narrow(v16);
     }
 
     #region AV1 Intra Frame Codec

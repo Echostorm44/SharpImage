@@ -49,7 +49,10 @@ public static partial class HeifCoder
                 Av1.Av1PixelLayout.I400 => AvifChromaSubsampling.Yuv400,
                 _ => AvifChromaSubsampling.Yuv444,
             };
-        return EncodeAvif(newBase, o);
+        bool prev = t_rgbaSource;
+        t_rgbaSource = true;   // ChangeBase converts an RGBA avifRGBImage
+        try { return EncodeAvif(newBase, o); }
+        finally { t_rgbaSource = prev; }
     }
 
     // avifgainmaputil ChangeBase: the alternate rendition as the new base, the old base described as the alternate.
@@ -140,14 +143,16 @@ public static partial class HeifCoder
         return frame;
     }
 
-    // avifImageRGBToYUV then avifImageYUVToRGB at 8 bits (the round trip avifgainmaputil convert puts a JPEG's
-    // libjpeg RGB through before applying the gain map).
+    // avifImageRGBToYUV then avifImageYUVToRGB at 8 bits: the round trip avifgainmaputil convert puts a JPEG's
+    // libjpeg RGB through before applying the gain map.
     private static ImageFrame RoundTripYuv(ImageFrame rgb, CicpInfo cicp, Av1.Av1PixelLayout layout)
     {
         int w = (int)rgb.Columns, h = (int)rgb.Rows;
-        var color = new Av1.Av1ObuWriter.Av1ColorDesc(cicp.ColorPrimaries, cicp.TransferCharacteristics, cicp.MatrixCoefficients, cicp.FullRange);
+        // The JPEG is read with the matrix still unspecified: no libyuv route, libavif's float path with its default
+        // (BT.601) coefficients; the planes are then labelled with the final matrix for the conversion back.
+        var color = new Av1.Av1ObuWriter.Av1ColorDesc(cicp.ColorPrimaries, cicp.TransferCharacteristics, 2, cicp.FullRange);
         ReadRgbPlanes(rgb, 8, out var r, out var g, out var b, out _, out _, out _);
-        RgbToYuvAvif(r, g, b, w, h, 8, layout, color, out var y, out var u, out var v);
+        RgbToYuvLibavif(rgb, 8, layout, color, 8, false, r, g, b, out var y, out var u, out var v);
         static byte[] Narrow(ushort[] p) => p.Select(s => (byte)s).ToArray();
         var raw = new JpegRawYuv { Planes = [Narrow(y), Narrow(u), Narrow(v)], Width = w, Height = h, Layout = layout };
         return RgbFromPlanes8(raw, cicp);

@@ -114,17 +114,19 @@ public sealed class AvifJpegGainMapTests
         await Assert.That(Hash(HeifCoder.Decode(avif), 3)).IsEqualTo("71afa306f20dd69a");
     }
 
-    // avifgainmaputil convert --swap-base: colour properties, content light level and gain map metadata match libavif.
+    // avifgainmaputil convert --swap-base: pixels, colour properties, content light level and gain map metadata match
+    // libavif (base hash: avifdec's 16-bit PNG as RGBA, alpha 65535).
     [Test]
-    [Arguments("libavif_paris_exif_xmp_gainmap_littleendian.jpg", 1414, 285,
+    [Arguments("libavif_paris_exif_xmp_gainmap_littleendian.jpg", "c87b07b11d0227ba", 1414, 285,
         "0000000000800000000700000002000000000000000100000000000000010000000700000002000000010000000100000000000000010000000000000001000000000000000100000012000000050000000100000001000000000000000100000000000000010000000000000001000000250000000a000000010000000100000000000000010000000000000001")]
-    [Arguments("libavif_seine_sdr_different_gainmap_srgb.jpg", 492, 172,
+    [Arguments("libavif_seine_sdr_different_gainmap_srgb.jpg", "d09dd5fa7ca6c6f3", 492, 172,
         "0000000000800000000d0000000a0000000000000001fffc1475000f424000137cf9000f42400001d1b70001e84800000001000000400000000100000040ffff33cf00030d4000137d13000f42400002df3b00030d4000000001000000400000000100000040fffeee490003d09000138011000f4240000703bf0007a12000000001000000400000000100000040")]
-    public async Task SwapBaseFromJpeg_MatchesAvifgainmaputil(string jpg, int maxCll, int maxPall, string tmap)
+    public async Task SwapBaseFromJpeg_MatchesAvifgainmaputil(string jpg, string baseSha, int maxCll, int maxPall, string tmap)
     {
         byte[] avif = HeifCoder.EncodeAvifFromJpeg(File.ReadAllBytes(Asset(jpg)), new AvifEncodeOptions { Quality = 100, QualityGainMap = 100 },
             swapBase: true, ignoreIccProfile: true);
         var d = HeifCoder.Decode(avif);
+        await Assert.That(AvifRgbToYuvTests.Hash16Rgba(d)).IsEqualTo(baseSha);
         await Assert.That(d.Metadata.Cicp).IsEqualTo(new SharpImage.Metadata.CicpInfo(1, 16, 6, true));
         await Assert.That(d.Metadata.ContentLightLevel).IsEqualTo(new SharpImage.Metadata.ContentLightLevel((ushort)maxCll, (ushort)maxPall));
         var gm = HeifCoder.DecodeGainMap(avif)!;
