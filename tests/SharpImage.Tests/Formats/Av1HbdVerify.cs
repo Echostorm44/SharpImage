@@ -1560,10 +1560,15 @@ public sealed class Av1HbdVerify
             if (t.Length < 2) continue;
             try
             {
-                if (t[0] == "rgb")
+                if (t[0] is "rgb" or "read")
                 {
-                    var m = typeof(JpegCoder).GetMethod("ReadLibjpegRgb", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
-                    var f = (ImageFrame)m.Invoke(null, [File.ReadAllBytes(t[1]), 0])!;
+                    ImageFrame f;
+                    if (t[0] == "read") f = JpegCoder.Read(t[1]);
+                    else
+                    {
+                        var m = typeof(JpegCoder).GetMethod("ReadLibjpegRgb", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+                        f = (ImageFrame)m.Invoke(null, [File.ReadAllBytes(t[1]), 0])!;
+                    }
                     var bytes = new byte[f.Columns * f.Rows * 3];
                     for (int y = 0; y < (int)f.Rows; y++)
                     {

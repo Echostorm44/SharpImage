@@ -90,7 +90,7 @@ public static partial class JpegCoder
     private static bool IsGreyJpeg(byte[] jpeg, int start)
     {
         foreach (var (marker, off, len) in ScanSegments(jpeg, start))
-            if (marker is SOF0 or 0xC1 or SOF2 && len >= 6) return jpeg[off + 5] == 1;
+            if (marker is SOF0 or SOF1 or SOF2 && len >= 6) return jpeg[off + 5] == 1;
         return false;
     }
 
@@ -399,17 +399,14 @@ public static partial class JpegCoder
     /// or unusual sampling factors).</summary>
     internal static JpegRawYuv? ReadRawYuv(byte[] jpeg, int start = 0)
     {
-        JpegDctData d;
-        try { d = ReadDctData(new MemoryStream(jpeg, start, jpeg.Length - start)); }
-        catch (Exception) { return null; }
+        var c = ReadComponents(jpeg, start);
+        if (c == null) return null;
         Av1.Av1PixelLayout layout;
-        if (d.ComponentCount == 1) layout = Av1.Av1PixelLayout.I400;
-        else if (d.ComponentCount == 3)
+        if (c.Planes.Length == 1) layout = Av1.Av1PixelLayout.I400;
+        else
         {
-            if (!IsYCbCr(jpeg, start, d)) return null;
-            var c = d.Components;
-            if (c[1].HSample != 1 || c[1].VSample != 1 || c[2].HSample != 1 || c[2].VSample != 1) return null;
-            Av1.Av1PixelLayout? l = (c[0].HSample, c[0].VSample) switch
+            if (c.IsRgb || c.HSamp[1] != 1 || c.VSamp[1] != 1 || c.HSamp[2] != 1 || c.VSamp[2] != 1) return null;
+            Av1.Av1PixelLayout? l = (c.HSamp[0], c.VSamp[0]) switch
             {
                 (1, 1) => Av1.Av1PixelLayout.I444,
                 (2, 1) => Av1.Av1PixelLayout.I422,
@@ -419,29 +416,7 @@ public static partial class JpegCoder
             if (l == null) return null;
             layout = l.Value;
         }
-        else return null;
-
-        var planes = new byte[d.ComponentCount][];
-        Span<byte> block = stackalloc byte[64];
-        for (int ci = 0; ci < d.ComponentCount; ci++)
-        {
-            var comp = d.Components[ci];
-            int pw = (d.Width * comp.HSample + d.MaxHSample - 1) / d.MaxHSample;
-            int ph = (d.Height * comp.VSample + d.MaxVSample - 1) / d.MaxVSample;
-            var plane = new byte[pw * ph];
-            var qt = d.QuantTables[comp.QuantTableIndex];
-            int bw = (pw + 7) / 8, bh = (ph + 7) / 8;
-            for (int by = 0; by < bh; by++)
-                for (int bx = 0; bx < bw; bx++)
-                {
-                    IdctIslow(comp.Blocks[by * comp.BlocksPerRow + bx], qt, block);
-                    for (int y = 0; y < 8 && by * 8 + y < ph; y++)
-                        for (int x = 0; x < 8 && bx * 8 + x < pw; x++)
-                            plane[(by * 8 + y) * pw + bx * 8 + x] = block[y * 8 + x];
-                }
-            planes[ci] = plane;
-        }
-        return new JpegRawYuv { Planes = planes, Width = d.Width, Height = d.Height, Layout = layout };
+        return new JpegRawYuv { Planes = c.Planes, Width = c.Width, Height = c.Height, Layout = layout };
     }
 
     // libjpeg default_decompress_parms for 3 components: JFIF -> YCbCr; Adobe APP14 transform 0 -> RGB (else YCbCr);

@@ -53,7 +53,6 @@ public static partial class HeifCoder
         var raw = JpegCoder.ReadRawYuv(jpeg);
         if (raw != null)
         {
-            CopyPixels(JpegCoder.LibjpegRgb(raw), image);   // libjpeg-turbo's RGB, for whatever cannot copy the planes
             if (!swapBase)
             {
                 AttachJpegPlanes(image, raw);
@@ -124,13 +123,6 @@ public static partial class HeifCoder
         Av1.Av1PixelLayout.I400 => AvifChromaSubsampling.Yuv400,
         _ => AvifChromaSubsampling.Yuv444,
     };
-
-    private static void CopyPixels(ImageFrame src, ImageFrame dst)
-    {
-        int h = (int)dst.Rows, n = (int)dst.Columns * dst.NumberOfChannels;
-        for (int y = 0; y < h; y++) src.GetPixelRow(y)[..n].CopyTo(dst.GetPixelRowForWrite(y));
-        dst.Depth = 8;
-    }
 
     // The source planes to code for this frame, or null when the coded format differs from what they hold.
     private static SourceYuv? SourcePlanesFor(ImageFrame image, int bd, Av1.Av1ObuWriter.Av1ColorDesc color, int w, int h) =>

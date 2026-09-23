@@ -82,28 +82,28 @@ public class JpegDctTests
             }
         }
 
-        bool match = true;
-        for (int y = 0; y < h && match; y++)
+        // Read decodes as libjpeg-turbo does (integer islow IDCT, fixed-point YCbCr tables); this float
+        // reconstruction agrees within rounding, which wrong coefficients would not.
+        int maxDiff = 0;
+        for (int y = 0; y < h; y++)
         {
             var refRow = reference.GetPixelRow(y);
             for (int x = 0; x < w; x++)
             {
-                int yVal = spatial[0][(y * w) + x] + 128;
-                int cb = spatial[1][(y * w) + x];
-                int cr = spatial[2][(y * w) + x];
+                // IDCT outputs are range-limited to 8-bit samples before colour conversion, as in libjpeg.
+                int yVal = Math.Clamp(spatial[0][(y * w) + x] + 128, 0, 255);
+                int cb = Math.Clamp(spatial[1][(y * w) + x], -128, 127);
+                int cr = Math.Clamp(spatial[2][(y * w) + x], -128, 127);
                 int r = Math.Clamp(yVal + (((cr * 91881) + 32768) >> 16), 0, 255);
                 int g = Math.Clamp(yVal - (((cb * 22554) + (cr * 46802) + 32768) >> 16), 0, 255);
                 int b = Math.Clamp(yVal + (((cb * 116130) + 32768) >> 16), 0, 255);
                 int o = x * reference.NumberOfChannels;
-                if (Quantum.ScaleToByte(refRow[o]) != r || Quantum.ScaleToByte(refRow[o + 1]) != g || Quantum.ScaleToByte(refRow[o + 2]) != b)
-                {
-                    match = false;
-                    break;
-                }
+                maxDiff = Math.Max(maxDiff, Math.Max(Math.Abs(Quantum.ScaleToByte(refRow[o]) - r),
+                    Math.Max(Math.Abs(Quantum.ScaleToByte(refRow[o + 1]) - g), Math.Abs(Quantum.ScaleToByte(refRow[o + 2]) - b))));
             }
         }
 
-        await Assert.That(match).IsTrue();
+        await Assert.That(maxDiff).IsLessThanOrEqualTo(2);
     }
 
     // Byte-exact JPEG reconstruction (jbrd core): ReadDctData -> RebuildJpeg reproduces the original baseline
@@ -328,5 +328,17 @@ public class JpegDctTests
         report.Insert(0, $"tested={tested} ok={ok}\n");
         System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "jbrd_result.txt"), report.ToString());
         await Assert.That(ok).IsEqualTo(tested);
+    }
+
+    // SOF1 (extended sequential: here 16-bit quantisation tables, cjpeg -quality 20) parses like baseline and rebuilds
+    // byte-for-byte.
+    [Test]
+    public async Task Jpeg_Sof1_RebuildsByteExact()
+    {
+        byte[] jpeg = System.IO.File.ReadAllBytes(System.IO.Path.Combine(AppContext.BaseDirectory, "TestAssets", "jpeg_libjpeg", "cjpeg_31x33_q20.jpg"));
+        JpegDctData dct = JpegCoder.ReadDctData(new System.IO.MemoryStream(jpeg));
+        await Assert.That(dct.Width).IsEqualTo(31);
+        await Assert.That(JpegCoder.RebuildJpeg(dct).AsSpan().SequenceEqual(jpeg)).IsTrue();
+        await Assert.That(JpegXlLossless.Decode(JpegXlLossless.Encode(jpeg)).AsSpan().SequenceEqual(jpeg)).IsTrue();
     }
 }

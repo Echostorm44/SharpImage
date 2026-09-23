@@ -93,6 +93,7 @@ public static partial class JpegCoder
 
     private const byte EOI = 0xD9; // End of Image
     private const byte SOF0 = 0xC0; // Baseline DCT
+    private const byte SOF1 = 0xC1; // Extended sequential DCT (Huffman; decoded like baseline at 8-bit precision)
     private const byte SOF2 = 0xC2; // Progressive DCT
     private const byte DHT = 0xC4; // Define Huffman Table
     private const byte DQT = 0xDB; // Define Quantization Table
@@ -115,7 +116,38 @@ public static partial class JpegCoder
         return Read(stream);
     }
 
+    /// <summary>
+    /// Decodes a JPEG as libjpeg-turbo does by default (accurate integer IDCT, fancy chroma upsampling, fixed-point
+    /// YCbCr -> RGB), so the pixels are identical to djpeg / Pillow / browsers built on it. Files that path does not
+    /// cover (CMYK / YCCK, unusual sampling) use the general decoder.
+    /// </summary>
     public static ImageFrame Read(Stream stream)
+    {
+        byte[] data;
+        using (var ms = new MemoryStream())
+        {
+            stream.CopyTo(ms);
+            data = ms.ToArray();
+        }
+        var frame = data.Length >= 4 && data[0] == 0xFF && data[1] == SOI ? ReadLibjpegRgb(data) : null;
+        if (frame == null) return ReadGeneral(new MemoryStream(data));
+
+        byte[]? exifData = null, iptcData = null;
+        List<byte[]>? iccChunks = null, extendedXmp = null;
+        string? xmpData = null;
+        var ms2 = new MemoryStream(data);
+        foreach (var (marker, off, _) in ScanSegments(data, 0))
+        {
+            if (marker is < 0xE0 or > 0xEF) continue;
+            ms2.Position = off - 2;
+            ReadOrSkipAppMarker(ms2, marker, ref exifData, ref iccChunks, ref iptcData, ref xmpData, ref extendedXmp);
+        }
+        AttachMetadata(frame, exifData, iccChunks, iptcData, xmpData, extendedXmp);
+        return frame;
+    }
+
+    // The general decoder (float IDCT, simple upsampling): CMYK / YCCK and layouts the libjpeg-exact path skips.
+    private static ImageFrame ReadGeneral(Stream stream)
     {
         // Verify SOI marker
         if (stream.ReadByte() != 0xFF || stream.ReadByte() != SOI)
@@ -163,6 +195,7 @@ public static partial class JpegCoder
             switch (marker)
             {
                 case SOF0: // Baseline DCT
+                case SOF1: // Extended sequential DCT (e.g. 16-bit quantisation tables)
                     ReadSof(stream, ref width, ref height, ref componentCount, components,
                         ref maxHSample, ref maxVSample);
                     break;
@@ -288,6 +321,7 @@ public static partial class JpegCoder
             switch (marker)
             {
                 case SOF0:
+                case SOF1:
                     ReadSof(stream, ref width, ref height, ref componentCount, components, ref maxHSample, ref maxVSample);
                     break;
                 case SOF2:
@@ -495,6 +529,7 @@ public static partial class JpegCoder
             switch (marker)
             {
                 case SOF0:
+                case SOF1:
                 case SOF2:
                     ReadSof(stream, ref width, ref height, ref componentCount, comps, ref maxH, ref maxV);
                     break;
