@@ -11,7 +11,8 @@ namespace SharpImage.Formats;
 /// offsets are the coded values (mult 0..255 with 128 = 0, offset 0..511 with 256 = 0) and AR coefficients are signed.
 /// Signalled in the colour stream's frame header; decoders (dav1d, libavif, browsers, this library) synthesize the
 /// grain on output. Use <see cref="TestVector"/> for libaom's built-in vectors (--film-grain-test),
-/// <see cref="ParseTable"/> for a libaom grain table (--film-grain-table).
+/// <see cref="ParseTable"/> for a libaom grain table (--film-grain-table), or estimate it from the image with
+/// <see cref="AvifEncodeOptions.DenoiseNoiseLevel"/>.
 /// </summary>
 public sealed class AvifFilmGrain
 {
@@ -198,6 +199,28 @@ public sealed class AvifFilmGrain
                 for (int i = 0; i < nuv; i++) d.ArCoeffsUv[28 + i] = (sbyte)acr[i];
         }
         return d;
+    }
+
+    /// <summary>The inverse of <see cref="ToAv1"/>: decoder-side parameters in libaom conventions.</summary>
+    internal static unsafe AvifFilmGrain FromAv1(in Av1FilmGrainData d)
+    {
+        var c = d;
+        var g = new AvifFilmGrain
+        {
+            RandomSeed = (ushort)c.Seed, ChromaScalingFromLuma = c.ChromaScalingFromLuma != 0, ScalingShift = c.ScalingShift,
+            ArCoeffLag = c.ArCoeffLag, ArCoeffShift = (int)c.ArCoeffShift, GrainScaleShift = c.GrainScaleShift,
+            CbMult = c.UvMult0 + 128, CbLumaMult = c.UvLumaMult0 + 128, CbOffset = c.UvOffset0 + 256,
+            CrMult = c.UvMult1 + 128, CrLumaMult = c.UvLumaMult1 + 128, CrOffset = c.UvOffset1 + 256,
+            OverlapFlag = c.OverlapFlag != 0, ClipToRestrictedRange = c.ClipToRestrictedRange != 0,
+            ScalingPointsY = new (int, int)[c.NumYPoints], ScalingPointsCb = new (int, int)[c.NumUvPoints0],
+            ScalingPointsCr = new (int, int)[c.NumUvPoints1],
+        };
+        for (int i = 0; i < c.NumYPoints; i++) g.ScalingPointsY[i] = (c.YPoints[i * 2], c.YPoints[i * 2 + 1]);
+        for (int i = 0; i < c.NumUvPoints0; i++) g.ScalingPointsCb[i] = (c.UvPoints[i * 2], c.UvPoints[i * 2 + 1]);
+        for (int i = 0; i < c.NumUvPoints1; i++) g.ScalingPointsCr[i] = (c.UvPoints[20 + i * 2], c.UvPoints[21 + i * 2]);
+        for (int i = 0; i < 24; i++) g.ArCoeffsY[i] = c.ArCoeffsY[i];
+        for (int i = 0; i < 25; i++) { g.ArCoeffsCb[i] = c.ArCoeffsUv[i]; g.ArCoeffsCr[i] = c.ArCoeffsUv[28 + i]; }
+        return g;
     }
 
     // libaom av1/encoder/grain_test_vectors.h (BSD-2), generated.

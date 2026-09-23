@@ -549,6 +549,20 @@ public sealed class Av1HbdVerify
         Directory.CreateDirectory(outDir);
         var full = FormatRegistry.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", "sample1.dng"));
         ImageFrame Crop(int w, int h) => Geometry.Crop(full, ((int)full.Columns - w) / 2, ((int)full.Rows - h) / 2, w, h);
+        ImageFrame Grey(ImageFrame s)
+        {
+            int n = s.NumberOfChannels;
+            for (int y = 0; y < s.Rows; y++)
+            {
+                var row = s.GetPixelRowForWrite(y);
+                for (int x = 0; x < s.Columns; x++)
+                {
+                    ushort v = (ushort)((row[x * n] + row[x * n + 1] + row[x * n + 2]) / 3);
+                    row[x * n] = row[x * n + 1] = row[x * n + 2] = v;
+                }
+            }
+            return s;
+        }
         var log = new System.Text.StringBuilder();
         var cases = new System.Collections.Generic.List<(string Stem, ImageFrame Img, AvifEncodeOptions O, string PixFmt)>();
         for (int v = 1; v <= 16; v++)
@@ -560,6 +574,12 @@ public sealed class Av1HbdVerify
         cases.Add(("v07_8_gray", Gradient(200, 120, alpha: false, gray: true), new AvifEncodeOptions { BitDepth = 8, FilmGrain = AvifFilmGrain.TestVector(7) }, "gray"));
         cases.Add(("v01_10_gray", Gradient(131, 97, alpha: false, gray: true), new AvifEncodeOptions { BitDepth = 10, FilmGrain = AvifFilmGrain.TestVector(1) }, "gray10le"));
         cases.Add(("v01_8_420_alpha", Gradient(160, 96, alpha: true, gray: false), new AvifEncodeOptions { BitDepth = 8, FilmGrain = AvifFilmGrain.TestVector(1) }, "yuv420p"));
+        cases.Add(("dn_8_420", Crop(384, 256), new AvifEncodeOptions { BitDepth = 8, DenoiseNoiseLevel = 25 }, "yuv420p"));
+        cases.Add(("dn_10_420_odd", Crop(257, 131), new AvifEncodeOptions { BitDepth = 10, DenoiseNoiseLevel = 25 }, "yuv420p10le"));
+        cases.Add(("dn_8_444_req", Crop(200, 120), new AvifEncodeOptions { BitDepth = 8, ChromaSubsampling = AvifChromaSubsampling.Yuv444, DenoiseNoiseLevel = 30, DenoiseUseRequestedLevel = true }, "yuv444p"));
+        cases.Add(("dn_12_444_bs16", Crop(131, 97), new AvifEncodeOptions { BitDepth = 12, ChromaSubsampling = AvifChromaSubsampling.Yuv444, DenoiseNoiseLevel = 25, DenoiseBlockSize = 16 }, "yuv444p12le"));
+        cases.Add(("dn_8_gray", Grey(Crop(200, 120)), new AvifEncodeOptions { BitDepth = 8, DenoiseNoiseLevel = 25 }, "gray"));
+        cases.Add(("dn_8_420_noapply", Crop(160, 96), new AvifEncodeOptions { BitDepth = 8, DenoiseNoiseLevel = 25, DenoiseApply = false }, "yuv420p"));
         var tbl = AvifFilmGrain.ParseTable(AvifFilmGrain.TestVector(4).ToTable());
         cases.Add(("table4_8_420", Crop(257, 131), new AvifEncodeOptions { BitDepth = 8, FilmGrain = tbl }, "yuv420p"));
         foreach (var c in cases)
@@ -570,6 +590,12 @@ public sealed class Av1HbdVerify
                 File.WriteAllBytes(Path.Combine(outDir, c.Stem + ".avif"), avif);
                 var box = HeifContainer.Parse(avif);
                 byte[] item = box.ItemData(box.PrimaryId)!;
+                {
+                    var pd = new Av1Decoder();
+                    using (pd.Decode(item, 0, isKeyframe: true)) { }
+                    File.WriteAllText(Path.Combine(outDir, c.Stem + ".grain.tbl"),
+                        pd.LastFilmGrain is { } lf ? AvifFilmGrain.FromAv1(lf).ToTable() : "none");
+                }
                 foreach (bool g in new[] { true, false })
                 {
                     Environment.SetEnvironmentVariable("AV1_DUMP10", Path.Combine(outDir, c.Stem + (g ? ".ours.yuv" : ".ours_ng.yuv")));
@@ -588,11 +614,68 @@ public sealed class Av1HbdVerify
                                 : dec.HasAlpha ? (byte)Math.Round(row[x * ch + ch - 1] * 255.0 / 65535) : (byte)255;
                 }
                 File.WriteAllBytes(Path.Combine(outDir, c.Stem + ".ours.rgba"), rgba);
-                log.AppendLine($"{c.Stem} {c.PixFmt} {w}x{h} bytes={avif.Length}");
+                log.AppendLine($"{c.Stem} {c.PixFmt} {w}x{h} bytes={avif.Length} {Av1NoiseModel.LastStatus}");
             }
             catch (Exception e) { log.AppendLine($"{c.Stem} ERROR {e.GetType().Name}: {e.Message}"); }
         }
         File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
+    }
+
+    // Grain estimation parity probe (trigger hbd_fgest.txt): for each raw YUV in fgest/manifest.txt ("name w h bd ssx
+    // ssy mono level", level < 0 = all-intra estimate) runs our libaom noise-model port and writes name.ours.tbl; the
+    // libaom stream name.aom.avif (same YUV, ffmpeg libaom-av1 --denoise-noise-level) is parsed to name.aom.tbl.
+    [Test, NotInParallel]
+    public void GrainEstimate()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_fgest.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string dir = Path.Combine(Scratch, "fgest");
+        foreach (var line in File.ReadAllLines(Path.Combine(dir, "manifest.txt")))
+        {
+            var p = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (p.Length < 8) continue;
+            string name = p[0];
+            int w = int.Parse(p[1]), h = int.Parse(p[2]), bd = int.Parse(p[3]), ssx = int.Parse(p[4]), ssy = int.Parse(p[5]);
+            bool mono = p[6] == "1";
+            float level = float.Parse(p[7], System.Globalization.CultureInfo.InvariantCulture);
+            try
+            {
+                byte[] raw = File.ReadAllBytes(Path.Combine(dir, name + ".yuv"));
+                int cw = (w + ssx) >> ssx, chh = (h + ssy) >> ssy;
+                int pos = 0;
+                ushort[] Plane(int n)
+                {
+                    var a = new ushort[n];
+                    for (int i = 0; i < n; i++) { a[i] = bd > 8 ? BitConverter.ToUInt16(raw, pos) : raw[pos]; pos += bd > 8 ? 2 : 1; }
+                    return a;
+                }
+                ushort[] y = Plane(w * h);
+                ushort[]? u = mono ? null : Plane(cw * chh), v = mono ? null : Plane(cw * chh);
+                if (level < 0) level = Av1NoiseModel.AllIntraNoiseLevel(y, w, h, bd);
+                var g = Av1NoiseModel.DenoiseAndModel(y, u, v, w, h, ssx, ssy, bd, level, 32, out var den);
+                File.WriteAllText(Path.Combine(dir, name + ".ours.tbl"), $"level={level:R}\n" + (g?.ToTable() ?? "none\n"));
+                if (g != null)
+                    using (var fs = File.Create(Path.Combine(dir, name + ".ours_den.yuv")))
+                        foreach (var pl in den)
+                            if (pl != null)
+                                foreach (var s in pl)
+                                {
+                                    fs.WriteByte((byte)s);
+                                    if (bd > 8) fs.WriteByte((byte)(s >> 8));
+                                }
+                string aom = Path.Combine(dir, name + ".aom.avif");
+                if (File.Exists(aom))
+                {
+                    var box = HeifContainer.Parse(File.ReadAllBytes(aom));
+                    var dec = new Av1Decoder();
+                    using (dec.Decode(box.ItemData(box.PrimaryId)!, 0, true)) { }
+                    var fg = dec.LastFilmGrain;
+                    File.WriteAllText(Path.Combine(dir, name + ".aom.tbl"), fg is { } f ? AvifFilmGrain.FromAv1(f).ToTable() : "none\n");
+                }
+            }
+            catch (Exception e) { File.WriteAllText(Path.Combine(dir, name + ".ours.tbl"), "ERROR " + e); }
+        }
     }
 
     // Isolates in-loop-filter conformance at odd picture edges: encodes odd-size gradients at q28 with deblock only,

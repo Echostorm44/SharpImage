@@ -2046,6 +2046,9 @@ internal sealed class Av1Decoder
     /// libavif do). Off returns the grain-free reconstruction.</summary>
     public bool ApplyFilmGrain { get; set; } = true;
 
+    /// <summary>Film grain parameters of the last parsed frame header (null when none).</summary>
+    internal Av1FilmGrainData? LastFilmGrain => frameHdr.FilmGrainPresent ? frameHdr.FilmGrain : null;
+
     private (ushort[], ushort[]?, ushort[]?) WithFilmGrain(in Av1FilmGrainData fg, int w, int h, int ssHor, int ssVer,
         ushort[] y, int strideY, ushort[]? u, ushort[]? v, int strideUv)
     {

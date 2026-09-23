@@ -103,7 +103,28 @@ public sealed class AvifEncodeOptions
     /// <see cref="AvifFilmGrain.TestVector"/> (aomenc --film-grain-test) or <see cref="AvifFilmGrain.ParseTable"/>
     /// (--film-grain-table). Not allowed with <see cref="Lossless"/>.</summary>
     public AvifFilmGrain? FilmGrain { get; set; }
+
+    /// <summary>Denoise the colour planes and signal the removed noise as film grain (aomenc / avifenc
+    /// --denoise-noise-level; 0 = off). As in libaom's all-intra mode, which libavif uses for still images, any value
+    /// above 0 enables it and the Wiener filter strength is estimated from the image itself (capped at 5); set
+    /// <see cref="DenoiseUseRequestedLevel"/> to use this value / 10 instead (libaom's good-quality mode). The grain
+    /// model (libaom noise_model) fits AR coefficients and piecewise scaling functions on flat blocks. Not available
+    /// for 4:2:2 (as in libaom) or with <see cref="Lossless"/> / <see cref="FilmGrain"/>.</summary>
+    public int DenoiseNoiseLevel { get; set; }
+
+    /// <summary>Use <see cref="DenoiseNoiseLevel"/> / 10 as the Wiener noise level instead of the all-intra estimate.</summary>
+    public bool DenoiseUseRequestedLevel { get; set; }
+
+    /// <summary>Denoising / noise-model block size (--denoise-block-size): 8, 16 or 32 (default).</summary>
+    public int DenoiseBlockSize { get; set; } = 32;
+
+    /// <summary>Encode the denoised planes (--enable-dnl-denoising, default on). Off keeps the source planes but still
+    /// signals the estimated grain.</summary>
+    public bool DenoiseApply { get; set; } = true;
 }
+
+/// <summary>Film grain for one AVIF encode: explicit parameters, or denoise-and-estimate (Level &lt; 0 = all-intra estimate).</summary>
+internal sealed record AvifGrainRequest(AvifFilmGrain? Explicit, bool Denoise, float Level, int BlockSize, bool Apply);
 
 public static class HeifCoder
 {
@@ -652,12 +673,19 @@ public static class HeifCoder
         bool bt601Full = color.Matrix is 5 or 6 && color.FullRange;
         var extras = AvifExtras(image, options);
         extras.Premultiplied = options.PremultiplyAlpha && image.HasAlpha;
-        if (options.FilmGrain != null && options.Lossless)
-            throw new ArgumentException("Film grain cannot be combined with lossless coding.", nameof(options));
+        bool denoise = options.DenoiseNoiseLevel > 0;
+        if ((options.FilmGrain != null || denoise) && options.Lossless)
+            throw new ArgumentException("Film grain / denoising cannot be combined with lossless coding.", nameof(options));
+        if (options.FilmGrain != null && denoise)
+            throw new ArgumentException("Set either FilmGrain or DenoiseNoiseLevel, not both.", nameof(options));
+        if (denoise && options.DenoiseBlockSize is not (8 or 16 or 32))
+            throw new ArgumentOutOfRangeException(nameof(options), "DenoiseBlockSize must be 8, 16 or 32.");
+        var grain = new AvifGrainRequest(options.FilmGrain, denoise, options.DenoiseUseRequestedLevel ? options.DenoiseNoiseLevel / 10.0f : -1,
+            options.DenoiseBlockSize, options.DenoiseApply);
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
-               && options.FilmGrain == null
+               && options.FilmGrain == null && !denoise
             ? EncodeAvif8(image, options.Qp, color, extras)
-            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless, options.FilmGrain);
+            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless, grain);
     }
 
     // Container content carried over from the image: the ICC profile (colr 'prof'), Exif (as raw TIFF, the
@@ -778,13 +806,28 @@ public static class HeifCoder
     // full precision and coded through the multi-superblock encoder (which handles every size 8..4096). The 8-bit
     // 4:2:0 case keeps its original byte path (EncodeAvif8) so its output is unchanged.
     private static byte[] EncodeAvifGeneral(ImageFrame image, int qp, int bd, Av1.Av1PixelLayout layout,
-        Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras, bool lossless = false, AvifFilmGrain? grain = null)
+        Av1.Av1ObuWriter.Av1ColorDesc color, Av1.AvifContainerExtras extras, bool lossless = false, AvifGrainRequest? request = null)
     {
         // Film grain rides on the colour stream only: the ambient scope is read by the colour builders' headers and
-        // suppressed around the alpha builds.
+        // suppressed around the alpha builds. Denoising (libaom aom_denoise_and_model_run) replaces the colour planes
+        // and supplies the estimated grain.
         int gssX = layout == Av1.Av1PixelLayout.I444 ? 0 : 1, gssY = layout == Av1.Av1PixelLayout.I420 ? 1 : 0;
+        AvifFilmGrain? grain = request?.Explicit;
         Av1.Av1ObuWriter.FilmGrainScope Grain(bool mono) =>
             Av1.Av1ObuWriter.UseFilmGrain(grain?.ToAv1(mono, mono ? 1 : gssX, mono ? 1 : gssY), !mono && gssX == 1 && gssY == 1);
+        void Denoise(ref ushort[] yPl, ref ushort[]? uPl, ref ushort[]? vPl, int ssX, int ssY)
+        {
+            if (request is not { Denoise: true } r) return;
+            float level = r.Level >= 0 ? r.Level : Av1.Av1NoiseModel.AllIntraNoiseLevel(yPl, (int)image.Columns, (int)image.Rows, bd);
+            grain = Av1.Av1NoiseModel.DenoiseAndModel(yPl, uPl, vPl, (int)image.Columns, (int)image.Rows, ssX, ssY, bd, level,
+                r.BlockSize, out var den);
+            if (grain != null && r.Apply)
+            {
+                yPl = den[0]!;
+                uPl = den[1];
+                vPl = den[2];
+            }
+        }
         int w = (int)image.Columns;
         int h = (int)image.Rows;
         if (w > 65536 || h > 65536 || w < 8 || h < 8)
@@ -838,22 +881,26 @@ public static class HeifCoder
         if (hasAlpha && nonOpaque && alpha != null)
         {
             int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
-            RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yA, out ushort[] uA, out ushort[] vA);
+            RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yA, out ushort[] uA0, out ushort[] vA0);
+            ushort[]? uA = uA0, vA = vA0;
+            Denoise(ref yA, ref uA, ref vA, gssX, gssY);
             if (lossless)
-                return Av1.Av1StillImageEncoder.EncodeAvifLossless(yA, uA, vA, false, alpha, true, w, h, bd, layout, color, extras);
+                return Av1.Av1StillImageEncoder.EncodeAvifLossless(yA, uA!, vA!, false, alpha, true, w, h, bd, layout, color, extras);
             using (Grain(false))
-                return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA, vA, alpha, w, h, baseQIdx, alphaQIdx, bd, layout, color, extras);
+                return Av1.Av1StillImageEncoder.EncodeAvifColorWithAlpha(yA, uA!, vA!, alpha, w, h, baseQIdx, alphaQIdx, bd, layout, color, extras);
         }
 
         // Identity / YCgCo-R carry exact RGB, so lossy grey content keeps the colour (4:4:4) path; lossless grey is
         // coded as 4:0:0 like libavif (the single plane is exact already).
         if (colour || (!lossless && color.Matrix is 0 or 16 or 17))
         {
-            RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yP, out ushort[] uP, out ushort[] vP);
+            RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out ushort[] yP, out ushort[] uP0, out ushort[] vP0);
+            ushort[]? uP = uP0, vP = vP0;
+            Denoise(ref yP, ref uP, ref vP, gssX, gssY);
             if (lossless)
-                return Av1.Av1StillImageEncoder.EncodeAvifLossless(yP, uP, vP, false, default, false, w, h, bd, layout, color, extras);
+                return Av1.Av1StillImageEncoder.EncodeAvifLossless(yP, uP!, vP!, false, default, false, w, h, bd, layout, color, extras);
             using (Grain(false))
-                return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP, vP, w, h, baseQIdx, bd, layout, color, extras);
+                return Av1.Av1StillImageEncoder.EncodeAvifColorMultiSb(yP, uP!, vP!, w, h, baseQIdx, bd, layout, color, extras);
         }
 
         // Grey: 4:0:0 luma (Y = the grey value; limited range maps it into [16, 235] << (bd - 8)).
@@ -864,6 +911,8 @@ public static class HeifCoder
         if (lossless)
             return Av1.Av1StillImageEncoder.EncodeAvifLossless(luma, default, default, true, default, false, w, h, bd, Av1.Av1PixelLayout.I400,
                 color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color, extras);
+        ushort[]? noU = null, noV = null;
+        Denoise(ref luma, ref noU, ref noV, 1, 1);
         using (Grain(true))
             return Av1.Av1StillImageEncoder.EncodeAvifMonochromeMultiSb(luma, w, h, baseQIdx, bd, color, extras);
     }
