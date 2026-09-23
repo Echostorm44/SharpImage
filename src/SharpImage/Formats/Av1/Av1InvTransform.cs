@@ -214,6 +214,8 @@ public static class Av1InvTransform
         int txSizeIdx, int shift,
         Av1TxType txType, int bitDepth)
     {
+        // Lossless (coded-lossless inter blocks reach here too): the 4x4 Walsh-Hadamard inverse.
+        if (txType == Av1TxType.WhtWht) { InvWhtAdd16(dst, dstStride, coeffs, bitDepth); return; }
         ref readonly var tDim = ref Av1Tables.TxfmDimensions[txSizeIdx];
         int w = 4 * tDim.W;
         int h = 4 * tDim.H;

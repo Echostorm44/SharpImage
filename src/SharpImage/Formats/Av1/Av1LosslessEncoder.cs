@@ -158,7 +158,7 @@ internal static class Av1LosslessEncoder
     // libaom av1_fwht4x4 (the exact inverse of the decoder's WHT): residual (row-major) -> levels in the decoder's
     // coefficient order (column-major, rc = x * 4 + y). The UNIT_QUANT_FACTOR scaling cancels against the lossless
     // quantizer (dq = 4) and the inverse's >> 2, so the level is the raw lifting output.
-    private static void Fwht4(ReadOnlySpan<int> res, Span<int> levels)
+    internal static void Fwht4(ReadOnlySpan<int> res, Span<int> levels)
     {
         Span<int> t = stackalloc int[16];
         for (int i = 0; i < 4; i++)

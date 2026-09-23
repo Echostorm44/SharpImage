@@ -1421,7 +1421,7 @@ public static partial class HeifCoder
                 lastKeyBytes = cObus.cFrame.Length;
                 sinceKey = 1;
                 lastSlot = goldenSlot = 0;   // a key frame refreshes every slot
-                if (!lossless) Decode(cSamples[i], true);
+                Decode(cSamples[i], true);
             }
 
             void Decode(byte[] tu, bool key)
@@ -1459,7 +1459,7 @@ public static partial class HeifCoder
                     {
                         var build = Av1.Av1InterEncoder.EncodeFrameVariants(new Av1.Av1InterEncoder.Picture { Y = yP, U = uP, V = vP, Width = w, Height = h },
                             refs, bd, codedLayout, qIdx, colorDec.SequenceIntraTools);
-                        if (!SequenceFilterSearch) return build(lf, noCdef);
+                        if (!SequenceFilterSearch || qIdx == 0) return build(lf, noCdef);   // lossless: no filters
                         // Deblocking level, then CDEF strength, by decoding each variant into the refreshed slot and
                         // measuring it against the source (libaom's full-image loop filter / CDEF search); the slot
                         // is restored after every trial.
@@ -1511,7 +1511,7 @@ public static partial class HeifCoder
             bool Shown(int i, int arf, byte[]? prefix, int bwd = -1)
             {
                 int ws = FreeSlot(goldenSlot, arf >= 0 ? arf : goldenSlot, bwd);
-                byte[] obu = Inter(i, lastSlot, goldenSlot, arf, 1 << ws, true, baseQIdx, bwd);
+                byte[] obu = Inter(i, lastSlot, goldenSlot, arf, 1 << ws, true, lossless ? 0 : baseQIdx, bwd);
                 if (obu.Length > lastKeyBytes * 9 / 10) return false;
                 Decode([.. td, .. obu], false);
                 lastSlot = ws;
@@ -1523,7 +1523,7 @@ public static partial class HeifCoder
             int fi = 0;
             while (fi < n)
             {
-                if (lossless || fi == 0 || (options.KeyframeInterval > 0 && sinceKey >= options.KeyframeInterval))
+                if (fi == 0 || (options.KeyframeInterval > 0 && sinceKey >= options.KeyframeInterval))
                 {
                     Key(fi++);
                     continue;
@@ -1534,7 +1534,8 @@ public static partial class HeifCoder
                 int limit = n - fi;
                 if (options.KeyframeInterval > 0) limit = Math.Min(limit, options.KeyframeInterval - sinceKey);
                 int gf = Math.Min(limit, SequenceMaxGfInterval);
-                if (gf >= SequenceMinArfGroup)
+                // Lossless sequences are plain P-frame chains (a hidden ALTREF would only add bits).
+                if (gf >= SequenceMinArfGroup && !lossless)
                 {
                     int arfIdx = fi + gf - 1;
                     int arfSlot = FreeSlot(lastSlot, goldenSlot);
@@ -1606,14 +1607,13 @@ public static partial class HeifCoder
                         try
                         {
                             aSample = [.. td, .. Av1.Av1InterEncoder.EncodeFrameObu(new Av1.Av1InterEncoder.Picture { Y = alpha, Width = w, Height = h },
-                                alphaDec.ReferencePicture(0, true, 1, 1), bd, Av1.Av1PixelLayout.I400, Math.Max(alphaQIdx, 1), noCdef,
+                                alphaDec.ReferencePicture(0, true, 1, 1), bd, Av1.Av1PixelLayout.I400, alphaQIdx, noCdef,
                                 InterLoopFilterLevel(alphaQIdx, bd), alphaDec.SequenceIntraTools)];
                         }
                         finally { ls.InterFrame = false; }
                     }
                     sq.AlphaSamples!.Add(aSample);
                     sq.AlphaSync!.Add(cSync[i]);
-                    if (!lossless)
                     {
                         using var f = alphaDec.Decode(aSample, 0, cSync[i]);
                         if (f == null) throw new InvalidOperationException("Reference decode failed: " + Av1.Av1Decoder.LastDecodeError);

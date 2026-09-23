@@ -138,6 +138,9 @@ internal static class Av1InterEncoder
         public readonly Av1RefMvsFrame Rf = new();
         public bool ReferenceSelect;  // the frame header's reference_select (a comp_mode bit precedes each reference)
         public bool SeqFilterIntra, SeqEdgeFilter;
+        // base_q_idx 0: a coded-lossless frame (ONLY_4X4 Walsh-Hadamard transforms, no filters); every coded block
+        // reconstructs the source exactly and skip is only allowed where the prediction already does.
+        private bool Lossless => BaseQIdx == 0;
         // The current frame's reconstruction before loop filtering (what intra prediction reads, as the decoder's
         // planes and pre-filter SB-row edge backups hold it), and the intra modes per 4x4 (luma: -1 inter) / chroma
         // 4x4 (UV mode, DC for inter) for the smooth-neighbour edge flags.
@@ -320,7 +323,7 @@ internal static class Av1InterEncoder
                 single[r] = leaf.Mv;
                 if (j < bestJ) { bestJ = j; best = leaf; }
             }
-            if (UseIntraInInter)
+            if (UseIntraInInter && !Lossless)
             {
                 var il = EvaluateIntra(bs, bx, by, edge, edgeIdx, out double ji);
                 if (ji < bestJ) { bestJ = ji; best = il; }
@@ -751,7 +754,7 @@ internal static class Av1InterEncoder
             if (!Mono)
             {
                 int cw = n >> SsX, ch = n >> SsY;
-                int uvtx = Av1Tables.MaxTxfmSizeForBlockSize[bs, (int)Layout];
+                int uvtx = Lossless ? (int)Av1TxSize.Tx4x4 : Av1Tables.MaxTxfmSizeForBlockSize[bs, (int)Layout];
                 var cp = new ushort[cw * ch];
                 Predict(leaf, 1, cw, ch, cp);
                 ResidualPlane(SrcU, PadW >> SsX, px >> SsX, py >> SsY, cw, ch, uvtx, cp, 1, uLv, ref dSkip, ref dCoded, ref coefBits);
@@ -762,7 +765,7 @@ internal static class Av1InterEncoder
             double skipBits1 = Av1CoeffEncode.SymBits(cdf.GetSkipCdf(0), 1), skipBits0 = Av1CoeffEncode.SymBits(cdf.GetSkipCdf(0), 0);
             double jSkip = dSkip + Lambda * (modeBits + skipBits1);
             double jCoded = dCoded + Lambda * (modeBits + skipBits0 + coefBits);
-            if (!anyCoef || jSkip <= jCoded)
+            if (!anyCoef || (!Lossless && jSkip <= jCoded))
             {
                 leaf.Skip = true;
                 return jSkip;
@@ -777,6 +780,7 @@ internal static class Av1InterEncoder
         // transform, intra = the reconstruction its evaluation produced.
         private void Commit(Leaf leaf)
         {
+            if (Lossless) return;   // no intra blocks read the reconstruction
             int bw4 = Av1Tables.BlockDimensions[leaf.Bs, 0], bh4 = Av1Tables.BlockDimensions[leaf.Bs, 1];
             int n = bw4 * 4, px = leaf.Bx * 4, py = leaf.By * 4;
             int cw = n >> SsX, ch = n >> SsY, cpx = px >> SsX, cpy = py >> SsY, cStride = PadW >> SsX;
@@ -1040,6 +1044,19 @@ internal static class Av1InterEncoder
         private TxNode LumaTree(int tx, int depth, int xOff, int yOff, int bx, int by, int blkX, int blkY, ushort[] pred, int predW)
         {
             ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
+            if (Lossless)
+            {
+                var ll = new TxNode();
+                double ds = 0, dc = 0, bits = 0;
+                var lvs = new List<int[]>();
+                ResidualPlane(SrcY, PadW, bx * 4, by * 4, tDim.W * 4, tDim.H * 4, tx, pred, 0, lvs, ref ds, ref dc, ref bits,
+                    ((by - blkY) * 4) * predW + (bx - blkX) * 4, predW);
+                ll.DSkip = ds; ll.Bits = bits;
+                int k = 0;
+                for (int y = 0; y < tDim.H; y++)
+                    for (int x = 0; x < tDim.W; x++) ll.Leaves[(bx + x, by + y)] = lvs[k++];
+                return ll;
+            }
             bool canSplit = UseVarTx && depth < 2 && tx > (int)Av1TxSize.Tx4x4;
             int cat = 2 * ((int)Av1TxSize.Tx64x64 - tDim.Max) - depth;
             var whole = new TxNode();
@@ -1098,6 +1115,29 @@ internal static class Av1InterEncoder
             List<int[]> levelsOut, ref double dSkip, ref double dCoded, ref double coefBits, int predOff = 0, int predStride = -1)
         {
             if (predStride < 0) predStride = w;
+            if (Lossless)
+            {
+                Span<int> r4 = stackalloc int[16];
+                for (int ty = 0; ty < h; ty += 4)
+                    for (int txo = 0; txo < w; txo += 4)
+                    {
+                        long ss = 0;
+                        int vw = (plane == 0 ? W : CW) - (px + txo), vh = (plane == 0 ? H : CH) - (py + ty);
+                        for (int y = 0; y < 4; y++)
+                            for (int x = 0; x < 4; x++)
+                            {
+                                int d = src[(py + ty + y) * srcW + px + txo + x] - pred[predOff + (ty + y) * predStride + txo + x];
+                                r4[y * 4 + x] = d;
+                                if (x < vw && y < vh) ss += (long)d * d;
+                            }
+                        var lv = new int[16];
+                        Av1LosslessEncoder.Fwht4(r4, lv);
+                        levelsOut.Add(lv);
+                        dSkip += ss;   // coded: exact
+                        coefBits += Av1CoeffEncode.EstimateCoefBits(cdf.Coef, cdf.Mode, (int)Av1TxSize.Tx4x4, plane > 0 ? 1 : 0, 0, lv, 0, 0, 1);
+                    }
+                return;
+            }
             ref readonly var tDim = ref Av1Tables.TxfmDimensions[tx];
             int tw = tDim.W * 4, th = tDim.H * 4;
             int rcCount = Math.Min(tw, 32) * Math.Min(th, 32);
@@ -1121,7 +1161,7 @@ internal static class Av1InterEncoder
                             recon[y * tw + x] = (ushort)p;
                         }
                     dSkip += ss;
-                    var qf = InterRdoqScale > 0 && rcCount <= InterRdoqMaxCoefs ? new double[rcCount] : null;
+                    var qf = InterRdoqScale > 0 && rcCount <= InterRdoqMaxCoefs && !Lossless ? new double[rcCount] : null;
                     int[] lv = Av1FwdTransform.ForwardQuantRect(res, tw, th, tx, DcDq, AcDq, rcCount, Av1FwdTransform.FwdTxType.DctDct, qf);
                     if (qf != null && HasNonZero(lv))
                         Av1CoeffEncode.RdoqOptimize(cdf.Coef, cdf.Mode, tx, plane > 0 ? 1 : 0, 0, lv, qf, DcDq, AcDq, 0, 0, 1,
@@ -1385,7 +1425,7 @@ internal static class Av1InterEncoder
 
             // Transform size (read_vartx_tree): the split tree for a coded block, the block size for a skipped one.
             int maxTx = Av1Tables.MaxTxfmSizeForBlockSize[bs, 0];
-            if (UseVarTx)
+            if (UseVarTx && !Lossless)
             {
                 if (leaf.Skip)
                 {
@@ -1416,8 +1456,8 @@ internal static class Av1InterEncoder
             }
             else
             {
-                int ytx = Av1Tables.MaxTxfmSizeForBlockSize[bs, 0];
-                int uvtx = Av1Tables.MaxTxfmSizeForBlockSize[bs, (int)Layout];
+                int ytx = Lossless ? (int)Av1TxSize.Tx4x4 : Av1Tables.MaxTxfmSizeForBlockSize[bs, 0];
+                int uvtx = Lossless ? (int)Av1TxSize.Tx4x4 : Av1Tables.MaxTxfmSizeForBlockSize[bs, (int)Layout];
                 ref readonly var yt = ref Av1Tables.TxfmDimensions[ytx];
                 ref readonly var uvt = ref Av1Tables.TxfmDimensions[uvtx];
                 int cw4 = (w4 + SsX) >> SsX, ch4 = (h4 + SsY) >> SsY;
@@ -1682,7 +1722,7 @@ internal static class Av1InterEncoder
             int skipCtx = Av1CoeffDecode.GetSkipCtx(in tDim, bs, a.AsSpan(aOff, aLen), l.AsSpan(lOff, lLen), chroma, (int)Layout);
             int signCtx = Av1CoeffDecode.GetDcSignCtx(tx, a.AsSpan(aOff, aLen), l.AsSpan(lOff, lLen));
             Av1CoeffEncode.EncodeCoefs(msac, cdf.Coef, cdf.Mode, tx, chroma, Math.Max(intraYMode, 0), levels, skipCtx, signCtx, 1,
-                inter: intraYMode < 0);
+                lossless: Lossless, inter: intraYMode < 0);
             byte cf = CfCtx(levels, tx);
             if (ctw > 0) Av1BlockContextManaged.Fill(a, aOff, Math.Min(ctw, a.Length - aOff), cf);
             if (cth > 0) Av1BlockContextManaged.Fill(l, lOff, Math.Min(cth, l.Length - lOff), cf);

@@ -128,6 +128,29 @@ public sealed class AvifSequenceInterTests
         await Assert.That(cutSync[0]!.Contains(4)).IsTrue();   // the first frame of the new scene is a key frame
     }
 
+    // Lossless sequences code inter frames too (coded-lossless: 4x4 Walsh-Hadamard residuals on the motion-compensated
+    // prediction), reproducing exactly what all-intra lossless does at a fraction of the size. The dev harness verified
+    // dav1d == ours (colour + alpha) and that the result is ~9% smaller than avifenc --lossless on a photo pan.
+    [Test]
+    [Arguments(8, AvifChromaSubsampling.Yuv444, false)]
+    [Arguments(10, AvifChromaSubsampling.Yuv420, true)]
+    public async Task Lossless_InterFrames_Exact(int depth, AvifChromaSubsampling cs, bool alpha)
+    {
+        using var seq = Panning(72, 40, 5, alpha);
+        int? matrix = cs == AvifChromaSubsampling.Yuv444 ? null : 1;
+        byte[] inter = HeifCoder.EncodeAvifSequence(seq,
+            new AvifEncodeOptions { Lossless = true, BitDepth = depth, ChromaSubsampling = cs, MatrixCoefficients = matrix });
+        byte[] intra = HeifCoder.EncodeAvifSequence(seq,
+            new AvifEncodeOptions { Lossless = true, BitDepth = depth, ChromaSubsampling = cs, MatrixCoefficients = matrix, KeyframeInterval = 1 });
+        await Assert.That(inter.Length).IsLessThan(intra.Length * 2 / 3);
+        await Assert.That(SyncSamples(inter)[0]!).IsEquivalentTo(new List<int> { 1 });
+        using var a = HeifCoder.DecodeSequence(inter);
+        using var b = HeifCoder.DecodeSequence(intra);
+        for (int i = 0; i < 5; i++)
+            for (int y = 0; y < 40; y++)
+                await Assert.That(a[i].GetPixelRow(y).SequenceEqual(b[i].GetPixelRow(y))).IsTrue();
+    }
+
     [Test]
     [Arguments(8, AvifChromaSubsampling.Yuv420)]
     [Arguments(10, AvifChromaSubsampling.Yuv444)]
