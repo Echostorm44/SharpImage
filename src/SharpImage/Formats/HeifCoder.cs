@@ -869,6 +869,191 @@ public static class HeifCoder
                 options.Progressive && image.Columns >= 16 && image.Rows >= 16);   // a sub-8px base layer is pointless
     }
 
+    /// <summary>
+    /// Encodes an image sequence as an animated AVIF ('avis', libavif layout): an AV1 colour track (and an alpha track
+    /// linked by 'auxl' when any frame is not opaque), with the first frame also stored as the primary image items so
+    /// still-image readers show it. Every frame is coded as a key frame with the still-image encoder at the options'
+    /// quality, depth, subsampling, CICP and lossless / film-grain settings. Timing comes from
+    /// <see cref="ImageSequence.Timescale"/> and <see cref="ImageFrame.DurationTicks"/> when both are set, else from
+    /// <see cref="ImageFrame.Delay"/> (centiseconds; 0 plays as 10); <see cref="ImageSequence.LoopCount"/> 0 loops
+    /// forever, n plays n times. All frames must have the same size; colour properties, ICC and metadata come from
+    /// the first frame.
+    /// </summary>
+    public static byte[] EncodeAvifSequence(ImageSequence sequence, AvifEncodeOptions? options = null)
+    {
+        options ??= new AvifEncodeOptions();
+        if (sequence.Count == 0) throw new ArgumentException("The sequence has no frames.", nameof(sequence));
+        if (options.Progressive) throw new NotSupportedException("Progressive (layered) coding applies to still AVIF images.");
+        var first = sequence[0];
+        int w = (int)first.Columns, h = (int)first.Rows;
+        foreach (var f in sequence.Frames)
+            if ((int)f.Columns != w || (int)f.Rows != h)
+                throw new ArgumentException("Every frame of an AVIF sequence must have the same size.", nameof(sequence));
+        if (w > 65536 || h > 65536 || w < 8 || h < 8)
+            throw new NotSupportedException($"AVIF encoding supports 8..65536 per dimension (got {w}x{h}).");
+
+        int bd = options.BitDepth == 0 ? (sequence.Frames.Any(HasSubByteDetail) ? 10 : 8) : options.BitDepth;
+        if (bd is not (8 or 10 or 12))
+            throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
+        var color = ResolveAvifColor(first, options, bd);
+        if (options.Lossless && options.MatrixCoefficients == null) color = color with { Matrix = 0 };
+        var layout = options.ChromaSubsampling switch
+        {
+            AvifChromaSubsampling.Yuv422 => Av1.Av1PixelLayout.I422,
+            AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
+            AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
+            _ => color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
+        };
+        if (color.Matrix == 0 && layout != Av1.Av1PixelLayout.I444)
+            throw new ArgumentException("The identity matrix (MatrixCoefficients 0) requires 4:4:4 chroma.", nameof(options));
+        bool denoise = options.DenoiseNoiseLevel > 0;
+        if ((options.FilmGrain != null || denoise) && options.Lossless)
+            throw new ArgumentException("Film grain / denoising cannot be combined with lossless coding.", nameof(options));
+        if (options.FilmGrain != null && denoise)
+            throw new ArgumentException("Set either FilmGrain or DenoiseNoiseLevel, not both.", nameof(options));
+        if (denoise && options.DenoiseBlockSize is not (8 or 16 or 32))
+            throw new ArgumentOutOfRangeException(nameof(options), "DenoiseBlockSize must be 8, 16 or 32.");
+
+        var extras = AvifExtras(first, options);
+        var frames = new List<(double[] R, double[] G, double[] B, ushort[]? A)>();
+        bool anyColour = false, anyTranslucent = false;
+        foreach (var f in sequence.Frames)
+        {
+            ReadRgbPlanes(f, bd, out var r, out var g, out var b, out var a, out bool colour, out bool nonOpaque);
+            anyColour |= colour;
+            anyTranslucent |= nonOpaque;
+            frames.Add((r, g, b, a));
+        }
+        bool hasAlpha = anyTranslucent;
+        extras.Premultiplied = options.PremultiplyAlpha && hasAlpha;
+        // Grey sequences are coded 4:0:0 like stills; identity / YCgCo-R keep the colour path (they carry exact RGB).
+        bool mono = !anyColour && !(!options.Lossless && color.Matrix is 0 or 16 or 17);
+        var codedLayout = mono ? Av1.Av1PixelLayout.I400 : layout;
+        int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        int alphaQIdx = Math.Clamp(baseQIdx / 2, 4, 255);
+        int gssX = layout == Av1.Av1PixelLayout.I444 ? 0 : 1, gssY = layout == Av1.Av1PixelLayout.I420 ? 1 : 0;
+        int max = (1 << bd) - 1;
+
+        var sq = new Av1.AvifSequenceData { ColorSamples = [], AlphaSamples = hasAlpha ? [] : null };
+        byte[] td = [0x12, 0x00];   // temporal delimiter: every sample is one complete temporal unit (as libavif writes)
+        var ls = new Av1.Av1ObuWriter.LayeredStream
+        {
+            Layers = 1, Sequence = true, MaxWidth = w, MaxHeight = h, Widths = [w], Heights = [h],
+        };
+        using (Av1.Av1ObuWriter.UseLayers(ls))
+        {
+            foreach (var (r, g, b, a0) in frames)
+            {
+                ushort[]? alpha = hasAlpha ? a0 ?? Enumerable.Repeat((ushort)max, w * h).ToArray() : null;
+                if (extras.Premultiplied && alpha != null)
+                    for (int i = 0; i < r.Length; i++)
+                    {
+                        double k = alpha[i] / (double)max;
+                        if (k < 1) { r[i] *= k; g[i] *= k; b[i] *= k; }
+                    }
+                ushort[] yP;
+                ushort[]? uP = null, vP = null;
+                if (mono)
+                {
+                    yP = new ushort[w * h];
+                    for (int i = 0; i < yP.Length; i++)
+                        yP[i] = (ushort)Math.Clamp((int)Math.Round(color.FullRange ? r[i] : r[i] / max * (219 << (bd - 8)) + (16 << (bd - 8))), 0, max);
+                }
+                else
+                {
+                    RgbToYuvAvif(r, g, b, w, h, bd, layout, color, out yP, out var u0, out var v0);
+                    uP = u0;
+                    vP = v0;
+                }
+
+                AvifFilmGrain? grain = options.FilmGrain;
+                if (denoise)
+                {
+                    float level = options.DenoiseUseRequestedLevel ? options.DenoiseNoiseLevel / 10.0f
+                        : Av1.Av1NoiseModel.AllIntraNoiseLevel(yP, w, h, bd);
+                    grain = Av1.Av1NoiseModel.DenoiseAndModel(yP, uP, vP, w, h, mono ? 1 : gssX, mono ? 1 : gssY, bd, level,
+                        options.DenoiseBlockSize, out var den);
+                    if (grain != null && options.DenoiseApply)
+                    {
+                        yP = den[0]!;
+                        uP = den[1];
+                        vP = den[2];
+                    }
+                }
+
+                (byte[] cSeq, byte[] cFrame) cObus;
+                using (Av1.Av1ObuWriter.UseFilmGrain(grain?.ToAv1(mono, mono ? 1 : gssX, mono ? 1 : gssY), !mono && gssX == 1 && gssY == 1))
+                    cObus = options.Lossless
+                        ? Av1.Av1StillImageEncoder.BuildLosslessObus(yP, uP, vP, mono, w, h, bd, codedLayout,
+                            mono && color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color)
+                        : mono ? Av1.Av1StillImageEncoder.BuildMonochromeObus(yP, w, h, baseQIdx, bd, color)
+                        : Av1.Av1StillImageEncoder.BuildColorObus(yP, uP!, vP!, w, h, baseQIdx, bd, layout, color);
+                sq.ColorSamples.Add([.. td, .. cObus.cSeq, .. cObus.cFrame]);
+                if (alpha != null)
+                {
+                    (byte[] aSeq, byte[] aFrame) aObus;
+                    using (new Av1.Av1ObuWriter.SuppressFilmGrain(true))
+                        aObus = options.Lossless
+                            ? Av1.Av1StillImageEncoder.BuildLosslessObus(alpha, default, default, true, w, h, bd, Av1.Av1PixelLayout.I400, null)
+                            : Av1.Av1StillImageEncoder.BuildMonochromeObus(alpha, w, h, alphaQIdx, bd);
+                    sq.AlphaSamples!.Add([.. td, .. aObus.aSeq, .. aObus.aFrame]);
+                }
+            }
+        }
+
+        // Timing (libavif: mdhd/mvhd timescale, per-sample stts durations, elst repetition).
+        bool exact = sequence.Timescale > 0 && sequence.Timescale <= uint.MaxValue
+                     && sequence.Frames.All(f => f.DurationTicks > 0 && f.DurationTicks <= uint.MaxValue);
+        sq.Timescale = exact ? (uint)sequence.Timescale : 100;
+        sq.Durations = sequence.Frames.Select(f => exact ? (uint)f.DurationTicks : (uint)(f.Delay > 0 ? f.Delay : 10)).ToArray();
+        sq.RepetitionCount = sequence.LoopCount <= 0 ? -1 : sequence.LoopCount - 1;
+        extras.Sequence = sq;
+
+        var c0 = sq.ColorSamples[0];
+        return hasAlpha
+            ? Av1.Av1AvifWriter.BuildAvifWithAlpha(c0, [], sq.AlphaSamples![0], [], w, h, mono, bd, layout, color, extras)
+            : Av1.Av1AvifWriter.BuildAvif(c0, [], w, h, mono, bd, layout, color, extras);
+    }
+
+    // The frame's samples as RGB in coded-depth units [0, 2^bd - 1] plus the alpha plane (null without an alpha
+    // channel), whether any pixel has colour, and whether any pixel is not fully opaque.
+    private static void ReadRgbPlanes(ImageFrame image, int bd, out double[] r, out double[] g, out double[] b, out ushort[]? alpha,
+        out bool colour, out bool nonOpaque)
+    {
+        int w = (int)image.Columns, h = (int)image.Rows;
+        int channels = image.NumberOfChannels;
+        int alphaOff = channels - 1;
+        double scale = ((1 << bd) - 1) / 65535.0;
+        r = new double[w * h];
+        g = new double[w * h];
+        b = new double[w * h];
+        alpha = image.HasAlpha ? new ushort[w * h] : null;
+        colour = false;
+        nonOpaque = false;
+        for (int y = 0; y < h; y++)
+        {
+            ReadOnlySpan<ushort> row = image.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                int o = x * channels;
+                ushort r16 = row[o];
+                ushort g16 = channels >= 3 ? row[o + 1] : r16;
+                ushort b16 = channels >= 3 ? row[o + 2] : r16;
+                if (r16 != g16 || g16 != b16) colour = true;
+                int i = y * w + x;
+                r[i] = r16 * scale;
+                g[i] = g16 * scale;
+                b[i] = b16 * scale;
+                if (alpha != null)
+                {
+                    ushort a16 = row[o + alphaOff];
+                    alpha[i] = (ushort)Math.Round(a16 * scale);
+                    if (a16 != ushort.MaxValue) nonOpaque = true;
+                }
+            }
+        }
+    }
+
     // Container content carried over from the image: the ICC profile (colr 'prof'), Exif (as raw TIFF, the
     // form libavif stores after its 4-byte header offset) and XMP (mime item, application/rdf+xml).
     // Transforms: irot/imir from the options, else from the EXIF-style Orientation (libavif
@@ -1017,37 +1202,8 @@ public static class HeifCoder
             throw new NotSupportedException($"AVIF encoding supports 8..65536 per dimension (got {w}x{h}).");
         }
 
-        int channels = image.NumberOfChannels;
         bool hasAlpha = image.HasAlpha;
-        int alphaOff = channels - 1;
-        double scale = ((1 << bd) - 1) / 65535.0;
-        var r = new double[w * h];
-        var g = new double[w * h];
-        var b = new double[w * h];
-        var alpha = hasAlpha ? new ushort[w * h] : null;
-        bool colour = false, nonOpaque = false;
-        for (int y = 0; y < h; y++)
-        {
-            ReadOnlySpan<ushort> row = image.GetPixelRow(y);
-            for (int x = 0; x < w; x++)
-            {
-                int o = x * channels;
-                ushort r16 = row[o];
-                ushort g16 = channels >= 3 ? row[o + 1] : r16;
-                ushort b16 = channels >= 3 ? row[o + 2] : r16;
-                if (r16 != g16 || g16 != b16) colour = true;
-                int i = y * w + x;
-                r[i] = r16 * scale;
-                g[i] = g16 * scale;
-                b[i] = b16 * scale;
-                if (alpha != null)
-                {
-                    ushort a16 = row[o + alphaOff];
-                    alpha[i] = (ushort)Math.Round(a16 * scale);
-                    if (a16 != ushort.MaxValue) nonOpaque = true;
-                }
-            }
-        }
+        ReadRgbPlanes(image, bd, out var r, out var g, out var b, out var alpha, out bool colour, out bool nonOpaque);
 
         int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
         if (extras.Premultiplied && hasAlpha && nonOpaque && alpha != null)

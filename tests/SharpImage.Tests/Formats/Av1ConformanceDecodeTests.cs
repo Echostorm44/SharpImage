@@ -183,6 +183,11 @@ public sealed class Av1ConformanceDecodeTests
     [Arguments("colors-animated-12bpc-keyframes-0-2-3.avif", 1, 5, "3f4cc3d593c8fed0ce27080504c3efaf")]
     [Arguments("libavif_anim_8_444_alpha.avif", 0, 5, "f977c51aa7cf2ce10283e7ac902ea12e")]
     [Arguments("libavif_anim_8_444_alpha.avif", 1, 5, "7d0040e89f39753e9f0952e8551bba5b")]
+    // SharpImage's own animated AVIF (EncodeAvifSequence: non-reduced sequence header, key-frame samples, alpha track).
+    [Arguments("sharpimage_seq_8_420_alpha.avif", 0, 4, "2252f686135d2b2335df3450c1daf1a1")]
+    [Arguments("sharpimage_seq_8_420_alpha.avif", 1, 4, "aa655343e00bfd39e5a810d769fd895e")]
+    [Arguments("sharpimage_seq_12_422_alpha.avif", 0, 3, "c4c858ee63ee942003ffbfc21b559422")]
+    [Arguments("sharpimage_seq_12_422_alpha.avif", 1, 3, "beacaf624ef56e7b0865f92b1e3d7768")]
     public async Task SequenceTrack_ByteExactVsDav1d(string file, int track, int frames, string md5)
     {
         byte[] data = File.ReadAllBytes(Asset(file));

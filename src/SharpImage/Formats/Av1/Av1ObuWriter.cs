@@ -141,6 +141,12 @@ internal static class Av1ObuWriter
     {
         public int Layers, MaxWidth, MaxHeight, Current;
         public int[] Widths = [], Heights = [];
+
+        /// <summary>
+        /// A plain image sequence (animated AVIF track) rather than spatial layers: one operating point (idc 0), no
+        /// OBU extension headers, every frame a shown key frame at the sequence's maximum size.
+        /// </summary>
+        public bool Sequence;
     }
 
     [ThreadStatic] private static LayeredStream? t_layered;
@@ -164,8 +170,15 @@ internal static class Av1ObuWriter
         w.PutBool(false);         // reduced_still_picture_header = 0
         w.PutBool(false);         // timing_info_present_flag
         w.PutBool(false);         // initial_display_delay_present_flag
-        w.PutBits((uint)(ls.Layers - 1), 5);   // operating_points_cnt_minus_1
-        for (int op = 0; op < ls.Layers; op++)
+        w.PutBits((uint)(ls.Sequence ? 0 : ls.Layers - 1), 5);   // operating_points_cnt_minus_1
+        if (ls.Sequence)
+        {
+            w.PutBits(0, 12);                 // operating_point_idc: no scalability
+            int seqLevel = SeqLevelIdx(ls.MaxWidth, ls.MaxHeight);
+            w.PutBits((uint)seqLevel, 5);     // seq_level_idx
+            if (seqLevel > 7) w.PutBool(false);
+        }
+        else for (int op = 0; op < ls.Layers; op++)
         {
             int top = ls.Layers - 1 - op;     // highest spatial layer of this operating point
             uint idc = (uint)((((1 << (top + 1)) - 1) << 8) | 1);
@@ -196,7 +209,7 @@ internal static class Av1ObuWriter
     // layer, intra-only frames above it; every frame shown and explicitly sized (render size = the full image).
     private static void WriteLayeredFramePrefix(Av1BitWriter w, LayeredStream ls, bool screenContentTools)
     {
-        bool key = ls.Current == 0;
+        bool key = ls.Sequence || ls.Current == 0;
         w.PutBool(false);                      // show_existing_frame
         w.PutBits(key ? 0u : 2u, 2);           // frame_type: KEY_FRAME / INTRA_ONLY_FRAME
         w.PutBool(true);                       // show_frame
@@ -204,6 +217,15 @@ internal static class Av1ObuWriter
         w.PutBool(false);                      // disable_cdf_update
         w.PutBool(screenContentTools);         // allow_screen_content_tools (SELECT)
         if (screenContentTools) w.PutBool(false);   // force_integer_mv (SELECT; intra overrides it to 1)
+        if (ls.Sequence)
+        {
+            // Full-size key frame: no size override (the sequence maximum), render size = frame size.
+            w.PutBool(false);                  // frame_size_override_flag
+            w.PutBool(false);                  // render_and_frame_size_different
+            if (screenContentTools) w.PutBool(false);   // allow_intrabc
+            w.PutBool(true);                   // disable_frame_end_update_cdf
+            return;
+        }
         w.PutBool(true);                       // frame_size_override_flag
         // order_hint: 0 bits; primary_ref_frame: none (intra).
         if (!key) w.PutBits(1u << ls.Current, 8);   // refresh_frame_flags (a key frame refreshes all)
@@ -238,7 +260,7 @@ internal static class Av1ObuWriter
     /// <summary>Wraps a payload in an OBU: header byte + leb128 size + payload. No extension header.</summary>
     internal static byte[] WrapObu(Av1ObuType type, ReadOnlySpan<byte> payload)
     {
-        if (t_layered is { } ls && type is Av1ObuType.Frame or Av1ObuType.FrameHeader or Av1ObuType.TileGroup)
+        if (t_layered is { Sequence: false } ls && type is Av1ObuType.Frame or Av1ObuType.FrameHeader or Av1ObuType.TileGroup)
             return WrapObuExtension(type, payload, 0, ls.Current);
         // forbidden(0) | type(4) | extension(0) | has_size(1) | reserved(0)
         byte hdr = (byte)(((int)type << 3) | 0b10);

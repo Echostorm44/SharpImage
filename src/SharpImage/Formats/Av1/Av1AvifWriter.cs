@@ -26,7 +26,21 @@ internal sealed class AvifContainerExtras
     public long[]? ColorLayerSizes;          // layered (progressive) colour item: byte size of each layer -> 'a1lx'
     public long[]? AlphaLayerSizes;          // layered alpha item
 
+    public AvifSequenceData? Sequence;       // image sequence (animated AVIF): tracks written after the items
+
     internal bool HasItems => Exif != null || Xmp != null;
+}
+
+/// <summary>An AVIF image sequence's coded samples (one temporal unit per frame, colour and optional alpha) and timing.
+/// The first samples double as the primary colour / alpha items.</summary>
+internal sealed class AvifSequenceData
+{
+    public List<byte[]> ColorSamples = [];
+    public List<byte[]>? AlphaSamples;
+    public uint[] Durations = [];            // per frame, in Timescale units
+    public uint Timescale = 30;
+    public int RepetitionCount;              // extra plays; -1 = infinite (libavif AVIF_REPETITION_COUNT_INFINITE)
+    public bool AllKeyFrames = true;         // every sample a sync (key) frame: no 'stss', all-intra 'ccst'
 }
 
 internal static class Av1AvifWriter
@@ -89,10 +103,13 @@ internal static class Av1AvifWriter
     // ftyp: major brand avif; compatible avif/mif1/miaf plus the AVIF profile brand the stream qualifies for —
     // MA1B (Baseline = AV1 Main profile), MA1A (Advanced = AV1 High profile, i.e. 8/10-bit 4:4:4); AV1
     // Professional streams (4:2:2, 12-bit) fit no AVIF profile brand, so none is claimed (as libavif does).
-    private static byte[] Ftyp(int bitDepth, Av1PixelLayout layout)
+    private static byte[] Ftyp(int bitDepth, Av1PixelLayout layout, bool sequence = false)
     {
         int profile = Av1ObuWriter.SeqProfile(bitDepth, layout);
-        var brands = Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"));
+        // An image sequence (libavif): major brand 'avis', compatible avif, avis, msf1, iso8, mif1, miaf.
+        var brands = sequence
+            ? Concat(Fourcc("avis"), U32(0), Fourcc("avif"), Fourcc("avis"), Fourcc("msf1"), Fourcc("iso8"), Fourcc("mif1"), Fourcc("miaf"))
+            : Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"));
         return Box("ftyp", profile switch
         {
             0 => Concat(brands, Fourcc("MA1B")),
@@ -124,7 +141,8 @@ internal static class Av1AvifWriter
         Av1PixelLayout layout, Av1ObuWriter.Av1ColorDesc? color, AvifContainerExtras? x)
     {
         bool monochrome = layout == Av1PixelLayout.I400;
-        byte[] ftyp = Ftyp(bitDepth, layout);
+        var sq = x?.Sequence;
+        byte[] ftyp = Ftyp(bitDepth, layout, sq != null);
 
         var props = new List<byte[]>();
         int Add(byte[] box) { props.Add(box); return props.Count; }
@@ -213,29 +231,144 @@ internal static class Av1AvifWriter
         if (xmpId != 0) refs.Add(Box("cdsc", Concat(U16(xmpId), U16(1), U16(1))));
         byte[]? iref = refs.Count > 0 ? FullBox("iref", 0, 0, Concat(refs.ToArray())) : null;
 
+        // mdat: for a sequence, the colour then alpha samples (one chunk each; the first samples are the colour / alpha
+        // items' data, as in libavif), then the other items; otherwise every item's payload in order.
+        var chunks = new List<byte[]>();
+        var itemOffset = new long[items.Count];   // relative to the mdat payload start
+        long colorChunk = 0, alphaChunk = 0, pos = 0;
+        if (sq != null)
+        {
+            colorChunk = pos;
+            foreach (var smp in sq.ColorSamples) { chunks.Add(smp); pos += smp.Length; }
+            if (sq.AlphaSamples != null)
+            {
+                alphaChunk = pos;
+                foreach (var smp in sq.AlphaSamples) { chunks.Add(smp); pos += smp.Length; }
+            }
+        }
+        for (int i = 0; i < items.Count; i++)
+        {
+            if (sq != null && i == 0) { itemOffset[i] = colorChunk; continue; }
+            if (sq != null && i == 1 && alphaData != null) { itemOffset[i] = alphaChunk; continue; }
+            itemOffset[i] = pos;
+            chunks.Add(items[i].Payload);
+            pos += items[i].Payload.Length;
+        }
+
         // iloc: version 0, offset_size=4/length_size=4/base_offset_size=0; one extent per item. Offsets are patched
-        // once the meta length (invariant to the offset values) is known.
-        byte[] Iloc(uint firstOffset)
+        // once the meta (and moov) lengths (invariant to the offset values) are known.
+        byte[] Iloc(uint mdatStart)
         {
             var body = new List<byte[]> { new byte[] { 0x44, 0x00 }, U16(items.Count) };
-            uint off = firstOffset;
-            foreach (var it in items)
-            {
-                body.Add(Concat(U16(it.Id), U16(0), U16(1), U32(off), U32((uint)it.Payload.Length)));
-                off += (uint)it.Payload.Length;
-            }
+            for (int i = 0; i < items.Count; i++)
+                body.Add(Concat(U16(items[i].Id), U16(0), U16(1), U32((uint)(mdatStart + itemOffset[i])), U32((uint)items[i].Payload.Length)));
             return FullBox("iloc", 0, 0, Concat(body.ToArray()));
         }
 
-        byte[] Meta(uint firstOffset) => FullBox("meta", 0, 0, iref != null
-            ? Concat(hdlr, pitm, Iloc(firstOffset), iinf, iref, iprp)
-            : Concat(hdlr, pitm, Iloc(firstOffset), iinf, iprp));
+        byte[] Meta(uint mdatStart) => FullBox("meta", 0, 0, iref != null
+            ? Concat(hdlr, pitm, Iloc(mdatStart), iinf, iref, iprp)
+            : Concat(hdlr, pitm, Iloc(mdatStart), iinf, iprp));
 
         int metaLen = Meta(0).Length;
-        byte[] meta = Meta((uint)(ftyp.Length + metaLen + 8));   // + 8: mdat box header
-        var payloads = new byte[items.Count][];
-        for (int i = 0; i < items.Count; i++) payloads[i] = items[i].Payload;
-        return Concat(ftyp, meta, Box("mdat", Concat(payloads)));
+        if (sq == null)
+        {
+            byte[] meta = Meta((uint)(ftyp.Length + metaLen + 8));   // + 8: mdat box header
+            return Concat(ftyp, meta, Box("mdat", Concat(chunks.ToArray())));
+        }
+        var colorEntry = SampleEntryChildren(Box("av1C", BuildAv1C(layout, bitDepth, width, height)), x, color, monochrome, alpha: false, sq.AllKeyFrames);
+        byte[]? alphaEntry = sq.AlphaSamples != null
+            ? SampleEntryChildren(Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth, width, height)), null, null, true, alpha: true, sq.AllKeyFrames)
+            : null;
+        int moovLen = Moov(sq, width, height, colorEntry, alphaEntry, 0, 0, x?.Premultiplied == true).Length;
+        uint start = (uint)(ftyp.Length + metaLen + moovLen + 8);
+        return Concat(ftyp, Meta(start), Moov(sq, width, height, colorEntry, alphaEntry, start + (uint)colorChunk, start + (uint)alphaChunk,
+            x?.Premultiplied == true), Box("mdat", Concat(chunks.ToArray())));
+    }
+
+    // Sample-entry child boxes (libavif write.c): av1C, then for colour its colr (ICC / nclx) and pasp / clli / mdcv,
+    // ccst (coding constraints), and for alpha the auxi aux-track type.
+    private static byte[] SampleEntryChildren(byte[] av1C, AvifContainerExtras? x, Av1ObuWriter.Av1ColorDesc? color, bool monochrome,
+        bool alpha, bool allKey)
+    {
+        var parts = new List<byte[]> { av1C };
+        if (!alpha)
+        {
+            if (x?.Icc is { Length: > 0 } icc) parts.Add(Box("colr", Concat(Fourcc("prof"), icc)));
+            parts.Add(ColrNclx(color, monochrome));
+            if (x?.Pasp is { } pasp) parts.Add(Box("pasp", Concat(U32(pasp.H), U32(pasp.V))));
+            if (x?.Clli is { } clli) parts.Add(Box("clli", Concat(U16(clli.MaxCll), U16(clli.MaxPall))));
+            if (x?.Mdcv is { Length: 24 } mdcv) parts.Add(Box("mdcv", mdcv));
+        }
+        // ccst: all_ref_pics_intra(1) intra_pred_used(1) max_ref_per_pic(4) reserved(26). All-key sequences reference
+        // nothing; otherwise libavif's permissive (0, 1, 15).
+        uint ccst = allKey ? (1u << 31) | (1u << 30) : (1u << 30) | (15u << 26);
+        parts.Add(FullBox("ccst", 0, 0, U32(ccst)));
+        if (alpha) parts.Add(FullBox("auxi", 0, 0, System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0")));
+        return Concat(parts.ToArray());
+    }
+
+    private static byte[] U64(ulong v) => Concat(U32((uint)(v >> 32)), U32((uint)v));
+
+    // moov for an image sequence (libavif write.c): mvhd, then one trak per coded plane set (colour track 1, alpha
+    // track 2 with tref auxl -> 1), each with an edit list carrying the repetition count, mdhd/hdlr/minf and a
+    // sample table (stsd av01, stts, stsc, stsz, stco; stss only when some sample is not a sync sample).
+    private static byte[] Moov(AvifSequenceData sq, int width, int height, byte[] colorEntry, byte[]? alphaEntry,
+        uint colorChunkOffset, uint alphaChunkOffset, bool premultiplied)
+    {
+        byte[] unity = Concat(U32(0x00010000), U32(0), U32(0), U32(0), U32(0x00010000), U32(0), U32(0), U32(0), U32(0x40000000));
+        ulong framesDuration = 0;
+        foreach (uint d in sq.Durations) framesDuration += d;
+        ulong duration = sq.RepetitionCount < 0 ? ulong.MaxValue : framesDuration * (ulong)(sq.RepetitionCount + 1);
+        int tracks = alphaEntry != null ? 2 : 1;
+        byte[] mvhd = FullBox("mvhd", 1, 0, Concat(U64(0), U64(0), U32(sq.Timescale), U64(duration), U32(0x00010000), U16(0x0100),
+            U16(0), new byte[8], unity, new byte[24], U32((uint)(tracks + 1))));
+
+        byte[] Trak(int trackId, List<byte[]> samples, byte[] entryChildren, bool alpha, uint chunkOffset)
+        {
+            byte[] tkhd = FullBox("tkhd", 1, 1, Concat(U64(0), U64(0), U32((uint)trackId), U32(0), U64(duration), new byte[8],
+                U16(0), U16(0), U16(0), U16(0), unity, U32((uint)width << 16), U32((uint)height << 16)));
+            var trefParts = new List<byte[]>();
+            if (alpha) trefParts.Add(Box("auxl", U32(1)));                         // alpha -> colour
+            if (!alpha && premultiplied && sq.AlphaSamples != null) trefParts.Add(Box("prem", U32(2)));   // colour -> alpha
+            byte[] tref = trefParts.Count > 0 ? Box("tref", Concat(trefParts.ToArray())) : [];
+            byte[] elst = FullBox("elst", 1, sq.RepetitionCount != 0 ? 1u : 0u,
+                Concat(U32(1), U64(framesDuration), U64(0), U16(1), U16(0)));
+            byte[] edts = Box("edts", elst);
+            byte[] mdhd = FullBox("mdhd", 1, 0, Concat(U64(0), U64(0), U32(sq.Timescale), U64(framesDuration), U16(21956), U16(0)));
+            byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc(alpha ? "auxv" : "pict"), U32(0), U32(0), U32(0), new byte[] { 0 }));
+            byte[] vmhd = FullBox("vmhd", 0, 1, Concat(U16(0), new byte[6]));
+            byte[] dinf = Box("dinf", FullBox("dref", 0, 0, Concat(U32(1), FullBox("url ", 0, 1, []))));
+            byte[] compressor = new byte[32];
+            byte[] name = System.Text.Encoding.ASCII.GetBytes("\nAOM Coding");
+            name.CopyTo(compressor, 0);
+            byte[] av01 = Box("av01", Concat(new byte[6], U16(1), U16(0), U16(0), new byte[12], U16(width), U16(height),
+                U32(0x00480000), U32(0x00480000), U32(0), U16(1), compressor, U16(0x0018), U16(0xFFFF), entryChildren));
+            byte[] stsd = FullBox("stsd", 0, 0, Concat(U32(1), av01));
+            var stts = new List<byte[]>();
+            int runs = 0;
+            for (int i = 0, count = 0; i < sq.Durations.Length; i++)
+            {
+                count++;
+                if (i + 1 < sq.Durations.Length && sq.Durations[i + 1] == sq.Durations[i]) continue;
+                stts.Add(Concat(U32((uint)count), U32(sq.Durations[i])));
+                runs++;
+                count = 0;
+            }
+            byte[] sttsBox = FullBox("stts", 0, 0, Concat(U32((uint)runs), Concat(stts.ToArray())));
+            byte[] stsc = FullBox("stsc", 0, 0, Concat(U32(1), U32(1), U32((uint)samples.Count), U32(1)));
+            var sizes = new List<byte[]> { U32(0), U32((uint)samples.Count) };
+            foreach (var smp in samples) sizes.Add(U32((uint)smp.Length));
+            byte[] stsz = FullBox("stsz", 0, 0, Concat(sizes.ToArray()));
+            byte[] stco = FullBox("stco", 0, 0, Concat(U32(1), U32(chunkOffset)));
+            byte[] stbl = Box("stbl", Concat(stsd, sttsBox, stsc, stsz, stco));
+            byte[] minf = Box("minf", Concat(vmhd, dinf, stbl));
+            byte[] mdia = Box("mdia", Concat(mdhd, hdlr, minf));
+            return Box("trak", Concat(tkhd, tref, edts, mdia));
+        }
+
+        var body = new List<byte[]> { mvhd, Trak(1, sq.ColorSamples, colorEntry, false, colorChunkOffset) };
+        if (alphaEntry != null) body.Add(Trak(2, sq.AlphaSamples!, alphaEntry, true, alphaChunkOffset));
+        return Box("moov", Concat(body.ToArray()));
     }
 
     // HEIF Exif item: unsigned int(32) exif_tiff_header_offset, then the Exif block. The offset is the distance from

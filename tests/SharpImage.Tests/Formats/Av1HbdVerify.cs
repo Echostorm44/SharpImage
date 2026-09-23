@@ -859,6 +859,57 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(Scratch, "track.txt"), log.ToString());
     }
 
+    // Sequence encode probe (trigger hbd_seqenc.txt): animated AVIFs from a moving pattern -> scratch/seqenc/*.avif.
+    [Test, NotInParallel]
+    public void SequenceEncode()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_seqenc.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string dir = Path.Combine(Scratch, "seqenc");
+        Directory.CreateDirectory(dir);
+        ImageSequence Make(int w, int h, int n, bool alpha, bool grey)
+        {
+            var seq = new ImageSequence { Timescale = 30, LoopCount = 3 };
+            for (int k = 0; k < n; k++)
+            {
+                var f = new ImageFrame();
+                f.Initialize(w, h, ColorspaceType.SRGB, alpha);
+                int ch = f.NumberOfChannels;
+                for (int y = 0; y < h; y++)
+                {
+                    var row = f.GetPixelRowForWrite(y);
+                    for (int x = 0; x < w; x++)
+                    {
+                        double t = k * 0.35;
+                        int rr = (int)(32767 + 32767 * Math.Sin((x + 3 * k) * 0.09 + t));
+                        int gg = grey ? rr : (int)(32767 + 32767 * Math.Cos((y - 2 * k) * 0.07));
+                        int bb = grey ? rr : ((x ^ y) + 9 * k) * 257 & 0xFFFF;
+                        row[x * ch] = (ushort)rr; row[x * ch + 1] = (ushort)gg; row[x * ch + 2] = (ushort)bb;
+                        if (alpha) row[x * ch + 3] = (ushort)Math.Clamp(65535 - ((x + y + 5 * k) * 700) % 65536, 0, 65535);
+                    }
+                }
+                f.DurationTicks = k == 2 ? 6 : 3;
+                seq.AddFrame(f);
+            }
+            return seq;
+        }
+        var log = new System.Text.StringBuilder();
+        void Save(string name, ImageSequence seq, AvifEncodeOptions o)
+        {
+            try { File.WriteAllBytes(Path.Combine(dir, name + ".avif"), HeifCoder.EncodeAvifSequence(seq, o)); log.AppendLine(name + " ok"); }
+            catch (Exception e) { log.AppendLine($"{name} ERROR {e.ToString().ReplaceLineEndings(" | ")}"); }
+        }
+        Save("seq_8_420", Make(96, 64, 5, false, false), new AvifEncodeOptions { Qp = 24, BitDepth = 8 });
+        Save("seq_8_420_alpha", Make(96, 64, 4, true, false), new AvifEncodeOptions { Qp = 24, BitDepth = 8 });
+        Save("seq_10_444", Make(80, 48, 4, false, false), new AvifEncodeOptions { Qp = 20, BitDepth = 10, ChromaSubsampling = AvifChromaSubsampling.Yuv444 });
+        Save("seq_12_422_alpha", Make(72, 40, 3, true, false), new AvifEncodeOptions { Qp = 20, BitDepth = 12, ChromaSubsampling = AvifChromaSubsampling.Yuv422 });
+        Save("seq_8_grey", Make(64, 64, 3, false, true), new AvifEncodeOptions { Qp = 24, BitDepth = 8 });
+        Save("seq_8_lossless", Make(48, 32, 3, true, false), new AvifEncodeOptions { Lossless = true, BitDepth = 8 });
+        Save("seq_8_grain", Make(96, 64, 3, false, false), new AvifEncodeOptions { Qp = 30, BitDepth = 8, FilmGrain = AvifFilmGrain.TestVector(1) });
+        File.WriteAllText(Path.Combine(dir, "log.txt"), log.ToString());
+    }
+
     // Layered-stream probe (trigger hbd_layers.txt holding an .avif path): decodes the primary item's payload and writes
     // the outcome / full exception to layers.txt.
     [Test, NotInParallel]

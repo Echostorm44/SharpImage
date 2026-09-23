@@ -464,6 +464,9 @@ public static class FormatRegistry
                 using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write))
                     WebpCoder.WriteSequence(sequence, stream);
                 break;
+            case ImageFileFormat.Avif:
+                File.WriteAllBytes(path, HeifCoder.EncodeAvifSequence(sequence));
+                break;
             default:
                 throw new NotSupportedException($"Multi-frame write not supported for: {format}");
         }
