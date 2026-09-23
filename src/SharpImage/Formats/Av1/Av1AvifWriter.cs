@@ -1,29 +1,52 @@
 // AVIF (AV1 Image File Format) ISOBMFF container writer. AVIF is a HEIF/MIAF file whose primary item is an
 // AV1-coded image: an `av01` item described by an `av1C` config box (carrying the sequence-header OBU) with the
 // frame OBUs in `mdat`. Mirrors the box structure of the HEIC encoder, swapping hvc1/hvcC for av01/av1C.
-// Verified: files open in ffmpeg/libdav1d (and standard AVIF viewers).
+// Optional: a monochrome alpha auxiliary item (auxl), Exif / XMP metadata items (cdsc), and primary-item
+// properties for ICC (colr prof), transforms (clap/irot/imir, essential), pasp and HDR light levels (clli/mdcv),
+// laid out the way libavif writes them. Verified: files open in ffmpeg/libdav1d and libavif.
 using System;
 using System.Collections.Generic;
 
 namespace SharpImage.Formats.Av1;
 
+/// <summary>Optional AVIF container content beyond the coded image(s): colour profile, metadata items, transforms
+/// and HDR properties of the primary item.</summary>
+internal sealed class AvifContainerExtras
+{
+    public byte[]? Icc;                      // colr 'prof' (raw ICC profile)
+    public byte[]? Exif;                     // Exif item payload (TIFF header onward, or with a leading "Exif\0\0")
+    public byte[]? Xmp;                      // XMP packet (mime item, application/rdf+xml)
+    public int? IrotAngle;                   // irot: anti-clockwise rotation in 90° units (0..3)
+    public int? ImirAxis;                    // imir: 0 = vertical axis (left-right flip), 1 = horizontal axis (top-bottom)
+    public uint[]? Clap;                     // clap: widthN,widthD,heightN,heightD,horizOffN,horizOffD,vertOffN,vertOffD
+    public (uint H, uint V)? Pasp;           // pasp: pixel aspect ratio hSpacing:vSpacing
+    public (ushort MaxCll, ushort MaxPall)? Clli;
+    public byte[]? Mdcv;                     // mdcv payload (24 bytes: display primaries, white point, max/min luminance)
+
+    internal bool HasItems => Exif != null || Xmp != null;
+}
+
 internal static class Av1AvifWriter
 {
     /// <summary>Builds a complete .avif file. <paramref name="seqObu"/> is the sequence-header OBU (size-field
-    /// form); it is placed both in av1C configOBUs (for decoders that configure from it) and in-band at the head
-    /// of the mdat item data (for decoders that decode the item as a self-contained temporal unit — including
-    /// SharpImage's own). <paramref name="frameObu"/> is the OBU_FRAME.</summary>
+    /// form); it is placed in-band at the head of the mdat item data (the item decodes as a self-contained temporal
+    /// unit, as libaom/ffmpeg AVIF output does). <paramref name="frameObu"/> is the OBU_FRAME.</summary>
     internal static byte[] BuildAvif(byte[] seqObu, byte[] frameObu, int width, int height, bool monochrome, int bitDepth = 8,
-        Av1PixelLayout layout = Av1PixelLayout.I420, Av1ObuWriter.Av1ColorDesc? color = null)
+        Av1PixelLayout layout = Av1PixelLayout.I420, Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
     {
         if (monochrome) layout = Av1PixelLayout.I400;
-        byte[] av1C = BuildAv1C(layout, bitDepth);
-        // Sequence header + frame OBUs go in-band in mdat (matches libaom/ffmpeg AVIF output and lets any AV1
-        // decoder treat the item as a self-contained temporal unit).
-        var mdat = new byte[seqObu.Length + frameObu.Length];
-        seqObu.CopyTo(mdat, 0);
-        frameObu.CopyTo(mdat, seqObu.Length);
-        return BuildIsoBmff(width, height, av1C, mdat, monochrome, bitDepth, layout, color);
+        return BuildContainer(Concat(seqObu, frameObu), null, width, height, bitDepth, layout, color, extras);
+    }
+
+    /// <summary>Builds a 2-item AVIF: a primary colour `av01` item (item 1) and a monochrome alpha auxiliary
+    /// `av01` item (item 2) linked by an `auxl` item reference (item 2 → item 1) with the standard alpha aux URN.
+    /// Both items' OBUs share one mdat (colour first, then alpha) as two extents. Verified in ffmpeg/libavif.</summary>
+    internal static byte[] BuildAvifWithAlpha(byte[] colorSeq, byte[] colorFrame, byte[] alphaSeq, byte[] alphaFrame,
+        int width, int height, bool colorMonochrome, int bitDepth = 8, Av1PixelLayout layout = Av1PixelLayout.I420,
+        Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
+    {
+        if (colorMonochrome) layout = Av1PixelLayout.I400;
+        return BuildContainer(Concat(colorSeq, colorFrame), Concat(alphaSeq, alphaFrame), width, height, bitDepth, layout, color, extras);
     }
 
     // colr nclx. Legacy (no description given): unspecified primaries/transfer, matrix Identity(0) for mono /
@@ -60,88 +83,6 @@ internal static class Av1AvifWriter
         return new[] { b0, b1, b2, b3 };
     }
 
-    /// <summary>Builds a 2-item AVIF: a primary colour `av01` item (item 1) and a monochrome alpha auxiliary
-    /// `av01` item (item 2) linked by an `auxl` item reference (item 2 → item 1) with the standard alpha aux URN.
-    /// Both items' OBUs share one mdat (colour first, then alpha) as two extents. Verified in ffmpeg/libavif.</summary>
-    internal static byte[] BuildAvifWithAlpha(byte[] colorSeq, byte[] colorFrame, byte[] alphaSeq, byte[] alphaFrame,
-        int width, int height, bool colorMonochrome, int bitDepth = 8, Av1PixelLayout layout = Av1PixelLayout.I420,
-        Av1ObuWriter.Av1ColorDesc? color = null)
-    {
-        if (colorMonochrome) layout = Av1PixelLayout.I400;
-        var colorMdat = new byte[colorSeq.Length + colorFrame.Length];
-        colorSeq.CopyTo(colorMdat, 0);
-        colorFrame.CopyTo(colorMdat, colorSeq.Length);
-        var alphaMdat = new byte[alphaSeq.Length + alphaFrame.Length];
-        alphaSeq.CopyTo(alphaMdat, 0);
-        alphaFrame.CopyTo(alphaMdat, alphaSeq.Length);
-
-        byte[] av1CColor = Box("av1C", BuildAv1C(layout, bitDepth));
-        byte[] av1CAlpha = Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth));
-
-        // ipco properties (1-indexed): 1 ispe (shared), 2 pixi(colour), 3 av1C(colour), 4 colr,
-        // 5 av1C(alpha), 6 auxC(alpha URN), 7 pixi(alpha, 1ch).
-        byte[] ispe = FullBox("ispe", 0, 0, Concat(U32((uint)width), U32((uint)height)));
-        int cch = colorMonochrome ? 1 : 3;
-        var pixiC = new List<byte> { (byte)cch };
-        for (int i = 0; i < cch; i++) pixiC.Add((byte)bitDepth);
-        byte[] pixiColor = FullBox("pixi", 0, 0, pixiC.ToArray());
-        byte[] colr = ColrNclx(color, colorMonochrome);
-        byte[] pixiAlpha = FullBox("pixi", 0, 0, new byte[] { 1, (byte)bitDepth });
-        // auxC: aux_type is a null-terminated URN string identifying the alpha plane.
-        byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
-        byte[] auxC = FullBox("auxC", 0, 0, auxUrn);
-        byte[] ipco = Box("ipco", Concat(ispe, pixiColor, av1CColor, colr, av1CAlpha, auxC, pixiAlpha));
-
-        // ipma: item 1 → ispe(1), pixi(2), av1C essential(3), colr(4); item 2 → ispe(1), av1C essential(5),
-        // auxC essential(6), pixi(7).
-        byte[] ipmaPayload = Concat(
-            U32(2),                              // entry_count
-            U16(1), new byte[] { 4 },            // item 1, 4 associations
-            new byte[] { 0x01, 0x02, 0x83, 0x04 },
-            U16(2), new byte[] { 4 },            // item 2, 4 associations
-            new byte[] { 0x01, 0x85, 0x86, 0x07 });
-        byte[] ipma = FullBox("ipma", 0, 0, ipmaPayload);
-        byte[] iprp = Box("iprp", Concat(ipco, ipma));
-
-        byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc("pict"), U32(0), U32(0), U32(0),
-            System.Text.Encoding.ASCII.GetBytes("PictureHandler\0")));
-        byte[] pitm = FullBox("pitm", 0, 0, U16(1));
-
-        byte[] infeColor = FullBox("infe", 2, 0, Concat(U16(1), U16(0), Fourcc("av01"), new byte[] { 0 }));
-        byte[] infeAlpha = FullBox("infe", 2, 0, Concat(U16(2), U16(0), Fourcc("av01"), new byte[] { 0 }));
-        byte[] iinf = FullBox("iinf", 0, 0, Concat(U16(2), infeColor, infeAlpha));
-
-        // iref (version 0): auxl from item 2 → item 1 (alpha references its master image).
-        byte[] auxl = Box("auxl", Concat(U16(2), U16(1), U16(1))); // from_ID, ref_count, to_ID
-        byte[] iref = FullBox("iref", 0, 0, auxl);
-
-        // iloc: version 0, offset_size=4/length_size=4/base_offset_size=0; two items, one extent each. Offsets are
-        // patched after the meta layout is known (meta length is invariant to the offset values).
-        byte[] BuildIloc(uint colorOff, uint alphaOff) => FullBox("iloc", 0, 0, Concat(
-            new byte[] { 0x44 }, new byte[] { 0x00 }, U16(2),
-            U16(1), U16(0), U16(1), U32(colorOff), U32((uint)colorMdat.Length),
-            U16(2), U16(0), U16(1), U32(alphaOff), U32((uint)alphaMdat.Length)));
-
-        byte[] MetaWith(uint colorOff, uint alphaOff)
-        {
-            byte[] metaPayload = Concat(hdlr, pitm, BuildIloc(colorOff, alphaOff), iinf, iref, iprp);
-            return FullBox("meta", 0, 0, metaPayload);
-        }
-
-        byte[] ftyp = Ftyp(bitDepth, layout);
-
-        int metaLen = MetaWith(0, 0).Length;               // invariant to offset values
-        int mdatPayloadOffset = ftyp.Length + metaLen + 8; // +8 mdat box header
-        byte[] meta = MetaWith((uint)mdatPayloadOffset, (uint)(mdatPayloadOffset + colorMdat.Length));
-
-        var mdatPayload = new byte[colorMdat.Length + alphaMdat.Length];
-        colorMdat.CopyTo(mdatPayload, 0);
-        alphaMdat.CopyTo(mdatPayload, colorMdat.Length);
-        byte[] mdat = Box("mdat", mdatPayload);
-
-        return Concat(ftyp, meta, mdat);
-    }
-
     // ftyp: major brand avif; compatible avif/mif1/miaf plus the AVIF profile brand the stream qualifies for —
     // MA1B (Baseline = AV1 Main profile), MA1A (Advanced = AV1 High profile, i.e. 8/10-bit 4:4:4); AV1
     // Professional streams (4:2:2, 12-bit) fit no AVIF profile brand, so none is claimed (as libavif does).
@@ -157,74 +98,130 @@ internal static class Av1AvifWriter
         });
     }
 
-    private static byte[] BuildIsoBmff(int width, int height, byte[] av1C, byte[] mdatPayload, bool monochrome, int bitDepth,
-        Av1PixelLayout layout, Av1ObuWriter.Av1ColorDesc? color = null)
+    // One container builder for every layout. Item IDs: 1 = colour (primary), 2 = alpha (if any), then Exif, XMP.
+    // Property order: ispe, pixi, av1C, [colr prof], colr nclx, [pasp, clli, mdcv, clap, irot, imir], then the alpha
+    // item's av1C / auxC / pixi. With no extras this reproduces the original single/2-item byte layout exactly.
+    private static byte[] BuildContainer(byte[] colorData, byte[]? alphaData, int width, int height, int bitDepth,
+        Av1PixelLayout layout, Av1ObuWriter.Av1ColorDesc? color, AvifContainerExtras? x)
     {
-        byte[] ftyp = Ftyp(bitDepth, monochrome ? Av1PixelLayout.I400 : layout);
+        bool monochrome = layout == Av1PixelLayout.I400;
+        byte[] ftyp = Ftyp(bitDepth, layout);
 
-        // Property container ipco { ispe, pixi, av1C, colr } — matching libaom/ffmpeg AVIF order so av1C is the
-        // 3rd (essential) property.
-        byte[] av1CBox = Box("av1C", av1C);
-        byte[] ispe = FullBox("ispe", 0, 0, Concat(U32((uint)width), U32((uint)height)));
-        int channels = monochrome ? 1 : 3;
-        var pixiPayload = new List<byte> { (byte)channels };
-        for (int i = 0; i < channels; i++)
+        var props = new List<byte[]>();
+        int Add(byte[] box) { props.Add(box); return props.Count; }
+        var assoc1 = new List<(int Index, bool Essential)>();
+        int ispeIdx = Add(FullBox("ispe", 0, 0, Concat(U32((uint)width), U32((uint)height))));
+        assoc1.Add((ispeIdx, false));
+        int ch = monochrome ? 1 : 3;
+        var pixi = new byte[1 + ch];
+        pixi[0] = (byte)ch;
+        for (int i = 1; i <= ch; i++) pixi[i] = (byte)bitDepth;
+        assoc1.Add((Add(FullBox("pixi", 0, 0, pixi)), false));
+        assoc1.Add((Add(Box("av1C", BuildAv1C(layout, bitDepth))), true));
+        if (x?.Icc is { Length: > 0 } icc) assoc1.Add((Add(Box("colr", Concat(Fourcc("prof"), icc))), false));
+        assoc1.Add((Add(ColrNclx(color, monochrome)), false));
+        if (x?.Pasp is { } pasp) assoc1.Add((Add(Box("pasp", Concat(U32(pasp.H), U32(pasp.V)))), false));
+        if (x?.Clli is { } clli) assoc1.Add((Add(Box("clli", Concat(U16(clli.MaxCll), U16(clli.MaxPall)))), false));
+        if (x?.Mdcv is { Length: 24 } mdcv) assoc1.Add((Add(Box("mdcv", mdcv)), false));
+        if (x?.Clap is { Length: 8 } clap)
         {
-            pixiPayload.Add((byte)bitDepth); // bits per channel
+            var cb = new byte[32];
+            for (int i = 0; i < 8; i++) WriteU32(cb, i * 4, clap[i]);
+            assoc1.Add((Add(Box("clap", cb)), true));
+        }
+        if (x?.IrotAngle is { } angle) assoc1.Add((Add(Box("irot", new[] { (byte)(angle & 3) })), true));
+        if (x?.ImirAxis is { } axis) assoc1.Add((Add(Box("imir", new[] { (byte)(axis & 1) })), true));
+
+        var assoc2 = new List<(int Index, bool Essential)>();
+        if (alphaData != null)
+        {
+            assoc2.Add((ispeIdx, false));
+            assoc2.Add((Add(Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth))), true));
+            // auxC: aux_type is a null-terminated URN string identifying the alpha plane.
+            byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
+            assoc2.Add((Add(FullBox("auxC", 0, 0, auxUrn)), true));
+            assoc2.Add((Add(FullBox("pixi", 0, 0, new byte[] { 1, (byte)bitDepth })), false));
         }
 
-        byte[] pixi = FullBox("pixi", 0, 0, pixiPayload.ToArray());
-        byte[] colr = ColrNclx(color, monochrome);
-        byte[] ipco = Box("ipco", Concat(ispe, pixi, av1CBox, colr));
+        // Items: (id, type, name, content type, payload).
+        var items = new List<(int Id, string Type, byte[] Payload, byte[] InfeExtra)>
+        {
+            (1, "av01", colorData, new byte[] { 0 }),
+        };
+        if (alphaData != null) items.Add((2, "av01", alphaData, new byte[] { 0 }));
+        int nextId = items.Count + 1;
+        int exifId = 0, xmpId = 0;
+        if (x?.Exif is { Length: > 0 } exif)
+        {
+            exifId = nextId++;
+            items.Add((exifId, "Exif", ExifItemPayload(exif), System.Text.Encoding.ASCII.GetBytes("Exif\0")));
+        }
+        if (x?.Xmp is { Length: > 0 } xmp)
+        {
+            xmpId = nextId++;
+            items.Add((xmpId, "mime", xmp, System.Text.Encoding.ASCII.GetBytes("XMP\0application/rdf+xml\0")));
+        }
 
-        // ipma: item 1 → properties 1..4 (ispe, pixi, av1C essential = index 3, colr).
-        byte[] ipmaPayload = Concat(
-            U32(1),                 // entry_count
-            U16(1),                 // item_ID = 1
-            new byte[] { 4 },       // association_count
-            new byte[] { 0x01 },    // property_index 1 (ispe)
-            new byte[] { 0x02 },    // property_index 2 (pixi)
-            new byte[] { 0x83 },    // essential | property_index 3 (av1C)
-            new byte[] { 0x04 });   // property_index 4 (colr)
-        byte[] ipma = FullBox("ipma", 0, 0, ipmaPayload);
-        byte[] iprp = Box("iprp", Concat(ipco, ipma));
+        byte[] ipco = Box("ipco", Concat(props.ToArray()));
+        var ipmaBody = new List<byte[]> { U32((uint)(alphaData != null ? 2 : 1)) };
+        void Assoc(int id, List<(int Index, bool Essential)> a)
+        {
+            ipmaBody.Add(U16(id));
+            ipmaBody.Add(new[] { (byte)a.Count });
+            foreach (var (idx, ess) in a) ipmaBody.Add(new[] { (byte)((ess ? 0x80 : 0) | idx) });
+        }
+        Assoc(1, assoc1);
+        if (alphaData != null) Assoc(2, assoc2);
+        byte[] iprp = Box("iprp", Concat(ipco, FullBox("ipma", 0, 0, Concat(ipmaBody.ToArray()))));
 
         byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc("pict"), U32(0), U32(0), U32(0),
             System.Text.Encoding.ASCII.GetBytes("PictureHandler\0")));
         byte[] pitm = FullBox("pitm", 0, 0, U16(1));
-        // iinf { infe (item 1, type av01) }
-        byte[] infe = FullBox("infe", 2, 0, Concat(U16(1), U16(0), Fourcc("av01"), new byte[] { 0 }));
-        byte[] iinf = FullBox("iinf", 0, 0, Concat(U16(1), infe));
+        var infes = new List<byte[]> { U16(items.Count) };
+        foreach (var it in items) infes.Add(FullBox("infe", 2, 0, Concat(U16(it.Id), U16(0), Fourcc(it.Type), it.InfeExtra)));
+        byte[] iinf = FullBox("iinf", 0, 0, Concat(infes.ToArray()));
 
-        // iloc: version 0 (no construction_method field), offset_size=4, length_size=4, base_offset_size=0;
-        // one item, one extent.
-        byte[] ilocPayload = Concat(
-            new byte[] { 0x44 },              // offset_size(4) | length_size(4)
-            new byte[] { 0x00 },              // base_offset_size(0) | reserved(0)
-            U16(1),                           // item_count
-            U16(1),                           // item_ID
-            U16(0),                           // data_reference_index
-            U16(1),                           // extent_count
-            U32(0),                           // extent_offset (patched after layout)
-            U32((uint)mdatPayload.Length));   // extent_length
-        byte[] iloc = FullBox("iloc", 0, 0, ilocPayload);
+        // iref (version 0): auxl alpha → colour; cdsc metadata → colour.
+        var refs = new List<byte[]>();
+        if (alphaData != null) refs.Add(Box("auxl", Concat(U16(2), U16(1), U16(1))));   // from_ID, ref_count, to_ID
+        if (exifId != 0) refs.Add(Box("cdsc", Concat(U16(exifId), U16(1), U16(1))));
+        if (xmpId != 0) refs.Add(Box("cdsc", Concat(U16(xmpId), U16(1), U16(1))));
+        byte[]? iref = refs.Count > 0 ? FullBox("iref", 0, 0, Concat(refs.ToArray())) : null;
 
-        // Box order matches the reference: hdlr, pitm, iloc, iinf, iprp.
-        byte[] metaPayload = Concat(hdlr, pitm, iloc, iinf, iprp);
-        byte[] meta = FullBox("meta", 0, 0, metaPayload);
+        // iloc: version 0, offset_size=4/length_size=4/base_offset_size=0; one extent per item. Offsets are patched
+        // once the meta length (invariant to the offset values) is known.
+        byte[] Iloc(uint firstOffset)
+        {
+            var body = new List<byte[]> { new byte[] { 0x44, 0x00 }, U16(items.Count) };
+            uint off = firstOffset;
+            foreach (var it in items)
+            {
+                body.Add(Concat(U16(it.Id), U16(0), U16(1), U32(off), U32((uint)it.Payload.Length)));
+                off += (uint)it.Payload.Length;
+            }
+            return FullBox("iloc", 0, 0, Concat(body.ToArray()));
+        }
 
-        byte[] mdat = Box("mdat", mdatPayload);
+        byte[] Meta(uint firstOffset) => FullBox("meta", 0, 0, iref != null
+            ? Concat(hdlr, pitm, Iloc(firstOffset), iinf, iref, iprp)
+            : Concat(hdlr, pitm, Iloc(firstOffset), iinf, iprp));
 
-        int mdatBoxOffset = ftyp.Length + meta.Length;
-        int mdatPayloadOffset = mdatBoxOffset + 8; // box header (size + type)
+        int metaLen = Meta(0).Length;
+        byte[] meta = Meta((uint)(ftyp.Length + metaLen + 8));   // + 8: mdat box header
+        var payloads = new byte[items.Count][];
+        for (int i = 0; i < items.Count; i++) payloads[i] = items[i].Payload;
+        return Concat(ftyp, meta, Box("mdat", Concat(payloads)));
+    }
 
-        // Patch the iloc extent_offset inside meta. iloc is now the 3rd child; locate it by offset from the start
-        // of metaPayload: after hdlr + pitm, then its own 8(box header)+4(fullbox)+10(to extent_offset).
-        int ilocStartInMeta = 8 /*meta box hdr*/ + 4 /*meta fullbox*/ + hdlr.Length + pitm.Length;
-        int ilocOffsetInMeta = ilocStartInMeta + 8 + 4 + 10;
-        WriteU32(meta, ilocOffsetInMeta, (uint)mdatPayloadOffset);
-
-        return Concat(ftyp, meta, mdat);
+    // HEIF Exif item: unsigned int(32) exif_tiff_header_offset, then the Exif block. The offset is the distance from
+    // the block start to the TIFF header ("II*\0" / "MM\0*"), e.g. 6 when the block starts with "Exif\0\0".
+    private static byte[] ExifItemPayload(byte[] exif)
+    {
+        int off = 0;
+        for (int i = 0; i + 4 <= exif.Length; i++)
+            if ((exif[i] == 'I' && exif[i + 1] == 'I' && exif[i + 2] == 42 && exif[i + 3] == 0) ||
+                (exif[i] == 'M' && exif[i + 1] == 'M' && exif[i + 2] == 0 && exif[i + 3] == 42)) { off = i; break; }
+        return Concat(U32((uint)off), exif);
     }
 
     private static byte[] Box(string type, byte[] payload) => Concat(U32((uint)(payload.Length + 8)), Fourcc(type), payload);

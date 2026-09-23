@@ -207,7 +207,7 @@ internal static class Av1StillImageEncoder
     /// of 8/16/32/64) as a complete .avif. <paramref name="luma"/> is w x h; <paramref name="u"/>/<paramref
     /// name="v"/> are (w/2) x (h/2) subsampled chroma. DC intra for luma and chroma.</summary>
     internal static byte[] EncodeAvifColor(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
-        int width, int height, int baseQIdx, Av1ObuWriter.Av1ColorDesc? color = null)
+        int width, int height, int baseQIdx, Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
     {
         if (width % 2 != 0 || height % 2 != 0 || !TryResolveSingleBlock(width, height, out BlockPlan plan))
         {
@@ -223,7 +223,7 @@ internal static class Av1StillImageEncoder
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
         byte[] frameObu = Av1ObuWriter.WrapObu(Av1ObuType.Frame, framePayload);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false, color: color);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false, color: color, extras: extras);
     }
 
     private static byte[] EncodeColorTile(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
@@ -308,15 +308,15 @@ internal static class Av1StillImageEncoder
     /// PARTITION_NONE with real DC prediction from reconstructed neighbours and neighbour DC-sign contexts,
     /// reconstructing as it goes. Capped at 2x2 SBs because the decoder's above context holds only two SBs.</summary>
     internal static byte[] EncodeAvifMonochromeMultiSb(ReadOnlySpan<byte> luma, int width, int height, int baseQIdx,
-        Av1ObuWriter.Av1ColorDesc? color = null)
-        => EncodeAvifMonochromeMultiSb(Widen(luma), width, height, baseQIdx, 8, color);
+        Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
+        => EncodeAvifMonochromeMultiSb(Widen(luma), width, height, baseQIdx, 8, color, extras);
 
     /// <summary>High-bit-depth monochrome entry: <paramref name="luma"/> holds samples in [0, 2^bitDepth).</summary>
     internal static byte[] EncodeAvifMonochromeMultiSb(ReadOnlySpan<ushort> luma, int width, int height, int baseQIdx, int bitDepth,
-        Av1ObuWriter.Av1ColorDesc? color = null)
+        Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
     {
         (byte[] seqObu, byte[] frameObu) = BuildMonochromeObus(luma, width, height, baseQIdx, bitDepth, color);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true, bitDepth, color: color);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true, bitDepth, color: color, extras: extras);
     }
 
     // Widens 8-bit samples to the encoder's ushort pixel type (identity values).
@@ -508,16 +508,16 @@ internal static class Av1StillImageEncoder
     /// coding luma + subsampled chroma with cross-block DC prediction and reconstruct-as-you-go on all three
     /// planes.</summary>
     internal static byte[] EncodeAvifColorMultiSb(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
-        int width, int height, int baseQIdx, Av1ObuWriter.Av1ColorDesc? color = null)
-        => EncodeAvifColorMultiSb(Widen(luma), Widen(u), Widen(v), width, height, baseQIdx, 8, color: color);
+        int width, int height, int baseQIdx, Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
+        => EncodeAvifColorMultiSb(Widen(luma), Widen(u), Widen(v), width, height, baseQIdx, 8, color: color, extras: extras);
 
     /// <summary>High-bit-depth I420 colour entry: planes hold samples in [0, 2^bitDepth).</summary>
     internal static byte[] EncodeAvifColorMultiSb(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v,
         int width, int height, int baseQIdx, int bitDepth, Av1PixelLayout layout = Av1PixelLayout.I420,
-        Av1ObuWriter.Av1ColorDesc? color = null)
+        Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
     {
         (byte[] seqObu, byte[] frameObu) = BuildColorObus(luma, u, v, width, height, baseQIdx, bitDepth, layout, color);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false, bitDepth, layout, color);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: false, bitDepth, layout, color, extras);
     }
 
     /// <summary>Builds the sequence-header + OBU_FRAME for an I420 colour multi-superblock key frame.</summary>
@@ -558,18 +558,19 @@ internal static class Av1StillImageEncoder
     /// `av01` item and a monochrome alpha auxiliary item, linked by an `auxl` item reference. Alpha is coded as a
     /// full-range monochrome AV1 image (the standard AVIF alpha representation).</summary>
     internal static byte[] EncodeAvifColorWithAlpha(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v,
-        ReadOnlySpan<byte> alpha, int width, int height, int baseQIdx, int alphaQIdx, Av1ObuWriter.Av1ColorDesc? color = null)
-        => EncodeAvifColorWithAlpha(Widen(luma), Widen(u), Widen(v), Widen(alpha), width, height, baseQIdx, alphaQIdx, 8, color: color);
+        ReadOnlySpan<byte> alpha, int width, int height, int baseQIdx, int alphaQIdx, Av1ObuWriter.Av1ColorDesc? color = null,
+        AvifContainerExtras? extras = null)
+        => EncodeAvifColorWithAlpha(Widen(luma), Widen(u), Widen(v), Widen(alpha), width, height, baseQIdx, alphaQIdx, 8, color: color, extras: extras);
 
     /// <summary>High-bit-depth colour + alpha (alpha coded at the same depth, as libavif does).</summary>
     internal static byte[] EncodeAvifColorWithAlpha(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v,
         ReadOnlySpan<ushort> alpha, int width, int height, int baseQIdx, int alphaQIdx, int bitDepth,
-        Av1PixelLayout layout = Av1PixelLayout.I420, Av1ObuWriter.Av1ColorDesc? color = null)
+        Av1PixelLayout layout = Av1PixelLayout.I420, Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
     {
         (byte[] cSeq, byte[] cFrame) = BuildColorObus(luma, u, v, width, height, baseQIdx, bitDepth, layout, color);
         // Alpha: no colour description, always full range (AVIF forbids limited-range alpha).
         (byte[] aSeq, byte[] aFrame) = BuildMonochromeObus(alpha, width, height, alphaQIdx, bitDepth);
-        return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: false, bitDepth, layout, color);
+        return Av1AvifWriter.BuildAvifWithAlpha(cSeq, cFrame, aSeq, aFrame, width, height, colorMonochrome: false, bitDepth, layout, color, extras);
     }
 
     // Per-superblock recursive-partition state for I420 colour. Extends the grayscale scheme with two chroma
@@ -3632,7 +3633,7 @@ internal static class Av1StillImageEncoder
     /// dimensions within one of 5..8, 9..16, 17..32, 33..64 — coded at block sizes 8/16/32/64). The residual
     /// block is the frame content in its top-left, edge-replicated to the block size.</summary>
     internal static byte[] EncodeAvifMonochrome(ReadOnlySpan<byte> luma, int width, int height, int baseQIdx,
-        Av1ObuWriter.Av1ColorDesc? color = null)
+        Av1ObuWriter.Av1ColorDesc? color = null, AvifContainerExtras? extras = null)
     {
         if (!TryResolveSingleBlock(width, height, out BlockPlan plan))
         {
@@ -3643,7 +3644,7 @@ internal static class Av1StillImageEncoder
 
         int[]? coeffs = QuantizeBlock(luma, width, height, plan, baseQIdx);
         (byte[] seqObu, byte[] frameObu) = BuildObus(width, height, baseQIdx, coeffs, color);
-        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true, color: color);
+        return Av1AvifWriter.BuildAvif(seqObu, frameObu, width, height, monochrome: true, color: color, extras: extras);
     }
 
     /// <summary>Forward-transforms and quantizes a frame into its single block's coefficients (DC prediction =

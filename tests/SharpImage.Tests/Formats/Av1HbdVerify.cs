@@ -178,6 +178,34 @@ public sealed class Av1HbdVerify
         File.WriteAllText(Path.Combine(outDir, "manifest.txt"), log.ToString());
     }
 
+    // Container metadata verification (trigger hbd_meta.txt): (a) decode every scratch/meta_in/*.avif (made by
+    // Pillow/libavif) and dump what we extracted (ICC, Exif, XMP, orientation, CICP); (b) encode a test image carrying
+    // meta_in/test.icc (+ test.exif / test.xmp when present) to meta_out/ours*.avif for Pillow to read back.
+    [Test, NotInParallel]
+    public void Meta()
+    {
+        string trig = Path.Combine(Scratch, "corpus", "hbd_meta.txt");
+        if (!File.Exists(trig)) return;
+        File.Delete(trig);
+        string inDir = Path.Combine(Scratch, "meta_in"), outDir = Path.Combine(Scratch, "meta_out");
+        Directory.CreateDirectory(outDir);
+        foreach (string f in Directory.GetFiles(inDir, "*.avif"))
+        {
+            var img = HeifCoder.Decode(File.ReadAllBytes(f));
+            string stem = Path.Combine(outDir, Path.GetFileNameWithoutExtension(f));
+            if (img.IccProfile != null) File.WriteAllBytes(stem + ".icc", img.IccProfile);
+            File.WriteAllText(stem + ".txt", $"{img.Columns}x{img.Rows} cicp={img.Metadata.Cicp} icc={img.IccProfile?.Length ?? -1}");
+            File.WriteAllBytes(stem + ".rgb48", Rgb48(img));
+        }
+        var src = Gradient(96, 64, alpha: false, gray: false);
+        string icc = Path.Combine(inDir, "test.icc");
+        if (File.Exists(icc)) src.Metadata.IccProfile = new SharpImage.Metadata.IccProfile(File.ReadAllBytes(icc));
+        File.WriteAllBytes(Path.Combine(outDir, "ours_icc.avif"), HeifCoder.EncodeAvif(src));
+        var rgba = Gradient(96, 64, alpha: true, gray: false);
+        rgba.Metadata = src.Metadata.Clone();
+        File.WriteAllBytes(Path.Combine(outDir, "ours_icc_alpha.avif"), HeifCoder.EncodeAvif(rgba, new AvifEncodeOptions { BitDepth = 10 }));
+    }
+
     // Decodes externally produced AVIFs (e.g. libavif references) listed one path per line in hbd_decode.txt,
     // writing our HeifCoder 16-bit RGB(A) (.ours.rgb48) and our decoder's native planes (.ours.yuv) beside each.
     [Test, NotInParallel]
