@@ -1623,6 +1623,14 @@ public sealed class Av1HbdVerify
                     }
                     continue;
                 }
+                if (t[0] == "av1vec")
+                {
+                    // av1vec <dir> [filter]: every .ivf / .mkv test vector against its libaom .md5 (per frame).
+                    foreach (var f in Directory.GetFiles(t[1]).Where(x => x.EndsWith(".ivf") || x.EndsWith(".mkv")).Order())
+                        if (t.Length < 3 || Path.GetFileName(f).Contains(t[2]))
+                            log.AppendLine($"{Path.GetFileName(f)} {Av1Conformance.CheckVector(f)}");
+                    continue;
+                }
                 if (t[0] == "jraw")
                 {
                     // jraw <in.jpg> <out>: our JPEG decode as a "w h channels colorspace" line + 16-bit LE samples (all channels).
