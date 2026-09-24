@@ -17,7 +17,7 @@ public static class PnmCoder
     /// Detect PNM format by 'P' magic + format digit (1-6).
     /// </summary>
     public static bool CanDecode(ReadOnlySpan<byte> data) =>
-        data.Length >= 2 && data[0] == 'P' && data[1] >= '1' && data[1] <= '6';
+        data.Length >= 3 && data[0] == (byte)'P' && data[1] >= (byte)'1' && data[1] <= (byte)'6' && char.IsWhiteSpace((char)data[2]);
 
     // --- Reading ---
 

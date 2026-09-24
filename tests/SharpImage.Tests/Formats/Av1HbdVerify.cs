@@ -1545,6 +1545,70 @@ public sealed class Av1HbdVerify
         return o;
     }
 
+    private static JpegEncodeOptions ParseCjpeg(string[] a)
+    {
+        int? quality = null; int[]? tq = null; bool baseline = false, opt = false, prog = false, arith = false;
+        var csp = JpegColorSpace.Auto; var dct = JpegDctMethod.IntegerSlow;
+        int rst = 0, rstRows = 0, smooth = 0, precision = 8, psv = 0, pt = 0;
+        int[]? slots = null; (int, int)[]? samp = null; ushort[][]? qtables = null; JpegScanInfo[]? scans = null; byte[]? icc = null;
+        for (int i = 0; i < a.Length; i++)
+        {
+            string k = a[i].TrimStart('-');
+            switch (k)
+            {
+                case "quality": { var v = a[++i].Split(',').Select(int.Parse).ToArray(); if (v.Length == 1) quality = v[0]; else tq = v; break; }
+                case "baseline": baseline = true; break;
+                case "optimize": opt = true; break;
+                case "progressive": prog = true; break;
+                case "arithmetic": arith = true; break;
+                case "grayscale": csp = JpegColorSpace.Grayscale; break;
+                case "rgb": csp = JpegColorSpace.Rgb; break;
+                case "dct": dct = a[++i] switch { "fast" => JpegDctMethod.IntegerFast, "float" => JpegDctMethod.Float, _ => JpegDctMethod.IntegerSlow }; break;
+                case "restart": { string v = a[++i]; if (v.EndsWith('b') || v.EndsWith('B')) { rst = int.Parse(v[..^1]); rstRows = 0; } else rstRows = int.Parse(v); break; }
+                case "smooth": smooth = int.Parse(a[++i]); break;
+                case "precision": precision = int.Parse(a[++i]); break;
+                case "lossless": { var v = a[++i].Split(','); psv = int.Parse(v[0]); pt = v.Length > 1 ? int.Parse(v[1]) : 0; break; }
+                case "qslots": slots = a[++i].Split(',').Select(int.Parse).ToArray(); break;
+                case "sample": samp = a[++i].Split(',').Select(x => { var hv = x.ToLowerInvariant().Split('x'); return (int.Parse(hv[0]), int.Parse(hv[1])); }).ToArray(); break;
+                case "qtables":
+                {
+                    var nums = System.Text.RegularExpressions.Regex.Matches(File.ReadAllText(a[++i]), @"\d+").Select(m => ushort.Parse(m.Value)).ToArray();
+                    qtables = nums.Chunk(64).Select(x => x.ToArray()).ToArray();
+                    break;
+                }
+                case "scans":
+                {
+                    // "c1 c2 ...: Ss-Se, Ah, Al;" or the short "c1 c2 ...;" form (jcparam.c read_scan_script)
+                    var list = new List<JpegScanInfo>();
+                    string text = System.Text.RegularExpressions.Regex.Replace(File.ReadAllText(a[++i]), "#[^\n]*", "");
+                    foreach (var part in text.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        var cp = part.Split(':');
+                        var ids = System.Text.RegularExpressions.Regex.Matches(cp[0], @"\d+").Select(m => int.Parse(m.Value)).ToArray();
+                        int ss = 0, se = 63, ah = 0, al = 0;
+                        if (cp.Length > 1)
+                        {
+                            var nn = System.Text.RegularExpressions.Regex.Matches(cp[1], @"\d+").Select(m => int.Parse(m.Value)).ToArray();
+                            ss = nn[0]; se = nn[1]; ah = nn[2]; al = nn[3];
+                        }
+                        list.Add(new JpegScanInfo(ids, ss, se, ah, al));
+                    }
+                    scans = list.ToArray();
+                    break;
+                }
+                case "icc": icc = File.ReadAllBytes(a[++i]); break;
+                default: throw new ArgumentException("unknown switch " + a[i]);
+            }
+        }
+        return new JpegEncodeOptions
+        {
+            Quality = quality, TableQualities = tq, ForceBaseline = baseline, OptimizeCoding = opt, Progressive = prog, Arithmetic = arith,
+            ColorSpace = csp, Dct = dct, RestartInterval = rst, RestartRows = rstRows, Smoothing = smooth, Precision = precision,
+            LosslessPredictor = psv, LosslessPointTransform = pt, QuantTableSlots = slots, SamplingFactors = samp, QuantTables = qtables,
+            Scans = scans, IccProfile = icc,
+        };
+    }
+
     // JPEG input probe (trigger hbd_jpeg.txt: lines "<in.jpg> <out.avif> [quality] [qgainmap] [ignore]"): avifenc-style
     // JPEG -> AVIF through HeifCoder.EncodeAvifFromJpeg.
     [Test, NotInParallel]
@@ -1696,6 +1760,15 @@ public sealed class Av1HbdVerify
                     foreach (var f in Directory.GetFiles(t[1]).Where(x => x.EndsWith(".ivf") || x.EndsWith(".mkv")).Order())
                         if (t.Length < 3 || Path.GetFileName(f).Contains(t[2]))
                             log.AppendLine($"{Path.GetFileName(f)} {Av1Conformance.CheckVector(f)}");
+                    continue;
+                }
+                if (t[0] == "cjpeg")
+                {
+                    // cjpeg <in.ppm|pgm> <out.jpg> [cjpeg switches...]: JpegCoder.Encode with the switches parsed as cjpeg does
+                    var img = FormatRegistry.Read(t[1]);
+                    byte[] outB = JpegCoder.Encode(img, ParseCjpeg(t.Skip(3).ToArray()));
+                    File.WriteAllBytes(t[2], outB);
+                    log.AppendLine($"cjpeg {Path.GetFileName(t[2])} {outB.Length}");
                     continue;
                 }
                 if (t[0] == "y4mdec")

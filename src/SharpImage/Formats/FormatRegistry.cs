@@ -214,11 +214,7 @@ public static class FormatRegistry
             return ImageFileFormat.Xpm;
         }
 
-        if (TgaCoder.CanDecode(data))
-        {
-            return ImageFileFormat.Tga;
-        }
-
+        // PNM and Y4M have real signatures; TGA has none (a header-shape guess), so it must not shadow them.
         if (PnmCoder.CanDecode(data))
         {
             return ImageFileFormat.Pnm;
@@ -227,6 +223,11 @@ public static class FormatRegistry
         if (Y4mCoder.CanDecode(data))
         {
             return ImageFileFormat.Y4m;
+        }
+
+        if (TgaCoder.CanDecode(data))
+        {
+            return ImageFileFormat.Tga;
         }
         // WBMP has weak signature (0x00 0x00), check last
         if (WbmpCoder.CanDecode(data))
