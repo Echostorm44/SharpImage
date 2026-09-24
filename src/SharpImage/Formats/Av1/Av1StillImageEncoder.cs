@@ -61,6 +61,8 @@ internal sealed class Av1EncodeSpeed
     /// <summary>One joint round of deblocking x CDEF candidates (no/guess level x no/heuristic strength) instead of
     /// the level search followed by the CDEF search.</summary>
     public bool FilterSearchFast;
+    /// <summary>Rect / T-shape / 4-way partitions also at 64x64 (64x32, 64x16, ...; 4:2:0).</summary>
+    public bool UsePartition64 = true;
 
     public Av1EncodeSpeed Clone() => (Av1EncodeSpeed)MemberwiseClone();
 
@@ -71,7 +73,7 @@ internal sealed class Av1EncodeSpeed
         var p = new Av1EncodeSpeed();
         speed = Math.Clamp(speed, 0, 10);
         if (speed >= 1) { p.UseColorTxDepth = false; p.EarlyTermBits = 16; }
-        if (speed >= 2) { p.RdModeCandidates = 4; p.UseExtPartition = false; p.UseFilterIntra = false; p.EarlyTermBits = 32; }
+        if (speed >= 2) { p.RdModeCandidates = 4; p.UseExtPartition = false; p.UseFilterIntra = false; p.EarlyTermBits = 32; p.UsePartition64 = false; }
         if (speed >= 3) { p.UseRectPartition = false; p.EarlyTermBits = 64; }
         if (speed >= 4) { p.RdModeCandidates = 2; p.UseSub8Partition = false; p.EarlyTermBits = 32; }
         if (speed >= 4) p.LrSgrSets = 8;
@@ -1274,24 +1276,28 @@ internal static class Av1StillImageEncoder
                 EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4 + hsz, hsz, Av1EdgeFlags.None);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.RightSplit);
             }
-            else if (choice == 8) // PARTITION_HORZ_4: four 32x8 strips (bl==2 only; edge flags per decoder)
+            else if (choice == 8) // PARTITION_HORZ_4: four strips, 32x8 at 32x32 / 64x16 at 64x64 (edge flags per decoder)
             {
                 int q = hsz >> 1;   // quarter-height step in 4-units
+                var (hBs, hTx, hCh) = bl == 1 ? ((int)Av1BlockSize.Bs64x16, (int)Av1RectTxSize.Rtx64x16, (int)Av1RectTxSize.Rtx32x8)
+                                              : ((int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4);
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Horizontal4, nPart);
-                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4, bx4, by4, blk4, q, node.H0);
-                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4, bx4, by4 + q, blk4, q, node.H4);
-                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4, bx4, by4 + 2 * q, blk4, q, Av1EdgeFlags.AllLeftHasBottom);
-                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4, bx4, by4 + 3 * q, blk4, q, node.H1);
+                EncodeRectLeafColor(c, hBs, hTx, hCh, bx4, by4, blk4, q, node.H0);
+                EncodeRectLeafColor(c, hBs, hTx, hCh, bx4, by4 + q, blk4, q, node.H4);
+                EncodeRectLeafColor(c, hBs, hTx, hCh, bx4, by4 + 2 * q, blk4, q, Av1EdgeFlags.AllLeftHasBottom);
+                EncodeRectLeafColor(c, hBs, hTx, hCh, bx4, by4 + 3 * q, blk4, q, node.H1);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Horizontal4);
             }
-            else // choice == 9, PARTITION_VERT_4: four 8x32 strips
+            else // choice == 9, PARTITION_VERT_4: four strips, 8x32 at 32x32 / 16x64 at 64x64
             {
                 int q = hsz >> 1;
+                var (vBs, vTx, vCh) = bl == 1 ? ((int)Av1BlockSize.Bs16x64, (int)Av1RectTxSize.Rtx16x64, (int)Av1RectTxSize.Rtx8x32)
+                                              : ((int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16);
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Vertical4, nPart);
-                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16, bx4, by4, q, blk4, node.V0);
-                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16, bx4 + q, by4, q, blk4, node.V4);
-                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16, bx4 + 2 * q, by4, q, blk4, Av1EdgeFlags.AllTopHasRight);
-                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16, bx4 + 3 * q, by4, q, blk4, node.V1);
+                EncodeRectLeafColor(c, vBs, vTx, vCh, bx4, by4, q, blk4, node.V0);
+                EncodeRectLeafColor(c, vBs, vTx, vCh, bx4 + q, by4, q, blk4, node.V4);
+                EncodeRectLeafColor(c, vBs, vTx, vCh, bx4 + 2 * q, by4, q, blk4, Av1EdgeFlags.AllTopHasRight);
+                EncodeRectLeafColor(c, vBs, vTx, vCh, bx4 + 3 * q, by4, q, blk4, node.V1);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Vertical4);
             }
             return;
@@ -1403,18 +1409,18 @@ internal static class Av1StillImageEncoder
         cands[nc++] = 0;
         if (bl < 4) cands[nc++] = 3;   // SPLIT — not at 8x8 (that would be 4x4, unsupported); 8x8 offers NONE/HORZ/VERT
         // Sub-8x8 HORZ/VERT use 4:2:0 shared chroma (EncodeSub8Pair), so they stay 4:2:0-only for now.
-        bool rectHere = fullyInside && !UsePalette && (((bl == 2 || bl == 3) && UseRectPartition) || (bl == 4 && UseSub8Partition && i420));
+        bool rectHere = fullyInside && !UsePalette && (((bl == 2 || bl == 3 || (bl == 1 && i420 && UsePartition64)) && UseRectPartition) || (bl == 4 && UseSub8Partition && i420));
         // 4:2:2 forbids every tall (h = 2w) leaf: its chroma would be 1:4 (get_plane_residual_size == BLOCK_INVALID),
         // so VERT, VERT_A/B and VERT_4 are never emitted there (spec conformance requirement; dav1d table has 0).
         bool vertOk = c.Layout != Av1PixelLayout.I422;
         if (rectHere) { cands[nc++] = 1; if (vertOk) cands[nc++] = 2; }
         // Extended T-shape partitions (HORZ_A/B, VERT_A/B) at 32x32/16x16 — quarter squares + half rects, all
         // block sizes we already code. Same in-frame + rect gate; 8x8 has no extended types.
-        if (UseExtPartition && (bl == 2 || bl == 3) && rectHere)
+        if (UseExtPartition && (bl == 1 || bl == 2 || bl == 3) && rectHere)
         { cands[nc++] = 4; cands[nc++] = 5; if (vertOk) { cands[nc++] = 6; cands[nc++] = 7; } }
         // HORZ_4/VERT_4 at 32x32 → 32x8/8x32 strips (normal 16x4 chroma). Only bl==2: the 16x16→16x4 case needs
         // sub-8x8-style shared chroma. The decoder still reads the symbol wherever we choose not to emit it.
-        if (UseExtPartition && bl == 2 && rectHere)
+        if (UseExtPartition && (bl == 1 || bl == 2) && rectHere)
         { cands[nc++] = 8; if (vertOk) cands[nc++] = 9; }
 
         double lambda = RdLambdaK * c.AcDq * c.AcDq;
@@ -1464,9 +1470,12 @@ internal static class Av1StillImageEncoder
     private const int TxIdx8x16 = 7, TxIdx16x8 = 8, TxIdx8x4 = 6, TxIdx4x8 = 5, TxIdx32x16 = 10, TxIdx16x32 = 9;
 
     // Rect leaf tx/block-size ordinals per partition level (bl==2: 32x32→32x16/16x32; bl==3: 16x16→16x8/8x16).
-    private static (int LumaTxH, int LumaTxV, int ChTxH, int ChTxV, int BsH, int BsV) RectLeafParams(int bl) => bl == 2
-        ? (TxIdx32x16, TxIdx16x32, TxIdx16x8, TxIdx8x16, (int)Av1BlockSize.Bs32x16, (int)Av1BlockSize.Bs16x32)
-        : (TxIdx16x8, TxIdx8x16, TxIdx8x4, TxIdx4x8, (int)Av1BlockSize.Bs16x8, (int)Av1BlockSize.Bs8x16);
+    private static (int LumaTxH, int LumaTxV, int ChTxH, int ChTxV, int BsH, int BsV) RectLeafParams(int bl) => bl switch
+    {
+        1 => ((int)Av1RectTxSize.Rtx64x32, (int)Av1RectTxSize.Rtx32x64, TxIdx32x16, TxIdx16x32, (int)Av1BlockSize.Bs64x32, (int)Av1BlockSize.Bs32x64),
+        2 => (TxIdx32x16, TxIdx16x32, TxIdx16x8, TxIdx8x16, (int)Av1BlockSize.Bs32x16, (int)Av1BlockSize.Bs16x32),
+        _ => (TxIdx16x8, TxIdx8x16, TxIdx8x4, TxIdx4x8, (int)Av1BlockSize.Bs16x8, (int)Av1BlockSize.Bs8x16),
+    };
 
     private static void FillPartCtx(ColorPartCtx c, int bl, int bx8, int by8, int hsz, Av1BlockPartition part)
     {
@@ -3451,6 +3460,7 @@ internal static class Av1StillImageEncoder
     internal static long FilterSearchMaxPixels { get => Sp.FilterSearchMaxPixels; set => Sp.FilterSearchMaxPixels = value; }
     internal static bool FilterPickFromQ { get => Sp.FilterPickFromQ; set => Sp.FilterPickFromQ = value; }
     internal static bool FilterSearchFast { get => Sp.FilterSearchFast; set => Sp.FilterSearchFast = value; }
+    internal static bool UsePartition64 { get => Sp.UsePartition64; set => Sp.UsePartition64 = value; }
     internal static int AngleDeltaSet { get => Sp.AngleDeltaSet; set => Sp.SetAngleDeltas(value); }
 
     // Dev/conformance isolation: when set, only luma intra candidates passing the filter are considered (square,

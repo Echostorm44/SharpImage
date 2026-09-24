@@ -77,8 +77,32 @@ internal static class Av1FwdTransform
         FwdMatrixCache.GetOrAdd((logSize << 2) | type1d, static key =>
         {
             int ls = key >> 2, ty = key & 3, n = 4 << ls;
-            var m = new double[n, n];
             const int probe = 1 << 11;
+            if (n == 64)
+            {
+                // A 64-point inverse reads only its first 32 inputs, so M (64 outputs x 32 inputs) is not square: the
+                // forward is its least-squares pseudo-inverse F = (M^T M)^-1 M^T (32 x 64), stored in the first 32 rows.
+                var m64 = new double[64, 32];
+                for (int k = 0; k < 32; k++)
+                {
+                    Span<int> c = stackalloc int[64];
+                    c.Clear();
+                    c[k] = probe;
+                    Av1InvTransform.Probe1dInverse(c, ls, ty);
+                    for (int i = 0; i < 64; i++) m64[i, k] = c[i] / (double)probe;
+                }
+                var mtm = new double[32, 32];
+                for (int a2 = 0; a2 < 32; a2++)
+                    for (int b2 = 0; b2 < 32; b2++)
+                    { double sum = 0; for (int i = 0; i < 64; i++) sum += m64[i, a2] * m64[i, b2]; mtm[a2, b2] = sum; }
+                var inv = Invert(mtm);
+                var f = new double[64, 64];
+                for (int k = 0; k < 32; k++)
+                    for (int x = 0; x < 64; x++)
+                    { double sum = 0; for (int j = 0; j < 32; j++) sum += inv[k, j] * m64[x, j]; f[k, x] = sum; }
+                return f;
+            }
+            var m = new double[n, n];
             for (int k = 0; k < n; k++)
             {
                 Span<int> c = stackalloc int[n];
