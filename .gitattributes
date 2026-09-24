@@ -61,3 +61,14 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+###############################################################################
+# Binary image test data whose headers look like text (netpbm, YUV4MPEG2): never
+# convert line endings.
+###############################################################################
+*.pnm binary
+*.ppm binary
+*.pgm binary
+*.pbm binary
+*.pam binary
+*.y4m binary
