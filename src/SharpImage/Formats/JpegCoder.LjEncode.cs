@@ -1,6 +1,7 @@
 using SharpImage.Compression;
 using SharpImage.Core;
 using SharpImage.Image;
+using SharpImage.Metadata;
 
 namespace SharpImage.Formats;
 
@@ -472,7 +473,22 @@ public static partial class JpegCoder
                 Word(100); Word(0); Word(0);
                 Byte(cs == JpegColorSpace.YCbCr ? 1 : cs == JpegColorSpace.Ycck ? 2 : 0);
             }
-            if (o.IccProfile is { Length: > 0 } icc)
+            var md = o.WriteMetadata ? img.Metadata : null;
+            if (md?.ExifProfile is { } exif && ExifParser.SerializeForApp1(exif) is { Length: > 0 and <= 65533 } exifData)
+            {
+                Marker(0xE1); Word(exifData.Length + 2);
+                outp.Write(exifData);
+            }
+            if (md?.Xmp is { } xmp)
+            {
+                byte[] xmpData = [.. "http://ns.adobe.com/xap/1.0/\0"u8, .. System.Text.Encoding.UTF8.GetBytes(xmp)];
+                if (xmpData.Length <= 65533)
+                {
+                    Marker(0xE1); Word(xmpData.Length + 2);
+                    outp.Write(xmpData);
+                }
+            }
+            if ((o.IccProfile ?? md?.IccProfile?.Data) is { Length: > 0 } icc)
             {
                 const int maxData = 65533 - 14;
                 int count = DivUp(icc.Length, maxData);
@@ -485,6 +501,11 @@ public static partial class JpegCoder
                     outp.Write(icc, off, len);
                     off += len;
                 }
+            }
+            if (md?.IptcProfile is { } iptc && IptcParser.SerializeForApp13(iptc) is { Length: > 0 and <= 65533 } iptcData)
+            {
+                Marker(0xED); Word(iptcData.Length + 2);
+                outp.Write(iptcData);
             }
 
             if (!arith && !optimize)

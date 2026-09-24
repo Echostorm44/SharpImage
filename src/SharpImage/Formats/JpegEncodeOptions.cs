@@ -101,6 +101,10 @@ public sealed class JpegEncodeOptions
     /// <summary>cjpeg -icc: an ICC profile written as APP2 ICC_PROFILE markers.</summary>
     public byte[]? IccProfile { get; init; }
 
+    /// <summary>Also write the image's metadata after the JFIF / Adobe marker: EXIF (APP1), XMP (APP1), its ICC profile
+    /// (APP2, unless <see cref="IccProfile"/> is given) and IPTC (APP13). Off by default, as cjpeg copies none.</summary>
+    public bool WriteMetadata { get; init; }
+
     /// <summary>JFIF density unit (0 = aspect ratio only, 1 = dots per inch, 2 = dots per cm) and densities.</summary>
     public int DensityUnit { get; init; }
     public int XDensity { get; init; } = 1;
