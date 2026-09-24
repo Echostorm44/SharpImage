@@ -1762,6 +1762,35 @@ public sealed class Av1HbdVerify
                             log.AppendLine($"{Path.GetFileName(f)} {Av1Conformance.CheckVector(f)}");
                     continue;
                 }
+                if (t[0] == "cmykjpeg")
+                {
+                    // cmykjpeg <in.raw> <w> <h> <out.jpg> <cmyk|ycck> <quality> <hs> <vs> <arith> <prog> <prec>: the jx/cmykenc
+                    // harness's input as a CMYK frame (raw samples are the Adobe-inverted values the JPEG stores)
+                    int cw = int.Parse(t[2]), chh = int.Parse(t[3]), cprec = int.Parse(t[11]), cmax = (1 << cprec) - 1;
+                    var raw = File.ReadAllBytes(t[1]);
+                    var fr = new ImageFrame();
+                    fr.Initialize(cw, chh, ColorspaceType.CMYK, false);
+                    for (int y = 0; y < chh; y++)
+                    {
+                        var row = fr.GetPixelRowForWrite(y);
+                        for (int i = 0; i < cw * 4; i++)
+                        {
+                            int k = y * cw * 4 + i;
+                            int r = cprec > 8 ? raw[2 * k] | (raw[2 * k + 1] << 8) : raw[k];
+                            row[i] = (ushort)Math.Round((cmax - r) * 65535.0 / cmax);
+                        }
+                    }
+                    int chs = int.Parse(t[7]), cvs = int.Parse(t[8]);
+                    var co = new JpegEncodeOptions
+                    {
+                        ColorSpace = t[5] == "ycck" ? JpegColorSpace.Ycck : JpegColorSpace.Cmyk, Quality = int.Parse(t[6]), ForceBaseline = true,
+                        SamplingFactors = [(chs, cvs), (1, 1), (1, 1), (chs, cvs)], Arithmetic = t[9] == "1", Progressive = t[10] == "1", Precision = cprec,
+                    };
+                    byte[] outB = JpegCoder.Encode(fr, co);
+                    File.WriteAllBytes(t[4], outB);
+                    log.AppendLine($"cmykjpeg {Path.GetFileName(t[4])} {outB.Length}");
+                    continue;
+                }
                 if (t[0] == "cjpeg")
                 {
                     // cjpeg <in.ppm|pgm> <out.jpg> [cjpeg switches...]: JpegCoder.Encode with the switches parsed as cjpeg does

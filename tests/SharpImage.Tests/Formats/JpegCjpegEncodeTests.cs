@@ -79,6 +79,32 @@ public sealed class JpegCjpegEncodeTests
     }
 
     [Test]
+    [Arguments(JpegColorSpace.Cmyk)]
+    [Arguments(JpegColorSpace.Ycck)]
+    public async Task CmykRoundTripsAsInkAmounts(JpegColorSpace space)
+    {
+        // CMYK frames hold ink amounts; the file stores them Adobe-inverted (checked byte-exact against libjpeg with the
+        // cmykjpeg probe) and the decoder flips them back.
+        var src = new SharpImage.Image.ImageFrame();
+        src.Initialize(24, 16, SharpImage.Core.ColorspaceType.CMYK, false);
+        for (int y = 0; y < 16; y++)
+        {
+            var row = src.GetPixelRowForWrite(y);
+            for (int x = 0; x < 24; x++)
+                for (int k = 0; k < 4; k++) row[x * 4 + k] = (ushort)((x * 9 + y * 5 + k * 60) % 256 * 257);
+        }
+        using var back = JpegCoder.Read(new MemoryStream(JpegCoder.Encode(src, new JpegEncodeOptions { ColorSpace = space, Quality = 100, SamplingFactors = [(1, 1)] })));
+        await Assert.That(back.Colorspace).IsEqualTo(SharpImage.Core.ColorspaceType.CMYK);
+        double err = 0;
+        for (int y = 0; y < 16; y++)
+        {
+            var a = src.GetPixelRow(y); var b = back.GetPixelRow(y);
+            for (int i = 0; i < 24 * 4; i++) err += Math.Abs(a[i] - b[i]) / 257.0;
+        }
+        await Assert.That(err / (24 * 16 * 4)).IsLessThan(1.5);
+    }
+
+    [Test]
     public async Task InvalidScriptsAndTablesFailLikeLibjpeg()
     {
         var src = FormatRegistry.Read(Path.Combine(Dir, "src.ppm"));
