@@ -1708,7 +1708,9 @@ public sealed class Av1HbdVerify
                     {
                         var img = FormatRegistry.Read(t[1]);
                         var eo = new AvifEncodeOptions { Quality = int.Parse(t[3]) };
-                        if (t.Length > 5) typeof(AvifEncodeOptions).GetProperty("Speed")?.SetValue(eo, int.Parse(t[5]));
+                        if (t.Length > 5) eo.Speed = int.Parse(t[5]);
+                        if (t.Length > 6) eo.AutoTiling = t[6] == "1";
+                        if (t.Length > 7) eo.MaxThreads = int.Parse(t[7]);
                         byte[] outBytes = [];
                         for (int r = 0; r <= reps; r++)
                         {
@@ -1717,7 +1719,19 @@ public sealed class Av1HbdVerify
                             if (r > 0) best = Math.Min(best, sw.Elapsed.TotalSeconds);
                         }
                         File.WriteAllBytes(t[2], outBytes);
-                        log.AppendLine($"timeenc {Path.GetFileName(t[1])} q{t[3]}: {best:F3} s {outBytes.Length} bytes");
+                        using var back = HeifCoder.Decode(outBytes);
+                        double sse = 0; long cnt = 0;
+                        for (int y = 0; y < (int)img.Rows; y++)
+                        {
+                            var ra = img.GetPixelRow(y); var rb = back.GetPixelRow(y);
+                            for (int x = 0; x < (int)img.Columns; x++)
+                                for (int c = 0; c < 3; c++)
+                                {
+                                    int d = (ra[x * img.NumberOfChannels + c] >> 8) - (rb[x * back.NumberOfChannels + c] >> 8);
+                                    sse += d * d; cnt++;
+                                }
+                        }
+                        log.AppendLine($"timeenc {Path.GetFileName(t[1])} q{t[3]} {string.Join(' ', t.Skip(5))}: {best:F3} s {outBytes.Length} bytes psnr {10 * Math.Log10(255.0 * 255 * cnt / sse):F3}");
                     }
                     else
                     {

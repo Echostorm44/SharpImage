@@ -52,6 +52,12 @@ internal sealed class Av1Decoder
 
     // Persistent task context (reused across SB rows to avoid alloc)
     private readonly Av1TaskContext taskCtx = new();
+    // One task context per tile column when tile columns decode in parallel (index 0 is taskCtx).
+    private Av1TaskContext[] tileTaskCtx = [];
+
+    /// <summary>Threads for decoding the tile columns of an SB row in parallel (1 = serial). The output is
+    /// identical for any value.</summary>
+    public int MaxThreads { get; set; } = 1;
 
     private struct TileGroup
     {
@@ -861,6 +867,19 @@ internal sealed class Av1Decoder
         else Av1RefMvs.InitFrame(ctx.RefMvs, seqHdr, fh, ctx.CurrentRefPoc, null, null, null);
         Av1Decode.BlockTrace?.WriteLine($"F type={fh.FrameType} show={fh.ShowFrame} off={fh.FrameOffset} urfm={fh.UseRefFrameMvs} ohb={seqHdr.OrderHintNBits} n={ctx.RefMvs.MfmvCount} refpoc={string.Join(',', ctx.CurrentRefPoc)} refidx={string.Join(',', Enumerable.Range(0, 7).Select(i => fh.GetRefIdx(i)))} tm={string.Join(',', ctx.RefFrames.Select(r => r.TemporalMvs != null ? 1 : 0))} refresh={fh.RefreshFrameFlags} lf={fh.LfLevelY0},{fh.LfLevelY1},{fh.LfLevelU},{fh.LfLevelV} mrd={fh.LfModeRefDeltaEnabled} cdef={fh.CdefNBits}/{fh.CdefYStrength0} lr={fh.GetLrType(0)},{fh.GetLrType(1)},{fh.GetLrType(2)} dlf={fh.DeltaLfPresent} cw={fh.CodedWidth}/{fh.SuperResUpscaledWidth} seg={(fh.SegmentationEnabled ? 1 : 0)}{(fh.SegmentationUpdateMap ? 1 : 0)}{(fh.SegmentationTemporal ? 1 : 0)}{(fh.SegmentationUpdateData ? 1 : 0)} slotY0={string.Join(',', ctx.RefFrames.Select(r => r.Planes[0] == null ? -1 : r.Planes[0]![0]))} oh={string.Join(',', ctx.RefFrames.Select(r => r.OrderHint))}");
 
+        // Tile columns decode in parallel when allowed and every tile column starts on a 128-pixel column (the SB128
+        // above-context / loop-filter-mask entries are then never shared between two tiles' first blocks).
+        bool parallelTiles = MaxThreads > 1 && fh.TileCols > 1;
+        for (int tc = 0; tc < fh.TileCols && parallelTiles; tc++)
+            if (!seqHdr.Sb128 && (fh.TileColStartSb[tc] & 1) != 0) parallelTiles = false;
+        if (parallelTiles && tileTaskCtx.Length < fh.TileCols)
+        {
+            var arr = new Av1TaskContext[fh.TileCols];
+            arr[0] = taskCtx;
+            for (int i = 1; i < arr.Length; i++) arr[i] = i < tileTaskCtx.Length ? tileTaskCtx[i] : new Av1TaskContext();
+            tileTaskCtx = arr;
+        }
+
         // Process tile rows by superblock rows
         for (int tileRow = 0; tileRow < fh.TileRows; tileRow++)
         {
@@ -879,7 +898,7 @@ internal sealed class Av1Decoder
                         0, ctx.Bw >> 1, by >> 1, Math.Min(byEnd8, ctx.Bh >> 1));
                 }
 
-                for (int tileCol = 0; tileCol < fh.TileCols; tileCol++)
+                void DecodeTileColumn(int tileCol, Av1TaskContext t)
                 {
                     int tileIdx = tileRow * fh.TileCols + tileCol;
                     var ts = ctx.TileStates![tileIdx];
@@ -896,8 +915,31 @@ internal sealed class Av1Decoder
                     }
 
                     // Decode all superblocks in this tile column for this row
-                    DecodeTileSuperblockRow(ts, tileIdx, by, tileCol, tileRow);
+                    DecodeTileSuperblockRow(t, ts, tileIdx, by, tileCol, tileRow);
                 }
+                if (parallelTiles)
+                {
+                    // Tile columns are independent within an SB row (their own entropy coder, contexts and intra edges);
+                    // the per-column above / loop-filter state they touch is disjoint when every tile column starts on
+                    // a 128-pixel boundary (checked above).
+                    try
+                    {
+                        System.Threading.Tasks.Parallel.For(0, fh.TileCols,
+                            new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = MaxThreads },
+                            tc =>
+                            {
+                                // Motion compensation reads its bit depth from thread-static state.
+                                Av1MotionComp.McBitDepth = ctx.BitDepth;
+                                DecodeTileColumn(tc, tileTaskCtx[tc]);
+                            });
+                    }
+                    catch (AggregateException ae) when (ae.InnerExceptions.Count > 0)
+                    {
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
+                    }
+                }
+                else
+                    for (int tileCol = 0; tileCol < fh.TileCols; tileCol++) DecodeTileColumn(tileCol, taskCtx);
 
                 // Save temporal MVs for this SB row (dav1d: dav1d_refmvs_save_tmvs)
                 if (interOrSwitch)
@@ -1148,7 +1190,7 @@ internal sealed class Av1Decoder
         }
     }
 
-    private void DecodeTileSuperblockRow(Av1TileState ts, int tileIdx, int by,
+    private void DecodeTileSuperblockRow(Av1TaskContext t, Av1TileState ts, int tileIdx, int by,
         int tileCol, int tileRow)
     {
         var fh = frameHdr;
@@ -1192,7 +1234,6 @@ internal sealed class Av1Decoder
         }
 
         // Reset left context for this tile SB row
-        var t = taskCtx;
         t.TileState = ts;
         t.Left.Reset(isIntra);
         t.By = by;
@@ -1528,18 +1569,23 @@ internal sealed class Av1Decoder
             vPlane.CopyTo(vBak);
         }
 
-        // UV direction mapping for I422 (chroma is 2:1 vertical)
-        ReadOnlySpan<byte> uvDirI422 = stackalloc byte[] { 7, 0, 2, 4, 5, 6, 6, 6 };
 
-        // Scratch buffers for left border (2 bytes per row, up to 8 rows)
-        Span<ushort> leftBuf = stackalloc ushort[16]; // 8 rows * 2 cols
+        ushort[] yArr = ctx.CurrentPlanes[0]!;
+        ushort[]? uArr = hasChroma ? ctx.CurrentPlanes[1] : null, vArr = hasChroma ? ctx.CurrentPlanes[2] : null;
 
         try
         {
             int sb64w = (w4 + 15) >> 4; // number of SB64 columns
 
-            for (int by = 0; by < h4; by += 2)
+            // Every 8x8 block reads only the pre-CDEF copies and writes its own pixels, so the 8-pixel rows are
+            // filtered in parallel (identical output for any thread count; serial when tracing decisions).
+            void CdefRow(int by)
             {
+                Span<ushort> yPlane = yArr;
+                Span<ushort> uPlane = uArr, vPlane = vArr;
+                // Scratch buffers for left border (2 bytes per row, up to 8 rows)
+                Span<ushort> leftBuf = stackalloc ushort[16]; // 8 rows * 2 cols
+                ReadOnlySpan<byte> uvDirI422 = [7, 0, 2, 4, 5, 6, 6, 6];
                 var edges = Av1Cdef.EdgeFlags.Bottom | (by > 0 ? Av1Cdef.EdgeFlags.Top : 0);
                 if (by + 2 >= h4) edges &= ~Av1Cdef.EdgeFlags.Bottom;
 
@@ -1684,6 +1730,12 @@ internal sealed class Av1Decoder
                     }
                 }
             }
+            int rows = (h4 + 1) >> 1;
+            if (MaxThreads > 1 && !(DumpCdefDecisions && frameHdr.FrameOffset == 1))
+                System.Threading.Tasks.Parallel.For(0, rows, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = MaxThreads },
+                    r => CdefRow(r * 2));
+            else
+                for (int r = 0; r < rows; r++) CdefRow(r * 2);
         }
         finally
         {

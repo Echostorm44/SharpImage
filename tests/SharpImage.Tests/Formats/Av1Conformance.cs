@@ -112,7 +112,7 @@ internal static class Av1Conformance
             if (line.Length >= 32) expected.Add(line[..32]);
         byte[] d = File.ReadAllBytes(path);
         var tus = path.EndsWith(".mkv") || path.EndsWith(".webm") ? ReadMkv(d) : ReadIvf(d);
-        var dec = new Av1Decoder();
+        var dec = new Av1Decoder { MaxThreads = int.TryParse(Environment.GetEnvironmentVariable("AV1_THREADS"), out var nThreads) ? nThreads : 1 };
         int n = 0;
         try
         {
@@ -248,7 +248,7 @@ internal static class Av1Conformance
     {
         string expected = File.ReadAllText(md5Path).Trim().Split(' ', '\t', '\n', '\r')[0];
         var tus = ReadObuFile(File.ReadAllBytes(obuPath), annexB);
-        var dec = new Av1Decoder();
+        var dec = new Av1Decoder { MaxThreads = int.TryParse(Environment.GetEnvironmentVariable("AV1_THREADS"), out var nThreads) ? nThreads : 1 };
         using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
         int frames = 0;
         try
@@ -276,7 +276,7 @@ internal static class Av1Conformance
     internal static void DumpArgon(string obuPath, bool annexB, string yuvOut, string infoOut)
     {
         var tus = ReadObuFile(File.ReadAllBytes(obuPath), annexB);
-        var dec = new Av1Decoder();
+        var dec = new Av1Decoder { MaxThreads = int.TryParse(Environment.GetEnvironmentVariable("AV1_THREADS"), out var nThreads) ? nThreads : 1 };
         using var y = File.Create(yuvOut);
         using var info = new StreamWriter(infoOut);
         for (int i = 0; i < tus.Count; i++)

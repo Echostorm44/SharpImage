@@ -217,8 +217,10 @@ public sealed class AvifEncodeOptions
     public int TileRowsLog2 { get; set; }
 
     /// <summary>Choose the tiling automatically (avifenc --autotiling; overrides the log2 values): up to 8 tiles, about
-    /// one per 512x512 pixels, more along the longer dimension.</summary>
-    public bool AutoTiling { get; set; }
+    /// one per 512x512 pixels, more along the longer dimension. Null (default): automatic at <see cref="Speed"/> 6 and
+    /// faster when no tile counts are set (tiles encode and decode in parallel for ~0.3-0.5% size), one tile at slower
+    /// speeds; false: always the explicit <see cref="TileColumnsLog2"/> / <see cref="TileRowsLog2"/>.</summary>
+    public bool? AutoTiling { get; set; }
 
     /// <summary>Quality 0..100 on libavif's scale (avifenc -q; overrides <see cref="Qp"/>): mapped to a quantizer as
     /// libavif does (its default libaom tune=iq table; the linear formula for the identity matrix) and to a base
@@ -375,7 +377,7 @@ public static partial class HeifCoder
 
     // An AV1 decoder for untrusted input: frames larger than the image size limit fail before allocation (libavif sets
     // dav1d's frame_size_limit / checks aom's stream info against imageSizeLimit).
-    private static Av1.Av1Decoder NewAv1Decoder() => new() { FrameSizeLimit = Limits.ImageSizeLimit };
+    private static Av1.Av1Decoder NewAv1Decoder() => new() { FrameSizeLimit = Limits.ImageSizeLimit, MaxThreads = Limits.ThreadCount };
 
     // libavif avifDecoderParse: every image item (coded or grid, with data, not a thumbnail) with an 'ispe' must have a
     // non-zero size within the limits.
@@ -1262,7 +1264,10 @@ public static partial class HeifCoder
     // libavif: tile log2 values clamped to 0..6; autoTiling = avifSetTileConfiguration(8 threads, first cell size).
     private static (int Cols, int Rows) ResolveTiling(AvifEncodeOptions o, int w, int h)
     {
-        if (!o.AutoTiling) return (Math.Clamp(o.TileColumnsLog2, 0, 6), Math.Clamp(o.TileRowsLog2, 0, 6));
+        // Null: the fast presets (speed 6+) tile automatically unless tile counts were given; slower speeds keep one
+        // tile (tiles cost ~0.3-0.5% but encode and decode in parallel).
+        bool auto = o.AutoTiling ?? (o.Speed >= 6 && o.TileColumnsLog2 == 0 && o.TileRowsLog2 == 0);
+        if (!auto) return (Math.Clamp(o.TileColumnsLog2, 0, 6), Math.Clamp(o.TileRowsLog2, 0, 6));
         const int threads = 8;
         const long minTileArea = 512 * 512, maxTiles = 32;
         long tiles = Math.Min(((long)w * h + minTileArea - 1) / minTileArea, maxTiles);
