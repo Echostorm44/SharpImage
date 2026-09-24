@@ -53,6 +53,11 @@ internal sealed class Av1EncodeSpeed
     public bool LrVerify = true;
     /// <summary>Wiener statistics on every n-th row and column (1 = every pixel).</summary>
     public int LrStatsStep = 1;
+    /// <summary>Largest frame (pixels) the decode-based deblocking / CDEF searches run on.</summary>
+    public long FilterSearchMaxPixels = long.MaxValue;
+    /// <summary>Deblocking level / CDEF strength taken straight from the quantiser guess, without decode-based search
+    /// (libaom LPF_PICK_FROM_Q).</summary>
+    public bool FilterPickFromQ;
 
     public Av1EncodeSpeed Clone() => (Av1EncodeSpeed)MemberwiseClone();
 
@@ -73,7 +78,8 @@ internal sealed class Av1EncodeSpeed
         // 7-10 (measured on the speed corpus vs libaom's ladder, BD vs libaom speed 0 / fox 1204x800 1-thread time):
         // 7 +20.1% 0.30 s (aom s7 +22.3%), 8 +24.1% 0.22 s (aom s8 +26.5% 0.25 s), 9 +30.7% 0.20 s,
         // 10 +33.6% 0.18 s (aom s9/s10 +54.6%, 0.11 s).
-        if (speed >= 7) { p.UseDeblockSearch = false; p.UseCdefSearch = false; p.SetAngleDeltas(0); p.RdModeCandidates = 1; p.UseLoopRestoration = false; }
+        // 7+: deblocking level and CDEF strength from the quantiser (no decode-based search; -2.9% vs no filtering).
+        if (speed >= 7) { p.FilterPickFromQ = true; p.SetAngleDeltas(0); p.RdModeCandidates = 1; p.UseLoopRestoration = false; }
         if (speed >= 8) p.UseRdoq = false;
         if (speed >= 9) p.UseTxTypeSearch = false;
         if (speed >= 10) p.UseCfl = false;
@@ -494,12 +500,13 @@ internal static class Av1StillImageEncoder
         // re-decode is expensive and CDEF's gain on detailed content is near zero — skip it. Within that gate we
         // evaluate the no-op plus one q-scaled heuristic strength and keep whichever decodes closer to the
         // source, so it can never regress vs no CDEF.
-        if (!UseCdefSearch || baseQIdx < 64 || (long)width * height > 512 * 512) return Av1ObuWriter.CdefParams.None;
+        if (!UseCdefSearch || baseQIdx < 64 || (long)width * height > FilterSearchMaxPixels) return Av1ObuWriter.CdefParams.None;
 
         int yPri = Math.Clamp(baseQIdx / 16, 1, 12);   // stronger deringing as quantisation coarsens
         int ySec = baseQIdx >= 128 ? 2 : 1;
         int yLvl = (yPri << 2) | ySec;
         int uvLvl = monochrome ? 0 : ((Math.Clamp(baseQIdx / 24, 1, 8) << 2) | (baseQIdx >= 160 ? 1 : 0));
+        if (FilterPickFromQ) return new Av1ObuWriter.CdefParams(damping, 0, new[] { (byte)yLvl }, new[] { (byte)uvLvl });
         var both = EvaluateAll(2, i => i == 0 ? Evaluate(0, 0) : Evaluate(yLvl, uvLvl));
         long noopSse = both[0];
         BestSse = noopSse;
@@ -532,7 +539,7 @@ internal static class Av1StillImageEncoder
         int width, int height, bool monochrome, ushort[] srcY, ushort[]? srcU, ushort[]? srcV, int cw, int ch)
     {
         // Deblocking's still-image payoff is largest at coarse quantisation; skip the extra decodes when tiny.
-        if (!UseDeblockSearch || (long)width * height > 512 * 512) return 0;
+        if (!UseDeblockSearch || (long)width * height > FilterSearchMaxPixels) return 0;
 
         long Evaluate(int lvl)
         {
@@ -550,6 +557,7 @@ internal static class Av1StillImageEncoder
         // Candidate levels around a q-scaled guess (AV1 levels are 0..63; deblock strength grows with q), after the
         // no-deblocking baseline; evaluated concurrently, chosen in this order (first strictly lower SSE wins).
         int guess = Math.Clamp(baseQIdx / 8, 1, 40);
+        if (FilterPickFromQ) return guess;
         var levels = new List<int> { 0 };
         foreach (int lvl in new[] { guess / 2, guess, Math.Min(guess * 3 / 2, 63) }) if (lvl > 0) levels.Add(lvl);
         var sses = EvaluateAll(levels.Count, i => Evaluate(levels[i]));
@@ -3370,6 +3378,8 @@ internal static class Av1StillImageEncoder
     internal static bool LrVerify { get => Sp.LrVerify; set => Sp.LrVerify = value; }
 
     internal static int LrStatsStep { get => Sp.LrStatsStep; set => Sp.LrStatsStep = value; }
+    internal static long FilterSearchMaxPixels { get => Sp.FilterSearchMaxPixels; set => Sp.FilterSearchMaxPixels = value; }
+    internal static bool FilterPickFromQ { get => Sp.FilterPickFromQ; set => Sp.FilterPickFromQ = value; }
     internal static int AngleDeltaSet { get => Sp.AngleDeltaSet; set => Sp.SetAngleDeltas(value); }
 
     // Dev/conformance isolation: when set, only luma intra candidates passing the filter are considered (square,
