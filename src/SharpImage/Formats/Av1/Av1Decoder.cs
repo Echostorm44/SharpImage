@@ -43,7 +43,7 @@ internal sealed class Av1Decoder
 
     // Tile data collected during OBU parsing for the current frame
     [ThreadStatic] internal static string? LastDecodeError;   // per thread: concurrent decodes must not clobber it
-    private readonly TileGroup[] tileGroups = new TileGroup[256];
+    private readonly TileGroup[] tileGroups = new TileGroup[Av1Constants.MaxTileCols * Av1Constants.MaxTileRows];   // one tile per group at most
     private int tileGroupCount;
     private int tilesCollected;
 
@@ -1398,32 +1398,33 @@ internal sealed class Av1Decoder
 
         Span<ushort> edgeY = ctx.IpredEdgeY.AsSpan();
 
-        for (int tileRow = 0; tileRow < frameHdr.TileRows; tileRow++)
+        // dav1d backs up per tile after that tile's SB row: only the tiles of the tile row containing sby (the other
+        // tile rows' states may still hold a previous frame's layout).
+        int tileRow = 0;
+        while (tileRow + 1 < frameHdr.TileRows && frameHdr.TileRowStartSb[tileRow + 1] <= sby) tileRow++;
+        for (int tileCol = 0; tileCol < frameHdr.TileCols; tileCol++)
         {
-            for (int tileCol = 0; tileCol < frameHdr.TileCols; tileCol++)
+            var ts = ctx.TileStates![tileRow * frameHdr.TileCols + tileCol];
+            int xOff = ts.ColStart;                 // 4px units
+            int nPix = 4 * (ts.ColEnd - xOff);       // luma pixels
+            if (nPix <= 0) continue;
+
+            int src = yRow * yStride + xOff * 4;
+            int dst = sbyOff + xOff * 4;
+            yPlane.Slice(src, nPix).CopyTo(edgeY.Slice(dst, nPix));
+
+            if (hasChroma)
             {
-                var ts = ctx.TileStates![tileRow * frameHdr.TileCols + tileCol];
-                int xOff = ts.ColStart;                 // 4px units
-                int nPix = 4 * (ts.ColEnd - xOff);       // luma pixels
-                if (nPix <= 0) continue;
-
-                int src = yRow * yStride + xOff * 4;
-                int dst = sbyOff + xOff * 4;
-                yPlane.Slice(src, nPix).CopyTo(edgeY.Slice(dst, nPix));
-
-                if (hasChroma)
-                {
-                    int uvStride = ctx.UvStride;
-                    int uvRow = Math.Min(((by + sbStep) * 4 >> ssVer) - 1, (hPix >> ssVer) - 1);
-                    int uvXOff = (xOff * 4) >> ssHor;    // chroma pixels
-                    int uvN = nPix >> ssHor;
-                    int uvSrc = uvRow * uvStride + uvXOff;
-                    int uvDst = sbyOff + uvXOff;
-                    ctx.CurrentPlanes[1]!.AsSpan().Slice(uvSrc, uvN)
-                        .CopyTo(ctx.IpredEdgeU.AsSpan().Slice(uvDst, uvN));
-                    ctx.CurrentPlanes[2]!.AsSpan().Slice(uvSrc, uvN)
-                        .CopyTo(ctx.IpredEdgeV.AsSpan().Slice(uvDst, uvN));
-                }
+                int uvStride = ctx.UvStride;
+                int uvRow = Math.Min(((by + sbStep) * 4 >> ssVer) - 1, (hPix >> ssVer) - 1);
+                int uvXOff = (xOff * 4) >> ssHor;    // chroma pixels
+                int uvN = nPix >> ssHor;
+                int uvSrc = uvRow * uvStride + uvXOff;
+                int uvDst = sbyOff + uvXOff;
+                ctx.CurrentPlanes[1]!.AsSpan().Slice(uvSrc, uvN)
+                    .CopyTo(ctx.IpredEdgeU.AsSpan().Slice(uvDst, uvN));
+                ctx.CurrentPlanes[2]!.AsSpan().Slice(uvSrc, uvN)
+                    .CopyTo(ctx.IpredEdgeV.AsSpan().Slice(uvDst, uvN));
             }
         }
     }
@@ -1758,7 +1759,7 @@ internal sealed class Av1Decoder
 
     /// <summary>
     /// Copy specific rows from source plane to LR LPF buffer at stripe boundaries.
-    /// dav1d: backup_lpf (lf_apply_tmpl.c:41-101), simplified for no super-res, single-threaded.
+    /// dav1d: backup_lpf (lf_apply_tmpl.c:41-101), single-threaded (super-res rows are upscaled below).
     /// </summary>
     private static void BackupLpf(ushort[] dst, int dstStride,
         ushort[] src, int srcOffset, int srcStride,
@@ -2175,8 +2176,9 @@ internal sealed class Av1Decoder
                 else
                     refFrame.CdfSnapshot.CopyFrom(ctx.InCdf!);
 
-                // The frame's motion field (shared, never written again) and its reference order hints.
-                refFrame.TemporalMvs = ctx.CurrentRp;
+                // The frame's motion field (shared, never written again) and its reference order hints. An intrabc
+                // frame's block vectors are not a motion field: dav1d leaves such a slot's refmvs empty.
+                refFrame.TemporalMvs = fh.AllowIntraBc ? null : ctx.CurrentRp;
                 ctx.CurrentRefPoc.CopyTo(refFrame.RefPoc, 0);
             }
         }
@@ -2187,7 +2189,8 @@ internal sealed class Av1Decoder
         for (int plane = 0; plane < 3; plane++)
         {
             var src = ctx.CurrentPlanes[plane];
-            if (src == null) continue;
+            // A monochrome frame has no chroma: drop the slot's old planes (a new sequence may switch layouts).
+            if (src == null) { refFrame.Planes[plane] = null; continue; }
 
             int stride = ctx.CurrentStrides[plane];
             int height = plane == 0 ? frameHdr.Height :
@@ -2253,7 +2256,7 @@ internal sealed class Av1Decoder
                     if (refFrame.Planes[p] != null)
                     {
                         int sz = refFrame.Strides[p] *
-                            (p == 0 ? refFrame.Height : (refFrame.Height + 1) >> 1);
+                            (p == 0 || ctx.PixelLayout != Av1PixelLayout.I420 ? refFrame.Height : (refFrame.Height + 1) >> 1);
                         if (dst.Planes[p] == null || dst.Planes[p]!.Length < sz)
                             dst.Planes[p] = new ushort[sz];
                         refFrame.Planes[p].AsSpan(0, sz).CopyTo(dst.Planes[p]);

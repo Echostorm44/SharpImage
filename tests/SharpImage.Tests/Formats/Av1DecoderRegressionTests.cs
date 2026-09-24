@@ -26,6 +26,19 @@ public sealed class Av1DecoderRegressionTests
         await Assert.That(dst.Skip(1).All(v => v == 0xff)).IsTrue();
     }
 
+    // A coded segment id with no active segment (last_active_segid = -1) and a nonzero spatial prediction:
+    // neg_deinterleave goes negative, dav1d wraps it through uint8_t and resets it to 0 (was an out-of-range index,
+    // Argon test2776_9777); ids past the last active one are also reset to 0.
+    [Test]
+    public async Task CodedSegId_NoActiveSegment_WrapsToZeroLikeDav1d()
+    {
+        await Assert.That(Av1Decode.CodedSegId(2, 3, -1)).IsEqualTo((byte)0);
+        await Assert.That(Av1Decode.CodedSegId(0, 5, -1)).IsEqualTo((byte)0);
+        await Assert.That(Av1Decode.CodedSegId(5, 0, 7)).IsEqualTo((byte)5);
+        await Assert.That(Av1Decode.CodedSegId(5, 0, 2)).IsEqualTo((byte)0);
+        await Assert.That(Av1Decode.CodedSegId(1, 2, 7)).IsEqualTo((byte)3);
+    }
+
     // A luma palette block overhanging the frame bottom with CfL chroma: the palette index map past the visible rows
     // repeats the last visible row (dav1d pal_idx_finish), so CfL's block average matches. libavif's
     // colors_text_hdr_srgb.avif item 4 (10-bit 4:4:4): SHA-256 of dav1d's planes (u16 LE).

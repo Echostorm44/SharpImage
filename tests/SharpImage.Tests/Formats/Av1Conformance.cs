@@ -230,6 +230,19 @@ internal static class Av1Conformance
         }
     }
 
+    // The innermost "at Type.Method" frame of an exception text (triage grouping).
+    private static string TopFrame(string text)
+    {
+        foreach (var line in text.Split('\n'))
+        {
+            var t = line.Trim();
+            if (!t.StartsWith("at ")) continue;
+            int paren = t.IndexOf('(');
+            return (paren > 0 ? t[3..paren] : t[3..]).Replace("SharpImage.Formats.Av1.", "");
+        }
+        return "?";
+    }
+
     /// <summary>One Argon stream against its md5_ref (film grain applied, operating point 0, all layers output).</summary>
     internal static string CheckArgon(string obuPath, string md5Path, bool annexB)
     {
@@ -244,7 +257,7 @@ internal static class Av1Conformance
             {
                 Av1Decoder.LastDecodeError = null;
                 var outs = dec.DecodeTemporalUnit(tus[i], i);
-                if (outs.Count == 0 && Av1Decoder.LastDecodeError is { } err) return $"ERROR tu {i}: {err.Split('\n')[0]}";
+                if (outs.Count == 0 && Av1Decoder.LastDecodeError is { } err) return $"ERROR tu {i}: {err.Split('\n')[0]} @{TopFrame(err)}";
                 foreach (var (f, _) in outs)
                 {
                     AddDav1dMd5(md5, f, dec.Monochrome);
@@ -253,7 +266,7 @@ internal static class Av1Conformance
                 }
             }
         }
-        catch (Exception e) { return $"EXCEPTION after {frames} frames: {e.GetType().Name} {e.Message.Split('\n')[0]}"; }
+        catch (Exception e) { return $"EXCEPTION after {frames} frames: {e.GetType().Name} {e.Message.Split('\n')[0]} @{TopFrame(e.ToString())}"; }
         string got = Convert.ToHexStringLower(md5.GetHashAndReset());
         return got == expected ? $"ok {frames}" : $"MISMATCH ({frames} frames)";
     }

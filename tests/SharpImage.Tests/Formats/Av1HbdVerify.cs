@@ -1663,7 +1663,8 @@ public sealed class Av1HbdVerify
                 if (t[0] == "argon")
                 {
                     // argon <argonDir> <out.txt> [subdir filter] [name filter]: every stream of the default
-                    // dav1d_argon.bash set, decoded in parallel, one "subdir/name result" line each (appended as they finish).
+                    // dav1d_argon.bash set, decoded 3 at a time (the big streams take GBs each), one "subdir/name result" line
+                    // each (appended as they finish).
                     string[] dirs = ["profile0_core", "profile0_core_special", "profile0_not_annexb", "profile0_not_annexb_special",
                         "profile1_core", "profile1_core_special", "profile1_not_annexb", "profile1_not_annexb_special",
                         "profile2_core", "profile2_core_special", "profile2_not_annexb", "profile2_not_annexb_special", "profile_switching"];
@@ -1678,7 +1679,7 @@ public sealed class Av1HbdVerify
                     }
                     var outLock = new object();
                     using var outW = new StreamWriter(t[2]) { AutoFlush = true };
-                    System.Threading.Tasks.Parallel.ForEach(jobs, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, job =>
+                    System.Threading.Tasks.Parallel.ForEach(jobs, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = 3 }, job =>
                     {
                         string md5 = Path.Combine(t[1], job.Dir, "md5_ref", Path.GetFileNameWithoutExtension(job.File) + ".md5");
                         string r;

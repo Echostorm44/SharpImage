@@ -2277,9 +2277,15 @@ public static class Av1Decode
     {
         int pred = CurFrameSegIdPred(ctx, by, bx, haveTop, haveLeft, out int segCtx);
         int diff = (int)msac.DecodeSymbolAdapt8(ts.Cdf.Mode.SegId[segCtx], Av1Constants.MaxSegments - 1);
-        int last = fh.SegmentationData.LastActiveSegId;
-        int id = NegDeinterleave(diff, pred, last + 1);
-        if (id > last) id = 0;
+        return CodedSegId(diff, pred, fh.SegmentationData.LastActiveSegId);
+    }
+
+    // dav1d stores the result in a uint8_t and compares it against last_active_segid as unsigned, so with no active
+    // segment (last = -1) a negative result wraps to 255 - diff and only the >= 8 check resets it to 0.
+    internal static byte CodedSegId(int diff, int pred, int last)
+    {
+        int id = (byte)NegDeinterleave(diff, pred, last + 1);
+        if ((uint)id > (uint)last) id = 0;
         if (id >= Av1Constants.MaxSegments) id = 0;
         return (byte)id;
     }
