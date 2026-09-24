@@ -505,6 +505,13 @@ public class Av1FilterMask
         CdefIdx0 = CdefIdx1 = CdefIdx2 = CdefIdx3 = -1;
         Array.Clear(NoskipMask);
     }
+    /// <summary>Copy everything (loop-filter masks, noskip mask, CDEF indices) from another mask.</summary>
+    public void CopyAllFrom(Av1FilterMask other)
+    {
+        Array.Copy(other.FilterY, FilterY, FilterY.Length);
+        Array.Copy(other.FilterUv, FilterUv, FilterUv.Length);
+        CopyFrom(other);
+    }
     /// <summary>Copy noskip mask and CDEF indices from another mask.</summary>
     public void CopyFrom(Av1FilterMask other)
     {

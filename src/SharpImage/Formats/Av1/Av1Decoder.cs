@@ -60,6 +60,51 @@ internal sealed class Av1Decoder
     public int MaxThreads { get; set; } = 1;
 
     private static readonly bool CdfDump = Environment.GetEnvironmentVariable("AV1_CDFDUMP") == "1";
+    private static bool NoDeblock => Environment.GetEnvironmentVariable("AV1_NODEBLOCK") != null;   // dev probe
+
+    // Per-SB-row copies of the loop-filter masks handed to the deblocking worker (reused across frames).
+    private Av1FilterMask[][] lfSnap = [];
+
+    /// <summary>Deblocking pipelined behind the tile decode: SB row N is deblocked on a worker while row N+1 decodes.
+    /// Row N+1's decode never reads row N's deblocked pixels (intra edges come from the pre-filter backup) and
+    /// deblock(N) touches only rows of N and the bottom of N-1, so the output equals the serial order. The worker
+    /// gets its own copy of the row's masks (the live ones are reset for the next SB128 row).</summary>
+    private sealed class DeblockPipeline
+    {
+        private readonly System.Collections.Concurrent.BlockingCollection<(int Sby, Av1FilterMask[] Masks)> queue = new();
+        private readonly System.Threading.Tasks.Task worker;
+        public DeblockPipeline(Action<int, Av1FilterMask[]> run) =>
+            worker = System.Threading.Tasks.Task.Factory.StartNew(() =>
+            {
+                foreach (var (sby, masks) in queue.GetConsumingEnumerable()) run(sby, masks);
+            }, System.Threading.Tasks.TaskCreationOptions.LongRunning);
+        public void Post(int sby, Av1FilterMask[] masks) => queue.Add((sby, masks));
+        /// <summary>Waits for every posted row; rethrows the worker's exception unless the decode already failed.</summary>
+        public void Finish(bool rethrow)
+        {
+            queue.CompleteAdding();
+            try { worker.Wait(); }
+            catch (AggregateException ae) when (ae.InnerExceptions.Count > 0)
+            {
+                if (rethrow) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
+            }
+        }
+    }
+
+    private Av1FilterMask[] SnapshotLfMasks(int sby)
+    {
+        var live = ctx.LfMasks!;
+        if (lfSnap.Length < ctx.SuperBlockRows) Array.Resize(ref lfSnap, ctx.SuperBlockRows);
+        var row = lfSnap[sby];
+        if (row == null || row.Length < live.Length)
+        {
+            row = new Av1FilterMask[live.Length];
+            for (int i = 0; i < row.Length; i++) row[i] = new Av1FilterMask();
+            lfSnap[sby] = row;
+        }
+        for (int i = 0; i < live.Length; i++) row[i].CopyAllFrom(live[i]);
+        return row;
+    }
 
     private struct TileGroup
     {
@@ -882,6 +927,12 @@ internal sealed class Av1Decoder
             tileTaskCtx = arr;
         }
 
+        DeblockPipeline? lfPipe = MaxThreads > 1 && (fh.LfLevelY0 != 0 || fh.LfLevelY1 != 0) && ctx.LfMasks != null
+            && !NoDeblock && !DumpPreDeblockY
+            ? new DeblockPipeline((row, masks) => ApplyInLoopFilters(row, ssHor, ssVer, hasChroma, masks)) : null;
+        bool tileLoopDone = false;
+        try
+        {
         // Process tile rows by superblock rows
         for (int tileRow = 0; tileRow < fh.TileRows; tileRow++)
         {
@@ -960,8 +1011,9 @@ internal sealed class Av1Decoder
                 // MUST run before ApplyInLoopFilters (which deblocks in place).
                 BackupIpredEdge(sby, by, ssHor, ssVer, hasChroma);
 
-                // Apply in-loop filters for this superblock row
-                ApplyInLoopFilters(sby, ssHor, ssVer, hasChroma);
+                // Apply in-loop filters for this superblock row (on the pipeline worker when threaded)
+                if (lfPipe != null) lfPipe.Post(sby, SnapshotLfMasks(sby));
+                else ApplyInLoopFilters(sby, ssHor, ssVer, hasChroma);
                 // Save lfMask data for CDEF/LR (backup before next row overwrites)
                 if (ctx.LfMasksRows != null && ctx.LfMasks != null)
                 {
@@ -980,6 +1032,10 @@ internal sealed class Av1Decoder
                     AvDbg.W($"[SB-ROW] Frame#{frameIdx} sby={sby}/{sbhEnd} done");
             }
         }
+
+        tileLoopDone = true;
+        }
+        finally { lfPipe?.Finish(rethrow: tileLoopDone); }
 
         // End-of-frame CDF snapshot for comparison with dav1d's (dev only: AV1_CDFDUMP=1 writes cdf_ours_f<N>.txt to
         // the working directory; never on by default).
@@ -1481,7 +1537,10 @@ internal sealed class Av1Decoder
         }
     }
 
-    private void ApplyInLoopFilters(int sby, int ssHor, int ssVer, bool hasChroma)
+    private void ApplyInLoopFilters(int sby, int ssHor, int ssVer, bool hasChroma) =>
+        ApplyInLoopFilters(sby, ssHor, ssVer, hasChroma, ctx.LfMasks);
+
+    private void ApplyInLoopFilters(int sby, int ssHor, int ssVer, bool hasChroma, Av1FilterMask[]? masks)
     {
         var fh = frameHdr;
 
@@ -1493,7 +1552,7 @@ internal sealed class Av1Decoder
             for (int di = 0; di < 4; di++)
                 AvDbg.W($"[LF-LEVEL] LfLevel[{di}] col0={ctx.LfLevel[di, 0]} col1={ctx.LfLevel[di, 1]} col2={ctx.LfLevel[di, 2]} col3={ctx.LfLevel[di, 3]}");
         }
-        if ((fh.LfLevelY0 != 0 || fh.LfLevelY1 != 0) && ctx.LfMasks != null && Environment.GetEnvironmentVariable("AV1_NODEBLOCK") == null)
+        if ((fh.LfLevelY0 != 0 || fh.LfLevelY1 != 0) && masks != null && !NoDeblock)
         {
             int sbSz = seqHdr.Sb128 ? 32 : 16;
             int yPixelRow = sby * sbSz * 4;
@@ -1522,9 +1581,9 @@ internal sealed class Av1Decoder
             }
 
             Av1LoopFilter.LoopFilterSbRowCols(ctx, yPlane, uPlane, vPlane,
-                yOff, uvOff, uvOff, ctx.LfMasks, sby, ctx.StartOfTileRow.Length > sby ? ctx.StartOfTileRow[sby] : 0);
+                yOff, uvOff, uvOff, masks, sby, ctx.StartOfTileRow.Length > sby ? ctx.StartOfTileRow[sby] : 0);
             Av1LoopFilter.LoopFilterSbRowRows(ctx, yPlane, uPlane, vPlane,
-                yOff, uvOff, uvOff, ctx.LfMasks, sby);
+                yOff, uvOff, uvOff, masks, sby);
 
             // Debug: dump post-deblocking full YUV
             if (DumpPreDeblockY && sby == ctx.SuperBlockRows - 1)
