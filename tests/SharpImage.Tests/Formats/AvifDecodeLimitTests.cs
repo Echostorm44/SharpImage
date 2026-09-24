@@ -10,6 +10,18 @@ public sealed class AvifDecodeLimitTests
 {
     private static byte[] Asset(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "TestAssets", "avif_conformance", name));
 
+    // Decoding must not touch the file system (a leftover dav1d-comparison hook once wrote cdf_ours_f<N>.txt per frame
+    // into the working directory).
+    [Test]
+    public async Task Decode_WritesNoFiles()
+    {
+        string cwd = Environment.CurrentDirectory;
+        foreach (var f in Directory.GetFiles(cwd, "cdf_ours_f*.txt")) File.Delete(f);
+        using (var seq = HeifCoder.DecodeSequence(Asset("colors-animated-8bpc.avif"))) { }
+        HeifCoder.Decode(Asset("libavif_10bit_420_alpha.avif"));
+        await Assert.That(Directory.GetFiles(cwd, "cdf_ours_f*.txt").Length).IsEqualTo(0);
+    }
+
     [Test]
     public async Task ImageSizeLimit_RejectsLargerImages()
     {

@@ -59,6 +59,8 @@ internal sealed class Av1Decoder
     /// identical for any value.</summary>
     public int MaxThreads { get; set; } = 1;
 
+    private static readonly bool CdfDump = Environment.GetEnvironmentVariable("AV1_CDFDUMP") == "1";
+
     private struct TileGroup
     {
         public int StartTile;
@@ -979,9 +981,10 @@ internal sealed class Av1Decoder
             }
         }
 
-        // Write our end-of-frame CDF snapshot for comparison with dav1d's snapshot
+        // End-of-frame CDF snapshot for comparison with dav1d's (dev only: AV1_CDFDUMP=1 writes cdf_ours_f<N>.txt to
+        // the working directory; never on by default).
         AvDbg.W($"[CDF-DUMP-CHECK] FrameOffset={fh.FrameOffset} TileStatesNull={ctx.TileStates == null} Len={ctx.TileStates?.Length ?? -1}");
-        if (ctx.TileStates != null && ctx.TileStates.Length > 0)
+        if (CdfDump && ctx.TileStates != null && ctx.TileStates.Length > 0)
         {
             try
             {
