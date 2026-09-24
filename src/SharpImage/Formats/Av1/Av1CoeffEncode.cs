@@ -547,6 +547,7 @@ internal static class Av1CoeffEncode
         int yMode, int[] signedLevels, double[] qf, int dcDq, int acDq, int skipCtx, int dcSignCtx, int txTypeIdx,
         double lambda)
     {
+        if (!Av1StillImageEncoder.UseRdoq) return;   // speed preset: deadzone levels as-is
         ushort[] scan = Av1Tables.Scans[tx];
         int eob = -1;
         for (int i = scan.Length - 1; i >= 0; i--) if (signedLevels[scan[i]] != 0) { eob = i; break; }

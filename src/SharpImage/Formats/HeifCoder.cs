@@ -82,8 +82,9 @@ public sealed class AvifEncodeOptions
     public int Qp { get; set; } = 20;
 
     /// <summary>Encoder speed 0 (slowest, smallest files) .. 10 (fastest), as avifenc -s. Each step prunes the
-    /// rate-distortion search further (mode candidates, partition shapes, transform sets, filter searches); measured
-    /// on the encoder corpus, every speed up to 6 gives smaller files than libaom at the same speed setting.</summary>
+    /// rate-distortion search further (mode candidates, partition shapes, transform sets, filter searches, angle
+    /// deltas, RDOQ); measured on the encoder corpus, every speed gives smaller files than libaom at the same speed
+    /// setting (7..10: +20 / +24 / +31 / +34 % BD-rate vs libaom speed 0, libaom +22 / +26 / +55 / +55 %).</summary>
     public int Speed { get; set; } = DefaultSpeed;
 
     /// <summary>Default <see cref="Speed"/>.</summary>

@@ -32,6 +32,17 @@ internal sealed class Av1EncodeSpeed
     public int RdUvCandidates = 6;
     public bool UseFullIntraTxSet = true;
     public bool UseExtPartition = true;
+    /// <summary>Angle deltas searched for the directional intra modes: 1 = all of -3..3, 0 = none (delta 0 only),
+    /// 2 = {-2, 0, 2}, 3 = {-3, 0, 3}, 4 = {-3, -1, 0, 1, 3}.</summary>
+    public int AngleDeltaSet = 1;
+    public (Av1IntraPredMode Mode, int Delta)[] Candidates = Av1StillImageEncoder.BuildCandidates(AngleDeltas(1));
+    internal static int[] AngleDeltas(int set) => set switch
+    {
+        0 => [0], 2 => [-2, 0, 2], 3 => [-3, 0, 3], 4 => [-3, -1, 0, 1, 3], _ => [-3, -2, -1, 0, 1, 2, 3],
+    };
+    public void SetAngleDeltas(int set) { AngleDeltaSet = set; Candidates = Av1StillImageEncoder.BuildCandidates(AngleDeltas(set)); }
+    public bool UseTxTypeSearch = true;
+    public bool UseRdoq = true;
 
     public Av1EncodeSpeed Clone() => (Av1EncodeSpeed)MemberwiseClone();
 
@@ -47,7 +58,13 @@ internal sealed class Av1EncodeSpeed
         if (speed >= 4) { p.RdModeCandidates = 2; p.UseSub8Partition = false; p.EarlyTermBits = 32; }
         if (speed >= 5) { p.RdUvCandidates = 1; p.UseFullIntraTxSet = false; }
         if (speed >= 6) { p.UseTrueRd = false; p.UseRd = false; p.UseSub8Partition = true; p.EarlyTermBits = 8; }
-        if (speed >= 7) { p.UseDeblockSearch = false; p.UseCdefSearch = false; }
+        // 7-10 (measured on the speed corpus vs libaom's ladder, BD vs libaom speed 0 / fox 1204x800 1-thread time):
+        // 7 +20.1% 0.30 s (aom s7 +22.3%), 8 +24.1% 0.22 s (aom s8 +26.5% 0.25 s), 9 +30.7% 0.20 s,
+        // 10 +33.6% 0.18 s (aom s9/s10 +54.6%, 0.11 s).
+        if (speed >= 7) { p.UseDeblockSearch = false; p.UseCdefSearch = false; p.SetAngleDeltas(0); p.RdModeCandidates = 1; }
+        if (speed >= 8) p.UseRdoq = false;
+        if (speed >= 9) p.UseTxTypeSearch = false;
+        if (speed >= 10) p.UseCfl = false;
         return p;
     }
 }
@@ -790,6 +807,22 @@ internal static class Av1StillImageEncoder
         public ushort[] APalCol = null!, LPalCol = null!;     // [32*8] palette colours at each position
         public ushort[] Pred = new ushort[64 * 64];
         public ushort[] EstScratch = new ushort[64 * 64];
+        // EstimateBlockCost is a pure function of the source block (source prediction) and the quantizers, and the
+        // partition decision evaluates each block twice (as a parent's SPLIT child, then as its own NONE): cached per
+        // SB128 position (1 + 4 + 16 + 64 + 256 slots for levels 0..4), reset when the superblock changes.
+        public readonly long[] EstCache = new long[341];
+        public int EstCacheSb = -1, EstCacheDc, EstCacheAc;
+
+        public long EstCost(int bl, int bx4, int by4)
+        {
+            int sb = ((by4 >> 5) << 16) | (bx4 >> 5);
+            if (sb != EstCacheSb || DcDq != EstCacheDc || AcDq != EstCacheAc)
+            { Array.Fill(EstCache, -1); EstCacheSb = sb; EstCacheDc = DcDq; EstCacheAc = AcDq; }
+            int idx = ((1 << (2 * bl)) - 1) / 3 + ((((by4 & 31) >> (5 - bl)) << bl) | ((bx4 & 31) >> (5 - bl)));
+            long v = EstCache[idx];
+            if (v < 0) EstCache[idx] = v = EstimateBlockCost(Luma, W, Bw4, Bh4, DcDq, AcDq, EstScratch, bl, bx4, by4);
+            return v;
+        }
     }
 
     private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> uPlane, ReadOnlySpan<ushort> vPlane,
@@ -953,10 +986,9 @@ internal static class Av1StillImageEncoder
         int choice = 0;
         if (bl < 4 && fullyInside)
         {
-            long costNone = EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl, bx4, by4);
-            long costSplit = 0;
-            foreach ((int dx, int dy) in new[] { (0, 0), (hsz, 0), (0, hsz), (hsz, hsz) })
-                costSplit += EstimateBlockCost(c.Luma, c.W, c.Bw4, c.Bh4, c.DcDq, c.AcDq, c.EstScratch, bl + 1, bx4 + dx, by4 + dy);
+            long costNone = c.EstCost(bl, bx4, by4);
+            long costSplit = c.EstCost(bl + 1, bx4, by4) + c.EstCost(bl + 1, bx4 + hsz, by4)
+                           + c.EstCost(bl + 1, bx4, by4 + hsz) + c.EstCost(bl + 1, bx4 + hsz, by4 + hsz);
             long costHorz = long.MaxValue, costVert = long.MaxValue;
             if ((bl == 2 || bl == 3) && UseRectPartition && !UsePalette && c.Layout == Av1PixelLayout.I420)
             {
@@ -3227,7 +3259,7 @@ internal static class Av1StillImageEncoder
     // output bit-for-bit without replicating that logic. Directional prediction reuses the decoder's own
     // PrepareIntraEdges (which folds angle_delta into the base angle) + Av1IntraPred.Predict. angle_delta ∈ [-3,3]
     // is coded via AngleDeltaCdf[mode-Vertical], symbol = delta + 3, nsym 6 (7 symbols), for blocks ≥ 8x8.
-    private static readonly (Av1IntraPredMode Mode, int Delta)[] CandidateModes = BuildCandidates();
+    private static (Av1IntraPredMode Mode, int Delta)[] CandidateModes => Sp.Candidates;
 
 
     // How many SATD-best modes the RD leaf search fully rate-evaluates (of ~61 candidates: DC/Smooth/SmoothV/
@@ -3236,6 +3268,9 @@ internal static class Av1StillImageEncoder
     // -0.79% (saturated) BD-rate. 16 is the knee — essentially all the quality for ~1/4 the RD cost of an
     // exhaustive search. Higher trades encode time for <0.1%.
     internal static int RdModeCandidates { get => Sp.RdModeCandidates; set => Sp.RdModeCandidates = value; }
+    internal static bool UseRdoq { get => Sp.UseRdoq; set => Sp.UseRdoq = value; }
+    internal static bool UseTxTypeSearch { get => Sp.UseTxTypeSearch; set => Sp.UseTxTypeSearch = value; }
+    internal static int AngleDeltaSet { get => Sp.AngleDeltaSet; set => Sp.SetAngleDeltas(value); }
 
     // Dev/conformance isolation: when set, only luma intra candidates passing the filter are considered (square,
     // rect and sub-8x8 leaves). Null in production.
@@ -3269,7 +3304,7 @@ internal static class Av1StillImageEncoder
         (Av1FwdTransform.FwdTxType.HDct,     Av1TxType.HDct,    -1),
     };
 
-    private static (Av1IntraPredMode, int)[] BuildCandidates()
+    internal static (Av1IntraPredMode, int)[] BuildCandidates(int[] deltas)
     {
         var list = new List<(Av1IntraPredMode, int)>
         {
@@ -3280,7 +3315,7 @@ internal static class Av1StillImageEncoder
         // needs the top-right / bottom-left edge are now correct because the leaf threads the real intra-edge
         // availability flags (from Av1IntraEdgeTree, mirroring the decoder) into PrepareIntraEdges.
         for (int m = (int)Av1IntraPredMode.Vertical; m <= (int)Av1IntraPredMode.VerticalLeft; m++)
-            for (int d = -3; d <= 3; d++) list.Add(((Av1IntraPredMode)m, d));
+            foreach (int d in deltas) list.Add(((Av1IntraPredMode)m, d));
         return list.ToArray();
     }
 
@@ -3664,7 +3699,7 @@ internal static class Av1StillImageEncoder
             Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, bool filterEligible = false, int bs = 0, bool fullSet = false)
     {
         // Full intra set adds V_DCT/H_DCT for sub-16x16 luma (n in {4,8}); 16x16 and up stay on the reduced set.
-        var txSet = (fullSet && n <= 8) ? IntraTxTypesFull : (n <= 16 ? IntraTxTypes : DctOnly);
+        var txSet = !Sp.UseTxTypeSearch ? DctOnly : (fullSet && n <= 8) ? IntraTxTypesFull : (n <= 16 ? IntraTxTypes : DctOnly);
         int aboveCtx = Av1Tables.IntraModeContext[aboveMode];
         int leftCtx = Av1Tables.IntraModeContext[leftMode];
         Span<ushort> ymCdf = cdf.GetKfYModeCdf(aboveCtx, leftCtx);
