@@ -131,6 +131,8 @@ internal sealed class Av1Decoder
     public int TransferCharacteristics => (int)seqHdr.TransferCharacteristics;
     public int MatrixCoefficients => (int)seqHdr.MatrixCoefficients;
     public bool FullColorRange => seqHdr.ColorRange != 0;
+    /// <summary>AV1 chroma_sample_position (0 unknown, 1 vertical, 2 colocated).</summary>
+    public int ChromaSamplePosition => (int)seqHdr.ChromaSamplePosition;
 
     public bool Initialize(ReadOnlySpan<byte> codecPrivate)
     {

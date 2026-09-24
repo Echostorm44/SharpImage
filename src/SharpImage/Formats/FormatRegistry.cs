@@ -50,7 +50,10 @@ public enum ImageFileFormat
     Pix,
     Sun,
     Pdf,
-    CameraRaw
+    CameraRaw,
+
+    /// <summary>YUV4MPEG2 raw planar video / stills (<see cref="Y4mCoder"/>).</summary>
+    Y4m
 }
 
 /// <summary>
@@ -220,6 +223,11 @@ public static class FormatRegistry
         {
             return ImageFileFormat.Pnm;
         }
+
+        if (Y4mCoder.CanDecode(data))
+        {
+            return ImageFileFormat.Y4m;
+        }
         // WBMP has weak signature (0x00 0x00), check last
         if (WbmpCoder.CanDecode(data))
         {
@@ -240,6 +248,7 @@ public static class FormatRegistry
             ".bmp" => ImageFileFormat.Bmp,
             ".tga" => ImageFileFormat.Tga,
             ".pnm" or ".ppm" or ".pgm" or ".pbm" => ImageFileFormat.Pnm,
+            ".y4m" => ImageFileFormat.Y4m,
             ".gif" => ImageFileFormat.Gif,
             ".jpg" or ".jpeg" => ImageFileFormat.Jpeg,
             ".png" => ImageFileFormat.Png,
@@ -373,6 +382,7 @@ public static class FormatRegistry
             ImageFileFormat.Pix => PixCoder.Decode(data),
             ImageFileFormat.Sun => SunCoder.Decode(data),
             ImageFileFormat.CameraRaw => CameraRawCoder.Decode(data),
+            ImageFileFormat.Y4m => Y4mCoder.Read(data),
             _ => throw new NotSupportedException($"Unsupported image format: {format}")
         };
     }
@@ -417,6 +427,7 @@ public static class FormatRegistry
             ImageFileFormat.Sun => SunCoder.Encode(image),
             ImageFileFormat.Pdf => PdfCoder.Encode(image),
             ImageFileFormat.CameraRaw => CameraRawCoder.Encode(image),
+            ImageFileFormat.Y4m => EncodeToStream(image, (img, st) => Y4mCoder.Write(img, st)),
             _ => throw new NotSupportedException($"Unsupported image format: {format}")
         };
     }
@@ -443,6 +454,7 @@ public static class FormatRegistry
             ImageFileFormat.Gif => GifCoder.ReadSequence(new MemoryStream(data)),
             ImageFileFormat.WebP => WebpCoder.ReadSequence(new MemoryStream(data)),
             ImageFileFormat.Avif => HeifCoder.DecodeSequence(data),
+            ImageFileFormat.Y4m => Y4mCoder.ReadSequence(data),
             _ => throw new NotSupportedException($"Multi-frame read not supported for: {format}")
         };
     }
@@ -466,6 +478,10 @@ public static class FormatRegistry
                 break;
             case ImageFileFormat.Avif:
                 File.WriteAllBytes(path, HeifCoder.EncodeAvifSequence(sequence));
+                break;
+            case ImageFileFormat.Y4m:
+                using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write))
+                    Y4mCoder.WriteSequence(sequence, stream);
                 break;
             default:
                 throw new NotSupportedException($"Multi-frame write not supported for: {format}");

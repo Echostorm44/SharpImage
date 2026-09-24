@@ -1096,6 +1096,7 @@ public static partial class HeifCoder
 
     private static byte[] EncodeAvifEntry(ImageFrame image, AvifEncodeOptions options)
     {
+        options = AdoptSourceFormat(image, options);
         if (options.TargetSize is { } target)
             return SearchTargetSize(options, target, o => EncodeAvif(image, o));
         if (options.BitDepthExtension != AvifBitDepthExtension.None)
@@ -1365,6 +1366,7 @@ public static partial class HeifCoder
 
     private static byte[] EncodeAvifSequenceEntry(ImageSequence sequence, AvifEncodeOptions options)
     {
+        if (sequence.Count > 0) options = AdoptSourceFormat(sequence[0], options);
         if (options.TargetSize is { } target)
             return SearchTargetSize(options, target, o => EncodeAvifSequence(sequence, o));
         if (sequence.Count == 0) throw new ArgumentException("The sequence has no frames.", nameof(sequence));
@@ -1450,6 +1452,10 @@ public static partial class HeifCoder
                 yP = MonoLumaLibavif(r, g, b, w, h, bd, color, first.Depth is >= 1 and <= 16 ? first.Depth : 16);
             else if (mono)
                 yP = GreyLumaLibavif(frameImage, bd, color.FullRange, SourceRgbDepth(frameImage), extras.Premultiplied && alpha != null);
+            else if (SourcePlanesFor(frameImage, bd, color, w, h) is { } sp && sp.Layout == layout && !(extras.Premultiplied && alpha != null))
+            {
+                yP = sp.Planes.Value[0].ToArray(); uP = sp.Planes.Value[1].ToArray(); vP = sp.Planes.Value[2].ToArray();   // kept Y4M planes
+            }
             else
             {
                 RgbToYuvLibavif(frameImage, bd, layout, color, SourceRgbDepth(frameImage), extras.Premultiplied && alpha != null, r, g, b,
@@ -1991,7 +1997,8 @@ public static partial class HeifCoder
         nonOpaque |= forceAlpha && alpha != null;
         // Source YUV planes (JPEG input, a decoded gain map): coded as they are when the layout matches (a grey-looking
         // colour JPEG stays YCbCr, as in libavif); 4:0:0 takes the luma of any source.
-        var srcYuv = hasAlpha && nonOpaque ? null : SourcePlanesFor(image, bd, color, w, h);
+        var srcYuv = SourcePlanesFor(image, bd, color, w, h);
+        if (hasAlpha && nonOpaque && srcYuv?.Alpha == null) srcYuv = null;   // RGBA sources go through RGB -> YUV
         if (srcYuv != null && srcYuv.Layout != Av1.Av1PixelLayout.I400 && layout != Av1.Av1PixelLayout.I400)
         {
             if (srcYuv.Layout == layout) colour = true;
@@ -2043,7 +2050,12 @@ public static partial class HeifCoder
         {
             int alphaQIdx = alphaQIdxOverride ?? Math.Clamp(baseQIdx / 2, 4, 255);
             ushort[] yA, uA0, vA0;
-            if (!(sharpYuv && TrySharpYuv(image, r, g, b, w, h, bd, layout, color, out yA, out uA0, out vA0)))
+            if (srcYuv?.Alpha != null && srcYuv.Layout == layout && !extras.Premultiplied)
+            {
+                yA = srcYuv.Planes.Value[0].ToArray(); uA0 = srcYuv.Planes.Value[1].ToArray(); vA0 = srcYuv.Planes.Value[2].ToArray();
+                alpha = srcYuv.Alpha;
+            }
+            else if (!(sharpYuv && TrySharpYuv(image, r, g, b, w, h, bd, layout, color, out yA, out uA0, out vA0)))
                 RgbToYuvLibavif(image, bd, layout, color, SourceRgbDepth(image), extras.Premultiplied, r, g, b, out yA, out uA0, out vA0);
             ushort[]? uA = uA0, vA = vA0;
             Denoise(ref yA, ref uA, ref vA, gssX, gssY);

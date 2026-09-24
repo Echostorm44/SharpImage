@@ -1698,6 +1698,24 @@ public sealed class Av1HbdVerify
                             log.AppendLine($"{Path.GetFileName(f)} {Av1Conformance.CheckVector(f)}");
                     continue;
                 }
+                if (t[0] == "y4mdec")
+                {
+                    // y4mdec <in.avif> <out.y4m>: HeifCoder.DecodeYuv + Y4mCoder.WriteYuv (compare with avifdec -o out.y4m)
+                    var yuv = HeifCoder.DecodeYuv(File.ReadAllBytes(t[1]));
+                    using (var y4o = File.Create(t[2])) Y4mCoder.WriteYuv(y4o, [yuv]);
+                    log.AppendLine($"y4mdec {Path.GetFileName(t[1])} {yuv.Width}x{yuv.Height} d{yuv.Depth} {yuv.Subsampling}");
+                    continue;
+                }
+                if (t[0] == "y4menc")
+                {
+                    // y4menc <in.y4m> <out.avif> <quality> [speed]: FormatRegistry.Read (planes kept) + EncodeAvif
+                    var img = FormatRegistry.Read(t[1]);
+                    var eo = new AvifEncodeOptions { Quality = int.Parse(t[3]), Speed = t.Length > 4 ? int.Parse(t[4]) : 6 };
+                    byte[] outB = HeifCoder.EncodeAvif(img, eo);
+                    File.WriteAllBytes(t[2], outB);
+                    log.AppendLine($"y4menc {Path.GetFileName(t[1])} -> {outB.Length} bytes");
+                    continue;
+                }
                 if (t[0] == "encstream")
                 {
                     // encstream <prog|grid|layers|seq> <src (image, or animated GIF for seq)> <out.avif> [quality] [speed] [depth]:

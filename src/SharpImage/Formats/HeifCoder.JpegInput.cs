@@ -14,8 +14,9 @@ public static partial class HeifCoder
         public required Lazy<ushort[][]> Planes;
         public required int Width, Height, Depth;
         public required Av1.Av1PixelLayout Layout;
-        public required int[] Matrices;
+        public required int[]? Matrices;   // matrices the planes may be coded under; null = any (Y4M carries none)
         public required bool FullRange;
+        public ushort[]? Alpha;             // the source's alpha plane (Y4M C444alpha), coded as the alpha item
     }
 
     private static readonly ConditionalWeakTable<ImageFrame, SourceYuv> SourcePlanes = new();
@@ -128,7 +129,7 @@ public static partial class HeifCoder
     // The source planes to code for this frame, or null when the coded format differs from what they hold.
     private static SourceYuv? SourcePlanesFor(ImageFrame image, int bd, Av1.Av1ObuWriter.Av1ColorDesc color, int w, int h) =>
         SourcePlanes.TryGetValue(image, out var src) && src.Depth == bd && src.FullRange == color.FullRange
-        && src.Matrices.Contains(color.Matrix) && src.Width == w && src.Height == h ? src : null;
+        && (src.Matrices == null || src.Matrices.Contains(color.Matrix)) && src.Width == w && src.Height == h ? src : null;
 
     private static ushort[] Widen(byte[] p)
     {

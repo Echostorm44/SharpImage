@@ -69,7 +69,8 @@ public static partial class HeifCoder
     }
 
     // One input image item's native samples: Y, U, V (null for 4:0:0) plane arrays with their widths.
-    private sealed record ItemPlanes(int Width, int Height, int Depth, Av1.PixelFormat Format, bool Mono, ushort[][] Planes, int[] Widths, int[] Heights);
+    private sealed record ItemPlanes(int Width, int Height, int Depth, Av1.PixelFormat Format, bool Mono, ushort[][] Planes, int[] Widths, int[] Heights,
+        bool FullRange = true, int ChromaSamplePosition = 0);
 
     private static ItemPlanes DecodeItemPlanes(HeifContainer c, int id)
     {
@@ -126,7 +127,8 @@ public static partial class HeifCoder
                 var a = planes[0];
                 for (int k = 0; k < a.Length; k++) a[k] = (ushort)Math.Clamp(((a[k] - lo) * max + (hi - lo) / 2) / (hi - lo), 0, max);
             }
-            return new ItemPlanes(outW, outH, f0.BitDepth, f0.Format, mono, planes, widths, heights);
+            return new ItemPlanes(outW, outH, f0.BitDepth, f0.Format, mono, planes, widths, heights, first.FullColorRange,
+                first.ChromaSamplePosition);
         }
         finally
         {
