@@ -297,7 +297,10 @@ public static partial class JpegCoder
     /// decode either (hierarchical, arithmetic lossless, fractional sampling, ...) throws
     /// <see cref="NotSupportedException"/>. Entropy-coded data errors are recovered from as libjpeg-turbo does (its
     /// warnings: corrupt codes decode as 0, missing data as zeros).</summary>
-    internal static ImageFrame ReadLibjpegExact(byte[] d, long maxPixels = DefaultMaxPixels) => DecodeLj(d, maxPixels);
+    internal static ImageFrame ReadLibjpegExact(byte[] d, long maxPixels = DefaultMaxPixels) =>
+        DecodeLj(d, new JpegDecodeOptions { MaxPixels = maxPixels });
+
+    internal static ImageFrame ReadLibjpegExact(byte[] d, JpegDecodeOptions options) => DecodeLj(d, options);
 
     /// <summary>Default pixel limit of <see cref="Read(Stream)"/>: 16384 x 16384, as libavif's image size limit. A
     /// larger frame header fails before its buffers are allocated (libjpeg-turbo would try to allocate them).</summary>
@@ -312,8 +315,9 @@ public static partial class JpegCoder
         return r;
     }
 
-    private static ImageFrame DecodeLj(byte[] d, long maxPixels)
+    private static ImageFrame DecodeLj(byte[] d, JpegDecodeOptions opts)
     {
+        long maxPixels = opts.MaxPixels;
         // jdmarker.c first_marker: JERR_NO_SOI.
         if (d.Length < 2 || d[0] != 0xFF || d[1] != 0xD8)
             throw new InvalidDataException($"Not a JPEG file: starts with 0x{(d.Length > 0 ? d[0] : 0):x2} 0x{(d.Length > 1 ? d[1] : 0):x2}");
@@ -579,53 +583,170 @@ public static partial class JpegCoder
         // libjpeg: no lossy colour conversion in lossless mode (JERR_CONVERSION_NOTIMPL).
         if (lossless && space is 1 or 4) throw new NotSupportedException("Unsupported color conversion request");
 
-        // Component planes at their downsampled size.
+        // Output dimensions and each component's IDCT size (jdmaster.c jpeg_core_output_dimensions /
+        // jpeg_calc_output_dimensions): the smallest n/8 >= M/N, and larger IDCTs for subsampled components as far as
+        // they replace upsampling.
         int max = lossless ? (1 << precision) - 1 : precision == 12 ? 4095 : 255;
+        int minS = 8, outW = width, outH = height;
+        if (!lossless)
+        {
+            long num = opts.ScaleNumerator, den = opts.ScaleDenominator;
+            if (num <= 0 || den <= 0) throw new ArgumentOutOfRangeException(nameof(opts), "Scale factors must be positive");
+            minS = 16;
+            for (int n = 1; n <= 15; n++)
+                if (num * 8 <= den * n) { minS = n; break; }
+            outW = (int)(((long)width * minS + 7) / 8);
+            outH = (int)(((long)height * minS + 7) / 8);
+        }
+        var ssize = new int[nComp];
+        var dws = new int[nComp];
+        var dhs = new int[nComp];
+        for (int ci = 0; ci < nComp; ci++)
+        {
+            var c = comps[ci];
+            int s = minS;
+            if (!lossless)
+                while (s < 8 && maxH * minS % (c.H * s * 2) == 0 && maxV * minS % (c.V * s * 2) == 0) s *= 2;
+            ssize[ci] = s;
+            dws[ci] = lossless ? c.DownW : (int)(((long)width * c.H * s + maxH * 8 - 1) / (maxH * 8));
+            dhs[ci] = lossless ? c.DownH : (int)(((long)height * c.V * s + maxV * 8 - 1) / (maxV * 8));
+        }
+
+        // Output colour space (jdcolor.c): greyscale output takes Y of YCbCr / grey, or converts RGB.
+        bool greyOut = opts.Grayscale && space != 0;
+        if (greyOut && (space >= 3 || lossless)) throw new NotSupportedException("Unsupported color conversion request");
+        var needed = new bool[nComp];
+        for (int ci = 0; ci < nComp; ci++) needed[ci] = !greyOut || space == 2 || ci == 0;
+
+        // Component planes at their (scaled) downsampled size.
         var planes = new int[nComp][];
-        bool smooth = progressive && LjSmoothingOk(comps);
+        bool smooth = opts.BlockSmoothing && progressive && LjSmoothingOk(comps);
         int totalImcuRows = (height + maxV * 8 - 1) / (maxV * 8);
+        int p1 = precision == 8 ? 2 : 1, center = (max + 1) / 2;
+        int mask = 4 * (max + 1) - 1;
+        int[]? rlPost = null, rlSimple = null;
+        if (!lossless)
+        {
+            // jdmaster.c prepare_range_limit_table, indexed by (x & RANGE_MASK): IDCT_range_limit for the integer IDCTs,
+            // sample_range_limit for the float one
+            rlPost = new int[mask + 1];
+            rlSimple = new int[mask + 1];
+            for (int i = 0; i <= mask; i++)
+            {
+                int sg = i < 2 * (max + 1) ? i : i - 4 * (max + 1);
+                rlPost[i] = Math.Clamp(sg + center, 0, max);
+                rlSimple[i] = i <= max ? i : i < 2 * (max + 1) + center ? max : 0;
+            }
+        }
+        ReadOnlySpan<short> aanScales =
+        [
+            16384, 22725, 21407, 19266, 16384, 12873, 8867, 4520, 22725, 31521, 29692, 26722, 22725, 17855, 12299, 6270,
+            21407, 29692, 27969, 25172, 21407, 16819, 11585, 5906, 19266, 26722, 25172, 22654, 19266, 15137, 10426, 5315,
+            16384, 22725, 21407, 19266, 16384, 12873, 8867, 4520, 12873, 17855, 16819, 15137, 12873, 10114, 6967, 3552,
+            8867, 12299, 11585, 10426, 8867, 6967, 4799, 2446, 4520, 6270, 5906, 5315, 4520, 3552, 2446, 1247,
+        ];
+        ReadOnlySpan<double> aanFactors = [1.0, 1.387039845, 1.306562965, 1.175875602, 1.0, 0.785694958, 0.541196100, 0.275899379];
         for (int ci = 0; ci < nComp; ci++)
         {
             var c = comps[ci];
             if (lossless) { planes[ci] = c.Samples; continue; }
-            // A component that never appeared in a scan has no table (libjpeg leaves its multipliers zero).
+            if (!needed[ci]) continue;
+            int s = ssize[ci], dw = dws[ci], dh = dhs[ci];
+            var method = s == 8 ? opts.Dct : JpegDctMethod.IntegerSlow;
+            // jddctmgr.c multiplier tables. A component that never appeared in a scan has no table (libjpeg leaves its
+            // multipliers zero).
             var t = c.Qt ?? new int[64];
-            var plane = new int[c.DownW * c.DownH];
-            Span<int> blk = stackalloc int[64];
+            var qi = new int[64];
+            var qf = new float[64];
+            for (int i = 0; i < 64; i++)
+            {
+                if (method == JpegDctMethod.IntegerFast)
+                {
+                    int ifastBits = precision == 8 ? 2 : 13;
+                    qi[i] = unchecked((t[i] * aanScales[i] + (1 << (14 - ifastBits - 1))) >> (14 - ifastBits));
+                }
+                else if (method == JpegDctMethod.Float) qf[i] = (float)((double)t[i] * aanFactors[i >> 3] * aanFactors[i & 7]);
+                else qi[i] = t[i];
+            }
+            var plane = new int[dw * dh];
+            Span<int> blk = stackalloc int[256];
             var smoothRow = smooth ? new short[c.WidthInBlocks * 64] : null;
             for (int by = 0; by < c.HeightInBlocks; by++)
             {
+                if (by * s >= dh) break;
                 if (smoothRow != null) LjSmoothRow(c, by, totalImcuRows, lastGoodRow, scans > 1, smoothRow);
                 for (int bx = 0; bx < c.WidthInBlocks; bx++)
                 {
+                    if (bx * s >= dw) break;
                     var src = smoothRow != null ? smoothRow.AsSpan(bx * 64, 64) : c.Coef.AsSpan((by * c.AllocW + bx) * 64, 64);
-                    LjIdctIslow(src, t, blk, precision);
-                    for (int y = 0; y < 8 && by * 8 + y < c.DownH; y++)
-                        for (int x = 0; x < 8 && bx * 8 + x < c.DownW; x++)
-                            plane[(by * 8 + y) * c.DownW + bx * 8 + x] = blk[y * 8 + x];
+                    switch (s)
+                    {
+                        case 1: LjIdct1x1(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 2: LjIdct2x2(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 3: LjIdct3x3(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 4: LjIdct4x4(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 5: LjIdct5x5(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 6: LjIdct6x6(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 7: LjIdct7x7(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 8:
+                            if (method == JpegDctMethod.IntegerFast) LjIdctIfast(src, qi, blk, s, rlPost!, mask, p1, center);
+                            else if (method == JpegDctMethod.Float) LjIdctFloat(src, qf, blk, s, rlSimple!, mask, p1, center);
+                            else LjIdctIslow(src, qi, blk, s, rlPost!, mask, p1, center);
+                            break;
+                        case 9: LjIdct9x9(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 10: LjIdct10x10(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 11: LjIdct11x11(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 12: LjIdct12x12(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 13: LjIdct13x13(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 14: LjIdct14x14(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        case 15: LjIdct15x15(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                        default: LjIdct16x16(src, qi, blk, s, rlPost!, mask, p1, center); break;
+                    }
+                    for (int y = 0; y < s && by * s + y < dh; y++)
+                        for (int x = 0; x < s && bx * s + x < dw; x++)
+                            plane[(by * s + y) * dw + bx * s + x] = blk[y * s + x];
                 }
             }
             planes[ci] = plane;
         }
 
-        // Upsampling to full size.
+        // Upsampling to the output size (jdsample.c: the row-group ratios after IDCT scaling pick the method; no fancy
+        // upsampling at 1/8 scale).
+        bool doFancy = !lossless && opts.FancyUpsampling && minS > 1;
         var full = new int[nComp][];
         for (int ci = 0; ci < nComp; ci++)
-            full[ci] = LjUpsample(planes[ci], comps[ci], width, height, maxH, maxV, !lossless) ?? throw new NotSupportedException("sampling");
+        {
+            if (!needed[ci]) continue;
+            var c = comps[ci];
+            int s = lossless ? 1 : ssize[ci], m = lossless ? 1 : minS;
+            full[ci] = LjUpsample(planes[ci], dws[ci], dhs[ci], c.H * s / m, c.V * s / m, maxH, maxV, outW, outH, doFancy)
+                ?? throw new NotSupportedException("Fractional sampling not implemented yet");
+        }
 
         // Colour conversion + output.
         var frame = new ImageFrame();
-        frame.Initialize(width, height, space >= 3 ? ColorspaceType.CMYK : ColorspaceType.SRGB, false);
+        frame.Initialize(outW, outH, space >= 3 ? ColorspaceType.CMYK : ColorspaceType.SRGB, false);
         int nch = frame.NumberOfChannels;
         int[]? crR = null, cbB = null, crG = null, cbG = null;
-        if (space is 1 or 4) LjYccTables(max, out crR, out cbB, out crG, out cbG);
-        int center = (max + 1) / 2;
-        for (int y = 0; y < height; y++)
+        if (space is 1 or 4 && !greyOut) LjYccTables(max, out crR, out cbB, out crG, out cbG);
+        const int scaleBits = 16;
+        static int Fix(double x) => (int)(x * (1 << scaleBits) + 0.5);
+        int gr = Fix(0.29900), gg = Fix(0.58700), gb = Fix(0.11400);
+        for (int y = 0; y < outH; y++)
         {
             var row = frame.GetPixelRowForWrite(y);
-            for (int x = 0; x < width; x++)
+            for (int x = 0; x < outW; x++)
             {
-                int i = y * width + x, o = x * nch;
+                int i = y * outW + x, o = x * nch;
+                if (greyOut)
+                {
+                    // jdcolor.c grayscale_convert (Y) / rgb_gray_convert
+                    int v = space == 2
+                        ? (gr * full[0][i] + gg * full[1][i] + gb * full[2][i] + (1 << (scaleBits - 1))) >> scaleBits
+                        : full[0][i];
+                    row[o] = row[o + 1] = row[o + 2] = Scale16(v, max);
+                    continue;
+                }
                 switch (space)
                 {
                     case 0:
@@ -1277,98 +1398,20 @@ public static partial class JpegCoder
         }
     }
 
-    // ── IDCT (jidctint.c jpeg_idct_islow) at 8 / 12 bits, with the post-IDCT range-limit table ─────────────────────
-    private static void LjIdctIslow(ReadOnlySpan<short> coef, int[] qt, Span<int> output, int precision)
+    // jdsample.c: a component's samples (sw x sh) to the output size (w x h). hIn / vIn are its row-group size after
+    // IDCT scaling, hOut / vOut the maximum sampling factors: equal = full size, 2:1 = h2v1 / h1v2 / h2v2 (triangle
+    // filters when fancy, else replication), other integral ratios replicate. Null for fractional ratios.
+    private static int[]? LjUpsample(int[] src, int sw, int sh, int hIn, int vIn, int hOut, int vOut, int w, int h, bool fancy)
     {
-        const int CB = 13;
-        int p1 = precision == 12 ? 1 : 2;
-        int n = precision == 12 ? 4096 : 256, center = n / 2, mask = 4 * n - 1, maxv = n - 1;
-        const int F0_298 = 2446, F0_390 = 3196, F0_541 = 4433, F0_765 = 6270, F0_899 = 7373, F1_175 = 9633,
-            F1_501 = 12299, F1_847 = 15137, F1_961 = 16069, F2_053 = 16819, F2_562 = 20995, F3_072 = 25172;
-        Span<int> ws = stackalloc int[64];
-        unchecked
+        if (hIn == hOut && vIn == vOut)
         {
-            for (int col = 0; col < 8; col++)
-            {
-                if (coef[8 + col] == 0 && coef[16 + col] == 0 && coef[24 + col] == 0 && coef[32 + col] == 0 &&
-                    coef[40 + col] == 0 && coef[48 + col] == 0 && coef[56 + col] == 0)
-                {
-                    int dc = (coef[col] * qt[col]) << p1;
-                    for (int r = 0; r < 8; r++) ws[r * 8 + col] = dc;
-                    continue;
-                }
-                int z2 = coef[16 + col] * qt[16 + col], z3 = coef[48 + col] * qt[48 + col];
-                int z1 = (z2 + z3) * F0_541;
-                int tmp2 = z1 + z3 * -F1_847, tmp3 = z1 + z2 * F0_765;
-                z2 = coef[col] * qt[col];
-                z3 = coef[32 + col] * qt[32 + col];
-                int tmp0 = (z2 + z3) << CB, tmp1 = (z2 - z3) << CB;
-                int tmp10 = tmp0 + tmp3, tmp13 = tmp0 - tmp3, tmp11 = tmp1 + tmp2, tmp12 = tmp1 - tmp2;
-                tmp0 = coef[56 + col] * qt[56 + col];
-                tmp1 = coef[40 + col] * qt[40 + col];
-                tmp2 = coef[24 + col] * qt[24 + col];
-                tmp3 = coef[8 + col] * qt[8 + col];
-                Odd(ref tmp0, ref tmp1, ref tmp2, ref tmp3);
-                int s = CB - p1;
-                ws[col] = Descale(tmp10 + tmp3, s);
-                ws[56 + col] = Descale(tmp10 - tmp3, s);
-                ws[8 + col] = Descale(tmp11 + tmp2, s);
-                ws[48 + col] = Descale(tmp11 - tmp2, s);
-                ws[16 + col] = Descale(tmp12 + tmp1, s);
-                ws[40 + col] = Descale(tmp12 - tmp1, s);
-                ws[24 + col] = Descale(tmp13 + tmp0, s);
-                ws[32 + col] = Descale(tmp13 - tmp0, s);
-            }
-            for (int row = 0; row < 8; row++)
-            {
-                int o = row * 8;
-                int s = CB + p1 + 3;
-                int z2 = ws[o + 2], z3 = ws[o + 6];
-                int z1 = (z2 + z3) * F0_541;
-                int tmp2 = z1 + z3 * -F1_847, tmp3 = z1 + z2 * F0_765;
-                int tmp0 = (ws[o] + ws[o + 4]) << CB, tmp1 = (ws[o] - ws[o + 4]) << CB;
-                int tmp10 = tmp0 + tmp3, tmp13 = tmp0 - tmp3, tmp11 = tmp1 + tmp2, tmp12 = tmp1 - tmp2;
-                tmp0 = ws[o + 7]; tmp1 = ws[o + 5]; tmp2 = ws[o + 3]; tmp3 = ws[o + 1];
-                Odd(ref tmp0, ref tmp1, ref tmp2, ref tmp3);
-                output[o] = Range(Descale(tmp10 + tmp3, s));
-                output[o + 7] = Range(Descale(tmp10 - tmp3, s));
-                output[o + 1] = Range(Descale(tmp11 + tmp2, s));
-                output[o + 6] = Range(Descale(tmp11 - tmp2, s));
-                output[o + 2] = Range(Descale(tmp12 + tmp1, s));
-                output[o + 5] = Range(Descale(tmp12 - tmp1, s));
-                output[o + 3] = Range(Descale(tmp13 + tmp0, s));
-                output[o + 4] = Range(Descale(tmp13 - tmp0, s));
-            }
+            if (sw == w && sh == h) return src;
+            var crop = new int[w * h];
+            for (int y = 0; y < h; y++) Array.Copy(src, y * sw, crop, y * w, w);
+            return crop;
         }
-
-        static void Odd(ref int t0, ref int t1, ref int t2, ref int t3)
-        {
-            unchecked
-            {
-                int z1 = t0 + t3, z2 = t1 + t2, z3 = t0 + t2, z4 = t1 + t3;
-                int z5 = (z3 + z4) * F1_175;
-                t0 *= F0_298; t1 *= F2_053; t2 *= F3_072; t3 *= F1_501;
-                z1 *= -F0_899; z2 *= -F2_562; z3 *= -F1_961; z4 *= -F0_390;
-                z3 += z5; z4 += z5;
-                t0 += z1 + z3; t1 += z2 + z4; t2 += z2 + z3; t3 += z1 + z4;
-            }
-        }
-        static int Descale(int x, int s) => unchecked((x + (1 << (s - 1))) >> s);
-        // jdmaster.c prepare_range_limit_table, IDCT part: x & (4N-1) -> [0,C): x+C; [C,2N): max; [2N,4N-C): 0; else x-(4N-C).
-        int Range(int v)
-        {
-            int x = v & mask;
-            return x < center ? x + center : x < 2 * n ? maxv : x < 4 * n - center ? 0 : x - (4 * n - center);
-        }
-    }
-
-    // ── Upsampling (jdsample.c) ──────────────────────────────────────────────────────────────────────────────────
-    private static int[]? LjUpsample(int[] src, LjComp c, int w, int h, int maxH, int maxV, bool fancy)
-    {
-        int sw = c.DownW, sh = c.DownH;
-        if (maxH % c.H != 0 || maxV % c.V != 0) return null;
-        int rx = maxH / c.H, ry = maxV / c.V;
-        if (rx == 1 && ry == 1) return src;
+        if (hOut % hIn != 0 || vOut % vIn != 0) return null;
+        int rx = hOut / hIn, ry = vOut / vIn;
         var dst = new int[w * h];
         if (fancy && rx == 2 && ry == 1 && sw > 2)
         {

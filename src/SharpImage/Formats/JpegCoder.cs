@@ -129,7 +129,11 @@ public static partial class JpegCoder
     public static ImageFrame Read(Stream stream) => Read(stream, DefaultMaxPixels);
 
     /// <summary><see cref="Read(Stream)"/> with a custom pixel limit (width x height).</summary>
-    public static ImageFrame Read(Stream stream, long maxPixels)
+    public static ImageFrame Read(Stream stream, long maxPixels) => Read(stream, new JpegDecodeOptions { MaxPixels = maxPixels });
+
+    /// <summary><see cref="Read(Stream)"/> with djpeg's decompression options: scaled output (-scale), the IDCT
+    /// (-dct / -fast), upsampling (-nosmooth), greyscale output (-grayscale).</summary>
+    public static ImageFrame Read(Stream stream, JpegDecodeOptions options)
     {
         byte[] data;
         using (var ms = new MemoryStream())
@@ -137,7 +141,7 @@ public static partial class JpegCoder
             stream.CopyTo(ms);
             data = ms.ToArray();
         }
-        var frame = ReadLibjpegExact(data, maxPixels);
+        var frame = ReadLibjpegExact(data, options);
 
         byte[]? exifData = null, iptcData = null;
         List<byte[]>? iccChunks = null, extendedXmp = null;
@@ -151,146 +155,6 @@ public static partial class JpegCoder
         }
         AttachMetadata(frame, exifData, iccChunks, iptcData, xmpData, extendedXmp);
         return frame;
-    }
-
-    // The general decoder (float IDCT, simple upsampling): CMYK / YCCK and layouts the libjpeg-exact path skips.
-    private static ImageFrame ReadGeneral(Stream stream)
-    {
-        // Verify SOI marker
-        if (stream.ReadByte() != 0xFF || stream.ReadByte() != SOI)
-        {
-            throw new InvalidDataException("Not a valid JPEG file (missing SOI marker).");
-        }
-
-        // Image parameters (filled from markers)
-        int width = 0, height = 0;
-        int componentCount = 0;
-        int restartInterval = 0;
-        bool isProgressive = false;
-
-        // Component info
-        var components = new JpegComponent[MaxComponents];
-        int maxHSample = 1, maxVSample = 1;
-
-        // Quantization tables (up to 4)
-        var quantTables = new int[4][];
-
-        // Huffman tables (DC and AC, up to 4 each)
-        var dcTables = new HuffmanTable[4];
-        var acTables = new HuffmanTable[4];
-
-        // For progressive: blocks are allocated once and filled by multiple scans
-        bool blocksAllocated = false;
-        int mcuCols = 0, mcuRows = 0;
-
-        // Metadata segments collected during marker parsing
-        byte[]? exifData = null;
-        List<byte[]>? iccChunks = null;
-        byte[]? iptcData = null;
-        string? xmpData = null;
-        List<byte[]>? extendedXmp = null;
-
-        // Parse all markers
-        while (true)
-        {
-            int marker = ReadMarker(stream);
-            if (marker < 0 || marker == EOI)
-            {
-                break;
-            }
-
-            switch (marker)
-            {
-                case SOF0: // Baseline DCT
-                case SOF1: // Extended sequential DCT (e.g. 16-bit quantisation tables)
-                    ReadSof(stream, ref width, ref height, ref componentCount, components,
-                        ref maxHSample, ref maxVSample);
-                    break;
-
-                case SOF2: // Progressive DCT
-                    isProgressive = true;
-                    ReadSof(stream, ref width, ref height, ref componentCount, components,
-                        ref maxHSample, ref maxVSample);
-                    break;
-
-                case DHT:
-                    ReadDht(stream, dcTables, acTables);
-                    break;
-
-                case DQT:
-                    ReadDqt(stream, quantTables);
-                    break;
-
-                case DRI:
-                    ReadDri(stream, ref restartInterval);
-                    break;
-
-                case SOS:
-                    if (!isProgressive)
-                    {
-                        // Baseline: single scan, return immediately
-                        ReadSosHeader(stream, components, componentCount);
-                        var frame = DecodeScanData(stream, width, height, componentCount, components,
-                            quantTables, dcTables, acTables, maxHSample, maxVSample, restartInterval);
-                        AttachMetadata(frame, exifData, iccChunks, iptcData, xmpData, extendedXmp);
-                        return frame;
-                    }
-
-                    // Progressive: allocate blocks once, then decode each scan
-                    if (!blocksAllocated)
-                    {
-                        int mcuWidth = maxHSample * BlockSize;
-                        int mcuHeight = maxVSample * BlockSize;
-                        mcuCols = (width + mcuWidth - 1) / mcuWidth;
-                        mcuRows = (height + mcuHeight - 1) / mcuHeight;
-
-                        for (int c = 0; c < componentCount; c++)
-                        {
-                            int blocksH = mcuCols * components[c].HSample;
-                            int blocksV = mcuRows * components[c].VSample;
-                            components[c].Blocks = new int[blocksV * blocksH][];
-                            for (int i = 0; i < components[c].Blocks.Length; i++)
-                            {
-                                components[c].Blocks[i] = new int[64];
-                            }
-                        }
-                        blocksAllocated = true;
-                    }
-
-                    var scanInfo = ReadSosHeaderProgressive(stream, components, componentCount);
-                    DecodeProgressiveScan(stream, componentCount, components,
-                        dcTables, acTables, mcuCols, mcuRows,
-                        maxHSample, maxVSample, restartInterval, scanInfo, width, height);
-                    break;
-
-                default:
-                    // Capture metadata from APP markers before skipping
-                    ReadOrSkipAppMarker(stream, marker, ref exifData, ref iccChunks, ref iptcData, ref xmpData, ref extendedXmp);
-                    break;
-            }
-        }
-
-        if (isProgressive && blocksAllocated)
-        {
-            // All scans decoded — dequantize, IDCT, and convert to pixels
-            for (int c = 0; c < componentCount; c++)
-            {
-                var qt = quantTables[components[c].QuantTableIndex];
-                foreach (var block in components[c].Blocks)
-                {
-                    for (int i = 0; i < 64; i++)
-                    {
-                        block[i] *= qt[i];
-                    }
-                    Dct.InverseDct(block);
-                }
-            }
-            var progFrame = BlocksToImage(width, height, componentCount, components, maxHSample, maxVSample, mcuCols);
-            AttachMetadata(progFrame, exifData, iccChunks, iptcData, xmpData, extendedXmp);
-            return progFrame;
-        }
-
-        throw new InvalidDataException("JPEG missing SOS marker.");
     }
 
     /// <summary>

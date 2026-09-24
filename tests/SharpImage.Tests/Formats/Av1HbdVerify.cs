@@ -1762,6 +1762,53 @@ public sealed class Av1HbdVerify
                             log.AppendLine($"{Path.GetFileName(f)} {Av1Conformance.CheckVector(f)}");
                     continue;
                 }
+                if (t[0] == "djpeg")
+                {
+                    // djpeg <in.jpg> <out.ppm> [-scale M/N] [-dct int|fast|float] [-nosmooth] [-fast] [-grayscale]: JpegCoder.Read
+                    // with djpeg's options, written as a P6 at the file's precision (compare with djpeg -pnm)
+                    int sn = 1, sd = 1; var dm = JpegDctMethod.IntegerSlow; bool fancy = true, grey = false;
+                    for (int k = 3; k < t.Length; k++)
+                    {
+                        switch (t[k].TrimStart('-'))
+                        {
+                            case "scale": { var mn = t[++k].Split('/'); sn = int.Parse(mn[0]); sd = int.Parse(mn[1]); break; }
+                            case "dct": dm = t[++k] switch { "fast" => JpegDctMethod.IntegerFast, "float" => JpegDctMethod.Float, _ => JpegDctMethod.IntegerSlow }; break;
+                            case "nosmooth": fancy = false; break;
+                            case "fast": fancy = false; dm = JpegDctMethod.IntegerFast; break;
+                            case "grayscale": grey = true; break;
+                            default: throw new ArgumentException(t[k]);
+                        }
+                    }
+                    byte[] jb = File.ReadAllBytes(t[1]);
+                    int prec = 8;
+                    for (int k = 2; k + 4 < jb.Length; k++)
+                        if (jb[k] == 0xFF && jb[k + 1] is >= 0xC0 and <= 0xCF and not 0xC4 and not 0xC8 and not 0xCC) { prec = jb[k + 4]; break; }
+                    var img = JpegCoder.Read(new MemoryStream(jb), new JpegDecodeOptions { ScaleNumerator = sn, ScaleDenominator = sd, Dct = dm, FancyUpsampling = fancy, Grayscale = grey });
+                    int mx = (1 << prec) - 1, dw = (int)img.Columns, dh = (int)img.Rows;
+                    using (var fo = File.Create(t[2]))
+                    {
+                        var hdr = System.Text.Encoding.ASCII.GetBytes($"P6\n{dw} {dh}\n{mx}\n");
+                        fo.Write(hdr);
+                        var buf = new byte[dw * 3 * (mx > 255 ? 2 : 1)];
+                        for (int y = 0; y < dh; y++)
+                        {
+                            var row = img.GetPixelRow(y);
+                            int bi = 0;
+                            for (int x = 0; x < dw; x++)
+                                for (int ch = 0; ch < 3; ch++)
+                                {
+                                    int s16 = row[x * img.NumberOfChannels + ch];
+                                    int v = (int)(((long)s16 * mx + 32767) / 65535);
+                                    if ((ushort)(((long)v * 65535 + mx / 2) / mx) != s16) throw new InvalidOperationException("sample scaling not invertible");
+                                    if (mx > 255) buf[bi++] = (byte)(v >> 8);
+                                    buf[bi++] = (byte)v;
+                                }
+                            fo.Write(buf);
+                        }
+                    }
+                    log.AppendLine($"djpeg {Path.GetFileName(t[2])} {dw}x{dh}");
+                    continue;
+                }
                 if (t[0] == "cmykjpeg")
                 {
                     // cmykjpeg <in.raw> <w> <h> <out.jpg> <cmyk|ycck> <quality> <hs> <vs> <arith> <prog> <prec>: the jx/cmykenc
