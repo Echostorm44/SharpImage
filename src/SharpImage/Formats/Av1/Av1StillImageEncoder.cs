@@ -58,6 +58,9 @@ internal sealed class Av1EncodeSpeed
     /// <summary>Deblocking level / CDEF strength taken straight from the quantiser guess, without decode-based search
     /// (libaom LPF_PICK_FROM_Q).</summary>
     public bool FilterPickFromQ;
+    /// <summary>One joint round of deblocking x CDEF candidates (no/guess level x no/heuristic strength) instead of
+    /// the level search followed by the CDEF search.</summary>
+    public bool FilterSearchFast;
 
     public Av1EncodeSpeed Clone() => (Av1EncodeSpeed)MemberwiseClone();
 
@@ -74,7 +77,7 @@ internal sealed class Av1EncodeSpeed
         if (speed >= 4) p.LrSgrSets = 8;
         if (speed >= 5) { p.RdUvCandidates = 1; p.UseFullIntraTxSet = false; }
         if (speed >= 6) { p.UseTrueRd = false; p.UseRd = false; p.UseSub8Partition = true; p.EarlyTermBits = 8; }
-        if (speed >= 6) { p.LrSgrSets = 2; p.LrUnitShiftMask = 4; p.LrWienerRounds = 2; p.LrVerify = false; p.LrStatsStep = 2; }
+        if (speed >= 6) { p.LrSgrSets = 2; p.LrUnitShiftMask = 4; p.LrWienerRounds = 2; p.LrVerify = false; p.LrStatsStep = 2; p.FilterSearchFast = true; }
         // 7-10 (measured on the speed corpus vs libaom's ladder, BD vs libaom speed 0 / fox 1204x800 1-thread time):
         // 7 +20.1% 0.30 s (aom s7 +22.3%), 8 +24.1% 0.22 s (aom s8 +26.5% 0.25 s), 9 +30.7% 0.20 s,
         // 10 +33.6% 0.18 s (aom s9/s10 +54.6%, 0.11 s).
@@ -655,17 +658,94 @@ internal static class Av1StillImageEncoder
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false, enableFilterIntra: UseFilterIntra, bitDepth: bitDepth, layout: layout, color: color);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
 
-        // In-loop filter search (deblock first, then CDEF with the chosen level; see BuildMonochromeObus).
+        // In-loop filter search (deblocking + CDEF); its winning decode feeds the loop-restoration search.
         ushort[] srcY = luma.ToArray(), srcU = u.ToArray(), srcV = v.ToArray();
-        int lfLevel = SearchDeblock(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
-            monochrome: false, srcY, srcU, srcV, cwIn, chIn);
-        Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
-            monochrome: false, srcY, srcU, srcV, cwIn, chIn, lfLevel);
+        var (lfLevel, best, pic) = SearchColorFilters(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
+            srcY, srcU, srcV, cwIn, chIn, keepPicture: logs != null);
         byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: false, tile, best, lfLevel);
         if (logs != null && TryLoopRestoration(seqCfg, seqObu, frameObu, logs, sbCols, sbRows, width, height, layout, monochrome: false,
-                srcY, srcU, srcV, cwIn, chIn, baseQIdx, best, lfLevel) is { } withLr)
+                srcY, srcU, srcV, cwIn, chIn, baseQIdx, best, lfLevel, pic) is { } withLr)
             return withLr;
         return (seqObu, frameObu);
+    }
+
+    /// <summary>A decoded (grain-free) frame: its SSE vs the source and, when kept, the native-depth planes.</summary>
+    private sealed class DecodedPicture
+    {
+        public long Sse;
+        public ushort[][]? Planes;
+        public int[]? Strides;
+    }
+
+    private static DecodedPicture? DecodePicture(byte[] seqObu, byte[] frameObu, ushort[] srcY, ushort[]? srcU, ushort[]? srcV,
+        int width, int height, int cw, int ch, bool monochrome, bool keep, int threads = 1)
+    {
+        using var yuv = new Av1Decoder { ApplyFilmGrain = false, MaxThreads = threads }.Decode([.. seqObu, .. frameObu], 0, isKeyframe: true);
+        if (yuv == null) return null;
+        var d = new DecodedPicture { Sse = DecodedSse(yuv, srcY, srcU, srcV, width, height, cw, ch, monochrome) };
+        if (!keep) return d;
+        ushort[] Plane(int p, int stride, int ph)
+        {
+            var a = new ushort[stride * ph];
+            if (yuv.BitDepth > 8) (p == 0 ? yuv.YPlane16 : p == 1 ? yuv.UPlane16 : yuv.VPlane16).Span[..a.Length].CopyTo(a);
+            else { var b = (p == 0 ? yuv.YPlane : p == 1 ? yuv.UPlane : yuv.VPlane).Span; for (int i = 0; i < a.Length; i++) a[i] = b[i]; }
+            return a;
+        }
+        d.Strides = monochrome ? [yuv.YStride] : [yuv.YStride, yuv.UStride, yuv.VStride];
+        d.Planes = monochrome ? [Plane(0, yuv.YStride, height)] : [Plane(0, yuv.YStride, height), Plane(1, yuv.UStride, ch), Plane(2, yuv.VStride, ch)];
+        return d;
+    }
+
+    /// <summary>Colour-path deblocking level + CDEF strength: the full search (levels, then CDEF at the chosen level),
+    /// or with FilterSearchFast one concurrent round of {no, q-guess level} x {no, heuristic CDEF}; FilterPickFromQ takes
+    /// the guesses without decoding. Every search keeps the no-filter option, so it never loses to it. Returns the
+    /// winner's decode (planes kept when asked) for the loop-restoration stage, or null when nothing was decoded.</summary>
+    private static (int Lf, Av1ObuWriter.CdefParams Cdef, DecodedPicture? Pic) SearchColorFilters(byte[] seqObu, byte[] tile,
+        int baseQIdx, int sbCols, int sbRows, int width, int height, ushort[] srcY, ushort[] srcU, ushort[] srcV, int cw, int ch,
+        bool keepPicture)
+    {
+        bool sizeOk = (long)width * height <= FilterSearchMaxPixels;
+        bool dbOn = UseDeblockSearch && sizeOk, cdOn = UseCdefSearch && baseQIdx >= 64 && sizeOk;
+        int guess = Math.Clamp(baseQIdx / 8, 1, 40);
+        int damping = Math.Clamp(3 + (baseQIdx >> 6), 3, 6);
+        int yLvl = (Math.Clamp(baseQIdx / 16, 1, 12) << 2) | (baseQIdx >= 128 ? 2 : 1);
+        int uvLvl = (Math.Clamp(baseQIdx / 24, 1, 8) << 2) | (baseQIdx >= 160 ? 1 : 0);
+        var heur = new Av1ObuWriter.CdefParams(damping, 0, new[] { (byte)yLvl }, new[] { (byte)uvLvl });
+        var none = Av1ObuWriter.CdefParams.None;
+        if (FilterPickFromQ) return (dbOn ? guess : 0, cdOn ? heur : none, null);
+        if (!dbOn && !cdOn) return (0, none, null);
+
+        (int, Av1ObuWriter.CdefParams, DecodedPicture?) Best(List<(int Lf, Av1ObuWriter.CdefParams Cdef)> cands, bool keep)
+        {
+            var pics = new DecodedPicture?[cands.Count];
+            EvaluateAll(cands.Count, i =>
+            {
+                pics[i] = DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, false, tile, cands[i].Cdef, cands[i].Lf),
+                    srcY, srcU, srcV, width, height, cw, ch, false, keep, Math.Max(1, ThreadCount / cands.Count));
+                return pics[i]?.Sse ?? long.MaxValue;
+            });
+            int bi = 0;
+            for (int i = 1; i < cands.Count; i++) if ((pics[i]?.Sse ?? long.MaxValue) < (pics[bi]?.Sse ?? long.MaxValue)) bi = i;
+            return (cands[bi].Lf, cands[bi].Cdef, pics[bi]);
+        }
+
+        if (FilterSearchFast)
+        {
+            var c = new List<(int, Av1ObuWriter.CdefParams)> { (0, none) };
+            if (dbOn) c.Add((guess, none));
+            if (cdOn) { c.Add((0, heur)); if (dbOn) c.Add((guess, heur)); }
+            return Best(c, keepPicture);
+        }
+        int lf = 0;
+        if (dbOn)
+        {
+            var levels = new List<(int, Av1ObuWriter.CdefParams)> { (0, none) };
+            foreach (int lvl in new[] { guess / 2, guess, Math.Min(guess * 3 / 2, 63) }) if (lvl > 0) levels.Add((lvl, none));
+            var (l, _, p0) = Best(levels, keepPicture && !cdOn);
+            lf = l;
+            if (!cdOn) return (lf, none, p0);
+        }
+        return Best([(lf, none), (lf, heur)], keepPicture);
     }
 
     /// <summary>Loop-restoration stage: decodes the filtered (deblock + CDEF) frame, searches Wiener / self-guided
@@ -674,28 +754,18 @@ internal static class Av1StillImageEncoder
     /// SSE + λ·bits.</summary>
     private static (byte[] SeqObu, byte[] FrameObu)? TryLoopRestoration(in Av1ObuWriter.SeqConfig seqCfg, byte[] seqObu, byte[] frameObu,
         List<Av1MsacWriter.LogOp>[] logs, int sbCols, int sbRows, int width, int height, Av1PixelLayout layout, bool monochrome,
-        ushort[] srcY, ushort[]? srcU, ushort[]? srcV, int cw, int ch, int baseQIdx, Av1ObuWriter.CdefParams cdef, int lfLevel)
+        ushort[] srcY, ushort[]? srcU, ushort[]? srcV, int cw, int ch, int baseQIdx, Av1ObuWriter.CdefParams cdef, int lfLevel,
+        DecodedPicture? pic = null)
     {
         int acDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1];
         double lambda = RdLambdaK * acDq * acDq;
         bool i420 = layout == Av1PixelLayout.I420;
         int ssX = layout == Av1PixelLayout.I444 ? 0 : 1, ssY = i420 ? 1 : 0;
 
-        ushort[][] rec; int[] recStrides; long sseNoLr;
-        using (var yuv = new Av1Decoder { ApplyFilmGrain = false, MaxThreads = ThreadCount }.Decode([.. seqObu, .. frameObu], 0, isKeyframe: true))
-        {
-            if (yuv == null) return null;
-            sseNoLr = DecodedSse(yuv, srcY, srcU, srcV, width, height, cw, ch, monochrome);
-            ushort[] Plane(int p, int stride, int ph)
-            {
-                var a = new ushort[stride * ph];
-                if (yuv.BitDepth > 8) (p == 0 ? yuv.YPlane16 : p == 1 ? yuv.UPlane16 : yuv.VPlane16).Span[..a.Length].CopyTo(a);
-                else { var b = (p == 0 ? yuv.YPlane : p == 1 ? yuv.UPlane : yuv.VPlane).Span; for (int i = 0; i < a.Length; i++) a[i] = b[i]; }
-                return a;
-            }
-            recStrides = monochrome ? [yuv.YStride] : [yuv.YStride, yuv.UStride, yuv.VStride];
-            rec = monochrome ? [Plane(0, yuv.YStride, height)] : [Plane(0, yuv.YStride, height), Plane(1, yuv.UStride, ch), Plane(2, yuv.VStride, ch)];
-        }
+        if (pic?.Planes == null)
+            pic = DecodePicture(seqObu, frameObu, srcY, srcU, srcV, width, height, cw, ch, monochrome, keep: true, ThreadCount);
+        if (pic?.Planes == null) return null;
+        ushort[][] rec = pic.Planes; int[] recStrides = pic.Strides!; long sseNoLr = pic.Sse;
         ushort[][] src = monochrome ? [srcY] : [srcY, srcU!, srcV!];
         var plan = Av1LrEncoder.Search(src, rec, [width, cw, cw], [height, ch, ch], [width, cw, cw], recStrides,
             monochrome, i420, Bd, lambda, LrSgrSets, LrWienerRounds, LrStatsStep, ThreadCount,
@@ -3380,6 +3450,7 @@ internal static class Av1StillImageEncoder
     internal static int LrStatsStep { get => Sp.LrStatsStep; set => Sp.LrStatsStep = value; }
     internal static long FilterSearchMaxPixels { get => Sp.FilterSearchMaxPixels; set => Sp.FilterSearchMaxPixels = value; }
     internal static bool FilterPickFromQ { get => Sp.FilterPickFromQ; set => Sp.FilterPickFromQ = value; }
+    internal static bool FilterSearchFast { get => Sp.FilterSearchFast; set => Sp.FilterSearchFast = value; }
     internal static int AngleDeltaSet { get => Sp.AngleDeltaSet; set => Sp.SetAngleDeltas(value); }
 
     // Dev/conformance isolation: when set, only luma intra candidates passing the filter are considered (square,
