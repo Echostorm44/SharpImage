@@ -139,6 +139,9 @@ public sealed class Av1ReferenceFrame
     public Av1RefMvsTemporalBlock[]? TemporalMvs;
     public byte[] RefPoc = new byte[7];
 
+    /// <summary>The frame's loop filter mode / reference deltas (inherited through primary_ref_frame).</summary>
+    public Av1LoopfilterModeRefDeltas LfModeRefDeltas;
+
     /// <summary>An independent copy (planes, CDFs, order hints, global motion); the segment map and motion field
     /// are shared (never written after the frame that produced them).</summary>
     public Av1ReferenceFrame DeepCopy()

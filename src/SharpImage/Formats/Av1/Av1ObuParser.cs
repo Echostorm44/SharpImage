@@ -885,10 +885,8 @@ public static class Av1ObuParser
         }
         else
         {
-            // Copy from primary reference frame's loop filter deltas
-            // In a full decoder, we'd copy from the stored frame header.
-            // For now, use defaults as fallback.
-            hdr.LfModeRefDeltas = DefaultModeRefDeltas;
+            // dav1d: the primary reference frame's (stored) loop filter deltas, then this frame's updates.
+            hdr.LfModeRefDeltas = refFrames[hdr.GetRefIdx(hdr.PrimaryRefFrame)].LfModeRefDeltas;
         }
 
         hdr.LfModeRefDeltaEnabled = gb.GetBool();

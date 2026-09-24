@@ -2125,6 +2125,7 @@ internal sealed class Av1Decoder
         if (string.IsNullOrEmpty(path)) return;
         int w = frameHdr.SuperResUpscaledWidth, h = frameHdr.Height;
         int ssHor = ctx.PixelLayout != Av1PixelLayout.I444 ? 1 : 0, ssVer = ctx.PixelLayout == Av1PixelLayout.I420 ? 1 : 0;
+        File.AppendAllText(path + ".info", $"D {w} {h} {ctx.BitDepth} {(ctx.CurrentPlanes[1] == null ? 1 : 0)} {ssHor} {ssVer} show{(frameHdr.ShowFrame ? 1 : 0)}\n");
         using var fs = new FileStream(path, FileMode.Append);
         using var bw = new BinaryWriter(fs);
         for (int p = 0; p < 3; p++)
@@ -2158,6 +2159,7 @@ internal sealed class Av1Decoder
                 refFrame.FilmGrainPresent = fh.FilmGrainPresent;
                 refFrame.SegmentMap = ctx.CurSegMap;
                 refFrame.SegmentationData = fh.SegmentationData;
+                refFrame.LfModeRefDeltas = fh.LfModeRefDeltas;
                 Array.Copy(fh.Gmv, refFrame.Gmv, refFrame.Gmv.Length);
                 refFrame.Valid = true;
 
@@ -2219,6 +2221,8 @@ internal sealed class Av1Decoder
 
         if (!refFrame.Valid || refFrame.Planes[0] == null)
             return null;
+        if (Environment.GetEnvironmentVariable("AV1_DUMPALL") is { Length: > 0 } dumpPath)
+            File.AppendAllText(dumpPath + ".info", $"E {refFrame.Width} {refFrame.Height}\n");
 
         // Showing an existing key frame refreshes all reference slots. The type is the stored frame's (dav1d
         // refs[existing_frame_idx].frame_type): a show_existing_frame header carries none.
@@ -2239,6 +2243,7 @@ internal sealed class Av1Decoder
                 dst.FilmGrainPresent = refFrame.FilmGrainPresent;
                 dst.SegmentMap = refFrame.SegmentMap;
                 dst.SegmentationData = refFrame.SegmentationData;
+                dst.LfModeRefDeltas = refFrame.LfModeRefDeltas;
                 Array.Copy(refFrame.Gmv, dst.Gmv, dst.Gmv.Length);
                 dst.TemporalMvs = null;   // dav1d drops the other slots' refmvs
                 dst.Valid = true;

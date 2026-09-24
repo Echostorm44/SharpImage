@@ -1459,7 +1459,7 @@ public static class Av1CoeffDecode
         if (palSize <= 1)
         {
             byte[] dst = isLuma ? t.PalIdxY : t.PalIdxUv;
-            for (int i = 0; i < width * height; i++) dst[i] = 0;
+            Array.Clear(dst, 0, Math.Min(dst.Length, blockWidth4 * 4 * blockHeight4 * 4));
             return;
         }
 
@@ -1582,6 +1582,13 @@ public static class Av1CoeffDecode
             }
         }
         
+        // dav1d pal_idx_finish: the part of the index map past the visible area repeats the last visible column /
+        // row, so prediction (and CfL, which averages the whole block's luma) sees defined samples there.
+        for (int y = 0; y < height; y++)
+            for (int x = width; x < stride; x++) palTmp[y * stride + x] = palTmp[y * stride + width - 1];
+        for (int y = height; y < blockHeight4 * 4; y++)
+            Array.Copy(palTmp, (height - 1) * stride, palTmp, y * stride, stride);
+
         // Compare with DLL results
         if (dllPalIdx != null)
         {

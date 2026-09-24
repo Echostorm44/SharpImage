@@ -121,7 +121,8 @@ public static class Av1InvTransform
 
         // Clip ranges per AV1 spec (matches dav1d itx_tmpl.c)
         int rowClipMin = (int)((uint)~pixelMax << 7);
-        int colClipMin = (int)((uint)~pixelMax << 5);
+        // Column input: Max(BitDepth + 6, 16) bits (spec 7.13.3; dav1d uses INT16 at 8 bits), not BitDepth + 6.
+        int colClipMin = pixelMax == 255 ? short.MinValue : (int)((uint)~pixelMax << 5);
         int rowClipMax = ~rowClipMin;
         int colClipMax = ~colClipMin;
 
@@ -225,7 +226,8 @@ public static class Av1InvTransform
         int pixelMax = (1 << bitDepth) - 1;
 
         int rowClipMin = (int)((uint)~pixelMax << 7);
-        int colClipMin = (int)((uint)~pixelMax << 5);
+        // Column input: Max(BitDepth + 6, 16) bits (spec 7.13.3; dav1d uses INT16 at 8 bits), not BitDepth + 6.
+        int colClipMin = pixelMax == 255 ? short.MinValue : (int)((uint)~pixelMax << 5);
         int rowClipMax = ~rowClipMin;
         int colClipMax = ~colClipMin;
 

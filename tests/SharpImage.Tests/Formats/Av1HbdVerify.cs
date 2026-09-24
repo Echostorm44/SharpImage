@@ -1623,6 +1623,72 @@ public sealed class Av1HbdVerify
                     }
                     continue;
                 }
+                if (t[0] == "argontrace")
+                {
+                    // argontrace <stream.obu> <annexb 0|1> <trace.txt>: our per-block trace (dav1d_trace format).
+                    using var tw = new StreamWriter(t[3]);
+                    Av1Decode.BlockTrace = tw;
+                    try { Av1Conformance.DumpArgon(t[1], t[2] == "1", t[3] + ".yuv", t[3] + ".info"); }
+                    finally { Av1Decode.BlockTrace = null; }
+                    continue;
+                }
+                if (t[0] == "argonhdr")
+                {
+                    // argonhdr <stream.obu> <annexb 0|1> <out.txt>: the scalar fields of every decoded frame header.
+                    var tus = Av1Conformance.ReadObuFile(File.ReadAllBytes(t[1]), t[2] == "1");
+                    var dec = new Av1Decoder();
+                    var sbh = new System.Text.StringBuilder();
+                    for (int i = 0; i < tus.Count; i++)
+                    {
+                        try { foreach (var (f, _) in dec.DecodeTemporalUnit(tus[i], i)) f.Dispose(); }
+                        catch (Exception e) { sbh.AppendLine("EXCEPTION " + e.Message); break; }
+                        var fh = dec.CurrentFrameHeader;
+                        sbh.Append($"tu{i}:");
+                        foreach (var fld in fh.GetType().GetFields())
+                        {
+                            var v = fld.GetValue(fh);
+                            if (v is int or bool or byte or sbyte or short or ushort or Enum) sbh.Append($" {fld.Name}={v}");
+                        }
+                        sbh.AppendLine();
+                    }
+                    File.WriteAllText(t[3], sbh.ToString());
+                    continue;
+                }
+                if (t[0] == "argondump")
+                {
+                    // argondump <stream.obu> <annexb 0|1> <out.yuv> <out.info>
+                    Av1Conformance.DumpArgon(t[1], t[2] == "1", t[3], t[4]);
+                    continue;
+                }
+                if (t[0] == "argon")
+                {
+                    // argon <argonDir> <out.txt> [subdir filter] [name filter]: every stream of the default
+                    // dav1d_argon.bash set, decoded in parallel, one "subdir/name result" line each (appended as they finish).
+                    string[] dirs = ["profile0_core", "profile0_core_special", "profile0_not_annexb", "profile0_not_annexb_special",
+                        "profile1_core", "profile1_core_special", "profile1_not_annexb", "profile1_not_annexb_special",
+                        "profile2_core", "profile2_core_special", "profile2_not_annexb", "profile2_not_annexb_special", "profile_switching"];
+                    var jobs = new List<(string Dir, string File)>();
+                    foreach (var dn in dirs)
+                    {
+                        if (t.Length > 3 && t[3] != "-" && !dn.Contains(t[3])) continue;
+                        string sd = Path.Combine(t[1], dn, "streams");
+                        if (!Directory.Exists(sd)) continue;
+                        foreach (var f in Directory.GetFiles(sd, "*.obu").Order())
+                            if (t.Length < 5 || Path.GetFileName(f).Contains(t[4])) jobs.Add((dn, f));
+                    }
+                    var outLock = new object();
+                    using var outW = new StreamWriter(t[2]) { AutoFlush = true };
+                    System.Threading.Tasks.Parallel.ForEach(jobs, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, job =>
+                    {
+                        string md5 = Path.Combine(t[1], job.Dir, "md5_ref", Path.GetFileNameWithoutExtension(job.File) + ".md5");
+                        string r;
+                        try { r = Av1Conformance.CheckArgon(job.File, md5, !job.Dir.Contains("not_annexb")); }
+                        catch (Exception e) { r = "HARNESS " + e.GetType().Name + " " + e.Message.Split('\n')[0]; }
+                        lock (outLock) outW.WriteLine($"{job.Dir}/{Path.GetFileName(job.File)} {r}");
+                    });
+                    log.AppendLine($"argon {jobs.Count} streams");
+                    continue;
+                }
                 if (t[0] == "av1vec")
                 {
                     // av1vec <dir> [filter]: every .ivf / .mkv test vector against its libaom .md5 (per frame).
