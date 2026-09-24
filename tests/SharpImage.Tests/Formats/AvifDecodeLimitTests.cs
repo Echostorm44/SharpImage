@@ -23,6 +23,20 @@ public sealed class AvifDecodeLimitTests
     }
 
     [Test]
+    public async Task Strict_RequiresPixiLikeLibavif()
+    {
+        // avifdec (strict by default) rejects an AV1 item without 'pixi'; --no-strict (our default) decodes it.
+        byte[] data = Asset("libavif_10bit_420_alpha.avif");
+        int at = data.AsSpan().IndexOf("pixi"u8);
+        await Assert.That(at).IsGreaterThan(0);
+        var noPixi = (byte[])data.Clone();
+        "zzzz"u8.CopyTo(noPixi.AsSpan(at));   // an unknown, non-essential property instead
+        using (var lenient = HeifCoder.Decode(noPixi)) await Assert.That(lenient.Columns).IsGreaterThan(0u);
+        await Assert.That(() => HeifCoder.Decode(noPixi, new AvifDecodeOptions { Strict = true })).Throws<InvalidDataException>();
+        using (var ok = HeifCoder.Decode(data, new AvifDecodeOptions { Strict = true })) await Assert.That(ok.Columns).IsGreaterThan(0u);
+    }
+
+    [Test]
     public async Task ImageSizeLimit_RejectsLargerImages()
     {
         byte[] data = Asset("libavif_10bit_420_alpha.avif");

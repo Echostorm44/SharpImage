@@ -12,6 +12,13 @@ public sealed class AvifDecodeOptions
     /// and Nearest nearest-neighbour chroma. Matches avifdec -u for every mode.</summary>
     public AvifChromaUpsampling ChromaUpsampling { get; init; }
 
+    /// <summary>libavif's strict validation (avifdec without --no-strict: AVIF_STRICT_PIXI_REQUIRED,
+    /// AVIF_STRICT_CLAP_VALID, AVIF_STRICT_ALPHA_ISPE_REQUIRED): every AV1 item needs a 'pixi' property, an alpha item
+    /// its 'ispe', and a 'clap' must describe a valid crop — else <see cref="System.IO.InvalidDataException"/>.
+    /// Off by default (lenient, as avifdec --no-strict: a missing pixi / alpha ispe is tolerated, an invalid clap
+    /// ignored).</summary>
+    public bool Strict { get; init; }
+
     /// <summary>libavif AVIF_DEFAULT_IMAGE_SIZE_LIMIT: 16384 x 16384 pixels.</summary>
     public const long DefaultImageSizeLimit = 16384L * 16384;
 

@@ -2045,6 +2045,7 @@ public sealed class Av1HbdVerify
                     // optional 5th token: chroma upsampling (automatic / fastest / best / nearest / bilinear, as avifdec -u)
                     var dopt = new AvifDecodeOptions
                     {
+                        Strict = t.Length > 5 && t[5] == "strict",   // optional 6th token
                         ChromaUpsampling = (t.Length > 4 ? t[4] : "") switch
                         {
                             "fastest" => AvifChromaUpsampling.Fastest, "best" => AvifChromaUpsampling.BestQuality,

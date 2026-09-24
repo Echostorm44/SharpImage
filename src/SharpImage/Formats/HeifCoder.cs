@@ -400,11 +400,15 @@ public static partial class HeifCoder
         {
             if (item.Type is not ("av01" or "grid" or "hvc1") || c.ReferencesFrom(item.Id, "thmb").Count > 0) continue;
             if (item.Type != "grid" && item.Extents.Count == 0) continue;
+            if (Limits.Strict && item.Type == "av01" && c.Property(item.Id, "pixi") == null)
+                throw new InvalidDataException($"[Strict] Item ID [{item.Id}] of type 'av01' is missing mandatory pixi property.");
             if (c.Property(item.Id, "ispe") is not { Len: >= 12 } p)
             {
                 // Alpha may lack 'ispe' (libavif without AVIF_STRICT_ALPHA_ISPE_REQUIRED: the decoded size is used).
-                if (IsAlphaAux(c, item.Id)) continue;
-                throw new InvalidDataException($"Item ID [{item.Id}] is missing a mandatory ispe property.");
+                if (IsAlphaAux(c, item.Id) && !Limits.Strict) continue;
+                throw new InvalidDataException(IsAlphaAux(c, item.Id)
+                    ? $"[Strict] Alpha auxiliary image item ID [{item.Id}] is missing a mandatory ispe property."
+                    : $"Item ID [{item.Id}] is missing a mandatory ispe property.");
             }
             long w = BinaryPrimitives.ReadUInt32BigEndian(c.Data.AsSpan(p.Off + 4)), h = BinaryPrimitives.ReadUInt32BigEndian(c.Data.AsSpan(p.Off + 8));
             if (w == 0 || h == 0) throw new InvalidDataException($"Item ID [{item.Id}] has an invalid size [{w}x{h}].");
@@ -711,6 +715,8 @@ public static partial class HeifCoder
         {
             clap = new uint[8];
             for (int k = 0; k < 8; k++) clap[k] = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(cp.Off + 4 * k));
+            if (Limits.Strict && CropRectFromCleanAperture(clap, (int)frame.Columns, (int)frame.Rows) == null)
+                throw new InvalidDataException("[Strict] clap property is invalid.");
         }
         int? irot = c.Property(pid, "irot") is { Len: >= 1 } ir ? data[ir.Off] & 3 : null;
         int? imir = c.Property(pid, "imir") is { Len: >= 1 } im ? data[im.Off] & 1 : null;
