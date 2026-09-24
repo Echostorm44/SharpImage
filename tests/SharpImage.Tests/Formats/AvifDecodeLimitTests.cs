@@ -1,0 +1,43 @@
+using System;
+using System.IO;
+using SharpImage.Formats;
+
+namespace SharpImage.Tests.Formats;
+
+// Decode limits with libavif's semantics (avifdec --size-limit / --dimension-limit, imageCountLimit): a file over a
+// limit fails with InvalidDataException before its images are decoded; the options validate like libavif's.
+public sealed class AvifDecodeLimitTests
+{
+    private static byte[] Asset(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "TestAssets", "avif_conformance", name));
+
+    [Test]
+    public async Task ImageSizeLimit_RejectsLargerImages()
+    {
+        byte[] data = Asset("libavif_10bit_420_alpha.avif");
+        var full = HeifCoder.Decode(data);
+        long pixels = full.Columns * full.Rows;
+        await Assert.That(HeifCoder.Decode(data, new AvifDecodeOptions { ImageSizeLimit = pixels }).Columns).IsEqualTo(full.Columns);
+        await Assert.That(() => HeifCoder.Decode(data, new AvifDecodeOptions { ImageSizeLimit = pixels - 1 })).Throws<InvalidDataException>();
+        await Assert.That(() => HeifCoder.Decode(data, new AvifDecodeOptions { ImageDimensionLimit = (int)Math.Max(full.Columns, full.Rows) - 1 }))
+            .Throws<InvalidDataException>();
+    }
+
+    [Test]
+    public async Task ImageCountLimit_RejectsLongerSequences()
+    {
+        byte[] data = Asset("colors-animated-8bpc.avif");   // 5 frames
+        using (var all = HeifCoder.DecodeSequence(data, new AvifDecodeOptions { ImageCountLimit = 5 }))
+            await Assert.That(all.Count).IsEqualTo(5);
+        await Assert.That(() => HeifCoder.DecodeSequence(data, new AvifDecodeOptions { ImageCountLimit = 4 })).Throws<InvalidDataException>();
+    }
+
+    [Test]
+    public async Task Options_ValidateLikeLibavif()
+    {
+        // libavif: an imageSizeLimit of 0 or above AVIF_DEFAULT_IMAGE_SIZE_LIMIT is not supported.
+        await Assert.That(() => new AvifDecodeOptions { ImageSizeLimit = 0 }).Throws<ArgumentOutOfRangeException>();
+        await Assert.That(() => new AvifDecodeOptions { ImageSizeLimit = AvifDecodeOptions.DefaultImageSizeLimit + 1 }).Throws<ArgumentOutOfRangeException>();
+        await Assert.That(() => new AvifDecodeOptions { ImageDimensionLimit = -1 }).Throws<ArgumentOutOfRangeException>();
+        await Assert.That(new AvifDecodeOptions { ImageDimensionLimit = 0, ImageCountLimit = 0 }.ImageDimensionLimit).IsEqualTo(0);
+    }
+}

@@ -1,3 +1,4 @@
+using SharpImage.Compression;
 using SharpImage.Core;
 using SharpImage.Image;
 
@@ -9,8 +10,8 @@ namespace SharpImage.Formats;
 // choice (fancy h2v1 / h1v2 / h2v2, else replication), jdcolor.c's fixed-point YCbCr -> RGB and YCCK -> CMYK, and
 // jdapimin.c's colour-space guess (JFIF / Adobe APP14 / component ids). Output: grey and RGB as sRGB frames, CMYK /
 // YCCK as CMYK frames (Adobe-inverted samples flipped to ink amounts), samples scaled from the file's range to 16 bits.
-// Everything libjpeg-turbo rejects (hierarchical, arithmetic lossless, lossless colour conversion, fractional
-// sampling) returns null.
+// Malformed files fail where libjpeg-turbo fails (InvalidDataException, its error text); what libjpeg-turbo cannot
+// decode (hierarchical, arithmetic lossless, lossless colour conversion, fractional sampling) is NotSupportedException.
 public static partial class JpegCoder
 {
     private sealed class LjComp
@@ -21,6 +22,12 @@ public static partial class JpegCoder
         public int[] Diff = [];        // lossless: AllocW * AllocH differences, then samples
         public int[] Samples = [];     // lossless output samples (WidthInBlocks * HeightInBlocks)
         public int LastDc, DcContext;
+        public int[]? Qt;              // quantization table latched at the component's first scan (jdinput.c)
+        // Progressive status (cinfo->coef_bits): the successive-approximation bit each coefficient is known to, -1 when
+        // never scanned; PrevBits as of the previous scan (for rows an incomplete last scan did not reach).
+        public readonly int[] CurBits = Enumerable.Repeat(-1, 64).ToArray();
+        public readonly int[] PrevBits = new int[64];
+        public readonly int[] NoBits = Enumerable.Repeat(-1, 64).ToArray();
     }
 
     private sealed class LjHuff
@@ -29,10 +36,13 @@ public static partial class JpegCoder
         public readonly int[] ValOffset = new int[18];
         public readonly byte[] Vals = new byte[256];
         public readonly int[] Look = new int[256];   // (length << 8) | value, 0 = not in the lookahead
+        public readonly bool Bad;                     // code lengths do not form a prefix code (JERR_BAD_HUFF_TABLE)
+        public readonly int MaxSymbol;
 
         public LjHuff(ReadOnlySpan<byte> counts, ReadOnlySpan<byte> vals)
         {
             vals.CopyTo(Vals);
+            foreach (byte v in vals) MaxSymbol = Math.Max(MaxSymbol, v);
             Span<int> code = stackalloc int[257];
             Span<byte> size = stackalloc byte[257];
             int p = 0;
@@ -44,6 +54,8 @@ public static partial class JpegCoder
             while (size[p] != 0)
             {
                 while (size[p] == si) code[p++] = c++;
+                // No code may be all ones: the next code must still fit in si bits.
+                if (c >= 1 << si) { Bad = true; return; }
                 c <<= 1;
                 si++;
             }
@@ -70,21 +82,29 @@ public static partial class JpegCoder
     }
 
     // The entropy-coded segment reader shared by the Huffman and arithmetic decoders: stuffed zero bytes removed, a
-    // marker ends the data (zeros are supplied from then on, as libjpeg does).
+    // marker ends the data (zeros are supplied from then on, as libjpeg does). Insufficient mirrors libjpeg's
+    // entropy->insufficient_data: set once a decoder consumes bits past the real data (jdhuff.c jpeg_fill_bit_buffer),
+    // after which the Huffman decoders leave MCUs untouched until a restart marker resynchronises.
     private sealed class LjBits
     {
         private readonly byte[] d;
         public int Pos;
         public int UnreadMarker;
+        public bool Insufficient;
+        public int LastGoodRow;   // cinfo->master->last_good_iMCU_row: iMCU row of the last MCU started with data left
+        private int nextRestartNum;
         private ulong buf;
         private int bits;
+        private int padBits;   // zero bits appended after the data ended (the low end of buf)
 
         public LjBits(byte[] data, int pos) { d = data; Pos = pos; }
 
-        // Next data byte (0xFF00 -> 0xFF), or -1 at a marker (left unread).
+        // Next data byte (0xFF00 -> 0xFF), or -1 at a marker (left unread; the end of the data reads as EOI, as
+        // libjpeg's source manager inserts one).
         public int NextByte()
         {
-            if (UnreadMarker != 0 || Pos >= d.Length) return -1;
+            if (UnreadMarker != 0) return -1;
+            if (Pos >= d.Length) { UnreadMarker = 0xD9; return -1; }
             int b = d[Pos];
             if (b != 0xFF) { Pos++; return b; }
             int q = Pos + 1;
@@ -102,43 +122,83 @@ public static partial class JpegCoder
                 int b = NextByte();
                 buf = (buf << 8) | (uint)(b < 0 ? 0 : b);
                 bits += 8;
+                if (b < 0) padBits += 8;
             }
+        }
+
+        // Consuming n bits; reaching into the padding means the data ran out.
+        private void Consume(int n)
+        {
+            bits -= n;
+            if (bits < padBits) { Insufficient = true; padBits = bits; }
         }
 
         public int GetBits(int n)
         {
             if (n == 0) return 0;
             Fill(n);
-            bits -= n;
+            Consume(n);
             return (int)((buf >> bits) & ((1UL << n) - 1));
         }
 
         public int Peek8() { Fill(8); return (int)((buf >> (bits - 8)) & 0xFF); }
 
-        public void Skip(int n) { bits -= n; }
+        public void Skip(int n) { Consume(n); }
 
         public int Decode(LjHuff h)
         {
             int look = h.Look[Peek8()];
             if (look != 0) { Skip(look >> 8); return look & 0xFF; }
             int code = GetBits(8), l = 8;
-            while (l < 16 && code > h.MaxCode[l]) { code = (code << 1) | GetBits(1); l++; }
-            if (code > h.MaxCode[l]) return 0;   // corrupt: libjpeg returns 0
+            // jdhuff.c jpeg_huff_decode: MaxCode[17] is a sentinel, so a corrupt code consumes 17 bits, then decodes as 0.
+            while (code > h.MaxCode[l]) { code = (code << 1) | GetBits(1); l++; }
+            if (l > 16) return 0;
             return h.Vals[(code + h.ValOffset[l]) & 0xFF];
         }
 
-        // Restart: discard buffered bits, then the RSTn marker.
+        // jdhuff.c process_restart + jdmarker.c read_restart_marker: discard buffered bits, then the RSTn marker; a
+        // wrong or missing marker resynchronises as jpeg_resync_to_restart does. The data-exhausted state clears unless
+        // the resync left us at a marker (the next segment then counts as empty).
         public void Restart()
         {
             bits = 0;
             buf = 0;
-            if (UnreadMarker == 0)
+            padBits = 0;
+            if (UnreadMarker == 0) NextMarker();
+            if (UnreadMarker == 0xD0 + nextRestartNum) UnreadMarker = 0;
+            else Resync(nextRestartNum);
+            nextRestartNum = (nextRestartNum + 1) & 7;
+            if (UnreadMarker == 0) Insufficient = false;
+        }
+
+        // jdmarker.c next_marker: skip anything up to 0xFF, the 0xFF fill bytes, and stuffed 0xFF00 pairs.
+        private void NextMarker()
+        {
+            for (;;)
             {
                 while (Pos < d.Length && d[Pos] != 0xFF) Pos++;
                 while (Pos < d.Length && d[Pos] == 0xFF) Pos++;
-                if (Pos < d.Length) { UnreadMarker = d[Pos]; Pos++; }
+                if (Pos >= d.Length) { UnreadMarker = 0xD9; return; }
+                int c = d[Pos++];
+                if (c != 0) { UnreadMarker = c; return; }
             }
-            if (UnreadMarker is >= 0xD0 and <= 0xD7) UnreadMarker = 0;
+        }
+
+        // jdmarker.c jpeg_resync_to_restart.
+        private void Resync(int desired)
+        {
+            for (;;)
+            {
+                int marker = UnreadMarker, action;
+                if (marker < 0xC0) action = 2;                                     // invalid marker
+                else if (marker is < 0xD0 or > 0xD7) action = 3;                    // valid non-restart marker
+                else if (marker == 0xD0 + ((desired + 1) & 7) || marker == 0xD0 + ((desired + 2) & 7)) action = 3;
+                else if (marker == 0xD0 + ((desired - 1) & 7) || marker == 0xD0 + ((desired - 2) & 7)) action = 2;
+                else action = 1;                                                    // desired restart or too far away
+                if (action == 1) { UnreadMarker = 0; return; }
+                if (action == 3) return;
+                NextMarker();
+            }
         }
 
         // Position of the marker that ends the segment (0xFF of it).
@@ -190,8 +250,8 @@ public static partial class JpegCoder
     {
         public long C, A;
         public int Ct;
-        public readonly byte[][] DcStats = [new byte[64], new byte[64], new byte[64], new byte[64]];
-        public readonly byte[][] AcStats = [new byte[256], new byte[256], new byte[256], new byte[256]];
+        public readonly byte[][] DcStats = [.. Enumerable.Range(0, 16).Select(_ => new byte[64])];
+        public readonly byte[][] AcStats = [.. Enumerable.Range(0, 16).Select(_ => new byte[256])];
         public readonly byte[] Fixed = new byte[1];
 
         public int Decode(LjBits src, byte[] stats, int idx)
@@ -232,68 +292,111 @@ public static partial class JpegCoder
         public void Reset() { C = 0; A = 0; Ct = -16; }
     }
 
-    /// <summary>The JPEG decoded exactly as libjpeg-turbo's default decompression does; null for what libjpeg-turbo
-    /// does not decode (or a malformed file).</summary>
-    internal static ImageFrame? ReadLibjpegExact(byte[] d)
+    /// <summary>The JPEG decoded exactly as libjpeg-turbo's default decompression does. Malformed data fails as
+    /// libjpeg-turbo's ERREXIT does (<see cref="InvalidDataException"/> with its message); what libjpeg-turbo cannot
+    /// decode either (hierarchical, arithmetic lossless, fractional sampling, ...) throws
+    /// <see cref="NotSupportedException"/>. Entropy-coded data errors are recovered from as libjpeg-turbo does (its
+    /// warnings: corrupt codes decode as 0, missing data as zeros).</summary>
+    internal static ImageFrame ReadLibjpegExact(byte[] d, long maxPixels = DefaultMaxPixels) => DecodeLj(d, maxPixels);
+
+    /// <summary>Default pixel limit of <see cref="Read(Stream)"/>: 16384 x 16384, as libavif's image size limit. A
+    /// larger frame header fails before its buffers are allocated (libjpeg-turbo would try to allocate them).</summary>
+    public const long DefaultMaxPixels = 16384L * 16384;
+
+    // jdatasrc.c fill_input_buffer at the end of the data: FF D9 (a fake EOI), again on every further read.
+    private static byte[] PadWithFakeEoi(byte[] d, long need)
     {
-        try { return DecodeLj(d); }
-        catch (Exception e) when (e is IndexOutOfRangeException or InvalidDataException or NotSupportedException or ArgumentException or OverflowException)
-        {
-            return null;
-        }
+        var r = new byte[(int)Math.Min(need + 2, int.MaxValue)];
+        d.CopyTo(r, 0);
+        for (int i = d.Length; i < r.Length; i++) r[i] = ((i - d.Length) & 1) == 0 ? (byte)0xFF : (byte)0xD9;
+        return r;
     }
 
-    private static ImageFrame? DecodeLj(byte[] d)
+    private static ImageFrame DecodeLj(byte[] d, long maxPixels)
     {
-        if (d.Length < 4 || d[0] != 0xFF || d[1] != 0xD8) return null;
+        // jdmarker.c first_marker: JERR_NO_SOI.
+        if (d.Length < 2 || d[0] != 0xFF || d[1] != 0xD8)
+            throw new InvalidDataException($"Not a JPEG file: starts with 0x{(d.Length > 0 ? d[0] : 0):x2} 0x{(d.Length > 1 ? d[1] : 0):x2}");
         int pos = 2;
         int width = 0, height = 0, precision = 8, nComp = 0, maxH = 1, maxV = 1, restartInterval = 0;
         bool progressive = false, arith = false, lossless = false, sawFrame = false, sawJfif = false, sawAdobe = false;
+        bool entropyStarted = false;   // jpeg_start_decompress ran (first SOS reached): default Huffman tables installed
+        int scans = 0, lastGoodRow = 0;
+        bool multiScan = false;
         int adobeTransform = 0;
         LjComp[] comps = [];
         var qt = new int[4][];
         var dcHuff = new LjHuff?[4];
         var acHuff = new LjHuff?[4];
-        var dcL = new int[] { 0, 0, 0, 0 };
-        var dcU = new int[] { 1, 1, 1, 1 };
-        var acK = new int[] { 5, 5, 5, 5 };
+        // jdmarker.c reset_marker_reader: arithmetic conditioning defaults for all 16 tables.
+        var dcL = new int[16];
+        var dcU = new int[16];
+        var acK = new int[16];
+        Array.Fill(dcU, 1);
+        Array.Fill(acK, 5);
         LjArith? ar = null;
+
+        static InvalidDataException BadLength() => new("Bogus marker length");
 
         while (true)
         {
             while (pos < d.Length && d[pos] != 0xFF) pos++;
             while (pos < d.Length && d[pos] == 0xFF) pos++;
-            if (pos >= d.Length) break;
+            if (pos >= d.Length) break;   // end of data: libjpeg's source manager supplies a fake EOI (a warning)
             int marker = d[pos++];
             if (marker == 0xD9) break;
+            if (marker == 0) continue;   // a stuffed 0xFF00 outside entropy data: discarded (next_marker)
             if (marker is >= 0xD0 and <= 0xD7 or 0x01) continue;
+            if (marker == 0xD8) throw new InvalidDataException("Invalid JPEG file structure: two SOI markers");
+            // Markers libjpeg does not know (DHP, EXP, JPGn, RESn): JERR_UNKNOWN_MARKER.
+            bool known = marker is >= 0xC0 and <= 0xCF or 0xDA or 0xDB or 0xDC or 0xDD or >= 0xE0 and <= 0xEF or 0xFE;
+            if (!known || marker is 0xC8)
+            {
+                if (marker is 0xC8) throw new NotSupportedException($"Unsupported JPEG process: SOF type 0x{marker:x2}");
+                throw new InvalidDataException($"Unsupported marker type 0x{marker:x2}");
+            }
+            // A segment running past the data reads what libjpeg's source manager supplies there: a warning and fake
+            // EOI bytes (FF D9 repeated), which the marker parsers then consume as fields.
+            if (pos + 2 > d.Length) d = PadWithFakeEoi(d, pos + 2);
             int len = (d[pos] << 8) | d[pos + 1];
             int seg = pos + 2, end = pos + len;
-            if (end > d.Length) return null;
+            if (end > d.Length) d = PadWithFakeEoi(d, end);
+            if (end < seg) end = seg;   // a length below 2 skips nothing (skip_variable)
             switch (marker)
             {
-                case 0xC0: case 0xC1: case 0xC2: case 0xC3: case 0xC9: case 0xCA:
+                case 0xC0: case 0xC1: case 0xC2: case 0xC3: case 0xC9: case 0xCA: case 0xCB:
                 {
-                    if (sawFrame) return null;
-                    sawFrame = true;
+                    // jdmarker.c get_sof + jdinput.c initial_setup.
+                    if (sawFrame) throw new InvalidDataException("Invalid JPEG file structure: two SOF markers");
+                    if (len < 8) throw BadLength();
                     progressive = marker is 0xC2 or 0xCA;
-                    arith = marker is 0xC9 or 0xCA;
-                    lossless = marker == 0xC3;
+                    arith = marker is 0xC9 or 0xCA or 0xCB;
+                    lossless = marker is 0xC3 or 0xCB;
                     precision = d[seg];
                     height = (d[seg + 1] << 8) | d[seg + 2];
                     width = (d[seg + 3] << 8) | d[seg + 4];
                     nComp = d[seg + 5];
-                    if (width == 0 || height == 0 || nComp is < 1 or > 4) return null;
-                    if (lossless ? precision is < 2 or > 16 : precision is not (8 or 12)) return null;
+                    if (width == 0 || height == 0 || nComp == 0) throw new InvalidDataException("Empty JPEG image (DNL not supported)");
+                    if (len - 8 != nComp * 3) throw BadLength();
+                    if (width > 65500 || height > 65500) throw new InvalidDataException("Maximum supported image dimension is 65500 pixels");
+                    if (lossless ? precision is < 2 or > 16 : precision is not (8 or 12))
+                        throw new InvalidDataException($"Unsupported JPEG data precision {precision}");
+                    if (nComp > 10) throw new InvalidDataException($"Too many color components: {nComp}, max 10");
+                    if (marker == 0xCB) throw new NotSupportedException("Sorry, arithmetic coding is not implemented (lossless)");
+                    if ((long)width * height > maxPixels)
+                        throw new InvalidDataException($"JPEG image {width}x{height} exceeds the limit of {maxPixels} pixels.");
                     comps = new LjComp[nComp];
                     for (int i = 0; i < nComp; i++)
                     {
                         int o = seg + 6 + i * 3;
-                        comps[i] = new LjComp { Id = d[o], H = d[o + 1] >> 4, V = d[o + 1] & 15, Tq = d[o + 2] & 3 };
-                        if (comps[i].H is < 1 or > 4 || comps[i].V is < 1 or > 4) return null;
+                        comps[i] = new LjComp { Id = d[o], H = d[o + 1] >> 4, V = d[o + 1] & 15, Tq = d[o + 2] };
+                        if (comps[i].H is < 1 or > 4 || comps[i].V is < 1 or > 4) throw new InvalidDataException("Bogus sampling factors");
                         maxH = Math.Max(maxH, comps[i].H);
                         maxV = Math.Max(maxV, comps[i].V);
                     }
+                    // Beyond libjpeg-turbo's output: 2 or 5..10 components have no colour space we can return.
+                    if (nComp is 2 or > 4) throw new NotSupportedException($"JPEG files with {nComp} components are not supported.");
+                    sawFrame = true;
                     int bs = lossless ? 1 : 8;
                     foreach (var c in comps)
                     {
@@ -308,51 +411,78 @@ public static partial class JpegCoder
                     }
                     break;
                 }
-                case 0xC5: case 0xC6: case 0xC7: case 0xCB: case 0xCD: case 0xCE: case 0xCF:
-                    return null;   // hierarchical / arithmetic lossless: not in libjpeg-turbo
+                case 0xC5: case 0xC6: case 0xC7: case 0xCD: case 0xCE: case 0xCF:
+                    throw new NotSupportedException($"Unsupported JPEG process: SOF type 0x{marker:x2}");
                 case 0xC4:
                 {
+                    // jdmarker.c get_dht; the tables are validated when a scan uses them (jpeg_make_d_derived_tbl).
+                    long length = len - 2;
                     int p = seg;
-                    while (p < end)
+                    while (length > 16)
                     {
-                        int tc = d[p] >> 4, th = d[p] & 15;
+                        int index = d[p];
                         var counts = d.AsSpan(p + 1, 16);
                         int total = 0;
                         foreach (byte b in counts) total += b;
-                        if (th > 3 || total > 256) return null;
+                        length -= 17;
+                        if (total > 256 || total > length) throw new InvalidDataException("Bogus Huffman table definition");
+                        bool ac = (index & 0x10) != 0;
+                        int th = ac ? index - 0x10 : index;
+                        if (th is < 0 or > 3) throw new InvalidDataException($"Bogus DHT index {th}");
                         var h = new LjHuff(counts, d.AsSpan(p + 17, total));
-                        if (tc == 0) dcHuff[th] = h; else acHuff[th] = h;
+                        if (ac) acHuff[th] = h; else dcHuff[th] = h;
                         p += 17 + total;
+                        length -= total;
                     }
+                    if (length != 0) throw BadLength();
                     break;
                 }
                 case 0xCC:
                 {
-                    for (int p = seg; p + 1 < end; p += 2)
+                    // jdmarker.c get_dac: 16 DC and 16 AC conditioning tables.
+                    long length = len - 2;
+                    int p = seg;
+                    while (length > 0)
                     {
-                        int tc = d[p] >> 4, tb = d[p] & 15, v = d[p + 1];
-                        if (tb > 3) return null;
-                        if (tc == 0) { dcL[tb] = v & 15; dcU[tb] = v >> 4; if (dcL[tb] > dcU[tb]) return null; }
-                        else { if (v is < 1 or > 63) return null; acK[tb] = v; }
+                        if (p + 1 >= end) throw BadLength();
+                        int index = d[p], v = d[p + 1];
+                        p += 2;
+                        length -= 2;
+                        if (index >= 32) throw new InvalidDataException($"Bogus DAC index {index}");
+                        if (index >= 16) acK[index - 16] = v;
+                        else
+                        {
+                            dcL[index] = v & 15;
+                            dcU[index] = v >> 4;
+                            if (dcL[index] > dcU[index]) throw new InvalidDataException($"Bogus DAC value 0x{v:x}");
+                        }
                     }
+                    if (length != 0) throw BadLength();
                     break;
                 }
                 case 0xDB:
                 {
+                    // jdmarker.c get_dqt.
+                    long length = len - 2;
                     int p = seg;
-                    while (p < end)
+                    while (length > 0)
                     {
                         int pq = d[p] >> 4, tq = d[p] & 15;
-                        if (tq > 3) return null;
+                        if (tq > 3) throw new InvalidDataException($"Bogus DQT index {tq}");
+                        int size = 1 + (pq != 0 ? 128 : 64);
+                        if (p + size > end) throw BadLength();
                         var t = new int[64];
                         for (int i = 0; i < 64; i++)
                             t[LjNatural[i]] = pq != 0 ? (d[p + 1 + 2 * i] << 8) | d[p + 2 + 2 * i] : d[p + 1 + i];
                         qt[tq] = t;
-                        p += 1 + (pq != 0 ? 128 : 64);
+                        p += size;
+                        length -= size;
                     }
+                    if (length != 0) throw BadLength();
                     break;
                 }
                 case 0xDD:
+                    if (len != 4) throw BadLength();
                     restartInterval = (d[seg] << 8) | d[seg + 1];
                     break;
                 case 0xE0:
@@ -363,19 +493,53 @@ public static partial class JpegCoder
                     break;
                 case 0xDA:
                 {
-                    if (!sawFrame) return null;
+                    // jdmarker.c get_sos.
+                    if (!sawFrame) throw new InvalidDataException("Invalid JPEG file structure: SOS before SOF");
+                    if (len < 3) throw BadLength();
                     int ns = d[seg];
+                    if (len != ns * 2 + 6 || ns is < 1 or > 4) throw BadLength();
                     var scomps = new LjComp[ns];
                     for (int i = 0; i < ns; i++)
                     {
                         int cid = d[seg + 1 + i * 2], tbl = d[seg + 2 + i * 2];
-                        var c = Array.Find(comps, x => x.Id == cid) ?? throw new InvalidDataException("SOS component");
+                        LjComp? c = null;
+                        for (int ci = 0; ci < comps.Length && ci < 4; ci++)
+                            if (comps[ci].Id == cid && Array.IndexOf(scomps, comps[ci], 0, i) < 0) { c = comps[ci]; break; }
+                        c = c ?? throw new InvalidDataException($"Invalid component ID {cid} in SOS");
                         c.DcTbl = tbl >> 4;
                         c.AcTbl = tbl & 15;
                         scomps[i] = c;
                     }
                     int so = seg + 1 + ns * 2;
                     int ss = d[so], se = d[so + 1], ah = d[so + 2] >> 4, al = d[so + 2] & 15;
+
+                    // jdinput.c consume_markers: a sequential first scan holding every component makes a single-scan
+                    // file, and a second SOS is then an error (JERR_EOI_EXPECTED).
+                    if (scans == 0) multiScan = progressive || ns < nComp;
+                    else if (!multiScan) throw new InvalidDataException("Didn't expect more than one scan");
+                    // jdinput.c per_scan_setup: an interleaved MCU holds at most 10 blocks.
+                    if (ns > 1 && scomps.Sum(c => c.H * c.V) > 10) throw new InvalidDataException("Sampling factors too large for interleaved scan");
+                    // jdmaster / jdhuff jinit_huff_decoder at jpeg_start_decompress (first SOS): Motion-JPEG default
+                    // tables for the Huffman slots 0 and 1 still undefined (sequential Huffman only).
+                    if (!entropyStarted)
+                    {
+                        entropyStarted = true;
+                        if (!arith && !progressive && !lossless) InstallStdHuffTables(dcHuff, acHuff);
+                    }
+                    ValidateLjScan(scomps, lossless, progressive, arith, precision, ss, se, ah, al, dcHuff, acHuff);
+                    // jdphuff / jdarith start_pass: progression status per coefficient (input_scan_number = scans + 1).
+                    if (progressive)
+                        foreach (var c in scomps)
+                        {
+                            for (int k = Math.Min(ss, 1); k <= Math.Max(se, 9); k++) c.PrevBits[k] = scans > 0 ? c.CurBits[k] : 0;
+                            for (int k = ss; k <= se; k++) c.CurBits[k] = al;
+                        }
+                    // jdinput.c latch_quant_tables: each component's table as it was at its first scan.
+                    if (!lossless)
+                        foreach (var c in scomps)
+                            c.Qt ??= c.Tq <= 3 && qt[c.Tq] is { } q ? (int[])q.Clone()
+                                : throw new InvalidDataException($"Quantization table 0x{c.Tq:x2} was not defined");
+
                     var bits = new LjBits(d, end);
                     if (lossless)
                         DecodeLosslessScan(bits, scomps, dcHuff, width, height, maxH, maxV, restartInterval, ss, al, precision);
@@ -385,13 +549,15 @@ public static partial class JpegCoder
                     else
                         DecodeHuffScan(bits, scomps, dcHuff, acHuff, width, height, maxH, maxV, restartInterval,
                             progressive, ss, se, ah, al);
+                    scans++;
+                    lastGoodRow = bits.LastGoodRow;
                     pos = bits.EndOfSegment();
                     continue;
                 }
             }
             pos = end;
         }
-        if (!sawFrame) return null;
+        if (!sawFrame || scans == 0) throw new InvalidDataException("JPEG datastream contains no image");
 
         // Colour space (jdapimin.c default_decompress_parms).
         int space; // 0 grey, 1 YCbCr, 2 RGB, 3 CMYK, 4 YCCK
@@ -408,28 +574,37 @@ public static partial class JpegCoder
             case 4:
                 space = sawAdobe ? (adobeTransform == 0 ? 3 : 4) : 3;
                 break;
-            default: return null;
+            default: throw new NotSupportedException($"JPEG files with {nComp} components are not supported.");
         }
-        if (lossless && space is 1 or 4) return null;   // libjpeg: no lossy colour conversion in lossless mode
+        // libjpeg: no lossy colour conversion in lossless mode (JERR_CONVERSION_NOTIMPL).
+        if (lossless && space is 1 or 4) throw new NotSupportedException("Unsupported color conversion request");
 
         // Component planes at their downsampled size.
         int max = lossless ? (1 << precision) - 1 : precision == 12 ? 4095 : 255;
         var planes = new int[nComp][];
+        bool smooth = progressive && LjSmoothingOk(comps);
+        int totalImcuRows = (height + maxV * 8 - 1) / (maxV * 8);
         for (int ci = 0; ci < nComp; ci++)
         {
             var c = comps[ci];
             if (lossless) { planes[ci] = c.Samples; continue; }
-            var t = qt[c.Tq] ?? throw new InvalidDataException("missing DQT");
+            // A component that never appeared in a scan has no table (libjpeg leaves its multipliers zero).
+            var t = c.Qt ?? new int[64];
             var plane = new int[c.DownW * c.DownH];
             Span<int> blk = stackalloc int[64];
+            var smoothRow = smooth ? new short[c.WidthInBlocks * 64] : null;
             for (int by = 0; by < c.HeightInBlocks; by++)
+            {
+                if (smoothRow != null) LjSmoothRow(c, by, totalImcuRows, lastGoodRow, scans > 1, smoothRow);
                 for (int bx = 0; bx < c.WidthInBlocks; bx++)
                 {
-                    LjIdctIslow(c.Coef.AsSpan((by * c.AllocW + bx) * 64, 64), t, blk, precision);
+                    var src = smoothRow != null ? smoothRow.AsSpan(bx * 64, 64) : c.Coef.AsSpan((by * c.AllocW + bx) * 64, 64);
+                    LjIdctIslow(src, t, blk, precision);
                     for (int y = 0; y < 8 && by * 8 + y < c.DownH; y++)
                         for (int x = 0; x < 8 && bx * 8 + x < c.DownW; x++)
                             plane[(by * 8 + y) * c.DownW + bx * 8 + x] = blk[y * 8 + x];
                 }
+            }
             planes[ci] = plane;
         }
 
@@ -494,7 +669,9 @@ public static partial class JpegCoder
         }
         return frame;
 
-        static ushort Scale16(int v, int max) => (ushort)(((long)v * 65535 + max / 2) / max);
+        // Corrupt lossless data can undifference past 2^P - 1 (libjpeg outputs such samples as they are); a frame
+        // sample cannot exceed the maximum, so it is clamped.
+        static ushort Scale16(int v, int max) => (ushort)(((long)Math.Clamp(v, 0, max) * 65535 + max / 2) / max);
     }
 
     // jdcolor.c build_ycc_rgb_table for MAXJSAMPLE = max (SCALEBITS 16).
@@ -514,6 +691,184 @@ public static partial class JpegCoder
         }
     }
 
+    // jdhuff.c jinit_huff_decoder std_huff_tables: Motion-JPEG streams omit the default (Annex K.3) tables.
+    private static void InstallStdHuffTables(LjHuff?[] dc, LjHuff?[] ac)
+    {
+        dc[0] ??= new LjHuff(JpegTables.DcLuminanceBits, JpegTables.DcLuminanceValues);
+        ac[0] ??= new LjHuff(JpegTables.AcLuminanceBits, JpegTables.AcLuminanceValues);
+        dc[1] ??= new LjHuff(JpegTables.DcChrominanceBits, JpegTables.DcChrominanceValues);
+        ac[1] ??= new LjHuff(JpegTables.AcChrominanceBits, JpegTables.AcChrominanceValues);
+    }
+
+    // The checks libjpeg-turbo makes when a scan starts (jdphuff / jdarith / jdlossls start_pass, then
+    // jpeg_make_d_derived_tbl for every table the scan uses). Sequential scans with odd Ss/Se/Ah/Al only warn.
+    private static void ValidateLjScan(LjComp[] sc, bool lossless, bool progressive, bool arith, int precision,
+        int ss, int se, int ah, int al, LjHuff?[] dcH, LjHuff?[] acH)
+    {
+        InvalidDataException BadScan() => new($"Invalid progressive/lossless parameters Ss={ss} Se={se} Ah={ah} Al={al}");
+        if (lossless)
+        {
+            if (ss is < 1 or > 7 || se != 0 || ah != 0 || al >= precision) throw BadScan();
+            foreach (var c in sc) CheckHuff(dcH, c.DcTbl, dc: true, lossless: true);
+            return;
+        }
+        if (progressive)
+        {
+            bool bad = ss == 0 ? se != 0 : se < ss || se > 63 || sc.Length != 1;
+            if (ah != 0 && al != ah - 1) bad = true;
+            if (al > 13) bad = true;
+            if (bad) throw BadScan();
+        }
+        foreach (var c in sc)
+        {
+            bool needDc = !progressive || (ss == 0 && ah == 0), needAc = !progressive || ss != 0;
+            if (arith)
+            {
+                if (needDc && c.DcTbl > 15) throw new InvalidDataException($"Arithmetic table 0x{c.DcTbl:x2} was not defined");
+                if (needAc && c.AcTbl > 15) throw new InvalidDataException($"Arithmetic table 0x{c.AcTbl:x2} was not defined");
+                continue;
+            }
+            if (needDc) CheckHuff(dcH, c.DcTbl, dc: true, lossless: false);
+            if (needAc) CheckHuff(acH, c.AcTbl, dc: false, lossless: false);
+        }
+    }
+
+    // jdhuff.c jpeg_make_d_derived_tbl: the table exists, its code lengths form a valid prefix code, DC symbols fit.
+    private static void CheckHuff(LjHuff?[] tables, int tbl, bool dc, bool lossless)
+    {
+        if (tbl > 3 || tables[tbl] is not { } h) throw new InvalidDataException($"Huffman table 0x{tbl:x2} was not defined");
+        if (h.Bad || (dc && h.MaxSymbol > (lossless ? 16 : 15))) throw new InvalidDataException("Bogus Huffman table definition");
+    }
+
+    // ── Block smoothing (jdcoefct.c smoothing_ok / decompress_smooth_data) ───────────────────────────────────────
+    // A progressive image whose low AC coefficients are not all known yet (a truncated or partial file) is output with
+    // those coefficients estimated from the 5x5 neighbourhood of DC values, as libjpeg-turbo does by default
+    // (do_block_smoothing). Natural positions of the first 9 zigzag AC coefficients: 01 10 20 11 02 03 12 21 30.
+    private static readonly int[] SmoothPos = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24];
+
+    private static bool LjSmoothingOk(LjComp[] comps)
+    {
+        bool useful = false;
+        foreach (var c in comps)
+        {
+            if (c.Qt is not { } q) return false;
+            foreach (int p in SmoothPos) if (q[p] == 0) return false;
+            if (c.CurBits[0] < 0) return false;
+            for (int k = 1; k < 10; k++) if (c.CurBits[k] != 0) useful = true;
+        }
+        return useful;
+    }
+
+    // One component's block row, smoothed into ws (WidthInBlocks blocks of 64), for the IDCT.
+    private static void LjSmoothRow(LjComp c, int by, int totalImcuRows, int lastGoodRow, bool prevLatch, short[] ws)
+    {
+        int v = c.V, r = by / v, blockRow = by % v, lastRow = totalImcuRows - 1;
+        int blockRows = r < lastRow ? v : (c.HeightInBlocks % v == 0 ? v : c.HeightInBlocks % v);
+        int imageBlockRows = blockRows * totalImcuRows, imageBlockRow = r * blockRows + blockRow;
+        int row = by;
+        int prevRow = imageBlockRow > 0 ? row - 1 : row;
+        int prevPrevRow = imageBlockRow > 1 ? row - 2 : prevRow;
+        int nextRow = imageBlockRow < imageBlockRows - 1 ? row + 1 : row;
+        int nextNextRow = imageBlockRow < imageBlockRows - 2 ? row + 2 : nextRow;
+        // If the current scan is incomplete, rows past the last good one use the bits as of the previous scan.
+        int[] bits = r > lastGoodRow ? (prevLatch ? c.PrevBits : c.NoBits) : c.CurBits;
+        bool changeDc = true;
+        for (int k = 1; k < 10; k++) changeDc &= bits[k] == -1;
+        var q = c.Qt!;
+        long q00 = q[0], q01 = q[1], q10 = q[8], q20 = q[16], q11 = q[9], q02 = q[2];
+        long q03 = changeDc ? q[3] : 0, q12 = changeDc ? q[10] : 0, q21 = changeDc ? q[17] : 0, q30 = changeDc ? q[24] : 0;
+        short[] coef = c.Coef;
+        int aw = c.AllocW;
+        int Dc(int rr, int col) => coef[(rr * aw + col) * 64];
+
+        int dc01, dc02, dc03, dc04, dc05, dc06, dc07, dc08, dc09, dc10, dc11, dc12, dc13, dc14, dc15;
+        int dc16, dc17, dc18, dc19, dc20, dc21, dc22, dc23, dc24, dc25;
+        dc01 = dc02 = dc03 = dc04 = dc05 = Dc(prevPrevRow, 0);
+        dc06 = dc07 = dc08 = dc09 = dc10 = Dc(prevRow, 0);
+        dc11 = dc12 = dc13 = dc14 = dc15 = Dc(row, 0);
+        dc16 = dc17 = dc18 = dc19 = dc20 = Dc(nextRow, 0);
+        dc21 = dc22 = dc23 = dc24 = dc25 = Dc(nextNextRow, 0);
+        int lastCol = c.WidthInBlocks - 1;
+
+        static short Pred(long num, long qq, int al)
+        {
+            int pred;
+            if (num >= 0)
+            {
+                pred = (int)(((qq << 7) + num) / (qq << 8));
+                if (al > 0 && pred >= (1 << al)) pred = (1 << al) - 1;
+            }
+            else
+            {
+                pred = (int)(((qq << 7) - num) / (qq << 8));
+                if (al > 0 && pred >= (1 << al)) pred = (1 << al) - 1;
+                pred = -pred;
+            }
+            return (short)pred;
+        }
+
+        for (int b = 0; b <= lastCol; b++)
+        {
+            var w = ws.AsSpan(b * 64, 64);
+            coef.AsSpan((row * aw + b) * 64, 64).CopyTo(w);
+            if (b == 0 && b < lastCol)
+            {
+                dc04 = dc05 = Dc(prevPrevRow, 1);
+                dc09 = dc10 = Dc(prevRow, 1);
+                dc14 = dc15 = Dc(row, 1);
+                dc19 = dc20 = Dc(nextRow, 1);
+                dc24 = dc25 = Dc(nextNextRow, 1);
+            }
+            if (b + 1 < lastCol)
+            {
+                dc05 = Dc(prevPrevRow, b + 2);
+                dc10 = Dc(prevRow, b + 2);
+                dc15 = Dc(row, b + 2);
+                dc20 = Dc(nextRow, b + 2);
+                dc25 = Dc(nextNextRow, b + 2);
+            }
+            int al;
+            if ((al = bits[1]) != 0 && w[1] == 0)
+                w[1] = Pred(q00 * (changeDc
+                    ? -dc01 - dc02 + dc04 + dc05 - 3 * dc06 + 13 * dc07 - 13 * dc09 + 3 * dc10 - 3 * dc11 + 38 * dc12 - 38 * dc14
+                      + 3 * dc15 - 3 * dc16 + 13 * dc17 - 13 * dc19 + 3 * dc20 - dc21 - dc22 + dc24 + dc25
+                    : -7 * dc11 + 50 * dc12 - 50 * dc14 + 7 * dc15), q01, al);
+            if ((al = bits[2]) != 0 && w[8] == 0)
+                w[8] = Pred(q00 * (changeDc
+                    ? -dc01 - 3 * dc02 - 3 * dc03 - 3 * dc04 - dc05 - dc06 + 13 * dc07 + 38 * dc08 + 13 * dc09 - dc10 + dc16
+                      - 13 * dc17 - 38 * dc18 - 13 * dc19 + dc20 + dc21 + 3 * dc22 + 3 * dc23 + 3 * dc24 + dc25
+                    : -7 * dc03 + 50 * dc08 - 50 * dc18 + 7 * dc23), q10, al);
+            if ((al = bits[3]) != 0 && w[16] == 0)
+                w[16] = Pred(q00 * (changeDc
+                    ? dc03 + 2 * dc07 + 7 * dc08 + 2 * dc09 - 5 * dc12 - 14 * dc13 - 5 * dc14 + 2 * dc17 + 7 * dc18 + 2 * dc19 + dc23
+                    : -dc03 + 13 * dc08 - 24 * dc13 + 13 * dc18 - dc23), q20, al);
+            if ((al = bits[4]) != 0 && w[9] == 0)
+                w[9] = Pred(q00 * (changeDc
+                    ? -dc01 + dc05 + 9 * dc07 - 9 * dc09 - 9 * dc17 + 9 * dc19 + dc21 - dc25
+                    : dc10 + dc16 - 10 * dc17 + 10 * dc19 - dc02 - dc20 + dc22 - dc24 + dc04 - dc06 + 10 * dc07 - 10 * dc09), q11, al);
+            if ((al = bits[5]) != 0 && w[2] == 0)
+                w[2] = Pred(q00 * (changeDc
+                    ? 2 * dc07 - 5 * dc08 + 2 * dc09 + dc11 + 7 * dc12 - 14 * dc13 + 7 * dc14 + dc15 + 2 * dc17 - 5 * dc18 + 2 * dc19
+                    : -dc11 + 13 * dc12 - 24 * dc13 + 13 * dc14 - dc15), q02, al);
+            if (changeDc)
+            {
+                if ((al = bits[6]) != 0 && w[3] == 0) w[3] = Pred(q00 * (dc07 - dc09 + 2 * dc12 - 2 * dc14 + dc17 - dc19), q03, al);
+                if ((al = bits[7]) != 0 && w[10] == 0) w[10] = Pred(q00 * (dc07 - 3 * dc08 + dc09 - dc17 + 3 * dc18 - dc19), q12, al);
+                if ((al = bits[8]) != 0 && w[17] == 0) w[17] = Pred(q00 * (dc07 - dc09 - 3 * dc12 + 3 * dc14 + dc17 - dc19), q21, al);
+                if ((al = bits[9]) != 0 && w[24] == 0) w[24] = Pred(q00 * (dc07 + 2 * dc08 + dc09 - dc17 - 2 * dc18 - dc19), q30, al);
+                long num = q00 * (-2 * dc01 - 6 * dc02 - 8 * dc03 - 6 * dc04 - 2 * dc05 - 6 * dc06 + 6 * dc07 + 42 * dc08 + 6 * dc09
+                    - 6 * dc10 - 8 * dc11 + 42 * dc12 + 152 * dc13 + 42 * dc14 - 8 * dc15 - 6 * dc16 + 6 * dc17 + 42 * dc18
+                    + 6 * dc19 - 6 * dc20 - 2 * dc21 - 6 * dc22 - 8 * dc23 - 6 * dc24 - 2 * dc25);
+                w[0] = Pred(num, q00, 0);
+            }
+            dc01 = dc02; dc02 = dc03; dc03 = dc04; dc04 = dc05;
+            dc06 = dc07; dc07 = dc08; dc08 = dc09; dc09 = dc10;
+            dc11 = dc12; dc12 = dc13; dc13 = dc14; dc14 = dc15;
+            dc16 = dc17; dc17 = dc18; dc18 = dc19; dc19 = dc20;
+            dc21 = dc22; dc22 = dc23; dc23 = dc24; dc24 = dc25;
+        }
+    }
+
     // ── Huffman (jdhuff.c sequential, jdphuff.c progressive) ────────────────────────────────────────────────────
     private static int LjExtend(int r, int s) => r < (1 << (s - 1)) ? r + (-1 << s) + 1 : r;
 
@@ -523,19 +878,32 @@ public static partial class JpegCoder
         foreach (var c in sc) c.LastDc = 0;
         int eobrun = 0;
         int restartsToGo = restartInterval;
+        bool skipMcu = false, mcuStart = false, goodAtStart = false;
+        bool dcRefine = progressive && ss == 0 && ah != 0;
         foreach (var (c, blk) in LjBlocks(sc, width, height, maxH, maxV, () =>
         {
-            if (restartInterval == 0) return;
-            if (restartsToGo == 0)
+            mcuStart = true;
+            goodAtStart = !b.Insufficient;   // jdcoefct consume_data checks before decode_mcu (and its restart)
+            if (restartInterval != 0)
             {
-                b.Restart();
-                foreach (var cc in sc) cc.LastDc = 0;
-                eobrun = 0;
-                restartsToGo = restartInterval;
+                if (restartsToGo == 0)
+                {
+                    b.Restart();
+                    foreach (var cc in sc) cc.LastDc = 0;
+                    eobrun = 0;
+                    restartsToGo = restartInterval;
+                }
+                restartsToGo--;
             }
-            restartsToGo--;
+            skipMcu = b.Insufficient && !dcRefine;
         }))
         {
+            if (mcuStart)
+            {
+                mcuStart = false;
+                if (goodAtStart) b.LastGoodRow = blk / c.AllocW / c.V;
+            }
+            if (skipMcu) continue;
             var coef = c.Coef.AsSpan(blk * 64, 64);
             if (!progressive)
             {
@@ -688,9 +1056,10 @@ public static partial class JpegCoder
         InitStats();
         e.Fixed[0] = 113;
         int restartsToGo = restartInterval;
-        bool error = false;
+        bool error = false, mcuStart = false;
         foreach (var (c, blk) in LjBlocks(sc, width, height, maxH, maxV, () =>
         {
+            mcuStart = true;
             if (restartInterval == 0) return;
             if (restartsToGo == 0)
             {
@@ -702,6 +1071,7 @@ public static partial class JpegCoder
             restartsToGo--;
         }))
         {
+            if (mcuStart) { mcuStart = false; b.LastGoodRow = blk / c.AllocW / c.V; }
             if (error && !(progressive && ss == 0 && ah != 0)) continue;
             var coef = c.Coef.AsSpan(blk * 64, 64);
             if (!progressive || ss == 0)
@@ -832,6 +1202,18 @@ public static partial class JpegCoder
             {
                 if (rowsToGo == 0) { b.Restart(); restartAt[my] = true; rowsToGo = restartRows; }
                 rowsToGo--;
+            }
+            // jdlhuff.c decode_mcus: once the data ran out, an MCU row's differences are zero and the undifferencer
+            // restarts (its first-row prediction), so the rest of the segment comes out at the centre value.
+            if (b.Insufficient)
+            {
+                restartAt[my] = true;
+                foreach (var c in sc)
+                {
+                    int vv = single ? 1 : c.V;
+                    Array.Clear(c.Diff, my * vv * c.AllocW, Math.Min(vv * c.AllocW, c.Diff.Length - my * vv * c.AllocW));
+                }
+                continue;
             }
             for (int mx = 0; mx < mcusX; mx++)
                 foreach (var c in sc)

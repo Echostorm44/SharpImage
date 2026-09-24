@@ -231,7 +231,10 @@ public readonly struct Av1SequenceHeader
     
     /// <summary>Number of bytes consumed.</summary>
     public int BytesConsumed { get; init; }
-    
+
+    // The sequence header OBU payload, for the full parse TryParseFrameHeader needs.
+    internal byte[]? Raw { get; init; }
+
     /// <summary>Gets the chroma format string.</summary>
     public string ChromaFormat => (SubsamplingX, SubsamplingY, Monochrome) switch
     {
@@ -377,326 +380,47 @@ public static class Av1HeaderParser
     }
     
     /// <summary>
-    /// Parses an AV1 sequence header OBU.
+    /// Parses a sequence header OBU payload (after the OBU header) with the decoder's parser (AV1 spec 5.5, every
+    /// field, as verified against the Argon conformance suite).
     /// </summary>
-    /// <param name="data">OBU payload data (after OBU header).</param>
+    /// <param name="data">Sequence header OBU payload.</param>
     /// <param name="seqHeader">Parsed sequence header on success.</param>
     /// <returns>True if parsing succeeded.</returns>
     public static bool TryParseSequenceHeader(ReadOnlySpan<byte> data, out Av1SequenceHeader seqHeader)
     {
         seqHeader = default;
-        
-        if (data.Length < 3)
-            return false;
-        
-        var reader = new Av1BitReader(data);
-        
-        // seq_profile (3 bits)
-        var profile = (Av1Profile)reader.ReadBits(3);
-        
-        // still_picture (1 bit)
-        bool stillPicture = reader.ReadBit();
-        
-        // reduced_still_picture_header (1 bit)
-        bool reducedHeader = reader.ReadBit();
-        
-        int bitDepth = 8;
-        bool monochrome = false;
-        var colorPrimaries = Av1ColorPrimaries.Unspecified;
-        var transferCharacteristics = Av1TransferCharacteristics.Unspecified;
-        var matrixCoefficients = Av1MatrixCoefficients.Unspecified;
-        bool fullColorRange = false;
-        int subsamplingX = 1;
-        int subsamplingY = 1;
-        var chromaSamplePosition = Av1ChromaSamplePosition.Unknown;
-        bool filmGrainPresent = false;
-        
-        if (reducedHeader)
-        {
-            // Minimal header for still pictures
-            // timing_info not present
-            // decoder_model_info not present
-            // operating_points_cnt_minus_1 = 0
-            // operating_point_idc[0] = 0
-            // seq_level_idx[0] (5 bits)
-            _ = reader.ReadBits(5);
-        }
-        else
-        {
-            // timing_info_present_flag (1 bit)
-            bool timingInfoPresent = reader.ReadBit();
-            
-            if (timingInfoPresent)
-            {
-                // Skip timing_info()
-                _ = reader.ReadBits(32); // num_units_in_display_tick
-                _ = reader.ReadBits(32); // time_scale
-                bool equalPictureInterval = reader.ReadBit();
-                if (equalPictureInterval)
-                {
-                    // Skip uvlc(num_ticks_per_picture_minus_1)
-                    SkipUvlc(ref reader);
-                }
-                
-                // decoder_model_info_present_flag (1 bit)
-                bool decoderModelInfoPresent = reader.ReadBit();
-                if (decoderModelInfoPresent)
-                {
-                    // Skip decoder_model_info()
-                    _ = reader.ReadBits(5);  // buffer_delay_length_minus_1
-                    _ = reader.ReadBits(32); // num_units_in_decoding_tick
-                    _ = reader.ReadBits(5);  // buffer_removal_time_length_minus_1
-                    _ = reader.ReadBits(5);  // frame_presentation_time_length_minus_1
-                }
-            }
-            
-            // initial_display_delay_present_flag (1 bit)
-            bool initialDisplayDelayPresent = reader.ReadBit();
-            
-            // operating_points_cnt_minus_1 (5 bits)
-            int operatingPointsCnt = reader.ReadBits(5) + 1;
-            
-            for (int i = 0; i < operatingPointsCnt; i++)
-            {
-                _ = reader.ReadBits(12); // operating_point_idc
-                _ = reader.ReadBits(5);  // seq_level_idx
-                
-                if (reader.PeekBits(5) > 7)
-                {
-                    _ = reader.ReadBits(5);
-                    _ = reader.ReadBit(); // seq_tier
-                }
-                else
-                {
-                    _ = reader.ReadBits(5);
-                }
-                
-                // Skip decoder model and display delay if present
-                if (initialDisplayDelayPresent)
-                {
-                    bool displayDelayPresent = reader.ReadBit();
-                    if (displayDelayPresent)
-                    {
-                        _ = reader.ReadBits(4); // initial_display_delay_minus_1
-                    }
-                }
-            }
-        }
-        
-        // frame_width_bits_minus_1 (4 bits)
-        int frameWidthBits = reader.ReadBits(4) + 1;
-        
-        // frame_height_bits_minus_1 (4 bits)
-        int frameHeightBits = reader.ReadBits(4) + 1;
-        
-        // max_frame_width_minus_1 (n bits)
-        int maxFrameWidth = reader.ReadBits(frameWidthBits) + 1;
-        
-        // max_frame_height_minus_1 (n bits)
-        int maxFrameHeight = reader.ReadBits(frameHeightBits) + 1;
-        
-        // frame_id_numbers_present_flag (unless reduced header)
-        if (!reducedHeader)
-        {
-            bool frameIdNumbersPresent = reader.ReadBit();
-            if (frameIdNumbersPresent)
-            {
-                _ = reader.ReadBits(4); // delta_frame_id_length_minus_2
-                _ = reader.ReadBits(3); // additional_frame_id_length_minus_1
-            }
-        }
-        
-        // use_128x128_superblock (1 bit)
-        _ = reader.ReadBit();
-        
-        // enable_filter_intra (1 bit)
-        _ = reader.ReadBit();
-        
-        // enable_intra_edge_filter (1 bit)
-        _ = reader.ReadBit();
-        
-        if (!reducedHeader)
-        {
-            // enable_interintra_compound (1 bit)
-            _ = reader.ReadBit();
-            
-            // enable_masked_compound (1 bit)
-            _ = reader.ReadBit();
-            
-            // enable_warped_motion (1 bit)
-            _ = reader.ReadBit();
-            
-            // enable_dual_filter (1 bit)
-            _ = reader.ReadBit();
-            
-            // enable_order_hint (1 bit)
-            bool enableOrderHint = reader.ReadBit();
-            
-            if (enableOrderHint)
-            {
-                // enable_jnt_comp (1 bit)
-                _ = reader.ReadBit();
-                
-                // enable_ref_frame_mvs (1 bit)
-                _ = reader.ReadBit();
-            }
-            
-            // seq_choose_screen_content_tools (1 bit)
-            bool seqChooseScreenContentTools = reader.ReadBit();
-            
-            int seqForceScreenContentTools = 2; // SELECT_SCREEN_CONTENT_TOOLS
-            if (!seqChooseScreenContentTools)
-            {
-                seqForceScreenContentTools = reader.ReadBits(1);
-            }
-            
-            if (seqForceScreenContentTools > 0)
-            {
-                bool seqChooseIntegerMv = reader.ReadBit();
-                if (!seqChooseIntegerMv)
-                {
-                    _ = reader.ReadBit(); // seq_force_integer_mv
-                }
-            }
-            
-            if (enableOrderHint)
-            {
-                _ = reader.ReadBits(3); // order_hint_bits_minus_1
-            }
-        }
-        
-        // enable_superres (1 bit)
-        _ = reader.ReadBit();
-        
-        // enable_cdef (1 bit)
-        _ = reader.ReadBit();
-        
-        // enable_restoration (1 bit)
-        _ = reader.ReadBit();
-        
-        // color_config()
-        bool highBitDepth = reader.ReadBit();
-        
-        if (profile == Av1Profile.Professional && highBitDepth)
-        {
-            bool twelveBit = reader.ReadBit();
-            bitDepth = twelveBit ? 12 : 10;
-        }
-        else if (profile <= Av1Profile.Professional)
-        {
-            bitDepth = highBitDepth ? 10 : 8;
-        }
-        
-        if (profile == Av1Profile.High)
-        {
-            monochrome = false;
-        }
-        else
-        {
-            monochrome = reader.ReadBit();
-        }
-        
-        bool colorDescriptionPresent = reader.ReadBit();
-        
-        if (colorDescriptionPresent)
-        {
-            colorPrimaries = (Av1ColorPrimaries)reader.ReadBits(8);
-            transferCharacteristics = (Av1TransferCharacteristics)reader.ReadBits(8);
-            matrixCoefficients = (Av1MatrixCoefficients)reader.ReadBits(8);
-        }
-        
-        if (monochrome)
-        {
-            fullColorRange = reader.ReadBit();
-            subsamplingX = 1;
-            subsamplingY = 1;
-        }
-        else if (colorPrimaries == Av1ColorPrimaries.Bt709 &&
-                 transferCharacteristics == Av1TransferCharacteristics.Srgb &&
-                 matrixCoefficients == Av1MatrixCoefficients.Identity)
-        {
-            // sRGB
-            fullColorRange = true;
-            subsamplingX = 0;
-            subsamplingY = 0;
-        }
-        else
-        {
-            fullColorRange = reader.ReadBit();
-            
-            if (profile == Av1Profile.Main)
-            {
-                subsamplingX = 1;
-                subsamplingY = 1;
-            }
-            else if (profile == Av1Profile.High)
-            {
-                subsamplingX = 0;
-                subsamplingY = 0;
-            }
-            else
-            {
-                if (bitDepth == 12)
-                {
-                    subsamplingX = reader.ReadBits(1);
-                    if (subsamplingX == 1)
-                    {
-                        subsamplingY = reader.ReadBits(1);
-                    }
-                    else
-                    {
-                        subsamplingY = 0;
-                    }
-                }
-                else
-                {
-                    subsamplingX = 1;
-                    subsamplingY = 0;
-                }
-            }
-            
-            if (subsamplingX == 1 && subsamplingY == 1)
-            {
-                chromaSamplePosition = (Av1ChromaSamplePosition)reader.ReadBits(2);
-            }
-        }
-        
-        // separate_uv_delta_q (1 bit, if not monochrome)
-        if (!monochrome)
-        {
-            _ = reader.ReadBit();
-        }
-        
-        // film_grain_params_present (1 bit)
-        filmGrainPresent = reader.ReadBit();
-        
+        var h = new Av1DecoderSequenceHeader();
+        if (Av1ObuParser.ParseSequenceHeader(h, data) != Av1ObuParser.ParseResult.Ok) return false;
         seqHeader = new Av1SequenceHeader
         {
-            Profile = profile,
-            StillPicture = stillPicture,
-            MaxFrameWidth = maxFrameWidth,
-            MaxFrameHeight = maxFrameHeight,
-            BitDepth = bitDepth,
-            Monochrome = monochrome,
-            ColorPrimaries = colorPrimaries,
-            TransferCharacteristics = transferCharacteristics,
-            MatrixCoefficients = matrixCoefficients,
-            FullColorRange = fullColorRange,
-            SubsamplingX = subsamplingX,
-            SubsamplingY = subsamplingY,
-            ChromaSamplePosition = chromaSamplePosition,
-            FilmGrainPresent = filmGrainPresent,
-            BytesConsumed = reader.BytePosition + (reader.BitPosition > 0 ? 1 : 0)
+            Profile = h.Profile,
+            StillPicture = h.StillPicture,
+            MaxFrameWidth = h.MaxWidth,
+            MaxFrameHeight = h.MaxHeight,
+            BitDepth = h.BitDepth,
+            Monochrome = h.Monochrome,
+            ColorPrimaries = h.ColorPrimaries,
+            TransferCharacteristics = h.TransferCharacteristics,
+            MatrixCoefficients = h.MatrixCoefficients,
+            FullColorRange = h.ColorRange != 0,
+            SubsamplingX = h.SubsamplingX,
+            SubsamplingY = h.SubsamplingY,
+            ChromaSamplePosition = h.ChromaSamplePosition,
+            FilmGrainPresent = h.FilmGrainPresent,
+            BytesConsumed = data.Length,
+            Raw = data.ToArray(),
         };
-        
         return true;
     }
     
     /// <summary>
-    /// Parses a simple AV1 frame header (show_existing_frame and frame_type only).
+    /// Parses a frame header OBU payload (OBU_FRAME_HEADER, or the header part of OBU_FRAME) with the decoder's
+    /// parser, without decoder state: show_existing_frame, frame type, show / showable, error resilience and refresh
+    /// flags are exact. The size is exact for key and intra-only frames and for frames that code it; a frame that
+    /// takes its size from a reference frame (frame_size_with_refs) reports 0 x 0, as a stateless parse cannot know it.
     /// </summary>
-    /// <param name="data">OBU payload data (after OBU header).</param>
-    /// <param name="seqHeader">Sequence header for context.</param>
+    /// <param name="data">Frame header OBU payload (after the OBU header).</param>
+    /// <param name="seqHeader">The sequence header in effect (from <see cref="TryParseSequenceHeader"/>).</param>
     /// <param name="frameHeader">Parsed frame header on success.</param>
     /// <returns>True if parsing succeeded.</returns>
     public static bool TryParseFrameHeader(
@@ -705,90 +429,34 @@ public static class Av1HeaderParser
         out Av1FrameHeader frameHeader)
     {
         frameHeader = default;
-        
-        if (data.Length < 1)
-            return false;
-        
-        var reader = new Av1BitReader(data);
-        
-        bool showExistingFrame = false;
-        int frameToShowMapIndex = 0;
-        Av1FrameType frameType;
-        bool showFrame = true;
-        bool showable = false;
-        bool errorResilient = false;
-        byte refreshFrameFlags = 0;
-        
-        // show_existing_frame (1 bit if not reduced still picture)
-        showExistingFrame = reader.ReadBit();
-        
-        if (showExistingFrame)
+        if (seqHeader.Raw is not { } raw) return false;
+        var seq = new Av1DecoderSequenceHeader();
+        if (Av1ObuParser.ParseSequenceHeader(seq, raw) != Av1ObuParser.ParseResult.Ok) return false;
+        var refs = new Av1ReferenceFrame[8];
+        for (int i = 0; i < 8; i++) refs[i] = new Av1ReferenceFrame();
+        var h = new Av1DecoderFrameHeader();
+        int consumed;
+        try
         {
-            frameToShowMapIndex = reader.ReadBits(3);
-            
-            frameHeader = new Av1FrameHeader
-            {
-                FrameType = Av1FrameType.Inter, // Existing frame reference
-                ShowFrame = true,
-                ShowExistingFrame = true,
-                FrameToShowMapIndex = frameToShowMapIndex,
-                Width = seqHeader.MaxFrameWidth,
-                Height = seqHeader.MaxFrameHeight,
-                RenderWidth = seqHeader.MaxFrameWidth,
-                RenderHeight = seqHeader.MaxFrameHeight,
-                BytesConsumed = reader.BytePosition + (reader.BitPosition > 0 ? 1 : 0)
-            };
-            return true;
+            if (Av1ObuParser.ParseFrameHeader(h, seq, refs, data, out consumed) != Av1ObuParser.ParseResult.Ok) return false;
         }
-        
-        // frame_type (2 bits)
-        frameType = (Av1FrameType)reader.ReadBits(2);
-        
-        // show_frame (1 bit)
-        showFrame = reader.ReadBit();
-        
-        if (!showFrame)
-        {
-            // showable_frame (1 bit)
-            showable = reader.ReadBit();
-        }
-        
-        // error_resilient_mode (1 bit) - depends on frame type
-        if (frameType == Av1FrameType.Switch)
-        {
-            errorResilient = true;
-        }
-        else if (frameType != Av1FrameType.Key && !showFrame)
-        {
-            errorResilient = reader.ReadBit();
-        }
-        
-        // refresh_frame_flags
-        if (frameType == Av1FrameType.Key || frameType == Av1FrameType.IntraOnly)
-        {
-            refreshFrameFlags = 0xFF; // Refresh all slots
-        }
-        
-        // Simplified: use sequence header dimensions
-        int width = seqHeader.MaxFrameWidth;
-        int height = seqHeader.MaxFrameHeight;
-        
+        catch (InvalidDataException) { return false; }
+        bool sized = !h.ShowExistingFrame && h.SuperResUpscaledWidth > 0 && h.Height > 0;
         frameHeader = new Av1FrameHeader
         {
-            FrameType = frameType,
-            ShowFrame = showFrame,
-            ShowExistingFrame = false,
-            FrameToShowMapIndex = 0,
-            Showable = showable,
-            ErrorResilient = errorResilient,
-            Width = width,
-            Height = height,
-            RenderWidth = width,
-            RenderHeight = height,
-            RefreshFrameFlags = refreshFrameFlags,
-            BytesConsumed = reader.BytePosition + (reader.BitPosition > 0 ? 1 : 0)
+            FrameType = h.ShowExistingFrame ? Av1FrameType.Inter : h.FrameType,
+            ShowFrame = h.ShowExistingFrame || h.ShowFrame,
+            ShowExistingFrame = h.ShowExistingFrame,
+            FrameToShowMapIndex = h.ExistingFrameIdx,
+            Showable = h.ShowableFrame,
+            ErrorResilient = h.ErrorResilientMode,
+            Width = sized ? h.SuperResUpscaledWidth : 0,
+            Height = sized ? h.Height : 0,
+            RenderWidth = sized ? h.RenderWidth : 0,
+            RenderHeight = sized ? h.RenderHeight : 0,
+            RefreshFrameFlags = h.ShowExistingFrame ? (byte)0 : h.RefreshFrameFlags,
+            BytesConsumed = consumed,
         };
-        
         return true;
     }
     

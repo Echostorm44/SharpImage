@@ -3,6 +3,7 @@
 // Reference: AV1 Bitstream & Decoding Process Specification v1.0.0
 
 using System;
+using System.IO;
 using System.Runtime.CompilerServices;
 
 namespace SharpImage.Formats.Av1;
@@ -991,11 +992,15 @@ public static class Av1ObuParser
         ref var fgd = ref hdr.FilmGrain;
         fgd.Seed = seed;
 
+        // dav1d parse_frame_hdr: at most 14 luma / 10 chroma points, x strictly increasing, and for 4:2:0 both chroma
+        // planes with or both without points; anything else is an invalid header.
         fgd.NumYPoints = (int)gb.GetBits(4);
+        if (fgd.NumYPoints > 14) throw new InvalidDataException("AV1 film grain has more than 14 luma points.");
         for (int i = 0; i < fgd.NumYPoints; i++)
         {
             fgd.YPoints[i * 2] = (byte)gb.GetBits(8);
             fgd.YPoints[i * 2 + 1] = (byte)gb.GetBits(8);
+            if (i > 0 && fgd.YPoints[(i - 1) * 2] >= fgd.YPoints[i * 2]) throw new InvalidDataException("AV1 film grain luma points are not increasing.");
         }
 
         if (!seqHdr.Monochrome)
@@ -1011,14 +1016,19 @@ public static class Av1ObuParser
             for (int pl = 0; pl < 2; pl++)
             {
                 int numUvPoints = (int)gb.GetBits(4);
+                if (numUvPoints > 10) throw new InvalidDataException("AV1 film grain has more than 10 chroma points.");
                 if (pl == 0) fgd.NumUvPoints0 = numUvPoints;
                 else fgd.NumUvPoints1 = numUvPoints;
                 for (int i = 0; i < numUvPoints; i++)
                 {
                     fgd.UvPoints[(pl * 10 + i) * 2] = (byte)gb.GetBits(8);
                     fgd.UvPoints[(pl * 10 + i) * 2 + 1] = (byte)gb.GetBits(8);
+                    if (i > 0 && fgd.UvPoints[(pl * 10 + i - 1) * 2] >= fgd.UvPoints[(pl * 10 + i) * 2])
+                        throw new InvalidDataException("AV1 film grain chroma points are not increasing.");
                 }
             }
+            if (seqHdr.SubsamplingX == 1 && seqHdr.SubsamplingY == 1 && (fgd.NumUvPoints0 != 0) != (fgd.NumUvPoints1 != 0))
+                throw new InvalidDataException("AV1 4:2:0 film grain needs points for both chroma planes or neither.");
         }
 
         fgd.ScalingShift = (int)(gb.GetBits(2) + 8);

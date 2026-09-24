@@ -44,10 +44,13 @@ internal sealed class AvifTrack
     }
 }
 
-/// <summary>ISO BMFF 'moov' parsing for AVIF image sequences (tracks, sample tables, edit lists).</summary>
+/// <summary>ISO BMFF 'moov' parsing for AVIF image sequences (tracks, sample tables, edit lists). Every field read is
+/// bounded by its box, as libavif's avifROStream: a truncated box fails the parse (InvalidDataException).</summary>
 internal static class AvifTracks
 {
-    public static (string MajorBrand, List<AvifTrack> Tracks) Parse(byte[] d)
+    /// <summary>Tracks of the file; at most <paramref name="maxSamples"/> samples per track (libavif imageCountLimit;
+    /// 0: no limit), each lying inside the file.</summary>
+    public static (string MajorBrand, List<AvifTrack> Tracks) Parse(byte[] d, int maxSamples = 0)
     {
         string major = "";
         var tracks = new List<AvifTrack>();
@@ -57,16 +60,13 @@ internal static class AvifTracks
             else if (type == "moov")
             {
                 foreach (var (t2, o2, l2) in HeifContainer.Children(d, off, len))
-                    if (t2 == "trak") tracks.Add(ParseTrak(d, o2, l2));
+                    if (t2 == "trak") tracks.Add(ParseTrak(d, o2, l2, maxSamples));
             }
         }
         return (major, tracks);
     }
 
-    private static uint U32(byte[] d, int o) => BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(o));
-    private static ulong U64(byte[] d, int o) => BinaryPrimitives.ReadUInt64BigEndian(d.AsSpan(o));
-
-    private static AvifTrack ParseTrak(byte[] d, int off, int len)
+    private static AvifTrack ParseTrak(byte[] d, int off, int len, int maxSamples)
     {
         var t = new AvifTrack();
         foreach (var (type, o, l) in HeifContainer.Children(d, off, len))
@@ -75,20 +75,25 @@ internal static class AvifTracks
             {
                 case "tkhd":
                 {
-                    int v = d[o];
-                    t.Id = v == 1 ? U32(d, o + 20) : U32(d, o + 12);
-                    t.TrackDuration = v == 1 ? U64(d, o + 28) : U32(d, o + 20);
+                    var b = new BoxReader(d, o, l, "tkhd");
+                    var (v, _) = b.FullBox();
+                    b.Skip(v == 1 ? 16 : 8);                                   // creation / modification time
+                    t.Id = b.U32();
+                    b.Skip(4);                                                  // reserved
+                    t.TrackDuration = v == 1 ? b.U64() : b.U32();
                     if (v != 1 && t.TrackDuration == uint.MaxValue) t.TrackDuration = ulong.MaxValue;
-                    t.Width = (int)(U32(d, o + l - 8) >> 16);
-                    t.Height = (int)(U32(d, o + l - 4) >> 16);
+                    b.Skip(8 + 2 + 2 + 2 + 2 + 36);                             // reserved, layer, group, volume, reserved, matrix
+                    t.Width = (int)(b.U32() >> 16);
+                    t.Height = (int)(b.U32() >> 16);
                     break;
                 }
                 case "tref":
                     foreach (var (rt, ro, rl) in HeifContainer.Children(d, o, l))
                     {
                         if (rl < 4) continue;
-                        if (rt == "auxl") t.AuxForId = U32(d, ro);
-                        else if (rt == "prem") t.PremById = U32(d, ro);
+                        var b = new BoxReader(d, ro, rl, rt);
+                        if (rt == "auxl") t.AuxForId = b.U32();
+                        else if (rt == "prem") t.PremById = b.U32();
                     }
                     break;
                 case "edts":
@@ -96,137 +101,166 @@ internal static class AvifTracks
                     foreach (var (et, eo, el) in HeifContainer.Children(d, o, l))
                     {
                         if (et != "elst") continue;
-                        int v = d[eo];
-                        int flags = (d[eo + 1] << 16) | (d[eo + 2] << 8) | d[eo + 3];
+                        var b = new BoxReader(d, eo, el, "elst");
+                        var (v, flags) = b.FullBox();
                         t.IsRepeating = (flags & 1) != 0;
                         if (!t.IsRepeating) continue;
-                        uint count = U32(d, eo + 4);
+                        uint count = b.U32();
                         if (count != 1) throw new InvalidDataException("AVIF elst must have exactly one entry.");
-                        t.SegmentDuration = v == 1 ? U64(d, eo + 8) : U32(d, eo + 8);
+                        t.SegmentDuration = v == 1 ? b.U64() : b.U32();
                         if (t.SegmentDuration == 0) throw new InvalidDataException("AVIF elst segment_duration is 0.");
                     }
                     break;
                 case "mdia":
-                    ParseMdia(d, o, l, t);
+                    ParseMdia(d, o, l, t, maxSamples);
                     break;
             }
         }
         return t;
     }
 
-    private static void ParseMdia(byte[] d, int off, int len, AvifTrack t)
+    private static void ParseMdia(byte[] d, int off, int len, AvifTrack t, int maxSamples)
     {
         foreach (var (type, o, l) in HeifContainer.Children(d, off, len))
         {
             if (type == "mdhd")
             {
-                int v = d[o];
-                t.MediaTimescale = v == 1 ? U32(d, o + 20) : U32(d, o + 12);
-                t.MediaDuration = v == 1 ? U64(d, o + 24) : U32(d, o + 16);
+                var b = new BoxReader(d, o, l, "mdhd");
+                var (v, _) = b.FullBox();
+                b.Skip(v == 1 ? 16 : 8);
+                t.MediaTimescale = b.U32();
+                t.MediaDuration = v == 1 ? b.U64() : b.U32();
             }
             else if (type == "hdlr" && l >= 12) t.Handler = System.Text.Encoding.ASCII.GetString(d, o + 8, 4);
             else if (type == "minf")
                 foreach (var (mt, mo, ml) in HeifContainer.Children(d, o, l))
-                    if (mt == "stbl") ParseStbl(d, mo, ml, t);
+                    if (mt == "stbl") ParseStbl(d, mo, ml, t, maxSamples);
         }
     }
 
-    private static void ParseStbl(byte[] d, int off, int len, AvifTrack t)
+    private static void ParseStbl(byte[] d, int off, int len, AvifTrack t, int maxSamples)
     {
+        long cap = maxSamples > 0 ? maxSamples : int.MaxValue;
         var chunkOffsets = new List<long>();
         var stsc = new List<(uint FirstChunk, uint PerChunk)>();
         var sizes = new List<int>();
-        var durations = new List<uint>();
+        uint fixedSize = 0;
+        long fixedCount = -1;
+        var timeRuns = new List<(uint Count, uint Delta)>();
         List<uint>? sync = null;
         foreach (var (type, o, l) in HeifContainer.Children(d, off, len))
         {
+            var b = new BoxReader(d, o, l, type);
             switch (type)
             {
                 case "stsd":
                 {
-                    uint count = U32(d, o + 4);
+                    b.FullBox();
+                    uint count = b.U32();
                     if (count == 0) break;
-                    int eo = o + 8;
-                    int esz = (int)U32(d, eo);
+                    int eo = b.Pos;
+                    long esz = b.U32();
+                    if (esz < 8 || esz > l - (eo - o)) throw new InvalidDataException("Truncated Box[stsd].");
                     t.Codec = System.Text.Encoding.ASCII.GetString(d, eo + 4, 4);
                     // VisualSampleEntry: 8-byte box header + 78 bytes of fixed fields, then child boxes.
-                    if (esz > 86) t.Properties.AddRange(HeifContainer.Children(d, eo + 86, esz - 86));
+                    if (esz > 86) t.Properties.AddRange(HeifContainer.Children(d, eo + 86, (int)esz - 86));
                     break;
                 }
                 case "stts":
                 {
-                    uint n = U32(d, o + 4);
-                    for (int i = 0; i < n; i++)
-                    {
-                        uint cnt = U32(d, o + 8 + 8 * i), delta = U32(d, o + 12 + 8 * i);
-                        for (uint k = 0; k < cnt; k++) durations.Add(delta);
-                    }
+                    b.FullBox();
+                    uint n = b.U32();
+                    for (uint i = 0; i < n; i++) timeRuns.Add((b.U32(), b.U32()));
                     break;
                 }
                 case "stss":
                 {
-                    uint n = U32(d, o + 4);
+                    b.FullBox();
+                    uint n = b.U32();
                     sync = [];
-                    for (int i = 0; i < n; i++) sync.Add(U32(d, o + 8 + 4 * i));
+                    for (uint i = 0; i < n; i++) sync.Add(b.U32());
                     break;
                 }
                 case "stsc":
                 {
-                    uint n = U32(d, o + 4);
-                    for (int i = 0; i < n; i++) stsc.Add((U32(d, o + 8 + 12 * i), U32(d, o + 12 + 12 * i)));
+                    b.FullBox();
+                    uint n = b.U32();
+                    for (uint i = 0; i < n; i++)
+                    {
+                        uint first = b.U32(), per = b.U32();
+                        b.U32();                                               // sample_description_index
+                        stsc.Add((first, per));
+                    }
                     break;
                 }
                 case "stsz":
                 {
-                    uint fixedSize = U32(d, o + 4), n = U32(d, o + 8);
-                    for (int i = 0; i < n; i++) sizes.Add((int)(fixedSize != 0 ? fixedSize : U32(d, o + 12 + 4 * i)));
+                    b.FullBox();
+                    fixedSize = b.U32();
+                    uint n = b.U32();
+                    if (n > cap) throw new InvalidDataException("Exceeded the image count limit.");
+                    if (fixedSize != 0) fixedCount = n;
+                    else for (uint i = 0; i < n; i++) sizes.Add((int)Math.Min(b.U32(), int.MaxValue));
                     break;
                 }
                 case "stz2":
                 {
-                    int field = d[o + 7];
-                    uint n = U32(d, o + 8);
-                    for (int i = 0; i < n; i++)
-                        sizes.Add(field switch
-                        {
-                            4 => (d[o + 12 + i / 2] >> (i % 2 == 0 ? 4 : 0)) & 15,
-                            8 => d[o + 12 + i],
-                            _ => BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(o + 12 + 2 * i)),
-                        });
+                    b.FullBox();
+                    b.Skip(3);
+                    int field = b.U8();
+                    uint n = b.U32();
+                    if (n > cap) throw new InvalidDataException("Exceeded the image count limit.");
+                    if (field is not (4 or 8 or 16)) throw new InvalidDataException("Invalid Box[stz2] field size.");
+                    for (uint i = 0; i < n; i++)
+                    {
+                        if (field == 4) { byte v = b.U8(); sizes.Add(v >> 4); if (++i < n) sizes.Add(v & 15); }
+                        else sizes.Add(field == 8 ? b.U8() : b.U16());
+                    }
                     break;
                 }
                 case "stco":
                 {
-                    uint n = U32(d, o + 4);
-                    for (int i = 0; i < n; i++) chunkOffsets.Add(U32(d, o + 8 + 4 * i));
+                    b.FullBox();
+                    uint n = b.U32();
+                    for (uint i = 0; i < n; i++) chunkOffsets.Add(b.U32());
                     break;
                 }
                 case "co64":
                 {
-                    uint n = U32(d, o + 4);
-                    for (int i = 0; i < n; i++) chunkOffsets.Add((long)U64(d, o + 8 + 8 * i));
+                    b.FullBox();
+                    uint n = b.U32();
+                    for (uint i = 0; i < n; i++) chunkOffsets.Add((long)Math.Min(b.U64(), long.MaxValue));
                     break;
                 }
             }
         }
 
         // Sample positions: walk the chunks, taking samples_per_chunk from the stsc run covering each chunk.
+        long sampleCount = fixedCount >= 0 ? fixedCount : sizes.Count;
+        int SizeOf(int i) => fixedCount >= 0 ? (int)Math.Min(fixedSize, int.MaxValue) : sizes[i];
         int sample = 0;
-        for (int c = 0; c < chunkOffsets.Count && sample < sizes.Count; c++)
+        for (int c = 0; c < chunkOffsets.Count && sample < sampleCount; c++)
         {
             uint perChunk = 0;
             foreach (var (first, per) in stsc) if (first <= c + 1) perChunk = per;
+            if (perChunk == 0) throw new InvalidDataException("Sample table contains a chunk with 0 samples.");
             long pos = chunkOffsets[c];
-            for (uint k = 0; k < perChunk && sample < sizes.Count; k++)
+            for (uint k = 0; k < perChunk && sample < sampleCount; k++)
             {
-                t.Samples.Add((pos, sizes[sample]));
-                pos += sizes[sample];
+                int size = SizeOf(sample);
+                if (pos < 0 || pos > d.Length - (long)size) throw new InvalidDataException($"Sample {sample} lies outside the file.");
+                t.Samples.Add((pos, size));
+                pos += size;
                 sample++;
             }
         }
         t.Durations = new uint[t.Samples.Count];
-        for (int i = 0; i < t.Durations.Length; i++) t.Durations[i] = i < durations.Count ? durations[i] : 1;
+        int di = 0;
+        foreach (var (count, delta) in timeRuns)
+            for (uint k = 0; k < count && di < t.Durations.Length; k++) t.Durations[di++] = delta;
+        for (; di < t.Durations.Length; di++) t.Durations[di] = 1;
         t.Sync = new bool[t.Samples.Count];
-        for (int i = 0; i < t.Sync.Length; i++) t.Sync[i] = sync == null || sync.Contains((uint)(i + 1));
+        if (sync == null) Array.Fill(t.Sync, true);
+        else foreach (uint s1 in sync) if (s1 >= 1 && s1 <= t.Sync.Length) t.Sync[s1 - 1] = true;
     }
 }

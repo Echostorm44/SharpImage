@@ -1698,6 +1698,32 @@ public sealed class Av1HbdVerify
                             log.AppendLine($"{Path.GetFileName(f)} {Av1Conformance.CheckVector(f)}");
                     continue;
                 }
+                if (t[0] == "jrawall")
+                {
+                    // jrawall <dir>: every *.jpg decoded like jraw into <file>.ours, or "<Type> message" into <file>.err
+                    // (differential fuzzing against libjpeg-turbo's ljdump).
+                    foreach (var f in Directory.GetFiles(t[1], "*.jpg").Order())
+                    {
+                        try
+                        {
+                            using var fr = JpegCoder.Read(f);
+                            using var fo = File.Create(f + ".ours");
+                            int nch = fr.NumberOfChannels;
+                            fo.Write(System.Text.Encoding.ASCII.GetBytes($"{fr.Columns} {fr.Rows} {nch} {fr.Colorspace}" + "\n"));
+                            for (int y = 0; y < (int)fr.Rows; y++)
+                            {
+                                var row = fr.GetPixelRow(y);
+                                for (int k = 0; k < (int)fr.Columns * nch; k++) { fo.WriteByte((byte)row[k]); fo.WriteByte((byte)(row[k] >> 8)); }
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            string frame = e.StackTrace?.Split('\n').Select(l => l.Trim()).FirstOrDefault(l => l.StartsWith("at SharpImage.")) ?? "";
+                            File.WriteAllText(f + ".err", $"{e.GetType().Name} {e.Message.Split('\n')[0]} | {frame}");
+                        }
+                    }
+                    continue;
+                }
                 if (t[0] == "jraw")
                 {
                     // jraw <in.jpg> <out>: our JPEG decode as a "w h channels colorspace" line + 16-bit LE samples (all channels).

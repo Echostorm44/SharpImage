@@ -338,6 +338,52 @@ public static partial class HeifCoder
         return false;
     }
 
+    /// <summary>Decodes an AVIF / HEIC image under the given resource limits (null: <see cref="AvifDecodeOptions.Default"/>).</summary>
+    public static ImageFrame Decode(byte[] data, AvifDecodeOptions? options) => WithLimits(options, () => Decode(data));
+
+    /// <summary><see cref="DecodeSequence(byte[])"/> under the given resource limits.</summary>
+    public static ImageSequence DecodeSequence(byte[] data, AvifDecodeOptions? options) => WithLimits(options, () => DecodeSequence(data));
+
+    /// <summary><see cref="DecodeProgressive(byte[])"/> under the given resource limits.</summary>
+    public static IReadOnlyList<ImageFrame> DecodeProgressive(byte[] data, AvifDecodeOptions? options) => WithLimits(options, () => DecodeProgressive(data));
+
+    // The limits of the decode running on this thread (libavif avifDecoder imageSizeLimit / imageDimensionLimit /
+    // imageCountLimit); every decode is limited, by default with libavif's defaults.
+    [ThreadStatic] private static AvifDecodeOptions? t_limits;
+    private static AvifDecodeOptions Limits => t_limits ?? AvifDecodeOptions.Default;
+
+    private static T WithLimits<T>(AvifDecodeOptions? options, Func<T> decode)
+    {
+        var previous = t_limits;
+        t_limits = options ?? previous;
+        try { return decode(); }
+        finally { t_limits = previous; }
+    }
+
+    // An AV1 decoder for untrusted input: frames larger than the image size limit fail before allocation (libavif sets
+    // dav1d's frame_size_limit / checks aom's stream info against imageSizeLimit).
+    private static Av1.Av1Decoder NewAv1Decoder() => new() { FrameSizeLimit = Limits.ImageSizeLimit };
+
+    // libavif avifDecoderParse: every image item (coded or grid, with data, not a thumbnail) with an 'ispe' must have a
+    // non-zero size within the limits.
+    private static void CheckItemLimits(HeifContainer c)
+    {
+        foreach (var item in c.Items.Values)
+        {
+            if (item.Type is not ("av01" or "grid" or "hvc1") || c.ReferencesFrom(item.Id, "thmb").Count > 0) continue;
+            if (item.Type != "grid" && item.Extents.Count == 0) continue;
+            if (c.Property(item.Id, "ispe") is not { Len: >= 12 } p)
+            {
+                // Alpha may lack 'ispe' (libavif without AVIF_STRICT_ALPHA_ISPE_REQUIRED: the decoded size is used).
+                if (IsAlphaAux(c, item.Id)) continue;
+                throw new InvalidDataException($"Item ID [{item.Id}] is missing a mandatory ispe property.");
+            }
+            long w = BinaryPrimitives.ReadUInt32BigEndian(c.Data.AsSpan(p.Off + 4)), h = BinaryPrimitives.ReadUInt32BigEndian(c.Data.AsSpan(p.Off + 8));
+            if (w == 0 || h == 0) throw new InvalidDataException($"Item ID [{item.Id}] has an invalid size [{w}x{h}].");
+            if (Limits.TooLarge(w, h)) throw new InvalidDataException($"Item ID [{item.Id}] dimensions are too large [{w}x{h}].");
+        }
+    }
+
     public static ImageFrame Decode(byte[] data)
     {
         // libavif AVIF_DECODER_SOURCE_AUTO: an 'avis' major brand (or no 'avif' major brand with tracks present) decodes
@@ -356,7 +402,7 @@ public static partial class HeifCoder
     {
         tracks = null;
         if (data.Length < 12) return false;
-        var parsed = AvifTracks.Parse(data);
+        var parsed = AvifTracks.Parse(data, Limits.ImageCountLimit);
         bool anyTrack = parsed.Tracks.Exists(t => t.Samples.Count > 0 && t.Codec == "av01");
         // Honour the major brand ('avis' tracks, 'avif' primary item), otherwise prefer tracks when present.
         if (!anyTrack || parsed.MajorBrand == "avif") return false;
@@ -407,8 +453,14 @@ public static partial class HeifCoder
         int rep = color.RepetitionCount;
         seq.LoopCount = rep < 0 ? 0 : rep + 1;   // plays in total; infinite / unknown -> 0 (loop forever)
 
-        var cDec = new Av1.Av1Decoder();
-        var aDec = alpha != null ? new Av1.Av1Decoder() : null;
+        // libavif avifParseMovieBox / avifCodecDecodeInputFillFromSampleTable: track sizes and frame counts are limited.
+        foreach (var tr in alpha != null ? new[] { color, alpha } : [color])
+        {
+            if (Limits.TooLarge(tr.Width, tr.Height)) throw new InvalidDataException($"Track ID [{tr.Id}] dimensions are too large [{tr.Width}x{tr.Height}].");
+            if (Limits.ImageCountLimit != 0 && tr.Samples.Count > Limits.ImageCountLimit) throw new InvalidDataException("Exceeded the image count limit.");
+        }
+        var cDec = NewAv1Decoder();
+        var aDec = alpha != null ? NewAv1Decoder() : null;
         int n = Math.Min(maxFrames, color.Samples.Count);
         for (int i = 0; i < n; i++)
         {
@@ -470,6 +522,7 @@ public static partial class HeifCoder
         var c = HeifContainer.Parse(data);
         int layers = c.Primary is { } p ? ProgressiveLayerCount(c, p.Type == "grid" ? c.ReferencesFrom(p.Id, "dimg").FirstOrDefault() : p.Id) : 0;
         if (layers <= 1) return [DecodeCore(data)];
+        if (Limits.ImageCountLimit != 0 && layers > Limits.ImageCountLimit) throw new InvalidDataException("Exceeded the image count limit (progressive).");
         var result = new List<ImageFrame>(layers);
         for (int i = 0; i < layers; i++)
         {
@@ -526,6 +579,7 @@ public static partial class HeifCoder
         }
 
         var c = HeifContainer.Parse(data);
+        CheckItemLimits(c);
         var primary = c.Primary ?? throw new InvalidDataException("AVIF/HEIC has no primary item.");
         int pid = primary.Id;
         // libavif validates the gain map of every file carrying the 'tmap' brand; invalid gain map metadata fails the decode.
@@ -788,8 +842,12 @@ public static partial class HeifCoder
         if (g.Length < 8 || g[0] != 0) throw new InvalidDataException("Unsupported image grid payload.");
         bool large = (g[1] & 1) != 0;
         if (large && g.Length < 12) throw new InvalidDataException("Truncated image grid payload.");
-        int w = large ? (int)BinaryPrimitives.ReadUInt32BigEndian(g.AsSpan(4)) : BinaryPrimitives.ReadUInt16BigEndian(g.AsSpan(4));
-        int h = large ? (int)BinaryPrimitives.ReadUInt32BigEndian(g.AsSpan(8)) : BinaryPrimitives.ReadUInt16BigEndian(g.AsSpan(6));
+        long lw = large ? BinaryPrimitives.ReadUInt32BigEndian(g.AsSpan(4)) : BinaryPrimitives.ReadUInt16BigEndian(g.AsSpan(4));
+        long lh = large ? BinaryPrimitives.ReadUInt32BigEndian(g.AsSpan(8)) : BinaryPrimitives.ReadUInt16BigEndian(g.AsSpan(6));
+        // libavif avifParseImageGridBox: a non-empty output within the limits.
+        if (lw == 0 || lh == 0) throw new InvalidDataException("Image grid has an invalid output size.");
+        if (Limits.TooLarge(lw, lh)) throw new InvalidDataException($"Grid image dimensions are too large [{lw}x{lh}].");
+        int w = (int)lw, h = (int)lh;
         return (g[2] + 1, g[3] + 1, w, h);
     }
 
@@ -821,8 +879,7 @@ public static partial class HeifCoder
         var nclx = Nclx(c, id) ?? inherited;
         int w, h;
         if (c.Ispe(id) is { } ispe) (w, h) = ispe;
-        else if (codec == "av01") InferAv1Dimensions(coded, out w, out h);
-        else throw new InvalidDataException("Cannot determine image dimensions");
+        else throw new InvalidDataException($"Item ID [{id}] is missing a mandatory ispe property.");
         var f = new ImageFrame();
         f.Initialize(w, h, ColorspaceType.SRGB, false);
         if (codec == "av01")
@@ -847,9 +904,9 @@ public static partial class HeifCoder
         {
             byte[]? coded = c.ItemData(aTiles[i]);
             if (coded == null) continue;
-            int w, h;
+            // An alpha item without 'ispe' takes its decoded size, which must be the colour tile's.
+            int w = (int)frame.Columns / cols, h = (int)frame.Rows / Math.Max(1, (aTiles.Count + cols - 1) / cols);
             if (c.Ispe(aTiles[i]) is { } ispe) (w, h) = ispe;
-            else InferAv1Dimensions(coded, out w, out h);
             var af = new ImageFrame();
             af.Initialize(w, h, ColorspaceType.SRGB, false);
             ApplyAv1Alpha(coded, af, w, h, c, aTiles[i]);
@@ -2515,67 +2572,6 @@ public static partial class HeifCoder
 
     #region AV1 Intra Frame Codec
 
-    private static void InferAv1Dimensions(ReadOnlySpan<byte> obu, out int width, out int height)
-    {
-        width = height = 0;
-        // AV1 OBU (Open Bitstream Unit) parsing
-        // First OBU should be sequence header
-        if (obu.Length < 4)
-        {
-            return;
-        }
-
-        int pos = 0;
-        while (pos < obu.Length)
-        {
-            byte header = obu[pos++];
-            int obuType = (header >> 3) & 0xF;
-            bool hasSize = (header & 0x02) != 0;
-            bool hasExtension = (header & 0x04) != 0;
-            if (hasExtension && pos < obu.Length)
-            {
-                pos++; // skip extension
-            }
-
-            int obuSize = 0;
-            if (hasSize)
-            {
-                // LEB128 size
-                obuSize = ReadLeb128(obu, ref pos);
-            }
-
-            if (obuType == 1) // OBU_SEQUENCE_HEADER
-            {
-                // Parse sequence header for dimensions
-                if (pos + 8 <= obu.Length)
-                {
-                    // Simplified: read frame width/height from fixed positions
-                    var bitReader = new SimpleBitReader(obu[pos..].ToArray());
-                    int seqProfile = (int)bitReader.Read(3);
-                    bitReader.Read(1); // still_picture
-                    bitReader.Read(1); // reduced_still_picture_header
-
-                    // In reduced still picture header mode:
-                    bitReader.Read(5); // seq_level_idx
-                    int maxFrameWidthMinus1Bits = (int)bitReader.Read(4) + 1;
-                    int maxFrameHeightMinus1Bits = (int)bitReader.Read(4) + 1;
-                    width = (int)bitReader.Read(maxFrameWidthMinus1Bits) + 1;
-                    height = (int)bitReader.Read(maxFrameHeightMinus1Bits) + 1;
-                    return;
-                }
-            }
-
-            if (hasSize)
-            {
-                pos += obuSize;
-            }
-            else
-            {
-                break;
-            }
-        }
-    }
-
     // Decodes a monochrome AV1 alpha auxiliary item and writes its luma samples into the frame's alpha channel
     // (enabling alpha if needed). Full-range 8-bit is the standard AVIF alpha representation.
     private static void ApplyAv1Alpha(ReadOnlySpan<byte> codedData, ImageFrame frame, int w, int h, HeifContainer? c = null, int id = 0)
@@ -2586,6 +2582,8 @@ public static partial class HeifCoder
 
     private static void ApplyDecodedAlpha(Av1.DecodedVideoFrame yuv, bool fullRange, ImageFrame frame, int w, int h)
     {
+        if (yuv.Width != w || yuv.Height != h || frame.Columns < w || frame.Rows < h)
+            throw new InvalidDataException($"The alpha plane ({yuv.Width}x{yuv.Height}) does not match the image ({w}x{h}).");
         if (!fullRange)
         {
             ApplyAv1AlphaLimited(yuv, frame, w, h);
@@ -3002,7 +3000,7 @@ public static partial class HeifCoder
     /// </summary>
     private static Av1.DecodedVideoFrame DecodeAv1Item(HeifContainer? c, int id, ReadOnlySpan<byte> coded, out Av1.Av1Decoder decoder, string what)
     {
-        decoder = new Av1.Av1Decoder();
+        decoder = NewAv1Decoder();
         int layer = -1;
         bool byIndex = false;
         if (c != null)
@@ -3039,6 +3037,12 @@ public static partial class HeifCoder
     // image whose coded size is not its item's output size.
     private static Av1.DecodedVideoFrame ScaleDecodedFrame(Av1.DecodedVideoFrame f, int w, int h)
     {
+        // libavif avifImageScaleWithLimit: a valid target within the limits, and (its guard against integer overflow
+        // in libyuv's scalers) a source of at most 16384 x 16384.
+        if (w <= 0 || h <= 0) throw new InvalidDataException($"Invalid scaling target {w}x{h}.");
+        if (Limits.TooLarge(w, h)) throw new InvalidDataException($"Scaling target {w}x{h} is too large.");
+        if (f.Width > 16384 || f.Height > 16384)
+            throw new NotSupportedException($"Scaling a {f.Width}x{f.Height} frame to {w}x{h} is not supported (libavif's 16384 limit).");
         int ssx = f.Format is Av1.PixelFormat.Yuv444P or Av1.PixelFormat.Yuv444P10 or Av1.PixelFormat.Yuv444P12 ? 0 : 1;
         int ssy = f.Format is Av1.PixelFormat.Yuv420P or Av1.PixelFormat.Yuv420P10 or Av1.PixelFormat.Yuv420P12 ? 1 : 0;
         bool hbd = f.BitDepth > 8;
@@ -3560,24 +3564,6 @@ public static partial class HeifCoder
         return 0;
     }
 
-    private static int ReadLeb128(ReadOnlySpan<byte> data, ref int pos)
-    {
-        int result = 0;
-        int shift = 0;
-        while (pos < data.Length)
-        {
-            byte b = data[pos++];
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-            {
-                break;
-            }
-
-            shift += 7;
-        }
-        return result;
-    }
-
     private static bool IsAvifBrand(string brand) => AvifBrands.Any(b => brand.StartsWith(b));
 
     private static bool IsHeicBrand(string brand) => HeicBrands.Any(b => brand.StartsWith(b));
@@ -3596,39 +3582,6 @@ public static partial class HeifCoder
     #endregion
 
     #region Simple Bit I/O
-
-    private sealed class SimpleBitReader
-    {
-        private readonly byte[] data;
-        private int pos;
-        private int bitPos;
-
-        public SimpleBitReader(byte[] data)
-        {
-            this.data = data;
-            pos = 0;
-            bitPos = 7;
-        }
-
-        public uint Read(int numBits)
-        {
-            uint result = 0;
-            for (int i = 0;i < numBits;i++)
-            {
-                if (pos < data.Length)
-                {
-                    result |= (uint)((data[pos] >> bitPos) & 1) << (numBits - 1 - i);
-                    bitPos--;
-                    if (bitPos < 0)
-                    {
-                        bitPos = 7;
-                        pos++;
-                    }
-                }
-            }
-            return result;
-        }
-    }
 
     private sealed class SimpleBitWriter
     {

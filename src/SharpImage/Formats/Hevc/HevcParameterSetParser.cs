@@ -538,6 +538,13 @@ public static class HevcParameterSetParser
                     sps.ConfWinRightOffset = (int)reader.ReadExpGolombUnsigned();
                     sps.ConfWinTopOffset = (int)reader.ReadExpGolombUnsigned();
                     sps.ConfWinBottomOffset = (int)reader.ReadExpGolombUnsigned();
+                    // 7.4.3.2.1: the window must leave a non-empty picture (SubWidthC * (left + right) < width, ...).
+                    int subW = sps.ChromaFormatIdc is HevcChromaFormat.Chroma420 or HevcChromaFormat.Chroma422 ? 2 : 1;
+                    int subH = sps.ChromaFormatIdc == HevcChromaFormat.Chroma420 ? 2 : 1;
+                    if (sps.ConfWinLeftOffset < 0 || sps.ConfWinRightOffset < 0 || sps.ConfWinTopOffset < 0 || sps.ConfWinBottomOffset < 0
+                        || (long)subW * (sps.ConfWinLeftOffset + (long)sps.ConfWinRightOffset) >= sps.PictureWidthInLumaSamples
+                        || (long)subH * (sps.ConfWinTopOffset + (long)sps.ConfWinBottomOffset) >= sps.PictureHeightInLumaSamples)
+                        return null;
                 }
 
                 // bit_depth_luma_minus8
@@ -580,7 +587,16 @@ public static class HevcParameterSetParser
             sps.Log2DiffMaxMinLumaCodingBlockSize = (byte)reader.ReadExpGolombUnsigned();
             sps.Log2MinLumaTransformBlockSizeMinus2 = (byte)reader.ReadExpGolombUnsigned();
             sps.Log2DiffMaxMinLumaTransformBlockSize = (byte)reader.ReadExpGolombUnsigned();
-            
+            {
+                // 7.4.3.2.1 (as FFmpeg's hevc_ps checks): CtbLog2SizeY 4..6, transform sizes 2..min(CtbLog2SizeY, 5)
+                // below the minimum coding block, and the picture a whole number of minimum coding blocks.
+                int log2MinCb = sps.Log2MinLumaCodingBlockSizeMinus3 + 3, log2Ctb = log2MinCb + sps.Log2DiffMaxMinLumaCodingBlockSize;
+                int log2MinTb = sps.Log2MinLumaTransformBlockSizeMinus2 + 2, log2MaxTb = log2MinTb + sps.Log2DiffMaxMinLumaTransformBlockSize;
+                if (log2Ctb is < 4 or > 6 || log2MinTb >= log2MinCb || log2MaxTb > Math.Min(log2Ctb, 5)
+                    || sps.PictureWidthInLumaSamples % (1 << log2MinCb) != 0 || sps.PictureHeightInLumaSamples % (1 << log2MinCb) != 0)
+                    return null;
+            }
+
             sps.MaxTransformHierarchyDepthInter = (byte)reader.ReadExpGolombUnsigned();
             sps.MaxTransformHierarchyDepthIntra = (byte)reader.ReadExpGolombUnsigned();
 

@@ -127,6 +127,10 @@ internal sealed class Av1Decoder
     /// operating point's operating_point_idc are dropped (AVIF 'a1op').</summary>
     public int OperatingPoint { get; set; }
 
+    /// <summary>dav1d frame_size_limit: a frame header whose upscaled width x height exceeds this many pixels fails the
+    /// decode before anything is allocated (0: no limit). libavif passes its imageSizeLimit here.</summary>
+    public long FrameSizeLimit { get; set; }
+
     /// <summary>
     /// Decodes one temporal unit and returns every shown frame in decode order with its spatial id (dav1d all_layers:
     /// a layered / progressive AVIF item yields one frame per layer). Each frame is decoded as soon as its tiles are
@@ -181,20 +185,22 @@ internal sealed class Av1Decoder
             }
 
             int headerBytes = gb.BytePosition;
-            int obuSize;
+            long obuSizeLong;
             if (hasLengthField)
             {
-                obuSize = (int)gb.GetUleb128();
+                obuSizeLong = gb.GetUleb128();
                 headerBytes = gb.BytePosition;
             }
             else
             {
                 // Without length field, OBU extends to end of temporal unit
-                obuSize = data.Length - offset - headerBytes;
+                obuSizeLong = data.Length - offset - headerBytes;
             }
 
-            if (offset + headerBytes + obuSize > data.Length)
-                break; // truncated
+            // dav1d_parse_obus: an OBU (header or payload) running past the data is an error, not a silent stop.
+            if (headerBytes > data.Length - offset || obuSizeLong > data.Length - offset - headerBytes)
+                throw new InvalidDataException("AV1 OBU extends past the end of the data.");
+            int obuSize = (int)obuSizeLong;
 
             var obuPayload = data.Slice(offset + headerBytes, obuSize);
             offset += headerBytes + obuSize;
@@ -290,6 +296,8 @@ internal sealed class Av1Decoder
         var result = Av1ObuParser.ParseFrameHeader(frameHdr, seqHdr, ctx.RefFrames, payload, out bytesConsumed, isObuFrame);
         if (result != Av1ObuParser.ParseResult.Ok)
             return false;
+        if (FrameSizeLimit > 0 && (long)frameHdr.SuperResUpscaledWidth * frameHdr.Height > FrameSizeLimit)
+            throw new InvalidDataException($"AV1 frame size {frameHdr.SuperResUpscaledWidth}x{frameHdr.Height} exceeds the limit of {FrameSizeLimit} pixels.");
 
         // Propagate sequence header fields that the frame header needs
         frameHdr.PixelLayout = seqHdr.Layout;

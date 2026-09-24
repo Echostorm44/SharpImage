@@ -10,6 +10,38 @@ using System.Text;
 
 namespace SharpImage.Formats;
 
+/// <summary>A cursor over one ISO BMFF box payload whose reads are bounded by the box (libavif avifROStream): reading
+/// past its end throws <see cref="InvalidDataException"/> ("Truncated Box[type]").</summary>
+internal struct BoxReader(byte[] d, int off, int len, string name)
+{
+    private int pos = off;
+    private readonly int end = off + len;
+
+    private readonly void Need(long n)
+    {
+        if (n < 0 || pos > end - n) throw new InvalidDataException($"Truncated Box[{name}].");
+    }
+    public readonly int Pos => pos;
+    public readonly int Remaining => end - pos;
+    public void Skip(int n) { Need(n); pos += n; }
+    public byte U8() { Need(1); return d[pos++]; }
+    public uint U24() { Need(3); uint v = (uint)((d[pos] << 16) | (d[pos + 1] << 8) | d[pos + 2]); pos += 3; return v; }
+    public ushort U16() { Need(2); var v = BinaryPrimitives.ReadUInt16BigEndian(d.AsSpan(pos)); pos += 2; return v; }
+    public uint U32() { Need(4); var v = BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(pos)); pos += 4; return v; }
+    public ulong U64() { Need(8); var v = BinaryPrimitives.ReadUInt64BigEndian(d.AsSpan(pos)); pos += 8; return v; }
+    /// <summary>An unsigned big-endian field of 0, 4 or 8 bytes (iloc offset / length sizes); 0 bytes reads 0.</summary>
+    public ulong UN(int size) => size switch
+    {
+        0 => 0,
+        1 => U8(),
+        2 => U16(),
+        4 => U32(),
+        8 => U64(),
+        _ => throw new InvalidDataException($"Box[{name}] has an invalid field size {size}."),
+    };
+    public (byte Version, uint Flags) FullBox() => (U8(), U24());
+}
+
 internal sealed class HeifItem
 {
     public int Id;
@@ -110,8 +142,10 @@ internal sealed class HeifContainer
     /// <summary>ispe of an item (width, height), if any.</summary>
     public (int W, int H)? Ispe(int itemId)
         => Property(itemId, "ispe") is { Len: >= 12 } p
-            ? ((int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p.Off + 4)), (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p.Off + 8)))
+            ? (Dim(BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p.Off + 4))), Dim(BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p.Off + 8))))
             : null;
+
+    private static int Dim(uint v) => v is > 0 and <= int.MaxValue ? (int)v : throw new InvalidDataException($"Invalid ispe dimension {v}.");
 
     private void ParseMeta(int off, int len)
     {
@@ -120,10 +154,12 @@ internal sealed class HeifContainer
         {
             switch (type)
             {
-                case "pitm" when bLen >= 6:
-                    PrimaryId = data[bOff] == 0 ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(bOff + 4))
-                                                : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(bOff + 4));
+                case "pitm":
+                {
+                    var b = new BoxReader(data, bOff, bLen, "pitm");
+                    PrimaryId = b.FullBox().Version == 0 ? b.U16() : ItemId(b.U32());
                     break;
+                }
                 case "idat":
                     idatOff = bOff; idatLen = bLen;
                     break;
@@ -161,16 +197,20 @@ internal sealed class HeifContainer
         return it;
     }
 
+    // Item ids are 16 or 32 bits; ids past int.MaxValue cannot name anything we could reference.
+    private static int ItemId(uint id) => id <= int.MaxValue ? (int)id : throw new InvalidDataException($"Item ID {id} is out of range.");
+
     private void ParseIinf(int off, int len)
     {
-        if (len < 6) return;
-        int pos = off + 4 + (data[off] == 0 ? 2 : 4);
+        var b = new BoxReader(data, off, len, "iinf");
+        if (b.FullBox().Version == 0) b.U16(); else b.U32();   // entry_count (the infe children are what count)
+        int pos = b.Pos;
         foreach (var (type, pOff, pLen) in Children(data, pos, off + len - pos))
         {
             if (type != "infe" || pLen < 4) continue;
             int v = data[pOff], q = pOff + 4, qEnd = pOff + pLen;
             if (v < 2 || q + (v == 2 ? 2 : 4) + 6 > qEnd) continue;
-            int id = v == 2 ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q)) : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(q));
+            int id = v == 2 ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q)) : ItemId(BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(q)));
             q += (v == 2 ? 2 : 4) + 2;
             var item = Item(id);
             item.Type = Encoding.ASCII.GetString(data, q, 4);
@@ -186,30 +226,28 @@ internal sealed class HeifContainer
 
     private void ParseIloc(int off, int len)
     {
-        int end = off + len;
-        if (len < 8) return;
-        int version = data[off];
-        int offsetSize = data[off + 4] >> 4, lengthSize = data[off + 4] & 0xF;
-        int baseOffsetSize = data[off + 5] >> 4, indexSize = version >= 1 ? data[off + 5] & 0xF : 0;
-        int pos = off + 6;
-        int count;
-        if (version < 2) { count = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)); pos += 2; }
-        else { count = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos)); pos += 4; }
-        for (int i = 0; i < count && pos < end; i++)
+        var b = new BoxReader(data, off, len, "iloc");
+        int version = b.FullBox().Version;
+        if (version > 2) throw new InvalidDataException($"Box[iloc] version {version} is not supported.");
+        byte sizes = b.U8(), sizes2 = b.U8();
+        int offsetSize = sizes >> 4, lengthSize = sizes & 0xF;
+        int baseOffsetSize = sizes2 >> 4, indexSize = version >= 1 ? sizes2 & 0xF : 0;
+        foreach (int sz in (int[])[offsetSize, lengthSize, baseOffsetSize, indexSize])
+            if (sz is not (0 or 4 or 8)) throw new InvalidDataException($"Box[iloc] has an invalid field size {sz}.");
+        uint count = version < 2 ? b.U16() : b.U32();
+        for (uint i = 0; i < count; i++)
         {
-            int id;
-            if (version < 2) { id = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)); pos += 2; }
-            else { id = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos)); pos += 4; }
+            int id = version < 2 ? b.U16() : ItemId(b.U32());
             var item = Item(id);
-            if (version >= 1) { item.ConstructionMethod = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)) & 0xF; pos += 2; }
-            pos += 2;   // data_reference_index
-            item.BaseOffset = ReadN(pos, baseOffsetSize); pos += baseOffsetSize;
-            int extents = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)); pos += 2;
-            for (int e = 0; e < extents && pos <= end; e++)
+            if (version >= 1) item.ConstructionMethod = b.U16() & 0xF;
+            b.U16();   // data_reference_index
+            item.BaseOffset = (long)Math.Min(b.UN(baseOffsetSize), long.MaxValue);
+            int extents = b.U16();
+            for (int e = 0; e < extents; e++)
             {
-                pos += indexSize;   // extent_index (only meaningful for construction_method 2)
-                long eOff = ReadN(pos, offsetSize); pos += offsetSize;
-                long eLen = ReadN(pos, lengthSize); pos += lengthSize;
+                b.UN(indexSize);   // extent_index (only meaningful for construction_method 2)
+                long eOff = (long)Math.Min(b.UN(offsetSize), long.MaxValue);
+                long eLen = (long)Math.Min(b.UN(lengthSize), long.MaxValue);
                 item.Extents.Add((eOff, eLen));
             }
         }
@@ -217,17 +255,15 @@ internal sealed class HeifContainer
 
     private void ParseIref(int off, int len)
     {
-        if (len < 4) return;
-        bool wide = data[off] != 0;
-        int idSize = wide ? 4 : 2;
+        var hb = new BoxReader(data, off, len, "iref");
+        bool wide = hb.FullBox().Version != 0;
         foreach (var (type, pOff, pLen) in Children(data, off + 4, len - 4))
         {
-            int q = pOff, qEnd = pOff + pLen;
-            if (q + idSize + 2 > qEnd) continue;
-            int from = (int)ReadN(q, idSize); q += idSize;
-            int n = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(q)); q += 2;
+            var b = new BoxReader(data, pOff, pLen, type);
+            int from = wide ? ItemId(b.U32()) : b.U16();
+            int n = b.U16();
             var to = new List<int>(n);
-            for (int k = 0; k < n && q + idSize <= qEnd; k++, q += idSize) to.Add((int)ReadN(q, idSize));
+            for (int k = 0; k < n; k++) to.Add(wide ? ItemId(b.U32()) : b.U16());
             References.Add((type, from, to));
         }
     }
@@ -253,21 +289,19 @@ internal sealed class HeifContainer
         foreach (var (type, bOff, bLen) in kids) if (type == "ipco") props = Children(data, bOff, bLen);
         foreach (var (type, bOff, bLen) in kids)
         {
-            if (type != "ipma" || bLen < 8) continue;
-            int version = data[bOff];
-            bool wideIdx = (data[bOff + 3] & 1) != 0;
-            int pos = bOff + 4, end = bOff + bLen;
-            uint entries = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos)); pos += 4;
-            for (uint e = 0; e < entries && pos < end; e++)
+            if (type != "ipma") continue;
+            var b = new BoxReader(data, bOff, bLen, "ipma");
+            var (version, flags) = b.FullBox();
+            bool wideIdx = (flags & 1) != 0;
+            uint entries = b.U32();
+            for (uint e = 0; e < entries; e++)
             {
-                int id = version < 1 ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)) : (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos));
-                pos += version < 1 ? 2 : 4;
-                int n = data[pos++];
+                int id = version < 1 ? b.U16() : ItemId(b.U32());
+                int n = b.U8();
                 var item = Item(id);
-                for (int k = 0; k < n && pos < end; k++)
+                for (int k = 0; k < n; k++)
                 {
-                    int raw = wideIdx ? BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(pos)) : data[pos];
-                    pos += wideIdx ? 2 : 1;
+                    int raw = wideIdx ? b.U16() : b.U8();
                     bool essential = (raw & (wideIdx ? 0x8000 : 0x80)) != 0;
                     int idx = raw & (wideIdx ? 0x7FFF : 0x7F);
                     if (idx == 0 && essential && avif)
@@ -281,13 +315,6 @@ internal sealed class HeifContainer
                 }
             }
         }
-    }
-
-    private long ReadN(int pos, int size)
-    {
-        long v = 0;
-        for (int i = 0; i < size; i++) v = (v << 8) | data[pos + i];
-        return v;
     }
 
     /// <summary>Child boxes of a payload region: (type, payload offset, payload length). Handles 64-bit and to-end sizes.</summary>

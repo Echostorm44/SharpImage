@@ -127,7 +127,8 @@ public static class ExifParser
 
     private static void ReadIfd(ReadOnlySpan<byte> data, uint offset, bool le, List<ExifEntry> entries)
     {
-        if (offset + 2 > data.Length) return;
+        // Offsets and sizes in 64 bits: 32-bit count * size or offset + size from a corrupt IFD must not wrap past the checks.
+        if ((long)offset + 2 > data.Length) return;
 
         ushort entryCount = le
             ? BinaryPrimitives.ReadUInt16LittleEndian(data[(int)offset..])
@@ -136,7 +137,7 @@ public static class ExifParser
         uint pos = offset + 2;
         for (int i = 0; i < entryCount; i++)
         {
-            if (pos + 12 > data.Length) break;
+            if ((long)pos + 12 > data.Length) break;
 
             ushort tag = le
                 ? BinaryPrimitives.ReadUInt16LittleEndian(data[(int)pos..])
@@ -151,7 +152,7 @@ public static class ExifParser
                 : BinaryPrimitives.ReadUInt32BigEndian(data[(int)(pos + 4)..]);
 
             int typeSize = GetTypeSize((ExifDataType)type);
-            uint totalSize = count * (uint)typeSize;
+            long totalSize = (long)count * typeSize;
 
             byte[] value;
             if (totalSize <= 4)
@@ -166,7 +167,7 @@ public static class ExifParser
                     ? BinaryPrimitives.ReadUInt32LittleEndian(data[(int)(pos + 8)..])
                     : BinaryPrimitives.ReadUInt32BigEndian(data[(int)(pos + 8)..]);
 
-                if (valueOffset + totalSize <= data.Length)
+                if ((long)valueOffset + totalSize <= data.Length)
                 {
                     value = data.Slice((int)valueOffset, (int)totalSize).ToArray();
                 }

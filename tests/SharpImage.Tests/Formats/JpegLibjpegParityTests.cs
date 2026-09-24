@@ -87,4 +87,42 @@ public sealed class JpegLibjpegParityTests
         await Assert.That(img.Colorspace).IsEqualTo(asset.Contains("cmyk") || asset.Contains("ycck") ? ColorspaceType.CMYK : ColorspaceType.SRGB);
         await Assert.That(Hash16(img)).IsEqualTo(sha16);
     }
+
+    // Damaged files decode as libjpeg-turbo recovers them (its warnings, not errors): a progressive file cut short
+    // (block smoothing estimates the missing AC bands), a restart marker out of sequence (jpeg_resync_to_restart leaves
+    // the next interval empty) and a Motion-JPEG frame without DHT (the default Annex K tables). Expected: djpeg-style
+    // 8-bit RGB from libjpeg-turbo 3.1 (ljdump). The differential fuzzer (4832 mutated files) matched every output.
+    [Test]
+    [Arguments("jpeg_libjpeg/corrupt_prog_truncated.jpg", "faf472cedb802c3a")]
+    [Arguments("jpeg_libjpeg/corrupt_rst_sequence.jpg", "8c4c2eba757305c0")]
+    [Arguments("jpeg_libjpeg/mjpeg_no_dht.jpg", "381a15e88374f474")]
+    public async Task Read_DamagedFiles_RecoverLikeLibjpegTurbo(string asset, string sha16)
+    {
+        var img = JpegCoder.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", asset));
+        await Assert.That(Hash8(img)).IsEqualTo(sha16);
+    }
+
+    // What libjpeg-turbo rejects fails with InvalidDataException (its error text); what it cannot decode either is
+    // NotSupportedException; frames beyond the pixel limit fail before allocation.
+    [Test]
+    public async Task Read_Errors_AsLibjpegTurbo()
+    {
+        byte[] good = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "TestAssets", "jpeg_libjpeg", "cjpeg_31x33_q20.jpg"));
+        int dqt = FindMarker(good, 0xDB);
+        var badDqt = (byte[])good.Clone();
+        badDqt[dqt + 4] = 0x05;   // table index 5
+        await Assert.That(() => JpegCoder.Read(new MemoryStream(badDqt))).Throws<InvalidDataException>().WithMessage("Bogus DQT index 5");
+        var hierarchical = (byte[])good.Clone();
+        hierarchical[FindMarker(good, 0xC0, 0xC1) + 1] = 0xC5;
+        await Assert.That(() => JpegCoder.Read(new MemoryStream(hierarchical))).Throws<NotSupportedException>();
+        await Assert.That(() => JpegCoder.Read(new MemoryStream(good), maxPixels: 31 * 33 - 1)).Throws<InvalidDataException>();
+        await Assert.That(JpegCoder.Read(new MemoryStream(good), maxPixels: 31 * 33).Columns).IsEqualTo(31L);
+        await Assert.That(() => JpegCoder.Read(new MemoryStream([0x89, 0x50, 0x4E, 0x47]))).Throws<InvalidDataException>();
+    }
+
+    private static int FindMarker(byte[] d, params int[] markers)
+    {
+        for (int i = 2; i + 1 < d.Length; i++) if (d[i] == 0xFF && Array.IndexOf(markers, (int)d[i + 1]) >= 0) return i;
+        throw new InvalidOperationException();
+    }
 }

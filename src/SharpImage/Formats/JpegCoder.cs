@@ -122,9 +122,14 @@ public static partial class JpegCoder
     /// Decodes a JPEG as libjpeg-turbo 3.1 does by default (accurate integer IDCT, fancy chroma upsampling, fixed-point
     /// colour conversion), so the pixels are identical to djpeg / Pillow / browsers built on it: baseline, extended and
     /// progressive files with Huffman or arithmetic coding at 8 or 12 bits, lossless files (2..16 bits), grey / YCbCr /
-    /// RGB and CMYK / YCCK (returned as CMYK). Files libjpeg-turbo does not decode fall back to the general decoder.
+    /// RGB and CMYK / YCCK (returned as CMYK). Malformed files throw <see cref="InvalidDataException"/> where
+    /// libjpeg-turbo fails; files libjpeg-turbo cannot decode either (hierarchical, arithmetic lossless, fractional
+    /// sampling) throw <see cref="NotSupportedException"/>. Images over <see cref="DefaultMaxPixels"/> are rejected.
     /// </summary>
-    public static ImageFrame Read(Stream stream)
+    public static ImageFrame Read(Stream stream) => Read(stream, DefaultMaxPixels);
+
+    /// <summary><see cref="Read(Stream)"/> with a custom pixel limit (width x height).</summary>
+    public static ImageFrame Read(Stream stream, long maxPixels)
     {
         byte[] data;
         using (var ms = new MemoryStream())
@@ -132,8 +137,7 @@ public static partial class JpegCoder
             stream.CopyTo(ms);
             data = ms.ToArray();
         }
-        var frame = data.Length >= 4 && data[0] == 0xFF && data[1] == SOI ? ReadLibjpegExact(data) : null;
-        if (frame == null) return ReadGeneral(new MemoryStream(data));
+        var frame = ReadLibjpegExact(data, maxPixels);
 
         byte[]? exifData = null, iptcData = null;
         List<byte[]>? iccChunks = null, extendedXmp = null;
@@ -2520,212 +2524,69 @@ public static partial class JpegCoder
     }
 
     /// <summary>
-    /// Generates JPEG Huffman bits/values specification from symbol frequencies.
-    /// Uses the algorithm from ITU-T T.81 Annex K.2 (Figure K.1-K.4).
+    /// JPEG Huffman bits / values from symbol frequencies, exactly as libjpeg's jpeg_gen_optimal_table (jchuff.c):
+    /// a pseudo-symbol 256 with frequency 1 reserves the all-ones code (which T.81 forbids and decoders reject), code
+    /// sizes by Annex K.2, lengths limited to 16 bits by K.3, then the pseudo-symbol's code removed.
     /// </summary>
-    private static void GenerateHuffmanSpec(int[] freq, int symbolCount,
-        out byte[] bits, out byte[] values)
+    private static void GenerateHuffmanSpec(int[] freqIn, int symbolCount, out byte[] bits, out byte[] values)
     {
-        // Ensure at least 2 symbols have non-zero frequency
-        int nonZero = 0;
-        for (int i = 0; i < symbolCount; i++)
-            if (freq[i] > 0) nonZero++;
+        const int MaxClen = 32;
+        var freq = new long[257];
+        for (int i = 0; i < Math.Min(symbolCount, 256); i++) freq[i] = freqIn[i];
+        bool any = false;
+        for (int i = 0; i < 256; i++) any |= freq[i] != 0;
+        if (!any) freq[0] = 1;   // an unused table still needs one code
+        freq[256] = 1;
 
-        if (nonZero < 2)
+        var codesize = new int[257];
+        var others = new int[257];
+        Array.Fill(others, -1);
+        var clen = new int[MaxClen + 1];
+        for (;;)
         {
-            // Need at least 2 symbols for a valid Huffman tree
-            // Add dummy frequencies for symbols 0 and 1 if needed
-            if (freq[0] == 0) { freq[0] = 1; nonZero++; }
-            if (nonZero < 2 && freq[1] == 0) { freq[1] = 1; }
+            // The two least frequent nonzero entries (ties: the larger index), c1 then c2.
+            int c1 = -1, c2 = -1;
+            long v = 1000000000L;
+            for (int i = 0; i <= 256; i++) if (freq[i] != 0 && freq[i] <= v) { v = freq[i]; c1 = i; }
+            v = 1000000000L;
+            for (int i = 0; i <= 256; i++) if (freq[i] != 0 && freq[i] <= v && i != c1) { v = freq[i]; c2 = i; }
+            if (c2 < 0) break;
+            freq[c1] += freq[c2];
+            freq[c2] = 0;
+            codesize[c1]++;
+            while (others[c1] >= 0) { c1 = others[c1]; codesize[c1]++; }
+            others[c1] = c2;
+            codesize[c2]++;
+            while (others[c2] >= 0) { c2 = others[c2]; codesize[c2]++; }
         }
-
-        // Build a Huffman tree by repeated merging of lowest-frequency nodes
-        // Result: codeLength[i] = bit length assigned to symbol i
-        int maxSymbols = Math.Min(symbolCount, 256);
-        int[] codeLength = new int[maxSymbols];
-
-        // Collect symbols with non-zero frequency
-        var symbols = new List<(int symbol, int frequency)>();
-        for (int i = 0; i < maxSymbols; i++)
-        {
-            if (freq[i] > 0)
-                symbols.Add((i, freq[i]));
-        }
-
-        if (symbols.Count == 0)
-        {
-            // Fallback: single-symbol tree
-            bits = new byte[16];
-            bits[0] = 1;
-            values = [0];
-            return;
-        }
-
-        if (symbols.Count == 1)
-        {
-            bits = new byte[16];
-            bits[0] = 1;
-            values = [(byte)symbols[0].symbol];
-            return;
-        }
-
-        // Package-merge algorithm for length-limited Huffman codes (max 16 bits)
-        // Simplified: use standard Huffman then limit to 16 bits
-
-        // Build code lengths using a priority queue approach
-        int n = symbols.Count;
-        var nodes = new List<HuffNode>(n * 2);
-        for (int i = 0; i < n; i++)
-            nodes.Add(new HuffNode { Symbol = symbols[i].symbol, Frequency = symbols[i].frequency, Depth = 0 });
-
-        // Sort by frequency (ascending)
-        nodes.Sort((a, b) => a.Frequency.CompareTo(b.Frequency));
-
-        // Build tree by merging two lowest-frequency nodes
-        var queue1 = new Queue<HuffNode>(nodes);
-        var queue2 = new Queue<HuffNode>();
-
-        while (queue1.Count + queue2.Count > 1)
-        {
-            var left = Dequeue(queue1, queue2);
-            var right = Dequeue(queue1, queue2);
-
-            var merged = new HuffNode
+        for (int i = 0; i <= 256; i++)
+            if (codesize[i] != 0)
             {
-                Symbol = -1,
-                Frequency = left.Frequency + right.Frequency,
-                Depth = Math.Max(left.Depth, right.Depth) + 1,
-                Left = left,
-                Right = right
-            };
-            queue2.Enqueue(merged);
-        }
+                if (codesize[i] > MaxClen) throw new InvalidOperationException("Huffman code size table overflow");
+                clen[codesize[i]]++;
+            }
+        // K.3: move codes longer than 16 bits up the tree.
+        int l;
+        for (l = MaxClen; l > 16; l--)
+            while (clen[l] > 0)
+            {
+                int jj = l - 2;
+                while (clen[jj] == 0) jj--;
+                clen[l] -= 2;
+                clen[l - 1]++;
+                clen[jj + 1] += 2;
+                clen[jj]--;
+            }
+        while (clen[l] == 0) l--;
+        clen[l]--;   // remove the pseudo-symbol 256 (it has the longest code)
 
-        var root = queue1.Count > 0 ? queue1.Dequeue() : queue2.Dequeue();
-
-        // Extract code lengths from tree
-        AssignCodeLengths(root, 0, codeLength);
-
-        // Limit code lengths to 16 bits (JPEG maximum)
-        LimitCodeLengths(codeLength, maxSymbols, 16);
-
-        // Generate bits[] and values[] arrays from code lengths
         bits = new byte[16];
-        var sortedSymbols = new List<(int symbol, int length)>();
-
-        for (int i = 0; i < maxSymbols; i++)
-        {
-            if (codeLength[i] > 0)
-            {
-                bits[codeLength[i] - 1]++;
-                sortedSymbols.Add((i, codeLength[i]));
-            }
-        }
-
-        // Sort by (length ascending, symbol ascending) per JPEG spec
-        sortedSymbols.Sort((a, b) =>
-        {
-            int cmp = a.length.CompareTo(b.length);
-            return cmp != 0 ? cmp : a.symbol.CompareTo(b.symbol);
-        });
-
-        values = new byte[sortedSymbols.Count];
-        for (int i = 0; i < sortedSymbols.Count; i++)
-            values[i] = (byte)sortedSymbols[i].symbol;
-    }
-
-    private static HuffNode Dequeue(Queue<HuffNode> q1, Queue<HuffNode> q2)
-    {
-        if (q1.Count == 0) return q2.Dequeue();
-        if (q2.Count == 0) return q1.Dequeue();
-        return q1.Peek().Frequency <= q2.Peek().Frequency ? q1.Dequeue() : q2.Dequeue();
-    }
-
-    private static void AssignCodeLengths(HuffNode node, int depth, int[] codeLengths)
-    {
-        if (node.Left is null && node.Right is null)
-        {
-            if (node.Symbol >= 0 && node.Symbol < codeLengths.Length)
-                codeLengths[node.Symbol] = depth;
-            return;
-        }
-        if (node.Left is not null) AssignCodeLengths(node.Left, depth + 1, codeLengths);
-        if (node.Right is not null) AssignCodeLengths(node.Right, depth + 1, codeLengths);
-    }
-
-    /// <summary>
-    /// Limits Huffman code lengths to maxLen bits using the algorithm from ITU-T T.81 Annex K.3.
-    /// </summary>
-    private static void LimitCodeLengths(int[] codeLengths, int symbolCount, int maxLen)
-    {
-        bool needsAdjustment = false;
-        for (int i = 0; i < symbolCount; i++)
-        {
-            if (codeLengths[i] > maxLen)
-            {
-                needsAdjustment = true;
-                break;
-            }
-        }
-        if (!needsAdjustment) return;
-
-        // Count symbols at each depth
-        int[] depthCount = new int[33];
-        for (int i = 0; i < symbolCount; i++)
-        {
-            if (codeLengths[i] > 0)
-                depthCount[Math.Min(codeLengths[i], 32)]++;
-        }
-
-        // Move symbols from depths > maxLen up to maxLen per Annex K.3
-        while (true)
-        {
-            bool changed = false;
-            for (int depth = 32; depth > maxLen; depth--)
-            {
-                while (depthCount[depth] > 0)
-                {
-                    // Find a symbol at this depth and shorten it
-                    int j = depth - 2;
-                    while (j > 0 && depthCount[j] == 0) j--;
-
-                    depthCount[depth] -= 2;
-                    depthCount[depth - 1]++;
-                    depthCount[j + 1] += 2;
-                    depthCount[j]--;
-                    changed = true;
-                }
-            }
-            if (!changed) break;
-        }
-
-        // Reassign code lengths based on adjusted depth counts
-        // Sort symbols by original code length (longest first)
-        var symbolsByLength = new List<int>();
-        for (int i = 0; i < symbolCount; i++)
-        {
-            if (codeLengths[i] > 0)
-                symbolsByLength.Add(i);
-        }
-        symbolsByLength.Sort((a, b) => codeLengths[b].CompareTo(codeLengths[a]));
-
-        int idx = 0;
-        for (int depth = maxLen; depth >= 1; depth--)
-        {
-            for (int c = 0; c < depthCount[depth] && idx < symbolsByLength.Count; c++)
-            {
-                codeLengths[symbolsByLength[idx++]] = depth;
-            }
-        }
-    }
-
-    private class HuffNode
-    {
-        public int Symbol;
-        public int Frequency;
-        public int Depth;
-        public HuffNode? Left;
-        public HuffNode? Right;
+        for (int k = 1; k <= 16; k++) bits[k - 1] = (byte)clen[k];
+        var vals = new List<byte>();
+        for (int k = 1; k <= MaxClen; k++)
+            for (int sym = 0; sym <= 255; sym++)
+                if (codesize[sym] == k) vals.Add((byte)sym);
+        values = [.. vals];
     }
 
     /// <summary>
