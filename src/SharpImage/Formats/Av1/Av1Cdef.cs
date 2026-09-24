@@ -4,6 +4,8 @@
 
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics.X86;
+using System.Runtime.Intrinsics;
 
 namespace SharpImage.Formats.Av1;
 
@@ -261,6 +263,12 @@ public static class Av1Cdef
             top, topOffset, bottom, bottomOffset,
             w, h, edges);
 
+        if (Avx2.IsSupported)
+        {
+            FilterRowsV(dst, dstOffset, dstStride, tmpBuf, tmpCenter, priStrength, secStrength, dir, damping, w, h, bdMin8);
+            return;
+        }
+
         int dOff = dstOffset;
         int tOff = tmpCenter;
 
@@ -367,6 +375,90 @@ public static class Av1Cdef
                 dOff += dstStride;
                 tOff += tmpStride;
             }
+        }
+    }
+
+    // cdef_filter_block_c on a padded block, one row (w = 4 or 8 pixels) per Vector256<int>: the same integer
+    // operations per pixel (MinU16 as a min over p & 0xFFFF — the INT16_MIN padding maps above every pixel and the
+    // running min starts at a pixel; sum - (sum < 0) as sum + (sum >> 31); the unclamped (ushort) cast as a 16-bit
+    // narrowing), so the output is identical. 8-sample loads stay inside the 12 x 12 padded buffer.
+    private static void FilterRowsV(Span<ushort> dst, int dstOffset, int dstStride, ReadOnlySpan<short> tmp, int tmpCenter,
+        int priStrength, int secStrength, int dir, int damping, int w, int h, int bdMin8)
+    {
+        const int tmpStride = 12;
+        var zero = Vector256<int>.Zero;
+        var m16 = Vector256.Create(0xFFFF);
+        var eight = Vector256.Create(8);
+        bool pri = priStrength != 0, sec = secStrength != 0;
+        int priTap0 = 4 - ((priStrength >> bdMin8) & 1), priTap1 = (priTap0 & 3) | 2;
+        int priShift = pri ? Math.Max(0, damping - Log2(priStrength)) : 0;
+        int secShift = sec ? damping - Log2(secStrength) : 0;
+        var priThr = Vector256.Create(priStrength);
+        var secThr = Vector256.Create(secStrength);
+        int po0 = Directions[dir + 2, 0], po1 = Directions[dir + 2, 1];
+        int sa0 = Directions[dir + 4, 0], sa1 = Directions[dir + 4, 1];
+        int sb0 = Directions[dir + 0, 0], sb1 = Directions[dir + 0, 1];
+        Span<int> lanes = stackalloc int[8];
+
+        int dOff = dstOffset, tOff = tmpCenter;
+        for (int row = 0; row < h; row++, dOff += dstStride, tOff += tmpStride)
+        {
+            var px = Load(tmp, tOff);
+            var sum = zero;
+            var min = px; var max = px;
+            if (pri)
+            {
+                var p0 = Load(tmp, tOff + po0); var p1 = Load(tmp, tOff - po0);
+                sum += Constrain(p0 - px, priThr, priShift) * priTap0;
+                sum += Constrain(p1 - px, priThr, priShift) * priTap0;
+                var q0 = Load(tmp, tOff + po1); var q1 = Load(tmp, tOff - po1);
+                sum += Constrain(q0 - px, priThr, priShift) * priTap1;
+                sum += Constrain(q1 - px, priThr, priShift) * priTap1;
+                if (sec)
+                {
+                    min = Vector256.Min(min, p0 & m16); max = Vector256.Max(max, p0);
+                    min = Vector256.Min(min, p1 & m16); max = Vector256.Max(max, p1);
+                    min = Vector256.Min(min, q0 & m16); max = Vector256.Max(max, q0);
+                    min = Vector256.Min(min, q1 & m16); max = Vector256.Max(max, q1);
+                }
+            }
+            if (sec)
+            {
+                for (int k = 0; k < 2; k++)
+                {
+                    int oa = k == 0 ? sa0 : sa1, ob = k == 0 ? sb0 : sb1, tap = 2 - k;
+                    var s0 = Load(tmp, tOff + oa); var s1 = Load(tmp, tOff - oa);
+                    var s2 = Load(tmp, tOff + ob); var s3 = Load(tmp, tOff - ob);
+                    sum += Constrain(s0 - px, secThr, secShift) * tap;
+                    sum += Constrain(s1 - px, secThr, secShift) * tap;
+                    sum += Constrain(s2 - px, secThr, secShift) * tap;
+                    sum += Constrain(s3 - px, secThr, secShift) * tap;
+                    if (pri)
+                    {
+                        min = Vector256.Min(min, s0 & m16); max = Vector256.Max(max, s0);
+                        min = Vector256.Min(min, s1 & m16); max = Vector256.Max(max, s1);
+                        min = Vector256.Min(min, s2 & m16); max = Vector256.Max(max, s2);
+                        min = Vector256.Min(min, s3 & m16); max = Vector256.Max(max, s3);
+                    }
+                }
+            }
+            var res = px + Vector256.ShiftRightArithmetic(sum + Vector256.ShiftRightArithmetic(sum, 31) + eight, 4);
+            if (pri && sec) res = Vector256.Min(Vector256.Max(res, min), max);
+            if (w == 8)
+                Vector256.Narrow(res.AsUInt32(), Vector256<uint>.Zero).GetLower().CopyTo(dst.Slice(dOff, 8));
+            else
+            {
+                res.CopyTo(lanes);
+                for (int x = 0; x < w; x++) dst[dOff + x] = (ushort)lanes[x];
+            }
+        }
+
+        static Vector256<int> Load(ReadOnlySpan<short> t, int off) => Avx2.ConvertToVector256Int32(Vector128.Create(t.Slice(off, 8)));
+        static Vector256<int> Constrain(Vector256<int> diff, Vector256<int> thr, int shift)
+        {
+            var adiff = Vector256.Abs(diff);
+            var val = Vector256.Min(adiff, Vector256.Max(Vector256<int>.Zero, thr - Vector256.ShiftRightArithmetic(adiff, shift)));
+            return Vector256.ConditionalSelect(Vector256.LessThan(diff, Vector256<int>.Zero), -val, val);
         }
     }
 

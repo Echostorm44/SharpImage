@@ -464,7 +464,7 @@ public static class Av1CoeffDecode
         int cdfIdx = tDim.Ctx * 13 + sctx;
         uint preRng = msac.DebugRng;
         ushort preCdf0 = coefCdf.CoefSkip[cdfIdx][0];
-        Av1Msac.DbgLabel = $"allskip_tx{tx}_pl{plane}";
+        if (msac.TraceEnabled || Av1Msac.DavTraceOpen) Av1Msac.DbgLabel = $"allskip_tx{tx}_pl{plane}";   // trace-only label (no per-block string otherwise)
         Av1Msac.Phase = plane == 0 ? 5 : 6;   // 5=luma coef, 6=chroma coef (reuse the cdef slot for chroma coef here)
         int allSkip = (int)msac.DecodeBoolAdapt(coefCdf.CoefSkip[cdfIdx]);
 

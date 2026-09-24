@@ -65,6 +65,7 @@ public ref struct Av1Msac
     // Emits every decode op in dav1d's trace format for diff comparison.
     private static int _davTraceSeq;
     private static System.IO.TextWriter? _davTraceWriter;
+    internal static bool DavTraceOpen => _davTraceWriter != null;
     private int _davTraceFrame;  // per-instance frame tag (set via SetDav1dTraceFrame)
     private bool _davTraceEnabled;
 

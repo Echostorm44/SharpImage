@@ -3178,7 +3178,7 @@ public static partial class HeifCoder
         var po = new ParallelOptions { MaxDegreeOfParallelism = Limits.ThreadCount };
         if (ssHor == 0)
         {
-            Parallel.For(0, h, po, j => LibyuvRow(frame, ym.Span.Slice(j * ys, w), j, um.Span.Slice(j * us, w).ToArray(), vm.Span.Slice(j * vs, w).ToArray(), w, channels, k));
+            Parallel.For(0, h, po, j => LibyuvRow(frame, ym.Span.Slice(j * ys, w), j, um.Span.Slice(j * us, w), vm.Span.Slice(j * vs, w), w, channels, k));
             return;
         }
         if (ssVer == 0)
@@ -3215,7 +3215,7 @@ public static partial class HeifCoder
         }
     }
 
-    private static void LibyuvRow(ImageFrame frame, ReadOnlySpan<byte> yRow, int j, byte[] u, byte[] v, int w, int channels,
+    private static void LibyuvRow(ImageFrame frame, ReadOnlySpan<byte> yRow, int j, ReadOnlySpan<byte> u, ReadOnlySpan<byte> v, int w, int channels,
         (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr) k)
     {
         var row = frame.GetPixelRowForWrite(j);

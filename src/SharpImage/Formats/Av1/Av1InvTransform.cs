@@ -5,6 +5,8 @@
 
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics.X86;
+using System.Runtime.Intrinsics;
 
 namespace SharpImage.Formats.Av1;
 
@@ -255,10 +257,6 @@ public static class Av1InvTransform
         int sh = Math.Min(h, 32);
         int sw = Math.Min(w, 32);
 
-        // Only the w x h region is used (no implicit zeroing: SkipLocalsInit); rows past the 32 coded ones must be zero.
-        Span<int> tmp = stackalloc int[w * h];
-        if (h > sh) tmp.Slice(sh * w).Clear();
-
         // Rows (coefficient index rc = y + x * sh) holding a nonzero coefficient, found with a vectorized skip over zeros.
         uint rowMask = 0;
         {
@@ -272,6 +270,17 @@ public static class Av1InvTransform
                 if (++p >= cs.Length) break;
             }
         }
+
+        if (Avx2.IsSupported)
+        {
+            InvTxfmAdd16V(dst, dstStride, coeffs, rowMask, w, h, sw, sh, isRect2, rnd, shift, pixelMax,
+                rowClipMin, rowClipMax, colClipMin, colClipMax, tDim.Lw, tDim.Lh, txtp0, txtp1);
+            return;
+        }
+
+        // Only the w x h region is used (no implicit zeroing: SkipLocalsInit); rows past the 32 coded ones must be zero.
+        Span<int> tmp = stackalloc int[w * h];
+        if (h > sh) tmp.Slice(sh * w).Clear();
 
         for (int y = 0; y < sh; y++)
         {
@@ -306,6 +315,77 @@ public static class Av1InvTransform
             var tmpRow = tmp.Slice(y * w, w);
             for (int x = 0; x < w; x++)
                 row[x] = (ushort)Math.Clamp(row[x] + ((tmpRow[x] + 8) >> 4), 0, pixelMax);
+        }
+    }
+
+    /// <summary>InvTxfmAdd16 with the 1-D kernels run on 8 rows (row pass, loaded straight from the column-major
+    /// coefficients) or 8 columns (column pass) at a time via Av1InvTransformV; 4-wide / 4-tall blocks use the low half.
+    /// Every lane does the scalar integer math, so the output is identical.</summary>
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    private static void InvTxfmAdd16V(Span<ushort> dst, int dstStride, Span<int> coeffs, uint rowMask, int w, int h,
+        int sw, int sh, bool isRect2, int rnd, int shift, int pixelMax, int rowClipMin, int rowClipMax,
+        int colClipMin, int colClipMax, int lw, int lh, int txtp0, int txtp1)
+    {
+        Span<int> tmp = stackalloc int[w * h];   // row-major intermediate
+        if (h > sh) tmp.Slice(sh * w).Clear();
+        Span<VI> v = stackalloc VI[64];
+        Span<int> lanes = stackalloc int[8];
+        VI rmin = rowClipMin, rmax = rowClipMax, cmin = colClipMin, cmax = colClipMax;
+        var rndV = Vector256.Create(rnd);
+
+        // Row pass: element x of rows y0..y0+g-1 is coeffs[x * sh + y0 ..] (contiguous).
+        for (int y0 = 0; y0 < sh; y0 += 8)
+        {
+            int g = Math.Min(8, sh - y0);
+            if (((rowMask >> y0) & (g == 8 ? 0xFFu : 0xFu)) == 0) { tmp.Slice(y0 * w, g * w).Clear(); continue; }
+            for (int x = 0; x < sw; x++)
+            {
+                var src = coeffs.Slice(x * sh + y0, g);
+                var c = g == 8 ? Vector256.Create((ReadOnlySpan<int>)src)
+                               : Vector256.Create(Vector128.Create((ReadOnlySpan<int>)src), Vector128<int>.Zero);
+                if (isRect2) c = Vector256.ShiftRightArithmetic(c * 181 + Vector256.Create(128), 8);
+                v[x] = new VI(c);
+                src.Clear();
+            }
+            for (int x = sw; x < w; x++) v[x] = 0;
+            Av1InvTransformV.Apply1d(v, 1, rmin, rmax, lw, txtp0);
+            for (int x = 0; x < w; x++)
+            {
+                var r = Vector256.Min(Vector256.Max(Vector256.ShiftRightArithmetic(v[x].V + rndV, shift), cmin.V), cmax.V);
+                r.CopyTo(lanes);
+                for (int k = 0; k < g; k++) tmp[(y0 + k) * w + x] = lanes[k];
+            }
+        }
+
+        // Column pass: element i of columns x0..x0+g-1 is tmp[i * w + x0 ..] (contiguous).
+        var eight = Vector256.Create(8);
+        var zero = Vector256<int>.Zero;
+        var pmax = Vector256.Create(pixelMax);
+        for (int x0 = 0; x0 < w; x0 += 8)
+        {
+            int g = Math.Min(8, w - x0);
+            for (int i = 0; i < h; i++)
+            {
+                ReadOnlySpan<int> s2 = tmp.Slice(i * w + x0, g);
+                v[i] = new VI(g == 8 ? Vector256.Create(s2) : Vector256.Create(Vector128.Create(s2), Vector128<int>.Zero));
+            }
+            Av1InvTransformV.Apply1d(v, 1, cmin, cmax, lh, txtp1);
+            for (int y = 0; y < h; y++)
+            {
+                var add = Vector256.ShiftRightArithmetic(v[y].V + eight, 4);
+                var row = dst.Slice(y * dstStride + x0, g);
+                if (g == 8)
+                {
+                    var d = Avx2.ConvertToVector256Int32(Vector128.Create((ReadOnlySpan<ushort>)row));
+                    var sum = Vector256.Min(Vector256.Max(d + add, zero), pmax);
+                    Vector256.Narrow(sum.AsUInt32(), Vector256<uint>.Zero).GetLower().CopyTo(row);
+                }
+                else
+                {
+                    add.CopyTo(lanes);
+                    for (int x = 0; x < g; x++) row[x] = (ushort)Math.Clamp(row[x] + lanes[x], 0, pixelMax);
+                }
+            }
         }
     }
 

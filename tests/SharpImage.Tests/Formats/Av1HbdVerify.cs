@@ -1735,14 +1735,16 @@ public sealed class Av1HbdVerify
                     }
                     else
                     {
+                        // timedec <avif> <reps> [threads]
                         byte[] data = File.ReadAllBytes(t[1]);
+                        var dopt = new AvifDecodeOptions { MaxThreads = t.Length > 3 ? int.Parse(t[3]) : 0 };
                         for (int r = 0; r <= reps; r++)
                         {
                             var sw = System.Diagnostics.Stopwatch.StartNew();
-                            using var f = HeifCoder.Decode(data);
+                            using var f = HeifCoder.Decode(data, dopt);
                             if (r > 0) best = Math.Min(best, sw.Elapsed.TotalSeconds);
                         }
-                        log.AppendLine($"timedec {Path.GetFileName(t[1])}: {best:F3} s");
+                        log.AppendLine($"timedec {Path.GetFileName(t[1])} {string.Join(' ', t.Skip(3))}: {best:F3} s");
                     }
                     continue;
                 }
