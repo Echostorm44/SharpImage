@@ -84,6 +84,7 @@ internal sealed class AvifSequenceData
     public List<byte[]>? AlphaSamples;
     public uint[] Durations = [];            // per frame, in Timescale units
     public uint Timescale = 30;
+    public ulong CreationTime, ModificationTime;   // seconds since 1904-01-01 UTC (mvhd / tkhd / mdhd)
     public int RepetitionCount;              // extra plays; -1 = infinite (libavif AVIF_REPETITION_COUNT_INFINITE)
     public bool AllKeyFrames = true;         // every sample a sync (key) frame: no 'stss', all-intra 'ccst'
     // Per-sample sync (key frame) flags of each track when some samples are inter frames (null = all sync). A track
@@ -145,7 +146,7 @@ internal static class Av1AvifWriter
             (monoBit << 4) |                  // monochrome
             (cssX << 3) |                     // chroma_subsampling_x
             (cssY << 2) |                     // chroma_subsampling_y
-            0);                               // chroma_sample_position (2 bits) = 0
+            (layout == Av1PixelLayout.I420 ? Av1ObuWriter.ChromaSamplePosition : 0));   // chroma_sample_position (2 bits)
         byte b3 = 0x00;                       // reserved(3)=0 | initial_presentation_delay_present(1)=0 | reserved(4)=0
 
         return new[] { b0, b1, b2, b3 };
@@ -725,12 +726,12 @@ internal static class Av1AvifWriter
         foreach (uint d in sq.Durations) framesDuration += d;
         ulong duration = sq.RepetitionCount < 0 ? ulong.MaxValue : framesDuration * (ulong)(sq.RepetitionCount + 1);
         int tracks = alphaEntry != null ? 2 : 1;
-        byte[] mvhd = FullBox("mvhd", 1, 0, Concat(U64(0), U64(0), U32(sq.Timescale), U64(duration), U32(0x00010000), U16(0x0100),
+        byte[] mvhd = FullBox("mvhd", 1, 0, Concat(U64(sq.CreationTime), U64(sq.ModificationTime), U32(sq.Timescale), U64(duration), U32(0x00010000), U16(0x0100),
             U16(0), new byte[8], unity, new byte[24], U32((uint)(tracks + 1))));
 
         byte[] Trak(int trackId, List<byte[]> samples, byte[] entryChildren, bool alpha, uint chunkOffset, List<bool>? sync)
         {
-            byte[] tkhd = FullBox("tkhd", 1, 1, Concat(U64(0), U64(0), U32((uint)trackId), U32(0), U64(duration), new byte[8],
+            byte[] tkhd = FullBox("tkhd", 1, 1, Concat(U64(sq.CreationTime), U64(sq.ModificationTime), U32((uint)trackId), U32(0), U64(duration), new byte[8],
                 U16(0), U16(0), U16(0), U16(0), unity, U32((uint)width << 16), U32((uint)height << 16)));
             var trefParts = new List<byte[]>();
             if (alpha) trefParts.Add(Box("auxl", U32(1)));                         // alpha -> colour
@@ -739,7 +740,7 @@ internal static class Av1AvifWriter
             byte[] elst = FullBox("elst", 1, sq.RepetitionCount != 0 ? 1u : 0u,
                 Concat(U32(1), U64(framesDuration), U64(0), U16(1), U16(0)));
             byte[] edts = Box("edts", elst);
-            byte[] mdhd = FullBox("mdhd", 1, 0, Concat(U64(0), U64(0), U32(sq.Timescale), U64(framesDuration), U16(21956), U16(0)));
+            byte[] mdhd = FullBox("mdhd", 1, 0, Concat(U64(sq.CreationTime), U64(sq.ModificationTime), U32(sq.Timescale), U64(framesDuration), U16(21956), U16(0)));
             byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc(alpha ? "auxv" : "pict"), U32(0), U32(0), U32(0), new byte[] { 0 }));
             byte[] vmhd = FullBox("vmhd", 0, 1, Concat(U16(0), new byte[6]));
             byte[] dinf = Box("dinf", FullBox("dref", 0, 0, Concat(U32(1), FullBox("url ", 0, 1, []))));

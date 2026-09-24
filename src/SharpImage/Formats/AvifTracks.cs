@@ -13,6 +13,7 @@ internal sealed class AvifTrack
     public int Width, Height;              // tkhd (16.16 fixed point, integer part)
     public ulong TrackDuration;            // tkhd, in the movie timescale (all ones = indefinite)
     public uint MediaTimescale;            // mdhd
+    public ulong CreationTime, ModificationTime;   // mdhd, seconds since 1904-01-01 UTC
     public ulong MediaDuration;            // mdhd
     public bool HasEdts, IsRepeating;      // edts/elst flags & 1
     public ulong SegmentDuration;          // elst (single entry)
@@ -127,7 +128,8 @@ internal static class AvifTracks
             {
                 var b = new BoxReader(d, o, l, "mdhd");
                 var (v, _) = b.FullBox();
-                b.Skip(v == 1 ? 16 : 8);
+                t.CreationTime = v == 1 ? b.U64() : b.U32();
+                t.ModificationTime = v == 1 ? b.U64() : b.U32();
                 t.MediaTimescale = b.U32();
                 t.MediaDuration = v == 1 ? b.U64() : b.U32();
             }

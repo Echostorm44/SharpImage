@@ -78,6 +78,19 @@ public sealed class Y4mTests
     }
 
     [Test]
+    public async Task Mpeg2SitingIsKept()
+    {
+        // C420mpeg2 planes coded as they are signal chroma_sample_position = vertical (sequence header and av1C).
+        var src = Synthetic(40, 30, 8, AvifChromaSubsampling.Yuv420, false);
+        var sited = new YuvImage { Width = src.Width, Height = src.Height, Depth = 8, Subsampling = src.Subsampling, FullRange = false,
+            ChromaSamplePosition = 1, Y = src.Y, U = src.U, V = src.V };
+        byte[] y4m = ToY4m(sited);
+        await Assert.That(System.Text.Encoding.ASCII.GetString(y4m, 0, 60)).Contains("C420mpeg2");
+        byte[] avif = HeifCoder.EncodeAvif(Y4mCoder.Read(y4m), new AvifEncodeOptions { Quality = 80 });
+        await Assert.That(HeifCoder.DecodeYuv(avif).ChromaSamplePosition).IsEqualTo(1);
+    }
+
+    [Test]
     public async Task Y4mSequenceEncodesAsAvifSequence()
     {
         byte[] y4m = ToY4m(Synthetic(48, 32, 8, AvifChromaSubsampling.Yuv420, false, seed: 3),

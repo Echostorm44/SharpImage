@@ -17,6 +17,7 @@ public static partial class HeifCoder
         public required int[]? Matrices;   // matrices the planes may be coded under; null = any (Y4M carries none)
         public required bool FullRange;
         public ushort[]? Alpha;             // the source's alpha plane (Y4M C444alpha), coded as the alpha item
+        public int ChromaSamplePosition;    // 4:2:0 siting of the source planes (Y4M C420mpeg2 / C420paldv)
     }
 
     private static readonly ConditionalWeakTable<ImageFrame, SourceYuv> SourcePlanes = new();

@@ -42,6 +42,13 @@ public sealed class ImageSequence : IDisposable
     /// </summary>
     public long Timescale { get; set; }
 
+    /// <summary>Creation / modification time of the sequence (ISO BMFF mvhd / tkhd / mdhd; avifenc --creation-time /
+    /// --modification-time). Null = unset (written as 0).</summary>
+    public DateTimeOffset? CreationTime { get; set; }
+
+    /// <inheritdoc cref="CreationTime"/>
+    public DateTimeOffset? ModificationTime { get; set; }
+
     /// <summary>
     /// Background color index (GIF-specific).
     /// </summary>

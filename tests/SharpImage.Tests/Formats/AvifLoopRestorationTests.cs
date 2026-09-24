@@ -60,6 +60,21 @@ public sealed class AvifLoopRestorationTests
     }
 
     [Test]
+    public async Task SharpnessIsSignalled()
+    {
+        // avifenc -a sharpness=S: loop_filter_sharpness in every frame header (the deblocking search decodes with it).
+        var src = FormatRegistry.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", "peppers.jpg"));
+        byte[] avif = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Quality = 40, Sharpness = 5 });
+        var c = HeifContainer.Parse(avif);
+        var dec = new Av1Decoder();
+        using var frame = dec.Decode(c.ItemData(c.PrimaryId)!, 0, isKeyframe: true);
+        var ctx = typeof(Av1Decoder).GetField("ctx", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(dec)!;
+        var fh = (Av1DecoderFrameHeader)ctx.GetType().GetField("FrameHeader")!.GetValue(ctx)!;
+        await Assert.That((int)fh.LfSharpness).IsEqualTo(5);
+        await Assert.That(() => HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Sharpness = 8 })).Throws<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
     public async Task PhotoUsesRestorationAtDefaultSpeedOnly()
     {
         var src = FormatRegistry.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", "peppers.jpg"));

@@ -81,6 +81,18 @@ public sealed class AvifEncodeOptions
     /// <summary>Quantization parameter 0..51 (0 = highest quality / largest file). Default 20.</summary>
     public int Qp { get; set; } = 20;
 
+    /// <summary>Deblocking filter sharpness 0..7 (loop_filter_sharpness; libaom / avifenc -a sharpness=S): higher values
+    /// weaken the filter across strong edges. The deblocking level search runs with it.</summary>
+    public int Sharpness { get; set; }
+
+    /// <summary>Creation / modification time written into an image sequence's movie, track and media headers (avifenc
+    /// --creation-time / --modification-time); null takes <see cref="ImageSequence.CreationTime"/> /
+    /// <see cref="ImageSequence.ModificationTime"/>, which are also what decoding reports.</summary>
+    public DateTimeOffset? CreationTime { get; set; }
+
+    /// <inheritdoc cref="CreationTime"/>
+    public DateTimeOffset? ModificationTime { get; set; }
+
     /// <summary>Encoder speed 0 (slowest, smallest files) .. 10 (fastest), as avifenc -s. Each step prunes the
     /// rate-distortion search further (mode candidates, partition shapes, transform sets, filter searches, angle
     /// deltas, RDOQ); measured on the encoder corpus, every speed gives smaller files than libaom at the same speed
@@ -465,7 +477,11 @@ public static partial class HeifCoder
             if (p.Type == "colr" && p.Len > 4 && Encoding.ASCII.GetString(data, p.Off, 4) is "prof" or "rICC")
                 icc = data.AsSpan(p.Off + 4, p.Len - 4).ToArray();
 
-        var seq = new ImageSequence { FormatName = "AVIF", Timescale = color.MediaTimescale };
+        var seq = new ImageSequence
+        {
+            FormatName = "AVIF", Timescale = color.MediaTimescale,
+            CreationTime = FromMp4Time(color.CreationTime), ModificationTime = FromMp4Time(color.ModificationTime),
+        };
         int rep = color.RepetitionCount;
         seq.LoopCount = rep < 0 ? 0 : rep + 1;   // plays in total; infinite / unknown -> 0 (loop forever)
 
@@ -1080,9 +1096,12 @@ public static partial class HeifCoder
     {
         private readonly bool prevAvoid;
         private readonly Av1.Av1EncodeSpeed? prevSpeed;
-        private readonly int prevThreads;
+        private readonly int prevThreads, prevSharpness;
         public EncoderScope(AvifEncodeOptions options)
         {
+            if (options.Sharpness is < 0 or > 7) throw new ArgumentOutOfRangeException(nameof(options), "Sharpness must be 0..7.");
+            prevSharpness = Av1.Av1ObuWriter.t_sharpness;
+            Av1.Av1ObuWriter.t_sharpness = options.Sharpness;
             prevAvoid = t_avoidLibyuv; prevSpeed = Av1.Av1StillImageEncoder.t_speed; prevThreads = Av1.Av1StillImageEncoder.t_threads;
             t_avoidLibyuv = options.AvoidLibyuv;
             Av1.Av1StillImageEncoder.t_speed = Av1.Av1EncodeSpeed.ForSpeed(options.Speed);
@@ -1091,12 +1110,14 @@ public static partial class HeifCoder
         public void Dispose()
         {
             t_avoidLibyuv = prevAvoid; Av1.Av1StillImageEncoder.t_speed = prevSpeed; Av1.Av1StillImageEncoder.t_threads = prevThreads;
+            Av1.Av1ObuWriter.t_sharpness = prevSharpness;
         }
     }
 
     private static byte[] EncodeAvifEntry(ImageFrame image, AvifEncodeOptions options)
     {
         options = AdoptSourceFormat(image, options);
+        using var siting = new Av1.Av1ObuWriter.ChromaPositionScope(SourceChromaPosition(image, options));
         if (options.TargetSize is { } target)
             return SearchTargetSize(options, target, o => EncodeAvif(image, o));
         if (options.BitDepthExtension != AvifBitDepthExtension.None)
@@ -1364,9 +1385,17 @@ public static partial class HeifCoder
         return EncodeAvifSequenceEntry(sequence, options);
     }
 
+    // ISO BMFF times: seconds since 1904-01-01 UTC (0 = unset).
+    private const long Mp4EpochOffset = 2082844800;   // 1904-01-01 -> 1970-01-01
+    private static ulong ToMp4Time(DateTimeOffset? t) =>
+        t is { } v ? (ulong)Math.Max(0, v.ToUnixTimeSeconds() + Mp4EpochOffset) : 0;
+    private static DateTimeOffset? FromMp4Time(ulong t) =>
+        t == 0 || t > long.MaxValue / 2 ? null : DateTimeOffset.FromUnixTimeSeconds((long)t - Mp4EpochOffset);
+
     private static byte[] EncodeAvifSequenceEntry(ImageSequence sequence, AvifEncodeOptions options)
     {
         if (sequence.Count > 0) options = AdoptSourceFormat(sequence[0], options);
+        using var siting = new Av1.Av1ObuWriter.ChromaPositionScope(sequence.Count > 0 ? SourceChromaPosition(sequence[0], options) : 0);
         if (options.TargetSize is { } target)
             return SearchTargetSize(options, target, o => EncodeAvifSequence(sequence, o));
         if (sequence.Count == 0) throw new ArgumentException("The sequence has no frames.", nameof(sequence));
@@ -1733,6 +1762,8 @@ public static partial class HeifCoder
         sq.Timescale = exact ? (uint)sequence.Timescale : 100;
         sq.Durations = sequence.Frames.Select(f => exact ? (uint)f.DurationTicks : (uint)(f.Delay > 0 ? f.Delay : 10)).ToArray();
         sq.RepetitionCount = sequence.LoopCount <= 0 ? -1 : sequence.LoopCount - 1;
+        sq.CreationTime = ToMp4Time(options.CreationTime ?? sequence.CreationTime);
+        sq.ModificationTime = ToMp4Time(options.ModificationTime ?? sequence.ModificationTime);
         extras.Sequence = sq;
 
         var c0 = sq.ColorSamples[0];

@@ -101,7 +101,7 @@ public static partial class HeifCoder
         {
             Planes = new Lazy<ushort[][]>(() => planes), Width = w, Height = h, Depth = depth,
             Layout = mono ? Av1.Av1PixelLayout.I400 : ssX == 0 ? Av1.Av1PixelLayout.I444 : ssY == 0 ? Av1.Av1PixelLayout.I422 : Av1.Av1PixelLayout.I420,
-            Matrices = null, FullRange = yuv.FullRange, Alpha = yuv.Alpha,
+            Matrices = null, FullRange = yuv.FullRange, Alpha = yuv.Alpha, ChromaSamplePosition = yuv.ChromaSamplePosition,
         });
         return frame;
     }
@@ -135,6 +135,11 @@ public static partial class HeifCoder
             Alpha = image.HasAlpha && nonOpaque && bd == 8 ? a : null,
         };
     }
+
+    // The chroma siting to signal: a Y4M's 4:2:0 planes coded as they are (same layout and depth) keep theirs.
+    private static int SourceChromaPosition(ImageFrame image, AvifEncodeOptions options) =>
+        SourcePlanes.TryGetValue(image, out var src) && src.Matrices == null && src.Layout == Av1.Av1PixelLayout.I420
+        && options.ChromaSubsampling == AvifChromaSubsampling.Yuv420 && options.BitDepth == src.Depth ? src.ChromaSamplePosition : 0;
 
     // Kept Y4M planes: Auto subsampling / depth 0 adopt them and the range is retained (avifenc codes a Y4M's own
     // layout, depth and range).

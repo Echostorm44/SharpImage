@@ -197,6 +197,20 @@ internal static class Av1ObuWriter
 
     [ThreadStatic] private static LayeredStream? t_layered;
     internal static bool CurrentReferenceSelect => t_layered is { Sequence: true, InterFrame: true, ReferenceSelect: true };
+    // loop_filter_sharpness (0..7) of the frames written on this thread.
+    [ThreadStatic] internal static int t_sharpness;
+
+    // chroma_sample_position of the 4:2:0 stream written on this thread (0 unknown, 1 vertical, 2 colocated): a Y4M's
+    // C420mpeg2 / C420paldv planes coded as they are keep their siting (sequence header and av1C).
+    [ThreadStatic] private static int t_chromaSamplePosition;
+    internal static int ChromaSamplePosition => t_chromaSamplePosition;
+    internal readonly struct ChromaPositionScope : IDisposable
+    {
+        private readonly int prev;
+        internal ChromaPositionScope(int csp) { prev = t_chromaSamplePosition; t_chromaSamplePosition = csp; }
+        public void Dispose() => t_chromaSamplePosition = prev;
+    }
+
     // Set while writing the cells of a grid (they share the first cell's av1C).
     [ThreadStatic] private static bool t_sharedHeader;
     internal sealed class SharedHeaderScope : IDisposable
@@ -382,13 +396,15 @@ internal static class Av1ObuWriter
     // All of the writer's ambient (thread-static) state, so an encoder's worker threads build headers exactly as the
     // calling thread would (film grain, layered / sequence stream, tiling request).
     internal readonly record struct ThreadState(Av1FilmGrainData? FilmGrain, bool FilmGrain420, int FilmGrainSuppressed,
-        LayeredStream? Layered, (int Cols, int Rows) TileLog2);
-    internal static ThreadState CaptureThreadState() => new(t_filmGrain, t_filmGrain420, t_filmGrainSuppressed, t_layered, t_tileLog2Request);
+        LayeredStream? Layered, (int Cols, int Rows) TileLog2, bool SharedHeader, int Sharpness, int ChromaPosition);
+    internal static ThreadState CaptureThreadState() => new(t_filmGrain, t_filmGrain420, t_filmGrainSuppressed, t_layered, t_tileLog2Request,
+        t_sharedHeader, t_sharpness, t_chromaSamplePosition);
     internal static ThreadState ExchangeThreadState(ThreadState s)
     {
         var prev = CaptureThreadState();
         t_filmGrain = s.FilmGrain; t_filmGrain420 = s.FilmGrain420; t_filmGrainSuppressed = s.FilmGrainSuppressed;
         t_layered = s.Layered; t_tileLog2Request = s.TileLog2;
+        t_sharedHeader = s.SharedHeader; t_sharpness = s.Sharpness; t_chromaSamplePosition = s.ChromaPosition;
         return prev;
     }
 
@@ -549,7 +565,7 @@ internal static class Av1ObuWriter
                 if (ssX != 0) w.PutBit((uint)ssY);   // subsampling_y
             }
             if (ssX != 0 && ssY != 0)
-                w.PutBits(0, 2);  // chroma_sample_position = Unknown
+                w.PutBits((uint)t_chromaSamplePosition, 2);  // chroma_sample_position (Unknown unless a Y4M's siting is kept)
             w.PutBool(false);     // separate_uv_delta_q = 0
         }
 
@@ -688,7 +704,7 @@ internal static class Av1ObuWriter
             w.PutBits(lf, 6);     // loop_filter_level[2] (U) — read only when level[0]|level[1] and NumPlanes>1
             w.PutBits(lf, 6);     // loop_filter_level[3] (V)
         }
-        w.PutBits(0, 3);          // loop_filter_sharpness = 0
+        w.PutBits((uint)t_sharpness, 3);   // loop_filter_sharpness (AvifEncodeOptions.Sharpness, avifenc -a sharpness=S)
         w.PutBool(false);         // loop_filter_delta_enabled = 0
 
         // cdef_params (enable_cdef=1, not lossless, not intrabc). Strengths may all be 0 = no-op filter.
