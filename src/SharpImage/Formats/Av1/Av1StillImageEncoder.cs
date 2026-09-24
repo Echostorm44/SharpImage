@@ -43,6 +43,16 @@ internal sealed class Av1EncodeSpeed
     public void SetAngleDeltas(int set) { AngleDeltaSet = set; Candidates = Av1StillImageEncoder.BuildCandidates(AngleDeltas(set)); }
     public bool UseTxTypeSearch = true;
     public bool UseRdoq = true;
+    /// <summary>Loop restoration (Wiener / self-guided) search; LrSgrSets = self-guided parameter sets tried per unit.</summary>
+    public bool UseLoopRestoration = true;
+    public int LrSgrSets = 16;
+    /// <summary>Luma restoration unit sizes searched, as a mask of lr_unit_shift (bit 0 = 64, 1 = 128, 2 = 256).</summary>
+    public int LrUnitShiftMask = 7;
+    public int LrWienerRounds = 3;
+    /// <summary>Decode the restored frame and keep it only if it beats the unrestored one (else trust the search).</summary>
+    public bool LrVerify = true;
+    /// <summary>Wiener statistics on every n-th row and column (1 = every pixel).</summary>
+    public int LrStatsStep = 1;
 
     public Av1EncodeSpeed Clone() => (Av1EncodeSpeed)MemberwiseClone();
 
@@ -56,12 +66,14 @@ internal sealed class Av1EncodeSpeed
         if (speed >= 2) { p.RdModeCandidates = 4; p.UseExtPartition = false; p.UseFilterIntra = false; p.EarlyTermBits = 32; }
         if (speed >= 3) { p.UseRectPartition = false; p.EarlyTermBits = 64; }
         if (speed >= 4) { p.RdModeCandidates = 2; p.UseSub8Partition = false; p.EarlyTermBits = 32; }
+        if (speed >= 4) p.LrSgrSets = 8;
         if (speed >= 5) { p.RdUvCandidates = 1; p.UseFullIntraTxSet = false; }
         if (speed >= 6) { p.UseTrueRd = false; p.UseRd = false; p.UseSub8Partition = true; p.EarlyTermBits = 8; }
+        if (speed >= 6) { p.LrSgrSets = 2; p.LrUnitShiftMask = 4; p.LrWienerRounds = 2; p.LrVerify = false; p.LrStatsStep = 2; }
         // 7-10 (measured on the speed corpus vs libaom's ladder, BD vs libaom speed 0 / fox 1204x800 1-thread time):
         // 7 +20.1% 0.30 s (aom s7 +22.3%), 8 +24.1% 0.22 s (aom s8 +26.5% 0.25 s), 9 +30.7% 0.20 s,
         // 10 +33.6% 0.18 s (aom s9/s10 +54.6%, 0.11 s).
-        if (speed >= 7) { p.UseDeblockSearch = false; p.UseCdefSearch = false; p.SetAngleDeltas(0); p.RdModeCandidates = 1; }
+        if (speed >= 7) { p.UseDeblockSearch = false; p.UseCdefSearch = false; p.SetAngleDeltas(0); p.RdModeCandidates = 1; p.UseLoopRestoration = false; }
         if (speed >= 8) p.UseRdoq = false;
         if (speed >= 9) p.UseTxTypeSearch = false;
         if (speed >= 10) p.UseCfl = false;
@@ -626,7 +638,12 @@ internal static class Av1StillImageEncoder
         ushort[] padY = PadPlane(luma, width, height, pw, ph);
         ushort[] padU = PadPlane(u, cwIn, chIn, pw >> ssX, ph >> ssY);
         ushort[] padV = PadPlane(v, cwIn, chIn, pw >> ssX, ph >> ssY);
-        byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx, layout);
+        // Loop restoration (a standalone still enables it in its sequence header only when used; shared-header streams
+        // and grids always enable it — Av1ObuWriter.RestorationHeaderShared). Tiny frames gain nothing.
+        bool lrOn = UseLoopRestoration && baseQIdx > 0 && width >= 16 && height >= 16;
+        var (_, _, lrCols, lrRows) = Av1ObuWriter.TileLayout(sbCols, sbRows);
+        var logs = lrOn ? new List<Av1MsacWriter.LogOp>[(lrCols.Length - 1) * (lrRows.Length - 1)] : null;
+        byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx, layout, logs);
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: false, enableFilterIntra: UseFilterIntra, bitDepth: bitDepth, layout: layout, color: color);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
 
@@ -637,7 +654,70 @@ internal static class Av1StillImageEncoder
         Av1ObuWriter.CdefParams best = SearchCdef(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
             monochrome: false, srcY, srcU, srcV, cwIn, chIn, lfLevel);
         byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: false, tile, best, lfLevel);
+        if (logs != null && TryLoopRestoration(seqCfg, seqObu, frameObu, logs, sbCols, sbRows, width, height, layout, monochrome: false,
+                srcY, srcU, srcV, cwIn, chIn, baseQIdx, best, lfLevel) is { } withLr)
+            return withLr;
         return (seqObu, frameObu);
+    }
+
+    /// <summary>Loop-restoration stage: decodes the filtered (deblock + CDEF) frame, searches Wiener / self-guided
+    /// units against the source, replays the recorded tiles with the unit syntax at each superblock and rebuilds the
+    /// headers with restoration enabled. Returns null (keep the frame as is) unless the decoded result is better in
+    /// SSE + λ·bits.</summary>
+    private static (byte[] SeqObu, byte[] FrameObu)? TryLoopRestoration(in Av1ObuWriter.SeqConfig seqCfg, byte[] seqObu, byte[] frameObu,
+        List<Av1MsacWriter.LogOp>[] logs, int sbCols, int sbRows, int width, int height, Av1PixelLayout layout, bool monochrome,
+        ushort[] srcY, ushort[]? srcU, ushort[]? srcV, int cw, int ch, int baseQIdx, Av1ObuWriter.CdefParams cdef, int lfLevel)
+    {
+        int acDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1];
+        double lambda = RdLambdaK * acDq * acDq;
+        bool i420 = layout == Av1PixelLayout.I420;
+        int ssX = layout == Av1PixelLayout.I444 ? 0 : 1, ssY = i420 ? 1 : 0;
+
+        ushort[][] rec; int[] recStrides; long sseNoLr;
+        using (var yuv = new Av1Decoder { ApplyFilmGrain = false, MaxThreads = ThreadCount }.Decode([.. seqObu, .. frameObu], 0, isKeyframe: true))
+        {
+            if (yuv == null) return null;
+            sseNoLr = DecodedSse(yuv, srcY, srcU, srcV, width, height, cw, ch, monochrome);
+            ushort[] Plane(int p, int stride, int ph)
+            {
+                var a = new ushort[stride * ph];
+                if (yuv.BitDepth > 8) (p == 0 ? yuv.YPlane16 : p == 1 ? yuv.UPlane16 : yuv.VPlane16).Span[..a.Length].CopyTo(a);
+                else { var b = (p == 0 ? yuv.YPlane : p == 1 ? yuv.UPlane : yuv.VPlane).Span; for (int i = 0; i < a.Length; i++) a[i] = b[i]; }
+                return a;
+            }
+            recStrides = monochrome ? [yuv.YStride] : [yuv.YStride, yuv.UStride, yuv.VStride];
+            rec = monochrome ? [Plane(0, yuv.YStride, height)] : [Plane(0, yuv.YStride, height), Plane(1, yuv.UStride, ch), Plane(2, yuv.VStride, ch)];
+        }
+        ushort[][] src = monochrome ? [srcY] : [srcY, srcU!, srcV!];
+        var plan = Av1LrEncoder.Search(src, rec, [width, cw, cw], [height, ch, ch], [width, cw, cw], recStrides,
+            monochrome, i420, Bd, lambda, LrSgrSets, LrWienerRounds, LrStatsStep, ThreadCount,
+            Enumerable.Range(0, 3).Where(sh => (LrUnitShiftMask >> sh & 1) != 0).ToArray());
+        if (plan == null) return null;
+
+        // Replay each tile with the restoration syntax at its superblocks (fresh restoration CDFs / references per tile).
+        int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
+        var tiles = new byte[logs.Length][];
+        for (int ti = 0; ti < logs.Length; ti++)
+        {
+            var cdf = new Av1CdfContext();
+            Av1CdfDefaults.InitializeDefault(cdf, qcat);
+            var ts = new Av1LrEncoder.TileState(cdf);
+            tiles[ti] = Av1MsacWriter.Replay(logs[ti], (id, w) =>
+                Av1LrEncoder.WriteSb(w, ts, plan, (id & 0xFFFF) * 16, (id >> 16) * 16, width, height, ssX, ssY, monochrome));
+        }
+        byte[] seq2, frame2;
+        using (Av1ObuWriter.UseRestoration(plan, i420))
+        {
+            seq2 = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
+            frame2 = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome, AssembleTileGroup(tiles), cdef, lfLevel);
+        }
+        if (!LrVerify) return (seq2, frame2);
+        using var yuv2 = new Av1Decoder { ApplyFilmGrain = false, MaxThreads = ThreadCount }.Decode([.. seq2, .. frame2], 0, isKeyframe: true);
+        if (yuv2 == null) return null;
+        long sseLr = DecodedSse(yuv2, srcY, srcU, srcV, width, height, cw, ch, monochrome);
+        double jNo = sseNoLr + lambda * 8 * (seqObu.Length + frameObu.Length);
+        double jLr = sseLr + lambda * 8 * (seq2.Length + frame2.Length);
+        return jLr < jNo ? (seq2, frame2) : null;
     }
 
     /// <summary>Lossless key frame (base_q_idx 0, 4x4 WHT, no in-loop filters) for a colour image in any chroma layout
@@ -827,6 +907,14 @@ internal static class Av1StillImageEncoder
 
     private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> uPlane, ReadOnlySpan<ushort> vPlane,
         int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx, Av1PixelLayout layout = Av1PixelLayout.I420)
+        => EncodeMultiSbColorTile(luma, uPlane, vPlane, w, h, sbCols, sbRows, bw4, bh4, baseQIdx, layout, null);
+
+    /// <summary>As above; with <paramref name="tileLogs"/> (one slot per tile) each tile's coded operations are also
+    /// recorded, with a marker (sby &lt;&lt; 16 | sbx) before every superblock, for a later Replay that inserts syntax
+    /// decided after the tile (loop restoration).</summary>
+    private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> uPlane, ReadOnlySpan<ushort> vPlane,
+        int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx, Av1PixelLayout layout,
+        List<Av1MsacWriter.LogOp>[]? tileLogs)
     {
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
         var cdf = new Av1CdfContext();
@@ -862,7 +950,7 @@ internal static class Av1StillImageEncoder
             Av1CdfDefaults.InitializeDefault(tcdf, qcat);
             var c = new ColorPartCtx
             {
-                Msac = new Av1MsacWriter(), Cdf = tcdf, Luma = lumaArr, U = uArr, V = vArr,
+                Msac = new Av1MsacWriter { Log = tileLogs != null ? new() : null }, Cdf = tcdf, Luma = lumaArr, U = uArr, V = vArr,
                 ReconY = reconY, ReconU = reconU, ReconV = reconV,
                 W = w, Cw = cw, Chh = chh, Bw4 = bw4, Bh4 = bh4, Layout = layout, SsX = ssX, SsY = ssY,
                 DcDq = dcDq, AcDq = acDq,
@@ -890,9 +978,11 @@ internal static class Av1StillImageEncoder
                         c.AModeY = aModeY[col]; c.ASkip = aSkip[col]; c.ATxY = aTxY[col];
                         c.AModeUv = aModeUv[col];
                         c.APalSz = aPalSz[col]; c.APalCol = aPalCol[col];
+                        c.Msac.Mark((sby << 16) | sbx);
                         EncodePartitionColor(c, 1, sbx * 16, sby * 16);
                     }
                 }
+                if (tileLogs != null) tileLogs[ti] = c.Msac.Log!;
                 tiles[ti] = c.Msac.Finish();
             }
             finally
@@ -1262,6 +1352,7 @@ internal static class Av1StillImageEncoder
         double bestJ = double.MaxValue;
         RdSnapshot? bestSnap = null;
         int[] bestTail = System.Array.Empty<int>();
+        List<Av1MsacWriter.LogOp> bestLogTail = new();
         for (int i = 0; i < nc; i++)
         {
             if (i > 0) RestoreRd(c, snap0, bx4, by4, blk4);
@@ -1273,6 +1364,7 @@ internal static class Av1StillImageEncoder
             {
                 bestJ = j;
                 bestTail = c.Msac.PrecarryFrom(baseCount);
+                bestLogTail = c.Msac.LogFrom(snap0.Msac.LogCount);
                 bestSnap = SnapshotRd(c, bx4, by4, blk4);
             }
 
@@ -1286,6 +1378,7 @@ internal static class Av1StillImageEncoder
         RestoreRd(c, snap0, bx4, by4, blk4);
         RestoreRd(c, bestSnap!, bx4, by4, blk4);
         c.Msac.AppendPrecarry(bestTail);
+        c.Msac.AppendLog(bestLogTail);
         c.Msac.Measure = measureWas;
     }
 
@@ -3270,6 +3363,13 @@ internal static class Av1StillImageEncoder
     internal static int RdModeCandidates { get => Sp.RdModeCandidates; set => Sp.RdModeCandidates = value; }
     internal static bool UseRdoq { get => Sp.UseRdoq; set => Sp.UseRdoq = value; }
     internal static bool UseTxTypeSearch { get => Sp.UseTxTypeSearch; set => Sp.UseTxTypeSearch = value; }
+    internal static bool UseLoopRestoration { get => Sp.UseLoopRestoration; set => Sp.UseLoopRestoration = value; }
+    internal static int LrSgrSets { get => Sp.LrSgrSets; set => Sp.LrSgrSets = value; }
+    internal static int LrUnitShiftMask { get => Sp.LrUnitShiftMask; set => Sp.LrUnitShiftMask = value; }
+    internal static int LrWienerRounds { get => Sp.LrWienerRounds; set => Sp.LrWienerRounds = value; }
+    internal static bool LrVerify { get => Sp.LrVerify; set => Sp.LrVerify = value; }
+
+    internal static int LrStatsStep { get => Sp.LrStatsStep; set => Sp.LrStatsStep = value; }
     internal static int AngleDeltaSet { get => Sp.AngleDeltaSet; set => Sp.SetAngleDeltas(value); }
 
     // Dev/conformance isolation: when set, only luma intra candidates passing the filter are considered (square,

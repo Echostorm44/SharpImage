@@ -2505,6 +2505,7 @@ public static partial class HeifCoder
             ColorLayerSizes = layered ? [] : null, AlphaLayerSizes = layered && alpha ? [] : null,
         };
         using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, cellW, cellH));   // libavif: from the first cell
+        using var sharedHeader = new Av1.Av1ObuWriter.SharedHeaderScope();   // every cell uses the first cell's av1C
         for (int gy = 0; gy < rows; gy++)
             for (int gx = 0; gx < cols; gx++)
             {

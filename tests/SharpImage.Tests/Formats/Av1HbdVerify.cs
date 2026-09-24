@@ -1698,6 +1698,96 @@ public sealed class Av1HbdVerify
                             log.AppendLine($"{Path.GetFileName(f)} {Av1Conformance.CheckVector(f)}");
                     continue;
                 }
+                if (t[0] == "encstream")
+                {
+                    // encstream <prog|grid|layers|seq> <src (image, or animated GIF for seq)> <out.avif> [quality] [speed] [depth]:
+                    // shared-header streams from our encoder, for checking them against avifdec (loop restoration in
+                    // layered / grid / sequence streams).
+                    int q = t.Length > 4 ? int.Parse(t[4]) : 60, sp = t.Length > 5 ? int.Parse(t[5]) : 6, bdp = t.Length > 6 ? int.Parse(t[6]) : 8;
+                    var eo = new AvifEncodeOptions { Quality = q, Speed = sp, BitDepth = bdp };
+                    byte[] outB;
+                    if (t[1] == "seq")
+                    {
+                        using var seq = FormatRegistry.ReadSequence(t[2]);
+                        outB = HeifCoder.EncodeAvifSequence(seq, eo);
+                    }
+                    else if (t[1] == "seqpan")
+                    {
+                        // 6 frames panning a 320x240 window across the image (photographic inter frames)
+                        var src = FormatRegistry.Read(t[2]);
+                        using var seq = new ImageSequence();
+                        int n = src.NumberOfChannels;
+                        for (int fi = 0; fi < 6; fi++)
+                        {
+                            var fr = new SharpImage.Image.ImageFrame();
+                            fr.Initialize(320, 240, src.Colorspace, src.HasAlpha);
+                            for (int y = 0; y < 240; y++)
+                                src.GetPixelRow(y + fi * 3).Slice(fi * 7 * n, 320 * n).CopyTo(fr.GetPixelRowForWrite(y));
+                            fr.Delay = 10;
+                            seq.AddFrame(fr);
+                        }
+                        outB = HeifCoder.EncodeAvifSequence(seq, eo);
+                    }
+                    else
+                    {
+                        var img = FormatRegistry.Read(t[2]);
+                        if (t[1] == "prog") eo.Progressive = true;
+                        else if (t[1] == "grid") eo.Grid = (2, 2);
+                        else if (t[1] == "layers") eo.Layers = [new AvifLayer { Quality = 20, ScaleNumerator = 1, ScaleDenominator = 2 },
+                            new AvifLayer { Quality = 40, ScaleNumerator = 1, ScaleDenominator = 1 }, new AvifLayer { Quality = q }];
+                        outB = HeifCoder.EncodeAvif(img, eo);
+                    }
+                    File.WriteAllBytes(t[3], outB);
+                    log.AppendLine($"encstream {t[1]} {Path.GetFileName(t[3])} {outB.Length} bytes");
+                    continue;
+                }
+                if (t[0] == "encdump")
+                {
+                    // encdump <src image> <out.avif> <quality> <speed> <depth> <420|422|444> [crop WxH]: encodes with those
+                    // options, writes the file and our decode of its colour item as native-depth planes (u16 LE Y,U,V) to
+                    // <out.avif>.ours.yuv, for bit-exact comparison with another decoder (loop-restoration conformance).
+                    var img = FormatRegistry.Read(t[1]);
+                    if (t.Length > 7)
+                    {
+                        var wh = t[7].Split('x');
+                        int cw = Math.Min(int.Parse(wh[0]), (int)img.Columns), chh = Math.Min(int.Parse(wh[1]), (int)img.Rows);
+                        var cropped = new SharpImage.Image.ImageFrame();
+                        cropped.Initialize(cw, chh, img.Colorspace, img.HasAlpha);
+                        for (int y = 0; y < chh; y++)
+                            img.GetPixelRow(y).Slice(0, cw * img.NumberOfChannels).CopyTo(cropped.GetPixelRowForWrite(y));
+                        img = cropped;
+                    }
+                    var eo = new AvifEncodeOptions
+                    {
+                        Quality = int.Parse(t[3]), Speed = int.Parse(t[4]), BitDepth = int.Parse(t[5]),
+                        ChromaSubsampling = t[6] switch { "422" => AvifChromaSubsampling.Yuv422, "444" => AvifChromaSubsampling.Yuv444, _ => AvifChromaSubsampling.Yuv420 },
+                    };
+                    byte[] avif = HeifCoder.EncodeAvif(img, eo);
+                    File.WriteAllBytes(t[2], avif);
+                    var c = HeifContainer.Parse(avif);
+                    using var f = new Av1Decoder().Decode(c.ItemData(c.PrimaryId)!, 0, true)!;
+                    using var ofs = File.Create(t[2] + ".ours.yuv");
+                    void Plane(ReadOnlySpan<ushort> p16, ReadOnlySpan<byte> p8, int stride, int pw, int ph)
+                    {
+                        var row = new byte[pw * 2];
+                        for (int y = 0; y < ph; y++)
+                        {
+                            for (int x = 0; x < pw; x++)
+                            {
+                                int v = f.BitDepth > 8 ? p16[y * stride + x] : p8[y * stride + x];
+                                row[2 * x] = (byte)v; row[2 * x + 1] = (byte)(v >> 8);
+                            }
+                            ofs.Write(row);
+                        }
+                    }
+                    int w = f.Width, h = f.Height;
+                    int sx = t[6] == "444" ? 0 : 1, sy = t[6] == "420" ? 1 : 0;
+                    Plane(f.BitDepth > 8 ? f.YPlane16.Span : default, f.BitDepth > 8 ? default : f.YPlane.Span, f.YStride, w, h);
+                    Plane(f.BitDepth > 8 ? f.UPlane16.Span : default, f.BitDepth > 8 ? default : f.UPlane.Span, f.UStride, (w + sx) >> sx, (h + sy) >> sy);
+                    Plane(f.BitDepth > 8 ? f.VPlane16.Span : default, f.BitDepth > 8 ? default : f.VPlane.Span, f.VStride, (w + sx) >> sx, (h + sy) >> sy);
+                    log.AppendLine($"encdump {Path.GetFileName(t[2])} {w}x{h} bd{f.BitDepth} {avif.Length} bytes");
+                    continue;
+                }
                 if (t[0] == "timeenc" || t[0] == "timedec")
                 {
                     // timeenc <png> <out.avif> <quality> <reps> [speed]: best-of-reps wall time of HeifCoder.EncodeAvif (after a

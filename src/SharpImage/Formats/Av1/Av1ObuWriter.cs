@@ -23,6 +23,22 @@ internal static class Av1ObuWriter
         internal bool IsSrgbIdentity => Primaries == 1 && Transfer == 13 && Matrix == 0;
     }
 
+    // Loop restoration for the stream being written on this thread (null = enable_restoration 0). Set only around
+    // the final assembly of a still that uses it, so every other stream is unchanged.
+    [ThreadStatic] private static RestorationScope? t_lr;
+
+    internal sealed class RestorationScope : IDisposable
+    {
+        internal readonly Av1LrEncoder.Plan? Plan; internal readonly bool I420;
+        private readonly RestorationScope? prev;
+        internal RestorationScope(Av1LrEncoder.Plan? plan, bool i420) { Plan = plan; I420 = i420; prev = t_lr; t_lr = this; }
+        public void Dispose() => t_lr = prev;
+    }
+
+    /// <summary>Sequence header enable_restoration = 1 and frame header lr_params = <paramref name="plan"/> for the
+    /// headers written on this thread until disposed.</summary>
+    internal static RestorationScope UseRestoration(Av1LrEncoder.Plan? plan, bool i420) => new(plan, i420);
+
     internal readonly struct SeqConfig
     {
         public readonly int Width;
@@ -181,6 +197,20 @@ internal static class Av1ObuWriter
 
     [ThreadStatic] private static LayeredStream? t_layered;
     internal static bool CurrentReferenceSelect => t_layered is { Sequence: true, InterFrame: true, ReferenceSelect: true };
+    // Set while writing the cells of a grid (they share the first cell's av1C).
+    [ThreadStatic] private static bool t_sharedHeader;
+    internal sealed class SharedHeaderScope : IDisposable
+    {
+        private readonly bool prev = t_sharedHeader;
+        internal SharedHeaderScope() => t_sharedHeader = true;
+        public void Dispose() => t_sharedHeader = prev;
+    }
+
+    /// <summary>Loop restoration is enabled in the sequence header regardless of the frame: a layered / sequence stream
+    /// or a grid shares one sequence header across frames or cells, so it always enables restoration and every frame
+    /// header carries lr_params (its plan, or none).</summary>
+    internal static bool RestorationHeaderShared => t_layered != null || t_sharedHeader;
+    private static bool RestorationEnabled => t_lr != null || RestorationHeaderShared;
 
     internal readonly struct LayeredScope : IDisposable
     {
@@ -474,7 +504,7 @@ internal static class Av1ObuWriter
     afterTools:
         w.PutBool(false);         // enable_superres = 0
         w.PutBool(true);          // enable_cdef = 1 (frame header carries cdef_params; strengths may be 0 = no-op)
-        w.PutBool(false);         // enable_restoration = 0
+        w.PutBool(RestorationEnabled);   // enable_restoration (a standalone still only when its search chose it)
 
         // color_config (AV1 spec 5.5.2)
         w.PutBool(cfg.BitDepth > 8);                      // high_bitdepth
@@ -672,7 +702,8 @@ internal static class Av1ObuWriter
                 w.PutBits(cdef.UvStrengths[i], 6); // cdef_uv_strength
             }
         }
-        // lr_params skipped (enable_restoration=0)
+        // lr_params (only present when the sequence enables restoration)
+        if (RestorationEnabled) Av1LrEncoder.WriteParams(w, t_lr?.Plan, monochrome, t_lr?.I420 ?? false);
 
         // read_tx_mode (not lossless)
         w.PutBool(txModeSelect);  // tx_mode_select: 0 ⇒ TX_MODE_LARGEST, 1 ⇒ TX_MODE_SELECT

@@ -33,16 +33,59 @@ internal sealed class Av1MsacWriter
     internal readonly struct State
     {
         internal readonly ulong Low; internal readonly uint Rng; internal readonly int Cnt;
-        internal readonly int PrecarryCount; internal readonly double Bits;
-        internal State(ulong low, uint rng, int cnt, int pc, double bits) { Low = low; Rng = rng; Cnt = cnt; PrecarryCount = pc; Bits = bits; }
+        internal readonly int PrecarryCount; internal readonly double Bits; internal readonly int LogCount;
+        internal State(ulong low, uint rng, int cnt, int pc, double bits, int logCount)
+        { Low = low; Rng = rng; Cnt = cnt; PrecarryCount = pc; Bits = bits; LogCount = logCount; }
     }
 
-    internal State Save() => new(low, rng, cnt, precarry.Count, MeasuredBits);
+    internal State Save() => new(low, rng, cnt, precarry.Count, MeasuredBits, Log?.Count ?? 0);
 
     internal void Restore(in State s)
     {
         low = s.Low; rng = s.Rng; cnt = s.Cnt; MeasuredBits = s.Bits;
         if (precarry.Count > s.PrecarryCount) precarry.RemoveRange(s.PrecarryCount, precarry.Count - s.PrecarryCount);
+        if (Log != null && Log.Count > s.LogCount) Log.RemoveRange(s.LogCount, Log.Count - s.LogCount);
+    }
+
+    /// <summary>One coded operation, for <see cref="Log"/>: a symbol (its interval fl/fh within an nsyms-ary alphabet),
+    /// a bool with its Q15 probability, an equiprobable bool, or a <see cref="Mark"/> position.</summary>
+    internal readonly struct LogOp
+    {
+        internal const byte Sym = 0, Bool = 1, Equi = 2, Marker = 3;
+        internal readonly byte Kind, S, N; internal readonly int A, B;
+        internal LogOp(byte kind, byte s, byte n, int a, int b) { Kind = kind; S = s; N = n; A = a; B = b; }
+    }
+
+    /// <summary>When set, every coded operation is also appended here (rolled back with Restore), so the tile can be
+    /// re-coded later by <see cref="Replay"/> with extra syntax written at the <see cref="Mark"/> positions (syntax
+    /// decided after the tile, e.g. loop-restoration units). Symbols are recorded as their coded intervals, so the
+    /// replay is exact whatever the CDFs do afterwards.</summary>
+    internal List<LogOp>? Log;
+
+    /// <summary>Records a marker (no bits) at the current position of <see cref="Log"/>.</summary>
+    internal void Mark(int id) => Log?.Add(new LogOp(LogOp.Marker, 0, 0, id, 0));
+
+    internal List<LogOp> LogFrom(int start) => Log == null ? new() : Log.GetRange(start, Log.Count - start);
+
+    internal void AppendLog(List<LogOp> tail) => Log?.AddRange(tail);
+
+    /// <summary>Re-codes a recorded operation sequence into a fresh coder, calling <paramref name="onMarker"/> at each
+    /// marker (it may code anything with the given writer) and returns the finished bytes. Without markers that write,
+    /// the result equals the recording coder's own output.</summary>
+    internal static byte[] Replay(List<LogOp> ops, Action<int, Av1MsacWriter>? onMarker)
+    {
+        var w = new Av1MsacWriter();
+        foreach (var op in ops)
+        {
+            switch (op.Kind)
+            {
+                case LogOp.Sym: w.EncodeInterval((uint)op.A, (uint)op.B, op.S, op.N); break;
+                case LogOp.Bool: w.EncodeBool(op.S, (uint)op.A); break;
+                case LogOp.Equi: w.EncodeBoolEqui(op.S); break;
+                default: onMarker?.Invoke(op.A, w); break;
+            }
+        }
+        return w.Finish();
     }
 
     // Precarry-buffer bytes emitted since index `start` (a trial's output tail), so a winning trial's committed
@@ -91,10 +134,13 @@ internal sealed class Av1MsacWriter
     /// <summary>Encodes symbol <paramref name="s"/> of an <paramref name="nsyms"/>-ary alphabet whose inverse-
     /// cumulative CDF is <paramref name="icdf"/> (Q15, decreasing, terminal 0 implicit). Non-adaptive.</summary>
     public void EncodeSymbol(ReadOnlySpan<ushort> icdf, int s, int nsyms)
+        => EncodeInterval(s > 0 ? icdf[s - 1] : (uint)(1 << 15), icdf[s], s, nsyms);
+
+    // Codes symbol s of an nsyms-ary alphabet given its inverse-CDF interval [fh, fl).
+    private void EncodeInterval(uint fl, uint fh, int s, int nsyms)
     {
+        Log?.Add(new LogOp(LogOp.Sym, (byte)s, (byte)nsyms, (int)fl, (int)fh));
         uint r = rng;
-        uint fl = s > 0 ? icdf[s - 1] : (uint)(1 << 15);
-        uint fh = icdf[s];
         if (Measure) MeasuredBits += Av1CoeffEncode.BitCost[Math.Clamp((int)fl - (int)fh, 0, 32768)];
         ulong l = low;
         if (fl < (1 << 15))
@@ -117,6 +163,7 @@ internal sealed class Av1MsacWriter
     /// (matches the decoder's DecodeBool). Non-adaptive.</summary>
     public void EncodeBool(uint val, uint f)
     {
+        Log?.Add(new LogOp(LogOp.Bool, (byte)val, 0, (int)f, 0));
         if (Measure) MeasuredBits += Av1CoeffEncode.BitCost[Math.Clamp((int)(val == 0 ? f : 32768 - f), 0, 32768)];
         uint r = rng;
         ulong l = low;
@@ -137,6 +184,7 @@ internal sealed class Av1MsacWriter
     /// <summary>Encodes a 50/50 boolean (matches DecodeBoolEqui).</summary>
     public void EncodeBoolEqui(uint val)
     {
+        Log?.Add(new LogOp(LogOp.Equi, (byte)val, 0, 0, 0));
         if (Measure) MeasuredBits += 1.0;
         uint r = rng;
         ulong l = low;
