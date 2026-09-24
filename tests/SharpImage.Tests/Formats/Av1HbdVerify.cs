@@ -2042,6 +2042,15 @@ public sealed class Av1HbdVerify
                     // "name frames w h alpha" line (or "name ERROR ...") in <outdir>/avifall.txt. With "prog": the layers of
                     // HeifCoder.DecodeProgressive instead (compare with avifdec --progressive --index i).
                     bool prog = t.Length > 3 && t[3] == "prog";
+                    // optional 5th token: chroma upsampling (automatic / fastest / best / nearest / bilinear, as avifdec -u)
+                    var dopt = new AvifDecodeOptions
+                    {
+                        ChromaUpsampling = (t.Length > 4 ? t[4] : "") switch
+                        {
+                            "fastest" => AvifChromaUpsampling.Fastest, "best" => AvifChromaUpsampling.BestQuality,
+                            "nearest" => AvifChromaUpsampling.Nearest, "bilinear" => AvifChromaUpsampling.Bilinear, _ => AvifChromaUpsampling.Automatic,
+                        },
+                    };
                     using var lw = new StreamWriter(Path.Combine(t[2], "avifall.txt")) { AutoFlush = true };
                     foreach (var f in Directory.GetFiles(t[1], "*.avif").Order())
                     {
@@ -2049,8 +2058,8 @@ public sealed class Av1HbdVerify
                         try
                         {
                             using var seq = new ImageSequence();
-                            if (prog) foreach (var layer in HeifCoder.DecodeProgressive(File.ReadAllBytes(f))) seq.AddFrame(layer);
-                            else foreach (var fr in HeifCoder.DecodeSequence(File.ReadAllBytes(f)).Frames.ToList()) seq.AddFrame(fr);
+                            if (prog) foreach (var layer in HeifCoder.DecodeProgressive(File.ReadAllBytes(f), dopt)) seq.AddFrame(layer);
+                            else foreach (var fr in HeifCoder.DecodeSequence(File.ReadAllBytes(f), dopt).Frames.ToList()) seq.AddFrame(fr);
                             for (int i = 0; i < seq.Count; i++)
                                 File.WriteAllBytes(Path.Combine(t[2], $"{n}.f{i}.rgb48"), Rgb48(seq[i]));
                             lw.WriteLine($"{n} {seq.Count} {seq[0].Columns} {seq[0].Rows} {(seq[0].HasAlpha ? 1 : 0)}");

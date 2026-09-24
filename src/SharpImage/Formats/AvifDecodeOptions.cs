@@ -7,6 +7,11 @@ namespace SharpImage.Formats;
 /// </summary>
 public sealed class AvifDecodeOptions
 {
+    /// <summary>Chroma upsampling for 4:2:0 / 4:2:2 -> RGB (avifdec -u), libavif's avifChromaUpsampling: Automatic,
+    /// BestQuality and Bilinear are bilinear (libyuv's filter for 8-bit, as libavif 1.4 picks it for all three), Fastest
+    /// and Nearest nearest-neighbour chroma. Matches avifdec -u for every mode.</summary>
+    public AvifChromaUpsampling ChromaUpsampling { get; init; }
+
     /// <summary>libavif AVIF_DEFAULT_IMAGE_SIZE_LIMIT: 16384 x 16384 pixels.</summary>
     public const long DefaultImageSizeLimit = 16384L * 16384;
 
@@ -60,4 +65,19 @@ public sealed class AvifDecodeOptions
     // libavif avifDimensionsTooLarge.
     internal bool TooLarge(long width, long height) =>
         width > imageSizeLimit / System.Math.Max(height, 1) || (imageDimensionLimit != 0 && (width > imageDimensionLimit || height > imageDimensionLimit));
+}
+
+/// <summary>avifdec -u / libavif avifChromaUpsampling.</summary>
+public enum AvifChromaUpsampling
+{
+    /// <summary>libyuv bilinear where available (libavif's default).</summary>
+    Automatic,
+    /// <summary>Nearest-neighbour through libyuv where available.</summary>
+    Fastest,
+    /// <summary>Bilinear (libavif 1.4 still uses libyuv's bilinear filter for 8-bit).</summary>
+    BestQuality,
+    /// <summary>Nearest-neighbour chroma.</summary>
+    Nearest,
+    /// <summary>Bilinear chroma (libyuv's filter where available).</summary>
+    Bilinear,
 }

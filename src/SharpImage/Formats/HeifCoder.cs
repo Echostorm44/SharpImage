@@ -2885,9 +2885,11 @@ public static partial class HeifCoder
     {
         // 8-bit colour goes through libyuv in libavif (its default build), whose fixed-point math differs from the
         // float path by up to 2 levels — use the exact port so we decode what libavif decodes.
+        var ups = Limits.ChromaUpsampling;
+        bool nearest = ups is AvifChromaUpsampling.Fastest or AvifChromaUpsampling.Nearest;
         if (yuv.BitDepth == 8 && !monochrome && LibyuvConstants(matrixCoeffs, fullRange, primaries) is { } k)
         {
-            ConvertYuvToRgbLibyuv8(yuv, frame, w, h, channels, k, ssHor, ssVer);
+            ConvertYuvToRgbLibyuv8(yuv, frame, w, h, channels, k, ssHor, ssVer, nearest);
             if (premAlpha != null) UnattenuateLibyuv(frame, premAlpha, w, h, channels);
             return;
         }
@@ -2932,8 +2934,9 @@ public static partial class HeifCoder
                 {
                     float Cb, Cr;
                     int uvI = i >> ssHor;
-                    if (is444)
+                    if (is444 || nearest)
                     {
+                        // 4:4:4, or nearest-neighbour chroma (avifChromaUpsampling FASTEST / NEAREST)
                         Cb = tabUV[Math.Min(hbd ? u16[uvJ * us + uvI] : u8[uvJ * us + uvI], maxCh)];
                         Cr = tabUV[Math.Min(hbd ? v16[uvJ * vs + uvI] : v8[uvJ * vs + uvI], maxCh)];
                     }
@@ -3214,7 +3217,7 @@ public static partial class HeifCoder
     }
 
     private static void ConvertYuvToRgbLibyuv8(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
-        (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr) k, int ssHor, int ssVer)
+        (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr) k, int ssHor, int ssVer, bool nearest = false)
     {
         var ym = yuv.YPlane; var um = yuv.UPlane; var vm = yuv.VPlane;
         int ys = yuv.YStride, us = yuv.UStride, vs = yuv.VStride;
@@ -3224,6 +3227,18 @@ public static partial class HeifCoder
         if (ssHor == 0)
         {
             Parallel.For(0, h, po, j => LibyuvRow(frame, ym.Span.Slice(j * ys, w), j, um.Span.Slice(j * us, w), vm.Span.Slice(j * vs, w), w, channels, k));
+            return;
+        }
+        if (nearest)
+        {
+            // libyuv without a filter (I420/I422ToARGBMatrix): each chroma sample serves two columns (and two rows at 4:2:0).
+            Parallel.For(0, h, po, () => (new byte[w], new byte[w]), (j, _, b) =>
+            {
+                var up = um.Span.Slice((j >> ssVer) * us); var vp = vm.Span.Slice((j >> ssVer) * vs);
+                for (int x = 0; x < w; x++) { b.Item1[x] = up[x >> 1]; b.Item2[x] = vp[x >> 1]; }
+                LibyuvRow(frame, ym.Span.Slice(j * ys, w), j, b.Item1, b.Item2, w, channels, k);
+                return b;
+            }, _ => { });
             return;
         }
         if (ssVer == 0)
