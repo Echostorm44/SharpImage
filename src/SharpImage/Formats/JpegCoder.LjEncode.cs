@@ -297,7 +297,7 @@ public static partial class JpegCoder
             arith = opt.Arithmetic;
             if (arith) optimize = false;
             else optimize = opt.OptimizeCoding || lossless || progressive || prec == 12;
-            if (arith || lossless) throw new NotSupportedException("Not yet ported");
+            if (lossless && arith) throw new NotSupportedException("Sorry, arithmetic coding is not supported");
 
             // initial_setup
             maxH = comps.Max(c => c.H);
@@ -448,9 +448,12 @@ public static partial class JpegCoder
         public byte[] Run()
         {
             var planes = ColorConvert();
-            bool context = !lossless && o.Smoothing > 0 && comps.Any(c => (c.H == maxH && c.V == maxV) || (c.H * 2 == maxH && c.V * 2 == maxV));
-            for (int ci = 0; ci < comps.Length; ci++) Downsample(comps[ci], planes[ci], context);
-            foreach (var c in comps) ForwardDct(c);
+            if (!lossless)
+            {
+                bool context = o.Smoothing > 0 && comps.Any(c => (c.H == maxH && c.V == maxV) || (c.H * 2 == maxH && c.V * 2 == maxV));
+                for (int ci = 0; ci < comps.Length; ci++) Downsample(comps[ci], planes[ci], context);
+                foreach (var c in comps) ForwardDct(c);
+            }
 
             // jcmarker.c write_file_header (+ cjpeg's ICC profile)
             Marker(0xD8);
@@ -496,6 +499,22 @@ public static partial class JpegCoder
             {
                 var si = scans[s];
                 var sc = SetupScan(si);
+                if (lossless)
+                {
+                    // jcdiffct.c: the statistics and output passes each difference the samples afresh
+                    GatherLossless(sc, LosslessDiffs(sc, si, planes));
+                    if (s == 0) WriteFrameHeader();
+                    WriteScanHeader(sc, si);
+                    EncodeLossless(sc, LosslessDiffs(sc, si, planes));
+                    continue;
+                }
+                if (arith)
+                {
+                    if (s == 0) WriteFrameHeader();
+                    WriteScanHeader(sc, si);
+                    Arithmetic(sc, si);
+                    continue;
+                }
                 if (progressive)
                 {
                     // jcmaster.c: no statistics pass for DC refinement scans (they use no Huffman table)
@@ -1360,6 +1379,441 @@ public static partial class JpegCoder
             }
         }
 
+        // ---- lossless (jclossls.c differencing, jclhuff.c Huffman) ----
+
+        /// <summary>The differences of a lossless scan's components (all full size: one sample per MCU and component),
+        /// with the scan's predictor and point transform; every pass restarts the predictors (start_pass_lossless).</summary>
+        private int[][] LosslessDiffs(ScanCtx sc, JpegScanInfo si, int[][] planes)
+        {
+            if (restartInterval % sc.McusPerRow != 0)
+                throw new ArgumentException($"Invalid restart interval {restartInterval}; must be an integer multiple of the number of MCUs in an MCU row ({sc.McusPerRow})");
+            int psv = si.Ss, al = si.Al;
+            int rowsPerRestart = restartInterval / sc.McusPerRow;
+            var diffs = new int[sc.Comps.Length][];
+            for (int ci = 0; ci < sc.Comps.Length; ci++)
+            {
+                var src = planes[sc.Comps[ci].Index];
+                var d = diffs[ci] = new int[W * H];
+                var prev = new int[W];
+                var cur = new int[W];
+                bool firstRow = true;
+                int rowsToGo = rowsPerRestart;
+                for (int y = 0; y < H; y++)
+                {
+                    int o0 = y * W;
+                    for (int x = 0; x < W; x++) cur[x] = src[o0 + x] >> al;
+                    if (firstRow)
+                    {
+                        // the first row after the start or a restart: 1-D, from 2^(P - Pt - 1)
+                        d[o0] = cur[0] - (1 << (prec - al - 1));
+                        for (int x = 1; x < W; x++) d[o0 + x] = cur[x] - cur[x - 1];
+                    }
+                    else
+                    {
+                        d[o0] = cur[0] - prev[0];
+                        for (int x = 1; x < W; x++)
+                        {
+                            long ra = cur[x - 1], rb = prev[x], rc = prev[x - 1];
+                            long p = psv switch
+                            {
+                                1 => ra,
+                                2 => rb,
+                                3 => rc,
+                                4 => ra + rb - rc,
+                                5 => ra + ((rb - rc) >> 1),
+                                6 => rb + ((ra - rc) >> 1),
+                                _ => (ra + rb) >> 1,
+                            };
+                            d[o0 + x] = cur[x] - (int)p;
+                        }
+                    }
+                    firstRow = false;
+                    if (restartInterval != 0 && --rowsToGo == 0) { rowsToGo = rowsPerRestart; firstRow = true; }
+                    (prev, cur) = (cur, prev);
+                }
+            }
+            return diffs;
+        }
+
+        /// <summary>jclhuff.c: a difference's magnitude category and extra bits, modulo 2^16.</summary>
+        private static int LosslessCategory(int temp, out int extra)
+        {
+            if ((temp & 0x8000) != 0)
+            {
+                temp = -temp & 0x7FFF;
+                if (temp == 0) temp = 0x8000;
+                extra = ~temp;
+            }
+            else
+            {
+                temp &= 0x7FFF;
+                extra = temp;
+            }
+            int nb = 0;
+            while (temp != 0) { nb++; temp >>= 1; }
+            return nb;
+        }
+
+        private void GatherLossless(ScanCtx sc, int[][] diffs)
+        {
+            var counts = new long[4][];
+            foreach (var c in sc.Comps) counts[c.Td] = new long[257];
+            for (int i = 0; i < W * H; i++)
+                for (int ci = 0; ci < sc.Comps.Length; ci++)
+                    counts[sc.Comps[ci].Td][LosslessCategory(diffs[ci][i], out _)]++;
+            var did = new bool[4];
+            foreach (var c in sc.Comps)
+                if (!did[c.Td]) { dcTbl[c.Td] = LeHuff.Optimal(counts[c.Td]); did[c.Td] = true; }
+        }
+
+        private void EncodeLossless(ScanCtx sc, int[][] diffs)
+        {
+            foreach (var c in sc.Comps)
+                (dcTbl[c.Td] ?? throw new InvalidOperationException("Huffman table was not defined")).Derive(16);
+            var bits = new LeBits(outp);
+            int restartsToGo = restartInterval, nextRestart = 0;
+            for (int i = 0; i < W * H; i++)
+            {
+                if (restartInterval != 0 && restartsToGo == 0)
+                {
+                    bits.Flush();
+                    outp.WriteByte(0xFF);
+                    outp.WriteByte((byte)(0xD0 + nextRestart));
+                }
+                for (int ci = 0; ci < sc.Comps.Length; ci++)
+                {
+                    var t = dcTbl[sc.Comps[ci].Td]!;
+                    int nb = LosslessCategory(diffs[ci][i], out int extra);
+                    if (t.Size[nb] == 0) throw new InvalidOperationException("Missing Huffman code table entry");
+                    bits.Put(t.Code[nb], t.Size[nb]);
+                    if (nb != 0 && nb != 16) bits.Put((uint)extra & ((1u << nb) - 1), nb);
+                }
+                if (restartInterval != 0)
+                {
+                    if (restartsToGo == 0)
+                    {
+                        restartsToGo = restartInterval;
+                        nextRestart = (nextRestart + 1) & 7;
+                    }
+                    restartsToGo--;
+                }
+            }
+            bits.Flush();
+        }
+
+        // ---- arithmetic coding (jcarith.c) ----
+
+        private sealed class LeArith
+        {
+            private readonly MemoryStream o;
+            private long c, a, sc, zc;
+            private int ct, buffer;
+            public LeArith(MemoryStream outp) { o = outp; Reset(); }
+
+            public void Reset() { c = 0; a = 0x10000L; sc = 0; zc = 0; ct = 11; buffer = -1; }
+
+            private void Zeros() { while (zc > 0) { o.WriteByte(0); zc--; } }
+
+            public void Encode(byte[] st, int i, int val)
+            {
+                int sv = st[i];
+                long qe = LjAritab[sv & 0x7F];
+                int nl = (int)(qe & 0xFF); qe >>= 8;
+                int nm = (int)(qe & 0xFF); qe >>= 8;
+                a -= qe;
+                if (val != (sv >> 7))
+                {
+                    if (a >= qe) { c += a; a = qe; }
+                    st[i] = (byte)((sv & 0x80) ^ nl);
+                }
+                else
+                {
+                    if (a >= 0x8000L) return;
+                    if (a < qe) { c += a; a = qe; }
+                    st[i] = (byte)((sv & 0x80) ^ nm);
+                }
+                do
+                {
+                    a <<= 1;
+                    c <<= 1;
+                    if (--ct == 0)
+                    {
+                        long temp = c >> 19;
+                        if (temp > 0xFF)
+                        {
+                            if (buffer >= 0)
+                            {
+                                Zeros();
+                                o.WriteByte((byte)(buffer + 1));
+                                if (buffer + 1 == 0xFF) o.WriteByte(0);
+                            }
+                            zc += sc;
+                            sc = 0;
+                            buffer = (int)(temp & 0xFF);
+                        }
+                        else if (temp == 0xFF) sc++;
+                        else
+                        {
+                            if (buffer == 0) zc++;
+                            else if (buffer >= 0)
+                            {
+                                Zeros();
+                                o.WriteByte((byte)buffer);
+                            }
+                            if (sc != 0)
+                            {
+                                Zeros();
+                                do { o.WriteByte(0xFF); o.WriteByte(0); } while (--sc != 0);
+                            }
+                            buffer = (int)(temp & 0xFF);
+                        }
+                        c &= 0x7FFFFL;
+                        ct += 8;
+                    }
+                } while (a < 0x8000L);
+            }
+
+            public void Finish()
+            {
+                long temp = (a - 1 + c) & 0xFFFF0000L;
+                c = temp < c ? temp + 0x8000L : temp;
+                c <<= ct;
+                if ((c & 0xF8000000L) != 0)
+                {
+                    if (buffer >= 0)
+                    {
+                        Zeros();
+                        o.WriteByte((byte)(buffer + 1));
+                        if (buffer + 1 == 0xFF) o.WriteByte(0);
+                    }
+                    zc += sc;
+                    sc = 0;
+                }
+                else
+                {
+                    if (buffer == 0) zc++;
+                    else if (buffer >= 0)
+                    {
+                        Zeros();
+                        o.WriteByte((byte)buffer);
+                    }
+                    if (sc != 0)
+                    {
+                        Zeros();
+                        do { o.WriteByte(0xFF); o.WriteByte(0); } while (--sc != 0);
+                    }
+                }
+                if ((c & 0x7FFF800L) != 0)
+                {
+                    Zeros();
+                    o.WriteByte((byte)((c >> 19) & 0xFF));
+                    if (((c >> 19) & 0xFF) == 0xFF) o.WriteByte(0);
+                    if ((c & 0x7F800L) != 0)
+                    {
+                        o.WriteByte((byte)((c >> 11) & 0xFF));
+                        if (((c >> 11) & 0xFF) == 0xFF) o.WriteByte(0);
+                    }
+                }
+            }
+        }
+
+        private const int ArithDcL = 0, ArithDcU = 1, ArithAcK = 5;   // jcparam.c defaults (DAC)
+
+        private void Arithmetic(ScanCtx sc, JpegScanInfo si)
+        {
+            var e = new LeArith(outp);
+            var dcStats = new byte[4][];
+            var acStats = new byte[4][];
+            var fixedBin = new byte[] { 113 };
+            bool dcPart = !progressive || (si.Ss == 0 && si.Ah == 0), acPart = !progressive || si.Se != 0;
+            foreach (var c in sc.Comps)
+            {
+                if (dcPart) dcStats[c.Td] = new byte[64];
+                if (acPart) acStats[c.Ta] = new byte[256];
+            }
+            var lastDc = new int[sc.Comps.Length];
+            var dcContext = new int[sc.Comps.Length];
+            int restartsToGo = restartInterval, nextRestart = 0;
+            var natural = JpegTables.NaturalOrder;
+            int al = si.Al;
+
+            void EncodeDc(int ci, int tbl, int v)
+            {
+                var stats = dcStats[tbl];
+                int st = dcContext[ci];
+                if (v == 0)
+                {
+                    e.Encode(stats, st, 0);
+                    dcContext[ci] = 0;
+                    return;
+                }
+                e.Encode(stats, st, 1);
+                if (v > 0) { e.Encode(stats, st + 1, 0); st += 2; dcContext[ci] = 4; }
+                else { v = -v; e.Encode(stats, st + 1, 1); st += 3; dcContext[ci] = 8; }
+                int m = 0;
+                if ((v -= 1) != 0)
+                {
+                    e.Encode(stats, st, 1);
+                    m = 1;
+                    int v2 = v;
+                    st = 20;
+                    while ((v2 >>= 1) != 0) { e.Encode(stats, st, 1); m <<= 1; st++; }
+                }
+                e.Encode(stats, st, 0);
+                if (m < (1 << ArithDcL) >> 1) dcContext[ci] = 0;
+                else if (m > (1 << ArithDcU) >> 1) dcContext[ci] += 8;
+                st += 14;
+                while ((m >>= 1) != 0) e.Encode(stats, st, (m & v) != 0 ? 1 : 0);
+            }
+
+            // the magnitude category and bits of v >= 1 (after the sign), from context st (jcarith.c)
+            void EncodeAcMagnitude(byte[] stats, int st, int k, int v)
+            {
+                st += 2;
+                int m = 0;
+                if ((v -= 1) != 0)
+                {
+                    e.Encode(stats, st, 1);
+                    m = 1;
+                    int v2 = v;
+                    if ((v2 >>= 1) != 0)
+                    {
+                        e.Encode(stats, st, 1);
+                        m <<= 1;
+                        st = k <= ArithAcK ? 189 : 217;
+                        while ((v2 >>= 1) != 0) { e.Encode(stats, st, 1); m <<= 1; st++; }
+                    }
+                }
+                e.Encode(stats, st, 0);
+                st += 14;
+                while ((m >>= 1) != 0) e.Encode(stats, st, (m & v) != 0 ? 1 : 0);
+            }
+
+            foreach (var mcu in Mcus(sc))
+            {
+                if (restartInterval != 0)
+                {
+                    if (restartsToGo == 0)
+                    {
+                        e.Finish();
+                        outp.WriteByte(0xFF);
+                        outp.WriteByte((byte)(0xD0 + nextRestart));
+                        foreach (var c in sc.Comps)
+                        {
+                            if (dcPart) Array.Clear(dcStats[c.Td]);
+                            if (acPart) Array.Clear(acStats[c.Ta]);
+                        }
+                        if (dcPart) { Array.Clear(lastDc); Array.Clear(dcContext); }
+                        e.Reset();
+                        restartsToGo = restartInterval;
+                        nextRestart = (nextRestart + 1) & 7;
+                    }
+                    restartsToGo--;
+                }
+                if (!progressive)
+                {
+                    foreach (var (ci, b) in mcu)
+                    {
+                        var c = sc.Comps[ci];
+                        var blk = c.Coef.AsSpan(b * 64, 64);
+                        int v = blk[0] - lastDc[ci];
+                        if (v != 0) lastDc[ci] = blk[0];
+                        EncodeDc(ci, c.Td, v);
+                        var stats = acStats[c.Ta];
+                        int ke;
+                        for (ke = 63; ke > 0; ke--) if (blk[natural[ke]] != 0) break;
+                        int k;
+                        for (k = 1; k <= ke; k++)
+                        {
+                            int st = 3 * (k - 1);
+                            e.Encode(stats, st, 0);
+                            while ((v = blk[natural[k]]) == 0) { e.Encode(stats, st + 1, 0); st += 3; k++; }
+                            e.Encode(stats, st + 1, 1);
+                            if (v > 0) e.Encode(fixedBin, 0, 0);
+                            else { v = -v; e.Encode(fixedBin, 0, 1); }
+                            EncodeAcMagnitude(stats, st, k, v);
+                        }
+                        if (k <= 63) e.Encode(stats, 3 * (k - 1), 1);
+                    }
+                }
+                else if (si.Ss == 0 && si.Ah == 0)
+                {
+                    foreach (var (ci, b) in mcu)
+                    {
+                        var c = sc.Comps[ci];
+                        int m = c.Coef[b * 64] >> al;
+                        int v = m - lastDc[ci];
+                        if (v != 0) lastDc[ci] = m;
+                        EncodeDc(ci, c.Td, v);
+                    }
+                }
+                else if (si.Ss == 0)
+                {
+                    foreach (var (ci, b) in mcu) e.Encode(fixedBin, 0, (sc.Comps[ci].Coef[b * 64] >> al) & 1);
+                }
+                else
+                {
+                    var c = sc.Comps[0];
+                    var blk = c.Coef.AsSpan(mcu[0].Block * 64, 64);
+                    var stats = acStats[c.Ta];
+                    static int Mag(int x, int sh) => (x < 0 ? -x : x) >> sh;
+                    int ke;
+                    for (ke = si.Se; ke > 0; ke--) if (Mag(blk[natural[ke]], al) != 0) break;
+                    int k;
+                    if (si.Ah == 0)
+                    {
+                        for (k = si.Ss; k <= ke; k++)
+                        {
+                            int st = 3 * (k - 1);
+                            e.Encode(stats, st, 0);
+                            int v;
+                            for (;;)
+                            {
+                                int raw = blk[natural[k]];
+                                v = Mag(raw, al);
+                                if (v != 0)
+                                {
+                                    e.Encode(stats, st + 1, 1);
+                                    e.Encode(fixedBin, 0, raw >= 0 ? 0 : 1);
+                                    break;
+                                }
+                                e.Encode(stats, st + 1, 0); st += 3; k++;
+                            }
+                            EncodeAcMagnitude(stats, st, k, v);
+                        }
+                    }
+                    else
+                    {
+                        int kex;
+                        for (kex = ke; kex > 0; kex--) if (Mag(blk[natural[kex]], si.Ah) != 0) break;
+                        for (k = si.Ss; k <= ke; k++)
+                        {
+                            int st = 3 * (k - 1);
+                            if (k > kex) e.Encode(stats, st, 0);
+                            for (;;)
+                            {
+                                int raw = blk[natural[k]];
+                                int v = Mag(raw, al);
+                                if (v != 0)
+                                {
+                                    if ((v >> 1) != 0) e.Encode(stats, st + 2, v & 1);
+                                    else
+                                    {
+                                        e.Encode(stats, st + 1, 1);
+                                        e.Encode(fixedBin, 0, raw >= 0 ? 0 : 1);
+                                    }
+                                    break;
+                                }
+                                e.Encode(stats, st + 1, 0); st += 3; k++;
+                            }
+                        }
+                    }
+                    if (k <= si.Se) e.Encode(stats, 3 * (k - 1), 1);
+                }
+            }
+            e.Finish();
+        }
+
         // ---- markers (jcmarker.c) ----
 
         private void Byte(int v) => outp.WriteByte((byte)v);
@@ -1412,7 +1866,27 @@ public static partial class JpegCoder
 
         private void WriteScanHeader(ScanCtx sc, JpegScanInfo s)
         {
-            if (!arith)
+            if (arith)
+            {
+                // emit_dac: the conditioning of every table the scan uses (libjpeg's defaults L=0 U=1, K=5)
+                var dcUse = new bool[4]; var acUse = new bool[4];
+                foreach (var c in sc.Comps)
+                {
+                    if (s.Ss == 0 && s.Ah == 0) dcUse[c.Td] = true;
+                    if (s.Se != 0) acUse[c.Ta] = true;
+                }
+                int n = dcUse.Count(x => x) + acUse.Count(x => x);
+                if (n != 0)
+                {
+                    Marker(0xCC); Word(n * 2 + 2);
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if (dcUse[i]) { Byte(i); Byte(ArithDcL + (ArithDcU << 4)); }
+                        if (acUse[i]) { Byte(i + 0x10); Byte(ArithAcK); }
+                    }
+                }
+            }
+            else
             {
                 foreach (var c in sc.Comps)
                 {

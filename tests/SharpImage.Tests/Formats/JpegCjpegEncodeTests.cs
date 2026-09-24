@@ -7,7 +7,8 @@ namespace SharpImage.Tests.Formats;
 
 // JpegCoder.Encode is libjpeg-turbo 3.1's compressor as cjpeg drives it: the output must equal cjpeg's byte for byte.
 // The references are cjpeg 3.1.4 runs over a 33x47 crop (TestAssets/jpeg_cjpeg); the full conformance sweep (images x
-// switch sets, 8 / 12-bit, sequential / progressive / scan scripts) ran against cjpeg with the cjpeg probe.
+// switch sets: 8 / 12-bit, sequential / progressive / scan scripts, Huffman / arithmetic, lossless at 2..16 bits) ran
+// against cjpeg with the cjpeg probe.
 public sealed class JpegCjpegEncodeTests
 {
     private static string Dir => Path.Combine(AppContext.BaseDirectory, "TestAssets", "jpeg_cjpeg");
@@ -32,6 +33,10 @@ public sealed class JpegCjpegEncodeTests
                 new([0, 1, 2], 0, 0, 2, 1), new([0, 1, 2], 0, 0, 1, 0),
             ],
         },
+        "arith" => new() { Arithmetic = true, RestartRows = 1 },
+        "arith_prog" => new() { Arithmetic = true, Progressive = true, Quality = 90 },
+        "lossless6" => new() { LosslessPredictor = 6, LosslessPointTransform = 1 },
+        "lossless12_rst" => new() { LosslessPredictor = 7, Precision = 12, RestartRows = 2 },
         _ => throw new ArgumentException(name),
     };
 
@@ -46,6 +51,10 @@ public sealed class JpegCjpegEncodeTests
     [Arguments("prog12")]
     [Arguments("seq12")]
     [Arguments("scans_deep")]
+    [Arguments("arith")]
+    [Arguments("arith_prog")]
+    [Arguments("lossless6")]
+    [Arguments("lossless12_rst")]
     public async Task MatchesCjpeg(string name)
     {
         var src = FormatRegistry.Read(Path.Combine(Dir, "src.ppm"));
