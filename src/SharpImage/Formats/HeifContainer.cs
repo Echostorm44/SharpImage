@@ -232,8 +232,22 @@ internal sealed class HeifContainer
         }
     }
 
+    // libavif avifParseItemPropertyAssociation: AVIF 2.3.2.3.2 ('a1lx' shall not be essential), AVIF 2.3.2.1.1 ('a1op'),
+    // HEIF 6.5.11.1 ('lsel') and MIAF 7.3.9 (transformative 'clap' / 'irot' / 'imir') shall be. Enforced for AVIF files
+    // only, as libavif does; HEIC files are read leniently.
+    private static void CheckEssential(int id, string type, bool essential)
+    {
+        if (essential && type == "a1lx")
+            throw new InvalidDataException($"Item ID [{id}] has a {type} property association which must not be marked essential, but is.");
+        if (!essential && type is "a1op" or "lsel" or "clap" or "irot" or "imir")
+            throw new InvalidDataException($"Item ID [{id}] has a {type} property association which must be marked essential, but is not.");
+    }
+
+    private bool IsAvifBrand => Brands.Exists(b => b is "avif" or "avis");
+
     private void ParseIprp(int off, int len)
     {
+        bool avif = IsAvifBrand;
         var kids = Children(data, off, len);
         List<(string Type, int Off, int Len)> props = [];
         foreach (var (type, bOff, bLen) in kids) if (type == "ipco") props = Children(data, bOff, bLen);
@@ -256,9 +270,12 @@ internal sealed class HeifContainer
                     pos += wideIdx ? 2 : 1;
                     bool essential = (raw & (wideIdx ? 0x8000 : 0x80)) != 0;
                     int idx = raw & (wideIdx ? 0x7FFF : 0x7F);
+                    if (idx == 0 && essential && avif)
+                        throw new InvalidDataException($"Box[ipma] for item ID [{id}] contains an illegal essential property index 0.");
                     if (idx >= 1 && idx <= props.Count)
                     {
                         var (pt, po, pl) = props[idx - 1];
+                        if (avif) CheckEssential(id, pt, essential);
                         item.Properties.Add((pt, po, pl, essential));
                     }
                 }

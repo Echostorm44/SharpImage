@@ -1,8 +1,9 @@
 // AVIF Sample Transform ('sato', AVIF 1.2 section 4.2.3): a derived image item whose samples are computed per plane from
 // its input image items by a postfix expression — libavif uses it for bit-depth extension (avifenc -d 8,8 / 12,4 /
 // 12,8: a lossless or lossy base item plus a hidden item with the remaining bits, combined into a 16-bit image). The
-// 'sato' item is found and evaluated as libavif does when sample transforms are decoded (avifdec enables them): the
-// first 'sato' item preferred over the primary in an 'altr' group, 32-bit expressions, output clamped to its pixi depth.
+// 'sato' item is found and evaluated as libavif does when sample transforms are decoded (AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS,
+// avifdec --sato; libavif's default decodes only the base item): the first 'sato' item preferred over the primary in an
+// 'altr' group, 32-bit expressions, output clamped to its pixi depth. We always decode it — the full-precision image.
 using SharpImage.Core;
 using SharpImage.Image;
 using System.Buffers;

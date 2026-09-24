@@ -1851,6 +1851,30 @@ public sealed class Av1HbdVerify
                     log.AppendLine($"ok {t[1]} {avif.Length} bytes {dec.Count} frames {sw2.ElapsedMilliseconds} ms");
                     continue;
                 }
+                if (t[0] == "avifall")
+                {
+                    // avifall <dir> <outdir>: every .avif through the public decode (HeifCoder.DecodeSequence: tracks or
+                    // primary item), one file at a time; frames as <name>.f<i>.rgb48 (u16 LE RGB or RGBA) plus one
+                    // "name frames w h alpha" line (or "name ERROR ...") in <outdir>/avifall.txt. With "prog": the layers of
+                    // HeifCoder.DecodeProgressive instead (compare with avifdec --progressive --index i).
+                    bool prog = t.Length > 3 && t[3] == "prog";
+                    using var lw = new StreamWriter(Path.Combine(t[2], "avifall.txt")) { AutoFlush = true };
+                    foreach (var f in Directory.GetFiles(t[1], "*.avif").Order())
+                    {
+                        string n = Path.GetFileName(f);
+                        try
+                        {
+                            using var seq = new ImageSequence();
+                            if (prog) foreach (var layer in HeifCoder.DecodeProgressive(File.ReadAllBytes(f))) seq.AddFrame(layer);
+                            else foreach (var fr in HeifCoder.DecodeSequence(File.ReadAllBytes(f)).Frames.ToList()) seq.AddFrame(fr);
+                            for (int i = 0; i < seq.Count; i++)
+                                File.WriteAllBytes(Path.Combine(t[2], $"{n}.f{i}.rgb48"), Rgb48(seq[i]));
+                            lw.WriteLine($"{n} {seq.Count} {seq[0].Columns} {seq[0].Rows} {(seq[0].HasAlpha ? 1 : 0)}");
+                        }
+                        catch (Exception e) { lw.WriteLine($"{n} ERROR {e.GetType().Name} {e.Message.Split('\n')[0]}"); }
+                    }
+                    continue;
+                }
                 if (t[0] == "progdec")
                 {
                     var layers = HeifCoder.DecodeProgressive(File.ReadAllBytes(t[1]));

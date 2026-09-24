@@ -159,4 +159,28 @@ public sealed class AvifCicpTests
         await Assert.That(dec.Metadata.Cicp!.FullRange).IsFalse();
         await Assert.That(Psnr(src, dec)).IsGreaterThan(45);
     }
+
+    // 8-bit limited-range 4:0:0 (avifenc -y 400 -r limited): the grey expands like libavif's avifImageYUVToRGB (avifdec
+    // -d 16; avifdec's own 8-bit PNG path copies Y unexpanded, which is an app shortcut, not the library conversion).
+    [Test]
+    public async Task Gray8Limited_MatchesLibavifYuvToRgb()
+    {
+        var img = HeifCoder.Decode(System.IO.File.ReadAllBytes(System.IO.Path.Combine(AppContext.BaseDirectory, "TestAssets", "avif_conformance", "libavif_gray_8_limited_37x29.avif")));
+        int w = (int)img.Columns, h = (int)img.Rows, ch = img.NumberOfChannels;
+        var grey = new byte[w * h * 2];
+        bool neutral = true;
+        for (int y = 0; y < h; y++)
+        {
+            var row = img.GetPixelRow(y);
+            for (int x = 0; x < w; x++)
+            {
+                ushort v = row[x * ch];
+                neutral &= row[x * ch + 1] == v && row[x * ch + 2] == v;
+                grey[2 * (y * w + x)] = (byte)v; grey[2 * (y * w + x) + 1] = (byte)(v >> 8);
+            }
+        }
+        await Assert.That(neutral).IsTrue();
+        await Assert.That(Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(grey)))
+            .IsEqualTo("86394b9013da039b616db4ef259cfa5dbeb4dbe9ffe4d578eee438ec1d8f97d9");
+    }
 }

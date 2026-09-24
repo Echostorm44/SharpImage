@@ -106,9 +106,15 @@ public sealed class AvifTransformTests
         // 12x34 with essential irot (angle 1) plus made-up non-essential 'clop' / 'imor' — only the rotation applies.
         var img = HeifCoder.Decode(File.ReadAllBytes(Asset("libavif_clop_irot_imor.avif")));
         await Assert.That((img.Columns, img.Rows)).IsEqualTo((34L, 12L));
-        // Non-essential clap/irot/imir (libavif rejects the file); we decode leniently: crop (4,6,8x10), rotate, mirror.
-        var lenient = HeifCoder.Decode(File.ReadAllBytes(Asset("libavif_clap_irot_imir_non_essential.avif")));
-        await Assert.That((lenient.Columns, lenient.Rows)).IsEqualTo((10L, 8L));
+    }
+
+    [Test]
+    public async Task LibavifNonEssentialTransforms_AreRejectedLikeLibavif()
+    {
+        // MIAF 7.3.9: transformative properties shall be essential. libavif fails the parse (strict or not) when
+        // clap / irot / imir are associated as non-essential, and so do we for AVIF files.
+        await Assert.That(() => HeifCoder.Decode(File.ReadAllBytes(Asset("libavif_clap_irot_imir_non_essential.avif"))))
+            .Throws<InvalidDataException>();
     }
 
     [Test]
