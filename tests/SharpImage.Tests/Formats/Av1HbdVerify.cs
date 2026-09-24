@@ -1698,6 +1698,40 @@ public sealed class Av1HbdVerify
                             log.AppendLine($"{Path.GetFileName(f)} {Av1Conformance.CheckVector(f)}");
                     continue;
                 }
+                if (t[0] == "timeenc" || t[0] == "timedec")
+                {
+                    // timeenc <png> <out.avif> <quality> <reps> [speed]: best-of-reps wall time of HeifCoder.EncodeAvif (after a
+                    // warm-up run); timedec <avif> <reps>: the same for HeifCoder.Decode (YUV -> RGB included).
+                    int reps = int.Parse(t[t[0] == "timeenc" ? 4 : 2]);
+                    double best = double.MaxValue;
+                    if (t[0] == "timeenc")
+                    {
+                        var img = FormatRegistry.Read(t[1]);
+                        var eo = new AvifEncodeOptions { Quality = int.Parse(t[3]) };
+                        if (t.Length > 5) typeof(AvifEncodeOptions).GetProperty("Speed")?.SetValue(eo, int.Parse(t[5]));
+                        byte[] outBytes = [];
+                        for (int r = 0; r <= reps; r++)
+                        {
+                            var sw = System.Diagnostics.Stopwatch.StartNew();
+                            outBytes = HeifCoder.EncodeAvif(img, eo);
+                            if (r > 0) best = Math.Min(best, sw.Elapsed.TotalSeconds);
+                        }
+                        File.WriteAllBytes(t[2], outBytes);
+                        log.AppendLine($"timeenc {Path.GetFileName(t[1])} q{t[3]}: {best:F3} s {outBytes.Length} bytes");
+                    }
+                    else
+                    {
+                        byte[] data = File.ReadAllBytes(t[1]);
+                        for (int r = 0; r <= reps; r++)
+                        {
+                            var sw = System.Diagnostics.Stopwatch.StartNew();
+                            using var f = HeifCoder.Decode(data);
+                            if (r > 0) best = Math.Min(best, sw.Elapsed.TotalSeconds);
+                        }
+                        log.AppendLine($"timedec {Path.GetFileName(t[1])}: {best:F3} s");
+                    }
+                    continue;
+                }
                 if (t[0] == "jrawall")
                 {
                     // jrawall <dir>: every *.jpg decoded like jraw into <file>.ours, or "<Type> message" into <file>.err

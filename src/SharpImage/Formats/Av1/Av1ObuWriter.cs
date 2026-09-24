@@ -349,6 +349,19 @@ internal static class Av1ObuWriter
 
     [ThreadStatic] private static (int Cols, int Rows) t_tileLog2Request;
 
+    // All of the writer's ambient (thread-static) state, so an encoder's worker threads build headers exactly as the
+    // calling thread would (film grain, layered / sequence stream, tiling request).
+    internal readonly record struct ThreadState(Av1FilmGrainData? FilmGrain, bool FilmGrain420, int FilmGrainSuppressed,
+        LayeredStream? Layered, (int Cols, int Rows) TileLog2);
+    internal static ThreadState CaptureThreadState() => new(t_filmGrain, t_filmGrain420, t_filmGrainSuppressed, t_layered, t_tileLog2Request);
+    internal static ThreadState ExchangeThreadState(ThreadState s)
+    {
+        var prev = CaptureThreadState();
+        t_filmGrain = s.FilmGrain; t_filmGrain420 = s.FilmGrain420; t_filmGrainSuppressed = s.FilmGrainSuppressed;
+        t_layered = s.Layered; t_tileLog2Request = s.TileLog2;
+        return prev;
+    }
+
     internal readonly struct TilingScope : IDisposable
     {
         private readonly (int, int) prev;

@@ -2149,6 +2149,8 @@ internal sealed class Av1Decoder
 
     private void UpdateReferenceFrames()
     {
+        // Reference planes are never written in place, so the refreshed slots share one copy (as dav1d refcounts).
+        ushort[]?[]? sharedPlanes = null;
         var fh = frameHdr;
         byte refreshFlags = fh.RefreshFrameFlags;
 
@@ -2172,8 +2174,8 @@ internal sealed class Av1Decoder
                 Array.Copy(fh.Gmv, refFrame.Gmv, refFrame.Gmv.Length);
                 refFrame.Valid = true;
 
-                // Copy current frame planes to reference
-                CopyFrameToReference(refFrame);
+                // Copy current frame planes to reference (one copy shared by every refreshed slot)
+                CopyFrameToReference(refFrame, ref sharedPlanes);
 
                 // The CDFs later frames load from this slot (dav1d refs[].cdf = out_cdf): the frame-end update of the
                 // context_update_tile_id tile when refresh_context is set, else the frame's input CDFs.
@@ -2192,8 +2194,14 @@ internal sealed class Av1Decoder
         }
     }
 
-    private void CopyFrameToReference(Av1ReferenceFrame refFrame)
+    private void CopyFrameToReference(Av1ReferenceFrame refFrame, ref ushort[]?[]? shared)
     {
+        if (shared != null)
+        {
+            for (int plane = 0; plane < 3; plane++) { refFrame.Planes[plane] = shared[plane]; refFrame.Strides[plane] = ctx.CurrentStrides[plane]; }
+            return;
+        }
+        shared = new ushort[3][];
         for (int plane = 0; plane < 3; plane++)
         {
             var src = ctx.CurrentPlanes[plane];
@@ -2208,8 +2216,8 @@ internal sealed class Av1Decoder
                  (frameHdr.SuperResUpscaledWidth + 1) >> 1);
 
             int bufSize = stride * height;
-            if (refFrame.Planes[plane] == null || refFrame.Planes[plane]!.Length < bufSize)
-                refFrame.Planes[plane] = new ushort[bufSize];
+            // Always a fresh array: the slot's previous one may be shared with other slots.
+            refFrame.Planes[plane] = shared[plane] = new ushort[bufSize];
 
             refFrame.Strides[plane] = stride;
 
@@ -2259,17 +2267,11 @@ internal sealed class Av1Decoder
                 dst.TemporalMvs = null;   // dav1d drops the other slots' refmvs
                 dst.Valid = true;
 
+                // Shared (reference planes are read-only); a monochrome source leaves no stale chroma behind.
                 for (int p = 0; p < 3; p++)
                 {
-                    if (refFrame.Planes[p] != null)
-                    {
-                        int sz = refFrame.Strides[p] *
-                            (p == 0 || ctx.PixelLayout != Av1PixelLayout.I420 ? refFrame.Height : (refFrame.Height + 1) >> 1);
-                        if (dst.Planes[p] == null || dst.Planes[p]!.Length < sz)
-                            dst.Planes[p] = new ushort[sz];
-                        refFrame.Planes[p].AsSpan(0, sz).CopyTo(dst.Planes[p]);
-                        dst.Strides[p] = refFrame.Strides[p];
-                    }
+                    dst.Planes[p] = refFrame.Planes[p];
+                    dst.Strides[p] = refFrame.Strides[p];
                 }
 
                 if (refFrame.CdfSnapshot != null)

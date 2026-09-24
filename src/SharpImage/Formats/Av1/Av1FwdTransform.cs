@@ -174,36 +174,56 @@ internal static class Av1FwdTransform
     {
         int logSize = System.Numerics.BitOperations.Log2((uint)n) - 2; // 4→0, 8→1, 16→2
         (int hType, int vType) = AxisTypes(txType);
-        double[,] fh = ForwardMatrix(logSize, hType);
-        double[,] fv = ForwardMatrix(logSize, vType);
+        double[] fh = ForwardMatrixFlat(logSize, hType);
+        double[] fv = ForwardMatrixFlat(logSize, vType);
         double s = 4.0 * n;
 
-        // Horizontal forward: t[y][kx] = sum_x Fh[kx][x] * res[y][x].
-        var t = new double[n, n];
+        // Horizontal forward: t[y][kx] = sum_x Fh[kx][x] * res[y][x], stored transposed (tT[kx][y]) so the vertical
+        // pass reads it contiguously. Same products in the same order as the textbook loops: identical doubles.
+        Span<double> tT = stackalloc double[n * n];
         for (int y = 0; y < n; y++)
+        {
+            var row = residual.Slice(y * n, n);
             for (int kx = 0; kx < n; kx++)
             {
+                var f = fh.AsSpan(kx * n, n);
                 double acc = 0;
-                for (int x = 0; x < n; x++) acc += fh[kx, x] * residual[y * n + x];
-                t[y, kx] = acc;
+                for (int x = 0; x < f.Length; x++) acc += f[x] * row[x];
+                tT[kx * n + y] = acc;
             }
+        }
 
         // Vertical forward + quant: C[ky][kx] = sum_y Fv[ky][y] * t[y][kx].
         var levels = new int[rcCount];
         for (int kx = 0; kx < n; kx++)
+        {
+            var col = tT.Slice(kx * n, n);
             for (int ky = 0; ky < n; ky++)
             {
+                var f = fv.AsSpan(ky * n, n);
                 double acc = 0;
-                for (int y = 0; y < n; y++) acc += fv[ky, y] * t[y, kx];
+                for (int y = 0; y < f.Length; y++) acc += f[y] * col[y];
                 int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
                 double qf = acc * s / dq;
                 if (qfOut != null) qfOut[kx * n + ky] = qf;
                 double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
                 levels[kx * n + ky] = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
             }
+        }
 
         return levels;
     }
+
+    // ForwardMatrix flattened row-major ([k * n + x]); read-only after construction.
+    private static readonly ConcurrentDictionary<int, double[]> FwdMatrixFlatCache = new();
+    private static double[] ForwardMatrixFlat(int logSize, int type1d) => FwdMatrixFlatCache.GetOrAdd((logSize << 2) | type1d, key =>
+    {
+        var m = ForwardMatrix(key >> 2, key & 3);
+        int n = m.GetLength(0);
+        var f = new double[n * n];
+        for (int k = 0; k < n; k++) for (int x = 0; x < n; x++) f[k * n + x] = m[k, x];
+        return f;
+    });
 
     internal static int[] ForwardQuantSquare(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, double k)
         => ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, k, null);
@@ -213,20 +233,23 @@ internal static class Av1FwdTransform
         int kept = Math.Min(n, 32);
         int sh = kept;
 
-        // Horizontal pass: rows → T[y][kx].
-        double[,] basis = DctBasis(n);
-        var t = new double[n, kept];
+        // Horizontal pass: rows → T[y][kx], stored transposed (tT[kx][y]); products and summation order as the
+        // straightforward loops, so the doubles are identical.
+        double[] basis = DctBasisFlat(n);
+        var tT = t_fwdScratch is { } sc && sc.Length >= n * kept ? sc : (t_fwdScratch = new double[64 * 32]);
         for (int y = 0; y < n; y++)
         {
+            var row = residual.Slice(y * n, n);
             for (int kx = 0; kx < kept; kx++)
             {
+                var bk = basis.AsSpan(kx * n, n);
                 double acc = 0;
-                for (int x = 0; x < n; x++)
+                for (int x = 0; x < bk.Length; x++)
                 {
-                    acc += residual[y * n + x] * basis[kx, x];
+                    acc += row[x] * bk[x];
                 }
 
-                t[y, kx] = acc;
+                tT[kx * n + y] = acc;
             }
         }
 
@@ -234,12 +257,14 @@ internal static class Av1FwdTransform
         var levels = new int[rcCount];
         for (int kx = 0; kx < kept; kx++)
         {
+            var col = tT.AsSpan(kx * n, n);
             for (int ky = 0; ky < kept; ky++)
             {
+                var bk = basis.AsSpan(ky * n, n);
                 double acc = 0;
-                for (int y = 0; y < n; y++)
+                for (int y = 0; y < bk.Length; y++)
                 {
-                    acc += t[y, kx] * basis[ky, y];
+                    acc += col[y] * bk[y];
                 }
 
                 int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
@@ -258,6 +283,16 @@ internal static class Av1FwdTransform
     // Orthonormal DCT-II basis, cached per size (values depend only on n). basis[k, n] = a(k) * sqrt(2/N) *
     // cos(pi*(2n+1)*k / (2N)), a(0)=1/sqrt2 else 1. Read-only after construction, so the cache is safe to share.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, double[,]> BasisCache = new();
+
+    [ThreadStatic] private static double[]? t_fwdScratch;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, double[]> BasisFlatCache = new();
+    private static double[] DctBasisFlat(int n) => BasisFlatCache.GetOrAdd(n, nn =>
+    {
+        var b = DctBasis(nn);
+        var f = new double[nn * nn];
+        for (int k = 0; k < nn; k++) for (int i = 0; i < nn; i++) f[k * nn + i] = b[k, i];
+        return f;
+    });
 
     private static double[,] DctBasis(int n) => BasisCache.GetOrAdd(n, static nn =>
     {

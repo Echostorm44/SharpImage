@@ -1,3 +1,4 @@
+using System.Threading.Tasks;
 // AVIF/HEIC format coder — read and write.
 // Pure C# implementation of AVIF (AV1 Still Image) and HEIC (HEVC Still Image).
 // Uses ISOBMFF (ISO Base Media File Format) container with intra-frame encoding.
@@ -79,6 +80,18 @@ public sealed class AvifEncodeOptions
 {
     /// <summary>Quantization parameter 0..51 (0 = highest quality / largest file). Default 20.</summary>
     public int Qp { get; set; } = 20;
+
+    /// <summary>Encoder speed 0 (slowest, smallest files) .. 10 (fastest), as avifenc -s. Each step prunes the
+    /// rate-distortion search further (mode candidates, partition shapes, transform sets, filter searches); measured
+    /// on the encoder corpus, every speed up to 6 gives smaller files than libaom at the same speed setting.</summary>
+    public int Speed { get; set; } = DefaultSpeed;
+
+    /// <summary>Default <see cref="Speed"/>.</summary>
+    public const int DefaultSpeed = 6;
+
+    /// <summary>Worker threads (avifenc -j): 0 (default) uses every core, 1 encodes on the calling thread. The output
+    /// is identical for any thread count.</summary>
+    public int MaxThreads { get; set; }
 
     /// <summary>Coded bit depth: 8, 10 or 12 — or 0 (default) to choose automatically: 8 when every source sample
     /// is exactly representable at 8 bits (e.g. images decoded from 8-bit formats), otherwise 10. 12-bit is coded
@@ -1054,10 +1067,28 @@ public static partial class HeifCoder
     public static byte[] EncodeAvif(ImageFrame image, AvifEncodeOptions? options = null)
     {
         options ??= new AvifEncodeOptions();
-        bool prevAvoid = t_avoidLibyuv;
-        t_avoidLibyuv = options.AvoidLibyuv;
-        try { return EncodeAvifEntry(image, options); }
-        finally { t_avoidLibyuv = prevAvoid; }
+        using var scope = new EncoderScope(options);
+        return EncodeAvifEntry(image, options);
+    }
+
+    // The per-call encoder settings of an AvifEncodeOptions, held thread-static for the encode's duration (the
+    // encoder's worker threads inherit them): libyuv avoidance, speed preset and thread count.
+    private readonly struct EncoderScope : IDisposable
+    {
+        private readonly bool prevAvoid;
+        private readonly Av1.Av1EncodeSpeed? prevSpeed;
+        private readonly int prevThreads;
+        public EncoderScope(AvifEncodeOptions options)
+        {
+            prevAvoid = t_avoidLibyuv; prevSpeed = Av1.Av1StillImageEncoder.t_speed; prevThreads = Av1.Av1StillImageEncoder.t_threads;
+            t_avoidLibyuv = options.AvoidLibyuv;
+            Av1.Av1StillImageEncoder.t_speed = Av1.Av1EncodeSpeed.ForSpeed(options.Speed);
+            Av1.Av1StillImageEncoder.t_threads = Math.Max(0, options.MaxThreads);
+        }
+        public void Dispose()
+        {
+            t_avoidLibyuv = prevAvoid; Av1.Av1StillImageEncoder.t_speed = prevSpeed; Av1.Av1StillImageEncoder.t_threads = prevThreads;
+        }
     }
 
     private static byte[] EncodeAvifEntry(ImageFrame image, AvifEncodeOptions options)
@@ -1322,10 +1353,8 @@ public static partial class HeifCoder
     public static byte[] EncodeAvifSequence(ImageSequence sequence, AvifEncodeOptions? options = null)
     {
         options ??= new AvifEncodeOptions();
-        bool prevAvoid = t_avoidLibyuv;
-        t_avoidLibyuv = options.AvoidLibyuv;
-        try { return EncodeAvifSequenceEntry(sequence, options); }
-        finally { t_avoidLibyuv = prevAvoid; }
+        using var scope = new EncoderScope(options);
+        return EncodeAvifSequenceEntry(sequence, options);
     }
 
     private static byte[] EncodeAvifSequenceEntry(ImageSequence sequence, AvifEncodeOptions options)
@@ -1463,16 +1492,20 @@ public static partial class HeifCoder
             Av1.Av1ObuWriter.FilmGrainScope Grain(int i)
                 => Av1.Av1ObuWriter.UseFilmGrain(coded[i].Grain?.ToAv1(mono, mono ? 1 : gssX, mono ? 1 : gssY), !mono && gssX == 1 && gssY == 1);
 
-            void Key(int i)
+            (byte[] cSeq, byte[] cFrame) KeyObus(int i)
             {
                 var (yP, uP, vP, _, _) = coded[i];
-                (byte[] cSeq, byte[] cFrame) cObus;
                 using (Grain(i))
-                    cObus = lossless
+                    return lossless
                         ? Av1.Av1StillImageEncoder.BuildLosslessObus(yP, uP, vP, mono, w, h, bd, codedLayout,
                             mono && color.Matrix is 16 or 17 ? color with { Matrix = 0 } : color)
                         : mono ? Av1.Av1StillImageEncoder.BuildMonochromeObus(yP, w, h, KeyFrameQIdx(baseQIdx, bd), bd, color)
                         : Av1.Av1StillImageEncoder.BuildColorObus(yP, uP!, vP!, w, h, KeyFrameQIdx(baseQIdx, bd), bd, layout, color);
+            }
+
+            void Key(int i)
+            {
+                var cObus = KeyObus(i);
                 cSamples[i] = [.. td, .. cObus.cSeq, .. cObus.cFrame];
                 cSync[i] = true;
                 lastKeyBytes = cObus.cFrame.Length;
@@ -1569,7 +1602,10 @@ public static partial class HeifCoder
             {
                 int ws = FreeSlot(goldenSlot, arf >= 0 ? arf : goldenSlot, bwd);
                 byte[] obu = Inter(i, lastSlot, goldenSlot, arf, 1 << ws, true, lossless ? 0 : baseQIdx, bwd);
-                if (obu.Length > lastKeyBytes * 9 / 10) return false;
+                // A scene cut (key frame, as libaom's scene-change detection): the inter frame costs over 3/4 of this frame
+                // coded as a key frame. Only frames well above a normal inter size (60% of the last key frame) pay for the
+                // trial key encode; comparing with this frame's own key cost keeps the rule stable at every speed.
+                if (obu.Length > lastKeyBytes * 6 / 10 && obu.Length > KeyObus(i).cFrame.Length * 3 / 4) return false;
                 Decode([.. td, .. obu], false);
                 lastSlot = ws;
                 cSamples[i] = prefix == null ? [.. td, .. obu] : [.. td, .. prefix, .. obu];
@@ -3130,29 +3166,48 @@ public static partial class HeifCoder
     private static void ConvertYuvToRgbLibyuv8(Av1.DecodedVideoFrame yuv, ImageFrame frame, int w, int h, int channels,
         (int Yg, int Yb, int Ub, int Ug, int Vg, int Vr) k, int ssHor, int ssVer)
     {
-        ReadOnlySpan<byte> yp = yuv.YPlane.Span, up = yuv.UPlane.Span, vp = yuv.VPlane.Span;
+        var ym = yuv.YPlane; var um = yuv.UPlane; var vm = yuv.VPlane;
         int ys = yuv.YStride, us = yuv.UStride, vs = yuv.VStride;
-        var ur = new byte[w]; var vr = new byte[w]; var ur2 = new byte[w]; var vr2 = new byte[w];
-
+        // Rows (4:2:0: row pairs sharing two chroma rows) are independent: converted in parallel with per-thread
+        // chroma scratch rows. Identical output for any thread count.
+        var po = new ParallelOptions { MaxDegreeOfParallelism = Limits.ThreadCount };
         if (ssHor == 0)
         {
-            for (int j = 0; j < h; j++) LibyuvRow(frame, yp.Slice(j * ys, w), j, up.Slice(j * us, w).ToArray(), vp.Slice(j * vs, w).ToArray(), w, channels, k);
+            Parallel.For(0, h, po, j => LibyuvRow(frame, ym.Span.Slice(j * ys, w), j, um.Span.Slice(j * us, w).ToArray(), vm.Span.Slice(j * vs, w).ToArray(), w, channels, k));
             return;
         }
         if (ssVer == 0)
         {
-            for (int j = 0; j < h; j++) { UpLinear(up.Slice(j * us), ur, w); UpLinear(vp.Slice(j * vs), vr, w); LibyuvRow(frame, yp.Slice(j * ys, w), j, ur, vr, w, channels, k); }
+            Parallel.For(0, h, po, () => (new byte[w], new byte[w]), (j, _, b) =>
+            {
+                UpLinear(um.Span.Slice(j * us), b.Item1, w); UpLinear(vm.Span.Slice(j * vs), b.Item2, w);
+                LibyuvRow(frame, ym.Span.Slice(j * ys, w), j, b.Item1, b.Item2, w, channels, k);
+                return b;
+            }, _ => { });
             return;
         }
-        UpLinear(up, ur, w); UpLinear(vp, vr, w); LibyuvRow(frame, yp.Slice(0, w), 0, ur, vr, w, channels, k);
-        int jj = 1, cj = 0;
-        for (; jj < h - 1; jj += 2, cj++)
         {
-            UpBilinear(up.Slice(cj * us), up.Slice((cj + 1) * us), ur, ur2, w);
-            UpBilinear(vp.Slice(cj * vs), vp.Slice((cj + 1) * vs), vr, vr2, w);
-            LibyuvRow(frame, yp.Slice(jj * ys, w), jj, ur, vr, w, channels, k); LibyuvRow(frame, yp.Slice((jj + 1) * ys, w), jj + 1, ur2, vr2, w, channels, k);
+            var ur = new byte[w]; var vr = new byte[w];
+            UpLinear(um.Span, ur, w); UpLinear(vm.Span, vr, w); LibyuvRow(frame, ym.Span.Slice(0, w), 0, ur, vr, w, channels, k);
         }
-        if ((h & 1) == 0) { UpLinear(up.Slice(cj * us), ur, w); UpLinear(vp.Slice(cj * vs), vr, w); LibyuvRow(frame, yp.Slice((h - 1) * ys, w), h - 1, ur, vr, w, channels, k); }
+        int pairs = (h - 1) / 2;   // output rows 1+2i and 2+2i from chroma rows i and i+1
+        Parallel.For(0, pairs, po, () => (new byte[w], new byte[w], new byte[w], new byte[w]), (cj, _, b) =>
+        {
+            int jj = 1 + 2 * cj;
+            ReadOnlySpan<byte> up = um.Span, vp = vm.Span, yp = ym.Span;
+            UpBilinear(up.Slice(cj * us), up.Slice((cj + 1) * us), b.Item1, b.Item3, w);
+            UpBilinear(vp.Slice(cj * vs), vp.Slice((cj + 1) * vs), b.Item2, b.Item4, w);
+            LibyuvRow(frame, yp.Slice(jj * ys, w), jj, b.Item1, b.Item2, w, channels, k);
+            LibyuvRow(frame, yp.Slice((jj + 1) * ys, w), jj + 1, b.Item3, b.Item4, w, channels, k);
+            return b;
+        }, _ => { });
+        if ((h & 1) == 0)
+        {
+            int cj = pairs;
+            var ur = new byte[w]; var vr = new byte[w];
+            UpLinear(um.Span.Slice(cj * us), ur, w); UpLinear(vm.Span.Slice(cj * vs), vr, w);
+            LibyuvRow(frame, ym.Span.Slice((h - 1) * ys, w), h - 1, ur, vr, w, channels, k);
+        }
     }
 
     private static void LibyuvRow(ImageFrame frame, ReadOnlySpan<byte> yRow, int j, byte[] u, byte[] v, int w, int channels,

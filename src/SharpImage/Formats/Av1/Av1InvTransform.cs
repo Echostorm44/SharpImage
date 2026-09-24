@@ -209,6 +209,7 @@ public static class Av1InvTransform
     /// <summary>
     /// Apply inverse transform and add residuals to 16-bit destination (10/12-bit).
     /// </summary>
+    [System.Runtime.CompilerServices.SkipLocalsInit]
     public static void InvTxfmAdd16(
         Span<ushort> dst, int dstStride,
         Span<int> coeffs, int eob,
@@ -254,12 +255,17 @@ public static class Av1InvTransform
         int sh = Math.Min(h, 32);
         int sw = Math.Min(w, 32);
 
-        Span<int> tmp = stackalloc int[64 * 64];
-        tmp.Slice(0, w * sh).Clear();
+        // Only the w x h region is used (no implicit zeroing: SkipLocalsInit); rows past the 32 coded ones must be zero.
+        Span<int> tmp = stackalloc int[w * h];
+        tmp.Clear();
 
         for (int y = 0; y < sh; y++)
         {
             var row = tmp.Slice(y * w, w);
+            // An all-zero coefficient row stays zero through every 1-D kernel (dav1d skips them too).
+            bool any = false;
+            for (int x = 0; x < sw && !any; x++) any = coeffs[y + x * sh] != 0;
+            if (!any) continue;
             if (isRect2)
                 for (int x = 0; x < sw; x++)
                     row[x] = (coeffs[y + x * sh] * 181 + 128) >> 8;

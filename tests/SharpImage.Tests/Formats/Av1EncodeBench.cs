@@ -65,7 +65,7 @@ public sealed class Av1EncodeBench
         foreach (int qp in new[] { 1, 2, 4, 8, 14, 20, 28, 36, 44 })
         {
             byte[] avif;
-            try { avif = HeifCoder.Encode(src, HeifContainerType.Avif, qp); }
+            try { avif = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = qp, Speed = 0 }); }   // the full search
             catch (Exception ex) { sb.AppendLine($"qp={qp} ENCODE-THREW {ex.GetType().Name}: {ex.Message}"); continue; }
             using var dec = HeifCoder.Decode(avif);
             double psnr = PsnrRgb(src, dec, w, h);

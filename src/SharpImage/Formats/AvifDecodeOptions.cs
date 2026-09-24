@@ -46,6 +46,17 @@ public sealed class AvifDecodeOptions
         init => imageCountLimit = value >= 0 ? value : throw new System.ArgumentOutOfRangeException(nameof(ImageCountLimit));
     }
 
+    /// <summary>Worker threads a decode may use (avifdec -j): 0 (default) uses every core, 1 decodes on the calling
+    /// thread only. The output is identical whatever the count.</summary>
+    public int MaxThreads
+    {
+        get => maxThreads;
+        init => maxThreads = value >= 0 ? value : throw new System.ArgumentOutOfRangeException(nameof(MaxThreads));
+    }
+    private readonly int maxThreads;
+
+    internal int ThreadCount => maxThreads > 0 ? maxThreads : System.Environment.ProcessorCount;
+
     // libavif avifDimensionsTooLarge.
     internal bool TooLarge(long width, long height) =>
         width > imageSizeLimit / System.Math.Max(height, 1) || (imageDimensionLimit != 0 && (width > imageDimensionLimit || height > imageDimensionLimit));

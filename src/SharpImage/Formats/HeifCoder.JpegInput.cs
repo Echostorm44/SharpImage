@@ -44,6 +44,7 @@ public static partial class HeifCoder
         bool swapBase = false, bool ignoreIccProfile = false)
     {
         var o = (options ?? new AvifEncodeOptions()).Clone();
+        using var scope = new EncoderScope(o);
         var image = JpegCoder.Read(new MemoryStream(jpeg));
         if (ignoreIccProfile)
         {
