@@ -3581,7 +3581,8 @@ internal static class Av1StillImageEncoder
         int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
-        var block = (ushort[])predBlock.Clone();
+        var block = (t_reconBlock ??= new ushort[64 * 64]).AsSpan(0, n * n);
+        predBlock.AsSpan(0, n * n).CopyTo(block);
         Av1InvTransform.InvTxfmAdd16(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], txType, Bd);
         for (int y = 0; y < n; y++)
         {
@@ -3827,7 +3828,8 @@ internal static class Av1StillImageEncoder
         int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
-        var block = (ushort[])predBlock.Clone();
+        var block = (t_reconBlock ??= new ushort[64 * 64]).AsSpan(0, w * h);
+        predBlock.AsSpan(0, w * h).CopyTo(block);
         Av1InvTransform.InvTxfmAdd16(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, Bd);
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)

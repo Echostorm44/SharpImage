@@ -1,3 +1,4 @@
+using System.Runtime.Intrinsics;
 // Forward transform + quantization for the AV1 encoder. The AV1 standard specifies only the INVERSE transform
 // (Av1InvTransform); the forward is the encoder's choice — it only has to produce coefficients the decoder's
 // inverse maps back to the residual.
@@ -135,30 +136,40 @@ internal static class Av1FwdTransform
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[txSizeIdx];
         int logW = tDim.Lw, logH = tDim.Lh;
         (int hType, int vType) = AxisTypes(txType);
-        double[,] fh = ForwardMatrix(logW, hType);   // width (horizontal / row) forward
-        double[,] fv = ForwardMatrix(logH, vType);   // height (vertical / column) forward
+        double[] fh = ForwardMatrixFlat(logW, hType);   // width (horizontal / row) forward, w x w
+        double[] fv = ForwardMatrixFlat(logH, vType);   // height (vertical / column) forward, h x h
         int sw = Math.Min(w, 32), sh = Math.Min(h, 32);
         bool isRect2 = w * 2 == h || h * 2 == w;
         int dqShift = Math.Max(0, tDim.Ctx - 2);
         double s = (1 << (4 + Av1InvTransform.TxShift[txSizeIdx] + dqShift)) * (isRect2 ? 256.0 / 181.0 : 1.0);
+        if (Vector256.IsHardwareAccelerated)
+            return MatForwardV(residual, w, h, ForwardMatrixFlatT(logW, hType), ForwardMatrixFlatT(logH, vType), s,
+                dcDq, acDq, rcCount, qfOut);
 
-        // Horizontal forward: t[y][kx] = sum_x Fh[kx][x] * res[y][x].
-        var t = new double[h, sw];
+        // Horizontal forward: t[y][kx] = sum_x Fh[kx][x] * res[y][x], stored transposed (tT[kx][y]); same products in
+        // the same order as the textbook loops, so identical doubles.
+        Span<double> tT = stackalloc double[sw * h];
         for (int y = 0; y < h; y++)
+        {
+            var row = residual.Slice(y * w, w);
             for (int kx = 0; kx < sw; kx++)
             {
+                var f = fh.AsSpan(kx * w, w);
                 double acc = 0;
-                for (int x = 0; x < w; x++) acc += fh[kx, x] * residual[y * w + x];
-                t[y, kx] = acc;
+                for (int x = 0; x < f.Length; x++) acc += f[x] * row[x];
+                tT[kx * h + y] = acc;
             }
+        }
 
         // Vertical forward + quant: C[ky][kx] = sum_y Fv[ky][y] * t[y][kx]; level = deadzone(C·S/dq).
         var levels = new int[rcCount];
         for (int kx = 0; kx < sw; kx++)
             for (int ky = 0; ky < sh; ky++)
             {
+                var col = tT.Slice(kx * h, h);
+                var f = fv.AsSpan(ky * h, h);
                 double acc = 0;
-                for (int y = 0; y < h; y++) acc += fv[ky, y] * t[y, kx];
+                for (int y = 0; y < f.Length; y++) acc += f[y] * col[y];
                 int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
                 double qf = acc * s / dq;
                 if (qfOut != null) qfOut[kx * sh + ky] = qf;
@@ -174,9 +185,12 @@ internal static class Av1FwdTransform
     {
         int logSize = System.Numerics.BitOperations.Log2((uint)n) - 2; // 4→0, 8→1, 16→2
         (int hType, int vType) = AxisTypes(txType);
+        double s = 4.0 * n;
+        if (Vector256.IsHardwareAccelerated)
+            return MatForwardV(residual, n, n, ForwardMatrixFlatT(logSize, hType), ForwardMatrixFlatT(logSize, vType), s,
+                dcDq, acDq, rcCount, qfOut);
         double[] fh = ForwardMatrixFlat(logSize, hType);
         double[] fv = ForwardMatrixFlat(logSize, vType);
-        double s = 4.0 * n;
 
         // Horizontal forward: t[y][kx] = sum_x Fh[kx][x] * res[y][x], stored transposed (tT[kx][y]) so the vertical
         // pass reads it contiguously. Same products in the same order as the textbook loops: identical doubles.
@@ -232,6 +246,7 @@ internal static class Av1FwdTransform
     {
         int kept = Math.Min(n, 32);
         int sh = kept;
+        if (Vector256.IsHardwareAccelerated) return ForwardQuantSquareV(residual, n, dcDq, acDq, rcCount, k, qfOut);
 
         // Horizontal pass: rows → T[y][kx], stored transposed (tT[kx][y]); products and summation order as the
         // straightforward loops, so the doubles are identical.
@@ -279,6 +294,123 @@ internal static class Av1FwdTransform
 
         return levels;
     }
+
+    // Matrix forward + deadzone quant of a w x h residual with transposed forward matrices (fhT[x * sw + kx] =
+    // Fh[kx][x], fvT[y * sh + ky] = Fv[ky][y]; sw = min(w, 32), sh = min(h, 32)), 4 coefficients per Vector256: every
+    // lane is the scalar dot product in the same order (no FMA), so levels / qf are identical to the scalar loops.
+    private static int[] MatForwardV(ReadOnlySpan<int> residual, int w, int h, double[] fhT, double[] fvT, double s,
+        int dcDq, int acDq, int rcCount, double[]? qfOut)
+    {
+        int sw = Math.Min(w, 32), sh = Math.Min(h, 32), nvx = sw / 4, nvy = sh / 4;
+        Span<double> tT = stackalloc double[sw * h];      // tT[kx * h + y]
+        Span<Vector256<double>> acc = stackalloc Vector256<double>[8];
+        Span<double> lanes = stackalloc double[32];
+        for (int y = 0; y < h; y++)
+        {
+            var row = residual.Slice(y * w, w);
+            for (int v = 0; v < nvx; v++) acc[v] = Vector256<double>.Zero;
+            for (int x = 0; x < w; x++)
+            {
+                var r = Vector256.Create((double)row[x]);
+                var b = fhT.AsSpan(x * sw, sw);
+                for (int v = 0; v < nvx; v++) acc[v] += Vector256.Create(b.Slice(v * 4, 4)) * r;
+            }
+            for (int v = 0; v < nvx; v++) acc[v].CopyTo(lanes.Slice(v * 4, 4));
+            for (int kx = 0; kx < sw; kx++) tT[kx * h + y] = lanes[kx];
+        }
+
+        var levels = new int[rcCount];
+        for (int kx = 0; kx < sw; kx++)
+        {
+            var col = tT.Slice(kx * h, h);
+            for (int v = 0; v < nvy; v++) acc[v] = Vector256<double>.Zero;
+            for (int y = 0; y < h; y++)
+            {
+                var c = Vector256.Create(col[y]);
+                var b = fvT.AsSpan(y * sh, sh);
+                for (int v = 0; v < nvy; v++) acc[v] += Vector256.Create(b.Slice(v * 4, 4)) * c;
+            }
+            for (int v = 0; v < nvy; v++) acc[v].CopyTo(lanes.Slice(v * 4, 4));
+            for (int ky = 0; ky < sh; ky++)
+            {
+                int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
+                double qf = lanes[ky] * s / dq;
+                if (qfOut != null) qfOut[kx * sh + ky] = qf;
+                double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
+                levels[kx * sh + ky] = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
+            }
+        }
+        return levels;
+    }
+
+    private static readonly ConcurrentDictionary<int, double[]> FwdMatrixFlatTCache = new();
+    private static double[] ForwardMatrixFlatT(int logSize, int type1d) => FwdMatrixFlatTCache.GetOrAdd((logSize << 2) | type1d, key =>
+    {
+        var f = ForwardMatrixFlat(key >> 2, key & 3);
+        int n = 4 << (key >> 2), kept = Math.Min(n, 32);
+        var t = new double[n * kept];
+        for (int x = 0; x < n; x++) for (int kk = 0; kk < kept; kk++) t[x * kept + kk] = f[kk * n + x];
+        return t;
+    });
+
+    // ForwardQuantSquare with 4 output coefficients per Vector256 lane group: each lane is the same scalar dot product
+    // (double(int) * basis, added in x / y order; no FMA contraction), so the doubles are identical.
+    private static int[] ForwardQuantSquareV(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, double k, double[]? qfOut)
+    {
+        int kept = Math.Min(n, 32), sh = kept, nv = kept / 4;
+        double[] bT = DctBasisFlatT(n);   // bT[x * kept + k] = basis[k][x]
+        var tT = t_fwdScratch is { } sc && sc.Length >= n * kept ? sc : (t_fwdScratch = new double[64 * 32]);
+        Span<Vector256<double>> acc = stackalloc Vector256<double>[8];
+        Span<double> lanes = stackalloc double[32];
+
+        for (int y = 0; y < n; y++)
+        {
+            var row = residual.Slice(y * n, n);
+            for (int v = 0; v < nv; v++) acc[v] = Vector256<double>.Zero;
+            for (int x = 0; x < n; x++)
+            {
+                var r = Vector256.Create((double)row[x]);
+                var b = bT.AsSpan(x * kept, kept);
+                for (int v = 0; v < nv; v++) acc[v] += r * Vector256.Create(b.Slice(v * 4, 4));
+            }
+            for (int v = 0; v < nv; v++) acc[v].CopyTo(lanes.Slice(v * 4, 4));
+            for (int kx = 0; kx < kept; kx++) tT[kx * n + y] = lanes[kx];
+        }
+
+        var levels = new int[rcCount];
+        for (int kx = 0; kx < kept; kx++)
+        {
+            var col = tT.AsSpan(kx * n, n);
+            for (int v = 0; v < nv; v++) acc[v] = Vector256<double>.Zero;
+            for (int y = 0; y < n; y++)
+            {
+                var c = Vector256.Create(col[y]);
+                var b = bT.AsSpan(y * kept, kept);
+                for (int v = 0; v < nv; v++) acc[v] += c * Vector256.Create(b.Slice(v * 4, 4));
+            }
+            for (int v = 0; v < nv; v++) acc[v].CopyTo(lanes.Slice(v * 4, 4));
+            for (int ky = 0; ky < kept; ky++)
+            {
+                double a = lanes[ky];
+                int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
+                double qf = a * k / dq;
+                if (qfOut != null) qfOut[kx * sh + ky] = qf;
+                double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
+                levels[kx * sh + ky] = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
+            }
+        }
+        return levels;
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, double[]> BasisFlatTCache = new();
+    private static double[] DctBasisFlatT(int n) => BasisFlatTCache.GetOrAdd(n, nn =>
+    {
+        var b = DctBasisFlat(nn);
+        int kept = Math.Min(nn, 32);
+        var t = new double[nn * kept];
+        for (int x = 0; x < nn; x++) for (int kk = 0; kk < kept; kk++) t[x * kept + kk] = b[kk * nn + x];
+        return t;
+    });
 
     // Orthonormal DCT-II basis, cached per size (values depend only on n). basis[k, n] = a(k) * sqrt(2/N) *
     // cos(pi*(2n+1)*k / (2N)), a(0)=1/sqrt2 else 1. Read-only after construction, so the cache is safe to share.

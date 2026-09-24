@@ -257,25 +257,43 @@ public static class Av1InvTransform
 
         // Only the w x h region is used (no implicit zeroing: SkipLocalsInit); rows past the 32 coded ones must be zero.
         Span<int> tmp = stackalloc int[w * h];
-        tmp.Clear();
+        if (h > sh) tmp.Slice(sh * w).Clear();
+
+        // Rows (coefficient index rc = y + x * sh) holding a nonzero coefficient, found with a vectorized skip over zeros.
+        uint rowMask = 0;
+        {
+            var cs = coeffs.Slice(0, sw * sh);
+            for (int p = 0; ;)
+            {
+                int k = cs.Slice(p).IndexOfAnyExcept(0);
+                if (k < 0) break;
+                p += k;
+                rowMask |= 1u << (p & (sh - 1));
+                if (++p >= cs.Length) break;
+            }
+        }
 
         for (int y = 0; y < sh; y++)
         {
             var row = tmp.Slice(y * w, w);
             // An all-zero coefficient row stays zero through every 1-D kernel (dav1d skips them too).
-            bool any = false;
-            for (int x = 0; x < sw && !any; x++) any = coeffs[y + x * sh] != 0;
-            if (!any) continue;
+            if ((rowMask & (1u << y)) == 0) { row.Clear(); continue; }
+            if (w > sw) row.Slice(sw).Clear();
+            // read and clear the coefficients (the caller's buffer is left all-zero)
             if (isRect2)
                 for (int x = 0; x < sw; x++)
+                {
                     row[x] = (coeffs[y + x * sh] * 181 + 128) >> 8;
+                    coeffs[y + x * sh] = 0;
+                }
             else
                 for (int x = 0; x < sw; x++)
+                {
                     row[x] = coeffs[y + x * sh];
+                    coeffs[y + x * sh] = 0;
+                }
             Apply1d(row, 1, rowClipMin, rowClipMax, tDim.Lw, txtp0);
         }
-
-        coeffs.Slice(0, sw * sh).Clear();
         for (int i = 0; i < w * sh; i++)
             tmp[i] = Math.Clamp((tmp[i] + rnd) >> shift, colClipMin, colClipMax);
 

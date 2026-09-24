@@ -46,7 +46,8 @@ public sealed class Av1HbdTwinTests
             int maxW = rnd.Next(1, 2 * w + 1), maxH = rnd.Next(1, 2 * h + 1);
             bool t8 = false, t16 = false;
             try { Av1IntraPred.Predict(mode, d8, w, e8, center, w, h, angle, maxW, maxH, 8); } catch (IndexOutOfRangeException) { t8 = true; }
-            try { Av1IntraPred.Predict16(mode, d16, w, e16, center, w, h, angle, maxW, maxH, 8); } catch (IndexOutOfRangeException) { t16 = true; }
+            // (the vector paths slice their edge spans, so an out-of-range read can surface as ArgumentOutOfRangeException)
+            try { Av1IntraPred.Predict16(mode, d16, w, e16, center, w, h, angle, maxW, maxH, 8); } catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException) { t16 = true; }
             if (t8 || t16) { if (t8 != t16) mismatches++; continue; }   // invalid combo: both must reject alike
             compared++;
             for (int i = 0; i < d8.Length; i++) if (d8[i] != d16[i]) { mismatches++; break; }

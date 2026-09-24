@@ -1,3 +1,4 @@
+using System.Runtime.Intrinsics;
 // AV1 intra prediction modes for the decoder
 // Ported from dav1d: src/ipred_tmpl.c + src/ipred_prepare_tmpl.c (VideoLAN dav1d, BSD-2-Clause)
 // Implements DC, V, H, Paeth, Smooth, directional (Z1/Z2/Z3), filter intra,
@@ -1600,6 +1601,40 @@ public static class Av1IntraPred
         }
     }
 
+    /// <summary>row[x] = (src[b + x] * (64 - frac) + src[b + x + 1] * frac + 32) >> 6 for x &lt; n. For bit depths up to
+    /// 10 the sum stays below 65536, so 16-bit vector lanes give the identical result.</summary>
+    private static void InterpRun(Span<ushort> row, ReadOnlySpan<ushort> src, int b, int frac, int n, int bitDepth)
+    {
+        int x = 0;
+        if (bitDepth <= 10)
+        {
+            if (Vector256.IsHardwareAccelerated && n >= 16)
+            {
+                var w0 = Vector256.Create((ushort)(64 - frac)); var w1 = Vector256.Create((ushort)frac);
+                var r32 = Vector256.Create((ushort)32);
+                for (; x + 16 <= n; x += 16)
+                {
+                    var a = Vector256.Create(src.Slice(b + x, 16));
+                    var c = Vector256.Create(src.Slice(b + x + 1, 16));
+                    Vector256.ShiftRightLogical(a * w0 + c * w1 + r32, 6).CopyTo(row.Slice(x, 16));
+                }
+            }
+            if (Vector128.IsHardwareAccelerated && x + 8 <= n)
+            {
+                var w0 = Vector128.Create((ushort)(64 - frac)); var w1 = Vector128.Create((ushort)frac);
+                var r32 = Vector128.Create((ushort)32);
+                for (; x + 8 <= n; x += 8)
+                {
+                    var a = Vector128.Create(src.Slice(b + x, 8));
+                    var c = Vector128.Create(src.Slice(b + x + 1, 8));
+                    Vector128.ShiftRightLogical(a * w0 + c * w1 + r32, 6).CopyTo(row.Slice(x, 8));
+                }
+            }
+        }
+        for (; x < n; x++)
+            row[x] = (ushort)((src[b + x] * (64 - frac) + src[b + x + 1] * frac + 32) >> 6);
+    }
+
     public static void PredZ1_16(
         Span<ushort> dst, int dstStride,
         ReadOnlySpan<ushort> edgeBuf, int center,
@@ -1646,6 +1681,19 @@ public static class Av1IntraPred
         }
 
         int baseInc = 1 + (upsample ? 1 : 0);
+        if (!upsample)
+        {
+            ReadOnlySpan<ushort> src = useTopBuf ? (ReadOnlySpan<ushort>)topBuf : edgeBuf.Slice(topOffset);
+            ushort fill = src[maxBaseX];
+            for (int y = 0, xpos = dx; y < height; y++, xpos += dx)
+            {
+                var row = dst.Slice(y * dstStride, width);
+                int b = xpos >> 6, n = Math.Clamp(maxBaseX - b, 0, width);
+                InterpRun(row, src, b, xpos & 0x3E, n, bitDepth);
+                if (n < width) row.Slice(n).Fill(fill);
+            }
+            return;
+        }
         for (int y = 0, xpos = dx; y < height; y++, xpos += dx)
         {
             var row = dst.Slice(y * dstStride, width);
@@ -1736,6 +1784,27 @@ public static class Av1IntraPred
         int baseIncX = 1 + (upsampleAbove ? 1 : 0);
         int leftStep = 1 + (upsampleLeft ? 1 : 0);
 
+        if (!upsampleAbove)
+        {
+            ReadOnlySpan<ushort> top = edge.Slice(edgeCenter);
+            for (int y = 0, xpos = (1 << 6) - dx; y < height; y++, xpos -= dx)
+            {
+                var row = dst.Slice(y * dstStride, width);
+                int baseX = xpos >> 6;
+                int xs = Math.Clamp(-baseX, 0, width);   // pixels x >= xs read the top edge (baseX + x >= 0)
+                for (int x = 0, ypos = (y << (6 + (upsampleLeft ? 1 : 0))) - dy; x < xs; x++, ypos -= dy)
+                {
+                    int baseY = ypos >> 6;
+                    int fracY = ypos & 0x3E;
+                    int v = edge[edgeCenter - leftStep - baseY] * (64 - fracY) +
+                            edge[edgeCenter - leftStep - baseY - 1] * fracY;
+                    row[x] = (ushort)((v + 32) >> 6);
+                }
+                if (xs < width) InterpRun(row.Slice(xs), top, baseX + xs, xpos & 0x3E, width - xs, bitDepth);
+            }
+            return;
+        }
+
         for (int y = 0, xpos = ((1 + (upsampleAbove ? 1 : 0)) << 6) - dx;
              y < height; y++, xpos -= dx)
         {
@@ -1812,6 +1881,23 @@ public static class Av1IntraPred
         }
 
         int baseInc = 1 + (upsample ? 1 : 0);
+        if (!upsample)
+        {
+            // rev[i] = left sample i steps down (the original reads src[leftOffset - base] and its successor)
+            ReadOnlySpan<ushort> srcL = useLeftBuf ? (ReadOnlySpan<ushort>)leftBuf : edgeBuf;
+            Span<ushort> rev = stackalloc ushort[maxBaseY + 1];
+            for (int i = 0; i <= maxBaseY; i++) rev[i] = srcL[leftOffset - i];
+            ushort fill = rev[maxBaseY];
+            Span<ushort> col = stackalloc ushort[height];
+            for (int x = 0, ypos = dy; x < width; x++, ypos += dy)
+            {
+                int b = ypos >> 6, n = Math.Clamp(maxBaseY - b, 0, height);
+                InterpRun(col, rev, b, ypos & 0x3E, n, bitDepth);
+                if (n < height) col.Slice(n).Fill(fill);
+                for (int y = 0; y < height; y++) dst[y * dstStride + x] = col[y];
+            }
+            return;
+        }
         for (int x = 0, ypos = dy; x < width; x++, ypos += dy)
         {
             int frac = ypos & 0x3E;

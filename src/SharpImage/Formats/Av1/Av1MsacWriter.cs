@@ -95,7 +95,7 @@ internal sealed class Av1MsacWriter
         uint r = rng;
         uint fl = s > 0 ? icdf[s - 1] : (uint)(1 << 15);
         uint fh = icdf[s];
-        if (Measure) MeasuredBits += Log2_32768 - Math.Log2(Math.Max((int)fl - (int)fh, 1));
+        if (Measure) MeasuredBits += Av1CoeffEncode.BitCost[Math.Clamp((int)fl - (int)fh, 0, 32768)];
         ulong l = low;
         if (fl < (1 << 15))
         {
@@ -117,7 +117,7 @@ internal sealed class Av1MsacWriter
     /// (matches the decoder's DecodeBool). Non-adaptive.</summary>
     public void EncodeBool(uint val, uint f)
     {
-        if (Measure) MeasuredBits += Log2_32768 - Math.Log2(Math.Max((int)(val == 0 ? f : 32768 - f), 1));
+        if (Measure) MeasuredBits += Av1CoeffEncode.BitCost[Math.Clamp((int)(val == 0 ? f : 32768 - f), 0, 32768)];
         uint r = rng;
         ulong l = low;
         uint v = (((r >> 8) * (f >> ProbShift)) >> (7 - ProbShift)) + MinProb;
