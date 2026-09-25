@@ -605,7 +605,7 @@ internal static class Av1CoeffEncode
                 if (RdoqCheck)
                 {
                     double full = EstimateCoefBits(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx);
-                    if (full != newBits) throw new InvalidOperationException($"RDOQ incremental cost {newBits:R} != full {full:R} (tx {tx} i {i} eob {eob})");
+                    if (Math.Abs(full - newBits) > 1e-6) throw new InvalidOperationException($"RDOQ incremental cost {newBits:R} != full {full:R} (tx {tx} i {i} eob {eob})");
                 }
             }
             if (dDist + lambda * (newBits - curBits) < 0) curBits = newBits;
@@ -619,12 +619,14 @@ internal static class Av1CoeffEncode
 
     /// <summary>EstimateCoefBits for a 2D block with eob >= 1, kept as its individual additive terms so a change of
     /// one coefficient below / at the eob (not to zero at the eob) re-derives only its own terms and those of the
-    /// positions whose context reads it; Sum re-adds every term in EstimateCoefBits' order (an absent term is +0.0),
-    /// giving the identical double.</summary>
+    /// positions whose context reads it, and a running total follows every term change (Sum is O(1); it can differ
+    /// from the full estimate in the last bits of the double).</summary>
     private sealed class RdoqCost
     {
         private readonly double[] tA = new double[1024], tB = new double[1024], sA = new double[1024], sB = new double[1024];
         private readonly double[] pre = new double[5];
+        private double total;
+        private void W(double[] a, int idx, double v) { total += v - a[idx]; a[idx] = v; }
         private readonly byte[] lv = new byte[32 * 34];   // LevelByte of every coefficient (all positions, zero past eob)
         private short[] inv = null!;
         private int[] sl = null!;
@@ -673,6 +675,8 @@ internal static class Av1CoeffEncode
             // only the previous build's positions (scan[0..eob]) can be set
             if (prevScan != null) for (int i = 0; i <= prevEob; i++) lv[prevScan[i]] = 0;
             prevScan = scan; prevEob = eob;
+            Array.Clear(tA, 0, eob + 1); Array.Clear(tB, 0, eob + 1); Array.Clear(sA, 0, eob + 1); Array.Clear(sB, 0, eob + 1);
+            total = pre[0] + pre[1] + pre[2] + pre[3] + pre[4];
             for (int i = 0; i <= eob; i++) lv[scan[i]] = LevelByte(Math.Abs(sl[scan[i]]));
             EobTerm();
             for (int i = eob - 1; i > 0; i--) BaseTerm(i);
@@ -719,8 +723,8 @@ internal static class Av1CoeffEncode
             int xE = rcEob >> shift, yE = rcEob & mask, magEob = Math.Abs(sl[rcEob]);
             uint ctx = (uint)(1 + (eob > (2 << tx2dSzCtx) ? 1 : 0) + (eob > (4 << tx2dSzCtx) ? 1 : 0));
             int eobTok = Math.Min(magEob, 3) - 1;
-            tA[eob] = SymBits(coef.EobBaseTok[eobBaseTokIdx + ctx], eobTok);
-            tB[eob] = eobTok == 2 ? HiTokBits(coef.BrTok[brTokIdx + (((xE | yE) > 1) ? 14 : 7)], magEob) : 0;
+            W(tA, eob, SymBits(coef.EobBaseTok[eobBaseTokIdx + ctx], eobTok));
+            W(tB, eob, eobTok == 2 ? HiTokBits(coef.BrTok[brTokIdx + (((xE | yE) > 1) ? 14 : 7)], magEob) : 0);
         }
 
         private void BaseTerm(int j)
@@ -732,27 +736,27 @@ internal static class Av1CoeffEncode
             m += Lv(rcI + 2, j) + Lv(rcI + 2 * stride, j);
             int loCtx = Av1Tables.LoCtxOffsets[lcIdx, Math.Min(y, 4), Math.Min(x, 4)] + (m > 512 ? 4 : (int)((m + 64) >> 7));
             int tok = Math.Min(mag, 3);
-            tA[j] = SymBits(coef.BaseTok[baseTokIdx + loCtx], tok);
+            W(tA, j, SymBits(coef.BaseTok[baseTokIdx + loCtx], tok));
             if (tok == 3)
             {
                 hiMag &= 63;
                 int hiCtx = (int)(((y | x) > 1 ? 14u : 7u) + (hiMag > 12 ? 6u : (uint)(hiMag + 1) >> 1));
-                tB[j] = HiTokBits(coef.BrTok[brTokIdx + hiCtx], mag);
+                W(tB, j, HiTokBits(coef.BrTok[brTokIdx + hiCtx], mag));
             }
-            else tB[j] = 0;
+            else W(tB, j, 0);
         }
 
         private void DcTerm()
         {
             int dcMag = Math.Abs(sl[0]);
             int dcTokBase = Math.Min(dcMag, 3);
-            tA[0] = SymBits(coef.BaseTok[baseTokIdx + 0], dcTokBase);
+            W(tA, 0, SymBits(coef.BaseTok[baseTokIdx + 0], dcTokBase));
             if (dcTokBase == 3)
             {
                 uint mg = (uint)(lv[1] + lv[stride] + lv[stride + 1]) & 63;
-                tB[0] = HiTokBits(coef.BrTok[brTokIdx + (int)(mg > 12 ? 6u : (mg + 1) >> 1)], dcMag);
+                W(tB, 0, HiTokBits(coef.BrTok[brTokIdx + (int)(mg > 12 ? 6u : (mg + 1) >> 1)], dcMag));
             }
-            else tB[0] = 0;
+            else W(tB, 0, 0);
         }
 
         private void SignTerm(int i)
@@ -760,27 +764,17 @@ internal static class Av1CoeffEncode
             int v = sl[scan[i]], mag = Math.Abs(v);
             if (i == 0)
             {
-                sA[0] = mag != 0 ? BoolBits(coef.DcSign[dcSignIdx][0], v < 0 ? 1u : 0u) : 0;
-                sB[0] = mag >= 15 ? GolombBits((uint)(mag - 15)) : 0;
+                W(sA, 0, mag != 0 ? BoolBits(coef.DcSign[dcSignIdx][0], v < 0 ? 1u : 0u) : 0);
+                W(sB, 0, mag >= 15 ? GolombBits((uint)(mag - 15)) : 0);
             }
             else
             {
-                sA[i] = mag != 0 ? 1 : 0;
-                sB[i] = mag >= 15 ? GolombBits((uint)(mag - 15)) : 0;
+                W(sA, i, mag != 0 ? 1 : 0);
+                W(sB, i, mag >= 15 ? GolombBits((uint)(mag - 15)) : 0);
             }
         }
 
-        public double Sum()
-        {
-            double bits = pre[0];
-            bits += pre[1]; bits += pre[2]; bits += pre[3]; bits += pre[4];
-            bits += tA[eob]; bits += tB[eob];
-            for (int j = eob - 1; j > 0; j--) { bits += tA[j]; bits += tB[j]; }
-            bits += tA[0]; bits += tB[0];
-            bits += sA[0]; bits += sB[0];
-            for (int j = 1; j <= eob; j++) { bits += sA[j]; bits += sB[j]; }
-            return bits;
-        }
+        public double Sum() => total;
     }
 
     /// <summary>Level byte stored for GetLoCtx neighbour magnitude, matching DecodeCoefs: mag 1..2 → mag*0x41;

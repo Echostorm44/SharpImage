@@ -40,12 +40,16 @@ internal sealed class Av1EncodeSpeed
     /// <summary>Angle deltas searched for the directional intra modes: 1 = all of -3..3, 0 = none (delta 0 only),
     /// 2 = {-2, 0, 2}, 3 = {-3, 0, 3}, 4 = {-3, -1, 0, 1, 3}.</summary>
     public int AngleDeltaSet = 1;
-    public (Av1IntraPredMode Mode, int Delta)[] Candidates = Av1StillImageEncoder.BuildCandidates(AngleDeltas(1));
+    // The candidate (mode, delta) list, rebuilt whenever AngleDeltaSet changes (however it is set).
+    private (Av1IntraPredMode Mode, int Delta)[]? candidates; private int candidatesSet = -1;
+    public (Av1IntraPredMode Mode, int Delta)[] Candidates
+        => candidatesSet == AngleDeltaSet && candidates != null ? candidates
+            : (candidates = Av1StillImageEncoder.BuildCandidates(AngleDeltas(candidatesSet = AngleDeltaSet)));
     internal static int[] AngleDeltas(int set) => set switch
     {
         0 => [0], 2 => [-2, 0, 2], 3 => [-3, 0, 3], 4 => [-3, -1, 0, 1, 3], _ => [-3, -2, -1, 0, 1, 2, 3],
     };
-    public void SetAngleDeltas(int set) { AngleDeltaSet = set; Candidates = Av1StillImageEncoder.BuildCandidates(AngleDeltas(set)); }
+    public void SetAngleDeltas(int set) => AngleDeltaSet = set;
     public bool UseTxTypeSearch = true;
     public bool UseRdoq = true;
     /// <summary>RDOQ every candidate inside the leaf mode / tx-type search (as libaom optimizes coefficients in its RD
@@ -84,6 +88,9 @@ internal sealed class Av1EncodeSpeed
     public bool FastIntraTxType;
     /// <summary>Partition levels (1 = 64x64 .. 4 = 8x8) decided by trial encodes; the others use the fast estimate.</summary>
     public int TrueRdFromBl = 1, TrueRdToBl = 4;
+    /// <summary>Coarse-to-fine luma mode prescreen (libaom prunes delta angles around the best base modes): 0 = every
+    /// (mode, delta) candidate; N = the delta-0 modes first, then the other deltas of the N best directional modes.</summary>
+    public int AngleRefineTop;
     /// <summary>Loop restoration (Wiener / self-guided) search; LrSgrSets = self-guided parameter sets tried per unit.</summary>
     public bool UseLoopRestoration = true;
     public int LrSgrSets = 16;
@@ -2644,17 +2651,26 @@ internal static class Av1StillImageEncoder
         Span<long> topCost = stackalloc long[RdModeCandidates];
         topCost.Fill(long.MaxValue);
         double satdLambda = Math.Sqrt(RdLambdaK) * c.AcDq;
-        for (int ci = 0; ci < CandidateModes.Length; ci++)
+        int refine = Sp.AngleRefineTop;
+        Span<long> baseCost = stackalloc long[16];
+        baseCost.Fill(long.MaxValue);
+        for (int pass = 0; pass < (refine > 0 ? 2 : 1); pass++)
         {
-            (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
-            if (DbgLumaModeFilter != null && !DbgLumaModeFilter(mode, delta)) continue;
-            PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, intraFlags);
-            long satd = Satd8x8Rect(c.Luma, c.W, bx, by, pred, w, h);
-            long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
-                + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
-            long cost = satd + mb;
-            for (int k = 0; k < RdModeCandidates; k++)
-                if (cost < topCost[k]) { for (int j = RdModeCandidates - 1; j > k; j--) { topCost[j] = topCost[j - 1]; topIdx[j] = topIdx[j - 1]; } topCost[k] = cost; topIdx[k] = ci; break; }
+            uint dirMask = pass == 1 ? TopDirectional(baseCost, refine) : 0;
+            for (int ci = 0; ci < CandidateModes.Length; ci++)
+            {
+                (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
+                if (DbgLumaModeFilter != null && !DbgLumaModeFilter(mode, delta)) continue;
+                if (refine > 0 && (pass == 0 ? delta != 0 : delta == 0 || (dirMask >> (int)mode & 1) == 0)) continue;
+                PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, intraFlags);
+                long satd = Satd8x8Rect(c.Luma, c.W, bx, by, pred, w, h);
+                long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
+                    + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
+                long cost = satd + mb;
+                if (delta == 0) baseCost[(int)mode] = cost;
+                for (int k = 0; k < RdModeCandidates; k++)
+                    if (cost < topCost[k]) { for (int j = RdModeCandidates - 1; j > k; j--) { topCost[j] = topCost[j - 1]; topIdx[j] = topIdx[j - 1]; } topCost[k] = cost; topIdx[k] = ci; break; }
+            }
         }
 
         bool fastTx = Sp.FastIntraTxType;
@@ -2866,6 +2882,21 @@ internal static class Av1StillImageEncoder
         for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; c.AModeUv[cxR + i] = (byte)uvSym; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; c.LModeUv[cyR + j] = (byte)uvSym; }
+    }
+
+    // Bit mask (by mode value) of the `top` directional modes (Vertical..VerticalLeft) with the lowest delta-0 prescreen cost.
+    private static uint TopDirectional(ReadOnlySpan<long> baseCost, int top)
+    {
+        uint mask = 0;
+        for (int k = 0; k < top; k++)
+        {
+            int bi = -1;
+            for (int m = (int)Av1IntraPredMode.Vertical; m <= (int)Av1IntraPredMode.VerticalLeft; m++)
+                if ((mask >> m & 1) == 0 && baseCost[m] != long.MaxValue && (bi < 0 || baseCost[m] < baseCost[bi])) bi = m;
+            if (bi < 0) break;
+            mask |= 1u << bi;
+        }
+        return mask;
     }
 
     // Intra chroma transform type: derived from the UV mode, except DCT_DCT once the chroma tx reaches 32 in either
@@ -4366,17 +4397,26 @@ internal static class Av1StillImageEncoder
         Span<long> topCost = stackalloc long[RdModeCandidates];
         topCost.Fill(long.MaxValue);
         double satdLambda = Math.Sqrt(RdLambdaK) * acDq; // ~rate weight in SATD units
-        for (int ci = 0; ci < CandidateModes.Length; ci++)
+        int refine = Sp.AngleRefineTop;
+        Span<long> baseCost = stackalloc long[16];
+        baseCost.Fill(long.MaxValue);
+        for (int pass = 0; pass < (refine > 0 ? 2 : 1); pass++)
         {
-            (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
-            if (DbgLumaModeFilter != null && !DbgLumaModeFilter(mode, delta)) continue;
-            PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf, edgeFlags, intraFlags);
-            long satd = Satd8x8(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
-            long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
-                + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
-            long cost = satd + mb;
-            for (int k = 0; k < RdModeCandidates; k++)
-                if (cost < topCost[k]) { for (int j = RdModeCandidates - 1; j > k; j--) { topCost[j] = topCost[j - 1]; topIdx[j] = topIdx[j - 1]; } topCost[k] = cost; topIdx[k] = ci; break; }
+            uint dirMask = pass == 1 ? TopDirectional(baseCost, refine) : 0;
+            for (int ci = 0; ci < CandidateModes.Length; ci++)
+            {
+                (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
+                if (DbgLumaModeFilter != null && !DbgLumaModeFilter(mode, delta)) continue;
+                if (refine > 0 && (pass == 0 ? delta != 0 : delta == 0 || (dirMask >> (int)mode & 1) == 0)) continue;
+                PredictIntra(recon, reconW, bw4, bh4, bx4, by4, n, mode, delta, predBuf, edgeFlags, intraFlags);
+                long satd = Satd8x8(luma, lumaW, bx4 * 4, by4 * 4, predBuf, n);
+                long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
+                    + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
+                long cost = satd + mb;
+                if (delta == 0) baseCost[(int)mode] = cost;
+                for (int k = 0; k < RdModeCandidates; k++)
+                    if (cost < topCost[k]) { for (int j = RdModeCandidates - 1; j > k; j--) { topCost[j] = topCost[j - 1]; topIdx[j] = topIdx[j - 1]; } topCost[k] = cost; topIdx[k] = ci; break; }
+            }
         }
 
         double best = double.MaxValue;
