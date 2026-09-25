@@ -740,6 +740,46 @@ public static partial class JpegCoder
             dhs[ci] = lossless ? c.DownH : (int)(((long)height * c.V * s + maxV * 8 - 1) / (maxV * 8));
         }
 
+        // Cropping (jdapistd.c jpeg_crop_scanline): the left edge moves down to an iMCU column boundary and the width grows
+        // by as much; each component then covers only its columns of the region, whose ends the upsampler treats as image
+        // edges. Skipping (jpeg_skip_scanlines) leaves the remaining rows as they are.
+        var sxs = new int[nComp];
+        var fancyWidthOk = new bool[nComp];
+        for (int ci = 0; ci < nComp; ci++) fancyWidthOk[ci] = dws[ci] > 2;
+        int cropX = 0;
+        var outRows = new List<int>();
+        if (opts.Crop != null && opts.SkipRows != null) throw new ArgumentException("Crop and SkipRows cannot be combined");
+        if ((opts.Crop != null || opts.SkipRows != null) && lossless) throw new NotSupportedException("Not implemented yet");
+        if (opts.Crop is { } crop)
+        {
+            if (crop.Width <= 0 || crop.Height <= 0 || crop.X < 0 || crop.Y < 0 || (long)crop.X + crop.Width > outW || (long)crop.Y + crop.Height > outH)
+                throw new ArgumentException($"crop dimensions exceed image dimensions {outW} x {outH}");
+            for (int y = crop.Y; y < crop.Y + crop.Height; y++) outRows.Add(y);
+            if (crop.Width != outW)
+            {
+                int align = nComp == 1 ? minS : minS * maxH;
+                cropX = crop.X / align * align;
+                int newW = crop.Width + crop.X - cropX;
+                for (int ci = 0; ci < nComp; ci++)
+                {
+                    long num = (long)comps[ci].H * ssize[ci], den = (long)maxH * minS;
+                    int ndw = (int)((newW * num + den - 1) / den);
+                    // a component now under 2 samples wide re-selects its upsampler (jinit_upsampler): no triangle filter
+                    if (ndw < 2 && dws[ci] >= 2) fancyWidthOk[ci] = false;
+                    sxs[ci] = (int)(cropX * num / den);
+                    dws[ci] = ndw;
+                }
+                outW = newW;
+            }
+        }
+        else if (opts.SkipRows is { } sk)
+        {
+            if (sk.Start < 0 || sk.End < sk.Start || sk.End > outH - 1)
+                throw new ArgumentException($"skip region exceeds image height {outH}");
+            for (int y = 0; y < outH; y++) if (y < sk.Start || y > sk.End) outRows.Add(y); if (outRows.Count == 0) throw new ArgumentException("The skip region covers every row (a frame needs at least one)");
+        }
+        else for (int y = 0; y < outH; y++) outRows.Add(y);
+
         // Output colour space (jdcolor.c): greyscale output takes Y of YCbCr / grey, or converts RGB.
         bool greyOut = opts.Grayscale && space != 0;
         if (greyOut && (space >= 3 || lossless)) throw new NotSupportedException("Unsupported color conversion request");
@@ -802,10 +842,11 @@ public static partial class JpegCoder
             for (int by = 0; by < c.HeightInBlocks; by++)
             {
                 if (by * s >= dh) break;
-                if (smoothRow != null) LjSmoothRow(c, by, totalImcuRows, lastGoodRow, scans > 1, smoothRow);
-                for (int bx = 0; bx < c.WidthInBlocks; bx++)
+                if (smoothRow != null) LjSmoothRow(c, by, totalImcuRows, lastGoodRow, scans > 1, smoothRow, sxs[ci] / s);
+                int sx = sxs[ci];
+                for (int bx = sx / s; bx < c.WidthInBlocks; bx++)
                 {
-                    if (bx * s >= dw) break;
+                    if (bx * s >= sx + dw) break;
                     var src = smoothRow != null ? smoothRow.AsSpan(bx * 64, 64) : c.Coef.AsSpan((by * c.AllocW + bx) * 64, 64);
                     switch (s)
                     {
@@ -831,8 +872,8 @@ public static partial class JpegCoder
                         default: LjIdct16x16(src, qi, blk, s, rlPost!, mask, p1, center); break;
                     }
                     for (int y = 0; y < s && by * s + y < dh; y++)
-                        for (int x = 0; x < s && bx * s + x < dw; x++)
-                            plane[(by * s + y) * dw + bx * s + x] = blk[y * s + x];
+                        for (int x = Math.Max(0, sx - bx * s); x < s && bx * s + x < sx + dw; x++)
+                            plane[(by * s + y) * dw + bx * s + x - sx] = blk[y * s + x];
                 }
             }
             planes[ci] = plane;
@@ -847,22 +888,24 @@ public static partial class JpegCoder
             if (!needed[ci]) continue;
             var c = comps[ci];
             int s = lossless ? 1 : ssize[ci], m = lossless ? 1 : minS;
-            full[ci] = LjUpsample(planes[ci], dws[ci], dhs[ci], c.H * s / m, c.V * s / m, maxH, maxV, outW, outH, doFancy)
+            full[ci] = LjUpsample(planes[ci], dws[ci], dhs[ci], c.H * s / m, c.V * s / m, maxH, maxV, outW, outH, doFancy, fancyWidthOk[ci])
                 ?? throw new NotSupportedException("Fractional sampling not implemented yet");
         }
 
         // Colour conversion + output.
         var frame = new ImageFrame();
-        frame.Initialize(outW, outH, space >= 3 ? ColorspaceType.CMYK : ColorspaceType.SRGB, false);
+        frame.Initialize(outW, outRows.Count, space >= 3 ? ColorspaceType.CMYK : ColorspaceType.SRGB, false);
+        if (opts.Crop is { } region) frame.Page = new FrameOffset(cropX, region.Y);
         int nch = frame.NumberOfChannels;
         int[]? crR = null, cbB = null, crG = null, cbG = null;
         if (space is 1 or 4 && !greyOut) LjYccTables(max, out crR, out cbB, out crG, out cbG);
         const int scaleBits = 16;
         static int Fix(double x) => (int)(x * (1 << scaleBits) + 0.5);
         int gr = Fix(0.29900), gg = Fix(0.58700), gb = Fix(0.11400);
-        for (int y = 0; y < outH; y++)
+        for (int oy = 0; oy < outRows.Count; oy++)
         {
-            var row = frame.GetPixelRowForWrite(y);
+            var row = frame.GetPixelRowForWrite(oy);
+            int y = outRows[oy];
             for (int x = 0; x < outW; x++)
             {
                 int i = y * outW + x, o = x * nch;
@@ -1011,7 +1054,8 @@ public static partial class JpegCoder
     }
 
     // One component's block row, smoothed into ws (WidthInBlocks blocks of 64), for the IDCT.
-    private static void LjSmoothRow(LjComp c, int by, int totalImcuRows, int lastGoodRow, bool prevLatch, short[] ws)
+    private static void LjSmoothRow(LjComp c, int by, int totalImcuRows, int lastGoodRow, bool prevLatch, short[] ws,
+        int firstCol = 0)
     {
         int v = c.V, r = by / v, blockRow = by % v, lastRow = totalImcuRows - 1;
         int blockRows = r < lastRow ? v : (c.HeightInBlocks % v == 0 ? v : c.HeightInBlocks % v);
@@ -1034,11 +1078,12 @@ public static partial class JpegCoder
 
         int dc01, dc02, dc03, dc04, dc05, dc06, dc07, dc08, dc09, dc10, dc11, dc12, dc13, dc14, dc15;
         int dc16, dc17, dc18, dc19, dc20, dc21, dc22, dc23, dc24, dc25;
-        dc01 = dc02 = dc03 = dc04 = dc05 = Dc(prevPrevRow, 0);
-        dc06 = dc07 = dc08 = dc09 = dc10 = Dc(prevRow, 0);
-        dc11 = dc12 = dc13 = dc14 = dc15 = Dc(row, 0);
-        dc16 = dc17 = dc18 = dc19 = dc20 = Dc(nextRow, 0);
-        dc21 = dc22 = dc23 = dc24 = dc25 = Dc(nextNextRow, 0);
+        // The window starts at the first column decoded (first_MCU_col: a crop's left edge smooths like the image edge).
+        dc01 = dc02 = dc03 = dc04 = dc05 = Dc(prevPrevRow, firstCol);
+        dc06 = dc07 = dc08 = dc09 = dc10 = Dc(prevRow, firstCol);
+        dc11 = dc12 = dc13 = dc14 = dc15 = Dc(row, firstCol);
+        dc16 = dc17 = dc18 = dc19 = dc20 = Dc(nextRow, firstCol);
+        dc21 = dc22 = dc23 = dc24 = dc25 = Dc(nextNextRow, firstCol);
         int lastCol = c.WidthInBlocks - 1;
 
         static short Pred(long num, long qq, int al)
@@ -1058,17 +1103,17 @@ public static partial class JpegCoder
             return (short)pred;
         }
 
-        for (int b = 0; b <= lastCol; b++)
+        for (int b = firstCol; b <= lastCol; b++)
         {
             var w = ws.AsSpan(b * 64, 64);
             coef.AsSpan((row * aw + b) * 64, 64).CopyTo(w);
-            if (b == 0 && b < lastCol)
+            if (b == firstCol && b < lastCol)
             {
-                dc04 = dc05 = Dc(prevPrevRow, 1);
-                dc09 = dc10 = Dc(prevRow, 1);
-                dc14 = dc15 = Dc(row, 1);
-                dc19 = dc20 = Dc(nextRow, 1);
-                dc24 = dc25 = Dc(nextNextRow, 1);
+                dc04 = dc05 = Dc(prevPrevRow, b + 1);
+                dc09 = dc10 = Dc(prevRow, b + 1);
+                dc14 = dc15 = Dc(row, b + 1);
+                dc19 = dc20 = Dc(nextRow, b + 1);
+                dc24 = dc25 = Dc(nextNextRow, b + 1);
             }
             if (b + 1 < lastCol)
             {
@@ -1622,10 +1667,12 @@ public static partial class JpegCoder
         }
     }
 
-    // jdsample.c: a component's samples (sw x sh) to the output size (w x h). hIn / vIn are its row-group size after
+    // jdsample.c: a component's samples (sw x sh) to the output size (w x h); the triangle filters also need the
+    // component wide enough (fancyWidthOk: more than 2 samples when the upsampler was selected). hIn / vIn are its row-group size after
     // IDCT scaling, hOut / vOut the maximum sampling factors: equal = full size, 2:1 = h2v1 / h1v2 / h2v2 (triangle
     // filters when fancy, else replication), other integral ratios replicate. Null for fractional ratios.
-    private static int[]? LjUpsample(int[] src, int sw, int sh, int hIn, int vIn, int hOut, int vOut, int w, int h, bool fancy)
+    private static int[]? LjUpsample(int[] src, int sw, int sh, int hIn, int vIn, int hOut, int vOut, int w, int h, bool fancy,
+        bool fancyWidthOk)
     {
         if (hIn == hOut && vIn == vOut)
         {
@@ -1637,7 +1684,7 @@ public static partial class JpegCoder
         if (hOut % hIn != 0 || vOut % vIn != 0) return null;
         int rx = hOut / hIn, ry = vOut / vIn;
         var dst = new int[w * h];
-        if (fancy && rx == 2 && ry == 1 && sw > 2)
+        if (fancy && rx == 2 && ry == 1 && fancyWidthOk)
         {
             var line = new int[sw * 2];
             for (int y = 0; y < h; y++)
@@ -1667,7 +1714,7 @@ public static partial class JpegCoder
             }
             return dst;
         }
-        if (fancy && rx == 2 && ry == 2 && sw > 2)
+        if (fancy && rx == 2 && ry == 2 && fancyWidthOk)
         {
             var line = new int[sw * 2];
             for (int y = 0; y < h; y++)

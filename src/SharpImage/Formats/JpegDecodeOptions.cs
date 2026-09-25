@@ -38,4 +38,15 @@ public sealed class JpegDecodeOptions
 
     /// <summary>djpeg -maxscans N: fail on a file with more than N scans (0 = no limit).</summary>
     public int MaxScans { get; init; }
+
+    /// <summary>djpeg -crop WxH+X+Y (jpeg_crop_scanline): decode only this region of the (scaled) output. As in libjpeg,
+    /// X moves down to an iMCU column boundary and the width grows by as much (the returned frame's
+    /// <see cref="SharpImage.Image.ImageFrame.Page"/> holds the region's actual origin), and the upsampler treats the
+    /// region's left and right ends as image edges. Not for lossless files.</summary>
+    public (int X, int Y, int Width, int Height)? Crop { get; init; }
+
+    /// <summary>djpeg -skip Y0,Y1 (jpeg_skip_scanlines): decode every row except Y0..Y1 (inclusive). Not for lossless
+    /// files. (libjpeg-turbo 3.1.4's merged upsampler, used with <see cref="FancyUpsampling"/> off for 4:2:0 colour
+    /// output, returns rows shifted by one after a skip that starts on an odd row; this returns the intended rows.) Skipping every row is an error (djpeg writes an empty image).</summary>
+    public (int Start, int End)? SkipRows { get; init; }
 }

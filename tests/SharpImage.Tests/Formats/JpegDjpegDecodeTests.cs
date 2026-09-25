@@ -51,6 +51,11 @@ public sealed class JpegDjpegDecodeTests
     [Arguments("cjpeg_31x33_rgb420", "rgbgrey")]
     [Arguments("ljt_p12_420", "p12_scale3_4")]
     [Arguments("ljt_p12_420", "p12_float")]
+    [Arguments("cjpeg_31x33_prog420", "crop")]
+    [Arguments("cjpeg_31x33_s22_21", "crop_scale")]
+    [Arguments("corrupt_prog_truncated", "crop_smooth")]
+    [Arguments("cjpeg_31x33_prog420", "skip")]
+    [Arguments("ljt_p12_420", "p12_skip")]
     public async Task MatchesDjpeg(string file, string mode)
     {
         var o = mode switch
@@ -67,6 +72,12 @@ public sealed class JpegDjpegDecodeTests
             "grey" or "rgbgrey" => new JpegDecodeOptions { Grayscale = true },
             "p12_scale3_4" => new JpegDecodeOptions { ScaleNumerator = 3, ScaleDenominator = 4 },
             "p12_float" => new JpegDecodeOptions { Dct = JpegDctMethod.Float },
+            // the region's edges upsample (and block-smooth) like image edges; X moves down to the iMCU boundary 16
+            "crop" => new JpegDecodeOptions { Crop = (17, 8, 13, 9) },
+            "crop_scale" => new JpegDecodeOptions { Crop = (9, 3, 7, 5), ScaleNumerator = 3, ScaleDenominator = 4 },
+            "crop_smooth" => new JpegDecodeOptions { Crop = (16, 8, 17, 9) },
+            "skip" => new JpegDecodeOptions { SkipRows = (5, 20) },
+            "p12_skip" => new JpegDecodeOptions { SkipRows = (1, 7), FancyUpsampling = false },
             _ => throw new ArgumentException(mode),
         };
         using var img = JpegCoder.Read(new MemoryStream(File.ReadAllBytes(Path.Combine(Dir("jpeg_libjpeg"), file + ".jpg"))), o);
@@ -106,6 +117,15 @@ public sealed class JpegDjpegDecodeTests
         using (var ok = JpegCoder.Read(new MemoryStream(prog), new JpegDecodeOptions { MaxScans = 10 })) await Assert.That(ok.Columns).IsEqualTo(31u);
         await Assert.That(() => JpegCoder.Read(new MemoryStream(prog), new JpegDecodeOptions { MaxScans = 9 }))
             .Throws<InvalidDataException>().WithMessage("Scan number 10 exceeds maximum scans (9)");
+    }
+
+    [Test]
+    public async Task CropReportsItsAlignedOrigin()
+    {
+        byte[] jpg = File.ReadAllBytes(Path.Combine(Dir("jpeg_libjpeg"), "cjpeg_31x33_prog420.jpg"));
+        using var img = JpegCoder.Read(new MemoryStream(jpg), new JpegDecodeOptions { Crop = (17, 8, 13, 9) });
+        await Assert.That((img.Page.X, img.Page.Y, (int)img.Columns, (int)img.Rows)).IsEqualTo((16, 8, 14, 9));
+        await Assert.That(() => JpegCoder.Read(new MemoryStream(jpg), new JpegDecodeOptions { Crop = (20, 0, 12, 5) })).Throws<ArgumentException>();
     }
 
     [Test]
