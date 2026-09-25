@@ -164,6 +164,32 @@ internal sealed class Av1Decoder
     /// tile group(s). Returns the visible frame, or null if the frame is
     /// not visible (e.g., altref).
     /// </summary>
+    /// <summary>After a decode, per 8x8 block of the MI grid (row-major, ceil(Bw/2) x ceil(Bh/2)): 1 when any of its
+    /// 4x4 blocks codes a residual — the blocks CDEF filters (from the loop-filter masks, as ApplyCdef reads them).
+    /// Used by the encoder's per-superblock CDEF search.</summary>
+    internal byte[] NoskipMap8x8(out int w8, out int h8)
+    {
+        int w4 = ctx.Bw, h4 = ctx.Bh, sb128w = ctx.Sb128w;
+        w8 = (w4 + 1) >> 1;
+        h8 = (h4 + 1) >> 1;
+        var map = new byte[w8 * h8];
+        var rows = ctx.LfMasksRows;
+        if (rows == null) return map;
+        for (int by = 0; by < h4; by += 2)
+        {
+            int byIdx = (by & 31) >> 1;
+            for (int bx = 0; bx < w4; bx += 2)
+            {
+                int idx = (by >> 5) * sb128w + (bx >> 5);
+                if (idx >= rows.Length) continue;
+                var m = rows[idx];
+                uint noskip = (uint)m.NoskipMask[byIdx, 1] << 16 | m.NoskipMask[byIdx, 0];
+                if ((noskip & (3u << (bx & 30))) != 0) map[(by >> 1) * w8 + (bx >> 1)] = 1;
+            }
+        }
+        return map;
+    }
+
     public DecodedVideoFrame? Decode(ReadOnlySpan<byte> data, long presentationTimeTicks, bool isKeyframe)
     {
         // One output per temporal unit: the shown frame with the highest spatial id (dav1d with all_layers = 0 outputs

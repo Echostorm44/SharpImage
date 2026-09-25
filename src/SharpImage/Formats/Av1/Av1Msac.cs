@@ -34,7 +34,10 @@ public ref struct Av1Msac
     // added to PhaseBits[Phase]. The decoder sets Phase around each symbol group (0=part,1=mode,2=skip,3=tx,
     // 4=filter,5=coef,6=cdef,7=other). Works on ANY valid AV1 stream, so it profiles libaom's bit split too.
     public static bool AcctOn;
-    public static readonly double[] PhaseBits = new double[8];
+    public static readonly double[] PhaseBits = new double[16];
+    // Dev accounting (AcctOn): finer mode phases 8=y mode, 9=y angle, 10=uv mode, 11=cfl alpha, 12=uv angle,
+    // 13=palette, 14=intrabc; ModeHist counts y modes [0..13], uv modes [16..29], palette-y [32], palette-uv [33].
+    public static readonly int[] ModeHist = new int[40];
     public static int Phase = 7;
 
     /// <summary>Label attached to trace entries for code path identification.</summary>

@@ -1975,8 +1975,11 @@ public sealed class Av1HbdVerify
                     int w = f.Width, h = f.Height;
                     int sx = t[6] == "444" ? 0 : 1, sy = t[6] == "420" ? 1 : 0;
                     Plane(f.BitDepth > 8 ? f.YPlane16.Span : default, f.BitDepth > 8 ? default : f.YPlane.Span, f.YStride, w, h);
-                    Plane(f.BitDepth > 8 ? f.UPlane16.Span : default, f.BitDepth > 8 ? default : f.UPlane.Span, f.UStride, (w + sx) >> sx, (h + sy) >> sy);
-                    Plane(f.BitDepth > 8 ? f.VPlane16.Span : default, f.BitDepth > 8 ? default : f.VPlane.Span, f.VStride, (w + sx) >> sx, (h + sy) >> sy);
+                    if ((f.BitDepth > 8 ? f.UPlane16.Length : f.UPlane.Length) > 0) // monochrome streams have luma only
+                    {
+                        Plane(f.BitDepth > 8 ? f.UPlane16.Span : default, f.BitDepth > 8 ? default : f.UPlane.Span, f.UStride, (w + sx) >> sx, (h + sy) >> sy);
+                        Plane(f.BitDepth > 8 ? f.VPlane16.Span : default, f.BitDepth > 8 ? default : f.VPlane.Span, f.VStride, (w + sx) >> sx, (h + sy) >> sy);
+                    }
                     log.AppendLine($"encdump {Path.GetFileName(t[2])} {w}x{h} bd{f.BitDepth} {avif.Length} bytes");
                     continue;
                 }

@@ -1244,8 +1244,9 @@ public static class Av1Decode
             int leftCtx = Av1Tables.IntraModeContext[t.Left.Mode[by4]];
             ymodeCdf = ts.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
         }
-        Av1Msac.Phase = 1;
+        Av1Msac.Phase = Av1Msac.AcctOn ? 8 : 1;
         b.YMode = (byte)msac.DecodeSymbolAdapt16(ymodeCdf, Av1Constants.NumIntraPredModes - 1);
+        if (Av1Msac.AcctOn) { Av1Msac.ModeHist[b.YMode]++; Av1Msac.Phase = 9; }
 
         // === Angle delta ===
         if (bDimW + bDimH >= 2 &&
@@ -1270,7 +1271,9 @@ public static class Av1Decode
 
             var uvmodeCdf = ts.Cdf.GetUvModeCdf(cflAllowed, b.YMode);
             int maxSym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
+            if (Av1Msac.AcctOn) Av1Msac.Phase = 10;
             b.UvMode = (byte)msac.DecodeSymbolAdapt16(uvmodeCdf, maxSym);
+            if (Av1Msac.AcctOn) { Av1Msac.ModeHist[16 + b.UvMode]++; Av1Msac.Phase = b.UvMode == (byte)Av1IntraPredMode.ChromaFromLuma ? 11 : 12; }
             if (t.Bx < 8 && t.By < 4)
                 AvDbg.W($"[DEC-DBG] post-uvmode={b.UvMode} cfl={(cflAllowed ? 1 : 0)} has_chroma={(hasChroma ? 1 : 0)} rng={msac.DebugRng}");
             if (DbgFirstBlock && t.Bx == 0 && t.By == 0)
@@ -1331,6 +1334,7 @@ public static class Av1Decode
         // === Palette ===
         b.PalSzY = 0;
         b.PalSzUv = 0;
+        if (Av1Msac.AcctOn) Av1Msac.Phase = 13;
         if (fh.AllowScreenContentTools && Math.Max(bw4, bh4) <= 16 && bw4 + bh4 >= 4)
         {
             int szCtx = bDimW + bDimH - 2;
@@ -1367,6 +1371,7 @@ public static class Av1Decode
             }
         }
 
+        if (Av1Msac.AcctOn) { if (b.PalSzY > 0) Av1Msac.ModeHist[32]++; if (b.PalSzUv > 0) Av1Msac.ModeHist[33]++; }
         // === Filter intra ===
         // Decoded AFTER palette colors but BEFORE palette indices (dav1d decode_b order).
         if (b.YMode == (byte)Av1IntraPredMode.Dc && b.PalSzY == 0 &&

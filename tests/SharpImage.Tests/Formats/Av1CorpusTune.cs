@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using SharpImage.Formats.Av1;
 using TUnit.Core;
 
@@ -24,10 +25,22 @@ public sealed class Av1CorpusTune
         if (!File.Exists(cfgPath)) return;
         var p = File.ReadAllText(cfgPath).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         File.Delete(cfgPath);
-        if (p.Length < 5) return;
+        if (p.Where(t => !t.Contains((char)61)).Count() < 5) return;
         var ci = System.Globalization.CultureInfo.InvariantCulture;
         string label = p[0];
         double rdlk = double.Parse(p[1], ci), rdoq = double.Parse(p[2], ci), crdoq = double.Parse(p[3], ci), dz = double.Parse(p[4], ci);
+        // Any Av1EncodeSpeed field can be set with a trailing "Field=Value" token (ablations / sweeps).
+        var speedTok = p.FirstOrDefault(t => t.StartsWith("Speed="));
+        var sp = speedTok != null ? Av1EncodeSpeed.ForSpeed(int.Parse(speedTok[6..], ci)) : new Av1EncodeSpeed();
+        Av1StillImageEncoder.t_speed = sp;
+        foreach (var tok in p)
+        {
+            int eq = tok.IndexOf('=');
+            if (eq <= 0 || tok.StartsWith("Speed=")) continue;
+            var f = typeof(Av1EncodeSpeed).GetField(tok[..eq]) ?? throw new ArgumentException("unknown speed field " + tok);
+            f.SetValue(sp, Convert.ChangeType(tok[(eq + 1)..], f.FieldType, ci));
+        }
+        p = p.Where(t => !t.Contains('=')).ToArray();
         Av1StillImageEncoder.RdLambdaK = rdlk;
         Av1StillImageEncoder.RdoqLambdaScale = rdoq;
         Av1StillImageEncoder.ChromaRdoqLambdaScale = crdoq;
