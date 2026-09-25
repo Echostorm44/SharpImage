@@ -167,6 +167,28 @@ internal sealed class Av1Decoder
     /// <summary>After a decode, per 8x8 block of the MI grid (row-major, ceil(Bw/2) x ceil(Bh/2)): 1 when any of its
     /// 4x4 blocks codes a residual — the blocks CDEF filters (from the loop-filter masks, as ApplyCdef reads them).
     /// Used by the encoder's per-superblock CDEF search.</summary>
+    /// <summary>Copies of the last decoded frame's internal (64-aligned) planes, <paramref name="rowsY"/> /
+    /// <paramref name="rowsC"/> rows each (rows past the buffer repeat its last row): unlike the cropped output they hold
+    /// the reconstruction past the visible edges that in-loop filters read (encoder filter searches).</summary>
+    internal ushort[][] InternalPlanes(int rowsY, int rowsC, out int[] strides)
+    {
+        int n = ctx.CurrentPlanes[1] != null ? 3 : 1;
+        strides = new int[n];
+        var planes = new ushort[n][];
+        for (int i = 0; i < n; i++)
+        {
+            int stride = ctx.CurrentStrides[i], rows = i == 0 ? rowsY : rowsC;
+            var src = ctx.CurrentPlanes[i]!;
+            var a = new ushort[stride * rows];
+            int avail = Math.Min(rows, src.Length / stride) * stride;
+            Array.Copy(src, a, avail);
+            for (int o = avail; o + stride <= a.Length; o += stride) Array.Copy(a, avail - stride, a, o, stride);
+            strides[i] = stride;
+            planes[i] = a;
+        }
+        return planes;
+    }
+
     internal byte[] NoskipMap8x8(out int w8, out int h8)
     {
         int w4 = ctx.Bw, h4 = ctx.Bh, sb128w = ctx.Sb128w;

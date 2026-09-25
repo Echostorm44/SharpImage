@@ -159,12 +159,29 @@ public static class Av1Cdef
     /// Fill extended input buffer (int16) for the filter kernel.
     /// tmp points to offset [2*stride+2] in a (h+4)×12 buffer.
     /// </summary>
+    /// <summary>Encoder CDEF search: the 12x12 padded neighbourhood FilterBlock builds (block, 2-pixel border), built
+    /// once so every strength can then be filtered from it with <see cref="FilterPadded"/>.</summary>
+    internal static void PadBlock(Span<short> tmp144, ReadOnlySpan<ushort> src, int srcOffset, int srcStride,
+        ReadOnlySpan<ushort> left, int leftOffset, int leftStride, ReadOnlySpan<ushort> top, int topOffset,
+        ReadOnlySpan<ushort> bottom, int bottomOffset, int w, int h, EdgeFlags edges, int tbStride)
+        => Padding(tmp144, 2 * 12 + 2, 12, src, srcOffset, srcStride, left, leftOffset, leftStride, top, topOffset,
+            bottom, bottomOffset, w, h, edges, tbStride);
+
+    /// <summary>Filters a block from its <see cref="PadBlock"/> neighbourhood into dst (AVX2 only; false otherwise).</summary>
+    internal static bool FilterPadded(ReadOnlySpan<short> tmp144, Span<ushort> dst, int dstOffset, int dstStride,
+        int priStrength, int secStrength, int dir, int damping, int w, int h, int bitDepth)
+    {
+        if (!Avx2.IsSupported) return false;
+        FilterRowsV(dst, dstOffset, dstStride, tmp144, 2 * 12 + 2, priStrength, secStrength, dir, damping, w, h, bitDepth - 8);
+        return true;
+    }
+
     private static void Padding(Span<short> tmp, int tmpOffset, int tmpStride,
         ReadOnlySpan<ushort> src, int srcOffset, int srcStride,
         ReadOnlySpan<ushort> left, int leftOffset, int leftStride,
         ReadOnlySpan<ushort> top, int topOffset,
         ReadOnlySpan<ushort> bottom, int bottomOffset,
-        int w, int h, EdgeFlags edges)
+        int w, int h, EdgeFlags edges, int tbStride)
     {
         int xStart = -2, xEnd = w + 2, yStart = -2, yEnd = h + 2;
 
@@ -194,7 +211,7 @@ public static class Av1Cdef
         {
             for (int x = xStart; x < xEnd; x++)
                 tmp[tmpOffset + x + y * tmpStride] = (short)top[topOff + x];
-            topOff += srcStride;
+            topOff += tbStride;
         }
 
         for (int y = 0; y < h; y++)
@@ -216,7 +233,7 @@ public static class Av1Cdef
         {
             for (int x = xStart; x < xEnd; x++)
                 tmp[tOff + x] = (short)bottom[bOff + x];
-            bOff += srcStride;
+            bOff += tbStride;
             tOff += tmpStride;
         }
     }
@@ -246,7 +263,7 @@ public static class Av1Cdef
         ReadOnlySpan<ushort> top, int topOffset,
         ReadOnlySpan<ushort> bottom, int bottomOffset,
         int priStrength, int secStrength, int dir, int damping,
-        int w, int h, EdgeFlags edges, int bitDepth = 8)
+        int w, int h, EdgeFlags edges, int bitDepth = 8, int topBottomStride = 0)
     {
         int bdMin8 = bitDepth - 8;
         // Strengths and damping arrive already scaled for the bit depth by the caller
@@ -261,7 +278,7 @@ public static class Av1Cdef
             dst, dstOffset, dstStride,
             left, leftOffset, leftStride,
             top, topOffset, bottom, bottomOffset,
-            w, h, edges);
+            w, h, edges, topBottomStride > 0 ? topBottomStride : dstStride);
 
         if (Avx2.IsSupported)
         {

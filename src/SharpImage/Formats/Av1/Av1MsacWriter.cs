@@ -52,6 +52,9 @@ internal sealed class Av1MsacWriter
     internal readonly struct LogOp
     {
         internal const byte Sym = 0, Bool = 1, Equi = 2, Marker = 3;
+        // Symbolic forms (with SymIndex): adaptive symbol / bool on CDF array A at offset B, and the edge-partition
+        // bool whose probability is gathered from partition CDF A/B at block level N (top or left gather).
+        internal const byte SymC = 4, BoolC = 5, GatherTop = 6, GatherLeft = 7;
         internal readonly byte Kind, S, N; internal readonly int A, B;
         internal LogOp(byte kind, byte s, byte n, int a, int b) { Kind = kind; S = s; N = n; A = a; B = b; }
     }
@@ -61,6 +64,12 @@ internal sealed class Av1MsacWriter
     /// decided after the tile, e.g. loop-restoration units). Symbols are recorded as their coded intervals, so the
     /// replay is exact whatever the CDFs do afterwards.</summary>
     internal List<LogOp>? Log;
+
+    /// <summary>With <see cref="Log"/>: record adaptive symbols by CDF identity (array id + offset in this index's
+    /// context) instead of by interval, so <see cref="Replay"/> re-codes them against another context's CDFs (which
+    /// adapt as they are replayed). Row-parallel encoding decides each superblock row on its own CDF copy this way.</summary>
+    internal Av1CdfIndex? SymIndex;
+    private bool suppressLog;
 
     /// <summary>Records a marker (no bits) at the current position of <see cref="Log"/>.</summary>
     internal void Mark(int id) => Log?.Add(new LogOp(LogOp.Marker, 0, 0, id, 0));
@@ -72,20 +81,46 @@ internal sealed class Av1MsacWriter
     /// <summary>Re-codes a recorded operation sequence into a fresh coder, calling <paramref name="onMarker"/> at each
     /// marker (it may code anything with the given writer) and returns the finished bytes. Without markers that write,
     /// the result equals the recording coder's own output.</summary>
-    internal static byte[] Replay(List<LogOp> ops, Action<int, Av1MsacWriter>? onMarker)
+    internal static byte[] Replay(List<LogOp> ops, Action<int, Av1MsacWriter>? onMarker, ushort[][]? cdfs = null)
     {
         var w = new Av1MsacWriter();
+        w.ReplayInto(ops, onMarker, cdfs);
+        return w.Finish();
+    }
+
+    /// <summary>Re-codes recorded operations into this coder. Symbolic ops use <paramref name="cdfs"/> (the arrays of
+    /// the context they are replayed against, <see cref="Av1CdfIndex.Arrays"/> order), adapting them.</summary>
+    internal void ReplayInto(List<LogOp> ops, Action<int, Av1MsacWriter>? onMarker, ushort[][]? cdfs)
+    {
         foreach (var op in ops)
         {
             switch (op.Kind)
             {
-                case LogOp.Sym: w.EncodeInterval((uint)op.A, (uint)op.B, op.S, op.N); break;
-                case LogOp.Bool: w.EncodeBool(op.S, (uint)op.A); break;
-                case LogOp.Equi: w.EncodeBoolEqui(op.S); break;
-                default: onMarker?.Invoke(op.A, w); break;
+                case LogOp.Sym: EncodeInterval((uint)op.A, (uint)op.B, op.S, op.N); break;
+                case LogOp.Bool: EncodeBool(op.S, (uint)op.A); break;
+                case LogOp.Equi: EncodeBoolEqui(op.S); break;
+                case LogOp.SymC: EncodeSymbolAdapt(cdfs![op.A].AsSpan(op.B), op.S, op.N); break;
+                case LogOp.BoolC: EncodeBoolAdapt(cdfs![op.A].AsSpan(op.B), op.S); break;
+                case LogOp.GatherTop: EncodeBool(op.S, Av1Decode.GatherTopPartitionProb(cdfs![op.A].AsSpan(op.B), (Av1BlockLevel)op.N)); break;
+                case LogOp.GatherLeft: EncodeBool(op.S, Av1Decode.GatherLeftPartitionProb(cdfs![op.A].AsSpan(op.B), (Av1BlockLevel)op.N)); break;
+                default: onMarker?.Invoke(op.A, this); break;
             }
         }
-        return w.Finish();
+    }
+
+    /// <summary>The edge-partition split bool (probability gathered from the partition CDF, non-adaptive).</summary>
+    public void EncodeBoolGathered(ReadOnlySpan<ushort> partCdf, Av1BlockLevel bl, bool top, uint val)
+    {
+        uint f = top ? Av1Decode.GatherTopPartitionProb(partCdf, bl) : Av1Decode.GatherLeftPartitionProb(partCdf, bl);
+        if (SymIndex != null && Log != null)
+        {
+            var (id, off) = SymIndex.Locate(partCdf);
+            Log.Add(new LogOp(top ? LogOp.GatherTop : LogOp.GatherLeft, (byte)val, (byte)bl, id, off));
+            suppressLog = true;
+            EncodeBool(val, f);
+            suppressLog = false;
+        }
+        else EncodeBool(val, f);
     }
 
     // Precarry-buffer bytes emitted since index `start` (a trial's output tail), so a winning trial's committed
@@ -139,7 +174,7 @@ internal sealed class Av1MsacWriter
     // Codes symbol s of an nsyms-ary alphabet given its inverse-CDF interval [fh, fl).
     private void EncodeInterval(uint fl, uint fh, int s, int nsyms)
     {
-        Log?.Add(new LogOp(LogOp.Sym, (byte)s, (byte)nsyms, (int)fl, (int)fh));
+        if (!suppressLog) Log?.Add(new LogOp(LogOp.Sym, (byte)s, (byte)nsyms, (int)fl, (int)fh));
         uint r = rng;
         if (Measure) MeasuredBits += Av1CoeffEncode.BitCost[Math.Clamp((int)fl - (int)fh, 0, 32768)];
         ulong l = low;
@@ -163,7 +198,7 @@ internal sealed class Av1MsacWriter
     /// (matches the decoder's DecodeBool). Non-adaptive.</summary>
     public void EncodeBool(uint val, uint f)
     {
-        Log?.Add(new LogOp(LogOp.Bool, (byte)val, 0, (int)f, 0));
+        if (!suppressLog) Log?.Add(new LogOp(LogOp.Bool, (byte)val, 0, (int)f, 0));
         if (Measure) MeasuredBits += Av1CoeffEncode.BitCost[Math.Clamp((int)(val == 0 ? f : 32768 - f), 0, 32768)];
         uint r = rng;
         ulong l = low;
@@ -206,7 +241,15 @@ internal sealed class Av1MsacWriter
     /// decoder's DecodeBoolAdapt does.</summary>
     public void EncodeBoolAdapt(Span<ushort> cdf, uint val)
     {
-        EncodeBool(val, cdf[0]);
+        if (SymIndex != null && Log != null)
+        {
+            var (id, off) = SymIndex.Locate(cdf);
+            Log.Add(new LogOp(LogOp.BoolC, (byte)val, 0, id, off));
+            suppressLog = true;
+            EncodeBool(val, cdf[0]);
+            suppressLog = false;
+        }
+        else EncodeBool(val, cdf[0]);
         uint count = cdf[1];
         int rate = 4 + (int)(count >> 4);
         if (val != 0)
@@ -228,7 +271,15 @@ internal sealed class Av1MsacWriter
         // Pass the full cdf (not cdf[0..nsyms]) so the last symbol s==nsyms can read icdf[nsyms]. After adaptation
         // that slot holds the counter (<=32), and counter>>6 == 0, so v computes to 0 exactly as the decoder's
         // decode loop does (it likewise reads cdf[nsyms]) — the two stay in sync at the terminal symbol.
-        EncodeSymbol(cdf, s, nsyms);
+        if (SymIndex != null && Log != null)
+        {
+            var (id, off) = SymIndex.Locate(cdf);
+            Log.Add(new LogOp(LogOp.SymC, (byte)s, (byte)nsyms, id, off));
+            suppressLog = true;
+            EncodeSymbol(cdf, s, nsyms);
+            suppressLog = false;
+        }
+        else EncodeSymbol(cdf, s, nsyms);
 
         uint count = cdf[nsyms];
         int rate = 4 + (int)(count >> 4) + (nsyms > 2 ? 1 : 0);

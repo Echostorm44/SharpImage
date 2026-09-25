@@ -160,8 +160,6 @@ internal static class Av1FwdTransform
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[txSizeIdx];
         int logW = tDim.Lw, logH = tDim.Lh;
         (int hType, int vType) = AxisTypes(txType);
-        double[] fh = ForwardMatrixFlat(logW, hType);   // width (horizontal / row) forward, w x w
-        double[] fv = ForwardMatrixFlat(logH, vType);   // height (vertical / column) forward, h x h
         int sw = Math.Min(w, 32), sh = Math.Min(h, 32);
         bool isRect2 = w * 2 == h || h * 2 == w;
         int dqShift = Math.Max(0, tDim.Ctx - 2);
@@ -169,6 +167,8 @@ internal static class Av1FwdTransform
         if (Vector256.IsHardwareAccelerated)
             return MatForwardV(residual, w, h, ForwardMatrixFlatT(logW, hType), ForwardMatrixFlatT(logH, vType), s,
                 dcDq, acDq, rcCount, qfOut);
+        double[] fh = ForwardMatrixFlat(logW, hType);   // width (horizontal / row) forward, w x w
+        double[] fv = ForwardMatrixFlat(logH, vType);   // height (vertical / column) forward, h x h
 
         // Horizontal forward: t[y][kx] = sum_x Fh[kx][x] * res[y][x], stored transposed (tT[kx][y]); same products in
         // the same order as the textbook loops, so identical doubles.
@@ -367,15 +367,18 @@ internal static class Av1FwdTransform
         return levels;
     }
 
-    private static readonly ConcurrentDictionary<int, double[]> FwdMatrixFlatTCache = new();
-    private static double[] ForwardMatrixFlatT(int logSize, int type1d) => FwdMatrixFlatTCache.GetOrAdd((logSize << 2) | type1d, key =>
+    // Indexed by (logSize << 2) | type1d; filled on first use (a benign race builds identical arrays).
+    private static readonly double[]?[] FwdMatrixFlatTCache = new double[]?[32];
+    private static double[] ForwardMatrixFlatT(int logSize, int type1d) =>
+        FwdMatrixFlatTCache[(logSize << 2) | type1d] ??= BuildForwardMatrixFlatT((logSize << 2) | type1d);
+    private static double[] BuildForwardMatrixFlatT(int key)
     {
         var f = ForwardMatrixFlat(key >> 2, key & 3);
         int n = 4 << (key >> 2), kept = Math.Min(n, 32);
         var t = new double[n * kept];
         for (int x = 0; x < n; x++) for (int kk = 0; kk < kept; kk++) t[x * kept + kk] = f[kk * n + x];
         return t;
-    });
+    }
 
     // ForwardQuantSquare with 4 output coefficients per Vector256 lane group: each lane is the same scalar dot product
     // (double(int) * basis, added in x / y order; no FMA contraction), so the doubles are identical.

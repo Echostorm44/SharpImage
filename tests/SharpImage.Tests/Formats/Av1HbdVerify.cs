@@ -1996,6 +1996,15 @@ public sealed class Av1HbdVerify
                         if (t.Length > 5) eo.Speed = int.Parse(t[5]);
                         if (t.Length > 6) eo.AutoTiling = t[6] == "1";
                         if (t.Length > 7) eo.MaxThreads = int.Parse(t[7]);
+                        // [8]: Field=Value,... applied to the speed preset (Av1EncodeSpeed.TestOverride)
+                        Av1EncodeSpeed.TestOverride = t.Length > 8 ? sp =>
+                        {
+                            foreach (var kv in t[8].Split(',', StringSplitOptions.RemoveEmptyEntries))
+                            {
+                                var f = typeof(Av1EncodeSpeed).GetField(kv.Split('=')[0])!;
+                                f.SetValue(sp, Convert.ChangeType(kv.Split('=')[1], f.FieldType, System.Globalization.CultureInfo.InvariantCulture));
+                            }
+                        } : null;
                         byte[] outBytes = [];
                         for (int r = 0; r <= reps; r++)
                         {

@@ -1649,16 +1649,40 @@ public static partial class HeifCoder
             {
                 int ws = FreeSlot(goldenSlot, arf >= 0 ? arf : goldenSlot, bwd);
                 byte[] obu = Inter(i, lastSlot, goldenSlot, arf, 1 << ws, true, lossless ? 0 : baseQIdx, bwd);
-                // A scene cut (key frame, as libaom's scene-change detection): the inter frame costs over 3/4 of this frame
-                // coded as a key frame. Only frames well above a normal inter size (60% of the last key frame) pay for the
-                // trial key encode; comparing with this frame's own key cost keeps the rule stable at every speed.
-                if (obu.Length > lastKeyBytes * 6 / 10 && obu.Length > KeyObus(i).cFrame.Length * 3 / 4) return false;
+                // A scene cut (key frame, as libaom's scene-change detection): among frames well above a normal inter size
+                // (60% of the last key frame), either the inter frame costs over 3/4 of this frame coded as a key frame, or
+                // the source jumps (a source-SAD test after the best global shift: this frame matches the previous one over
+                // 3x worse than that one matched its predecessor, by a clear margin). The source test keeps the rule
+                // independent of how the key encoder trades bits for quality.
+                if (obu.Length > lastKeyBytes * 6 / 10 && (SourceJump(i) || obu.Length > KeyObus(i).cFrame.Length * 3 / 4)) return false;
                 Decode([.. td, .. obu], false);
                 lastSlot = ws;
                 cSamples[i] = prefix == null ? [.. td, .. obu] : [.. td, .. prefix, .. obu];
                 sinceKey++;
                 return true;
             }
+
+            // Mean absolute luma difference of source frame a from frame b after the best global shift (+-16 pixels), on
+            // a sparse grid of about 4096 interior samples, in 8-bit units: ~0 for a pan, large across a cut.
+            double SourceDiff(int a, int b)
+            {
+                ushort[] ya = coded[a].Y, yb = coded[b].Y;
+                const int r = 16;
+                int x0 = Math.Min(r, w / 4), y0 = Math.Min(r, h / 4), x1 = w - x0, y1 = h - y0;
+                if (x1 <= x0 || y1 <= y0) return 0;
+                int step = Math.Max(1, (int)Math.Sqrt((double)(x1 - x0) * (y1 - y0) / 4096));
+                long best = long.MaxValue; int cnt = 0;
+                for (int dy = -y0; dy <= y0; dy++)
+                    for (int dx = -x0; dx <= x0; dx++)
+                    {
+                        long sum = 0; int c = 0;
+                        for (int y = y0; y < y1 && sum < best; y += step)
+                            for (int x = x0; x < x1; x += step) { sum += Math.Abs(ya[y * w + x] - yb[(y + dy) * w + x + dx]); c++; }
+                        if (sum < best) { best = sum; cnt = c; }
+                    }
+                return (double)best / Math.Max(1, cnt) / (1 << (bd - 8));
+            }
+            bool SourceJump(int i) => i >= 2 && SourceDiff(i, i - 1) is var d && d > 8 && d > 3 * SourceDiff(i - 1, i - 2);
 
             int fi = 0;
             while (fi < n)
