@@ -30,4 +30,12 @@ public sealed class JpegDecodeOptions
     /// <summary>djpeg -grayscale: greyscale output (luma of YCbCr, the weighted sum of RGB; not for CMYK / YCCK).
     /// Returned as an sRGB frame with equal channels, like greyscale files.</summary>
     public bool Grayscale { get; init; }
+
+    /// <summary>djpeg -strict: libjpeg's warnings (corrupt entropy data, premature end of file, restart resynchronisation,
+    /// extraneous bytes, inconsistent progression, unknown JFIF / Adobe codes) fail with
+    /// <see cref="System.IO.InvalidDataException"/> instead of being recovered from.</summary>
+    public bool Strict { get; init; }
+
+    /// <summary>djpeg -maxscans N: fail on a file with more than N scans (0 = no limit).</summary>
+    public int MaxScans { get; init; }
 }

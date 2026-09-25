@@ -1766,7 +1766,7 @@ public sealed class Av1HbdVerify
                 {
                     // djpeg <in.jpg> <out.ppm> [-scale M/N] [-dct int|fast|float] [-nosmooth] [-fast] [-grayscale]: JpegCoder.Read
                     // with djpeg's options, written as a P6 at the file's precision (compare with djpeg -pnm)
-                    int sn = 1, sd = 1; var dm = JpegDctMethod.IntegerSlow; bool fancy = true, grey = false;
+                    int sn = 1, sd = 1; var dm = JpegDctMethod.IntegerSlow; bool fancy = true, grey = false, strict = false; int maxScans = 0;
                     for (int k = 3; k < t.Length; k++)
                     {
                         switch (t[k].TrimStart('-'))
@@ -1775,7 +1775,7 @@ public sealed class Av1HbdVerify
                             case "dct": dm = t[++k] switch { "fast" => JpegDctMethod.IntegerFast, "float" => JpegDctMethod.Float, _ => JpegDctMethod.IntegerSlow }; break;
                             case "nosmooth": fancy = false; break;
                             case "fast": fancy = false; dm = JpegDctMethod.IntegerFast; break;
-                            case "grayscale": grey = true; break;
+                            case "grayscale": grey = true; break; case "strict": strict = true; break; case "maxscans": maxScans = int.Parse(t[++k]); break;
                             default: throw new ArgumentException(t[k]);
                         }
                     }
@@ -1783,7 +1783,7 @@ public sealed class Av1HbdVerify
                     int prec = 8;
                     for (int k = 2; k + 4 < jb.Length; k++)
                         if (jb[k] == 0xFF && jb[k + 1] is >= 0xC0 and <= 0xCF and not 0xC4 and not 0xC8 and not 0xCC) { prec = jb[k + 4]; break; }
-                    var img = JpegCoder.Read(new MemoryStream(jb), new JpegDecodeOptions { ScaleNumerator = sn, ScaleDenominator = sd, Dct = dm, FancyUpsampling = fancy, Grayscale = grey });
+                    var img = JpegCoder.Read(new MemoryStream(jb), new JpegDecodeOptions { ScaleNumerator = sn, ScaleDenominator = sd, Dct = dm, FancyUpsampling = fancy, Grayscale = grey, Strict = strict, MaxScans = maxScans });
                     int mx = (1 << prec) - 1, dw = (int)img.Columns, dh = (int)img.Rows;
                     using (var fo = File.Create(t[2]))
                     {

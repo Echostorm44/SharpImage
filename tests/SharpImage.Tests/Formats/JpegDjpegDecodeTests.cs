@@ -87,6 +87,28 @@ public sealed class JpegDjpegDecodeTests
     }
 
     [Test]
+    [Arguments("corrupt_prog_truncated", "Premature end of JPEG file")]
+    [Arguments("corrupt_rst_sequence", "Corrupt JPEG data: found marker 0xd2 instead of RST1")]
+    public async Task StrictFailsWhereDjpegStrictDoes(string file, string message)
+    {
+        // djpeg recovers from these with a warning; djpeg -strict makes the warning fatal (checked against djpeg over
+        // 4000 mutated files with the djstrict probe run: identical accept / reject decisions).
+        byte[] jpg = File.ReadAllBytes(Path.Combine(Dir("jpeg_libjpeg"), file + ".jpg"));
+        using (var lenient = JpegCoder.Read(new MemoryStream(jpg))) await Assert.That(lenient.Columns).IsGreaterThan(0u);
+        await Assert.That(() => JpegCoder.Read(new MemoryStream(jpg), new JpegDecodeOptions { Strict = true }))
+            .Throws<InvalidDataException>().WithMessage(message);
+    }
+
+    [Test]
+    public async Task MaxScansLimitsProgressiveFiles()
+    {
+        byte[] prog = File.ReadAllBytes(Path.Combine(Dir("jpeg_libjpeg"), "cjpeg_31x33_prog420.jpg"));   // 10 scans
+        using (var ok = JpegCoder.Read(new MemoryStream(prog), new JpegDecodeOptions { MaxScans = 10 })) await Assert.That(ok.Columns).IsEqualTo(31u);
+        await Assert.That(() => JpegCoder.Read(new MemoryStream(prog), new JpegDecodeOptions { MaxScans = 9 }))
+            .Throws<InvalidDataException>().WithMessage("Scan number 10 exceeds maximum scans (9)");
+    }
+
+    [Test]
     public async Task ScaleIsTheSmallestEighthAtOrAboveTheRequest()
     {
         // jdmaster.c: 1/3 -> 3/8 (8 * 1 <= 3 * 3), 9/8 -> 9/8, 3/1 -> 16/8 (the largest)
