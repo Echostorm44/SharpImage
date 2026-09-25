@@ -31,12 +31,13 @@ public sealed class Av1CorpusTune
         double rdlk = double.Parse(p[1], ci), rdoq = double.Parse(p[2], ci), crdoq = double.Parse(p[3], ci), dz = double.Parse(p[4], ci);
         // Any Av1EncodeSpeed field can be set with a trailing "Field=Value" token (ablations / sweeps).
         var speedTok = p.FirstOrDefault(t => t.StartsWith("Speed="));
+        bool mono = p.Contains("Mono=1");   // code the luma plane alone as a monochrome stream
         var sp = speedTok != null ? Av1EncodeSpeed.ForSpeed(int.Parse(speedTok[6..], ci)) : new Av1EncodeSpeed();
         Av1StillImageEncoder.t_speed = sp;
         foreach (var tok in p)
         {
             int eq = tok.IndexOf('=');
-            if (eq <= 0 || tok.StartsWith("Speed=")) continue;
+            if (eq <= 0 || tok.StartsWith("Speed=") || tok.StartsWith("Mono=")) continue;
             var f = typeof(Av1EncodeSpeed).GetField(tok[..eq]) ?? throw new ArgumentException("unknown speed field " + tok);
             f.SetValue(sp, Convert.ChangeType(tok[(eq + 1)..], f.FieldType, ci));
         }
@@ -68,7 +69,13 @@ public sealed class Av1CorpusTune
             foreach (int qp in qps)
             {
                 int baseQIdx = Math.Clamp((int)Math.Round(Math.Clamp(qp, 0, 51) * (255.0 / 51.0)), 4, 255);
-                byte[] avif = Av1StillImageEncoder.EncodeAvifColorMultiSb(y, u, v, W, H, baseQIdx);
+                byte[] avif;
+                if (mono)
+                {
+                    var (seqObu, frameObu) = Av1StillImageEncoder.BuildMonochromeObus(y, W, H, baseQIdx);
+                    avif = Av1AvifWriter.BuildAvif(seqObu, frameObu, W, H, monochrome: true, 8, Av1PixelLayout.I400, null, null);
+                }
+                else avif = Av1StillImageEncoder.EncodeAvifColorMultiSb(y, u, v, W, H, baseQIdx);
                 File.WriteAllBytes(Path.Combine(outDir, $"{name}_q{qp}.avif"), avif);
                 manifest.AppendLine($"{name} {qp} {avif.Length}");
             }

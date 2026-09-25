@@ -24,7 +24,7 @@ internal static class Av1CdefSearch
 
     /// <summary>Planes are the deblocked (pre-CDEF) reconstruction with strides; their rows must cover the MI grid
     /// (8-aligned) plus two below. noskip is the decoder's 8x8 map (w8 x h8). 4:2:0 only.</summary>
-    internal static Result? Search(ushort[] yP, int ys, ushort[] uP, ushort[] vP, int cs, int planeRowsY, int planeRowsC,
+    internal static Result? Search(ushort[] yP, int ys, ushort[]? uP, ushort[]? vP, int cs, int planeRowsY, int planeRowsC,
         byte[] noskip, int w8, int h8, ushort[] srcY, ushort[] srcU, ushort[] srcV, int width, int height, int cw, int ch,
         int sbCols, int sbRows, int baseQIdx, int bitDepth, double lambda, int threads, int level = 0)
     {
@@ -64,7 +64,8 @@ internal static class Av1CdefSearch
                         // luma
                         BlockSse(yP, ys, planeRowsY, srcY, width, width, height, px, py, 8, edges, scratch, left, dir, variance,
                             damping, bitDepth, bdMin8, luma: true, accY, codes);
-                        // chroma (4x4 of each plane, luma direction, damping - 1)
+                        // chroma (4x4 of each plane, luma direction, damping - 1); none for monochrome
+                        if (uP == null || vP == null) continue;
                         BlockSse(uP, cs, planeRowsC, srcU, cw, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance,
                             damping - 1, bitDepth, bdMin8, luma: false, accC, codes);
                         BlockSse(vP, cs, planeRowsC, srcV, cw, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance,
@@ -143,10 +144,10 @@ internal static class Av1CdefSearch
     /// <summary>The CDEF-filtered picture for a search result, as the decoder produces it from the same deblocked planes
     /// (visible width x the planes' rows; skip blocks and superblocks without an index unfiltered) — the loop-restoration
     /// search's input without another decode.</summary>
-    internal static ushort[][] Apply(Result r, ushort[] yP, int ys, ushort[] uP, ushort[] vP, int cs, int planeRowsY, int planeRowsC,
+    internal static ushort[][] Apply(Result r, ushort[] yP, int ys, ushort[]? uP, ushort[]? vP, int cs, int planeRowsY, int planeRowsC,
         byte[] noskip, int w8, int h8, int width, int height, int cw, int ch, int sbCols, int sbRows, int bitDepth, int threads)
     {
-        var outY = (ushort[])yP.Clone(); var outU = (ushort[])uP.Clone(); var outV = (ushort[])vP.Clone();
+        var outY = (ushort[])yP.Clone(); var outU = (ushort[]?)uP?.Clone(); var outV = (ushort[]?)vP?.Clone();
         int damping = r.Params.Damping, bdMin8 = bitDepth - 8, w4 = w8 * 2, h4 = h8 * 2;
         void SbRow(int sby)
         {
@@ -170,8 +171,9 @@ internal static class Av1CdefSearch
                         if (bx + 2 < w4) edges |= Av1Cdef.EdgeFlags.Right;
                         int dir = Av1Cdef.FindDirection(yP, py * ys + px, ys, out uint variance, bitDepth);
                         FilterTo(yP, ys, planeRowsY, outY, width, height, px, py, 8, edges, scratch, left, dir, variance, damping, bitDepth, bdMin8, true, yCode);
-                        FilterTo(uP, cs, planeRowsC, outU, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance, damping - 1, bitDepth, bdMin8, false, cCode);
-                        FilterTo(vP, cs, planeRowsC, outV, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance, damping - 1, bitDepth, bdMin8, false, cCode);
+                        if (uP == null || vP == null) continue;
+                        FilterTo(uP, cs, planeRowsC, outU!, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance, damping - 1, bitDepth, bdMin8, false, cCode);
+                        FilterTo(vP, cs, planeRowsC, outV!, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance, damping - 1, bitDepth, bdMin8, false, cCode);
                     }
             }
         }
@@ -179,7 +181,7 @@ internal static class Av1CdefSearch
             System.Threading.Tasks.Parallel.For(0, sbRows, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads }, SbRow);
         else
             for (int y = 0; y < sbRows; y++) SbRow(y);
-        return [outY, outU, outV];
+        return outU == null ? [outY] : [outY, outU, outV!];
     }
 
     // Filters one block of a plane with one strength code (as BlockSse does) and writes its visible part to dst.
