@@ -56,6 +56,14 @@ public sealed class JpegDjpegDecodeTests
     [Arguments("corrupt_prog_truncated", "crop_smooth")]
     [Arguments("cjpeg_31x33_prog420", "skip")]
     [Arguments("ljt_p12_420", "p12_skip")]
+    [Arguments("cjpeg_31x33_prog420", "colors16")]
+    [Arguments("cjpeg_31x33_prog420", "colors9_none")]
+    [Arguments("cjpeg_31x33_q20", "onepass27_ordered")]
+    [Arguments("cjpeg_31x33_q20", "onepass40")]
+    [Arguments("cjpeg_31x33_grey", "grey6")]
+    [Arguments("cjpeg_31x33_s411", "map")]
+    [Arguments("cjpeg_31x33_prog420", "rgb565")]
+    [Arguments("cjpeg_31x33_s22_21", "rgb565_nodither")]
     public async Task MatchesDjpeg(string file, string mode)
     {
         var o = mode switch
@@ -78,6 +86,16 @@ public sealed class JpegDjpegDecodeTests
             "crop_smooth" => new JpegDecodeOptions { Crop = (16, 8, 17, 9) },
             "skip" => new JpegDecodeOptions { SkipRows = (5, 20) },
             "p12_skip" => new JpegDecodeOptions { SkipRows = (1, 7), FancyUpsampling = false },
+            // djpeg -colors / -dither / -onepass / -map (jquant1.c, jquant2.c)
+            "colors16" => new JpegDecodeOptions { QuantizeColors = 16 },
+            "colors9_none" => new JpegDecodeOptions { QuantizeColors = 9, Dither = JpegDitherMode.None },
+            "onepass27_ordered" => new JpegDecodeOptions { QuantizeColors = 27, TwoPassQuantize = false, Dither = JpegDitherMode.Ordered },
+            "onepass40" => new JpegDecodeOptions { QuantizeColors = 40, TwoPassQuantize = false },
+            "grey6" => new JpegDecodeOptions { QuantizeColors = 6 },
+            "map" => new JpegDecodeOptions { QuantizeColormap = MapColors() },
+            // djpeg -rgb565 (compared with its BMP output)
+            "rgb565" => new JpegDecodeOptions { Rgb565 = true },
+            "rgb565_nodither" => new JpegDecodeOptions { Rgb565 = true, Dither = JpegDitherMode.None, FancyUpsampling = false },
             _ => throw new ArgumentException(mode),
         };
         using var img = JpegCoder.Read(new MemoryStream(File.ReadAllBytes(Path.Combine(Dir("jpeg_libjpeg"), file + ".jpg"))), o);
@@ -117,6 +135,33 @@ public sealed class JpegDjpegDecodeTests
         using (var ok = JpegCoder.Read(new MemoryStream(prog), new JpegDecodeOptions { MaxScans = 10 })) await Assert.That(ok.Columns).IsEqualTo(31u);
         await Assert.That(() => JpegCoder.Read(new MemoryStream(prog), new JpegDecodeOptions { MaxScans = 9 }))
             .Throws<InvalidDataException>().WithMessage("Scan number 10 exceeds maximum scans (9)");
+    }
+
+    private static (int, int, int)[] MapColors()
+    {
+        var (w, h, _, rgb) = ReadPnm(File.ReadAllBytes(Path.Combine(Dir("jpeg_djpeg"), "map12.ppm")));
+        return Enumerable.Range(0, w * h).Select(i => (rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2])).Distinct().ToArray();
+    }
+
+    [Test]
+    public async Task QuantizedFramesCarryTheirColormap()
+    {
+        byte[] jpg = File.ReadAllBytes(Path.Combine(Dir("jpeg_libjpeg"), "cjpeg_31x33_prog420.jpg"));
+        using var img = JpegCoder.Read(new MemoryStream(jpg), new JpegDecodeOptions { QuantizeColors = 16 });
+        await Assert.That(img.ColormapSize).IsLessThanOrEqualTo(16);
+        var pal = img.Colormap!.Take(img.ColormapSize).Select(p => ((int)p.Red, (int)p.Green, (int)p.Blue)).ToHashSet();
+        int outside = 0;
+        for (int y = 0; y < (int)img.Rows; y++)
+        {
+            var row = img.GetPixelRow(y);
+            for (int x = 0; x < (int)img.Columns; x++)
+                if (!pal.Contains((row[x * 3], row[x * 3 + 1], row[x * 3 + 2]))) outside++;
+        }
+        await Assert.That(outside).IsEqualTo(0);
+        // libjpeg: the two-pass quantizer needs 8 colors or more; skipping rows needs one pass
+        await Assert.That(() => JpegCoder.Read(new MemoryStream(jpg), new JpegDecodeOptions { QuantizeColors = 7 })).Throws<ArgumentException>();
+        await Assert.That(() => JpegCoder.Read(new MemoryStream(jpg), new JpegDecodeOptions { QuantizeColors = 16, SkipRows = (1, 2) }))
+            .Throws<NotSupportedException>();
     }
 
     [Test]

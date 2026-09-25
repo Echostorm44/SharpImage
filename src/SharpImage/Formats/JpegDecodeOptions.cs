@@ -3,7 +3,8 @@ namespace SharpImage.Formats;
 /// <summary>
 /// Options for <see cref="JpegCoder.Read(System.IO.Stream, JpegDecodeOptions)"/>, libjpeg-turbo's decompression
 /// parameters as djpeg sets them. The defaults are libjpeg's: full size, accurate integer IDCT, fancy upsampling,
-/// block smoothing, colour output. djpeg -fast is <see cref="Dct"/> = IntegerFast with <see cref="FancyUpsampling"/> off.
+/// block smoothing, colour output. djpeg -fast is <see cref="Dct"/> = IntegerFast, <see cref="FancyUpsampling"/> off and,
+/// when quantizing, <see cref="TwoPassQuantize"/> off with <see cref="Dither"/> = Ordered.
 /// </summary>
 public sealed class JpegDecodeOptions
 {
@@ -49,4 +50,35 @@ public sealed class JpegDecodeOptions
     /// files. (libjpeg-turbo 3.1.4's merged upsampler, used with <see cref="FancyUpsampling"/> off for 4:2:0 colour
     /// output, returns rows shifted by one after a skip that starts on an odd row; this returns the intended rows.) Skipping every row is an error (djpeg writes an empty image).</summary>
     public (int Start, int End)? SkipRows { get; init; }
+
+    /// <summary>djpeg -rgb565: RGB565 output (not for CMYK, lossless or 12-bit files), returned as 8-bit-per-channel
+    /// samples R &amp; 0xF8, G &amp; 0xFC, B &amp; 0xF8 as djpeg's BMP writer expands them; ordered-dithered unless
+    /// <see cref="Dither"/> is None.</summary>
+    public bool Rgb565 { get; init; }
+
+    /// <summary>djpeg -colors N: quantize to at most N colors (0 = no quantization). The frame's pixels are then colors
+    /// of <see cref="SharpImage.Image.ImageFrame.Colormap"/>. Two-pass median cut for colour output unless
+    /// <see cref="TwoPassQuantize"/> is off; greyscale and CMYK output always use the one-pass quantizer.</summary>
+    public int QuantizeColors { get; init; }
+
+    /// <summary>djpeg -onepass turns this off: the one-pass quantizer's equally spaced colormap instead of median cut.</summary>
+    public bool TwoPassQuantize { get; init; } = true;
+
+    /// <summary>djpeg -map: quantize colour output to these colors (samples of the file's precision).</summary>
+    public (int R, int G, int B)[]? QuantizeColormap { get; init; }
+
+    /// <summary>djpeg -dither: the quantizers' dithering (the two-pass quantizer does Floyd-Steinberg or none), and
+    /// whether RGB565 output is dithered.</summary>
+    public JpegDitherMode Dither { get; init; }
+}
+
+/// <summary>djpeg -dither.</summary>
+public enum JpegDitherMode
+{
+    /// <summary>Floyd-Steinberg error diffusion (libjpeg's default).</summary>
+    FloydSteinberg,
+    /// <summary>Ordered (16x16) dithering; the one-pass quantizer only.</summary>
+    Ordered,
+    /// <summary>No dithering.</summary>
+    None,
 }

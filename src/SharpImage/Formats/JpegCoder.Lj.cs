@@ -892,72 +892,189 @@ public static partial class JpegCoder
                 ?? throw new NotSupportedException("Fractional sampling not implemented yet");
         }
 
-        // Colour conversion + output.
-        var frame = new ImageFrame();
-        frame.Initialize(outW, outRows.Count, space >= 3 ? ColorspaceType.CMYK : ColorspaceType.SRGB, false);
-        if (opts.Crop is { } region) frame.Page = new FrameOffset(cropX, region.Y);
-        int nch = frame.NumberOfChannels;
+        // Colour conversion (jdcolor.c / jdcol565.c) into libjpeg's output samples, then colour quantization
+        // (jquant1.c / jquant2.c), then the frame. RGB565 output adds its ordered dither before clamping, so it happens
+        // in the conversion; pixel (x, y) takes byte x & 3 of dither_matrix[y & 3] (djpeg reads a row at a time).
+        bool rgb565 = opts.Rgb565;
+        bool quantize = opts.QuantizeColors > 0 || opts.QuantizeColormap != null;
+        if (rgb565)
+        {
+            if (lossless || space >= 3 || opts.Grayscale) throw new NotSupportedException("Unsupported color conversion request");
+            if (precision != 8) throw new NotSupportedException($"Unsupported JPEG data precision {precision}");
+            if (quantize) throw new NotSupportedException("RGB565 output cannot be color-quantized");
+        }
+        if (quantize && lossless) throw new NotSupportedException("Not implemented yet");
+        int nc = rgb565 ? 3 : greyOut || space == 0 ? 1 : space >= 3 ? 4 : 3;   // out_color_components
+        // jdmaster.c master_selection: the two-pass quantizer (or a given colormap) needs 3-component, non-565 output
+        bool twoPass = quantize && nc == 3 && (opts.QuantizeColormap != null || opts.TwoPassQuantize);
+        if (twoPass && (opts.Crop != null || opts.SkipRows != null)) throw new NotSupportedException("Not implemented yet");
         int[]? crR = null, cbB = null, crG = null, cbG = null;
         if (space is 1 or 4 && !greyOut) LjYccTables(max, out crR, out cbB, out crG, out cbG);
         const int scaleBits = 16;
         static int Fix(double x) => (int)(x * (1 << scaleBits) + 0.5);
         int gr = Fix(0.29900), gg = Fix(0.58700), gb = Fix(0.11400);
+        bool dither565 = opts.Dither != JpegDitherMode.None;
+        ReadOnlySpan<uint> dither565Matrix = [0x0008020A, 0x0C040E06, 0x030B0109, 0x0F070D05];
+        var samples = new int[outRows.Count][];
         for (int oy = 0; oy < outRows.Count; oy++)
         {
-            var row = frame.GetPixelRowForWrite(oy);
             int y = outRows[oy];
+            var srow = samples[oy] = new int[outW * nc];
+            uint drow = dither565Matrix[y & 3];
             for (int x = 0; x < outW; x++)
             {
-                int i = y * outW + x, o = x * nch;
+                int i = y * outW + x, o = x * nc;
+                if (rgb565)
+                {
+                    int dv = dither565 ? (int)((drow >> (8 * (x & 3))) & 0xFF) : 0;
+                    int r, g, b;
+                    if (space == 0) r = g = b = Math.Clamp(full[0][i] + dv, 0, max);   // gray_rgb565D: R's dither throughout
+                    else if (space == 2)
+                    {
+                        r = Math.Clamp(full[0][i] + dv, 0, max);
+                        g = Math.Clamp(full[1][i] + (dv >> 1), 0, max);
+                        b = Math.Clamp(full[2][i] + dv, 0, max);
+                    }
+                    else
+                    {
+                        int yy = full[0][i], cb = full[1][i], cr = full[2][i];
+                        r = Math.Clamp(yy + crR![cr] + dv, 0, max);
+                        g = Math.Clamp(yy + ((cbG![cb] + crG![cr]) >> 16) + (dv >> 1), 0, max);
+                        b = Math.Clamp(yy + cbB![cb] + dv, 0, max);
+                    }
+                    // packed 5-6-5, as the BMP writer expands it (no bit replication)
+                    srow[o] = r & 0xF8;
+                    srow[o + 1] = g & 0xFC;
+                    srow[o + 2] = b & 0xF8;
+                    continue;
+                }
                 if (greyOut)
                 {
                     // jdcolor.c grayscale_convert (Y) / rgb_gray_convert
-                    int v = space == 2
+                    srow[o] = space == 2
                         ? (gr * full[0][i] + gg * full[1][i] + gb * full[2][i] + (1 << (scaleBits - 1))) >> scaleBits
                         : full[0][i];
-                    row[o] = row[o + 1] = row[o + 2] = Scale16(v, max);
                     continue;
                 }
                 switch (space)
                 {
                     case 0:
-                        row[o] = row[o + 1] = row[o + 2] = Scale16(full[0][i], max);
+                        srow[o] = full[0][i];
                         break;
                     case 2:
-                        row[o] = Scale16(full[0][i], max);
-                        row[o + 1] = Scale16(full[1][i], max);
-                        row[o + 2] = Scale16(full[2][i], max);
+                        srow[o] = full[0][i];
+                        srow[o + 1] = full[1][i];
+                        srow[o + 2] = full[2][i];
                         break;
                     case 1:
                     {
                         int yy = full[0][i], cb = full[1][i], cr = full[2][i];
-                        row[o] = Scale16(Math.Clamp(yy + crR![cr], 0, max), max);
-                        row[o + 1] = Scale16(Math.Clamp(yy + ((cbG![cb] + crG![cr]) >> 16), 0, max), max);
-                        row[o + 2] = Scale16(Math.Clamp(yy + cbB![cb], 0, max), max);
+                        srow[o] = Math.Clamp(yy + crR![cr], 0, max);
+                        srow[o + 1] = Math.Clamp(yy + ((cbG![cb] + crG![cr]) >> 16), 0, max);
+                        srow[o + 2] = Math.Clamp(yy + cbB![cb], 0, max);
                         break;
                     }
                     default:
                     {
-                        int c0, c1, c2;
                         if (space == 4)
                         {
                             int yy = full[0][i], cb = full[1][i], cr = full[2][i];
-                            c0 = Math.Clamp(max - (yy + crR![cr]), 0, max);
-                            c1 = Math.Clamp(max - (yy + ((cbG![cb] + crG![cr]) >> 16)), 0, max);
-                            c2 = Math.Clamp(max - (yy + cbB![cb]), 0, max);
+                            srow[o] = Math.Clamp(max - (yy + crR![cr]), 0, max);
+                            srow[o + 1] = Math.Clamp(max - (yy + ((cbG![cb] + crG![cr]) >> 16)), 0, max);
+                            srow[o + 2] = Math.Clamp(max - (yy + cbB![cb]), 0, max);
                         }
-                        else { c0 = full[0][i]; c1 = full[1][i]; c2 = full[2][i]; }
-                        int k = full[3][i];
-                        // Adobe (Photoshop) CMYK JPEGs store inverted samples: flip to ink amounts.
-                        if (sawAdobe) { c0 = max - c0; c1 = max - c1; c2 = max - c2; k = max - k; }
-                        row[o] = Scale16(c0, max);
-                        row[o + 1] = Scale16(c1, max);
-                        row[o + 2] = Scale16(c2, max);
-                        row[o + 3] = Scale16(k, max);
+                        else { srow[o] = full[0][i]; srow[o + 1] = full[1][i]; srow[o + 2] = full[2][i]; }
+                        srow[o + 3] = full[3][i];
                         break;
                     }
                 }
             }
+        }
+
+        int[][]? colormap = null;
+        int colors = 0;
+        if (quantize)
+        {
+            var codes = new int[outW];
+            if (twoPass)
+            {
+                var q2 = new LjQuant2(max, outW, opts.Dither != JpegDitherMode.None);
+                if (opts.QuantizeColormap is { } given)
+                {
+                    var cm = new int[3][];
+                    for (int c = 0; c < 3; c++) cm[c] = new int[given.Length];
+                    for (int k = 0; k < given.Length; k++)
+                    {
+                        var (r, g, b) = given[k];
+                        if (r < 0 || r > max || g < 0 || g > max || b < 0 || b > max) throw new ArgumentException("Colormap entries must be samples of the file's precision");
+                        cm[0][k] = r; cm[1][k] = g; cm[2][k] = b;
+                    }
+                    q2.UseColormap(cm, given.Length);
+                }
+                else
+                {
+                    foreach (var srow in samples) q2.Prescan(srow);
+                    q2.SelectColors(opts.QuantizeColors);
+                }
+                colormap = q2.Colormap;
+                colors = q2.Count;
+                foreach (var srow in samples)
+                {
+                    q2.QuantizeRow(srow, codes);
+                    for (int x = 0; x < outW; x++)
+                        for (int c = 0; c < 3; c++) srow[x * 3 + c] = colormap[c][codes[x]];
+                }
+            }
+            else
+            {
+                var q1 = new LjQuant1(nc, max, opts.QuantizeColors > 0 ? opts.QuantizeColors : 256, opts.Dither, outW, nc == 3);
+                colormap = q1.Colormap;
+                colors = q1.Count;
+                foreach (var srow in samples)
+                {
+                    q1.QuantizeRow(srow, codes);
+                    for (int x = 0; x < outW; x++)
+                        for (int c = 0; c < nc; c++) srow[x * nc + c] = colormap[c][codes[x]];
+                }
+            }
+        }
+
+        var frame = new ImageFrame();
+        frame.Initialize(outW, outRows.Count, nc == 4 ? ColorspaceType.CMYK : ColorspaceType.SRGB, false);
+        if (opts.Crop is { } region) frame.Page = new FrameOffset(cropX, region.Y);
+        int nch = frame.NumberOfChannels;
+        // Adobe (Photoshop) CMYK JPEGs store inverted samples: frames hold ink amounts.
+        bool flip = nc == 4 && sawAdobe;
+        for (int oy = 0; oy < outRows.Count; oy++)
+        {
+            var row = frame.GetPixelRowForWrite(oy);
+            var srow = samples[oy];
+            for (int x = 0; x < outW; x++)
+            {
+                int o = x * nch, s0 = x * nc;
+                if (nc == 1) row[o] = row[o + 1] = row[o + 2] = Scale16(srow[s0], max);
+                else
+                    for (int c = 0; c < nc; c++) row[o + c] = Scale16(flip ? max - srow[s0 + c] : srow[s0 + c], max);
+            }
+        }
+        if (colormap != null)
+        {
+            // the quantizer's colormap (the frame's pixels are its colors)
+            var pal = new PixelInfo[colors];
+            for (int k = 0; k < colors; k++)
+            {
+                if (nc == 1) pal[k].Red = pal[k].Green = pal[k].Blue = Scale16(colormap[0][k], max);
+                else
+                {
+                    pal[k].Red = Scale16(flip ? max - colormap[0][k] : colormap[0][k], max);
+                    pal[k].Green = Scale16(flip ? max - colormap[1][k] : colormap[1][k], max);
+                    pal[k].Blue = Scale16(flip ? max - colormap[2][k] : colormap[2][k], max);
+                    if (nc == 4) pal[k].Black = Scale16(flip ? max - colormap[3][k] : colormap[3][k], max);
+                }
+                pal[k].Alpha = 65535;
+            }
+            frame.Colormap = pal;
+            frame.ColormapSize = colors;
         }
         return frame;
 

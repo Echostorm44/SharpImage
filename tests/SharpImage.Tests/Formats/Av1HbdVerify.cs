@@ -1545,6 +1545,31 @@ public sealed class Av1HbdVerify
         return o;
     }
 
+    // rdcolmap.c read_ppm_map: the distinct colors of a P6 file (maxval 255), in raster order
+    private static (int, int, int)[] ReadPpmColormap(string path)
+    {
+        var b = File.ReadAllBytes(path);
+        int pos = 0;
+        string Tok()
+        {
+            while (char.IsWhiteSpace((char)b[pos])) pos++;
+            int st = pos;
+            while (!char.IsWhiteSpace((char)b[pos])) pos++;
+            return System.Text.Encoding.ASCII.GetString(b, st, pos - st);
+        }
+        bool text = Tok() == "P3";
+        int w = int.Parse(Tok()), h = int.Parse(Tok());
+        Tok();
+        if (!text) pos++;
+        var list = new List<(int, int, int)>();
+        for (int i = 0; i < w * h; i++)
+        {
+            (int, int, int) c = text ? (int.Parse(Tok()), int.Parse(Tok()), int.Parse(Tok())) : (b[pos + 3 * i], b[pos + 3 * i + 1], b[pos + 3 * i + 2]);
+            if (!list.Contains(c)) list.Add(c);
+        }
+        return list.ToArray();
+    }
+
     private static JpegEncodeOptions ParseCjpeg(string[] a)
     {
         int? quality = null; int[]? tq = null; bool baseline = false, opt = false, prog = false, arith = false;
@@ -1766,7 +1791,7 @@ public sealed class Av1HbdVerify
                 {
                     // djpeg <in.jpg> <out.ppm> [-scale M/N] [-dct int|fast|float] [-nosmooth] [-fast] [-grayscale]: JpegCoder.Read
                     // with djpeg's options, written as a P6 at the file's precision (compare with djpeg -pnm)
-                    int sn = 1, sd = 1; var dm = JpegDctMethod.IntegerSlow; bool fancy = true, grey = false, strict = false; int maxScans = 0; (int, int, int, int)? crop = null; (int, int)? skipRows = null;
+                    int sn = 1, sd = 1; var dm = JpegDctMethod.IntegerSlow; bool fancy = true, grey = false, strict = false, rgb565 = false, twoPass = true; int maxScans = 0, colors = 0; var dith = JpegDitherMode.FloydSteinberg; (int, int, int)[]? cmap = null; (int, int, int, int)? crop = null; (int, int)? skipRows = null;
                     for (int k = 3; k < t.Length; k++)
                     {
                         switch (t[k].TrimStart('-'))
@@ -1774,7 +1799,7 @@ public sealed class Av1HbdVerify
                             case "scale": { var mn = t[++k].Split('/'); sn = int.Parse(mn[0]); sd = int.Parse(mn[1]); break; }
                             case "dct": dm = t[++k] switch { "fast" => JpegDctMethod.IntegerFast, "float" => JpegDctMethod.Float, _ => JpegDctMethod.IntegerSlow }; break;
                             case "nosmooth": fancy = false; break;
-                            case "fast": fancy = false; dm = JpegDctMethod.IntegerFast; break;
+                            case "fast": fancy = false; dm = JpegDctMethod.IntegerFast; twoPass = false; dith = JpegDitherMode.Ordered; break; case "rgb565": rgb565 = true; break; case "colors": colors = int.Parse(t[++k]); break; case "onepass": twoPass = false; break; case "dither": dith = t[++k] switch { "none" => JpegDitherMode.None, "ordered" => JpegDitherMode.Ordered, _ => JpegDitherMode.FloydSteinberg }; break; case "map": cmap = ReadPpmColormap(t[++k]); break;
                             case "grayscale": grey = true; break; case "strict": strict = true; break; case "crop": { var cp = t[++k].Split(new[] { (char)120, (char)43 }); crop = (int.Parse(cp[2]), int.Parse(cp[3]), int.Parse(cp[0]), int.Parse(cp[1])); break; } case "skip": { var sp = t[++k].Split((char)44); skipRows = (int.Parse(sp[0]), int.Parse(sp[1])); break; } case "maxscans": maxScans = int.Parse(t[++k]); break;
                             default: throw new ArgumentException(t[k]);
                         }
@@ -1783,7 +1808,7 @@ public sealed class Av1HbdVerify
                     int prec = 8;
                     for (int k = 2; k + 4 < jb.Length; k++)
                         if (jb[k] == 0xFF && jb[k + 1] is >= 0xC0 and <= 0xCF and not 0xC4 and not 0xC8 and not 0xCC) { prec = jb[k + 4]; break; }
-                    var img = JpegCoder.Read(new MemoryStream(jb), new JpegDecodeOptions { ScaleNumerator = sn, ScaleDenominator = sd, Dct = dm, FancyUpsampling = fancy, Grayscale = grey, Strict = strict, MaxScans = maxScans, Crop = crop, SkipRows = skipRows });
+                    var img = JpegCoder.Read(new MemoryStream(jb), new JpegDecodeOptions { ScaleNumerator = sn, ScaleDenominator = sd, Dct = dm, FancyUpsampling = fancy, Grayscale = grey, Strict = strict, MaxScans = maxScans, Crop = crop, SkipRows = skipRows, Rgb565 = rgb565, QuantizeColors = colors, TwoPassQuantize = twoPass, Dither = dith, QuantizeColormap = cmap });
                     int mx = (1 << prec) - 1, dw = (int)img.Columns, dh = (int)img.Rows;
                     using (var fo = File.Create(t[2]))
                     {
