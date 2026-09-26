@@ -173,6 +173,17 @@ public sealed class Av1CdfContext
     /// Copies all CDF data from another context, then resets adaptation counters.
     /// Used at the start of each frame to initialize from the previous frame's CDFs.
     /// </summary>
+    /// <summary>Copies only what an intra frame can adapt (coefficient, intra-mode, intrabc and key-frame y-mode CDFs):
+    /// encoder snapshots of intra tiles, which never touch the inter-mode or MV CDFs.</summary>
+    public void CopyIntraFrom(Av1CdfContext src)
+    {
+        CopyCoef(src.Coef, Coef);
+        CopyModeIntra(src.Mode, Mode);
+        Array.Copy(src.Mode.Intrabc, Mode.Intrabc, 2);
+        for (int i = 0; i < 25; i++)
+            Array.Copy(src.Kfym[i], Kfym[i], 16);
+    }
+
     public void CopyFrom(Av1CdfContext src)
     {
         CopyCoef(src.Coef, Coef);

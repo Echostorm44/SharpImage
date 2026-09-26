@@ -1639,7 +1639,8 @@ public sealed class Av1HbdVerify
     [Test, NotInParallel]
     public void JpegProbe()
     {
-        string trig = Path.Combine(Scratch, "corpus", "hbd_jpeg.txt");
+        // PROBE_IN / PROBE_LOG override the trigger / log files (concurrent harness runs).
+        string trig = Environment.GetEnvironmentVariable("PROBE_IN") ?? Path.Combine(Scratch, "corpus", "hbd_jpeg.txt");
         if (!File.Exists(trig)) return;
         var lines = File.ReadAllLines(trig);
         File.Delete(trig);
@@ -2018,12 +2019,17 @@ public sealed class Av1HbdVerify
                             f.SetValue(sp, Convert.ChangeType(kv.Split('=')[1], f.FieldType, System.Globalization.CultureInfo.InvariantCulture));
                         }
                     } : null;
+                    var gcPause0 = GC.GetTotalPauseDuration(); long alloc0 = GC.GetTotalAllocatedBytes(true);
+                    // PROBE_ALLOC=1: sampled allocation volume by type (GCAllocationTick, ~100 KB per sample).
+                    using var allocL = Environment.GetEnvironmentVariable("PROBE_ALLOC") == "1" ? new AllocTypeListener() : null;
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     byte[] outB = HeifCoder.EncodeAvif(img, eo);
+                    if (allocL != null) log.Append(allocL.Report());
                     double secs = sw.Elapsed.TotalSeconds;
+                    double gcMs = (GC.GetTotalPauseDuration() - gcPause0).TotalMilliseconds; long allocMb = (GC.GetTotalAllocatedBytes(true) - alloc0) >> 20;
                     Av1EncodeSpeed.TestOverride = null;
                     File.WriteAllBytes(t[2], outB);
-                    log.AppendLine($"encq {Path.GetFileName(t[2])} {outB.Length} {secs:F3}");
+                    log.AppendLine($"encq {Path.GetFileName(t[2])} {outB.Length} {secs:F3} gc {gcMs:F1}ms alloc {allocMb}MB");
                     continue;
                 }
                 if (t[0] == "timeenc" || t[0] == "timedec")
@@ -2323,6 +2329,31 @@ public sealed class Av1HbdVerify
             }
             catch (Exception e) { log.AppendLine($"ERR {t[0]}: {e}"); }
         }
-        File.WriteAllText(Path.Combine(Scratch, "corpus", "hbd_jpeg.log"), log.ToString());
+        File.WriteAllText(Environment.GetEnvironmentVariable("PROBE_LOG") ?? Path.Combine(Scratch, "corpus", "hbd_jpeg.log"), log.ToString());
+    }
+}
+
+/// <summary>Dev probe helper: counts GCAllocationTick samples per allocated type name.</summary>
+internal sealed class AllocTypeListener : System.Diagnostics.Tracing.EventListener
+{
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> bytes = new();
+    protected override void OnEventSourceCreated(System.Diagnostics.Tracing.EventSource source)
+    {
+        if (source.Name == "Microsoft-Windows-DotNETRuntime")
+            EnableEvents(source, System.Diagnostics.Tracing.EventLevel.Verbose, (System.Diagnostics.Tracing.EventKeywords)0x1);
+    }
+    protected override void OnEventWritten(System.Diagnostics.Tracing.EventWrittenEventArgs e)
+    {
+        if (e.EventName == null || !e.EventName.StartsWith("GCAllocationTick") || e.Payload == null) return;
+        int ti = e.PayloadNames!.IndexOf("TypeName"), ai = e.PayloadNames.IndexOf("AllocationAmount64");
+        string tn = ti >= 0 ? e.Payload[ti]?.ToString() ?? "?" : "?";
+        long amt = ai >= 0 ? Convert.ToInt64(e.Payload[ai]) : 100_000;
+        bytes.AddOrUpdate(tn, amt, (_, v) => v + amt);
+    }
+    public string Report()
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var kv in bytes.OrderByDescending(k => k.Value).Take(15)) sb.AppendLine($"  alloc {kv.Value >> 20,6} MB {kv.Key}");
+        return sb.ToString();
     }
 }

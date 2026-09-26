@@ -10,6 +10,9 @@ namespace SharpImage.Formats.Av1;
 /// </summary>
 internal static class Av1CdefSearch
 {
+    // dav1d uv_dirs[1]: the chroma CDEF direction of a 4:2:2 block.
+    private static readonly byte[] UvDir422 = [7, 0, 2, 4, 5, 6, 6, 6];
+
     internal readonly record struct Result(Av1ObuWriter.CdefParams Params, sbyte[] SbIdx, double Cost);
 
     /// <summary>The strength codes (pri &lt;&lt; 2 | sec index) searched at a libaom CDEF_FAST_SEARCH level: 0 = all 64,
@@ -23,11 +26,14 @@ internal static class Av1CdefSearch
     }
 
     /// <summary>Planes are the deblocked (pre-CDEF) reconstruction with strides; their rows must cover the MI grid
-    /// (8-aligned) plus two below. noskip is the decoder's 8x8 map (w8 x h8). 4:2:0 only.</summary>
+    /// (8-aligned) plus two below. noskip is the decoder's 8x8 map (w8 x h8). Chroma subsampling ssX / ssY: the
+    /// chroma block of each 8x8 luma block is (8 >> ssX) x (8 >> ssY), its direction remapped for 4:2:2 (dav1d uv_dir).</summary>
     internal static Result? Search(ushort[] yP, int ys, ushort[]? uP, ushort[]? vP, int cs, int planeRowsY, int planeRowsC,
         byte[] noskip, int w8, int h8, ushort[] srcY, ushort[] srcU, ushort[] srcV, int width, int height, int cw, int ch,
-        int sbCols, int sbRows, int baseQIdx, int bitDepth, double lambda, int threads, int level = 0)
+        int sbCols, int sbRows, int baseQIdx, int bitDepth, double lambda, int threads, int level = 0, int ssX = 1, int ssY = 1)
     {
+        int cnw = 8 >> ssX, cnh = 8 >> ssY;
+        bool i422 = ssX == 1 && ssY == 0;
         int[] codes = Codes(level);
         int damping = Math.Clamp(3 + (baseQIdx >> 6), 3, 6);
         int bdMin8 = bitDepth - 8;
@@ -62,13 +68,14 @@ internal static class Av1CdefSearch
                         int dir = Av1Cdef.FindDirection(yP, py * ys + px, ys, out uint variance, bitDepth);
 
                         // luma
-                        BlockSse(yP, ys, planeRowsY, srcY, width, width, height, px, py, 8, edges, scratch, left, dir, variance,
+                        BlockSse(yP, ys, planeRowsY, srcY, width, width, height, px, py, 8, 8, edges, scratch, left, dir, variance,
                             damping, bitDepth, bdMin8, luma: true, accY, codes);
-                        // chroma (4x4 of each plane, luma direction, damping - 1); none for monochrome
+                        // chroma (the co-located block of each plane, luma direction, damping - 1); none for monochrome
                         if (uP == null || vP == null) continue;
-                        BlockSse(uP, cs, planeRowsC, srcU, cw, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance,
+                        int cdir = i422 ? UvDir422[dir] : dir;
+                        BlockSse(uP, cs, planeRowsC, srcU, cw, cw, ch, px >> ssX, py >> ssY, cnw, cnh, edges, scratch, left, cdir, variance,
                             damping - 1, bitDepth, bdMin8, luma: false, accC, codes);
-                        BlockSse(vP, cs, planeRowsC, srcV, cw, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance,
+                        BlockSse(vP, cs, planeRowsC, srcV, cw, cw, ch, px >> ssX, py >> ssY, cnw, cnh, edges, scratch, left, cdir, variance,
                             damping - 1, bitDepth, bdMin8, luma: false, accC, codes);
                     }
                 has[sb] = any;
@@ -145,8 +152,11 @@ internal static class Av1CdefSearch
     /// (visible width x the planes' rows; skip blocks and superblocks without an index unfiltered) — the loop-restoration
     /// search's input without another decode.</summary>
     internal static ushort[][] Apply(Result r, ushort[] yP, int ys, ushort[]? uP, ushort[]? vP, int cs, int planeRowsY, int planeRowsC,
-        byte[] noskip, int w8, int h8, int width, int height, int cw, int ch, int sbCols, int sbRows, int bitDepth, int threads)
+        byte[] noskip, int w8, int h8, int width, int height, int cw, int ch, int sbCols, int sbRows, int bitDepth, int threads,
+        int ssX = 1, int ssY = 1)
     {
+        int cnw = 8 >> ssX, cnh = 8 >> ssY;
+        bool i422 = ssX == 1 && ssY == 0;
         var outY = (ushort[])yP.Clone(); var outU = (ushort[]?)uP?.Clone(); var outV = (ushort[]?)vP?.Clone();
         int damping = r.Params.Damping, bdMin8 = bitDepth - 8, w4 = w8 * 2, h4 = h8 * 2;
         void SbRow(int sby)
@@ -170,10 +180,11 @@ internal static class Av1CdefSearch
                         if (bx > 0) edges |= Av1Cdef.EdgeFlags.Left;
                         if (bx + 2 < w4) edges |= Av1Cdef.EdgeFlags.Right;
                         int dir = Av1Cdef.FindDirection(yP, py * ys + px, ys, out uint variance, bitDepth);
-                        FilterTo(yP, ys, planeRowsY, outY, width, height, px, py, 8, edges, scratch, left, dir, variance, damping, bitDepth, bdMin8, true, yCode);
+                        FilterTo(yP, ys, planeRowsY, outY, width, height, px, py, 8, 8, edges, scratch, left, dir, variance, damping, bitDepth, bdMin8, true, yCode);
                         if (uP == null || vP == null) continue;
-                        FilterTo(uP, cs, planeRowsC, outU!, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance, damping - 1, bitDepth, bdMin8, false, cCode);
-                        FilterTo(vP, cs, planeRowsC, outV!, cw, ch, px >> 1, py >> 1, 4, edges, scratch, left, dir, variance, damping - 1, bitDepth, bdMin8, false, cCode);
+                        int cdir = i422 ? UvDir422[dir] : dir;
+                        FilterTo(uP, cs, planeRowsC, outU!, cw, ch, px >> ssX, py >> ssY, cnw, cnh, edges, scratch, left, cdir, variance, damping - 1, bitDepth, bdMin8, false, cCode);
+                        FilterTo(vP, cs, planeRowsC, outV!, cw, ch, px >> ssX, py >> ssY, cnw, cnh, edges, scratch, left, cdir, variance, damping - 1, bitDepth, bdMin8, false, cCode);
                     }
             }
         }
@@ -185,11 +196,11 @@ internal static class Av1CdefSearch
     }
 
     // Filters one block of a plane with one strength code (as BlockSse does) and writes its visible part to dst.
-    private static void FilterTo(ushort[] plane, int stride, int planeRows, ushort[] dst, int visW, int visH, int px, int py, int n,
+    private static void FilterTo(ushort[] plane, int stride, int planeRows, ushort[] dst, int visW, int visH, int px, int py, int nw, int nh,
         Av1Cdef.EdgeFlags edges, Span<ushort> scratch, Span<ushort> left, int dir, uint variance, int damping, int bitDepth, int bdMin8,
         bool luma, int code)
     {
-        int w = Math.Min(n, visW - px), h = Math.Min(n, visH - py);
+        int w = Math.Min(nw, visW - px), h = Math.Min(nh, visH - py);
         if (w <= 0 || h <= 0) return;
         int pri = (code >> 2) << bdMin8;
         int sec = code & 3;
@@ -199,16 +210,16 @@ internal static class Av1CdefSearch
         if (adjPri == 0 && sec == 0) return;
         int off = py * stride + px;
         if ((edges & Av1Cdef.EdgeFlags.Left) != 0)
-            for (int y = 0; y < n; y++) { left[y * 2] = plane[off + y * stride - 2]; left[y * 2 + 1] = plane[off + y * stride - 1]; }
+            for (int y = 0; y < nh; y++) { left[y * 2] = plane[off + y * stride - 2]; left[y * 2 + 1] = plane[off + y * stride - 1]; }
         int topOff = py >= 2 ? (py - 2) * stride + px : off;
-        int botOff = (edges & Av1Cdef.EdgeFlags.Bottom) != 0 ? (py + n) * stride + px : off + (n - 1) * stride;
-        if ((edges & Av1Cdef.EdgeFlags.Bottom) != 0 && (py + n + 2) > planeRows) edges &= ~Av1Cdef.EdgeFlags.Bottom;
-        int sw = n + 2;
-        for (int y = 0; y < n; y++)
+        int botOff = (edges & Av1Cdef.EdgeFlags.Bottom) != 0 ? (py + nh) * stride + px : off + (nh - 1) * stride;
+        if ((edges & Av1Cdef.EdgeFlags.Bottom) != 0 && (py + nh + 2) > planeRows) edges &= ~Av1Cdef.EdgeFlags.Bottom;
+        int sw = nw + 2;
+        for (int y = 0; y < nh; y++)
             for (int x = 0; x < sw; x++)
                 scratch[y * sw + x] = px + x < stride ? plane[off + y * stride + x] : (ushort)0;
         Av1Cdef.FilterBlock(scratch, 0, sw, left, 0, 2, plane, topOff, plane, botOff,
-            adjPri, sec, pri != 0 ? dir : 0, damping, n, n, edges, bitDepth, stride);
+            adjPri, sec, pri != 0 ? dir : 0, damping, nw, nh, edges, bitDepth, stride);
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++) dst[off + y * stride + x] = scratch[y * sw + x];
     }
@@ -233,27 +244,27 @@ internal static class Av1CdefSearch
 
     // Accumulates, for each of the 64 strength codes (pri << 2 | sec), the SSE of this block after CDEF vs the source.
     private static void BlockSse(ushort[] plane, int stride, int planeRows, ushort[] src, int srcStride, int visW, int visH,
-        int px, int py, int n, Av1Cdef.EdgeFlags edges, Span<ushort> scratch, Span<ushort> left, int dir, uint variance,
+        int px, int py, int nw, int nh, Av1Cdef.EdgeFlags edges, Span<ushort> scratch, Span<ushort> left, int dir, uint variance,
         int damping, int bitDepth, int bdMin8, bool luma, Span<long> acc, int[] codes)
     {
-        int w = Math.Min(n, visW - px), h = Math.Min(n, visH - py);
+        int w = Math.Min(nw, visW - px), h = Math.Min(nh, visH - py);
         if (w <= 0 || h <= 0) return;
         int off = py * stride + px;
         // left context (2 columns of pre-CDEF pixels) and the unfiltered SSE
         if ((edges & Av1Cdef.EdgeFlags.Left) != 0)
-            for (int y = 0; y < n; y++) { left[y * 2] = plane[off + y * stride - 2]; left[y * 2 + 1] = plane[off + y * stride - 1]; }
+            for (int y = 0; y < nh; y++) { left[y * 2] = plane[off + y * stride - 2]; left[y * 2 + 1] = plane[off + y * stride - 1]; }
         long sse0 = 0;
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++) { int d = plane[off + y * stride + x] - src[(py + y) * srcStride + px + x]; sse0 += d * d; }
         int topOff = py >= 2 ? (py - 2) * stride + px : off;
-        int botOff = (edges & Av1Cdef.EdgeFlags.Bottom) != 0 ? (py + n) * stride + px : off + (n - 1) * stride;
-        if ((edges & Av1Cdef.EdgeFlags.Bottom) != 0 && (py + n + 2) > planeRows) edges &= ~Av1Cdef.EdgeFlags.Bottom;
-        int sw = n + 2;
+        int botOff = (edges & Av1Cdef.EdgeFlags.Bottom) != 0 ? (py + nh) * stride + px : off + (nh - 1) * stride;
+        if ((edges & Av1Cdef.EdgeFlags.Bottom) != 0 && (py + nh + 2) > planeRows) edges &= ~Av1Cdef.EdgeFlags.Bottom;
+        int sw = nw + 2;
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
         {
             // The padded neighbourhood does not depend on the strength: build it once, filter every code from it.
             Span<short> tmp = stackalloc short[144];
-            Av1Cdef.PadBlock(tmp, plane, off, stride, left, 0, 2, plane, topOff, plane, botOff, n, n, edges, stride);
+            Av1Cdef.PadBlock(tmp, plane, off, stride, left, 0, 2, plane, topOff, plane, botOff, nw, nh, edges, stride);
             foreach (int code in codes)
             {
                 int pri = (code >> 2) << bdMin8;
@@ -262,10 +273,10 @@ internal static class Av1CdefSearch
                 sec <<= bdMin8;
                 int adjPri = luma ? (pri != 0 ? Av1Cdef.AdjustStrength(pri, variance) : 0) : pri;
                 if (adjPri == 0 && sec == 0) { acc[code] += sse0; continue; }
-                Av1Cdef.FilterPadded(tmp, scratch, 0, n, adjPri, sec, pri != 0 ? dir : 0, damping, n, n, bitDepth);
+                Av1Cdef.FilterPadded(tmp, scratch, 0, nw, adjPri, sec, pri != 0 ? dir : 0, damping, nw, nh, bitDepth);
                 long sse = 0;
                 for (int y = 0; y < h; y++)
-                    for (int x = 0; x < w; x++) { int d = scratch[y * n + x] - src[(py + y) * srcStride + px + x]; sse += d * d; }
+                    for (int x = 0; x < w; x++) { int d = scratch[y * nw + x] - src[(py + y) * srcStride + px + x]; sse += d * d; }
                 acc[code] += sse;
             }
             return;
@@ -279,14 +290,14 @@ internal static class Av1CdefSearch
             int adjPri = luma ? (pri != 0 ? Av1Cdef.AdjustStrength(pri, variance) : 0) : pri;
             if (adjPri == 0 && sec == 0) { acc[code] += sse0; continue; }
             // the block plus its two pre-CDEF right-hand columns (the filter reads them from the block's own buffer)
-            for (int y = 0; y < n; y++)
+            for (int y = 0; y < nh; y++)
                 for (int x = 0; x < sw; x++)
                 {
                     int sx = px + x;
                     scratch[y * sw + x] = sx < stride ? plane[off + y * stride + x] : (ushort)0;
                 }
             Av1Cdef.FilterBlock(scratch, 0, sw, left, 0, 2, plane, topOff, plane, botOff,
-                adjPri, sec, pri != 0 ? dir : 0, damping, n, n, edges, bitDepth, stride);
+                adjPri, sec, pri != 0 ? dir : 0, damping, nw, nh, edges, bitDepth, stride);
             long sse = 0;
             for (int y = 0; y < h; y++)
                 for (int x = 0; x < w; x++) { int d = scratch[y * sw + x] - src[(py + y) * srcStride + px + x]; sse += d * d; }

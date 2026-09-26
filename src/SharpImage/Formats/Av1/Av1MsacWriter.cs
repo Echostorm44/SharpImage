@@ -25,6 +25,9 @@ internal sealed class Av1MsacWriter
     // Av1CoeffEncode.SymBits/BoolBits, so a trial encode's MeasuredBits is a faithful coded-rate proxy. Only
     // accumulated when Measure is set, so the real (committed) encode path pays nothing.
     internal bool Measure;
+    /// <summary>The coded bytes are never used (a row-parallel row, re-coded later by replaying its log): renormalisation
+    /// keeps the coder state (and MeasuredBits) exact but stores no bytes.</summary>
+    internal bool DiscardOutput;
     internal double MeasuredBits;
     private const double Log2_32768 = 15.0;
 
@@ -125,7 +128,7 @@ internal sealed class Av1MsacWriter
 
     // Precarry-buffer bytes emitted since index `start` (a trial's output tail), so a winning trial's committed
     // state can be reconstructed without re-encoding. Used by true-RD to avoid re-running the winning subtree.
-    internal int[] PrecarryFrom(int start) => precarry.GetRange(start, precarry.Count - start).ToArray();
+    internal int[] PrecarryFrom(int start) => DiscardOutput ? Array.Empty<int>() : precarry.GetRange(start, precarry.Count - start).ToArray();
 
     internal void AppendPrecarry(int[] tail) => precarry.AddRange(tail);
 
@@ -150,13 +153,13 @@ internal sealed class Av1MsacWriter
             ulong m = (1UL << c) - 1;
             if (s >= 8)
             {
-                precarry.Add((int)(lo >> c));
+                if (!DiscardOutput) precarry.Add((int)(lo >> c));
                 lo &= m;
                 c -= 8;
                 m >>= 8;
             }
 
-            precarry.Add((int)(lo >> c));
+            if (!DiscardOutput) precarry.Add((int)(lo >> c));
             s = c + d - 24;
             lo &= m;
         }

@@ -186,7 +186,7 @@ internal static class Av1FwdTransform
         }
 
         // Vertical forward + quant: C[ky][kx] = sum_y Fv[ky][y] * t[y][kx]; level = deadzone(C·S/dq).
-        var levels = new int[rcCount];
+        var levels = RentLevels(rcCount);
         for (int kx = 0; kx < sw; kx++)
             for (int ky = 0; ky < sh; ky++)
             {
@@ -232,7 +232,7 @@ internal static class Av1FwdTransform
         }
 
         // Vertical forward + quant: C[ky][kx] = sum_y Fv[ky][y] * t[y][kx].
-        var levels = new int[rcCount];
+        var levels = RentLevels(rcCount);
         for (int kx = 0; kx < n; kx++)
         {
             var col = tT.Slice(kx * n, n);
@@ -293,7 +293,7 @@ internal static class Av1FwdTransform
         }
 
         // Vertical pass: columns → C[ky][kx].
-        var levels = new int[rcCount];
+        var levels = RentLevels(rcCount);
         for (int kx = 0; kx < kept; kx++)
         {
             var col = tT.AsSpan(kx * n, n);
@@ -322,49 +322,179 @@ internal static class Av1FwdTransform
     // Matrix forward + deadzone quant of a w x h residual with transposed forward matrices (fhT[x * sw + kx] =
     // Fh[kx][x], fvT[y * sh + ky] = Fv[ky][y]; sw = min(w, 32), sh = min(h, 32)), 4 coefficients per Vector256: every
     // lane is the scalar dot product in the same order (no FMA), so levels / qf are identical to the scalar loops.
+    [System.Runtime.CompilerServices.SkipLocalsInit]
     private static int[] MatForwardV(ReadOnlySpan<int> residual, int w, int h, double[] fhT, double[] fvT, double s,
         int dcDq, int acDq, int rcCount, double[]? qfOut)
     {
-        int sw = Math.Min(w, 32), sh = Math.Min(h, 32), nvx = sw / 4, nvy = sh / 4;
+        int sw = Math.Min(w, 32), sh = Math.Min(h, 32);
         Span<double> tT = stackalloc double[sw * h];      // tT[kx * h + y]
-        Span<Vector256<double>> acc = stackalloc Vector256<double>[8];
         Span<double> lanes = stackalloc double[32];
+        // Horizontal pass: one row's sw outputs in up to 8 register accumulators (4 doubles each).
         for (int y = 0; y < h; y++)
         {
-            var row = residual.Slice(y * w, w);
-            for (int v = 0; v < nvx; v++) acc[v] = Vector256<double>.Zero;
-            for (int x = 0; x < w; x++)
-            {
-                var r = Vector256.Create((double)row[x]);
-                var b = fhT.AsSpan(x * sw, sw);
-                for (int v = 0; v < nvx; v++) acc[v] += Vector256.Create(b.Slice(v * 4, 4)) * r;
-            }
-            for (int v = 0; v < nvx; v++) acc[v].CopyTo(lanes.Slice(v * 4, 4));
+            DotRows(residual.Slice(y * w, w), fhT, sw, lanes);
             for (int kx = 0; kx < sw; kx++) tT[kx * h + y] = lanes[kx];
         }
 
-        var levels = new int[rcCount];
+        var levels = RentLevels(rcCount);
+        var sv = Vector256.Create(s);
+        var acv = Vector256.Create((double)acDq);
+        var half = Vector256.Create(0.5);
+        var bias = Vector256.Create(DeadzoneBias);
+        var one = Vector256.Create(1.0);
         for (int kx = 0; kx < sw; kx++)
         {
-            var col = tT.Slice(kx * h, h);
-            for (int v = 0; v < nvy; v++) acc[v] = Vector256<double>.Zero;
-            for (int y = 0; y < h; y++)
+            DotCols(tT.Slice(kx * h, h), fvT, sh, lanes);
+            // Quantise 4 at a time with the scalar operations and order: qf = a * s / dq, mag = |qf| + 0.5 - bias,
+            // level = mag < 1 ? 0 : sign(qf) * floor(mag).
+            for (int ky = 0; ky < sh; ky += 4)
             {
-                var c = Vector256.Create(col[y]);
-                var b = fvT.AsSpan(y * sh, sh);
-                for (int v = 0; v < nvy; v++) acc[v] += Vector256.Create(b.Slice(v * 4, 4)) * c;
-            }
-            for (int v = 0; v < nvy; v++) acc[v].CopyTo(lanes.Slice(v * 4, 4));
-            for (int ky = 0; ky < sh; ky++)
-            {
-                int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
-                double qf = lanes[ky] * s / dq;
-                if (qfOut != null) qfOut[kx * sh + ky] = qf;
-                double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
-                levels[kx * sh + ky] = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
+                var a = Vector256.Create(lanes.Slice(ky, 4));
+                var dq = kx == 0 && ky == 0 ? Vector256.Create((double)dcDq, acDq, acDq, acDq) : acv;
+                var qf = a * sv / dq;
+                if (qfOut != null) qf.CopyTo(qfOut.AsSpan(kx * sh + ky, 4));
+                var mag = Vector256.Abs(qf) + half - bias;
+                var fl = Vector256.Floor(mag);
+                var sgn = Vector256.ConditionalSelect(Vector256.LessThan(qf, Vector256<double>.Zero), -fl, fl);
+                var lv = Vector256.ConditionalSelect(Vector256.LessThan(mag, one), Vector256<double>.Zero, sgn);
+                var li = System.Runtime.Intrinsics.X86.Avx.ConvertToVector128Int32WithTruncation(lv);
+                li.CopyTo(levels.AsSpan(kx * sh + ky, 4));
             }
         }
         return levels;
+    }
+
+    // out[k] = sum_x src[x] * fT[x * n + k] for k < n (n = 4, 8, 16 or 32), accumulated in x order per lane.
+    private static void DotRows(ReadOnlySpan<int> src, double[] fT, int n, Span<double> outLanes)
+    {
+        ref double f = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(fT);
+        int len = src.Length;
+        switch (n)
+        {
+            case 4:
+            {
+                var a0 = Vector256<double>.Zero;
+                for (int x = 0; x < len; x++) { var r = Vector256.Create((double)src[x]); a0 += Vector256.LoadUnsafe(ref f, (nuint)(x * 4)) * r; }
+                a0.CopyTo(outLanes);
+                return;
+            }
+            case 8:
+            {
+                Vector256<double> a0 = default, a1 = default;
+                for (int x = 0; x < len; x++)
+                {
+                    var r = Vector256.Create((double)src[x]); nuint o = (nuint)(x * 8);
+                    a0 += Vector256.LoadUnsafe(ref f, o) * r; a1 += Vector256.LoadUnsafe(ref f, o + 4) * r;
+                }
+                a0.CopyTo(outLanes); a1.CopyTo(outLanes.Slice(4));
+                return;
+            }
+            case 16:
+            {
+                Vector256<double> a0 = default, a1 = default, a2 = default, a3 = default;
+                for (int x = 0; x < len; x++)
+                {
+                    var r = Vector256.Create((double)src[x]); nuint o = (nuint)(x * 16);
+                    a0 += Vector256.LoadUnsafe(ref f, o) * r; a1 += Vector256.LoadUnsafe(ref f, o + 4) * r;
+                    a2 += Vector256.LoadUnsafe(ref f, o + 8) * r; a3 += Vector256.LoadUnsafe(ref f, o + 12) * r;
+                }
+                a0.CopyTo(outLanes); a1.CopyTo(outLanes.Slice(4)); a2.CopyTo(outLanes.Slice(8)); a3.CopyTo(outLanes.Slice(12));
+                return;
+            }
+            default:
+            {
+                Vector256<double> a0 = default, a1 = default, a2 = default, a3 = default, a4 = default, a5 = default, a6 = default, a7 = default;
+                for (int x = 0; x < len; x++)
+                {
+                    var r = Vector256.Create((double)src[x]); nuint o = (nuint)(x * 32);
+                    a0 += Vector256.LoadUnsafe(ref f, o) * r; a1 += Vector256.LoadUnsafe(ref f, o + 4) * r;
+                    a2 += Vector256.LoadUnsafe(ref f, o + 8) * r; a3 += Vector256.LoadUnsafe(ref f, o + 12) * r;
+                    a4 += Vector256.LoadUnsafe(ref f, o + 16) * r; a5 += Vector256.LoadUnsafe(ref f, o + 20) * r;
+                    a6 += Vector256.LoadUnsafe(ref f, o + 24) * r; a7 += Vector256.LoadUnsafe(ref f, o + 28) * r;
+                }
+                a0.CopyTo(outLanes); a1.CopyTo(outLanes.Slice(4)); a2.CopyTo(outLanes.Slice(8)); a3.CopyTo(outLanes.Slice(12));
+                a4.CopyTo(outLanes.Slice(16)); a5.CopyTo(outLanes.Slice(20)); a6.CopyTo(outLanes.Slice(24)); a7.CopyTo(outLanes.Slice(28));
+                return;
+            }
+        }
+    }
+
+    // DotRows for a double column (the vertical pass): products c * f in the scalar order.
+    private static void DotCols(ReadOnlySpan<double> src, double[] fT, int n, Span<double> outLanes)
+    {
+        ref double f = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(fT);
+        int len = src.Length;
+        switch (n)
+        {
+            case 4:
+            {
+                var a0 = Vector256<double>.Zero;
+                for (int y = 0; y < len; y++) { var c = Vector256.Create(src[y]); a0 += Vector256.LoadUnsafe(ref f, (nuint)(y * 4)) * c; }
+                a0.CopyTo(outLanes);
+                return;
+            }
+            case 8:
+            {
+                Vector256<double> a0 = default, a1 = default;
+                for (int y = 0; y < len; y++)
+                {
+                    var c = Vector256.Create(src[y]); nuint o = (nuint)(y * 8);
+                    a0 += Vector256.LoadUnsafe(ref f, o) * c; a1 += Vector256.LoadUnsafe(ref f, o + 4) * c;
+                }
+                a0.CopyTo(outLanes); a1.CopyTo(outLanes.Slice(4));
+                return;
+            }
+            case 16:
+            {
+                Vector256<double> a0 = default, a1 = default, a2 = default, a3 = default;
+                for (int y = 0; y < len; y++)
+                {
+                    var c = Vector256.Create(src[y]); nuint o = (nuint)(y * 16);
+                    a0 += Vector256.LoadUnsafe(ref f, o) * c; a1 += Vector256.LoadUnsafe(ref f, o + 4) * c;
+                    a2 += Vector256.LoadUnsafe(ref f, o + 8) * c; a3 += Vector256.LoadUnsafe(ref f, o + 12) * c;
+                }
+                a0.CopyTo(outLanes); a1.CopyTo(outLanes.Slice(4)); a2.CopyTo(outLanes.Slice(8)); a3.CopyTo(outLanes.Slice(12));
+                return;
+            }
+            default:
+            {
+                Vector256<double> a0 = default, a1 = default, a2 = default, a3 = default, a4 = default, a5 = default, a6 = default, a7 = default;
+                for (int y = 0; y < len; y++)
+                {
+                    var c = Vector256.Create(src[y]); nuint o = (nuint)(y * 32);
+                    a0 += Vector256.LoadUnsafe(ref f, o) * c; a1 += Vector256.LoadUnsafe(ref f, o + 4) * c;
+                    a2 += Vector256.LoadUnsafe(ref f, o + 8) * c; a3 += Vector256.LoadUnsafe(ref f, o + 12) * c;
+                    a4 += Vector256.LoadUnsafe(ref f, o + 16) * c; a5 += Vector256.LoadUnsafe(ref f, o + 20) * c;
+                    a6 += Vector256.LoadUnsafe(ref f, o + 24) * c; a7 += Vector256.LoadUnsafe(ref f, o + 28) * c;
+                }
+                a0.CopyTo(outLanes); a1.CopyTo(outLanes.Slice(4)); a2.CopyTo(outLanes.Slice(8)); a3.CopyTo(outLanes.Slice(12));
+                a4.CopyTo(outLanes.Slice(16)); a5.CopyTo(outLanes.Slice(20)); a6.CopyTo(outLanes.Slice(24)); a7.CopyTo(outLanes.Slice(28));
+                return;
+            }
+        }
+    }
+
+    // Per-thread recycling of the quantised-level arrays (the RD searches transform every candidate and keep only the
+    // winner): a search returns its losing candidates with ReturnLevels. Every entry of a rented array is overwritten
+    // by the forward transform, so no clearing is needed. Pools by power-of-two length 16 .. 1024, a few arrays each.
+    [ThreadStatic] private static int[][][]? t_levelPool;
+    [ThreadStatic] private static int[]? t_levelPoolN;
+    internal static int[] RentLevels(int count)
+    {
+        int b = System.Numerics.BitOperations.Log2((uint)count);
+        if ((count & (count - 1)) == 0 && b >= 4 && b <= 10 && t_levelPool != null && t_levelPoolN![b] > 0)
+            return t_levelPool[b][--t_levelPoolN[b]];
+        return new int[count];
+    }
+    internal static void ReturnLevels(int[]? a)
+    {
+        if (a == null) return;
+        int count = a.Length, b = System.Numerics.BitOperations.Log2((uint)count);
+        if ((count & (count - 1)) != 0 || b < 4 || b > 10) return;
+        t_levelPool ??= new int[11][][];
+        t_levelPoolN ??= new int[11];
+        var st = t_levelPool[b] ??= new int[8][];
+        if (t_levelPoolN[b] < st.Length) st[t_levelPoolN[b]++] = a;
     }
 
     // Indexed by (logSize << 2) | type1d; filled on first use (a benign race builds identical arrays).
@@ -404,7 +534,7 @@ internal static class Av1FwdTransform
             for (int kx = 0; kx < kept; kx++) tT[kx * n + y] = lanes[kx];
         }
 
-        var levels = new int[rcCount];
+        var levels = RentLevels(rcCount);
         for (int kx = 0; kx < kept; kx++)
         {
             var col = tT.AsSpan(kx * n, n);

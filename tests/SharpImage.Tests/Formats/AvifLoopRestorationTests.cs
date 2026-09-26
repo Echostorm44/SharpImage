@@ -75,16 +75,21 @@ public sealed class AvifLoopRestorationTests
     }
 
     [Test]
-    public async Task PhotoUsesRestorationAtDefaultSpeedOnly()
+    public async Task PhotoRestorationFollowsSpeedPreset()
     {
+        // Loop restoration through speed 5; at speed 6 only outside 4:2:0 (where it still pays); none from speed 7.
         var src = FormatRegistry.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", "peppers.jpg"));
+        byte[] s5 = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Quality = 50, Speed = 5 });
         byte[] s6 = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Quality = 50 });
+        byte[] s6x444 = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Quality = 50, ChromaSubsampling = AvifChromaSubsampling.Yuv444 });
         byte[] s7 = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Quality = 50, Speed = 7 });
-        var t6 = LrTypes(s6);
-        await Assert.That(t6.Y != Av1RestorationType.None || t6.U != Av1RestorationType.None || t6.V != Av1RestorationType.None).IsTrue();
-        var t7 = LrTypes(s7);
-        await Assert.That(t7.Y == Av1RestorationType.None && t7.U == Av1RestorationType.None && t7.V == Av1RestorationType.None).IsTrue();
-        using var back = HeifCoder.Decode(s6);
+        static bool Any((Av1RestorationType Y, Av1RestorationType U, Av1RestorationType V) t)
+            => t.Y != Av1RestorationType.None || t.U != Av1RestorationType.None || t.V != Av1RestorationType.None;
+        await Assert.That(Any(LrTypes(s5))).IsTrue();
+        await Assert.That(Any(LrTypes(s6))).IsFalse();
+        await Assert.That(Any(LrTypes(s6x444))).IsTrue();
+        await Assert.That(Any(LrTypes(s7))).IsFalse();
+        using var back = HeifCoder.Decode(s5);
         await Assert.That(back.Columns).IsEqualTo(src.Columns);
     }
 }
