@@ -2069,7 +2069,7 @@ public sealed class Av1HbdVerify
                             f.SetValue(sp, Convert.ChangeType(kv.Split('=')[1], f.FieldType, System.Globalization.CultureInfo.InvariantCulture));
                         }
                     } : null;
-                    var gcPause0 = GC.GetTotalPauseDuration(); long alloc0 = GC.GetTotalAllocatedBytes(true);
+                    var gcPause0 = GC.GetTotalPauseDuration(); long alloc0 = GC.GetTotalAllocatedBytes(true); int g0c = GC.CollectionCount(0), g1c = GC.CollectionCount(1), g2c = GC.CollectionCount(2);
                     // PROBE_ALLOC=1: sampled allocation volume by type (GCAllocationTick, ~100 KB per sample).
                     using var allocL = Environment.GetEnvironmentVariable("PROBE_ALLOC") == "1" ? new AllocTypeListener() : null;
                     var phases = new System.Text.StringBuilder();
@@ -2085,7 +2085,7 @@ public sealed class Av1HbdVerify
                     Av1EncodeSpeed.TestOverride = null;
                     foreach (var (sf, old) in statics) sf.SetValue(null, old);
                     File.WriteAllBytes(t[2], outB);
-                    log.AppendLine($"encq {Path.GetFileName(t[2])} {outB.Length} {secs:F3} gc {gcMs:F1}ms alloc {allocMb}MB");
+                    log.AppendLine($"encq {Path.GetFileName(t[2])} {outB.Length} {secs:F3} gc {gcMs:F1}ms alloc {allocMb}MB g{GC.CollectionCount(0) - g0c}/{GC.CollectionCount(1) - g1c}/{GC.CollectionCount(2) - g2c}");
                     continue;
                 }
                 if (t[0] == "timeenc" || t[0] == "timedec")

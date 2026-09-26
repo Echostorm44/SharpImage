@@ -179,6 +179,8 @@ internal sealed class Av1Decoder
         {
             int stride = ctx.CurrentStrides[i], rows = i == 0 ? rowsY : rowsC;
             var src = ctx.CurrentPlanes[i]!;
+            // Enough rows already: hand out the decoder's own plane (the caller's decoder is not used again).
+            if (src.Length >= stride * rows) { strides[i] = stride; planes[i] = src; continue; }
             var a = new ushort[stride * rows];
             int avail = Math.Min(rows, src.Length / stride) * stride;
             Array.Copy(src, a, avail);

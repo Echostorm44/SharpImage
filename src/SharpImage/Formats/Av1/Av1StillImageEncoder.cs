@@ -1432,14 +1432,14 @@ internal static partial class Av1StillImageEncoder
         public List<Av1MsacWriter.LogOp>[] RowLogs = null!;
     }
 
-    private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> uPlane, ReadOnlySpan<ushort> vPlane,
+    private static byte[] EncodeMultiSbColorTile(ushort[] luma, ushort[] uPlane, ushort[] vPlane,
         int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx, Av1PixelLayout layout = Av1PixelLayout.I420)
         => EncodeMultiSbColorTile(luma, uPlane, vPlane, w, h, sbCols, sbRows, bw4, bh4, baseQIdx, layout, null);
 
     /// <summary>As above; with <paramref name="tileLogs"/> (one slot per tile) each tile's coded operations are also
     /// recorded, with a marker (sby &lt;&lt; 16 | sbx) before every superblock, for a later Replay that inserts syntax
     /// decided after the tile (loop restoration).</summary>
-    private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> uPlane, ReadOnlySpan<ushort> vPlane,
+    private static byte[] EncodeMultiSbColorTile(ushort[] luma, ushort[] uPlane, ushort[] vPlane,
         int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx, Av1PixelLayout layout,
         List<Av1MsacWriter.LogOp>[]? tileLogs, bool screenContent = false)
     {
@@ -1453,9 +1453,10 @@ internal static partial class Av1StillImageEncoder
         int cw = w >> ssX, chh = h >> ssY;
 
         int sb128Cols = (sbCols + 1) >> 1;
-        ushort[] lumaArr = new ushort[w * h]; luma.CopyTo(lumaArr);
-        ushort[] uArr = new ushort[cw * chh]; uPlane.CopyTo(uArr);
-        ushort[] vArr = new ushort[cw * chh]; vPlane.CopyTo(vArr);
+        // the padded source planes are only read: used as they are (no per-encode copies of whole planes)
+        ushort[] lumaArr = luma.Length == w * h ? luma : luma.AsSpan(0, w * h).ToArray();
+        ushort[] uArr = uPlane.Length == cw * chh ? uPlane : uPlane.AsSpan(0, cw * chh).ToArray();
+        ushort[] vArr = vPlane.Length == cw * chh ? vPlane : vPlane.AsSpan(0, cw * chh).ToArray();
         ushort[] reconY = new ushort[w * h], reconU = new ushort[cw * chh], reconV = new ushort[cw * chh];
         int dcDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 0], acDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1];
         int bd = Bd;
@@ -3193,10 +3194,12 @@ internal static partial class Av1StillImageEncoder
     private static int[] ForwardResidualRectDc(ReadOnlySpan<ushort> plane, int planeW, int bx, int by, int w, int h,
         int dc, int txIdx, int dcDq, int acDq, int rcCount)
     {
-        var residual = new int[h * w];
+        var residual = Av1FwdTransform.RentLevels(h * w);   // fully written below
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++) residual[y * w + x] = plane[(by + y) * planeW + (bx + x)] - dc;
-        return Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, Av1FwdTransform.FwdTxType.DctDct);
+        var lv = Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, Av1FwdTransform.FwdTxType.DctDct);
+        Av1FwdTransform.ReturnLevels(residual);
+        return lv;
     }
 
     // Reconstructs a rect w x h block on top of a flat DC prediction, via the decoder's InvTxfmAdd.
@@ -3232,11 +3235,10 @@ internal static partial class Av1StillImageEncoder
         int leftCtx = Av1Tables.IntraModeContext[c.LModeY[byR]];
         var ymCdf = c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
         int ySign = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
-        var pred = new ushort[h * w];
-        var bestPred = new ushort[h * w];
-        var resBuf = new int[h * w];
-        var qfCand = new double[lScan];
-        var qfWin = new double[lScan];
+        // per-thread scratch (the leaf is not re-entrant; only the first h * w / lScan entries are used)
+        var scr = t_scRect ??= new LeafScratch();
+        var pred = scr.P1; var bestPred = scr.P2; var resBuf = scr.R;
+        var qfCand = scr.Q1; var qfWin = scr.Q2;
         int[] yC = null!;
         Av1IntraPredMode yMode = Av1IntraPredMode.Dc; int yDelta = 0;
         Av1TxType yInv = Av1TxType.DctDct; int yTxIdx = 1;
@@ -3957,8 +3959,9 @@ internal static partial class Av1StillImageEncoder
         // Luma mode search (no angle_delta at these sizes, so only the ~13 base modes — all RD-evaluated directly,
         // no SATD prescreen). Full reduced tx-type set (IDTX+DCT/ADST): the symbol is coded for 8x4/4x8 (max tx
         // dim <= 16), and IDTX helps these tiny edge sub-blocks — same win as the square/rect leaves.
-        var pred = new ushort[h * w]; var bestPred = new ushort[h * w]; var resBuf = new int[h * w];
-        var qfCand = new double[lScan]; var qfWin = new double[lScan];
+        var scr = t_scSub8 ??= new LeafScratch();
+        var pred = scr.P1; var bestPred = scr.P2; var resBuf = scr.R;
+        var qfCand = scr.Q1; var qfWin = scr.Q2;
         double rectLambda = RdLambdaK * c.AcDq * c.AcDq;
         int[] yC = null!; Av1IntraPredMode yMode = Av1IntraPredMode.Dc; Av1TxType yInv = Av1TxType.DctDct; int yTxIdx = 1;
         double best = double.MaxValue;
@@ -4203,7 +4206,7 @@ internal static partial class Av1StillImageEncoder
     private static int[] ForwardResidual(ReadOnlySpan<ushort> plane, int planeW, int bx, int by, int n, int dcPred,
         int dcDq, int acDq, int scanLen, double[]? qfOut = null)
     {
-        var residual = new int[n * n];
+        var residual = Av1FwdTransform.RentLevels(n * n);   // fully written below
         for (int y = 0; y < n; y++)
         {
             for (int x = 0; x < n; x++)
@@ -4212,9 +4215,11 @@ internal static partial class Av1StillImageEncoder
             }
         }
 
-        return qfOut == null
+        var lv = qfOut == null
             ? Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen)
             : Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, Av1FwdTransform.FwdTxType.DctDct, qfOut);
+        Av1FwdTransform.ReturnLevels(residual);
+        return lv;
     }
 
     // Validates a multi-SB frame and returns the SB grid, real 4-unit dims (bw4/bh4, for context clipping) and
@@ -5148,6 +5153,16 @@ internal static partial class Av1StillImageEncoder
 
     // J (pre-RDOQ) of the last ChooseLeafRdCore winner, for the palette comparison.
     [ThreadStatic] private static double t_leafJ;
+
+    // Per-thread working buffers of a leaf search (ChooseLeafRdCore / the rect leaf / the sub-8 leaf, one set each: none
+    // of them re-enters itself), sized for the largest block.
+    private sealed class LeafScratch
+    {
+        public readonly ushort[] P1 = new ushort[64 * 64], P2 = new ushort[64 * 64];
+        public readonly int[] R = new int[64 * 64];
+        public readonly double[] Q1 = new double[1024], Q2 = new double[1024];
+    }
+    [ThreadStatic] private static LeafScratch? t_scCore, t_scRect, t_scSub8;
     // The last ChooseLeafRdCore prescreen's surviving candidates (CandidateModes indices, SATD order).
     [ThreadStatic] private static int[]? t_topModesArr;
     private static int[] t_topModes => t_topModesArr ??= new int[64];
@@ -5221,12 +5236,13 @@ internal static partial class Av1StillImageEncoder
         int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, aboveLCoef, leftLCoef);
         int intraFlags = IntraEdgeFlags(aboveMode, leftMode);
         int scanLen = Av1Tables.Scans[tx].Length;
-        var predBuf = new ushort[n * n];
-        var qfCand = new double[scanLen];
-        var qfWin = new double[scanLen];
+        var scr = t_scCore ??= new LeafScratch();
+        var predBuf = scr.P1;
+        var qfCand = scr.Q1;
+        var qfWin = scr.Q2;
         // The winner's prediction stays in predBuf until the next mode would overwrite it (then the buffers swap), and
         // the pre-quant floats swap buffers too: no copy per improvement, one to predOut at the end.
-        var predBest = new ushort[n * n];
+        var predBest = scr.P2;
         bool bestInPredBuf = false;
 
         // Pre-screen all candidate modes by cheap SATD and RD-evaluate only the best few — the full rate search
@@ -5392,11 +5408,13 @@ internal static partial class Av1StillImageEncoder
         ushort[] pred, int w, int h, int txIdx, int dcDq, int acDq, int rcCount, double[]? qfOut = null,
         Av1FwdTransform.FwdTxType fwd = Av1FwdTransform.FwdTxType.DctDct)
     {
-        var residual = new int[h * w];
+        var residual = Av1FwdTransform.RentLevels(h * w);   // fully written below
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 residual[y * w + x] = src[(srcBy + y) * srcW + (srcBx + x)] - pred[y * w + x];
-        return Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, fwd, qfOut);
+        var lv = Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, fwd, qfOut);
+        Av1FwdTransform.ReturnLevels(residual);
+        return lv;
     }
 
     // Dequantizes rect levels and reconstructs a w x h block onto predBlock (h x w) via the decoder's InvTxfmAdd,
@@ -5516,7 +5534,7 @@ internal static partial class Av1StillImageEncoder
     private static int[] ForwardResidualPred(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy,
         ushort[] pred, int n, int dcDq, int acDq, int scanLen)
     {
-        var residual = new int[n * n];
+        var residual = Av1FwdTransform.RentLevels(n * n);   // fully written below
         for (int y = 0; y < n; y++)
         {
             for (int x = 0; x < n; x++)
@@ -5525,7 +5543,9 @@ internal static partial class Av1StillImageEncoder
             }
         }
 
-        return Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen);
+        var lv = Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen);
+        Av1FwdTransform.ReturnLevels(residual);
+        return lv;
     }
 
     /// <summary>Builds the sequence-header OBU and the OBU_FRAME (frame header + tile) for a monochrome key frame
