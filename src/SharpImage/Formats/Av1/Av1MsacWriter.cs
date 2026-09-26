@@ -81,6 +81,19 @@ internal sealed class Av1MsacWriter
 
     internal void AppendLog(List<LogOp> tail) => Log?.AddRange(tail);
 
+    /// <summary>Copies the log ops from <paramref name="start"/> on into a reusable buffer (grown as needed); returns
+    /// the count.</summary>
+    internal int CopyLogTail(int start, ref LogOp[] buffer)
+    {
+        if (Log == null) return 0;
+        int n = Log.Count - start;
+        if (buffer.Length < n) buffer = new LogOp[Math.Max(n, buffer.Length * 2)];
+        System.Runtime.InteropServices.CollectionsMarshal.AsSpan(Log).Slice(start, n).CopyTo(buffer);
+        return n;
+    }
+
+    internal void AppendLog(LogOp[] buffer, int count) => Log?.AddRange(buffer.AsSpan(0, count));
+
     /// <summary>Re-codes a recorded operation sequence into a fresh coder, calling <paramref name="onMarker"/> at each
     /// marker (it may code anything with the given writer) and returns the finished bytes. Without markers that write,
     /// the result equals the recording coder's own output.</summary>

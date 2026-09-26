@@ -224,7 +224,10 @@ internal static partial class Av1StillImageEncoder
     /// <summary>The best luma palette for a fully-inside w x h block (8x8..64x64) by RD, or null when the block has
     /// fewer than 2 or more than 64 colours. J = recon SSE + λ·(DC mode + palette flag/size/colours/map + coefficient
     /// bits), directly comparable with the regular leaf's J.</summary>
-    private static LumaPal? SearchLumaPalette(ColorPartCtx c, int bs, int lumaTx, int bx4, int by4, int w, int h, Span<ushort> ymCdf)
+    /// <summary>... bound: the J the palette must beat (the regular winner's); a candidate whose side information alone
+    /// costs that much is not evaluated.</summary>
+    private static LumaPal? SearchLumaPalette(ColorPartCtx c, int bs, int lumaTx, int bx4, int by4, int w, int h, Span<ushort> ymCdf,
+        double bound = double.MaxValue)
     {
         int bx = bx4 * 4, by = by4 * 4, bxR = bx4 & 31, byR = by4 & 31;
         Span<ushort> vals = stackalloc ushort[64]; Span<int> cnts = stackalloc int[64];
@@ -246,6 +249,7 @@ internal static partial class Av1StillImageEncoder
         var colors = new ushort[8];
         var qf = new double[scanLen];
         var res = new int[w * h];
+        double prevJ = double.MaxValue;
         for (int k = Math.Min(nv, 8); k >= 2; k--)
         {
             int size;
@@ -258,6 +262,8 @@ internal static partial class Av1StillImageEncoder
             double palBits = baseBits + Av1CoeffEncode.SymBits(c.Cdf.GetPalSzCdf(0, szCtx), size - 2)
                 + Av1CoeffEncode.LumaPaletteColorBits(cand.Colors, size, lCol, lSz, aCol, aSz, Bd)
                 + EstimatePaletteIndexBits(c.Cdf.Mode, cand.Map, size, w, h, bw4, bh4);
+            double limit = Math.Min(bound, best?.J ?? double.MaxValue);
+            if (lambda * palBits >= limit) continue;   // the side information alone already loses (exact)
             for (int y = 0; y < h; y++)
                 for (int x = 0; x < w; x++) res[y * w + x] = c.Luma[(by + y) * c.W + bx + x] - cand.Pred[y * w + x];
             double bestJ = double.MaxValue;
@@ -265,12 +271,18 @@ internal static partial class Av1StillImageEncoder
             {
                 if (inv == Av1TxType.VDct || inv == Av1TxType.HDct) continue;   // 2D types only (RDOQ / estimate)
                 int[] cf = Av1FwdTransform.ForwardQuantRect(res, w, h, lumaTx, c.DcDq, c.AcDq, scanLen, fwd, qf);
+                long sse = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, cand.Pred, c.Luma, c.W, bx, by, inv);
+                if (sse + lambda * palBits >= Math.Min(bestJ, limit)) continue;   // distortion alone loses (exact)
                 double rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)Av1IntraPredMode.Dc, cf, 0, ySign, idx, fullSet: UseFullIntraTxSet);
-                double j = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, cand.Pred, c.Luma, c.W, bx, by, inv) + lambda * (rate + palBits);
+                double j = sse + lambda * (rate + palBits);
                 if (j < bestJ) { bestJ = j; cand.Coeffs = cf; cand.Inv = inv; cand.Idx = idx; }
             }
+            if (cand.Coeffs == null) continue;
             cand.J = bestJ;
             if (best == null || cand.J < best.J) best = cand;
+            // libaom prune_palette_search_level: sizes descend; stop once a smaller palette no longer improves
+            if (Sp.PaletteEarlyStop && bestJ > prevJ) break;
+            prevJ = bestJ;
         }
         if (best != null && Sp.UseRdoq)
         {

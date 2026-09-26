@@ -690,6 +690,8 @@ public static class Av1Decode
 
     /// <summary>Diagnostics: when set, every non-key-frame block writes "B by bx bs r=rng" (as a patched dav1d does).</summary>
     [ThreadStatic] internal static System.IO.TextWriter? BlockTrace;
+    /// <summary>Dev hook: every decoded intra block (visible w4 x h4) after its mode info, for encoder statistics.</summary>
+    internal static Action<int, int, Av1Block>? BlockStatsHook;
 
     public static int DecodeBlock(
         Av1TaskContext t,
@@ -947,6 +949,7 @@ public static class Av1Decode
             DecodeBlockIntra(t, ref msac, ctx, ref b, bl, bs, bx4, by4, bw4, bh4, w4, h4,
                 cbx4, cby4, cbw4, cbh4, ssHor, ssVer,
                 haveLeft, haveTop, hasChroma, intraEdgeFlags);
+            BlockStatsHook?.Invoke(w4, h4, b);
 
             // === Reconstruction ===
             // Call intra reconstruction which does: prediction + coefficient decode + IDCT + residual add

@@ -626,7 +626,10 @@ internal static class Av1CoeffEncode
         private readonly double[] tA = new double[1024], tB = new double[1024], sA = new double[1024], sB = new double[1024];
         private readonly double[] pre = new double[5];
         private double total;
-        private void W(double[] a, int idx, double v) { total += v - a[idx]; a[idx] = v; }
+        // While building, every term position is written for the first time (its stale value from an earlier block is
+        // ignored), so no clearing is needed; afterwards writes replace the stored term.
+        private bool building;
+        private void W(double[] a, int idx, double v) { total += building ? v : v - a[idx]; a[idx] = v; }
         private readonly byte[] lv = new byte[32 * 34];   // LevelByte of every coefficient (all positions, zero past eob)
         private short[] inv = null!;
         private int[] sl = null!;
@@ -675,13 +678,16 @@ internal static class Av1CoeffEncode
             // only the previous build's positions (scan[0..eob]) can be set
             if (prevScan != null) for (int i = 0; i <= prevEob; i++) lv[prevScan[i]] = 0;
             prevScan = scan; prevEob = eob;
-            Array.Clear(tA, 0, eob + 1); Array.Clear(tB, 0, eob + 1); Array.Clear(sA, 0, eob + 1); Array.Clear(sB, 0, eob + 1);
             total = pre[0] + pre[1] + pre[2] + pre[3] + pre[4];
             for (int i = 0; i <= eob; i++) lv[scan[i]] = LevelByte(Math.Abs(sl[scan[i]]));
+            building = true;
             EobTerm();
             for (int i = eob - 1; i > 0; i--) BaseTerm(i);
+            building = eob > 0;   // with eob == 0 the DC term replaces the eob term just written at position 0
             DcTerm();
+            building = true;
             for (int i = 0; i <= eob; i++) SignTerm(i);
+            building = false;
         }
 
         private static short[] MakeInv(ushort[] scan, int n)

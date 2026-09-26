@@ -512,52 +512,46 @@ internal static class Av1FwdTransform
 
     // ForwardQuantSquare with 4 output coefficients per Vector256 lane group: each lane is the same scalar dot product
     // (double(int) * basis, added in x / y order; no FMA contraction), so the doubles are identical.
+    [System.Runtime.CompilerServices.SkipLocalsInit]
     private static int[] ForwardQuantSquareV(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, double k, double[]? qfOut)
     {
-        int kept = Math.Min(n, 32), sh = kept, nv = kept / 4;
-        double[] bT = DctBasisFlatT(n);   // bT[x * kept + k] = basis[k][x]
+        int kept = Math.Min(n, 32), sh = kept;
+        double[] bT = BasisFlatTArr[System.Numerics.BitOperations.Log2((uint)n)] ??= DctBasisFlatT(n);   // bT[x * kept + k] = basis[k][x]
         var tT = t_fwdScratch is { } sc && sc.Length >= n * kept ? sc : (t_fwdScratch = new double[64 * 32]);
-        Span<Vector256<double>> acc = stackalloc Vector256<double>[8];
         Span<double> lanes = stackalloc double[32];
-
+        // Row pass then column pass, each output lane the scalar dot product in x / y order (DotRows / DotCols).
         for (int y = 0; y < n; y++)
         {
-            var row = residual.Slice(y * n, n);
-            for (int v = 0; v < nv; v++) acc[v] = Vector256<double>.Zero;
-            for (int x = 0; x < n; x++)
-            {
-                var r = Vector256.Create((double)row[x]);
-                var b = bT.AsSpan(x * kept, kept);
-                for (int v = 0; v < nv; v++) acc[v] += r * Vector256.Create(b.Slice(v * 4, 4));
-            }
-            for (int v = 0; v < nv; v++) acc[v].CopyTo(lanes.Slice(v * 4, 4));
+            DotRows(residual.Slice(y * n, n), bT, kept, lanes);
             for (int kx = 0; kx < kept; kx++) tT[kx * n + y] = lanes[kx];
         }
 
         var levels = RentLevels(rcCount);
+        var kv = Vector256.Create(k);
+        var acv = Vector256.Create((double)acDq);
+        var half = Vector256.Create(0.5);
+        var bias = Vector256.Create(DeadzoneBias);
+        var one = Vector256.Create(1.0);
         for (int kx = 0; kx < kept; kx++)
         {
-            var col = tT.AsSpan(kx * n, n);
-            for (int v = 0; v < nv; v++) acc[v] = Vector256<double>.Zero;
-            for (int y = 0; y < n; y++)
+            DotCols(tT.AsSpan(kx * n, n), bT, kept, lanes);
+            for (int ky = 0; ky < kept; ky += 4)
             {
-                var c = Vector256.Create(col[y]);
-                var b = bT.AsSpan(y * kept, kept);
-                for (int v = 0; v < nv; v++) acc[v] += c * Vector256.Create(b.Slice(v * 4, 4));
-            }
-            for (int v = 0; v < nv; v++) acc[v].CopyTo(lanes.Slice(v * 4, 4));
-            for (int ky = 0; ky < kept; ky++)
-            {
-                double a = lanes[ky];
-                int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
-                double qf = a * k / dq;
-                if (qfOut != null) qfOut[kx * sh + ky] = qf;
-                double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
-                levels[kx * sh + ky] = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
+                var a = Vector256.Create(lanes.Slice(ky, 4));
+                var dq = kx == 0 && ky == 0 ? Vector256.Create((double)dcDq, acDq, acDq, acDq) : acv;
+                var qf = a * kv / dq;
+                if (qfOut != null) qf.CopyTo(qfOut.AsSpan(kx * sh + ky, 4));
+                var mag = Vector256.Abs(qf) + half - bias;
+                var fl = Vector256.Floor(mag);
+                var sgn = Vector256.ConditionalSelect(Vector256.LessThan(qf, Vector256<double>.Zero), -fl, fl);
+                var lv = Vector256.ConditionalSelect(Vector256.LessThan(mag, one), Vector256<double>.Zero, sgn);
+                System.Runtime.Intrinsics.X86.Avx.ConvertToVector128Int32WithTruncation(lv).CopyTo(levels.AsSpan(kx * sh + ky, 4));
             }
         }
         return levels;
     }
+
+    private static readonly double[]?[] BasisFlatTArr = new double[]?[8];
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, double[]> BasisFlatTCache = new();
     private static double[] DctBasisFlatT(int n) => BasisFlatTCache.GetOrAdd(n, nn =>

@@ -1984,6 +1984,41 @@ public sealed class Av1HbdVerify
                     log.AppendLine($"encdump {Path.GetFileName(t[2])} {w}x{h} bd{f.BitDepth} {avif.Length} bytes");
                     continue;
                 }
+                if (t[0] == "blkstats")
+                {
+                    // blkstats <file.avif>...: area-weighted (luma pixels) histograms of the decoded intra blocks' size,
+                    // luma tx size, y mode (+ share with an angle delta), uv mode, skip.
+                    var bsz = new SortedDictionary<string, long>(); var txs = new SortedDictionary<string, long>();
+                    var ym = new SortedDictionary<int, long>(); var uvm = new SortedDictionary<int, long>();
+                    long total = 0, angled = 0, skip = 0, nblk = 0;
+                    object gate = new();
+                    SharpImage.Formats.Av1.Av1Decode.BlockStatsHook = (w4, h4, b) =>
+                    {
+                        long a = 16L * w4 * h4;
+                        lock (gate)
+                        {
+                            string k = $"{4 * SharpImage.Formats.Av1.Av1Tables.BlockDimensions[b.BlockSize, 0]}x{4 * SharpImage.Formats.Av1.Av1Tables.BlockDimensions[b.BlockSize, 1]}";
+                            bsz[k] = bsz.GetValueOrDefault(k) + a;
+                            ref readonly var td = ref SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[b.Tx];
+                            string tk = $"{4 * td.W}x{4 * td.H}";
+                            txs[tk] = txs.GetValueOrDefault(tk) + a;
+                            ym[b.YMode] = ym.GetValueOrDefault(b.YMode) + a;
+                            uvm[b.UvMode] = uvm.GetValueOrDefault(b.UvMode) + a;
+                            if (b.YAngle != 0) angled += a;
+                            if (b.Skip != 0) skip += a;
+                            total += a; nblk++;
+                        }
+                    };
+                    for (int fi = 1; fi < t.Length; fi++) { using var im = HeifCoder.Decode(File.ReadAllBytes(t[fi])); }
+                    SharpImage.Formats.Av1.Av1Decode.BlockStatsHook = null;
+                    string Pct(long v) => $"{100.0 * v / Math.Max(1, total):F1}";
+                    log.AppendLine($"blkstats blocks {nblk} angled {Pct(angled)}% skip {Pct(skip)}%");
+                    log.AppendLine("  bsize " + string.Join(" ", bsz.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}:{Pct(kv.Value)}")));
+                    log.AppendLine("  tx    " + string.Join(" ", txs.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}:{Pct(kv.Value)}")));
+                    log.AppendLine("  ymode " + string.Join(" ", ym.Select(kv => $"{kv.Key}:{Pct(kv.Value)}")));
+                    log.AppendLine("  uvmode " + string.Join(" ", uvm.Select(kv => $"{kv.Key}:{Pct(kv.Value)}")));
+                    continue;
+                }
                 if (t[0] == "hdrinfo")
                 {
                     // hdrinfo <avif...>: frame-header tool flags of each file's primary item (what an encoder turned on).
@@ -2011,9 +2046,24 @@ public sealed class Av1HbdVerify
                             "400" => AvifChromaSubsampling.Yuv400, _ => AvifChromaSubsampling.Yuv420,
                         },
                     };
-                    Av1EncodeSpeed.TestOverride = t.Length > 7 ? sp =>
+                    // Field=Value: an Av1EncodeSpeed field, else an internal static of the encoder / forward transform
+                    // (RdLambdaK, DeadzoneBias, ...), restored after this encode.
+                    var statics = new List<(System.Reflection.FieldInfo F, object? Old)>();
+                    var speedKv = new List<string>();
+                    foreach (var kv in t.Length > 7 ? t[7].Split(',', StringSplitOptions.RemoveEmptyEntries) : [])
                     {
-                        foreach (var kv in t[7].Split(',', StringSplitOptions.RemoveEmptyEntries))
+                        string name = kv.Split('=')[0];
+                        if (typeof(Av1EncodeSpeed).GetField(name) != null) { speedKv.Add(kv); continue; }
+                        var sf = new[] { "SharpImage.Formats.Av1.Av1StillImageEncoder", "SharpImage.Formats.Av1.Av1FwdTransform" }
+                            .Select(tn => typeof(Av1EncodeSpeed).Assembly.GetType(tn)!.GetField(name,
+                                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public))
+                            .First(x => x != null)!;
+                        statics.Add((sf, sf.GetValue(null)));
+                        sf.SetValue(null, Convert.ChangeType(kv.Split('=')[1], sf.FieldType, System.Globalization.CultureInfo.InvariantCulture));
+                    }
+                    Av1EncodeSpeed.TestOverride = speedKv.Count > 0 ? sp =>
+                    {
+                        foreach (var kv in speedKv)
                         {
                             var f = typeof(Av1EncodeSpeed).GetField(kv.Split('=')[0])!;
                             f.SetValue(sp, Convert.ChangeType(kv.Split('=')[1], f.FieldType, System.Globalization.CultureInfo.InvariantCulture));
@@ -2022,12 +2072,18 @@ public sealed class Av1HbdVerify
                     var gcPause0 = GC.GetTotalPauseDuration(); long alloc0 = GC.GetTotalAllocatedBytes(true);
                     // PROBE_ALLOC=1: sampled allocation volume by type (GCAllocationTick, ~100 KB per sample).
                     using var allocL = Environment.GetEnvironmentVariable("PROBE_ALLOC") == "1" ? new AllocTypeListener() : null;
+                    var phases = new System.Text.StringBuilder();
+                    if (Environment.GetEnvironmentVariable("PROBE_PHASES") == "1")
+                        SharpImage.Formats.Av1.Av1StillImageEncoder.PhaseHook = (nm, ms) => { lock (phases) phases.Append($" {nm} {ms:F1}"); };
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     byte[] outB = HeifCoder.EncodeAvif(img, eo);
                     if (allocL != null) log.Append(allocL.Report());
+                    SharpImage.Formats.Av1.Av1StillImageEncoder.PhaseHook = null;
+                    if (phases.Length > 0) log.AppendLine("  phases" + phases);
                     double secs = sw.Elapsed.TotalSeconds;
                     double gcMs = (GC.GetTotalPauseDuration() - gcPause0).TotalMilliseconds; long allocMb = (GC.GetTotalAllocatedBytes(true) - alloc0) >> 20;
                     Av1EncodeSpeed.TestOverride = null;
+                    foreach (var (sf, old) in statics) sf.SetValue(null, old);
                     File.WriteAllBytes(t[2], outB);
                     log.AppendLine($"encq {Path.GetFileName(t[2])} {outB.Length} {secs:F3} gc {gcMs:F1}ms alloc {allocMb}MB");
                     continue;

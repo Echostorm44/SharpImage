@@ -607,7 +607,14 @@ internal static class Av1ObuWriter
     /// superblocks, coded as a single tile (uniform spacing, log2 tile dims 0). <paramref name="monochrome"/>
     /// selects whether the U/V quant-delta bits are emitted. <paramref name="txModeSelect"/> enables per-block
     /// tx-size signalling (TX_MODE_SELECT) — the encoder must then code a tx_depth symbol per block.</summary>
-    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef, int lfLevel = 0, bool screenContentTools = false, bool reducedTxSet = true)
+    /// <summary>Deblocking levels: luma vertical / horizontal edges, U, V (loop_filter_level[0..3]). An int converts to
+    /// the same level everywhere. Chroma levels are only coded when a luma level is nonzero.</summary>
+    internal readonly record struct LfLevels(int Y0, int Y1, int U, int V)
+    {
+        public static implicit operator LfLevels(int level) => new(level, level, level, level);
+    }
+
+    internal static byte[] WriteFrameHeaderPayload(int baseQIdx, bool isObuFrame, int sbCols, int sbRows, bool monochrome, bool txModeSelect, CdefParams cdef, LfLevels lfLevel = default, bool screenContentTools = false, bool reducedTxSet = true)
     {
         if (baseQIdx < 0 || baseQIdx > 255)
         {
@@ -696,13 +703,13 @@ internal static class Av1ObuWriter
         // loop_filter_params (not lossless, not intrabc). A single deblocking level is applied to both Y edges
         // (and, for colour, to U/V); level 0 = filter off. Deblocking is post-reconstruction and does not feed
         // intra prediction, so signalling a level never changes the coded tile — only the decoded output.
-        uint lf = (uint)Math.Clamp(lfLevel, 0, 63);
-        w.PutBits(lf, 6);         // loop_filter_level[0]
-        w.PutBits(lf, 6);         // loop_filter_level[1]
-        if (lf != 0 && !monochrome)
+        uint ly0 = (uint)Math.Clamp(lfLevel.Y0, 0, 63), ly1 = (uint)Math.Clamp(lfLevel.Y1, 0, 63);
+        w.PutBits(ly0, 6);        // loop_filter_level[0]
+        w.PutBits(ly1, 6);        // loop_filter_level[1]
+        if ((ly0 | ly1) != 0 && !monochrome)
         {
-            w.PutBits(lf, 6);     // loop_filter_level[2] (U) — read only when level[0]|level[1] and NumPlanes>1
-            w.PutBits(lf, 6);     // loop_filter_level[3] (V)
+            w.PutBits((uint)Math.Clamp(lfLevel.U, 0, 63), 6);   // loop_filter_level[2] (U) — read only when level[0]|level[1] and NumPlanes>1
+            w.PutBits((uint)Math.Clamp(lfLevel.V, 0, 63), 6);   // loop_filter_level[3] (V)
         }
         w.PutBits((uint)t_sharpness, 3);   // loop_filter_sharpness (AvifEncodeOptions.Sharpness, avifenc -a sharpness=S)
         w.PutBool(false);         // loop_filter_delta_enabled = 0
