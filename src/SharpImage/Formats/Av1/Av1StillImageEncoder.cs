@@ -113,6 +113,18 @@ internal sealed class Av1EncodeSpeed
     /// <summary>libaom allintra (every speed): a 16x16+ block holding a near-flat 4x4 (log variance &lt; 0.272) and a much
     /// busier one (spread &gt; 3) is not coded whole (NONE pruned), so ringing does not spread into the flat part.</summary>
     public bool ForceSplitVar;
+    /// <summary>The luma winner's mode is always a chroma RD candidate (libaom prune_chroma_modes_using_luma_winner keeps
+    /// it); RectScreenContent: rectangular partitions stay searched for screen content when UseRectPartition is off
+    /// (libaom prunes rect by qindex only for camera content).</summary>
+    public bool UvLumaWinner = true, RectScreenContent;
+    /// <summary>libaom VAR_BASED_PARTITION for key frames (allintra speed 7+) in the estimate path: the variance of 4x4
+    /// source averages decides NONE / SPLIT per 32x32 / 16x16 block against q-scaled thresholds (64x64 always split,
+    /// 8x8 the minimum) — no transforms.</summary>
+    public bool VarPartition;
+    /// <summary>Joint tx-size search: at the split depths the next-best prescreened luma modes (up to this many) are
+    /// also tried, each paying its own mode symbol, so a mode that only wins with smaller transforms can be chosen
+    /// (libaom searches tx size inside the mode decision).</summary>
+    public int TxDepthAltModes;
     /// <summary>libaom nonrd intra mode masks (allintra speed 8+, intra_y_mode_bsize_mask_nrd): DC / H / V below 32x32,
     /// DC only from 32x32 — for the partition estimate (EstimateNrdModes) and the leaf mode prescreen (LeafNrdModes).</summary>
     public bool EstimateNrdModes, LeafNrdModes;
@@ -225,7 +237,9 @@ internal sealed class Av1EncodeSpeed
         // 9+: libaom's nonrd intra mode masks (DC/H/V below 32x32, DC above) for the partition estimate and the leaf
         // prescreen: scoreboard s10 -9.31% x1.49 -> -9.50% x1.27.
         if (speed >= 9) { p.EstimateNrdModes = true; p.LeafNrdModes = true; }
-        if (speed >= 10) p.UseCfl = false;
+        // 9+: no HOG pruning (the nonrd masks leave only V / H directional; s9 x1.30 -> x1.15); 10: DC / CfL chroma only.
+        if (speed >= 9) { p.HogLevel = 0; p.HogChromaLevel = 0; }
+        if (speed >= 10) { p.UseCfl = false; p.UseUvModeSearch = false; }
         TestOverride?.Invoke(p);
         return p;
     }
@@ -622,6 +636,67 @@ internal static partial class Av1StillImageEncoder
 
     private static bool NrdModeAllowed(Av1IntraPredMode mode, int n)
         => mode == Av1IntraPredMode.Dc || (n < 32 && mode is Av1IntraPredMode.Vertical or Av1IntraPredMode.Horizontal);
+
+    // libaom choose_var_based_partitioning for a key frame (64x64 superblock): leaves are 4x4 source averages minus 128
+    // (fill_variance_4x4avg), a node's variance = 256 * (sse - sum^2 / n) / n over its leaves (get_variance); a 16x16
+    // over thresholds[3] forces the split of itself and its parents, a 32x32 over thresholds[2] likewise, 64x64 always
+    // splits, and a block below its threshold is kept whole (set_vt_partitioning).
+    private static int VarPartitionChoice(ColorPartCtx c, int bl, int bx4, int by4)
+    {
+        if (bl <= 1) return 3;
+        int sbKey = ((by4 >> 4) << 16) | (bx4 >> 4);
+        int sx4 = bx4 & ~15, sy4 = by4 & ~15, sh = Bd - 8;
+        if (c.VbpSb != sbKey)
+        {
+            for (int j = 0; j < 16; j++)
+                for (int i = 0; i < 16; i++)
+                {
+                    int x0 = (sx4 + i) * 4, y0 = (sy4 + j) * 4, s = 0;
+                    if (sx4 + i < c.Bw4 && sy4 + j < c.Bh4)
+                        for (int y = 0; y < 4; y++)
+                            for (int x = 0; x < 4; x++) s += c.Luma[(y0 + y) * c.W + x0 + x] >> sh;
+                    c.VbpAvg[j * 16 + i] = sx4 + i < c.Bw4 && sy4 + j < c.Bh4 ? ((s + 8) >> 4) - 128 : 0;
+                }
+            c.VbpSb = sbKey;
+        }
+        long Var(int ox, int oy, int n)   // n x n leaves at (ox, oy) of the superblock
+        {
+            long sum = 0, sse = 0;
+            for (int j = 0; j < n; j++)
+                for (int i = 0; i < n; i++) { long v = c.VbpAvg[(oy + j) * 16 + ox + i]; sum += v; sse += v * v; }
+            int log2 = 2 * System.Numerics.BitOperations.Log2((uint)n);
+            return (256 * (sse - ((sum * sum) >> log2))) >> log2;
+        }
+        long baseT = 120L * (c.AcDq >> sh);
+        bool below720p = (long)c.Bw4 * c.Bh4 * 16 < 1280 * 720;
+        long th2 = below720p ? baseT / 3 : baseT >> 2, th3 = below720p ? baseT >> 1 : baseT >> 2;
+        int ox = bx4 & 15, oy = by4 & 15;
+        if (bl == 2)
+        {
+            for (int q = 0; q < 4; q++) if (Var(ox + (q & 1) * 4, oy + (q >> 1) * 4, 4) > th3) return 3;
+            long v = Var(ox, oy, 8);
+            return v < th2 ? 0 : 3;
+        }
+        if (bl == 3) return Var(ox, oy, 4) < th3 ? 0 : 3;
+        return 0;
+    }
+
+    // UvLumaWinner: appends the luma winner's (mode, delta) to the chroma RD list when the prescreen dropped it; returns the
+    // list length (the entries before the first unused slot, plus the appended one).
+    private static int AddUvLumaWinner(Span<int> idx, Span<long> cost, Av1IntraPredMode yMode, int yDelta, bool uvAngleOk)
+    {
+        int n = 0;
+        while (n < idx.Length - 1 && cost[n] != long.MaxValue) n++;
+        if (!Sp.UvLumaWinner || yMode == Av1IntraPredMode.Dc || yMode > Av1IntraPredMode.Paeth) return n;
+        int d = uvAngleOk && IsDirectional(yMode) ? yDelta : 0, wi = -1;
+        var cm = CandidateModes;
+        for (int i = 0; i < cm.Length && wi < 0; i++) if (cm[i].Mode == yMode && cm[i].Delta == d) wi = i;
+        for (int i = 0; i < cm.Length && wi < 0; i++) if (cm[i].Mode == yMode && cm[i].Delta == 0) wi = i;
+        if (wi < 0) return n;
+        for (int i = 0; i < n; i++) if (idx[i] == wi) return n;
+        idx[n] = wi; cost[n] = 0;
+        return n + 1;
+    }
 
     // libaom av1_derived_filter_intra_mode_used_flag: FILTER_DC plus the filter mode of the best regular mode so far
     // (FILTER_V / H / D157 / PAETH for V / H / D157 / Paeth).
@@ -1326,6 +1401,8 @@ internal static partial class Av1StillImageEncoder
         public readonly List<Av1MsacWriter.LogOp>?[] NoneLogPool = new List<Av1MsacWriter.LogOp>?[6];
         public readonly double[] LogVar4 = new double[256];   // log1p(var / 16) of each 4x4 of the superblock LogVarSb
         public int LogVarSb = -1;
+        public readonly int[] VbpAvg = new int[256];   // 4x4 source averages - 128 (8-bit scale) of the superblock VbpSb
+        public int VbpSb = -1;
         public Av1PartitionCnn.SbOutput? Cnn;   // intra CNN partition features of the superblock CnnSb
         public int CnnSb = -1;
         public int EstCacheSb = -1, EstCacheDc, EstCacheAc;
@@ -1678,7 +1755,8 @@ internal static partial class Av1StillImageEncoder
         // 16x8/8x16 luma + 8x4/4x8 chroma — both ≤16 per axis, so the matched rect transform applies and there is
         // no sub-8x8 chroma corner case).
         int choice = 0;
-        if (bl < 4 && fullyInside)
+        if (Sp.VarPartition && bl < 4 && fullyInside) choice = VarPartitionChoice(c, bl, bx4, by4);
+        else if (bl < 4 && fullyInside)
         {
             long costNone = c.EstCost(bl, bx4, by4);
             long costSplit = c.EstCost(bl + 1, bx4, by4) + c.EstCost(bl + 1, bx4 + hsz, by4)
@@ -1962,7 +2040,7 @@ internal static partial class Av1StillImageEncoder
         cands[nc++] = 0;
         if (bl < 4) cands[nc++] = 3;   // SPLIT (at 8x8 only with UseSplit4x4, below)
         // Sub-8x8 HORZ/VERT use 4:2:0 shared chroma (EncodeSub8Pair), so they stay 4:2:0-only for now.
-        bool rectHere = fullyInside && (((bl == 2 || bl == 3 || (bl == 1 && i420 && UsePartition64)) && UseRectPartition)
+        bool rectHere = fullyInside && (((bl == 2 || bl == 3 || (bl == 1 && i420 && UsePartition64)) && (UseRectPartition || (Sp.RectScreenContent && c.ScreenContent)))
             || (bl == 4 && UseSub8Partition && (i420 || c.Layout == Av1PixelLayout.I444)));
         // 4:2:2 forbids every tall (h = 2w) leaf: its chroma would be 1:4 (get_plane_residual_size == BLOCK_INVALID),
         // so VERT, VERT_A/B and VERT_4 are never emitted there (spec conformance requirement; dav1d table has 0).
@@ -2449,14 +2527,40 @@ internal static partial class Av1StillImageEncoder
             int txNsym = Math.Min((int)maxTDim.Max, 2);
             var snap = SnapshotRd(c, bx4, by4, blk4, Pooled(c, bl * 3 + 2));
             long txBestJ = long.MaxValue;
+            int ymA = Av1Tables.IntraModeContext[c.AModeY[bxR]], ymL = Av1Tables.IntraModeContext[c.LModeY[byR]];
+            double ModeBits(Av1IntraPredMode m, int dl) => Av1CoeffEncode.SymBits(c.Cdf.GetKfYModeCdf(ymA, ymL), (int)m)
+                + (IsDirectional(m) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)m - (int)Av1IntraPredMode.Vertical), dl + 3) : 0)
+                + (filterEligible && m == Av1IntraPredMode.Dc ? Av1CoeffEncode.SymBits(c.Cdf.GetFilterIntraCdf((Av1BlockSize)bs), 0) : 0);
+            // the winner's own mode bits (only compared across modes, so a filter winner keeps its flag cost out)
+            double winModeBits = isFilter ? 0 : ModeBits(yMode, yDelta);
+            (Av1IntraPredMode M, int D) alt = (yMode, yDelta);
             for (int d = 0; d <= maxDepth; d++)
             {
                 var (_, _, bitsT) = ReconstructLumaAtDepth(c, bx4, by4, blk4, n, tx, ReduceTx(tx, d), d,
                     yMode, yDelta, yModeNoFilt, yC, yInv, yTxIdx, edgeFlags, bs);
                 double txSizeBits = Av1CoeffEncode.SymBits(txSzCdf, Math.Min(d, txNsym));
-                long j = LumaBlockSse(c, bx, by, n) + (long)(lambda * (bitsT + txSizeBits));
-                if (j < txBestJ) { txBestJ = j; depth = d; }
+                long j = LumaBlockSse(c, bx, by, n) + (long)(lambda * (bitsT + txSizeBits + winModeBits));
+                if (j < txBestJ) { txBestJ = j; depth = d; alt = (yMode, yDelta); }
                 RestoreRd(c, snap, bx4, by4, blk4);
+                if (d == 0 || isFilter) continue;
+                // joint: the other prescreened modes at this split depth
+                for (int k = 0, tried = 0; k < t_topModeCount && tried < Sp.TxDepthAltModes; k++)
+                {
+                    var (m, dl) = CandidateModes[t_topModes[k]];
+                    if (m == yMode && dl == yDelta) continue;
+                    tried++;
+                    var (_, _, bitsA) = ReconstructLumaAtDepth(c, bx4, by4, blk4, n, tx, ReduceTx(tx, d), d,
+                        m, dl, (int)m, yC, yInv, yTxIdx, edgeFlags, bs);
+                    long ja = LumaBlockSse(c, bx, by, n) + (long)(lambda * (bitsA + txSizeBits + ModeBits(m, dl)));
+                    if (ja < txBestJ) { txBestJ = ja; depth = d; alt = (m, dl); }
+                    RestoreRd(c, snap, bx4, by4, blk4);
+                }
+            }
+            if (alt.M != yMode || alt.D != yDelta)
+            {
+                // a split depth won with another mode: it becomes the leaf's mode
+                yMode = alt.M; yDelta = alt.D; isFilter = false;
+                yModeSym = (int)yMode; yModeNoFilt = (int)yMode;
             }
         }
         int lumaTx = ReduceTx(tx, depth);
@@ -2576,8 +2680,8 @@ internal static partial class Av1StillImageEncoder
             var pu = new ushort[cn * cn]; var pv = new ushort[cn * cn];
 
             // SAD prescreen on U (SATD's 8x8 tiling overflows the 4x4 chroma case), then full RD on the best few.
-            Span<int> topIdx = stackalloc int[RdUvCandidates];
-            Span<long> topCost = stackalloc long[RdUvCandidates];
+            Span<int> topIdx = stackalloc int[RdUvCandidates + 1];
+            Span<long> topCost = stackalloc long[RdUvCandidates + 1];
             topCost.Fill(long.MaxValue);
             uint hogUv = uvAngleOk ? HogSkipMask(c.U, c.Cw, cbx, cby, cn, cn, (c.Bw4 * 4) >> 1, (c.Bh4 * 4) >> 1, Sp.HogChromaLevel, 4) : 0;
             for (int ci = 0; ci < CandidateModes.Length; ci++)
@@ -2591,7 +2695,8 @@ internal static partial class Av1StillImageEncoder
                 for (int k = 0; k < RdUvCandidates; k++)
                     if (sad < topCost[k]) { for (int j = RdUvCandidates - 1; j > k; j--) { topCost[j] = topCost[j - 1]; topIdx[j] = topIdx[j - 1]; } topCost[k] = sad; topIdx[k] = ci; break; }
             }
-            for (int t = 0; t < RdUvCandidates; t++)
+            int uvN = AddUvLumaWinner(topIdx, topCost, yMode, yDelta, uvAngleOk);
+            for (int t = 0; t < uvN; t++)
             {
                 if (topCost[t] == long.MaxValue) break;
                 (Av1IntraPredMode mode, int delta) = CandidateModes[topIdx[t]];
@@ -3375,8 +3480,8 @@ internal static partial class Av1StillImageEncoder
             int bDimW = Av1Tables.BlockDimensions[lumaBs, 2], bDimH = Av1Tables.BlockDimensions[lumaBs, 3];
             bool uvAngleOk = bDimW + bDimH >= 2;
             var pu = new ushort[cw * ch]; var pv = new ushort[cw * ch];
-            Span<int> uvTopIdx = stackalloc int[RdUvCandidates];
-            Span<long> uvTopCost = stackalloc long[RdUvCandidates];
+            Span<int> uvTopIdx = stackalloc int[RdUvCandidates + 1];
+            Span<long> uvTopCost = stackalloc long[RdUvCandidates + 1];
             uvTopCost.Fill(long.MaxValue);
             uint hogUv = uvAngleOk ? HogSkipMask(c.U, c.Cw, cbx, cby, cw, ch, (c.Bw4 * 4) >> ssX, (c.Bh4 * 4) >> ssY, Sp.HogChromaLevel, (1 + ssX) * (1 + ssY)) : 0;
             for (int ci = 0; ci < CandidateModes.Length; ci++)
@@ -3391,7 +3496,8 @@ internal static partial class Av1StillImageEncoder
                 for (int k = 0; k < RdUvCandidates; k++)
                     if (sad < uvTopCost[k]) { for (int j = RdUvCandidates - 1; j > k; j--) { uvTopCost[j] = uvTopCost[j - 1]; uvTopIdx[j] = uvTopIdx[j - 1]; } uvTopCost[k] = sad; uvTopIdx[k] = ci; break; }
             }
-            for (int t = 0; t < RdUvCandidates; t++)
+            int uvN = AddUvLumaWinner(uvTopIdx, uvTopCost, yMode, yDelta, uvAngleOk);
+            for (int t = 0; t < uvN; t++)
             {
                 if (uvTopCost[t] == long.MaxValue) break;
                 (Av1IntraPredMode mode, int delta) = CandidateModes[uvTopIdx[t]];
@@ -3458,7 +3564,8 @@ internal static partial class Av1StillImageEncoder
                 }
             }
         // RDOQ of the chroma winner (as the square 4:2:0 leaf): the pre-quant floats re-derived with its tx kernel.
-        if (UseChromaRdoq && UseRdoq && uvPal == null)
+        // Not for 4:2:0 rectangles: their chroma blocks are small, and there it cost time for a slight loss.
+        if (UseChromaRdoq && UseRdoq && uvPal == null && c.Layout != Av1PixelLayout.I420)
         {
             var uvT = useCfl ? Av1TxType.DctDct : UvIntraTxType(chromaTx, uvMode);
             if (uvT is Av1TxType.DctDct or Av1TxType.AdstDct or Av1TxType.DctAdst or Av1TxType.AdstAdst)
@@ -5041,6 +5148,10 @@ internal static partial class Av1StillImageEncoder
 
     // J (pre-RDOQ) of the last ChooseLeafRdCore winner, for the palette comparison.
     [ThreadStatic] private static double t_leafJ;
+    // The last ChooseLeafRdCore prescreen's surviving candidates (CandidateModes indices, SATD order).
+    [ThreadStatic] private static int[]? t_topModesArr;
+    private static int[] t_topModes => t_topModesArr ??= new int[64];
+    [ThreadStatic] private static int t_topModeCount;
 
     // Per-thread scratch for the candidate reconstructions (the encoder's hottest loop): the coefficient buffer is
     // always all zero between calls — the inverse transform clears the region it consumed, as dav1d's does — so no
@@ -5150,6 +5261,9 @@ internal static partial class Av1StillImageEncoder
             }
         }
 
+        t_topModeCount = 0;
+        for (int t = 0; t < RdModeCandidates && t < t_topModes.Length; t++)
+            if (topCost[t] != long.MaxValue) t_topModes[t_topModeCount++] = topIdx[t];
         double best = double.MaxValue;
         double rdLambda = RdLambdaK * acDq * acDq;   // pixel-SSE units per bit (same λ as the palette RD gate)
         double rdoqLambda = RdoqLambdaScale * RdLambdaK * acDq * acDq;
