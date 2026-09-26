@@ -1983,6 +1983,49 @@ public sealed class Av1HbdVerify
                     log.AppendLine($"encdump {Path.GetFileName(t[2])} {w}x{h} bd{f.BitDepth} {avif.Length} bytes");
                     continue;
                 }
+                if (t[0] == "hdrinfo")
+                {
+                    // hdrinfo <avif...>: frame-header tool flags of each file's primary item (what an encoder turned on).
+                    foreach (var f in t.Skip(1))
+                    {
+                        var c = HeifContainer.Parse(File.ReadAllBytes(f));
+                        var dec = new Av1Decoder();
+                        using var yuv = dec.Decode(c.ItemData(c.PrimaryId)!, 0, true);
+                        var fh = dec.CurrentFrameHeader;
+                        log.AppendLine($"hdrinfo {Path.GetFileName(f)} sct={fh.AllowScreenContentTools} ibc={fh.AllowIntraBc} q={fh.QuantBaseQIdx} txmode={fh.TxMode} reduced={fh.ReducedTxSet} cdefbits={fh.CdefBits} lr={fh.LrType0}/{fh.LrType1} tiles={fh.TileCols}x{fh.TileRows}");
+                    }
+                    continue;
+                }
+                if (t[0] == "encq")
+                {
+                    // encq <src> <out.avif> <quality> <speed> <depth> <420|422|444|400> [Field=Value,...]: one still through the
+                    // public encoder (all threads), for the avifenc scoreboard; logs the encode wall time.
+                    var img = FormatRegistry.Read(t[1]);
+                    var eo = new AvifEncodeOptions
+                    {
+                        Quality = int.Parse(t[3]), Speed = int.Parse(t[4]), BitDepth = int.Parse(t[5]),
+                        ChromaSubsampling = t[6] switch
+                        {
+                            "444" => AvifChromaSubsampling.Yuv444, "422" => AvifChromaSubsampling.Yuv422,
+                            "400" => AvifChromaSubsampling.Yuv400, _ => AvifChromaSubsampling.Yuv420,
+                        },
+                    };
+                    Av1EncodeSpeed.TestOverride = t.Length > 7 ? sp =>
+                    {
+                        foreach (var kv in t[7].Split(',', StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            var f = typeof(Av1EncodeSpeed).GetField(kv.Split('=')[0])!;
+                            f.SetValue(sp, Convert.ChangeType(kv.Split('=')[1], f.FieldType, System.Globalization.CultureInfo.InvariantCulture));
+                        }
+                    } : null;
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    byte[] outB = HeifCoder.EncodeAvif(img, eo);
+                    double secs = sw.Elapsed.TotalSeconds;
+                    Av1EncodeSpeed.TestOverride = null;
+                    File.WriteAllBytes(t[2], outB);
+                    log.AppendLine($"encq {Path.GetFileName(t[2])} {outB.Length} {secs:F3}");
+                    continue;
+                }
                 if (t[0] == "timeenc" || t[0] == "timedec")
                 {
                     // timeenc <png> <out.avif> <quality> <reps> [speed]: best-of-reps wall time of HeifCoder.EncodeAvif (after a

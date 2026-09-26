@@ -94,6 +94,10 @@ internal sealed class Av1EncodeSpeed
     /// <summary>Monochrome images and alpha planes go through the colour encoder with its chroma switched off (every
     /// partition / mode / filter tool, row-parallel), instead of the older grey-only encoder.</summary>
     public bool MonoColorPath = true;
+    /// <summary>libaom's per-frame screen-content detection: when it fires, palette mode is searched and signalled.</summary>
+    public bool UseScreenContentDetection = true;
+    /// <summary>Screen detection on every other 16x16 block (libaom all-intra speed >= 3).</summary>
+    public bool FastScreenDetection;
     /// <summary>Loop restoration (Wiener / self-guided) search; LrSgrSets = self-guided parameter sets tried per unit.</summary>
     public bool UseLoopRestoration = true;
     public int LrSgrSets = 16;
@@ -128,7 +132,7 @@ internal sealed class Av1EncodeSpeed
         speed = Math.Clamp(speed, 0, 10);
         if (speed >= 1) { p.UseColorTxDepth = false; p.EarlyTermBits = 16; p.RdoqInSearch = false; p.RdUvCandidates = 6; }
         if (speed >= 2) { p.RdModeCandidates = 4; p.UseExtPartition = false; p.UseFilterIntra = false; p.EarlyTermBits = 32; p.UsePartition64 = false; }
-        if (speed >= 3) { p.UseRectPartition = false; p.EarlyTermBits = 64; }
+        if (speed >= 3) { p.UseRectPartition = false; p.EarlyTermBits = 64; p.FastScreenDetection = true; }
         // 4+: sub-8x8 leaves stay (worth ~4.5% here) with their luma modes prescreened to 4.
         if (speed >= 4) { p.RdModeCandidates = 2; p.Sub8ModeCandidates = 4; p.UseSplit4x4 = false; p.EarlyTermBits = 32; }
         if (speed >= 4) p.LrSgrSets = 8;
@@ -152,7 +156,7 @@ internal sealed class Av1EncodeSpeed
     }
 }
 
-internal static class Av1StillImageEncoder
+internal static partial class Av1StillImageEncoder
 {
     // Coding bit depth (8/10/12) for the current encode, set by BitDepthScope at every multi-superblock entry.
     // Thread-static: the encoder runs single-threaded per call but callers may encode different images on
@@ -529,9 +533,9 @@ internal static class Av1StillImageEncoder
     // legacyGray: the grey-only encoder (EncodeMultiSbTile) always selects tx sizes and uses the reduced tx set without
     // screen-content tools; the colour encoder (also for monochrome) signals what its speed preset uses.
     private static byte[] BuildFrameObu(int baseQIdx, int sbCols, int sbRows, bool monochrome, byte[] tile, Av1ObuWriter.CdefParams cdef, int lfLevel = 0,
-        bool legacyGray = false)
+        bool legacyGray = false, bool screenContent = false)
     {
-        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome, txModeSelect: legacyGray || UseColorTxDepth, cdef, lfLevel, screenContentTools: UsePalette && !legacyGray, reducedTxSet: legacyGray || !UseFullIntraTxSet);
+        byte[] frameHdr = Av1ObuWriter.WriteFrameHeaderPayload(baseQIdx, isObuFrame: true, sbCols, sbRows, monochrome, txModeSelect: legacyGray || UseColorTxDepth, cdef, lfLevel, screenContentTools: (UsePalette || screenContent) && !legacyGray, reducedTxSet: legacyGray || !UseFullIntraTxSet);
         var framePayload = new byte[frameHdr.Length + tile.Length];
         frameHdr.CopyTo(framePayload, 0);
         tile.CopyTo(framePayload.AsSpan(frameHdr.Length));
@@ -724,21 +728,37 @@ internal static class Av1StillImageEncoder
             && (long)width * height <= FilterSearchMaxPixels && !FilterPickFromQ;
         var (_, _, lrCols, lrRows) = Av1ObuWriter.TileLayout(sbCols, sbRows);
         var logs = lrOn || cdefSb ? new List<Av1MsacWriter.LogOp>[(lrCols.Length - 1) * (lrRows.Length - 1)] : null;
-        byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx, layout, logs);
+        // Screen content (libaom's per-frame detection): palette mode on, signalled in the frame header.
+        bool sct = UsePalette || (Sp.UseScreenContentDetection && DetectScreenContent(padY, pw, width, height, bitDepth, fast: Sp.FastScreenDetection));
+        byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx, layout, logs, sct);
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: mono, enableFilterIntra: UseFilterIntra, bitDepth: bitDepth, layout: layout, color: color);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
+        if (t_verifyRecon && t_lastRecon is { } lr)
+        {
+            var dp = DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, Av1ObuWriter.CdefParams.None, 0, screenContent: sct),
+                luma.ToArray(), u.ToArray(), v.ToArray(), width, height, cwIn, chIn, mono, keep: true, 1);
+            for (int pl = 0; pl < (mono ? 1 : 3); pl++)
+            {
+                int pw2 = pl == 0 ? width : cwIn, ph2 = pl == 0 ? height : chIn, rs = pl == 0 ? lr.W : lr.Cw, ds = dp!.Strides![pl];
+                for (int yy = 0; yy < ph2; yy++)
+                    for (int xx = 0; xx < pw2; xx++)
+                        if (lr.Planes[pl][yy * rs + xx] != dp.Planes![pl][yy * ds + xx])
+                            throw new InvalidOperationException($"encoder reconstruction differs from the decoder: plane {pl} ({xx},{yy}) " +
+                                $"encoder {lr.Planes[pl][yy * rs + xx]} decoder {dp.Planes[pl][yy * ds + xx]} ({width}x{height} {layout} q{baseQIdx})");
+            }
+        }
 
         // In-loop filter search (deblocking + CDEF); its winning decode feeds the loop-restoration search.
         ushort[] srcY = luma.ToArray(), srcU = u.ToArray(), srcV = v.ToArray();
         // With per-superblock CDEF the filter search only picks the deblocking level, and its winning (CDEF-free) decode
         // is the CDEF search's input.
         var (lfLevel, best, pic) = SearchColorFilters(seqObu, tile, baseQIdx, sbCols, sbRows, width, height,
-            srcY, srcU, srcV, cwIn, chIn, keepPicture: logs != null, deblockOnly: cdefSb, mono: mono);
+            srcY, srcU, srcV, cwIn, chIn, keepPicture: logs != null, deblockOnly: cdefSb, mono: mono, sct: sct);
         sbyte[]? cdefIdx = null;
         if (cdefSb)
         {
             // Per-superblock CDEF on the deblocked picture; replay the tiles with each superblock's cdef_idx.
-            var dpic = pic?.Noskip != null ? pic : DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, Av1ObuWriter.CdefParams.None, lfLevel),
+            var dpic = pic?.Noskip != null ? pic : DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, Av1ObuWriter.CdefParams.None, lfLevel, screenContent: sct),
                 srcY, srcU, srcV, width, height, cwIn, chIn, mono, keep: true, ThreadCount, noskip: true);
             int acDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1];
             ushort[]? cU = mono ? null : dpic?.Planes?[1], cV = mono ? null : dpic?.Planes?[2];
@@ -765,9 +785,9 @@ internal static class Av1StillImageEncoder
                 };
             }
         }
-        byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: mono, tile, best, lfLevel);
+        byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: mono, tile, best, lfLevel, screenContent: sct);
         if (lrOn && logs != null && TryLoopRestoration(seqCfg, seqObu, frameObu, logs, sbCols, sbRows, width, height, layout, monochrome: mono,
-                srcY, srcU, srcV, cwIn, chIn, baseQIdx, best, lfLevel, pic, cdefIdx) is { } withLr)
+                srcY, srcU, srcV, cwIn, chIn, baseQIdx, best, lfLevel, pic, cdefIdx, sct) is { } withLr)
             return withLr;
         return (seqObu, frameObu);
     }
@@ -832,7 +852,7 @@ internal static class Av1StillImageEncoder
     /// winner's decode (planes kept when asked) for the loop-restoration stage, or null when nothing was decoded.</summary>
     private static (int Lf, Av1ObuWriter.CdefParams Cdef, DecodedPicture? Pic) SearchColorFilters(byte[] seqObu, byte[] tile,
         int baseQIdx, int sbCols, int sbRows, int width, int height, ushort[] srcY, ushort[] srcU, ushort[] srcV, int cw, int ch,
-        bool keepPicture, bool deblockOnly = false, bool mono = false)
+        bool keepPicture, bool deblockOnly = false, bool mono = false, bool sct = false)
     {
         bool sizeOk = (long)width * height <= FilterSearchMaxPixels;
         bool dbOn = UseDeblockSearch && sizeOk, cdOn = UseCdefSearch && baseQIdx >= 64 && sizeOk && !deblockOnly;
@@ -854,7 +874,7 @@ internal static class Av1StillImageEncoder
             var pics = new DecodedPicture?[cands.Count];
             EvaluateAll(cands.Count, i =>
             {
-                pics[i] = DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, cands[i].Cdef, cands[i].Lf),
+                pics[i] = DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, cands[i].Cdef, cands[i].Lf, screenContent: sct),
                     srcY, srcU, srcV, width, height, cw, ch, mono, keep, Math.Max(1, ThreadCount / cands.Count), keepNoskip);
                 return pics[i]?.Sse ?? long.MaxValue;
             });
@@ -889,7 +909,7 @@ internal static class Av1StillImageEncoder
     private static (byte[] SeqObu, byte[] FrameObu)? TryLoopRestoration(in Av1ObuWriter.SeqConfig seqCfg, byte[] seqObu, byte[] frameObu,
         List<Av1MsacWriter.LogOp>[] logs, int sbCols, int sbRows, int width, int height, Av1PixelLayout layout, bool monochrome,
         ushort[] srcY, ushort[]? srcU, ushort[]? srcV, int cw, int ch, int baseQIdx, Av1ObuWriter.CdefParams cdef, int lfLevel,
-        DecodedPicture? pic = null, sbyte[]? cdefIdx = null)
+        DecodedPicture? pic = null, sbyte[]? cdefIdx = null, bool sct = false)
     {
         int acDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1];
         double lambda = RdLambdaK * acDq * acDq;
@@ -925,7 +945,7 @@ internal static class Av1StillImageEncoder
         using (Av1ObuWriter.UseRestoration(plan, i420))
         {
             seq2 = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
-            frame2 = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome, AssembleTileGroup(tiles), cdef, lfLevel);
+            frame2 = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome, AssembleTileGroup(tiles), cdef, lfLevel, screenContent: sct);
         }
         if (!LrVerify) return (seq2, frame2);
         using var yuv2 = new Av1Decoder { ApplyFilmGrain = false, MaxThreads = ThreadCount }.Decode([.. seq2, .. frame2], 0, isKeyframe: true);
@@ -1102,6 +1122,9 @@ internal static class Av1StillImageEncoder
         // context and the colour-prediction cache. APal* are per-SB128-column (like AModeY); LPal* reset per SB row.
         public byte[] APalSz = null!, LPalSz = null!;         // [32] palette size at each position (0 = none)
         public ushort[] APalCol = null!, LPalCol = null!;     // [32*8] palette colours at each position
+        public byte[] APalSzUv = null!, LPalSzUv = null!;     // chroma palette size / U colours (dav1d pal_sz_uv, pal[1])
+        public ushort[] APalColU = null!, LPalColU = null!;
+        public bool ScreenContent;     // allow_screen_content_tools: palette flags coded, palette searched
         public ushort[] Pred = new ushort[64 * 64];
         public ushort[] EstScratch = new ushort[64 * 64];
         // EstimateBlockCost is a pure function of the source block (source prediction) and the quantizers, and the
@@ -1132,8 +1155,9 @@ internal static class Av1StillImageEncoder
     /// decided after the tile (loop restoration).</summary>
     private static byte[] EncodeMultiSbColorTile(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> uPlane, ReadOnlySpan<ushort> vPlane,
         int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx, Av1PixelLayout layout,
-        List<Av1MsacWriter.LogOp>[]? tileLogs)
+        List<Av1MsacWriter.LogOp>[]? tileLogs, bool screenContent = false)
     {
+        screenContent |= UsePalette;
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
         var cdf = new Av1CdfContext();
         Av1CdfDefaults.InitializeDefault(cdf, qcat);
@@ -1173,14 +1197,15 @@ internal static class Av1StillImageEncoder
                 Msac = new Av1MsacWriter { Log = tileLogs != null ? new() : null }, Cdf = tcdf, Luma = lumaArr, U = uArr, V = vArr,
                 ReconY = reconY, ReconU = reconU, ReconV = reconV,
                 W = w, Cw = cw, Chh = chh, Bw4 = bw4, Bh4 = bh4, Layout = layout, SsX = ssX, SsY = ssY,
-                DcDq = dcDq, AcDq = acDq, Mono = mono,
+                DcDq = dcDq, AcDq = acDq, Mono = mono, ScreenContent = screenContent,
             };
             var abovePart = new byte[sb128Cols][];
             var aLY = FilledArray(sb128Cols); var aCU = FilledArray(sb128Cols); var aCV = FilledArray(sb128Cols);
             var aModeY = new byte[sb128Cols][]; var aSkip = new byte[sb128Cols][]; var aTxY = new sbyte[sb128Cols][];
             var aModeUv = new byte[sb128Cols][];
             var aPalSz = new byte[sb128Cols][]; var aPalCol = new ushort[sb128Cols][];
-            for (int i = 0; i < sb128Cols; i++) { abovePart[i] = new byte[16]; aModeY[i] = new byte[32]; aSkip[i] = new byte[32]; aTxY[i] = FilledSbyte(32, -1); aModeUv[i] = new byte[32]; aPalSz[i] = new byte[32]; aPalCol[i] = new ushort[32 * 8]; }
+            var aPalSzUv = new byte[sb128Cols][]; var aPalColU = new ushort[sb128Cols][];
+            for (int i = 0; i < sb128Cols; i++) { abovePart[i] = new byte[16]; aModeY[i] = new byte[32]; aSkip[i] = new byte[32]; aTxY[i] = FilledSbyte(32, -1); aModeUv[i] = new byte[32]; aPalSz[i] = new byte[32]; aPalCol[i] = new ushort[32 * 8]; aPalSzUv[i] = new byte[32]; aPalColU[i] = new ushort[32 * 8]; }
             SetTileWindow(colStart[tc] * 16, rowStart[tr] * 16, Math.Min(colStart[tc + 1] * 16, bw4),
                 Math.Min(rowStart[tr + 1] * 16, bh4), w, ssX, ssY);
             try
@@ -1190,14 +1215,14 @@ internal static class Av1StillImageEncoder
                     c.LeftPart = new byte[16]; c.LLY = Filled(32); c.LCU = Filled(32); c.LCV = Filled(32);
                     c.LModeY = new byte[32]; c.LSkip = new byte[32]; c.LTxY = FilledSbyte(32, -1);
                     c.LModeUv = new byte[32];
-                    c.LPalSz = new byte[32]; c.LPalCol = new ushort[32 * 8];
+                    c.LPalSz = new byte[32]; c.LPalCol = new ushort[32 * 8]; c.LPalSzUv = new byte[32]; c.LPalColU = new ushort[32 * 8];
                     for (int sbx = colStart[tc]; sbx < colStart[tc + 1]; sbx++)
                     {
                         int col = sbx >> 1;
                         c.AbovePart = abovePart[col]; c.ALY = aLY[col]; c.ACU = aCU[col]; c.ACV = aCV[col];
                         c.AModeY = aModeY[col]; c.ASkip = aSkip[col]; c.ATxY = aTxY[col];
                         c.AModeUv = aModeUv[col];
-                        c.APalSz = aPalSz[col]; c.APalCol = aPalCol[col];
+                        c.APalSz = aPalSz[col]; c.APalCol = aPalCol[col]; c.APalSzUv = aPalSzUv[col]; c.APalColU = aPalColU[col];
                         c.Msac.Mark((sby << 16) | sbx);
                         EncodePartitionColor(c, 1, sbx * 16, sby * 16);
                     }
@@ -1222,7 +1247,8 @@ internal static class Av1StillImageEncoder
             var aModeY = new byte[sb128Cols][]; var aSkip = new byte[sb128Cols][]; var aTxY = new sbyte[sb128Cols][];
             var aModeUv = new byte[sb128Cols][];
             var aPalSz = new byte[sb128Cols][]; var aPalCol = new ushort[sb128Cols][];
-            for (int i = 0; i < sb128Cols; i++) { abovePart[i] = new byte[16]; aModeY[i] = new byte[32]; aSkip[i] = new byte[32]; aTxY[i] = FilledSbyte(32, -1); aModeUv[i] = new byte[32]; aPalSz[i] = new byte[32]; aPalCol[i] = new ushort[32 * 8]; }
+            var aPalSzUv = new byte[sb128Cols][]; var aPalColU = new ushort[sb128Cols][];
+            for (int i = 0; i < sb128Cols; i++) { abovePart[i] = new byte[16]; aModeY[i] = new byte[32]; aSkip[i] = new byte[32]; aTxY[i] = FilledSbyte(32, -1); aModeUv[i] = new byte[32]; aPalSz[i] = new byte[32]; aPalCol[i] = new ushort[32 * 8]; aPalSzUv[i] = new byte[32]; aPalColU[i] = new ushort[32 * 8]; }
             var rowInit = new Av1CdfContext?[nRows];
             rowInit[0] = new Av1CdfContext();
             Av1CdfDefaults.InitializeDefault(rowInit[0]!, qcat);
@@ -1273,13 +1299,13 @@ internal static class Av1StillImageEncoder
                             Msac = new Av1MsacWriter { Log = new(), SymIndex = index }, Cdf = rcdf, Luma = lumaArr, U = uArr, V = vArr,
                             ReconY = reconY, ReconU = reconU, ReconV = reconV,
                             W = w, Cw = cw, Chh = chh, Bw4 = bw4, Bh4 = bh4, Layout = layout, SsX = ssX, SsY = ssY,
-                            DcDq = dcDq, AcDq = acDq, Mono = mono,
+                            DcDq = dcDq, AcDq = acDq, Mono = mono, ScreenContent = screenContent,
                         };
                         int sby = r0 + r;
                         c.LeftPart = new byte[16]; c.LLY = Filled(32); c.LCU = Filled(32); c.LCV = Filled(32);
                         c.LModeY = new byte[32]; c.LSkip = new byte[32]; c.LTxY = FilledSbyte(32, -1);
                         c.LModeUv = new byte[32];
-                        c.LPalSz = new byte[32]; c.LPalCol = new ushort[32 * 8];
+                        c.LPalSz = new byte[32]; c.LPalCol = new ushort[32 * 8]; c.LPalSzUv = new byte[32]; c.LPalColU = new ushort[32 * 8];
                         for (int k = 0; k < nCols; k++)
                         {
                             // the superblock above-right must be reconstructed (top-right edge, above contexts)
@@ -1288,7 +1314,7 @@ internal static class Av1StillImageEncoder
                             c.AbovePart = abovePart[col]; c.ALY = aLY[col]; c.ACU = aCU[col]; c.ACV = aCV[col];
                             c.AModeY = aModeY[col]; c.ASkip = aSkip[col]; c.ATxY = aTxY[col];
                             c.AModeUv = aModeUv[col];
-                            c.APalSz = aPalSz[col]; c.APalCol = aPalCol[col];
+                            c.APalSz = aPalSz[col]; c.APalCol = aPalCol[col]; c.APalSzUv = aPalSzUv[col]; c.APalColU = aPalColU[col];
                             c.Msac.Mark((sby << 16) | sbx);
                             EncodePartitionColor(c, 1, sbx * 16, sby * 16);
                             if (k + 1 == syncAfter && r + 1 < nRows)
@@ -1322,6 +1348,7 @@ internal static class Av1StillImageEncoder
             tiles[ti] = Av1MsacWriter.Replay(all, null, FreshCdfArrays(baseQIdx));
         }
 
+        if (t_verifyRecon) t_lastRecon = ([reconY, reconU, reconV], w, cw);
         if (Sp.RowMt)
         {
             for (int ti = 0; ti < tiles.Length; ti++) EncodeTileRowMt(ti);
@@ -1335,6 +1362,11 @@ internal static class Av1StillImageEncoder
         return AssembleTileGroup(tiles);
     }
 
+    /// <summary>Test hook (this thread's encodes): after coding, decode the tile without in-loop filters and require the
+    /// encoder's own reconstruction to match it sample for sample — the encoder predicts from exactly what a decoder
+    /// will have. A mismatch throws.</summary>
+    [ThreadStatic] internal static bool t_verifyRecon;
+    [ThreadStatic] private static (ushort[][] Planes, int W, int Cw)? t_lastRecon;
     // The CDF arrays (Av1CdfIndex order) of a fresh default tile context, to replay symbolic tile logs against.
     private static ushort[][] FreshCdfArrays(int baseQIdx)
     {
@@ -1586,6 +1618,7 @@ internal static class Av1StillImageEncoder
         public sbyte[] ATxY = null!, LTxY = null!;
         public byte[] APalSz = null!, LPalSz = null!; public ushort[] APalCol = null!, LPalCol = null!;
         public byte[] AModeUv = null!, LModeUv = null!;
+        public byte[] APalSzUv = null!, LPalSzUv = null!; public ushort[] APalColU = null!, LPalColU = null!;
     }
 
     // Snapshots reused per partition level (slot = level * 3 + k: the candidate loop's base and best, the leaf's
@@ -1631,6 +1664,8 @@ internal static class Av1StillImageEncoder
         s.APalSz = CopyInto(s.APalSz, c.APalSz); s.LPalSz = CopyInto(s.LPalSz, c.LPalSz);
         s.APalCol = CopyInto(s.APalCol, c.APalCol); s.LPalCol = CopyInto(s.LPalCol, c.LPalCol);
         s.AModeUv = CopyInto(s.AModeUv, c.AModeUv); s.LModeUv = CopyInto(s.LModeUv, c.LModeUv);
+        s.APalSzUv = CopyInto(s.APalSzUv, c.APalSzUv); s.LPalSzUv = CopyInto(s.LPalSzUv, c.LPalSzUv);
+        s.APalColU = CopyInto(s.APalColU, c.APalColU); s.LPalColU = CopyInto(s.LPalColU, c.LPalColU);
         return s;
     }
 
@@ -1653,6 +1688,8 @@ internal static class Av1StillImageEncoder
         Array.Copy(s.APalSz, c.APalSz, s.APalSz.Length); Array.Copy(s.LPalSz, c.LPalSz, s.LPalSz.Length);
         Array.Copy(s.APalCol, c.APalCol, s.APalCol.Length); Array.Copy(s.LPalCol, c.LPalCol, s.LPalCol.Length);
         Array.Copy(s.AModeUv, c.AModeUv, s.AModeUv.Length); Array.Copy(s.LModeUv, c.LModeUv, s.LModeUv.Length);
+        Array.Copy(s.APalSzUv, c.APalSzUv, s.APalSzUv.Length); Array.Copy(s.LPalSzUv, c.LPalSzUv, s.LPalSzUv.Length);
+        Array.Copy(s.APalColU, c.APalColU, s.APalColU.Length); Array.Copy(s.LPalColU, c.LPalColU, s.LPalColU.Length);
     }
 
     // SSE of the reconstructed block (luma + chroma) vs the source planes — the distortion term for true-RD.
@@ -1692,7 +1729,8 @@ internal static class Av1StillImageEncoder
         cands[nc++] = 0;
         if (bl < 4) cands[nc++] = 3;   // SPLIT (at 8x8 only with UseSplit4x4, below)
         // Sub-8x8 HORZ/VERT use 4:2:0 shared chroma (EncodeSub8Pair), so they stay 4:2:0-only for now.
-        bool rectHere = fullyInside && !UsePalette && (((bl == 2 || bl == 3 || (bl == 1 && i420 && UsePartition64)) && UseRectPartition) || (bl == 4 && UseSub8Partition && i420));
+        bool rectHere = fullyInside && (((bl == 2 || bl == 3 || (bl == 1 && i420 && UsePartition64)) && UseRectPartition)
+            || (bl == 4 && UseSub8Partition && (i420 || c.Layout == Av1PixelLayout.I444)));
         // 4:2:2 forbids every tall (h = 2w) leaf: its chroma would be 1:4 (get_plane_residual_size == BLOCK_INVALID),
         // so VERT, VERT_A/B and VERT_4 are never emitted there (spec conformance requirement; dav1d table has 0).
         bool vertOk = c.Layout != Av1PixelLayout.I422;
@@ -1995,7 +2033,29 @@ internal static class Av1StillImageEncoder
         // J = real recon SSE + λ·(real coef bits + tx_size symbol bits). The winner is then reconstructed for keeps.
         // (Replaces the old source-predicted estimate, which mismatched the recon-predicted coding path.)
         bool fullyInside = bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
-        int maxDepth = (UseColorTxDepth && HasNonZero(yC) && fullyInside) ? Math.Min((int)maxTDim.Max, 2) : 0;
+
+        // Luma palette (screen content): the colour map as predictor, residual coded as for DC; kept when its RD beats
+        // the regular choice (which then also pays has_palette_y = 0 when it is a DC block).
+        LumaPal? yPal = null;
+        bool palOk = c.ScreenContent && blk4 <= 16 && fullyInside;
+        if (palOk)
+        {
+            var ymCdfP = c.Cdf.GetKfYModeCdf(Av1Tables.IntraModeContext[c.AModeY[bxR]], Av1Tables.IntraModeContext[c.LModeY[byR]]);
+            int pSzC = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
+            int pCtxC = (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0);
+            double nonPalJ = t_leafJ + (yModeSym == (int)Av1IntraPredMode.Dc
+                ? RdLambdaK * c.AcDq * c.AcDq * Av1CoeffEncode.BoolBits(c.Cdf.GetPalYCdf(pSzC, pCtxC)[0], 0) : 0);
+            var pal = SearchLumaPalette(c, bs, tx, bx4, by4, n, n, ymCdfP);
+            if (pal != null && pal.J < nonPalJ)
+            {
+                yPal = pal;
+                yMode = Av1IntraPredMode.Dc; yDelta = 0; isFilter = false;
+                yModeSym = (int)Av1IntraPredMode.Dc; yModeNoFilt = (int)Av1IntraPredMode.Dc;
+                yC = pal.Coeffs; yInv = pal.Inv; yTxIdx = pal.Idx;
+                Array.Copy(pal.Pred, c.Pred, n * n);
+            }
+        }
+        int maxDepth = (UseColorTxDepth && HasNonZero(yC) && fullyInside && yPal == null) ? Math.Min((int)maxTDim.Max, 2) : 0;
         int depth = 0;
         if (maxDepth > 0)
         {
@@ -2024,62 +2084,6 @@ internal static class Av1StillImageEncoder
             yMode, yDelta, yModeNoFilt, yC, yInv, yTxIdx, edgeFlags, bs);
         bool lumaAllZero = depth == 0 ? !HasNonZero(yC) : lumaTxb!.TrueForAll(t => !HasNonZero(t.Cf));
 
-        // --- Palette (screen content): code this block as a luma palette when it wins RD. Eligible DC-sized
-        // blocks fully inside the frame with 2..8 distinct source colours are palette-representable LOSSLESSLY
-        // (skip, no residual), which beats lossy transform coding for flat/graphics content. Compare luma J:
-        // palette (SSE 0 + λ·palBits) vs the transform mode just chosen (its SSE + λ·coeff/mode bits).
-        if (UsePalette && blk4 <= 16 && fullyInside)
-        {
-            Span<byte> present = stackalloc byte[1 << Bd];
-            int palSz = 0; bool tooMany = false;
-            for (int yy = 0; yy < n && !tooMany; yy++)
-                for (int xx = 0; xx < n; xx++)
-                {
-                    int px = c.Luma[(by + yy) * c.W + bx + xx];
-                    if (present[px] == 0) { if (palSz == PaletteMaxColors) { tooMany = true; break; } present[px] = 1; palSz++; }
-                }
-            if (!tooMany && palSz >= 2)
-            {
-                var palColors = new ushort[8]; int pi = 0;
-                for (int v = 0; v < (1 << Bd); v++) if (present[v] != 0) palColors[pi++] = (ushort)v;
-                int stride = blk4 * 4;
-                var palIdx = new byte[stride * n];
-                for (int yy = 0; yy < n; yy++)
-                    for (int xx = 0; xx < n; xx++)
-                    {
-                        int px = c.Luma[(by + yy) * c.W + bx + xx];
-                        int k = 0; while (palColors[k] != px) k++;
-                        palIdx[yy * stride + xx] = (byte)k;
-                    }
-
-                long txSSE = 0;
-                for (int yy = 0; yy < n; yy++)
-                    for (int xx = 0; xx < n; xx++)
-                    { int d = c.ReconY[(by + yy) * c.W + bx + xx] - c.Luma[(by + yy) * c.W + bx + xx]; txSSE += (long)d * d; }
-                double txBits;
-                if (depth == 0)
-                {
-                    int ySign0 = Av1CoeffDecode.GetDcSignCtx(tx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
-                    txBits = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, tx, 0, (int)yMode, yC, 0, ySign0, yTxIdx);
-                }
-                else { txBits = 0; foreach (var tb in lumaTxb!) txBits += Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, tb.Cf, tb.SkipCtx, tb.SignCtx, tb.Idx); }
-                txBits += Av1CoeffEncode.SymBits(c.Cdf.GetKfYModeCdf(Av1Tables.IntraModeContext[c.AModeY[bxR]], Av1Tables.IntraModeContext[c.LModeY[byR]]), (int)yMode);
-
-                int szCtx = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
-                int palCtx = (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0);
-                double palBits = Av1CoeffEncode.SymBits(c.Cdf.GetPalYCdf(szCtx, palCtx), 1)
-                    + Av1CoeffEncode.SymBits(c.Cdf.GetPalSzCdf(0, szCtx), palSz - 2)
-                    + palSz * 8
-                    + EstimatePaletteIndexBits(c.Cdf.Mode, palIdx, palSz, n, n, blk4, blk4);
-                double lambda = RdLambdaK * c.AcDq * c.AcDq;
-                if (palBits * lambda < txSSE + txBits * lambda)
-                {
-                    EmitPaletteBlock(c, bx4, by4, blk4, bs, tx, n, palColors, palSz, palIdx, szCtx, palCtx, in maxTDim, cflAllowed, uvNsym);
-                    return;
-                }
-            }
-        }
-
         if (c.Mono)
         {
             // Monochrome: the colour syntax minus uv_mode / CfL / has_palette_uv / chroma coefficients.
@@ -2089,17 +2093,19 @@ internal static class Av1StillImageEncoder
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetKfYModeCdf(Av1Tables.IntraModeContext[c.AModeY[bxR]], Av1Tables.IntraModeContext[c.LModeY[byR]]), yModeSym, 12);
             if (IsDirectional(yMode))
                 c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
-            if (UsePalette && blk4 <= 16 && yMode == Av1IntraPredMode.Dc)
+            if (c.ScreenContent && blk4 <= 16 && yModeSym == (int)Av1IntraPredMode.Dc)
             {
                 int pSzCtx = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
                 int pCtx = (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0);
-                c.Msac.EncodeBoolAdapt(c.Cdf.GetPalYCdf(pSzCtx, pCtx), 0);
+                c.Msac.EncodeBoolAdapt(c.Cdf.GetPalYCdf(pSzCtx, pCtx), yPal != null ? 1u : 0u);
+                if (yPal != null) EmitLumaPaletteColors(c, yPal, bx4, by4, pSzCtx);
             }
-            if (filterEligible && (yMode == Av1IntraPredMode.Dc || isFilter))
+            if (filterEligible && yPal == null && (yMode == Av1IntraPredMode.Dc || isFilter))
             {
                 c.Msac.EncodeBoolAdapt(c.Cdf.GetFilterIntraCdf((Av1BlockSize)bs), (uint)(isFilter ? 1 : 0));
                 if (isFilter) c.Msac.EncodeSymbolAdapt(c.Cdf.GetFilterIntraModeCdf(), yDelta, 4);
             }
+            if (yPal != null) Av1CoeffEncode.EncodePaletteIndices(c.Msac, c.Cdf.Mode, yPal.Map, yPal.Size, n, n, blk4, blk4, isLuma: true);
             if (UseColorTxDepth && maxTDim.Max > (byte)Av1TxSize.Tx4x4)
             {
                 int txCtx = (c.LTxY[byR] >= maxTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= maxTDim.Lw ? 1 : 0);
@@ -2124,11 +2130,12 @@ internal static class Av1StillImageEncoder
             sbyte mLw = (sbyte)lTDim.Lw, mLh = (sbyte)lTDim.Lh;
             for (int i = 0; i < mW && bxR + i < 32; i++) { if (depth == 0) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)mSkip; c.ATxY[bxR + i] = mLw; c.APalSz[bxR + i] = 0; }
             for (int j = 0; j < mH && byR + j < 32; j++) { if (depth == 0) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)mSkip; c.LTxY[byR + j] = mLh; c.LPalSz[byR + j] = 0; }
+            FillPaletteCtx(c, bx4, by4, mW, mH, yPal, null);
             return;
         }
 
-        int dcU = DcPredict(c.ReconU, c.Cw, c.Chh, cbx, cby, cn, cn);
-        int dcV = DcPredict(c.ReconV, c.Cw, c.Chh, cbx, cby, cn, cn);
+        int dcU = ChromaDc(c, c.ReconU, cbx, cby, cn, cn);
+        int dcV = ChromaDc(c, c.ReconV, cbx, cby, cn, cn);
         int scanLenC = Av1Tables.Scans[ctx0].Length;
         var qfU = new double[scanLenC]; var qfV = new double[scanLenC];
         int[] uC = ForwardResidual(c.U, c.Cw, cbx, cby, cn, dcU, c.DcDq, c.AcDq, scanLenC, qfU);
@@ -2255,6 +2262,26 @@ internal static class Av1StillImageEncoder
             }
         }
 
+        // Chroma palette (screen content; uv_mode DC): one map over (u, v) pairs, coded residual on top.
+        UvPal? uvPal = null;
+        if (palOk)
+        {
+            foreach (var cp in UvPaletteCandidates(c, cbx, cby, cn, cn))
+            {
+                var qu = new double[scanLenC]; var qv = new double[scanLenC];
+                int[] uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cp.PredU, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qu);
+                int[] vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cp.PredV, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qv);
+                double j = ChromaReconSse(uu, ctx0, cn, c.DcDq, c.AcDq, cp.PredU, c.U, c.Cw, cbx, cby)
+                         + ChromaReconSse(vv, ctx0, cn, c.DcDq, c.AcDq, cp.PredV, c.V, c.Cw, cbx, cby)
+                         + clam0 * (CRate(uu, vv) + Av1CoeffEncode.SymBits(uvModeCdf, 0) + UvPaletteBits(c, cp, bx4, by4, bs, yPal != null, cn, cn));
+                if (j < bestJ)
+                {
+                    bestJ = j; uvPal = cp; uvMode = 0; uvDelta = 0; useCfl = false;
+                    uC = uu; vC = vv; qfU = qu; qfV = qv; predU = cp.PredU; predV = cp.PredV;
+                }
+            }
+        }
+
         // Chroma RDOQ: trim coefficients whose coding rate outweighs their (dq-scaled) distortion, the same
         // rate-distortion coefficient optimisation luma gets in the rect leaf. Chroma was previously left at
         // round-to-nearest quantisation, which over-codes it (measured 2-6 dB above luma at matched rate). Must
@@ -2294,24 +2321,32 @@ internal static class Av1StillImageEncoder
         // has_palette_y for every size-eligible block whose Y mode is DC, and — INDEPENDENTLY — has_palette_uv for
         // every such block whose UV mode is DC (not CfL). The size gate max(bw4,bh4)<=16 && bw4+bh4>=4 is always
         // true for the square leaf's 8x8..64x64, so only the per-plane DC condition matters.
-        if (UsePalette && blk4 <= 16)
+        if (c.ScreenContent && blk4 <= 16)
         {
             int pSzCtx = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
-            if (yMode == Av1IntraPredMode.Dc)
+            if (yModeSym == (int)Av1IntraPredMode.Dc)
             {
                 int pCtx = (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0);
-                c.Msac.EncodeBoolAdapt(c.Cdf.GetPalYCdf(pSzCtx, pCtx), 0);
+                c.Msac.EncodeBoolAdapt(c.Cdf.GetPalYCdf(pSzCtx, pCtx), yPal != null ? 1u : 0u);
+                if (yPal != null) EmitLumaPaletteColors(c, yPal, bx4, by4, pSzCtx);
             }
-            if (!useCfl && uvMode == 0) c.Msac.EncodeBoolAdapt(c.Cdf.GetPalUvCdf(0), 0);   // has_palette_uv only when UvMode==DC
+            if (!useCfl && uvMode == 0)   // has_palette_uv only when UvMode==DC
+            {
+                c.Msac.EncodeBoolAdapt(c.Cdf.GetPalUvCdf(yPal != null ? 1 : 0), uvPal != null ? 1u : 0u);
+                if (uvPal != null) EmitUvPaletteColors(c, uvPal, bx4, by4, pSzCtx);
+            }
         }
 
         // filter_intra: for DC-coded eligible blocks (no palette — always true on this non-palette leaf), emit
         // use_filter_intra + the filter mode, in the exact decode_b position (after palette flags, before tx_size).
-        if (filterEligible && (yMode == Av1IntraPredMode.Dc || isFilter))
+        if (filterEligible && yPal == null && (yMode == Av1IntraPredMode.Dc || isFilter))
         {
             c.Msac.EncodeBoolAdapt(c.Cdf.GetFilterIntraCdf((Av1BlockSize)bs), (uint)(isFilter ? 1 : 0));
             if (isFilter) c.Msac.EncodeSymbolAdapt(c.Cdf.GetFilterIntraModeCdf(), yDelta, 4);
         }
+        // palette colour-index maps (after filter_intra, before tx_size: dav1d decode_b order)
+        if (yPal != null) Av1CoeffEncode.EncodePaletteIndices(c.Msac, c.Cdf.Mode, yPal.Map, yPal.Size, n, n, blk4, blk4, isLuma: true);
+        if (uvPal != null) Av1CoeffEncode.EncodePaletteIndices(c.Msac, c.Cdf.Mode, uvPal.Map, uvPal.Size, cn, cn, cblk4, cblk4, isLuma: false);
 
         // tx_size (read_tx_size): coded for every intra block > 4x4 when tx_mode=SELECT — including skip blocks
         // (depth 0). Comes after all mode info, before residual, mirroring the decoder + grayscale path.
@@ -2370,6 +2405,7 @@ internal static class Av1StillImageEncoder
         for (int j = 0; j < yH && byR + j < 32; j++) { if (depth == 0) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; c.LPalSz[byR + j] = 0; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; c.AModeUv[cxR + i] = (byte)uvSym; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; c.LModeUv[cyR + j] = (byte)uvSym; }
+        FillPaletteCtx(c, bx4, by4, yW, yH, yPal, uvPal);
     }
 
     // Emits a fully-inside DC luma block as a palette block, in the decoder's exact order: skip=1, y_mode=DC,
@@ -2413,8 +2449,8 @@ internal static class Av1StillImageEncoder
                 c.ReconY[(by + yy) * c.W + bx + xx] = (ushort)palColors[palIdx[yy * stride + xx]];
         if (!c.Mono)
         {
-            int dcU = DcPredict(c.ReconU, c.Cw, c.Chh, cbx, cby, cn, cn);
-            int dcV = DcPredict(c.ReconV, c.Cw, c.Chh, cbx, cby, cn, cn);
+            int dcU = ChromaDc(c, c.ReconU, cbx, cby, cn, cn);
+            int dcV = ChromaDc(c, c.ReconV, cbx, cby, cn, cn);
             FillFlat(c.ReconU, c.Cw, cbx, cby, cn, dcU);
             FillFlat(c.ReconV, c.Cw, cbx, cby, cn, dcV);
         }
@@ -2594,6 +2630,16 @@ internal static class Av1StillImageEncoder
 
     private static void ClearTileWindow() => t_tileOn = false;
 
+    // Chroma DC prediction exactly as the decoder forms it: the intra edges clipped to the plane's 4-unit extent (tile
+    // end >> ss) and padded by replication — the encoder's reconstruction past the frame edge never feeds it.
+    [ThreadStatic] private static ushort[]? t_dcScratch;
+    private static int ChromaDc(ColorPartCtx c, ushort[] plane, int cbx, int cby, int w, int h)
+    {
+        var buf = t_dcScratch ??= new ushort[64 * 64];
+        PredictIntraRect(plane, c.Cw, c.Bw4 >> c.SsX, c.Bh4 >> c.SsY, cbx >> 2, cby >> 2, w, h, Av1IntraPredMode.Dc, 0, buf);
+        return buf[0];
+    }
+
     private static int DcPredictRect(ushort[] recon, int reconW, int bx, int by, int w, int h)
     {
         var tb = TileBounds4(reconW, int.MaxValue, int.MaxValue);
@@ -2710,6 +2756,10 @@ internal static class Av1StillImageEncoder
         var txSet = (fullHere && rectSymbolCoded) ? IntraTxTypesFull
                   : (rectSymbolCoded ? IntraTxTypes : DctOnly);
         int intraFlags = IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]);
+        // angle_delta is coded only from 8x8 up (bw4 + bh4 log2 >= 2); filter intra for DC blocks up to 32x32.
+        bool angleOk = Av1Tables.BlockDimensions[lumaBs, 2] + Av1Tables.BlockDimensions[lumaBs, 3] >= 2;
+        bool fiOk = UseFilterIntra && Math.Max(Av1Tables.BlockDimensions[lumaBs, 2], Av1Tables.BlockDimensions[lumaBs, 3]) <= 3;
+        var fiCdf = c.Cdf.GetFilterIntraCdf((Av1BlockSize)lumaBs);
 
         // Prescreen modes by cheap SATD (as the square leaf does) and RD-evaluate only the best few — the full
         // tx-type search is the hot loop; SATD tracks coded cost closely enough that the top handful holds the winner.
@@ -2728,8 +2778,12 @@ internal static class Av1StillImageEncoder
                 (Av1IntraPredMode mode, int delta) = CandidateModes[ci];
                 if (DbgLumaModeFilter != null && !DbgLumaModeFilter(mode, delta)) continue;
                 if (refine > 0 && (pass == 0 ? delta != 0 : delta == 0 || (dirMask >> (int)mode & 1) == 0)) continue;
+                if (delta != 0 && !angleOk) continue;
                 PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, intraFlags);
-                long satd = Satd8x8Rect(c.Luma, c.W, bx, by, pred, w, h);
+                long satd = 0;
+                if (w >= 8 && h >= 8) satd = Satd8x8Rect(c.Luma, c.W, bx, by, pred, w, h);
+                else   // sub-8x8 (4:4:4 sub-block leaves): SAD
+                    for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) satd += Math.Abs(c.Luma[(by + yy) * c.W + bx + xx] - pred[yy * w + xx]);
                 long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                     + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
                 long cost = satd + mb;
@@ -2750,7 +2804,8 @@ internal static class Av1StillImageEncoder
             for (int yy = 0; yy < h; yy++)
                 for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
-                + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
+                + (IsDirectional(mode) && angleOk ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)
+                + (fiOk && mode == Av1IntraPredMode.Dc ? Av1CoeffEncode.SymBits(fiCdf, 0) : 0);
             foreach (var (fwd, inv, idx) in txSet)
             {
                 if (fastTx && (pass == 0) != (inv == Av1TxType.DctDct)) continue;
@@ -2772,9 +2827,64 @@ internal static class Av1StillImageEncoder
             }
         }
 
+        // Filter intra: the 5 recursive-filter predictors, coded as y_mode=DC + use_filter_intra + filter_mode (the
+        // tx-type context is FilterModeToYMode; the neighbour mode context stays DC).
+        if (fiOk)
+        {
+            double flagBits = Av1CoeffEncode.SymBits(fiCdf, 1) + Av1CoeffEncode.SymBits(ymCdf, (int)Av1IntraPredMode.Dc);
+            for (int fm = 0; fm < 5; fm++)
+            {
+                PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, Av1IntraPredMode.Filter, fm, pred, edgeFlags, intraFlags);
+                for (int yy = 0; yy < h; yy++)
+                    for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
+                int ymnf = Av1Tables.FilterModeToYMode[fm];
+                double modeBits = flagBits + Av1CoeffEncode.SymBits(c.Cdf.GetFilterIntraModeCdf(), fm);
+                foreach (var (fwd, inv, idx) in txSet)
+                {
+                    int[] cf = Av1FwdTransform.ForwardQuantRect(resBuf, w, h, lumaTx, c.DcDq, c.AcDq, lScan, fwd, qfCand);
+                    bool oneD = inv == Av1TxType.VDct || inv == Av1TxType.HDct;
+                    double rate = (oneD
+                        ? Av1CoeffEncode.EstimateCoefBits1D(c.Cdf.Coef, c.Cdf.Mode, lumaTx, ymnf, inv, cf, 0, ySign)
+                        : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, ymnf, cf, 0, ySign, idx, fullSet: UseFullIntraTxSet)) + modeBits;
+                    double j = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, pred, c.Luma, c.W, bx, by, inv) + rectLambda * rate;
+                    if (Sp.RdoqInSearch && !oneD && j < best * Sp.RdoqSearchMargin)
+                    {
+                        Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, ymnf, cf, qfCand, c.DcDq, c.AcDq, 0, ySign, idx,
+                            RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                        rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, ymnf, cf, 0, ySign, idx, fullSet: UseFullIntraTxSet) + modeBits;
+                        j = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, pred, c.Luma, c.W, bx, by, inv) + rectLambda * rate;
+                    }
+                    if (j < best) { best = j; yC = cf; yMode = Av1IntraPredMode.Filter; yDelta = fm; yInv = inv; yTxIdx = idx; Array.Copy(pred, bestPred, h * w); Array.Copy(qfCand, qfWin, lScan); }
+                }
+            }
+        }
+
+        // Luma palette (screen content), as in the square leaf.
+        LumaPal? yPal = null;
+        bool palOk = c.ScreenContent && Math.Max(w4, h4) <= 16 && w4 + h4 >= 4 && bx4 + w4 <= c.Bw4 && by4 + h4 <= c.Bh4;
+        if (palOk)
+        {
+            int pSzC = Av1Tables.BlockDimensions[lumaBs, 2] + Av1Tables.BlockDimensions[lumaBs, 3] - 2;
+            int pCtxC = (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0);
+            double nonPalJ = best + (yMode is Av1IntraPredMode.Dc or Av1IntraPredMode.Filter ? rectLambda * Av1CoeffEncode.BoolBits(c.Cdf.GetPalYCdf(pSzC, pCtxC)[0], 0) : 0);
+            var pal = SearchLumaPalette(c, lumaBs, lumaTx, bx4, by4, w, h, ymCdf);
+            if (pal != null && pal.J < nonPalJ)
+            {
+                yPal = pal; yMode = Av1IntraPredMode.Dc; yDelta = 0;
+                yC = pal.Coeffs; yInv = pal.Inv; yTxIdx = pal.Idx;
+                Array.Copy(pal.Pred, bestPred, w * h);
+            }
+        }
+
+        // The coded y_mode symbol and neighbour context are DC for a filter block; its tx-type context is the
+        // filter's FilterModeToYMode.
+        bool isFilter = yMode == Av1IntraPredMode.Filter;
+        int yModeSym = isFilter ? (int)Av1IntraPredMode.Dc : (int)yMode;
+        int yModeNoFilt = isFilter ? Av1Tables.FilterModeToYMode[yDelta] : (int)yMode;
+
         // RDOQ-refine the winning luma coefficients (skipped for V_DCT/H_DCT: RdoqOptimize assumes the 2D scan).
-        if (yInv != Av1TxType.VDct && yInv != Av1TxType.HDct && !Sp.RdoqInSearch)
-            Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, yTxIdx,
+        if (yPal == null && yInv != Av1TxType.VDct && yInv != Av1TxType.HDct && !Sp.RdoqInSearch)
+            Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, yTxIdx,
                 RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
 
         // Reconstruct luma into ReconY now — CfL chroma prediction reads it (encoder-internal; independent of the
@@ -2787,12 +2897,16 @@ internal static class Av1StillImageEncoder
             int mSkip = HasNonZero(yC) ? 0 : 1;
             c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(c.ASkip[bxR] + c.LSkip[byR]), (uint)mSkip);
             if (mSkip == 0) c.Msac.Mark(CdefMarker(bx4, by4));
-            c.Msac.EncodeSymbolAdapt(ymCdf, (int)yMode, 12);
-            if (IsDirectional(yMode))
+            c.Msac.EncodeSymbolAdapt(ymCdf, yModeSym, 12);
+            if (IsDirectional(yMode) && angleOk)
                 c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
-            if (UseFilterIntra && yMode == Av1IntraPredMode.Dc &&
-                Math.Max(Av1Tables.BlockDimensions[lumaBs, 2], Av1Tables.BlockDimensions[lumaBs, 3]) <= 3)
-                c.Msac.EncodeBoolAdapt(c.Cdf.GetFilterIntraCdf((Av1BlockSize)lumaBs), 0);
+            EmitPaletteFlags(c, lumaBs, bx4, by4, w4, h4, yModeSym == (int)Av1IntraPredMode.Dc, uvDc: false, yPal);
+            if (fiOk && yPal == null && yModeSym == (int)Av1IntraPredMode.Dc)
+            {
+                c.Msac.EncodeBoolAdapt(fiCdf, isFilter ? 1u : 0u);
+                if (isFilter) c.Msac.EncodeSymbolAdapt(c.Cdf.GetFilterIntraModeCdf(), yDelta, 4);
+            }
+            if (yPal != null) Av1CoeffEncode.EncodePaletteIndices(c.Msac, c.Cdf.Mode, yPal.Map, yPal.Size, w, h, w4, h4, isLuma: true);
             ref readonly var mTDim = ref Av1Tables.TxfmDimensions[lumaTx];
             if (UseColorTxDepth && mTDim.Max > (byte)Av1TxSize.Tx4x4)
             {
@@ -2802,14 +2916,15 @@ internal static class Av1StillImageEncoder
             if (mSkip == 0)
             {
                 if (yInv == Av1TxType.VDct || yInv == Av1TxType.HDct)
-                    Av1CoeffEncode.EncodeCoefs1D(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, (int)yMode, yInv, yC, skipCtx: 0, dcSignCtx: ySign);
+                    Av1CoeffEncode.EncodeCoefs1D(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, yModeNoFilt, yInv, yC, skipCtx: 0, dcSignCtx: ySign);
                 else
-                    Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx, fullSet: UseFullIntraTxSet);
+                    Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx, fullSet: UseFullIntraTxSet);
             }
             int mW = Math.Min(w4, c.Bw4 - bx4), mH = Math.Min(h4, c.Bh4 - by4);
             sbyte mLw = (sbyte)mTDim.Lw, mLh = (sbyte)mTDim.Lh;
-            for (int i = 0; i < mW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)mSkip; c.ATxY[bxR + i] = mLw; }
-            for (int j = 0; j < mH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)mSkip; c.LTxY[byR + j] = mLh; }
+            for (int i = 0; i < mW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)mSkip; c.ATxY[bxR + i] = mLw; }
+            for (int j = 0; j < mH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)mSkip; c.LTxY[byR + j] = mLh; }
+            FillPaletteCtx(c, bx4, by4, mW, mH, yPal, null);
             return;
         }
 
@@ -2822,12 +2937,12 @@ internal static class Av1StillImageEncoder
             return;
         }
 
-        int dcU = DcPredictRect(c.ReconU, c.Cw, cbx, cby, cw, ch);
-        int dcV = DcPredictRect(c.ReconV, c.Cw, cbx, cby, cw, ch);
+        int dcU = ChromaDc(c, c.ReconU, cbx, cby, cw, ch);
+        int dcV = ChromaDc(c, c.ReconV, cbx, cby, cw, ch);
         int[] uC = ForwardResidualRectDc(c.U, c.Cw, cbx, cby, cw, ch, dcU, chromaTx, c.DcDq, c.AcDq, cScan);
         int[] vC = ForwardResidualRectDc(c.V, c.Cw, cbx, cby, cw, ch, dcV, chromaTx, c.DcDq, c.AcDq, cScan);
         double clam0 = RdLambdaK * c.AcDq * c.AcDq;
-        var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode);
+        var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, yModeSym);
         var dcuP = new ushort[cw * ch]; Array.Fill(dcuP, (ushort)Math.Clamp(dcU, 0, PixMax));
         var dcvP = new ushort[cw * ch]; Array.Fill(dcvP, (ushort)Math.Clamp(dcV, 0, PixMax));
 
@@ -2923,13 +3038,30 @@ internal static class Av1StillImageEncoder
                 }
             }
         }
+
+        // Chroma palette (screen content; uv_mode DC).
+        UvPal? uvPal = null;
+        if (palOk)
+            foreach (var cp in UvPaletteCandidates(c, cbx, cby, cw, ch))
+            {
+                int[] uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cp.PredU, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
+                int[] vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cp.PredV, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
+                double j = ReconSseCandRect(uu, chromaTx, cw, ch, c.DcDq, c.AcDq, cp.PredU, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
+                         + ReconSseCandRect(vv, chromaTx, cw, ch, c.DcDq, c.AcDq, cp.PredV, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
+                         + clam0 * (CRate(uu, vv) + Av1CoeffEncode.SymBits(uvModeCdf, 0) + UvPaletteBits(c, cp, bx4, by4, lumaBs, yPal != null, cw, ch));
+                if (j < bestJ)
+                {
+                    bestJ = j; uvPal = cp; uvMode = 0; uvDelta = 0; useCfl = false;
+                    uC = uu; vC = vv; predU = cp.PredU; predV = cp.PredV;
+                }
+            }
         int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
 
         int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
         c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), (uint)skip);
         if (skip == 0) c.Msac.Mark(CdefMarker(bx4, by4));
-        c.Msac.EncodeSymbolAdapt(ymCdf, (int)yMode, 12);
-        if (IsDirectional(yMode))
+        c.Msac.EncodeSymbolAdapt(ymCdf, yModeSym, 12);
+        if (IsDirectional(yMode) && angleOk)
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf((int)yMode - (int)Av1IntraPredMode.Vertical), yDelta + 3, 6);
         int uvSym = useCfl ? (int)Av1IntraPredMode.ChromaFromLuma : uvMode;
         c.Msac.EncodeSymbolAdapt(uvModeCdf, uvSym, uvNsym);
@@ -2937,11 +3069,16 @@ internal static class Av1StillImageEncoder
         else if (IsDirectional((Av1IntraPredMode)uvMode) &&
                  Av1Tables.BlockDimensions[lumaBs, 2] + Av1Tables.BlockDimensions[lumaBs, 3] >= 2)
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf(uvMode - (int)Av1IntraPredMode.Vertical), uvDelta + 3, 6);
+        EmitPaletteFlags(c, lumaBs, bx4, by4, w4, h4, yModeSym == (int)Av1IntraPredMode.Dc, uvDc: !useCfl && uvMode == 0, yPal, uvPal);
 
-        // filter_intra: rect leaves are all <=32x32, so a DC rect block must emit use_filter_intra (0 here).
-        if (UseFilterIntra && yMode == Av1IntraPredMode.Dc &&
-            Math.Max(Av1Tables.BlockDimensions[lumaBs, 2], Av1Tables.BlockDimensions[lumaBs, 3]) <= 3)
-            c.Msac.EncodeBoolAdapt(c.Cdf.GetFilterIntraCdf((Av1BlockSize)lumaBs), 0);
+        // filter_intra (DC-coded blocks up to 32x32 without a palette)
+        if (fiOk && yPal == null && yModeSym == (int)Av1IntraPredMode.Dc)
+        {
+            c.Msac.EncodeBoolAdapt(fiCdf, isFilter ? 1u : 0u);
+            if (isFilter) c.Msac.EncodeSymbolAdapt(c.Cdf.GetFilterIntraModeCdf(), yDelta, 4);
+        }
+        if (yPal != null) Av1CoeffEncode.EncodePaletteIndices(c.Msac, c.Cdf.Mode, yPal.Map, yPal.Size, w, h, w4, h4, isLuma: true);
+        if (uvPal != null) Av1CoeffEncode.EncodePaletteIndices(c.Msac, c.Cdf.Mode, uvPal.Map, uvPal.Size, cw, ch, cw >> 2, ch >> 2, isLuma: false);
 
         ref readonly var lTDim = ref Av1Tables.TxfmDimensions[lumaTx];
         if (UseColorTxDepth && lTDim.Max > (byte)Av1TxSize.Tx4x4)
@@ -2958,9 +3095,9 @@ internal static class Av1StillImageEncoder
             int uSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
             int vSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
             if (yInv == Av1TxType.VDct || yInv == Av1TxType.HDct)
-                Av1CoeffEncode.EncodeCoefs1D(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, (int)yMode, yInv, yC, skipCtx: 0, dcSignCtx: ySign);
+                Av1CoeffEncode.EncodeCoefs1D(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, yModeNoFilt, yInv, yC, skipCtx: 0, dcSignCtx: ySign);
             else
-                Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx, fullSet: UseFullIntraTxSet);
+                Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx, fullSet: UseFullIntraTxSet);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
             var uvTxR = UvIntraTxType(chromaTx, uvSym);
@@ -2976,10 +3113,31 @@ internal static class Av1StillImageEncoder
         int yW = Math.Min(w4, c.Bw4 - bx4), yH = Math.Min(h4, c.Bh4 - by4);
         int cW = Math.Min(cw4, (c.Bw4 - bx4 + ssX) >> ssX), cH = Math.Min(ch4, (c.Bh4 - by4 + ssY) >> ssY);
         sbyte txLw = (sbyte)lTDim.Lw, txLh = (sbyte)lTDim.Lh;
-        for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
-        for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
+        for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
+        for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; c.AModeUv[cxR + i] = (byte)uvSym; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; c.LModeUv[cyR + j] = (byte)uvSym; }
+        FillPaletteCtx(c, bx4, by4, yW, yH, yPal, uvPal);
+    }
+
+    // The has_palette flags the decoder reads (screen content, 8x8..64x64 extent; Y when y_mode is DC, UV when uv_mode
+    // is DC), with the palettes' sizes and colours when chosen.
+    private static void EmitPaletteFlags(ColorPartCtx c, int bs, int bx4, int by4, int w4, int h4, bool yDc, bool uvDc,
+        LumaPal? yp = null, UvPal? uvp = null)
+    {
+        if (!c.ScreenContent || Math.Max(w4, h4) > 16 || w4 + h4 < 4) return;
+        int szCtx = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
+        int bxR = bx4 & 31, byR = by4 & 31;
+        if (yDc)
+        {
+            c.Msac.EncodeBoolAdapt(c.Cdf.GetPalYCdf(szCtx, (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0)), yp != null ? 1u : 0u);
+            if (yp != null) EmitLumaPaletteColors(c, yp, bx4, by4, szCtx);
+        }
+        if (uvDc && !c.Mono)
+        {
+            c.Msac.EncodeBoolAdapt(c.Cdf.GetPalUvCdf(yp != null ? 1 : 0), uvp != null ? 1u : 0u);
+            if (uvp != null) EmitUvPaletteColors(c, uvp, bx4, by4, szCtx);
+        }
     }
 
     // Bit mask (by mode value) of the `top` directional modes (Vertical..VerticalLeft) with the lowest delta-0 prescreen cost.
@@ -3127,6 +3285,7 @@ internal static class Av1StillImageEncoder
         c.Msac.EncodeSymbolAdapt(uvModeCdf, uvMode, uvNsym);
         if (IsDirectional((Av1IntraPredMode)uvMode) && uvAngleOk)
             c.Msac.EncodeSymbolAdapt(c.Cdf.GetAngleDeltaCdf(uvMode - (int)Av1IntraPredMode.Vertical), uvDelta + 3, 6);
+        EmitPaletteFlags(c, lumaBs, bx4, by4, w4, h4, yMode == Av1IntraPredMode.Dc, uvDc: uvMode == 0);
         // (no filter_intra symbol: these leaves are 64 wide, above the 32x32 filter-intra limit)
 
         ref readonly var lTDim = ref Av1Tables.TxfmDimensions[lumaTx];
@@ -3168,6 +3327,7 @@ internal static class Av1StillImageEncoder
         for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { if (skip != 0) { c.ACU[cxR + i] = 0x40; c.ACV[cxR + i] = 0x40; } c.AModeUv[cxR + i] = (byte)uvMode; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { if (skip != 0) { c.LCU[cyR + j] = 0x40; c.LCV[cyR + j] = 0x40; } c.LModeUv[cyR + j] = (byte)uvMode; }
+        FillPaletteCtx(c, bx4, by4, yW, yH, null, null);
     }
 
     // CfL luma AC for 4:2:2 / 4:4:4 via the decoder's own Av1Reconstruction.ComputeCflAc, with the decoder's exact
@@ -3193,7 +3353,21 @@ internal static class Av1StillImageEncoder
     private static void EncodeSub8Pair(ColorPartCtx c, bool horz, int bx4, int by4, Span<ushort> partCdf, int nPart, int bx8, int by8, Av1EdgeNode node)
     {
         c.Msac.EncodeSymbolAdapt(partCdf, (int)(horz ? Av1BlockPartition.Horizontal : Av1BlockPartition.Vertical), nPart);
-        if (horz)
+        if (c.Layout == Av1PixelLayout.I444)
+        {
+            // 4:4:4: every sub-block codes its own chroma, so each is a regular (layout-generic) rect leaf.
+            if (horz)
+            {
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x4, TxIdx8x4, -1, bx4, by4, 2, 1, node.H0);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x4, TxIdx8x4, -1, bx4, by4 + 1, 2, 1, node.H1);
+            }
+            else
+            {
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs4x8, TxIdx4x8, -1, bx4, by4, 1, 2, node.V0);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs4x8, TxIdx4x8, -1, bx4 + 1, by4, 1, 2, node.V1);
+            }
+        }
+        else if (horz)
         {
             // two 8x4: top (by4, no chroma), bottom (by4+1, chroma over the 8x8)
             EncodeSub8Leaf(c, (int)Av1BlockSize.Bs8x4, TxIdx8x4, bx4, by4, 2, 1, false, node.H0);
@@ -3215,6 +3389,15 @@ internal static class Av1StillImageEncoder
     {
         c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
         const int bs = (int)Av1BlockSize.Bs4x4, tx = (int)Av1TxSize.Tx4x4;
+        if (c.Layout == Av1PixelLayout.I444)
+        {
+            EncodeRectLeafColor(c, bs, tx, -1, bx4, by4, 1, 1, Av1EdgeFlags.AllTrAndBl);
+            EncodeRectLeafColor(c, bs, tx, -1, bx4 + 1, by4, 1, 1, node.Split0);
+            EncodeRectLeafColor(c, bs, tx, -1, bx4, by4 + 1, 1, 1, node.Split1);
+            EncodeRectLeafColor(c, bs, tx, -1, bx4 + 1, by4 + 1, 1, 1, node.Split2);
+            FillPartCtx(c, 4, bx8, by8, 1, Av1BlockPartition.Split);
+            return;
+        }
         EncodeSub8Leaf(c, bs, tx, bx4, by4, 1, 1, false, Av1EdgeFlags.AllTrAndBl);
         EncodeSub8Leaf(c, bs, tx, bx4 + 1, by4, 1, 1, false, node.Split0);
         EncodeSub8Leaf(c, bs, tx, bx4, by4 + 1, 1, 1, false, node.Split1);
@@ -3318,8 +3501,8 @@ internal static class Av1StillImageEncoder
         ushort[] predU = null!, predV = null!;
         if (hasChroma)
         {
-            int dcU = DcPredictRect(c.ReconU, c.Cw, cbx, cby, 4, 4);
-            int dcV = DcPredictRect(c.ReconV, c.Cw, cbx, cby, 4, 4);
+            int dcU = ChromaDc(c, c.ReconU, cbx, cby, 4, 4);
+            int dcV = ChromaDc(c, c.ReconV, cbx, cby, 4, 4);
             uC = ForwardResidualRectDc(c.U, c.Cw, cbx, cby, 4, 4, dcU, chromaTx, c.DcDq, c.AcDq, cScan);
             vC = ForwardResidualRectDc(c.V, c.Cw, cbx, cby, 4, 4, dcV, chromaTx, c.DcDq, c.AcDq, cScan);
             predU = new ushort[16]; Array.Fill(predU, (ushort)Math.Clamp(dcU, 0, PixMax));
@@ -3455,6 +3638,7 @@ internal static class Av1StillImageEncoder
         sbyte txLw = (sbyte)lTDim.Lw, txLh = (sbyte)lTDim.Lh;
         for (int i = 0; i < w4 && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; c.APalSz[bxR + i] = 0; }
         for (int j = 0; j < h4 && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; c.LPalSz[byR + j] = 0; }
+        FillPaletteCtx(c, bx4, by4, Math.Min(w4, c.Bw4 - bx4), Math.Min(h4, c.Bh4 - by4), null, null);
         if (hasChroma) { byte s8u = (byte)uvMode; c.ACU[cxR] = cfU; c.ACV[cxR] = cfV; c.LCU[cyR] = cfU; c.LCV[cyR] = cfV; c.AModeUv[cxR] = s8u; c.LModeUv[cyR] = s8u; }
     }
 
@@ -4417,6 +4601,9 @@ internal static class Av1StillImageEncoder
         ushort[] src, int srcW, int srcBx, int srcBy, Av1TxType txType)
         => ReconSseCandRect(levels, tx, n, n, dcDq, acDq, predBlock, src, srcW, srcBx, srcBy, txType);
 
+    // J (pre-RDOQ) of the last ChooseLeafRdCore winner, for the palette comparison.
+    [ThreadStatic] private static double t_leafJ;
+
     // Per-thread scratch for the candidate reconstructions (the encoder's hottest loop): the coefficient buffer is
     // always all zero between calls — the inverse transform clears the region it consumed, as dav1d's does — so no
     // allocation or clearing is needed per candidate.
@@ -4590,6 +4777,7 @@ internal static class Av1StillImageEncoder
             }
         }
 
+        t_leafJ = best;
         // RDOQ-refine the winning coefficients (encoder-only; decoder reconstructs from these same levels).
         // Skipped for V_DCT/H_DCT winners: RdoqOptimize assumes the 2D scan/contexts (EncodeCoefs1D codes the
         // 1D scan), so its rate model doesn't apply — the deadzone-quantized 1D levels are coded as-is.

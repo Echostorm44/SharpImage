@@ -411,7 +411,7 @@ internal static class Av1CoeffEncode
         int prob = (s == 0 ? 32768 : icdf[s - 1]) - icdf[s];
         return BitCost[Math.Max(prob, 0)];
     }
-    private static double BoolBits(ushort f0, uint val) // f0 = Q15 prob of 0
+    internal static double BoolBits(ushort f0, uint val) // f0 = Q15 prob of 0
     {
         int prob = val == 0 ? f0 : 32768 - f0;
         return BitCost[Math.Clamp(prob, 0, 32768)];
@@ -1012,6 +1012,217 @@ internal static class Av1CoeffEncode
                 w.EncodeSymbolAdapt(modeCdf.ColorMap[cdfIdx], colorIdx, palSize - 1);
             }
         }
+    }
+
+    /// <summary>Chroma palette colours — the inverse of Av1CoeffDecode.DecodeChromaPalette. U (ascending) uses the same
+    /// neighbour cache as luma but its new colours are coded as non-negative deltas (no +1); V is coded either as
+    /// wrapping signed deltas (after a selector bit and width) or raw, whichever is fewer bits.</summary>
+    public static void EncodeChromaPaletteColors(Av1MsacWriter w, ushort[] u, ushort[] v, int palSz,
+        ReadOnlySpan<ushort> leftU, int leftPalSz, ReadOnlySpan<ushort> aboveU, int abovePalSz, int bitDepth)
+    {
+        int bpc = bitDepth, maxVal = (1 << bpc) - 1;
+        Span<ushort> cache = stackalloc ushort[16];
+        int nCache = MergeCache(cache, leftU, leftPalSz, aboveU, abovePalSz);
+        // U may repeat a value (pairs sharing U): a selected cache entry covers ONE palette entry; the rest are new.
+        Span<bool> taken = stackalloc bool[8];
+        int nUsed = 0;
+        for (int ci = 0; ci < nCache && nUsed < palSz; ci++)
+        {
+            int k = TakeOne(u, palSz, cache[ci], taken);
+            w.EncodeBoolEqui(k >= 0 ? 1u : 0u);
+            if (k >= 0) nUsed++;
+        }
+        Span<ushort> newPal = stackalloc ushort[8]; int nNew = 0;
+        for (int ci = 0; ci < palSz; ci++)
+            if (!taken[ci]) newPal[nNew++] = u[ci];
+        if (nNew > 0)
+        {
+            w.EncodeLiteral(newPal[0], bpc);
+            if (nNew > 1)
+            {
+                int b2 = ChooseDeltaBitsU(newPal, nNew, bpc, maxVal);
+                w.EncodeLiteral((uint)b2, 2);
+                int bits = bpc - 3 + b2, prev = newPal[0];
+                for (int i = 1; i < nNew; i++)
+                {
+                    int delta = newPal[i] - prev;
+                    w.EncodeLiteral((uint)delta, bits);
+                    prev = Math.Min(prev + delta, maxVal);
+                    if (prev >= maxVal) break;
+                    int ulog2 = 0, tmp = maxVal - prev;
+                    while (tmp > 1) { tmp >>= 1; ulog2++; }
+                    bits = Math.Min(bits, 1 + ulog2);
+                }
+            }
+        }
+
+        // V: wrapping deltas when cheaper than raw.
+        var (useDelta, vb2) = ChooseVCoding(v, palSz, bpc);
+        w.EncodeBoolEqui(useDelta ? 1u : 0u);
+        if (useDelta)
+        {
+            w.EncodeLiteral((uint)vb2, 2);
+            int bits = bpc - 4 + vb2;
+            w.EncodeLiteral(v[0], bpc);
+            int prev = v[0];
+            for (int i = 1; i < palSz; i++)
+            {
+                int d = WrapDelta(v[i] - prev, bpc);
+                w.EncodeLiteral((uint)Math.Abs(d), bits);
+                if (d != 0) w.EncodeBoolEqui(d < 0 ? 1u : 0u);
+                prev = (prev + d) & maxVal;
+            }
+        }
+        else
+            for (int i = 0; i < palSz; i++) w.EncodeLiteral(v[i], bpc);
+    }
+
+    /// <summary>Bits of <see cref="EncodeChromaPaletteColors"/> / <see cref="EncodeLumaPaletteColorsCore"/> (all
+    /// equiprobable), for the palette RD.</summary>
+    public static int ChromaPaletteColorBits(ushort[] u, ushort[] v, int palSz, ReadOnlySpan<ushort> leftU, int leftPalSz,
+        ReadOnlySpan<ushort> aboveU, int abovePalSz, int bitDepth)
+    {
+        int bpc = bitDepth, maxVal = (1 << bpc) - 1, bits = 0;
+        Span<ushort> cache = stackalloc ushort[16];
+        int nCache = MergeCache(cache, leftU, leftPalSz, aboveU, abovePalSz);
+        Span<bool> taken = stackalloc bool[8];
+        int nUsed = 0;
+        for (int ci = 0; ci < nCache && nUsed < palSz; ci++) { bits++; if (TakeOne(u, palSz, cache[ci], taken) >= 0) nUsed++; }
+        Span<ushort> newPal = stackalloc ushort[8]; int nNew = 0;
+        for (int ci = 0; ci < palSz; ci++) if (!taken[ci]) newPal[nNew++] = u[ci];
+        if (nNew > 0)
+        {
+            bits += bpc;
+            if (nNew > 1)
+            {
+                int b2 = ChooseDeltaBitsU(newPal, nNew, bpc, maxVal);
+                bits += 2;
+                int bw = bpc - 3 + b2, prev = newPal[0];
+                for (int i = 1; i < nNew; i++)
+                {
+                    int delta = newPal[i] - prev;
+                    bits += bw;
+                    prev = Math.Min(prev + delta, maxVal);
+                    if (prev >= maxVal) break;
+                    int ulog2 = 0, tmp = maxVal - prev;
+                    while (tmp > 1) { tmp >>= 1; ulog2++; }
+                    bw = Math.Min(bw, 1 + ulog2);
+                }
+            }
+        }
+        var (useDelta, vb2) = ChooseVCoding(v, palSz, bpc);
+        bits += 1 + (useDelta ? VDeltaBits(v, palSz, bpc, vb2) : palSz * bpc);
+        return bits;
+    }
+
+    public static int LumaPaletteColorBits(ushort[] colors, int palSz, ReadOnlySpan<ushort> leftColors, int leftPalSz,
+        ReadOnlySpan<ushort> aboveColors, int abovePalSz, int bitDepth)
+    {
+        int bpc = bitDepth, maxVal = (1 << bpc) - 1, bits = 0;
+        Span<ushort> cache = stackalloc ushort[16];
+        int nCache = MergeCache(cache, leftColors, leftPalSz, aboveColors, abovePalSz);
+        int nUsed = 0;
+        for (int ci = 0; ci < nCache && nUsed < palSz; ci++) { bits++; if (Contains(colors, palSz, cache[ci])) nUsed++; }
+        Span<ushort> newPal = stackalloc ushort[8]; int nNew = 0;
+        for (int ci = 0; ci < palSz; ci++) if (!InCache(cache, nCache, colors[ci], nUsed > 0)) newPal[nNew++] = colors[ci];
+        if (nNew > 0)
+        {
+            bits += bpc;
+            if (nNew > 1)
+            {
+                int b2 = ChooseDeltaBits(newPal, nNew, bpc, maxVal);
+                bits += 2;
+                int bw = bpc - 3 + b2, prev = newPal[0];
+                for (int i = 1; i < nNew; i++)
+                {
+                    int delta = newPal[i] - prev - 1;
+                    bits += bw;
+                    prev = Math.Min(prev + delta + 1, maxVal);
+                    if (prev + 1 >= maxVal) break;
+                    int ulog2 = 0, tmp = maxVal - prev - 1;
+                    while (tmp > 1) { tmp >>= 1; ulog2++; }
+                    bw = Math.Min(bw, 1 + ulog2);
+                }
+            }
+        }
+        return bits;
+    }
+
+    // Marks the first not-yet-taken palette entry equal to v; its index, or -1.
+    private static int TakeOne(ushort[] colors, int n, ushort v, Span<bool> taken)
+    {
+        for (int i = 0; i < n; i++) if (!taken[i] && colors[i] == v) { taken[i] = true; return i; }
+        return -1;
+    }
+
+    // The decoder's palette cache: left and above colours merged ascending, duplicates removed.
+    private static int MergeCache(Span<ushort> cache, ReadOnlySpan<ushort> l, int lSz, ReadOnlySpan<ushort> a, int aSz)
+    {
+        lSz = Math.Min(lSz, 8); aSz = Math.Min(aSz, 8);
+        int n = 0, li = 0, ai = 0;
+        while (li < lSz && ai < aSz)
+        {
+            if (l[li] < a[ai]) { if (n == 0 || cache[n - 1] != l[li]) cache[n++] = l[li]; li++; }
+            else { if (a[ai] == l[li]) li++; if (n == 0 || cache[n - 1] != a[ai]) cache[n++] = a[ai]; ai++; }
+        }
+        while (li < lSz) { if (n == 0 || cache[n - 1] != l[li]) cache[n++] = l[li]; li++; }
+        while (ai < aSz) { if (n == 0 || cache[n - 1] != a[ai]) cache[n++] = a[ai]; ai++; }
+        return n;
+    }
+
+    // U deltas are >= 0 (no +1) and narrow to maxVal - prev.
+    private static int ChooseDeltaBitsU(ReadOnlySpan<ushort> newPal, int nNew, int bpc, int maxVal)
+    {
+        for (int b2 = 0; b2 <= 3; b2++)
+        {
+            int bits = bpc - 3 + b2, prev = newPal[0]; bool ok = true;
+            for (int i = 1; i < nNew; i++)
+            {
+                int delta = newPal[i] - prev;
+                if (bits < 0 || delta >= (1 << bits)) { ok = false; break; }
+                prev = Math.Min(prev + delta, maxVal);
+                if (prev >= maxVal) break;
+                int ulog2 = 0, tmp = maxVal - prev;
+                while (tmp > 1) { tmp >>= 1; ulog2++; }
+                bits = Math.Min(bits, 1 + ulog2);
+            }
+            if (ok) return b2;
+        }
+        return 3;
+    }
+
+    // V delta in (-2^(bpc-1), 2^(bpc-1)]: the decoder wraps (prev + delta) & maxVal.
+    private static int WrapDelta(int d, int bpc)
+    {
+        int m = 1 << bpc;
+        d = ((d % m) + m) % m;
+        return d > m / 2 ? d - m : d;
+    }
+
+    private static int VDeltaBits(ushort[] v, int palSz, int bpc, int b2)
+    {
+        int bits = bpc - 4 + b2, total = 2 + bpc, prev = v[0], maxVal = (1 << bpc) - 1;
+        for (int i = 1; i < palSz; i++)
+        {
+            int d = WrapDelta(v[i] - prev, bpc);
+            total += bits + (d != 0 ? 1 : 0);
+            prev = (prev + d) & maxVal;
+        }
+        return total;
+    }
+
+    // Delta coding of V (smallest width that fits every |delta|) when it beats raw.
+    private static (bool Delta, int B2) ChooseVCoding(ushort[] v, int palSz, int bpc)
+    {
+        int maxAbs = 0, prev = v[0];
+        for (int i = 1; i < palSz; i++) { int d = WrapDelta(v[i] - prev, bpc); maxAbs = Math.Max(maxAbs, Math.Abs(d)); prev = v[i]; }
+        for (int b2 = 0; b2 <= 3; b2++)
+        {
+            int bits = bpc - 4 + b2;
+            if (bits < 0 || maxAbs >= (1 << bits)) continue;
+            return (VDeltaBits(v, palSz, bpc, b2) < palSz * bpc, b2);
+        }
+        return (false, 0);
     }
 
     private static bool Contains(ushort[] colors, int n, ushort v)
