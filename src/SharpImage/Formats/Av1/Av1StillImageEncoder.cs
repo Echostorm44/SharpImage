@@ -154,6 +154,8 @@ internal sealed class Av1EncodeSpeed
     public bool UseLoopRestoration = true;
     /// <summary>No loop restoration for 4:2:0 / monochrome (it gains ~0 there at speed 6; 4:4:4 keeps ~1.2%).</summary>
     public bool LrSkip420;
+    /// <summary>No loop restoration for 4:2:2 either (speed 6: 0.2% for 6% of the time; 4:4:4 keeps it).</summary>
+    public bool LrSkip422;
     public int LrSgrSets = 16;
     /// <summary>Luma restoration unit sizes searched, as a mask of lr_unit_shift (bit 0 = 64, 1 = 128, 2 = 256).</summary>
     public int LrUnitShiftMask = 7;
@@ -213,7 +215,8 @@ internal sealed class Av1EncodeSpeed
         // 6 keeps the trial-encode partition search (libaom's speed 6 is RD with pruning): corpus BD vs libaom
         // cpu-used 6 -0.3% (the estimate-driven partitions it used before: +9.3%), fox 1204x800 0.62 s all threads.
         // 6: no rectangular partitions above 8x8 and no filter intra (libaom prune_filter_intra_level 2).
-        if (speed >= 6) { p.UseRd = false; p.EarlyTermBits = 64; p.CdefSearchLevel = 3; p.UseRectPartition = false; p.UseFilterIntra = false; }
+        // 6: CDEF fast level 4 as libaom (4:2:0 -3.29% x1.05 -> -3.19% x1.01), no 4:2:2 loop restoration.
+        if (speed >= 6) { p.UseRd = false; p.EarlyTermBits = 64; p.CdefSearchLevel = 4; p.UseRectPartition = false; p.UseFilterIntra = false; p.LrSkip422 = true; }
         // 6: DCT-only mode decision with the tx type searched for the winner (libaom fast_intra_tx_type_search), one RD
         // mode candidate (top_intra_model_count), early termination at 128 bits, CNN split forcing for screen content:
         // scoreboard -2.99% x1.42 -> -1.44% x1.05.
@@ -917,7 +920,8 @@ internal static partial class Av1StillImageEncoder
         ushort[] padV = mono ? new ushort[(pw >> 1) * (ph >> 1)] : PadPlane(v, cwIn, chIn, pw >> ssX, ph >> ssY);
         // Loop restoration (a standalone still enables it in its sequence header only when used; shared-header streams
         // and grids always enable it — Av1ObuWriter.RestorationHeaderShared). Tiny frames gain nothing.
-        bool lrOn = UseLoopRestoration && !(Sp.LrSkip420 && layout is Av1PixelLayout.I420 or Av1PixelLayout.I400) && baseQIdx > 0 && width >= 16 && height >= 16;
+        bool lrOn = UseLoopRestoration && !(Sp.LrSkip420 && layout is Av1PixelLayout.I420 or Av1PixelLayout.I400)
+            && !(Sp.LrSkip422 && layout == Av1PixelLayout.I422) && baseQIdx > 0 && width >= 16 && height >= 16;
         bool cdefSb = Sp.UseCdefPerSb && UseCdefSearch && baseQIdx > 0 && width >= 16 && height >= 16
             && (long)width * height <= FilterSearchMaxPixels && !FilterPickFromQ;
         var (_, _, lrCols, lrRows) = Av1ObuWriter.TileLayout(sbCols, sbRows);
