@@ -178,10 +178,16 @@ internal sealed class Av1EncodeSpeed
         if (speed >= 3) { p.HogLevel = 3; p.HogChromaLevel = 2; }
         if (speed >= 5) p.HogChromaLevel = 3;
         if (speed >= 6) { p.HogLevel = 4; p.HogChromaLevel = 4; }
+        // 1+: filter intra with libaom's prune_filter_intra_level 1 (FILTER_DC + the best mode's filter mode), 8 RD mode
+        // candidates, no 64x64 rectangular shapes (scoreboard s1 -0.37% x1.47 -> -0.20% x0.89).
+        // 0: tx-depth search and in-search RDOQ measured neutral-to-negative on the avifenc scoreboard (tx depth +0.2%,
+        // RDOQ-in-search -0.05% for 2.2x time): off (s0 +1.03% x1.70 -> +0.29% x0.57).
+        p.UseColorTxDepth = false; p.RdoqInSearch = false;
         if (speed >= 1) { p.UseColorTxDepth = false; p.EarlyTermBits = 16; p.RdoqInSearch = false; p.RdUvCandidates = 6; }
-        // 2+: filter intra with libaom's prune_filter_intra_level 1 (FILTER_DC + the best mode's filter mode).
-        if (speed >= 2) { p.RdModeCandidates = 4; p.UseExtPartition = false; p.FilterIntraPrune = true; p.EarlyTermBits = 32; p.UsePartition64 = false; }
-        if (speed >= 3) { p.EarlyTermBits = 64; p.FastScreenDetection = true; }
+        if (speed >= 1) { p.RdModeCandidates = 8; p.UsePartition64 = false; p.FilterIntraPrune = true; }
+        // 2 keeps the T-shape and 4-way partitions (s2 +0.27% x0.53 -> -0.17% x0.85).
+        if (speed >= 2) { p.RdModeCandidates = 4; p.EarlyTermBits = 32; }
+        if (speed >= 3) { p.UseExtPartition = false; p.EarlyTermBits = 64; p.FastScreenDetection = true; }
         // 0-5: deblocking levels per plane around libaom's q fit (scoreboard s4 -0.1%).
         if (speed <= 5) { p.DeblockPerPlane = true; p.LfGuessLibaom = true; }
         if (speed >= 4) p.CflSearchRange = 2;
@@ -200,7 +206,7 @@ internal sealed class Av1EncodeSpeed
         // mode candidate (top_intra_model_count), early termination at 128 bits, CNN split forcing for screen content:
         // scoreboard -2.99% x1.42 -> -1.44% x1.05.
         if (speed >= 6) { p.FastIntraTxType = true; p.RdModeCandidates = 1; p.EarlyTermBits = 128; p.CnnPruneLevelScreen = 2; }
-        if (speed >= 6) { p.LrSgrSets = 2; p.LrUnitShiftMask = 4; p.LrWienerRounds = 2; p.LrVerify = false; p.LrStatsStep = 2; p.FilterSearchFast = true; }
+        if (speed >= 6) { p.LrSgrSets = 0; p.LrUnitShiftMask = 4; p.LrWienerRounds = 2; p.LrVerify = false; p.LrStatsStep = 2; p.FilterSearchFast = true; }
         // 6: deblocking level from q (libaom LPF_PICK_FROM_Q) and no 4:2:0 loop restoration (libaom allintra 5+ has none): both measured
         // within 0.1% BD on the avifenc scoreboard, ~6% less time.
         if (speed >= 6) { p.DeblockPickFromQ = true; p.LrSkip420 = true; }
@@ -1317,6 +1323,7 @@ internal static partial class Av1StillImageEncoder
         public readonly long[] EstCache = new long[341];
         public readonly RdSnapshot?[] SnapPool = new RdSnapshot?[18];
         public readonly Av1MsacWriter.LogOp[][] LogTailPool = new Av1MsacWriter.LogOp[6][];   // per partition level
+        public readonly List<Av1MsacWriter.LogOp>?[] NoneLogPool = new List<Av1MsacWriter.LogOp>?[6];
         public readonly double[] LogVar4 = new double[256];   // log1p(var / 16) of each 4x4 of the superblock LogVarSb
         public int LogVarSb = -1;
         public Av1PartitionCnn.SbOutput? Cnn;   // intra CNN partition features of the superblock CnnSb
@@ -2087,11 +2094,23 @@ internal static partial class Av1StillImageEncoder
         var logBuf = c.LogTailPool[bl] ??= new Av1MsacWriter.LogOp[256];
         int bestLogCount = 0;
         int bestI = -1, lastI = 0;
+        // NONE (a leaf, coded first) records its ops in a side list: if a later candidate wins they are simply dropped,
+        // if NONE wins they are appended once — instead of copying NONE's tail out of the log and back.
+        List<Av1MsacWriter.LogOp>? noneLog = null, mainLog = null;
+        bool noneBest = false;
         for (int i = 0; i < nc; i++)
         {
             if (i > 0) RestoreRd(c, snap0!, bx4, by4, blk4);
             double b0 = c.Msac.MeasuredBits;
+            if (i == 0 && nc > 1 && cands[0] == 0 && c.Msac.Log != null)
+            {
+                mainLog = c.Msac.Log;
+                noneLog = c.NoneLogPool[bl] ??= new List<Av1MsacWriter.LogOp>(1024);
+                noneLog.Clear();
+                c.Msac.Log = noneLog;
+            }
             EncodeChoiceColor(c, cands[i], bl, bx4, by4, hsz, blk4, c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), nPart, bx8, by8, edgeIdx);
+            if (i == 0 && noneLog != null) c.Msac.Log = mainLog;
             double bits = c.Msac.MeasuredBits - b0;
             double j = BlockSseColor(c, bx4, by4, blk4) + lambda * bits;
             if (i == 0 && pruneRect != 0 && cands[0] == 0)
@@ -2116,23 +2135,33 @@ internal static partial class Av1StillImageEncoder
                 bestJ = j;
                 bestI = i;
                 // The last candidate coded stays in place if it wins: no copy of its state is needed.
+                noneBest = i == 0 && noneLog != null;
                 if (!last)
                 {
                     bestTail = c.Msac.PrecarryFrom(baseCount);
-                    bestLogCount = c.Msac.CopyLogTail(snap0!.Msac.LogCount, ref logBuf);
-                    c.LogTailPool[bl] = logBuf;
+                    if (!noneBest)
+                    {
+                        bestLogCount = c.Msac.CopyLogTail(snap0!.Msac.LogCount, ref logBuf);
+                        c.LogTailPool[bl] = logBuf;
+                    }
                     bestSnap = SnapshotRd(c, bx4, by4, blk4, Pooled(c, bl * 3 + 1));
                 }
             }
             if (last) break;
         }
 
-        if (bestI == lastI) { c.Msac.Measure = measureWas; return; }
+        if (bestI == lastI)
+        {
+            if (noneBest) c.Msac.AppendLog(noneLog!);   // NONE won in place (early termination): its ops join the log
+            c.Msac.Measure = measureWas;
+            return;
+        }
         // Commit the winner: restore its recon/contexts/CDF, then re-apply its coded bytes onto the base stream.
         RestoreRd(c, snap0!, bx4, by4, blk4);
         RestoreRd(c, bestSnap!, bx4, by4, blk4);
         c.Msac.AppendPrecarry(bestTail);
-        c.Msac.AppendLog(logBuf, bestLogCount);
+        if (noneBest) c.Msac.AppendLog(noneLog!);
+        else c.Msac.AppendLog(logBuf, bestLogCount);
         c.Msac.Measure = measureWas;
     }
 
@@ -3428,6 +3457,31 @@ internal static partial class Av1StillImageEncoder
                     uC = uu; vC = vv; predU = cp.PredU; predV = cp.PredV;
                 }
             }
+        // RDOQ of the chroma winner (as the square 4:2:0 leaf): the pre-quant floats re-derived with its tx kernel.
+        if (UseChromaRdoq && UseRdoq && uvPal == null)
+        {
+            var uvT = useCfl ? Av1TxType.DctDct : UvIntraTxType(chromaTx, uvMode);
+            if (uvT is Av1TxType.DctDct or Av1TxType.AdstDct or Av1TxType.DctAdst or Av1TxType.AdstAdst)
+            {
+                var fwdT = FwdTypeForTxType(uvT);
+                double clamR = ChromaRdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq;
+                var qfC = new double[cScan];
+                if (HasNonZero(uC))
+                {
+                    Av1FwdTransform.ReturnLevels(ForwardResidualPredRect(c.U, c.Cw, cbx, cby, predU, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, qfC, fwdT));
+                    Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, uC, qfC, c.DcDq, c.AcDq,
+                        Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)c.Layout),
+                        Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR)), 0, clamR);
+                }
+                if (HasNonZero(vC))
+                {
+                    Av1FwdTransform.ReturnLevels(ForwardResidualPredRect(c.V, c.Cw, cbx, cby, predV, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, qfC, fwdT));
+                    Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, chromaTx, 1, 0, vC, qfC, c.DcDq, c.AcDq,
+                        Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)c.Layout),
+                        Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR)), 0, clamR);
+                }
+            }
+        }
         int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
 
         int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
@@ -4473,7 +4527,9 @@ internal static partial class Av1StillImageEncoder
     // the residual statistics shifted the base-λ optimum DOWN, 0.002->0.00125 = -1.02% BD-rate (clean minimum:
     // 0.0011->+7.84, 0.00125->+7.59, 0.00135->+8.01; RdoqLambdaScale 50 re-confirmed, 65/80 worse). Better
     // prediction ⇒ keeping more residual detail (lower λ) wins.
-    internal static double RdLambdaK = 0.00125;
+    // Re-swept 2026-09-26 against avifenc (-a tune=psnr, scoreboard, joint with RdoqLambdaScale): 0.0008 / 125
+    // (effective RDOQ λ 0.1, was 0.0625): speed 2 +1.58 -> +0.27%, speed 4 -1.00 -> -2.11%, speed 6 -1.44 -> -2.98%.
+    internal static double RdLambdaK = 0.0008;
 
     // Extra multiplier on the RDOQ lambda relative to the partition lambda. The partition lambda is tuned for
     // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
@@ -4483,7 +4539,8 @@ internal static partial class Av1StillImageEncoder
     // filter-intra re-sweep (2026-09-16): filter improves prediction, so residuals are smaller and more aggressive
     // coefficient trimming wins (-0.46% BD-rate, clean 5/6; the knee — 36=-0.44, 40=-0.46, 45=-0.41 vs 25).
     // RdLambdaK stayed 0.002 and DeadzoneBias stayed 0.04 (both re-confirmed optimal in the same sweep).
-    internal static double RdoqLambdaScale = 50.0;
+    // 125 with RdLambdaK 0.0008 (2026-09-26, see RdLambdaK); chroma stays at 50 (higher chroma scales lost).
+    internal static double RdoqLambdaScale = 125.0;
 
     // Chroma coefficient RDOQ in the square colour leaf (EncodeLeafBlockColor). Chroma was previously coded at
     // round-to-nearest with no rate-distortion trimming, running measurably richer than luma at matched rate;
