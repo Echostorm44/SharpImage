@@ -131,6 +131,11 @@ internal sealed class Av1EncodeSpeed
     /// <summary>Partition estimate from the best mode's SATD (+ the header at the SATD rate weight), without the
     /// forward / inverse transform of the estimate block.</summary>
     public bool EstimateSatdOnly;
+    /// <summary>Partition estimate distortion from the quantisation error of the kept coefficients ((qf - L) * dq, the
+    /// pixel-domain error as RDOQ counts it) instead of an inverse transform + reconstruction; up to 32x32.</summary>
+    public bool EstimateCoefDist;
+    // (qf - L) * dq is in dequantised-coefficient units, 64x the pixel-domain SSE (scoreboard-calibrated; 1/32 loses 7%).
+    public double EstimateCoefDistScale = 1.0 / 64;
     /// <summary>Luma palette sizes are searched largest first; stop at the first size that does not improve on the
     /// previous (libaom prune_palette_search_level).</summary>
     public bool PaletteEarlyStop;
@@ -242,7 +247,10 @@ internal sealed class Av1EncodeSpeed
         if (speed >= 9) { p.EstimateNrdModes = true; p.LeafNrdModes = true; }
         // 9+: no HOG pruning (the nonrd masks leave only V / H directional; s9 x1.30 -> x1.15); 10: DC / CfL chroma only.
         if (speed >= 9) { p.HogLevel = 0; p.HogChromaLevel = 0; }
-        if (speed >= 10) { p.UseCfl = false; p.UseUvModeSearch = false; }
+        // 9+: partition estimates from the coefficient quantisation error (no inverse transform) and DC / CfL chroma:
+        // s9 -12.4% x1.15 -> -11.3% x0.96, s10 -8.9% x1.12 -> -8.6% x0.99.
+        if (speed >= 9) { p.EstimateCoefDist = true; p.UseUvModeSearch = false; }
+        if (speed >= 10) p.UseCfl = false;
         TestOverride?.Invoke(p);
         return p;
     }
@@ -1587,7 +1595,7 @@ internal static partial class Av1StillImageEncoder
             st.RowInit[r] = null;
             var c = new ColorPartCtx
             {
-                Msac = new Av1MsacWriter { Log = new(), SymIndex = index, DiscardOutput = true }, Cdf = rcdf, Luma = lumaArr, U = uArr, V = vArr,
+                Msac = new Av1MsacWriter { Log = new(st.NCols * 1024), SymIndex = index, DiscardOutput = true }, Cdf = rcdf, Luma = lumaArr, U = uArr, V = vArr,
                 ReconY = reconY, ReconU = reconU, ReconV = reconV,
                 W = w, Cw = cw, Chh = chh, Bw4 = bw4, Bh4 = bh4, Layout = layout, SsX = ssX, SsY = ssY,
                 DcDq = dcDq, AcDq = acDq, Mono = mono, ScreenContent = screenContent, QIdx = baseQIdx,
@@ -4733,6 +4741,27 @@ internal static partial class Av1StillImageEncoder
         int tx = BlToTx(bl);
         var (_, _, satd) = ChooseIntraMode(luma, w, bw4, bh4, bx4, by4, n, luma, w, bx4 * 4, by4 * 4, scratch);
         if (Sp.EstimateSatdOnly) return satd + (long)(Math.Sqrt(RdLambdaK) * acDq * HeaderCostBits);
+        if (Sp.EstimateCoefDist && n <= 32)
+        {
+            int scanLen = Av1Tables.Scans[tx].Length;
+            var residual = Av1FwdTransform.RentLevels(n * n);
+            for (int y = 0; y < n; y++)
+                for (int x = 0; x < n; x++) residual[y * n + x] = luma[(by4 * 4 + y) * w + bx4 * 4 + x] - scratch[y * n + x];
+            var qf = t_estQf ??= new double[1024];
+            int[] cq = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, Av1FwdTransform.FwdTxType.DctDct, qf);
+            Av1FwdTransform.ReturnLevels(residual);
+            long cbits = HeaderCostBits;
+            double dist = 0;
+            for (int i = 0; i < scanLen; i++)
+            {
+                int v = cq[i];
+                if (v != 0) { int a = Math.Abs(v); cbits += 5 + (a >= 15 ? 8 : a >> 1); }
+                double e = (qf[i] - v) * (i == 0 ? dcDq : acDq);
+                dist += e * e;
+            }
+            Av1FwdTransform.ReturnLevels(cq);
+            return (long)(dist * Sp.EstimateCoefDistScale + RdLambdaK * acDq * acDq * cbits);
+        }
         int[] coeffs = ForwardResidualPred(luma, w, bx4 * 4, by4 * 4, scratch, n, dcDq, acDq, Av1Tables.Scans[tx].Length);
         long bits = HeaderCostBits;
         foreach (int v in coeffs)
@@ -5167,6 +5196,7 @@ internal static partial class Av1StillImageEncoder
         public readonly double[] Q1 = new double[1024], Q2 = new double[1024];
     }
     [ThreadStatic] private static LeafScratch? t_scCore, t_scRect, t_scSub8;
+    [ThreadStatic] private static double[]? t_estQf;
     // The last ChooseLeafRdCore prescreen's surviving candidates (CandidateModes indices, SATD order).
     [ThreadStatic] private static int[]? t_topModesArr;
     private static int[] t_topModes => t_topModesArr ??= new int[64];

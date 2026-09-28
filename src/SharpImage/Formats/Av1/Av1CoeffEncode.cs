@@ -560,9 +560,36 @@ internal static class Av1CoeffEncode
             return e * e;
         }
 
-        double curBits = EstimateCoefBits(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx);
+        // With eob >= 1 the incremental evaluator prices the trials (it tracks EstimateCoefBits term by term).
+        RdoqCost? inc = null;
+        double curBits;
+        if (eob >= 1)
+        {
+            inc = t_rdoqCost ??= new RdoqCost();
+            inc.Build(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx, eob);
+            curBits = inc.Sum();
+        }
+        else curBits = EstimateCoefBits(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx);
 
         // --- EOB shrink: greedily drop trailing nonzero coefficients while it lowers J. ---
+        while (inc != null && eob >= 1)
+        {
+            int rc = scan[eob];
+            int L = signedLevels[rc];
+            int e2 = eob - 1;
+            while (e2 >= 0 && signedLevels[scan[e2]] == 0) e2--;
+            if (e2 < 1) break;   // a drop to eob 0 or nothing: the full estimate below
+            double dDist = DistOf(rc, 0) - DistOf(rc, L);
+            double nb = inc.TryDropEob(e2);
+            if (RdoqCheck)
+            {
+                double full = EstimateCoefBits(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx);
+                if (Math.Abs(full - nb) > 1e-6) throw new InvalidOperationException($"RDOQ eob-drop cost {nb:R} != full {full:R} (tx {tx} eob {eob}->{e2})");
+            }
+            if (dDist + lambda * (nb - curBits) < 0) { inc.Commit(); curBits = nb; eob = e2; }
+            else { inc.Undo(); goto LevelDown; }
+        }
+        if (inc != null) inc = null;   // the remaining trial (to eob 0 / none) uses the full estimate; rebuilt below
         while (eob >= 0)
         {
             int rc = scan[eob];
@@ -580,12 +607,12 @@ internal static class Av1CoeffEncode
         }
         if (eob < 0) return;
 
+        LevelDown:
         // --- Level-down: nudge each remaining coefficient one step toward zero when J improves. ---
         // With eob >= 1 the trial costs come from RdoqCost, which re-derives only the terms a one-coefficient change
         // touches and re-adds every term in EstimateCoefBits' order (identical doubles); a trial that moves the eob
         // (the last coefficient going to zero) uses the full estimate.
-        RdoqCost? inc = null;
-        if (eob >= 1) { inc = t_rdoqCost ??= new RdoqCost(); inc.Build(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx, eob); }
+        if (inc == null && eob >= 1) { inc = t_rdoqCost ??= new RdoqCost(); inc.Build(coef, modeCdf, tx, chroma, yMode, signedLevels, skipCtx, dcSignCtx, txTypeIdx, eob); }
         for (int i = 0; i <= eob; i++)
         {
             int rc = scan[i];
@@ -629,7 +656,18 @@ internal static class Av1CoeffEncode
         // While building, every term position is written for the first time (its stale value from an earlier block is
         // ignored), so no clearing is needed; afterwards writes replace the stored term.
         private bool building;
-        private void W(double[] a, int idx, double v) { total += building ? v : v - a[idx]; a[idx] = v; }
+        private void W(double[] a, int idx, double v)
+        {
+            if (undoOn) undo.Add((a, idx, a[idx]));
+            total += building ? v : v - a[idx]; a[idx] = v;
+        }
+        // Reversible eob drop (TryDropEob / Commit / Undo): the term writes it makes, and the scalars it changes.
+        private readonly List<(double[] A, int Idx, double Old)> undo = new();
+        private bool undoOn;
+        private double undoTotal, undoPre2, undoPre3, undoPre4;
+        private int undoEob, undoRc, undoSl;
+        private byte undoLv;
+        private int chromaF, txCtxF;
         private readonly byte[] lv = new byte[32 * 34];   // LevelByte of every coefficient (all positions, zero past eob)
         private short[] inv = null!;
         private int[] sl = null!;
@@ -643,7 +681,7 @@ internal static class Av1CoeffEncode
             int[] signedLevels, int skipCtx, int dcSignCtx, int txTypeIdx, int eob)
         {
             ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
-            this.coef = coef; sl = signedLevels; this.eob = eob;
+            this.coef = coef; sl = signedLevels; this.eob = eob; chromaF = chroma; txCtxF = tDim.Ctx;
             scan = Av1Tables.Scans[tx];
             int slw = Math.Min((int)tDim.Lw, (int)Av1TxSize.Tx32x32), slh = Math.Min((int)tDim.Lh, (int)Av1TxSize.Tx32x32);
             tx2dSzCtx = slw + slh; shift = slh + 2; stride = 4 << slh; mask = stride - 1;
@@ -781,6 +819,58 @@ internal static class Av1CoeffEncode
         }
 
         public double Sum() => total;
+
+        // pre[2..4]: the eob bin, hi bit and extra bits of the current eob (as Build derives them)
+        private void EobPrefix()
+        {
+            int eobPt = eob <= 1 ? eob : (31 - BitOperations.LeadingZeroCount((uint)eob) - 1) + 2;
+            ReadOnlySpan<ushort> eobCdf = tx2dSzCtx switch
+            {
+                0 => coef.EobBin16[chromaF * 2], 1 => coef.EobBin32[chromaF * 2], 2 => coef.EobBin64[chromaF * 2],
+                3 => coef.EobBin128[chromaF * 2], 4 => coef.EobBin256[chromaF * 2], 5 => coef.EobBin512[chromaF],
+                _ => coef.EobBin1024[chromaF],
+            };
+            pre[2] = SymBits(eobCdf, eobPt);
+            pre[3] = pre[4] = 0;
+            if (eob > 1)
+            {
+                int eobBin = eobPt - 2, hi = (eob >> eobBin) & 1;
+                pre[3] = BoolBits(coef.EobHiBit[txCtxF * 2 * 9 + chromaF * 9 + eobBin][0], (uint)hi);
+                if (eobBin > 0) pre[4] = eobBin;
+            }
+        }
+
+        /// <summary>Zeroes the last coefficient (scan index eob) and moves the eob to newEob (&gt;= 1, the previous
+        /// nonzero): the dropped positions' terms leave the sum, the prefix and the new last coefficient's term are
+        /// re-derived, and the earlier coefficients whose context read the dropped level are updated. Returns the new
+        /// sum; follow with Commit or Undo.</summary>
+        public double TryDropEob(int newEob)
+        {
+            undo.Clear(); undoOn = true;
+            undoTotal = total; undoEob = eob; undoPre2 = pre[2]; undoPre3 = pre[3]; undoPre4 = pre[4];
+            int e = eob, rcE = scan[e];
+            undoRc = rcE; undoSl = sl[rcE]; undoLv = lv[rcE];
+            for (int i = newEob + 1; i <= e; i++) total -= tA[i] + tB[i] + sA[i] + sB[i];
+            sl[rcE] = 0; lv[rcE] = 0;
+            total -= pre[2] + pre[3] + pre[4];
+            eob = newEob;
+            EobPrefix();
+            total += pre[2] + pre[3] + pre[4];
+            EobTerm();
+            Dep(rcE - 1, newEob); Dep(rcE - 2, newEob); Dep(rcE - stride, newEob); Dep(rcE - stride - 1, newEob); Dep(rcE - 2 * stride, newEob);
+            undoOn = false;
+            return total;
+        }
+
+        public void Commit() => undo.Clear();
+
+        public void Undo()
+        {
+            for (int k = undo.Count - 1; k >= 0; k--) { var (a, idx, old) = undo[k]; a[idx] = old; }
+            undo.Clear();
+            total = undoTotal; eob = undoEob; pre[2] = undoPre2; pre[3] = undoPre3; pre[4] = undoPre4;
+            sl[undoRc] = undoSl; lv[undoRc] = undoLv;
+        }
     }
 
     /// <summary>Level byte stored for GetLoCtx neighbour magnitude, matching DecodeCoefs: mag 1..2 → mag*0x41;
