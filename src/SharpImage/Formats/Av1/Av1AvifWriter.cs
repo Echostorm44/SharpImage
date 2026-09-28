@@ -376,7 +376,7 @@ internal static class Av1AvifWriter
         byte[] iprp = Box("iprp", Concat(ipco, FullBox("ipma", 0, 0, Concat(ipmaBody.ToArray()))));
 
         byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc("pict"), U32(0), U32(0), U32(0),
-            System.Text.Encoding.ASCII.GetBytes("PictureHandler\0")));
+            new byte[] { 0 }));   // empty handler name, as libavif (14 bytes less per file)
         byte[] pitm = FullBox("pitm", 0, 0, U16(1));
         var infes = new List<byte[]> { U16(items.Count) };
         foreach (var it in items) infes.Add(FullBox("infe", 2, it.Flags, Concat(U16(it.Id), U16(0), Fourcc(it.Type), it.InfeExtra)));
@@ -633,7 +633,7 @@ internal static class Av1AvifWriter
         byte[] iprp = Box("iprp", Concat(Box("ipco", Concat(props.ToArray())), FullBox("ipma", 0, 0, Concat(U32((uint)assocCount), Concat(ipmaBody.ToArray())))));
 
         byte[] hdlr = FullBox("hdlr", 0, 0, Concat(U32(0), Fourcc("pict"), U32(0), U32(0), U32(0),
-            System.Text.Encoding.ASCII.GetBytes("PictureHandler\0")));
+            new byte[] { 0 }));   // empty handler name, as libavif
         byte[] pitm = FullBox("pitm", 0, 0, U16(gridId));
         var infes = new List<byte[]> { U16(items.Count) };
         foreach (var it in items)
