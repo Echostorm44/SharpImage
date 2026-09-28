@@ -41,6 +41,12 @@ internal sealed class Av1EncodeSpeed
     public bool UseExtPartition = true;
     // HORZ_4 / VERT_4 at 16x16 (16x4 / 4x16 strips; libaom codes them heavily on photos at its slowest speed)
     public bool Part4At16;
+    // tx_depth 1 trial in the rect leaf (4:2:0 rect / strips, every 4:2:2 / 4:4:4 leaf); needs UseColorTxDepth
+    public bool RectTxDepth;
+    // RectTxDepth: how many further prescreened modes are also tried on the split transform (0 = the winner only)
+    public int RectTxDepthAlt;
+    // 4:4:4 / 4:2:2 encodes switch on UseColorTxDepth + RectTxDepth (LayoutSpeedScope)
+    public bool TxSplit444422;
     /// <summary>Angle deltas searched for the directional intra modes: 1 = all of -3..3, 0 = none (delta 0 only),
     /// 2 = {-2, 0, 2}, 3 = {-3, 0, 3}, 4 = {-3, -1, 0, 1, 3}.</summary>
     public int AngleDeltaSet = 1;
@@ -209,6 +215,10 @@ internal sealed class Av1EncodeSpeed
         // 0-2: 16x4 / 4x16 strips (HORZ_4 / VERT_4 at 16x16): s0 +0.49% x0.55 -> -0.01% x0.58,
         // s1 -0.12% x0.85 -> -0.54% x0.96, s2 -0.17% x0.78 -> -0.57% x0.89.
         p.Part4At16 = speed <= 2;
+        // 0-2, 4:4:4 / 4:2:2 only: tx_depth 1 in the rect leaf, jointly with the next 2 prescreened modes
+        // (s2 444 +2.39% x0.74 -> +1.84% x1.01 with 3 / +1.93% x0.88 with 1; 422 +1.79% x0.59 -> +1.07% x0.83 with 3;
+        // 4:4:4 keeps 1 alternative mode: 3 cost x1.11 at s1).
+        p.TxSplit444422 = speed <= 2; p.RectTxDepthAlt = 3;
         if (speed >= 1) { p.UseColorTxDepth = false; p.EarlyTermBits = 16; p.RdoqInSearch = false; p.RdUvCandidates = 6; }
         if (speed >= 1) { p.RdModeCandidates = 8; p.UsePartition64 = false; p.FilterIntraPrune = true; }
         // 2 keeps the T-shape and 4-way partitions (s2 +0.27% x0.53 -> -0.17% x0.85).
@@ -319,6 +329,26 @@ internal static partial class Av1StillImageEncoder
             t_bd = bd;
         }
         public void Dispose() => t_bd = prev;
+    }
+
+    // Layout-dependent preset adjustments for one colour encode: 4:4:4 / 4:2:2 turn on the rect-leaf tx split
+    // (TxSplit444422 — it pays there, not in 4:2:0 / mono). Restores the caller's settings on dispose.
+    private readonly struct LayoutSpeedScope : IDisposable
+    {
+        private readonly Av1EncodeSpeed? prev;
+        private readonly bool swapped;
+        public LayoutSpeedScope(Av1PixelLayout layout)
+        {
+            prev = t_speed; swapped = false;
+            var sp = Sp;
+            if (sp.TxSplit444422 && layout is Av1PixelLayout.I444 or Av1PixelLayout.I422 && !(sp.UseColorTxDepth && sp.RectTxDepth))
+            {
+                var s = sp.Clone(); s.UseColorTxDepth = true; s.RectTxDepth = true;
+                if (layout == Av1PixelLayout.I444) s.RectTxDepthAlt = Math.Min(s.RectTxDepthAlt, 1);   // 3 is x1.11 at s1
+                t_speed = s; swapped = true;
+            }
+        }
+        public void Dispose() { if (swapped) t_speed = prev; }
     }
 
     // A/B toggle: rate-distortion leaf decision (mode + tx-type via EstimateCoefBits) vs the SATD-only baseline.
@@ -921,6 +951,7 @@ internal static partial class Av1StillImageEncoder
         if (layout is not (Av1PixelLayout.I420 or Av1PixelLayout.I422 or Av1PixelLayout.I444 or Av1PixelLayout.I400))
             throw new ArgumentOutOfRangeException(nameof(layout));
         using var bdScope = new BitDepthScope(bitDepth);
+        using var spScope = new LayoutSpeedScope(layout);
         long phaseT = System.Diagnostics.Stopwatch.GetTimestamp();
         void Phase(string name)
         {
@@ -3101,6 +3132,83 @@ internal static partial class Av1StillImageEncoder
         return (0x40, lumaTxb, coefBits);
     }
 
+    // RectTxDepth trial: the w4 x h4 luma leaf on its depth-1 transform (TxfmDimensions.Sub), tx blocks in raster order,
+    // each predicted from the reconstruction with the decoder's per-tx edge flags (dav1d recon_b_intra), its tx type
+    // by RD over the intra set for that size, RDOQ'd. Writes ReconY and the per-tx ALY/LLY coefficient contexts.
+    // Returns J = SSE + lambda * coefficient bits (tx_size symbol excluded) and the per-tx records.
+    private static (double J, List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)> Txb)
+        RectLumaSplitTrial(ColorPartCtx c, int lumaBs, int lumaTx, int bx4, int by4, int w4, int h4,
+            Av1IntraPredMode yMode, int yDelta, int yModeNoFilt, Av1EdgeFlags edgeFlags, int intraFlags)
+    {
+        int stx = Av1Tables.TxfmDimensions[lumaTx].Sub;
+        ref readonly var sTD = ref Av1Tables.TxfmDimensions[stx];
+        int tw4 = sTD.W, th4 = sTD.H, tw = tw4 * 4, th = th4 * 4, sScan = Av1Tables.Scans[stx].Length;
+        bool symbolCoded = sTD.Max <= (byte)Av1TxSize.Tx16x16;
+        bool full = UseFullIntraTxSet && sTD.Min < (byte)Av1TxSize.Tx16x16;
+        var txSet = (full && symbolCoded) ? IntraTxTypesFull : (symbolCoded ? IntraTxTypes : DctOnly);
+        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        var scr = t_scSplit ??= new LeafScratch();
+        var pred = scr.P1; var res = scr.R; var qf = scr.Q1; var qfBest = scr.Q2;
+        bool sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0, sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0;
+        var list = new List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>();
+        double bitsSum = 0;
+        long sseSum = 0;
+        for (int iy = 0; iy < h4; iy += th4)
+            for (int ix = 0; ix < w4; ix += tw4)
+            {
+                int tx4 = bx4 + ix, ty4 = by4 + iy, txR = tx4 & 31, tyR = ty4 & 31, px = tx4 * 4, py = ty4 * 4;
+                var localEdge = (((iy > 0 || !sbHasTr) && ix + tw4 >= w4) ? 0 : Av1EdgeFlags.I444TopHasRight) |
+                                ((ix > 0 || (!sbHasBl && iy + th4 >= h4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
+                PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, tx4, ty4, tw, th, yMode, yDelta, pred, localEdge, intraFlags);
+                for (int yy = 0; yy < th; yy++)
+                    for (int xx = 0; xx < tw; xx++) res[yy * tw + xx] = c.Luma[(py + yy) * c.W + px + xx] - pred[yy * tw + xx];
+                int skc = Av1CoeffDecode.GetSkipCtx(in sTD, lumaBs, c.ALY.AsSpan(txR), c.LLY.AsSpan(tyR), 0, 0);
+                int snc = Av1CoeffDecode.GetDcSignCtx(stx, c.ALY.AsSpan(txR), c.LLY.AsSpan(tyR));
+                int[] bestCf = null!; Av1TxType bestInv = Av1TxType.DctDct; int bestIdx = 1; double bestJ = double.MaxValue, bestBits = 0;
+                foreach (var (fwd, inv, idx) in txSet)
+                {
+                    int[] cf = Av1FwdTransform.ForwardQuantRect(res, tw, th, stx, c.DcDq, c.AcDq, sScan, fwd, qf);
+                    bool oneD = inv == Av1TxType.VDct || inv == Av1TxType.HDct;
+                    long sse = ReconSseCandRect(cf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv);
+                    if (sse >= bestJ) { Av1FwdTransform.ReturnLevels(cf); continue; }
+                    double bits = oneD
+                        ? Av1CoeffEncode.EstimateCoefBits1D(c.Cdf.Coef, c.Cdf.Mode, stx, yModeNoFilt, inv, cf, skc, snc)
+                        : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, cf, skc, snc, idx, fullSet: UseFullIntraTxSet);
+                    double j = sse + lambda * bits;
+                    if (j < bestJ) { Av1FwdTransform.ReturnLevels(bestCf); bestJ = j; bestBits = bits; bestCf = cf; bestInv = inv; bestIdx = idx; Array.Copy(qf, qfBest, sScan); }
+                    else Av1FwdTransform.ReturnLevels(cf);
+                }
+                if (bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && HasNonZero(bestCf))
+                {
+                    Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, bestCf, qfBest, c.DcDq, c.AcDq, skc, snc, bestIdx,
+                        RdoqLambdaScale * lambda);
+                    bestBits = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, bestCf, skc, snc, bestIdx, fullSet: UseFullIntraTxSet);
+                }
+                byte cfc = DequantAndReconstructPredRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.ReconY, c.W, px, py, bestInv);
+                for (int yy = 0; yy < th; yy++)
+                    for (int xx = 0; xx < tw; xx++) { int d = c.ReconY[(py + yy) * c.W + px + xx] - c.Luma[(py + yy) * c.W + px + xx]; sseSum += (long)d * d; }
+                bitsSum += bestBits;
+                list.Add((bestCf, bestInv, bestIdx, skc, snc, px, py));
+                for (int i = 0; i < tw4 && txR + i < 32; i++) c.ALY[txR + i] = cfc;
+                for (int j = 0; j < th4 && tyR + j < 32; j++) c.LLY[tyR + j] = cfc;
+            }
+        return (sseSum + lambda * bitsSum, list);
+    }
+
+    // Emits the luma coefficients of a split-depth leaf (RectLumaSplitTrial records) in tx-block order.
+    private static void EmitSplitLuma(ColorPartCtx c, int stx, int yModeNoFilt,
+        List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)> txb)
+    {
+        foreach (var t in txb)
+        {
+            if (t.Inv == Av1TxType.VDct || t.Inv == Av1TxType.HDct)
+                Av1CoeffEncode.EncodeCoefs1D(c.Msac, c.Cdf.Coef, c.Cdf.Mode, stx, yModeNoFilt, t.Inv, t.Cf, skipCtx: t.SkipCtx, dcSignCtx: t.SignCtx);
+            else
+                Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, t.Cf, skipCtx: t.SkipCtx, dcSignCtx: t.SignCtx,
+                    txTypeIdx: t.Idx, fullSet: UseFullIntraTxSet);
+        }
+    }
+
     // Luma block SSE (reconstruction vs source) over an n x n region at pixel (bx,by).
     private static long LumaBlockSse(ColorPartCtx c, int bx, int by, int n)
     {
@@ -3448,14 +3556,95 @@ internal static partial class Av1StillImageEncoder
             Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, yTxIdx,
                 RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
 
+        // tx_depth 1 (RectTxDepth): the winning mode re-coded on the split transform, each tx block predicted from the
+        // reconstruction in the decoder's raster order with its own tx type; kept when its true RD beats the whole tx.
+        ref readonly var fullTD = ref Av1Tables.TxfmDimensions[lumaTx];
+        int depth = 0;
+        List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? txb = null;
+        if (Sp.RectTxDepth && UseColorTxDepth && yPal == null && fullTD.Max > (byte)Av1TxSize.Tx4x4 && w <= 32 && h <= 32
+            && bx4 + w4 <= c.Bw4 && by4 + h4 <= c.Bh4 && HasNonZero(yC))
+        {
+            int txCtxD = (c.LTxY[byR] >= fullTD.Lh ? 1 : 0) + (c.ATxY[bxR] >= fullTD.Lw ? 1 : 0);
+            var txSzCdfD = c.Cdf.GetTxSzCdf(fullTD.Max - 1, txCtxD);
+            double j0 = ReconSseCandRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.Luma, c.W, bx, by, yInv)
+                + rectLambda * ((yInv == Av1TxType.VDct || yInv == Av1TxType.HDct
+                    ? Av1CoeffEncode.EstimateCoefBits1D(c.Cdf.Coef, c.Cdf.Mode, lumaTx, yModeNoFilt, yInv, yC, 0, ySign)
+                    : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, yC, 0, ySign, yTxIdx, fullSet: UseFullIntraTxSet))
+                  + Av1CoeffEncode.SymBits(txSzCdfD, 0));
+            var saveA = c.ALY.AsSpan(bxR, Math.Min(w4, 32 - bxR)).ToArray();
+            var saveL = c.LLY.AsSpan(byR, Math.Min(h4, 32 - byR)).ToArray();
+            // Mode bits relative to the depth-0 winner's (joint trials of the next prescreened modes, RectTxDepthAlt).
+            int ymA = Av1Tables.IntraModeContext[c.AModeY[bxR]], ymL = Av1Tables.IntraModeContext[c.LModeY[byR]];
+            double ModeBitsOf(Av1IntraPredMode m, int dl) => Av1CoeffEncode.SymBits(c.Cdf.GetKfYModeCdf(ymA, ymL), (int)m)
+                + (IsDirectional(m) && angleOk ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)m - (int)Av1IntraPredMode.Vertical), dl + 3) : 0)
+                + (fiOk && m == Av1IntraPredMode.Dc ? Av1CoeffEncode.SymBits(c.Cdf.GetFilterIntraCdf((Av1BlockSize)lumaBs), 0) : 0);
+            double winBits = isFilter
+                ? Av1CoeffEncode.SymBits(fiCdf, 1) + Av1CoeffEncode.SymBits(ymCdf, (int)Av1IntraPredMode.Dc) + Av1CoeffEncode.SymBits(c.Cdf.GetFilterIntraModeCdf(), yDelta)
+                : ModeBitsOf(yMode, yDelta);
+            double tsz1 = rectLambda * Av1CoeffEncode.SymBits(txSzCdfD, 1);
+            double bestD = j0; (Av1IntraPredMode M, int D, int Nf)? win = null;
+            List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? winList = null;
+            bool lastIsWin = false;
+            for (int k = -1; k < RdModeCandidates && k < Sp.RectTxDepthAlt; k++)
+            {
+                Av1IntraPredMode m = yMode; int dl = yDelta, nf = yModeNoFilt; double extra = 0;
+                if (k >= 0)
+                {
+                    if (topCost[k] == long.MaxValue) break;
+                    (m, dl) = CandidateModes[topIdx[k]];
+                    if (m == yMode && dl == yDelta && !isFilter) continue;
+                    nf = (int)m; extra = rectLambda * (ModeBitsOf(m, dl) - winBits);
+                }
+                var (j1, list) = RectLumaSplitTrial(c, lumaBs, lumaTx, bx4, by4, w4, h4, m, dl, nf, edgeFlags, intraFlags);
+                j1 += tsz1 + extra;
+                saveA.CopyTo(c.ALY.AsSpan(bxR)); saveL.CopyTo(c.LLY.AsSpan(byR));
+                if (j1 < bestD)
+                {
+                    if (winList != null) foreach (var t in winList) Av1FwdTransform.ReturnLevels(t.Cf);
+                    bestD = j1; win = (m, dl, nf); winList = list; lastIsWin = true;
+                }
+                else { foreach (var t in list) Av1FwdTransform.ReturnLevels(t.Cf); lastIsWin = false; }
+            }
+            if (win is var (wm, wd, wnf))
+            {
+                depth = 1;
+                if (lastIsWin)
+                {
+                    // ReconY holds the winner's reconstruction: only its tx coefficient contexts need re-applying
+                    foreach (var t in winList!)
+                    {
+                        int tR = (t.Px >> 2) & 31, lR = (t.Py >> 2) & 31;
+                        ref readonly var sTD = ref Av1Tables.TxfmDimensions[fullTD.Sub];
+                        byte cfc = TxCoefCtx(t.Cf, fullTD.Sub);
+                        for (int i = 0; i < sTD.W && tR + i < 32; i++) c.ALY[tR + i] = cfc;
+                        for (int j = 0; j < sTD.H && lR + j < 32; j++) c.LLY[lR + j] = cfc;
+                    }
+                }
+                else
+                {
+                    // re-run the winner so ReconY / ALY / LLY hold its reconstruction (deterministic: same records)
+                    foreach (var t in winList!) Av1FwdTransform.ReturnLevels(t.Cf);
+                    winList = RectLumaSplitTrial(c, lumaBs, lumaTx, bx4, by4, w4, h4, wm, wd, wnf, edgeFlags, intraFlags).Txb;
+                }
+                txb = winList;
+                if (wnf != yModeNoFilt || wd != yDelta || wm != yMode)
+                {
+                    // an alternative (non-filter) mode won on the split transform: it becomes the leaf's mode
+                    yMode = wm; yDelta = wd; isFilter = false; yModeSym = (int)wm; yModeNoFilt = (int)wm;
+                }
+            }
+        }
+        int emitTx = depth == 0 ? lumaTx : fullTD.Sub;
+        bool lumaAllZero = depth == 0 ? !HasNonZero(yC) : txb!.TrueForAll(t => !HasNonZero(t.Cf));
+
         // Reconstruct luma into ReconY now — CfL chroma prediction reads it (encoder-internal; independent of the
-        // symbol emission order below, which the decoder does luma-then-chroma too).
-        byte cfY = DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by, yInv);
+        // symbol emission order below, which the decoder does luma-then-chroma too). A split depth already did.
+        byte cfY = depth == 0 ? DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by, yInv) : (byte)0x40;
 
         if (c.Mono || chromaRef < 0)
         {
             // Monochrome (or a 4:2:0 strip without chroma): the colour syntax minus uv_mode / CfL / chroma coefficients.
-            int mSkip = HasNonZero(yC) ? 0 : 1;
+            int mSkip = lumaAllZero ? 1 : 0;
             c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(c.ASkip[bxR] + c.LSkip[byR]), (uint)mSkip);
             if (mSkip == 0) c.Msac.Mark(CdefMarker(bx4, by4));
             c.Msac.EncodeSymbolAdapt(ymCdf, yModeSym, 12);
@@ -3472,9 +3661,10 @@ internal static partial class Av1StillImageEncoder
             if (UseColorTxDepth && mTDim.Max > (byte)Av1TxSize.Tx4x4)
             {
                 int txCtx = (c.LTxY[byR] >= mTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= mTDim.Lw ? 1 : 0);
-                c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(mTDim.Max - 1, txCtx), 0, Math.Min((int)mTDim.Max, 2));
+                c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(mTDim.Max - 1, txCtx), depth, Math.Min((int)mTDim.Max, 2));
             }
-            if (mSkip == 0)
+            if (mSkip == 0 && depth > 0) EmitSplitLuma(c, emitTx, yModeNoFilt, txb!);
+            else if (mSkip == 0)
             {
                 if (yInv == Av1TxType.VDct || yInv == Av1TxType.HDct)
                     Av1CoeffEncode.EncodeCoefs1D(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, yModeNoFilt, yInv, yC, skipCtx: 0, dcSignCtx: ySign);
@@ -3482,9 +3672,9 @@ internal static partial class Av1StillImageEncoder
                     Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx, fullSet: UseFullIntraTxSet);
             }
             int mW = Math.Min(w4, c.Bw4 - bx4), mH = Math.Min(h4, c.Bh4 - by4);
-            sbyte mLw = (sbyte)mTDim.Lw, mLh = (sbyte)mTDim.Lh;
-            for (int i = 0; i < mW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)mSkip; c.ATxY[bxR + i] = mLw; }
-            for (int j = 0; j < mH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)mSkip; c.LTxY[byR + j] = mLh; }
+            sbyte mLw = (sbyte)Av1Tables.TxfmDimensions[emitTx].Lw, mLh = (sbyte)Av1Tables.TxfmDimensions[emitTx].Lh;
+            for (int i = 0; i < mW && bxR + i < 32; i++) { if (depth == 0) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)mSkip; c.ATxY[bxR + i] = mLw; }
+            for (int j = 0; j < mH && byR + j < 32; j++) { if (depth == 0) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)mSkip; c.LTxY[byR + j] = mLh; }
             FillPaletteCtx(c, bx4, by4, mW, mH, yPal, null);
             return;
         }
@@ -3647,7 +3837,7 @@ internal static partial class Av1StillImageEncoder
                 }
             }
         }
-        int skip = (HasNonZero(yC) || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
+        int skip = (!lumaAllZero || HasNonZero(uC) || HasNonZero(vC)) ? 0 : 1;
 
         int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
         c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(skipCtx), (uint)skip);
@@ -3676,7 +3866,7 @@ internal static partial class Av1StillImageEncoder
         if (UseColorTxDepth && lTDim.Max > (byte)Av1TxSize.Tx4x4)
         {
             int txCtx = (c.LTxY[byR] >= lTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= lTDim.Lw ? 1 : 0);
-            c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(lTDim.Max - 1, txCtx), 0, Math.Min((int)lTDim.Max, 2));
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(lTDim.Max - 1, txCtx), depth, Math.Min((int)lTDim.Max, 2));
         }
 
         byte cfU = 0x40, cfV = 0x40;
@@ -3686,7 +3876,8 @@ internal static partial class Av1StillImageEncoder
             int vSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)c.Layout);
             int uSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
             int vSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
-            if (yInv == Av1TxType.VDct || yInv == Av1TxType.HDct)
+            if (depth > 0) EmitSplitLuma(c, emitTx, yModeNoFilt, txb!);
+            else if (yInv == Av1TxType.VDct || yInv == Av1TxType.HDct)
                 Av1CoeffEncode.EncodeCoefs1D(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, yModeNoFilt, yInv, yC, skipCtx: 0, dcSignCtx: ySign);
             else
                 Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx, fullSet: UseFullIntraTxSet);
@@ -3704,9 +3895,9 @@ internal static partial class Av1StillImageEncoder
 
         int yW = Math.Min(w4, c.Bw4 - bx4), yH = Math.Min(h4, c.Bh4 - by4);
         int cW = Math.Min(cw4, (c.Bw4 - bx4 + ssX) >> ssX), cH = Math.Min(ch4, (c.Bh4 - by4 + ssY) >> ssY);
-        sbyte txLw = (sbyte)lTDim.Lw, txLh = (sbyte)lTDim.Lh;
-        for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
-        for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
+        sbyte txLw = (sbyte)Av1Tables.TxfmDimensions[emitTx].Lw, txLh = (sbyte)Av1Tables.TxfmDimensions[emitTx].Lh;
+        for (int i = 0; i < yW && bxR + i < 32; i++) { if (depth == 0) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
+        for (int j = 0; j < yH && byR + j < 32; j++) { if (depth == 0) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; c.AModeUv[cxR + i] = (byte)uvSym; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; c.LModeUv[cyR + j] = (byte)uvSym; }
         FillPaletteCtx(c, bx4, by4, yW, yH, yPal, uvPal);
@@ -5240,7 +5431,7 @@ internal static partial class Av1StillImageEncoder
         public readonly int[] R = new int[64 * 64];
         public readonly double[] Q1 = new double[1024], Q2 = new double[1024];
     }
-    [ThreadStatic] private static LeafScratch? t_scCore, t_scRect, t_scSub8;
+    [ThreadStatic] private static LeafScratch? t_scCore, t_scRect, t_scSub8, t_scSplit;
     [ThreadStatic] private static double[]? t_estQf;
     // The last ChooseLeafRdCore prescreen's surviving candidates (CandidateModes indices, SATD order).
     [ThreadStatic] private static int[]? t_topModesArr;
@@ -5498,6 +5689,14 @@ internal static partial class Av1StillImageEncoder
 
     // Dequantizes rect levels and reconstructs a w x h block onto predBlock (h x w) via the decoder's InvTxfmAdd,
     // into recon. Returns the coefficient-context byte.
+    // The above/left coefficient-context byte of a coded tx block (as DequantAndReconstructPredRect returns it).
+    private static byte TxCoefCtx(int[] levels, int txIdx)
+    {
+        int n = Av1Tables.Scans[txIdx].Length, cul = 0;
+        for (int i = 0; i < n; i++) cul += Math.Abs(levels[i]);
+        return (byte)(Math.Min(cul, 63) | (levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80)));
+    }
+
     private static byte DequantAndReconstructPredRect(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
         ushort[] predBlock, ushort[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct)
     {

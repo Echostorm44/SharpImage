@@ -2028,7 +2028,7 @@ public sealed class Av1HbdVerify
                         var dec = new Av1Decoder();
                         using var yuv = dec.Decode(c.ItemData(c.PrimaryId)!, 0, true);
                         var fh = dec.CurrentFrameHeader;
-                        log.AppendLine($"hdrinfo {Path.GetFileName(f)} sct={fh.AllowScreenContentTools} ibc={fh.AllowIntraBc} q={fh.QuantBaseQIdx} txmode={fh.TxMode} reduced={fh.ReducedTxSet} cdefbits={fh.CdefBits} lr={fh.LrType0}/{fh.LrType1} tiles={fh.TileCols}x{fh.TileRows}");
+                        log.AppendLine($"hdrinfo {Path.GetFileName(f)} sct={fh.AllowScreenContentTools} ibc={fh.AllowIntraBc} q={fh.QuantBaseQIdx} dq={fh.QuantYDcDelta}/{fh.QuantUDcDelta}/{fh.QuantUAcDelta}/{fh.QuantVDcDelta}/{fh.QuantVAcDelta} qm={fh.QuantUseQMatrix}:{fh.QmY}/{fh.QmU}/{fh.QmV} dqp={fh.DeltaQPresent}/{fh.DeltaQResLog2} txmode={fh.TxMode} reduced={fh.ReducedTxSet} cdefbits={fh.CdefBits} lr={fh.LrType0}/{fh.LrType1} tiles={fh.TileCols}x{fh.TileRows}");
                     }
                     continue;
                 }
