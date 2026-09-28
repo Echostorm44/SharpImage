@@ -1286,6 +1286,7 @@ public static partial class HeifCoder
     {
         quality = Math.Clamp(quality, 0, 100);
         if (quality == 100) return 0;
+        if (!identityMatrix && Av1.Av1StillImageEncoder.ForceQIdx >= 0) return Av1.Av1StillImageEncoder.ForceQIdx;   // dev oracle
         int quantizer = identityMatrix ? ((100 - quality) * 63 + 50) / 100 : TuneIqQualityToQuantizer[quality];
         return Math.Max(QuantizerToQIndex[quantizer], 1);
     }

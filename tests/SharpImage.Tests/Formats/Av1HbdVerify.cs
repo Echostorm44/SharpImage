@@ -2075,8 +2075,36 @@ public sealed class Av1HbdVerify
                     var phases = new System.Text.StringBuilder();
                     if (Environment.GetEnvironmentVariable("PROBE_PHASES") == "1")
                         SharpImage.Formats.Av1.Av1StillImageEncoder.PhaseHook = (nm, ms) => { lock (phases) phases.Append($" {nm} {ms:F1}"); };
+                    // ORACLE_DIR: the same-named stream there supplies the qindex (and, unless ORACLE_QONLY=1, the
+                    // partition tree) this encode must use.
+                    string? odir = Environment.GetEnvironmentVariable("ORACLE_DIR");
+                    if (odir != null && File.Exists(Path.Combine(odir, Path.GetFileName(t[2]))))
+                    {
+                        var oc = HeifContainer.Parse(File.ReadAllBytes(Path.Combine(odir, Path.GetFileName(t[2]))));
+                        int ow4 = (int)((img.Columns + 3) >> 2), oh4 = (int)((img.Rows + 3) >> 2);
+                        var org = new int[ow4 * oh4]; var obs = new byte[ow4 * oh4];
+                        SharpImage.Formats.Av1.Av1Decode.BlockPosHook = (x4, y4, bs) =>
+                        {
+                            int bw = SharpImage.Formats.Av1.Av1Tables.BlockDimensions[bs, 0], bh = SharpImage.Formats.Av1.Av1Tables.BlockDimensions[bs, 1];
+                            for (int yy = y4; yy < Math.Min(oh4, y4 + bh); yy++)
+                                for (int xx = x4; xx < Math.Min(ow4, x4 + bw); xx++) { org[yy * ow4 + xx] = x4 | (y4 << 16); obs[yy * ow4 + xx] = (byte)bs; }
+                        };
+                        var odec = new Av1Decoder();
+                        using (var oy = odec.Decode(oc.ItemData(oc.PrimaryId)!, 0, true)) { }
+                        SharpImage.Formats.Av1.Av1Decode.BlockPosHook = null;
+                        SharpImage.Formats.Av1.Av1StillImageEncoder.ForceQIdx = odec.CurrentFrameHeader.QuantBaseQIdx;
+                        if (Environment.GetEnvironmentVariable("ORACLE_QONLY") != "1")
+                        {
+                            SharpImage.Formats.Av1.Av1StillImageEncoder.OracleOrigin = org;
+                            SharpImage.Formats.Av1.Av1StillImageEncoder.OracleBs = obs;
+                            SharpImage.Formats.Av1.Av1StillImageEncoder.OracleW4 = ow4;
+                        }
+                    }
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     byte[] outB = HeifCoder.EncodeAvif(img, eo);
+                    SharpImage.Formats.Av1.Av1StillImageEncoder.ForceQIdx = -1;
+                    SharpImage.Formats.Av1.Av1StillImageEncoder.OracleOrigin = null;
+                    SharpImage.Formats.Av1.Av1StillImageEncoder.OracleBs = null;
                     if (allocL != null) log.Append(allocL.Report());
                     SharpImage.Formats.Av1.Av1StillImageEncoder.PhaseHook = null;
                     if (phases.Length > 0) log.AppendLine("  phases" + phases);
@@ -2085,6 +2113,11 @@ public sealed class Av1HbdVerify
                     Av1EncodeSpeed.TestOverride = null;
                     foreach (var (sf, old) in statics) sf.SetValue(null, old);
                     File.WriteAllBytes(t[2], outB);
+                    if (Environment.GetEnvironmentVariable("AOM_STATS") == "1")
+                    {
+                        log.AppendLine($"  aomstats search {Av1StillImageEncoder.StatSearch} modes {Av1StillImageEncoder.StatModes} trials {Av1StillImageEncoder.StatTrials} txb {Av1StillImageEncoder.StatTxb} rdoq {Av1StillImageEncoder.StatRdoq}");
+                        Av1StillImageEncoder.StatSearch = Av1StillImageEncoder.StatModes = Av1StillImageEncoder.StatTrials = Av1StillImageEncoder.StatTxb = Av1StillImageEncoder.StatRdoq = 0;
+                    }
                     log.AppendLine($"encq {Path.GetFileName(t[2])} {outB.Length} {secs:F3} gc {gcMs:F1}ms alloc {allocMb}MB g{GC.CollectionCount(0) - g0c}/{GC.CollectionCount(1) - g1c}/{GC.CollectionCount(2) - g2c}");
                     continue;
                 }

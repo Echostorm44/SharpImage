@@ -47,6 +47,20 @@ internal sealed class Av1EncodeSpeed
     public int RectTxDepthAlt;
     // 4:4:4 / 4:2:2 encodes switch on UseColorTxDepth + RectTxDepth (LayoutSpeedScope)
     public bool TxSplit444422;
+    // libaom's slow-speed luma search in the rect leaf (Av1StillImageEncoder.LumaSearch.cs) and its speed features:
+    // top_intra_model_count_allowed, intra_tx_size_search_init_depth_sqr / _rect, the coeff_opt_thresholds MSE
+    // threshold for RDOQ in the tx-type loop, use_reduced_intra_txset, disable_smooth_intra (SMOOTH_H / V).
+    public bool LibaomLuma;
+    public int AomTopIntraModelCount = 4, AomTxInitDepthSqr = 1, AomTxInitDepthRect;
+    public double AomTrellisMseThr = 3200;
+    public bool AomReducedIntraTxSet = true, AomDisableSmoothHV;
+    // libaom's single-pass trellis (Av1CoeffEncode.TrellisOptimize) for the libaom luma search's RDOQ
+    public bool AomTrellis;
+    // trellis before the rate / distortion of each tx type (libaom search_tx_type); winner trellised even above the MSE gate
+    public bool AomTrellisFirst, AomTrellisAll = true;
+    // search_tx_type early exits: adaptive_txb_search_level (0 off, 1 s0, 2 s1+) and skip_tx_search (s1+)
+    public int AomAdaptiveTxb;
+    public bool AomSkipTxSearch;
     /// <summary>Angle deltas searched for the directional intra modes: 1 = all of -3..3, 0 = none (delta 0 only),
     /// 2 = {-2, 0, 2}, 3 = {-3, 0, 3}, 4 = {-3, -1, 0, 1, 3}.</summary>
     public int AngleDeltaSet = 1;
@@ -1724,6 +1738,38 @@ internal static partial class Av1StillImageEncoder
     /// encoder's own reconstruction to match it sample for sample — the encoder predicts from exactly what a decoder
     /// will have. A mismatch throws.</summary>
     [ThreadStatic] internal static bool t_verifyRecon;
+
+    // Dev oracle (partition + qindex of another encoder's stream, see the encq probe's ORACLE_DIR): per 4x4 unit the
+    // origin (x | y << 16, 4-units) and dav1d block size of the block covering it; ForceQIdx replaces the quality map.
+    internal static int[]? OracleOrigin;
+    internal static byte[]? OracleBs;
+    internal static int OracleW4;
+    internal static int ForceQIdx = -1;
+
+    private static int OracleChoice(int bx4, int by4, int n)
+    {
+        (int X, int Y, int W, int H) B(int x4, int y4)
+        {
+            int i = y4 * OracleW4 + x4;
+            if (i < 0 || i >= OracleBs!.Length) return (-1, -1, 0, 0);
+            int o = OracleOrigin![i], bs = OracleBs[i];
+            return (o & 0xFFFF, o >> 16, Av1Tables.BlockDimensions[bs, 0], Av1Tables.BlockDimensions[bs, 1]);
+        }
+        var b = B(bx4, by4);
+        if (b.X != bx4 || b.Y != by4) return -1;
+        int h = n >> 1, q = n >> 2;
+        if (b.W == n && b.H == n) return 0;
+        if (b.W == n && b.H == h) return B(bx4, by4 + h).W == n ? 1 : 5;
+        if (b.W == h && b.H == n) return B(bx4 + h, by4).H == n ? 2 : 7;
+        if (n >= 4 && b.W == n && b.H == q) return 8;
+        if (n >= 4 && b.W == q && b.H == n) return 9;
+        if (n >= 4 && b.W == h && b.H == h)
+        {
+            var b2 = B(bx4, by4 + h); if (b2.W == n && b2.H == h) return 4;
+            var b3 = B(bx4 + h, by4); if (b3.W == h && b3.H == n) return 6;
+        }
+        return 3;
+    }
     [ThreadStatic] private static (ushort[][] Planes, int W, int Cw)? t_lastRecon;
     // The CDF arrays (Av1CdfIndex order) of a fresh default tile context, to replay symbolic tile logs against.
     private static ushort[][] FreshCdfArrays(int baseQIdx)
@@ -2160,6 +2206,12 @@ internal static partial class Av1StillImageEncoder
         { cands[nc++] = 8; if (vertOk) cands[nc++] = 9; }
 
         Searched:
+        // Dev oracle: the partition another encoder chose here (OracleOrigin / OracleBs from its decoded stream).
+        if (OracleBs != null && fullyInside)
+        {
+            int oc = OracleChoice(bx4, by4, blk4);
+            if (oc >= 0) { cands[0] = oc; nc = 1; }
+        }
         // libaom's intra CNN partition pruning (whole-in-frame 64x64 .. 8x8 blocks; the CNN runs once per superblock).
         int cnnLevel = c.ScreenContent ? Sp.CnnPruneLevelScreen : Sp.CnnPruneLevel;
         if (cnnLevel > 0 && fullyInside && bl >= 1 && bl <= 4 && nc > 1)
@@ -2557,7 +2609,24 @@ internal static partial class Av1StillImageEncoder
         bool filterEligible = UseFilterIntra && Math.Max(Av1Tables.BlockDimensions[bs, 2], Av1Tables.BlockDimensions[bs, 3]) <= 3;
 
         // Luma: rate-distortion mode + tx-type decision (from reconstruction). Writes prediction into c.Pred.
-        var rd = ChooseLeafRdCore(c.ReconY, c.W, c.Bw4, c.Bh4, c.Luma, c.W, bx4, by4, n, tx, c.DcDq, c.AcDq,
+        // libaom's slow-speed luma search (LumaSearch.cs): joint mode x tx size x tx type; it replaces ChooseLeafRdCore
+        // and the tx-depth trials below, and leaves the winner reconstructed in ReconY.
+        bool aomSq = Sp.LibaomLuma && n <= 32 && bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
+        LumaPick aomPickSq = default;
+        (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx) rd;
+        if (aomSq)
+        {
+            var saveA = c.ALY.AsSpan(bxR, Math.Min(blk4, 32 - bxR)).ToArray();
+            var saveL = c.LLY.AsSpan(byR, Math.Min(blk4, 32 - byR)).ToArray();
+            aomPickSq = AomLumaSearch(c, bs, tx, bx4, by4, blk4, blk4, edgeFlags, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]), true, filterEligible);
+            // depth 0 (and a palette winner) read their contexts from ALY / LLY: put the pre-block values back; a kept
+            // split re-applies its per-tx contexts below
+            saveA.CopyTo(c.ALY.AsSpan(bxR)); saveL.CopyTo(c.LLY.AsSpan(byR));
+            var t0 = aomPickSq.Txb[0];
+            rd = (aomPickSq.Mode, aomPickSq.Delta, t0.Cf, t0.Inv, t0.Idx);
+            t_leafJ = aomPickSq.J;
+        }
+        else rd = ChooseLeafRdCore(c.ReconY, c.W, c.Bw4, c.Bh4, c.Luma, c.W, bx4, by4, n, tx, c.DcDq, c.AcDq,
             c.Cdf, c.AModeY[bxR], c.LModeY[byR], c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR), c.Pred, edgeFlags, filterEligible, bs, fullSet: UseFullIntraTxSet);
         Av1IntraPredMode yMode = rd.Mode; int yDelta = rd.Delta;
         int[] yC = rd.Coeffs; Av1TxType yInv = rd.Inv; int yTxIdx = rd.Idx;
@@ -2596,7 +2665,7 @@ internal static partial class Av1StillImageEncoder
                 Array.Copy(pal.Pred, c.Pred, n * n);
             }
         }
-        int maxDepth = (UseColorTxDepth && HasNonZero(yC) && fullyInside && yPal == null) ? Math.Min((int)maxTDim.Max, Sp.ColorTxMaxDepth) : 0;
+        int maxDepth = (!aomSq && UseColorTxDepth && HasNonZero(yC) && fullyInside && yPal == null) ? Math.Min((int)maxTDim.Max, Sp.ColorTxMaxDepth) : 0;
         int depth = 0;
         if (maxDepth > 0)
         {
@@ -2642,13 +2711,32 @@ internal static partial class Av1StillImageEncoder
                 yModeSym = (int)yMode; yModeNoFilt = (int)yMode;
             }
         }
+        bool aomUsed = aomSq && yPal == null;
+        if (aomUsed)
+        {
+            depth = aomPickSq.Depth;
+            if (depth > 0)
+            {
+                ref readonly var sTd = ref Av1Tables.TxfmDimensions[aomPickSq.Tx];
+                foreach (var t in aomPickSq.Txb)
+                {
+                    byte cc = TxCoefCtx(t.Cf, aomPickSq.Tx);
+                    int tR = (t.Px >> 2) & 31, lR = (t.Py >> 2) & 31;
+                    for (int i = 0; i < sTd.W && tR + i < 32; i++) c.ALY[tR + i] = cc;
+                    for (int j = 0; j < sTd.H && lR + j < 32; j++) c.LLY[lR + j] = cc;
+                }
+            }
+        }
+        else if (aomSq) foreach (var t in aomPickSq.Txb) Av1FwdTransform.ReturnLevels(t.Cf);
         int lumaTx = ReduceTx(tx, depth);
         ref readonly var lTDim = ref Av1Tables.TxfmDimensions[lumaTx];
 
         // Reconstruct luma at the chosen depth into ReconY for keeps (CfL needs the reconstructed luma AC; depth>0
-        // records the per-tx-block coeffs for emission after the tx_size symbol).
-        var (cfY, lumaTxb, _) = ReconstructLumaAtDepth(c, bx4, by4, blk4, n, tx, lumaTx, depth,
-            yMode, yDelta, yModeNoFilt, yC, yInv, yTxIdx, edgeFlags, bs);
+        // records the per-tx-block coeffs for emission after the tx_size symbol). The libaom search already did.
+        var (cfY, lumaTxb, _) = aomUsed
+            ? (depth == 0 ? TxCoefCtx(yC, tx) : (byte)0x40, depth == 0 ? null : aomPickSq.Txb, 0.0)
+            : ReconstructLumaAtDepth(c, bx4, by4, blk4, n, tx, lumaTx, depth,
+                yMode, yDelta, yModeNoFilt, yC, yInv, yTxIdx, edgeFlags, bs);
         bool lumaAllZero = depth == 0 ? !HasNonZero(yC) : lumaTxb!.TrueForAll(t => !HasNonZero(t.Cf));
 
         if (c.Mono)
@@ -2689,9 +2777,7 @@ internal static partial class Av1StillImageEncoder
                         Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, tx, 0, yModeNoFilt, yC, dcSignCtx: ySign, txTypeIdx: yTxIdx, fullSet: UseFullIntraTxSet);
                 }
                 else
-                    foreach (var t in lumaTxb!)
-                        Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, t.Cf,
-                            skipCtx: t.SkipCtx, dcSignCtx: t.SignCtx, txTypeIdx: t.Idx, fullSet: UseFullIntraTxSet);
+                    EmitSplitLuma(c, lumaTx, yModeNoFilt, lumaTxb!);   // (V_DCT / H_DCT tx blocks code their 1D scan)
             }
             int mW = Math.Min(blk4, c.Bw4 - bx4), mH = Math.Min(blk4, c.Bh4 - by4);
             sbyte mLw = (sbyte)lTDim.Lw, mLh = (sbyte)lTDim.Lh;
@@ -2947,9 +3033,7 @@ internal static partial class Av1StillImageEncoder
             }
             else
             {
-                foreach (var t in lumaTxb!)
-                    Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, t.Cf,
-                        skipCtx: t.SkipCtx, dcSignCtx: t.SignCtx, txTypeIdx: t.Idx, fullSet: UseFullIntraTxSet);
+                EmitSplitLuma(c, lumaTx, yModeNoFilt, lumaTxb!);   // (V_DCT / H_DCT tx blocks code their 1D scan)
             }
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, uC, skipCtx: uSkip, dcSignCtx: uSign);
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
@@ -3420,6 +3504,17 @@ internal static partial class Av1StillImageEncoder
         bool fiOk = UseFilterIntra && Math.Max(Av1Tables.BlockDimensions[lumaBs, 2], Av1Tables.BlockDimensions[lumaBs, 3]) <= 3;
         var fiCdf = c.Cdf.GetFilterIntraCdf((Av1BlockSize)lumaBs);
 
+        // libaom's slow-speed luma search (Av1StillImageEncoder.LumaSearch.cs): modes x tx sizes x tx types jointly;
+        // it replaces the prescreen / RD / filter-intra / RDOQ / depth steps below.
+        bool aom = Sp.LibaomLuma && w <= 32 && h <= 32 && bx4 + w4 <= c.Bw4 && by4 + h4 <= c.Bh4;
+        LumaPick aomPick = default;
+        if (aom)
+        {
+            aomPick = AomLumaSearch(c, lumaBs, lumaTx, bx4, by4, w4, h4, edgeFlags, intraFlags, angleOk, fiOk);
+            yMode = aomPick.Mode; yDelta = aomPick.Delta; best = aomPick.J;
+            yC = aomPick.Txb![0].Cf; yInv = aomPick.Txb[0].Inv; yTxIdx = aomPick.Txb[0].Idx;
+        }
+
         // Prescreen modes by cheap SATD (as the square leaf does) and RD-evaluate only the best few — the full
         // tx-type search is the hot loop; SATD tracks coded cost closely enough that the top handful holds the winner.
         Span<int> topIdx = stackalloc int[RdModeCandidates];
@@ -3430,7 +3525,7 @@ internal static partial class Av1StillImageEncoder
         int refine = Sp.AngleRefineTop;
         Span<long> baseCost = stackalloc long[16];
         baseCost.Fill(long.MaxValue);
-        for (int pass = 0; pass < (refine > 0 ? 2 : 1); pass++)
+        for (int pass = 0; pass < (aom ? 0 : refine > 0 ? 2 : 1); pass++)
         {
             uint dirMask = pass == 1 ? TopDirectional(baseCost, refine) : 0;
             for (int ci = 0; ci < CandidateModes.Length; ci++)
@@ -3455,7 +3550,7 @@ internal static partial class Av1StillImageEncoder
         }
 
         bool fastTx = Sp.FastIntraTxType;
-        for (int pass = 0; pass < (fastTx ? 2 : 1); pass++)
+        for (int pass = 0; pass < (aom ? 0 : fastTx ? 2 : 1); pass++)
         for (int t = 0; t < RdModeCandidates; t++)
         {
             if (topCost[t] == long.MaxValue) break;
@@ -3493,7 +3588,7 @@ internal static partial class Av1StillImageEncoder
 
         // Filter intra: the 5 recursive-filter predictors, coded as y_mode=DC + use_filter_intra + filter_mode (the
         // tx-type context is FilterModeToYMode; the neighbour mode context stays DC).
-        if (fiOk)
+        if (fiOk && !aom)
         {
             double flagBits = Av1CoeffEncode.SymBits(fiCdf, 1) + Av1CoeffEncode.SymBits(ymCdf, (int)Av1IntraPredMode.Dc);
             int fiMask = Sp.FilterIntraPrune ? FilterIntraModesFor(yMode) : 0x1F;
@@ -3552,7 +3647,7 @@ internal static partial class Av1StillImageEncoder
         int yModeNoFilt = isFilter ? Av1Tables.FilterModeToYMode[yDelta] : (int)yMode;
 
         // RDOQ-refine the winning luma coefficients (skipped for V_DCT/H_DCT: RdoqOptimize assumes the 2D scan).
-        if (yPal == null && yInv != Av1TxType.VDct && yInv != Av1TxType.HDct && !Sp.RdoqInSearch)
+        if (!aom && yPal == null && yInv != Av1TxType.VDct && yInv != Av1TxType.HDct && !Sp.RdoqInSearch)
             Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, yTxIdx,
                 RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
 
@@ -3561,7 +3656,7 @@ internal static partial class Av1StillImageEncoder
         ref readonly var fullTD = ref Av1Tables.TxfmDimensions[lumaTx];
         int depth = 0;
         List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? txb = null;
-        if (Sp.RectTxDepth && UseColorTxDepth && yPal == null && fullTD.Max > (byte)Av1TxSize.Tx4x4 && w <= 32 && h <= 32
+        if (!aom && Sp.RectTxDepth && UseColorTxDepth && yPal == null && fullTD.Max > (byte)Av1TxSize.Tx4x4 && w <= 32 && h <= 32
             && bx4 + w4 <= c.Bw4 && by4 + h4 <= c.Bh4 && HasNonZero(yC))
         {
             int txCtxD = (c.LTxY[byR] >= fullTD.Lh ? 1 : 0) + (c.ATxY[bxR] >= fullTD.Lw ? 1 : 0);
@@ -3634,12 +3729,14 @@ internal static partial class Av1StillImageEncoder
                 }
             }
         }
-        int emitTx = depth == 0 ? lumaTx : fullTD.Sub;
-        bool lumaAllZero = depth == 0 ? !HasNonZero(yC) : txb!.TrueForAll(t => !HasNonZero(t.Cf));
+        if (aom && yPal == null) { depth = aomPick.Depth; txb = aomPick.Txb; }
+        else if (aom && aomPick.Txb != null) foreach (var t in aomPick.Txb) Av1FwdTransform.ReturnLevels(t.Cf);
+        int emitTx = txb == null ? lumaTx : aom ? aomPick.Tx : fullTD.Sub;
+        bool lumaAllZero = txb == null ? !HasNonZero(yC) : txb.TrueForAll(t => !HasNonZero(t.Cf));
 
         // Reconstruct luma into ReconY now — CfL chroma prediction reads it (encoder-internal; independent of the
         // symbol emission order below, which the decoder does luma-then-chroma too). A split depth already did.
-        byte cfY = depth == 0 ? DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by, yInv) : (byte)0x40;
+        byte cfY = txb == null ? DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by, yInv) : (byte)0x40;
 
         if (c.Mono || chromaRef < 0)
         {
@@ -3663,7 +3760,7 @@ internal static partial class Av1StillImageEncoder
                 int txCtx = (c.LTxY[byR] >= mTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= mTDim.Lw ? 1 : 0);
                 c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(mTDim.Max - 1, txCtx), depth, Math.Min((int)mTDim.Max, 2));
             }
-            if (mSkip == 0 && depth > 0) EmitSplitLuma(c, emitTx, yModeNoFilt, txb!);
+            if (mSkip == 0 && txb != null) EmitSplitLuma(c, emitTx, yModeNoFilt, txb);
             else if (mSkip == 0)
             {
                 if (yInv == Av1TxType.VDct || yInv == Av1TxType.HDct)
@@ -3673,8 +3770,8 @@ internal static partial class Av1StillImageEncoder
             }
             int mW = Math.Min(w4, c.Bw4 - bx4), mH = Math.Min(h4, c.Bh4 - by4);
             sbyte mLw = (sbyte)Av1Tables.TxfmDimensions[emitTx].Lw, mLh = (sbyte)Av1Tables.TxfmDimensions[emitTx].Lh;
-            for (int i = 0; i < mW && bxR + i < 32; i++) { if (depth == 0) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)mSkip; c.ATxY[bxR + i] = mLw; }
-            for (int j = 0; j < mH && byR + j < 32; j++) { if (depth == 0) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)mSkip; c.LTxY[byR + j] = mLh; }
+            for (int i = 0; i < mW && bxR + i < 32; i++) { if (txb == null) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)mSkip; c.ATxY[bxR + i] = mLw; }
+            for (int j = 0; j < mH && byR + j < 32; j++) { if (txb == null) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)mSkip; c.LTxY[byR + j] = mLh; }
             FillPaletteCtx(c, bx4, by4, mW, mH, yPal, null);
             return;
         }
@@ -3876,7 +3973,7 @@ internal static partial class Av1StillImageEncoder
             int vSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)c.Layout);
             int uSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR));
             int vSign = Av1CoeffDecode.GetDcSignCtx(chromaTx, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR));
-            if (depth > 0) EmitSplitLuma(c, emitTx, yModeNoFilt, txb!);
+            if (txb != null) EmitSplitLuma(c, emitTx, yModeNoFilt, txb);
             else if (yInv == Av1TxType.VDct || yInv == Av1TxType.HDct)
                 Av1CoeffEncode.EncodeCoefs1D(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, yModeNoFilt, yInv, yC, skipCtx: 0, dcSignCtx: ySign);
             else
@@ -3896,8 +3993,8 @@ internal static partial class Av1StillImageEncoder
         int yW = Math.Min(w4, c.Bw4 - bx4), yH = Math.Min(h4, c.Bh4 - by4);
         int cW = Math.Min(cw4, (c.Bw4 - bx4 + ssX) >> ssX), cH = Math.Min(ch4, (c.Bh4 - by4 + ssY) >> ssY);
         sbyte txLw = (sbyte)Av1Tables.TxfmDimensions[emitTx].Lw, txLh = (sbyte)Av1Tables.TxfmDimensions[emitTx].Lh;
-        for (int i = 0; i < yW && bxR + i < 32; i++) { if (depth == 0) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
-        for (int j = 0; j < yH && byR + j < 32; j++) { if (depth == 0) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
+        for (int i = 0; i < yW && bxR + i < 32; i++) { if (txb == null) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yModeSym; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
+        for (int j = 0; j < yH && byR + j < 32; j++) { if (txb == null) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yModeSym; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; c.AModeUv[cxR + i] = (byte)uvSym; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; c.LModeUv[cyR + j] = (byte)uvSym; }
         FillPaletteCtx(c, bx4, by4, yW, yH, yPal, uvPal);

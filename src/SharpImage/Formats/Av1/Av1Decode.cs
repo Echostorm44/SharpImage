@@ -692,6 +692,8 @@ public static class Av1Decode
     [ThreadStatic] internal static System.IO.TextWriter? BlockTrace;
     /// <summary>Dev hook: every decoded intra block (visible w4 x h4) after its mode info, for encoder statistics.</summary>
     internal static Action<int, int, Av1Block>? BlockStatsHook;
+    // Dev: every decoded intra block's position (4-units) and dav1d block size (encoder partition oracle).
+    internal static Action<int, int, int>? BlockPosHook;
 
     public static int DecodeBlock(
         Av1TaskContext t,
@@ -950,6 +952,7 @@ public static class Av1Decode
                 cbx4, cby4, cbw4, cbh4, ssHor, ssVer,
                 haveLeft, haveTop, hasChroma, intraEdgeFlags);
             BlockStatsHook?.Invoke(w4, h4, b);
+            BlockPosHook?.Invoke(bx4, by4, b.BlockSize);
 
             // === Reconstruction ===
             // Call intra reconstruction which does: prediction + coefficient decode + IDCT + residual add

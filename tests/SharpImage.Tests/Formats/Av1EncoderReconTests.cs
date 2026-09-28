@@ -55,6 +55,30 @@ public sealed class Av1EncoderReconTests
     [Arguments(Av1PixelLayout.I400, 8, 6, true)]
     [Arguments(Av1PixelLayout.I400, 10, 2, false)]
     public async Task EncoderReconstruction_MatchesDecoder(Av1PixelLayout layout, int bitDepth, int speed, bool screen)
+        => await Run(layout, bitDepth, speed, screen, null);
+
+    // Optional tools off in the presets: the intra edge filter and the tx-split searches (square depth + rect leaf).
+    [Test]
+    [Arguments(Av1PixelLayout.I420, 8, 0, false)]
+    [Arguments(Av1PixelLayout.I420, 8, 2, true)]
+    [Arguments(Av1PixelLayout.I420, 10, 6, false)]
+    [Arguments(Av1PixelLayout.I444, 8, 2, false)]
+    [Arguments(Av1PixelLayout.I422, 8, 6, false)]
+    [Arguments(Av1PixelLayout.I400, 8, 2, false)]
+    public async Task EncoderReconstruction_EdgeFilterAndTxSplit_MatchesDecoder(Av1PixelLayout layout, int bitDepth, int speed, bool screen)
+        => await Run(layout, bitDepth, speed, screen, sp => { sp.UseIntraEdgeFilter = true; sp.UseColorTxDepth = true; sp.RectTxDepth = true; sp.RectTxDepthAlt = 2; });
+
+    // libaom's slow-speed luma search in the rect leaf (joint mode x tx size x tx type, tx depths down to 2).
+    [Test]
+    [Arguments(Av1PixelLayout.I444, 8, 0, false)]
+    [Arguments(Av1PixelLayout.I444, 10, 2, true)]
+    [Arguments(Av1PixelLayout.I422, 8, 1, false)]
+    [Arguments(Av1PixelLayout.I420, 8, 2, false)]
+    [Arguments(Av1PixelLayout.I400, 8, 0, false)]
+    public async Task EncoderReconstruction_LibaomLuma_MatchesDecoder(Av1PixelLayout layout, int bitDepth, int speed, bool screen)
+        => await Run(layout, bitDepth, speed, screen, sp => { sp.LibaomLuma = true; sp.UseColorTxDepth = true; sp.AomTxInitDepthRect = 0; sp.AomTxInitDepthSqr = 0; });
+
+    private static async Task Run(Av1PixelLayout layout, int bitDepth, int speed, bool screen, Action<Av1EncodeSpeed>? tweak)
     {
         foreach (var (w, h) in new[] { (97, 71), (130, 66) })
         {
@@ -65,7 +89,9 @@ public sealed class Av1EncoderReconTests
             foreach (int q in new[] { 60, 150 })
             {
                 var prevSpeed = Av1StillImageEncoder.t_speed;
-                Av1StillImageEncoder.t_speed = Av1EncodeSpeed.ForSpeed(speed);
+                var sp = Av1EncodeSpeed.ForSpeed(speed);
+                tweak?.Invoke(sp);
+                Av1StillImageEncoder.t_speed = sp;
                 Av1StillImageEncoder.t_verifyRecon = true;
                 try
                 {
