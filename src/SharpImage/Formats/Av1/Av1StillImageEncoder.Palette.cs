@@ -271,9 +271,14 @@ internal static partial class Av1StillImageEncoder
             {
                 if (inv == Av1TxType.VDct || inv == Av1TxType.HDct) continue;   // 2D types only (RDOQ / estimate)
                 int[] cf = Av1FwdTransform.ForwardQuantRect(res, w, h, lumaTx, c.DcDq, c.AcDq, scanLen, fwd, qf);
+                double rate = -1;
+                // under the libaom luma search its rivals are trellised: so is this candidate (fair comparison)
+                if (Sp.LibaomLuma && Sp.AomTrellis && Sp.UseRdoq && HasNonZero(cf))
+                    rate = Av1CoeffEncode.TrellisOptimize(c.Cdf.Coef, lumaTx, 0, cf, qf, c.DcDq, c.AcDq, 0, ySign, LumaTrellisLambda(c),
+                        Av1CoeffEncode.IntraTxTypeBits(c.Cdf.Mode, lumaTx, (int)Av1IntraPredMode.Dc, idx, UseFullIntraTxSet));
                 long sse = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, cand.Pred, c.Luma, c.W, bx, by, inv);
                 if (sse + lambda * palBits >= Math.Min(bestJ, limit)) continue;   // distortion alone loses (exact)
-                double rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)Av1IntraPredMode.Dc, cf, 0, ySign, idx, fullSet: UseFullIntraTxSet);
+                if (rate < 0) rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)Av1IntraPredMode.Dc, cf, 0, ySign, idx, fullSet: UseFullIntraTxSet);
                 double j = sse + lambda * (rate + palBits);
                 if (j < bestJ) { bestJ = j; cand.Coeffs = cf; cand.Inv = inv; cand.Idx = idx; }
             }
@@ -284,7 +289,7 @@ internal static partial class Av1StillImageEncoder
             if (Sp.PaletteEarlyStop && bestJ > prevJ) break;
             prevJ = bestJ;
         }
-        if (best != null && Sp.UseRdoq)
+        if (best != null && Sp.UseRdoq && !(Sp.LibaomLuma && Sp.AomTrellis))
         {
             // RDOQ the winner (as the regular leaf does after its choice)
             for (int y = 0; y < h; y++)

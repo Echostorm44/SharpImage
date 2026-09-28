@@ -3211,6 +3211,7 @@ internal static partial class Av1StillImageEncoder
                 var qu = new double[scanLenC]; var qv = new double[scanLenC];
                 int[] uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cp.PredU, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qu);
                 int[] vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cp.PredV, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qv);
+                if (aomSqC) CRdoq(uu, qu, vv, qv);
                 double j = ChromaReconSse(uu, ctx0, cn, c.DcDq, c.AcDq, cp.PredU, c.U, c.Cw, cbx, cby)
                          + ChromaReconSse(vv, ctx0, cn, c.DcDq, c.AcDq, cp.PredV, c.V, c.Cw, cbx, cby)
                          + clam0 * (CRate(uu, vv) + Av1CoeffEncode.SymBits(uvModeCdf, 0) + UvPaletteBits(c, cp, bx4, by4, bs, yPal != null, cn, cn));
@@ -3226,7 +3227,7 @@ internal static partial class Av1StillImageEncoder
         // rate-distortion coefficient optimisation luma gets in the rect leaf. Chroma was previously left at
         // round-to-nearest quantisation, which over-codes it (measured 2-6 dB above luma at matched rate). Must
         // run before the skip/txb_skip decision below so an all-zeroed plane is coded as skipped.
-        if (UseChromaRdoq && !rdoqC && (!aomSqC || uvPal != null))
+        if (UseChromaRdoq && !rdoqC && !aomSqC)
         {
             double clam = ChromaRdoqLambdaScale * LamK * c.AcDq * c.AcDq;
             ref readonly var uvtd0 = ref Av1Tables.TxfmDimensions[ctx0];
@@ -4235,11 +4236,19 @@ internal static partial class Av1StillImageEncoder
         if (palOk)
             foreach (var cp in UvPaletteCandidates(c, cbx, cby, cw, ch))
             {
-                int[] uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cp.PredU, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
-                int[] vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cp.PredV, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
-                double j = ReconSseCandRect(uu, chromaTx, cw, ch, c.DcDq, c.AcDq, cp.PredU, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
-                         + ReconSseCandRect(vv, chromaTx, cw, ch, c.DcDq, c.AcDq, cp.PredV, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
-                         + clam0 * (CRate(uu, vv) + Av1CoeffEncode.SymBits(uvModeCdf, 0) + UvPaletteBits(c, cp, bx4, by4, lumaBs, yPal != null, cw, ch));
+                int[] uu, vv; double j;
+                double palHdr = Av1CoeffEncode.SymBits(uvModeCdf, 0) + UvPaletteBits(c, cp, bx4, by4, lumaBs, yPal != null, cw, ch);
+                if (aomC)
+                    j = PlaneJ(c.U, cp.PredU, Av1TxType.DctDct, eUSkip, eUSign, out uu) + PlaneJ(c.V, cp.PredV, Av1TxType.DctDct, eVSkip, eVSign, out vv)
+                      + clam0 * palHdr;
+                else
+                {
+                    uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cp.PredU, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
+                    vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cp.PredV, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
+                    j = ReconSseCandRect(uu, chromaTx, cw, ch, c.DcDq, c.AcDq, cp.PredU, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
+                      + ReconSseCandRect(vv, chromaTx, cw, ch, c.DcDq, c.AcDq, cp.PredV, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
+                      + clam0 * (CRate(uu, vv) + palHdr);
+                }
                 if (j < bestJ)
                 {
                     bestJ = j; uvPal = cp; uvMode = 0; uvDelta = 0; useCfl = false;

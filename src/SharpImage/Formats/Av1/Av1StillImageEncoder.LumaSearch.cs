@@ -45,6 +45,15 @@ internal static partial class Av1StillImageEncoder
     }
 
     [ThreadStatic] private static LeafScratch? t_scAom;
+
+    // The luma trellis lambda (coefficient-domain units): AomTrellisLam x libaom's (4.25 rdmult in RDCOST units = 68 x
+    // its pixel-domain lambda rdmult / 2048), else RdoqLambdaScale x the mode lambda.
+    private static double LumaTrellisLambda(ColorPartCtx c)
+    {
+        if (Sp.AomTrellisLam <= 0) return RdoqLambdaScale * LamK * c.AcDq * c.AcDq;
+        double dc = c.DcDq, rdm = dc * dc * (3.3 + 0.0015 * dc) / (1 << (2 * (Bd - 8)));
+        return Sp.AomTrellisLam * 68 * rdm / 2048 * (1 << (2 * (Bd - 8)));
+    }
     // dev counters (AOM_STATS): searches, modes RD-evaluated, uniform-tx trials, tx blocks, RDOQ runs in the type loop
     internal static long StatSearch, StatModes, StatTrials, StatTxb, StatRdoq;
     internal static readonly long[] OracleMiss = new long[19 * 16];
@@ -71,13 +80,7 @@ internal static partial class Av1StillImageEncoder
         // search_tx_type's mask: the reduced intra set for this direction where the 7-type set applies
         int mask = (full && symbolCoded && Sp.AomReducedIntraTxSet) ? AomReducedIntraTxMask[Math.Min(yModeNoFilt, 12)] : 0xFFFF;
         double lambda = LamK * c.AcDq * c.AcDq, rdoqLambda = RdoqLambdaScale * lambda;
-        if (Sp.AomTrellisLam > 0)
-        {
-            // libaom's trellis lambda (4.25 rdmult in RDCOST units = 68 x its pixel-domain lambda rdmult / 2048, in our
-            // coefficient-domain units) times the factor
-            double dc = c.DcDq, rdm = dc * dc * (3.3 + 0.0015 * dc) / (1 << (2 * (Bd - 8)));
-            rdoqLambda = Sp.AomTrellisLam * 68 * rdm / 2048 * (1 << (2 * (Bd - 8)));
-        }
+        rdoqLambda = LumaTrellisLambda(c);
         // perform_block_coeff_opt: block_mse_q8 <= thr * qstep^2 (qstep = AC dequant >> 3 at 8 bits)
         double qstep = c.AcDq / (double)(1 << (Bd - 5));
         var scr = t_scAom ??= new LeafScratch();
