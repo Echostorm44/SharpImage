@@ -560,7 +560,7 @@ public static class Av1IntraPred
         ReadOnlySpan<byte> edgeBuf, int center,
         int width, int height)
     {
-        DbgPredCount++;
+        if (DbgPredCount <= 6) DbgPredCount++;   // the debug guard below only reads <= 6
         if (DbgPredCount <= 6)
         {
             AvDbg.W($"[SV-ERR #{DbgPredCount}] f={DbgCurFrame} w={width} h={height}");

@@ -504,11 +504,6 @@ public static class Av1Reconstruction
         int bw4 = Av1Tables.BlockDimensions[(int)bs, 0];
         int bh4 = Av1Tables.BlockDimensions[(int)bs, 1];
 
-        // Log per-block Y pixel sum BEFORE reconstruction
-        ulong preYSum = 0;
-        for (int dy = 0; dy < bh4 * 4; dy++)
-            for (int dx = 0; dx < bw4 * 4; dx++)
-                preYSum += yPlane[(by4 * 4 + dy) * yStride + (bx4 * 4 + dx)];
 
         // Debug: dump pixels for block (0,2) after recon
         bool dumpTarget = (bx4 == 0 && by4 == 2);
@@ -529,7 +524,7 @@ public static class Av1Reconstruction
         int intraEdgeFilterFlag = (seqHdr.IntraEdgeFilter ? 1 : 0) << 10;
 
         {
-            Av1CoeffDecode.DbgReconCount++;
+            if (Av1CoeffDecode.DbgReconCount <= 200) Av1CoeffDecode.DbgReconCount++;   // debug guards only read <= 200
             if (Av1CoeffDecode.DbgReconCount <= 200)
                 AvDbg.W($"[RECON-DBG] #{Av1CoeffDecode.DbgReconCount} bs={(int)bs} tx={b.Tx} uvtx={b.UvTx} y_mode={(int)b.YMode} uv_mode={(int)b.UvMode} bx={t.Bx} by={t.By} hasC={hasChroma} rng={msac.DebugRng} skip={b.Skip} palSzY={b.PalSzY}");
         }
@@ -574,7 +569,9 @@ public static class Av1Reconstruction
                         if (DbgBlockCount < 5)
                             AvDbg.W($"[RECON-INNER] Block#{DbgBlockCount} xx={xx} yy={yy} curBx={curBx} curBy={curBy}");
 
-                        DbgBlockCount++;
+                        // debug guards only test DbgBlockCount <= 12: stop writing the shared static past that
+                        if (DbgBlockCount <= 12) DbgBlockCount++;
+#if AV1_DEBUG
                         // Watch pixel(14,0) — report who wrote what
                         {
                             ushort current14 = yPlane[14];
@@ -585,16 +582,19 @@ public static class Av1Reconstruction
                             }
                         }
                         if (b.YMode < DbgModeHist.Length) DbgModeHist[b.YMode]++;
+#endif
 
                         // Debug: track writes to pixel (130,1)
                         int blkX0w = curBx * 4;
                         int blkY0w = curBy * 4;
                         bool dbgFirstErr = (130 >= blkX0w && 130 < blkX0w + tDim.W * 4 && 1 >= blkY0w && 1 < blkY0w + tDim.H * 4);
 
+#if AV1_DEBUG
                         // Watchpoint: detect any write to pixel (32,104) = offset 12392
                         ushort watchBefore = 0;
                         if (12392 < yPlane.Length)
                             watchBefore = yPlane[12392];
+#endif
 
                         if (b.PalSzY == 0) // skip prediction for palette blocks
                         {
@@ -787,7 +787,6 @@ public static class Av1Reconstruction
                             AvDbg.W($"[RECON-COEF] Block#{DbgBlockCount} skip={b.Skip} palSzY={b.PalSzY}");
                         if (b.Skip == 0)
                         {
-                            DbgCoefCalls++;
                             Span<int> cf = t.CfBuf;
                             Span<byte> levels = t.Levels;
                             bool lossless = fh.SegmentationLossless[b.SegId];
@@ -817,7 +816,6 @@ public static class Av1Reconstruction
                                 lossless, fh.ReducedTxSet,
                                 fh.SegmentationQIdx[b.SegId], ctx.BitDepth, levels, layout);
 
-                            DbgCoefNonSkip++;
                             bool dbgTarget = dbgFirstErr;
                             if (dbgTarget)
                             {
@@ -835,7 +833,6 @@ public static class Av1Reconstruction
                                         sbc.Append($" cf[{ci}]={cf[ci]}");
                                     Cf0DumpWriter?.WriteLine(sbc.ToString());
                                 }
-                                DbgCoefEobPos++;
                                 if (DbgFirstDqDc == 0)
                                 {
                                     DbgFirstDqDc = dqTable[0];
@@ -885,7 +882,9 @@ public static class Av1Reconstruction
                                 }
                                 else
                                 {
+#if AV1_DEBUG
                                 Av1InvTransform.DbgTrace = (curBx == 2 && curBy == 0) || (eob >= 0 && DbgBlockCount <= 5);
+#endif
                                 int shift = Av1InvTransform.TxShift[b.Tx];
                                     int pred0Val = DumpPixelPred ? yPlane[dstOff] : 0;
                                     Av1InvTransform.InvTxfmAdd16(
@@ -928,7 +927,9 @@ public static class Av1Reconstruction
                                             PixelDumpWriter?.WriteLine(sb.ToString());
                                         }
                                     }
+#if AV1_DEBUG
                                     Av1InvTransform.DbgTrace = false;
+#endif
 
                                     // Watch pixel (130,1) after write
                                     int blkX0 = curBx * 4;  // pixel column
@@ -970,12 +971,14 @@ public static class Av1Reconstruction
                         }
                         dstOff += 4 * tDim.W;
 
+#if AV1_DEBUG
                         // Watchpoint: detect modification of pixel (32,104)
                         ushort watchAfter = 0;
                         if (12392 < yPlane.Length)
                             watchAfter = yPlane[12392];
                         if (watchAfter != watchBefore && DbgBlockCount > 1)
                             AvDbg.W($"[WATCH] pixel (32,104) changed {watchBefore:x2}->{watchAfter:x2} by Block#{DbgBlockCount} bx={curBx} by={curBy} mode={(Av1IntraPredMode)b.YMode} tw={tDim.W} th={tDim.H} dstOff={dstOff - 4*tDim.W}");
+#endif
 
                         // Y-ERR debug dump removed for clean output
                     }
@@ -1257,7 +1260,6 @@ public static class Av1Reconstruction
                             }
 
                         skipUvPred:
-                            DbgChromaCoefCalls++;
                         if (b.Skip == 0)
                             {
                                 var aboveCoef = pl == 0 ? t.Above.CCoef0 : t.Above.CCoef1;
@@ -1306,7 +1308,6 @@ public static class Av1Reconstruction
                                         sb.Append($" {cf[ci]}");
                                     AvDbg.W(sb.ToString());
                                 }
-                                    DbgChromaEobPos++;
                                     
                                     // DBG: dump chroma dq and recon
                                     if (DbgBlockCount <= 12)
@@ -1389,13 +1390,6 @@ public static class Av1Reconstruction
             }
         }
 
-        // Per-block Y pixel sum after reconstruction
-        ulong postYSum = 0;
-        for (int dy = 0; dy < bh4 * 4; dy++)
-            for (int dx = 0; dx < bw4 * 4; dx++)
-                postYSum += yPlane[(by4 * 4 + dy) * yStride + (bx4 * 4 + dx)];
-        if (bw4 * 4 == 16 && by4 == 0) // first row 16-wide blocks
-            AvDbg.W($"[BLK-SUM] bx={bx4} by={by4} bs={(int)bs} palSz={b.PalSzY} preSum={preYSum} postSum={postYSum}");
     }
         }
     }
