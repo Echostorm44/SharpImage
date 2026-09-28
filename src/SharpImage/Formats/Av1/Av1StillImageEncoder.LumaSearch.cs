@@ -50,7 +50,7 @@ internal static partial class Av1StillImageEncoder
     // its pixel-domain lambda rdmult / 2048), else RdoqLambdaScale x the mode lambda.
     private static double LumaTrellisLambda(ColorPartCtx c)
     {
-        if (Sp.AomTrellisLam <= 0) return RdoqLambdaScale * LamK * c.AcDq * c.AcDq;
+        if (Sp.AomTrellisLam <= 0) return RdoqScale * LamK * c.AcDq * c.AcDq;
         double dc = c.DcDq, rdm = dc * dc * (3.3 + 0.0015 * dc) / (1 << (2 * (Bd - 8)));
         return Sp.AomTrellisLam * 68 * rdm / 2048 * (1 << (2 * (Bd - 8)));
     }
@@ -79,7 +79,7 @@ internal static partial class Av1StillImageEncoder
         var txSet = (full && symbolCoded) ? AomOrderFull : (symbolCoded ? AomOrderReduced : DctOnly);
         // search_tx_type's mask: the reduced intra set for this direction where the 7-type set applies
         int mask = (full && symbolCoded && Sp.AomReducedIntraTxSet) ? AomReducedIntraTxMask[Math.Min(yModeNoFilt, 12)] : 0xFFFF;
-        double lambda = LamK * c.AcDq * c.AcDq, rdoqLambda = RdoqLambdaScale * lambda;
+        double lambda = LamK * c.AcDq * c.AcDq, rdoqLambda = RdoqScale * lambda;
         rdoqLambda = LumaTrellisLambda(c);
         // perform_block_coeff_opt: block_mse_q8 <= thr * qstep^2 (qstep = AC dequant >> 3 at 8 bits)
         double qstep = c.AcDq / (double)(1 << (Bd - 5));
@@ -308,13 +308,18 @@ internal static partial class Av1StillImageEncoder
 
         // pick_sb_modes' rd budget: the partition candidate's remaining J (the luma J alone must stay below it)
         var best = new LumaPick { J = Sp.AomPartAbort ? PartRemaining(c) : double.MaxValue };
+        // winner-mode processing (enable_winner_mode_for_tx_size_srch, libaom s4+): modes compared at the largest tx,
+        // the full tx-size search then only for the winner
+        bool winnerTx = Sp.AomWinnerTxSize && nSizes > 1;
+        int kEnd = winnerTx ? 1 : nSizes, kStart = 0;
+        double bestModeBits = 0;
         // one mode: the tx-size loop (uniform_txfm_yrd per size), J including mode + tx_size bits
         System.Threading.Interlocked.Increment(ref StatSearch);
         void TryMode(Av1IntraPredMode m, int dl, int nf, double modeBits)
         {
             System.Threading.Interlocked.Increment(ref StatModes);
             double[] rd = { double.MaxValue, double.MaxValue, double.MaxValue };
-            for (int k = 0; k < nSizes; k++)
+            for (int k = kStart; k < kEnd; k++)
             {
                 if (orc && txSelect && sizes[k] != om.Tx) continue;
                 int codedDepth = k;   // sizes[k] is k splits below the largest tx (the coded tx_depth)
@@ -331,6 +336,7 @@ internal static partial class Av1StillImageEncoder
                     {
                         if (best.Txb != null) foreach (var t in best.Txb) Av1FwdTransform.ReturnLevels(t.Cf);
                         best = new LumaPick { Mode = m, Delta = dl, ModeNoFilt = nf, Depth = codedDepth, Tx = sizes[k], J = jt, Txb = txb };
+                        bestModeBits = modeBits;
                     }
                     else foreach (var t in txb) Av1FwdTransform.ReturnLevels(t.Cf);
                 }
@@ -396,6 +402,13 @@ internal static partial class Av1StillImageEncoder
                 TryMode(Av1IntraPredMode.Filter, fm, Av1Tables.FilterModeToYMode[fm],
                     flag + Av1CoeffEncode.SymBits(c.Cdf.GetFilterIntraModeCdf(), fm));
             }
+        }
+
+        if (winnerTx && best.Txb != null)
+        {
+            // the winner's split sizes (TryMode keeps whichever size beats its current J)
+            kStart = 1; kEnd = nSizes;
+            TryMode(best.Mode, best.Delta, best.ModeNoFilt, bestModeBits);
         }
 
         // leave the winner's reconstruction + coefficient contexts in place (deterministic re-run of its size)

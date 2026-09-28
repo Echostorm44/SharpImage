@@ -296,7 +296,7 @@ internal static partial class Av1StillImageEncoder
                 for (int x = 0; x < w; x++) res[y * w + x] = c.Luma[(by + y) * c.W + bx + x] - best.Pred[y * w + x];
             Av1FwdTransform.ForwardQuantRect(res, w, h, lumaTx, c.DcDq, c.AcDq, scanLen, FwdTypeForTxType(best.Inv), qf);
             Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)Av1IntraPredMode.Dc, best.Coeffs, qf,
-                c.DcDq, c.AcDq, 0, ySign, best.Idx, RdoqLambdaScale * LamK * c.AcDq * c.AcDq);
+                c.DcDq, c.AcDq, 0, ySign, best.Idx, RdoqScale * LamK * c.AcDq * c.AcDq);
         }
         return best;
     }
