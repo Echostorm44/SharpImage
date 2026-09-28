@@ -113,6 +113,8 @@ internal sealed class Av1EncodeSpeed
     /// <summary>libaom allintra (every speed): a 16x16+ block holding a near-flat 4x4 (log variance &lt; 0.272) and a much
     /// busier one (spread &gt; 3) is not coded whole (NONE pruned), so ringing does not spread into the flat part.</summary>
     public bool ForceSplitVar;
+    /// <summary>RDOQ level-down trials that would need more than this many bits of saving are skipped (0 = all).</summary>
+    public double RdoqSkipBits;
     /// <summary>The luma winner's mode is always a chroma RD candidate (libaom prune_chroma_modes_using_luma_winner keeps
     /// it); RectScreenContent: rectangular partitions stay searched for screen content when UseRectPartition is off
     /// (libaom prunes rect by qindex only for camera content).</summary>
@@ -213,7 +215,9 @@ internal sealed class Av1EncodeSpeed
         // 4+: sub-8x8 leaves stay (worth ~4.5% here) with their luma modes prescreened to 4.
         if (speed >= 4) { p.RdModeCandidates = 2; p.Sub8ModeCandidates = 4; p.UseSplit4x4 = false; p.EarlyTermBits = 32; }
         if (speed >= 4) p.LrSgrSets = 8;
-        if (speed >= 5) { p.RdUvCandidates = 1; p.UseFullIntraTxSet = false; }
+        // 5-6 keep the full intra tx set (V_DCT / H_DCT: s6 4:4:4 +0.17 -> -0.27%, 4:2:0 -3.14 -> -3.45%, no time cost)
+        if (speed >= 5) p.RdUvCandidates = 1;
+        if (speed >= 7) p.UseFullIntraTxSet = false;
         // 5: no 4:2:0 loop restoration (libaom allintra 5+), libaom's 4x4-variance and NONE-mode 8x8 prunes, CDEF fast
         // level 3: scoreboard -1.64% x1.49 -> -1.26% x0.93.
         if (speed >= 5) { p.LrSkip420 = true; p.RectPruneVarDev = true; p.RectPruneNoneMode = true; p.CdefSearchLevel = 3; }
@@ -226,13 +230,15 @@ internal sealed class Av1EncodeSpeed
         // mode candidate (top_intra_model_count), early termination at 128 bits, CNN split forcing for screen content:
         // scoreboard -2.99% x1.42 -> -1.44% x1.05.
         if (speed >= 6) { p.FastIntraTxType = true; p.RdModeCandidates = 1; p.EarlyTermBits = 128; p.CnnPruneLevelScreen = 2; }
-        if (speed >= 6) { p.LrSgrSets = 0; p.LrUnitShiftMask = 4; p.LrWienerRounds = 2; p.LrVerify = false; p.LrStatsStep = 2; p.FilterSearchFast = true; }
+        if (speed >= 6) { p.LrSgrSets = 0; p.LrUnitShiftMask = 4; p.LrWienerRounds = 1; p.LrVerify = false; p.LrStatsStep = 2; p.FilterSearchFast = true; }
         // 6: deblocking level from q (libaom LPF_PICK_FROM_Q) and no 4:2:0 loop restoration (libaom allintra 5+ has none): both measured
         // within 0.1% BD on the avifenc scoreboard, ~6% less time.
         if (speed >= 6) { p.DeblockPickFromQ = true; p.LrSkip420 = true; }
         // 6: libaom's 8x8 partition prunes (qindex, neighbour size, 4x4 variance spread, NONE mode): 4:2:0 scoreboard
         // -3.71% x3.78 -> -3.11% x2.43 vs avifenc.
         if (speed >= 6) { p.RectPruneQidx = true; p.Sub8PruneNeighbour = true; p.RectPruneVarDev = true; p.RectPruneNoneMode = true; }
+        // 6+: RDOQ skips level-down trials that would need > 6 bits of saving (4:2:0 s6 x0.96 -> x0.90, -0.05%).
+        if (speed >= 6) p.RdoqSkipBits = 6;
         // 7+: partitions from the fast estimate.
         if (speed >= 7) { p.UseTrueRd = false; p.EarlyTermBits = 8; }
         // 7-10 (measured on the speed corpus vs libaom's ladder, BD vs libaom speed 0 / fox 1204x800 1-thread time):
@@ -4670,6 +4676,7 @@ internal static partial class Av1StillImageEncoder
     // round-to-nearest with no rate-distortion trimming, running measurably richer than luma at matched rate;
     // this applies the same RDOQ to U/V. Scale kept equal to luma initially, tuned against the RD benchmark.
     internal static bool UseChromaRdoq { get => Sp.UseChromaRdoq; set => Sp.UseChromaRdoq = value; }
+    internal static double RdoqSkipBits => Sp.RdoqSkipBits;
     internal static double ChromaRdoqLambdaScale = 50.0;   // 25->40 (filter-intra re-sweep) ->50 (re-swept after UV modes + full tx set: gap -0.85%)
 
     // Enables PARTITION_HORZ / PARTITION_VERT rectangular leaves at 16x16 (colour path). Toggle for A/B testing.

@@ -621,6 +621,8 @@ internal static class Av1CoeffEncode
             int sign = L < 0 ? -1 : 1, mag = L < 0 ? -L : L;
             int cand = sign * (mag - 1);           // mag-1 (may be 0 for interior coeffs)
             double dDist = DistOf(rc, cand) - DistOf(rc, L);
+            // a trial that would have to save more than RdoqSkipBits bits to break even is not priced (speed presets)
+            if (RdoqSkipBits > 0 && dDist > lambda * RdoqSkipBits) continue;
             bool movesEob = inc == null || (i == eob && cand == 0);
             signedLevels[rc] = cand;
             double newBits;
@@ -640,6 +642,8 @@ internal static class Av1CoeffEncode
         }
     }
 
+    /// <summary>Level-down trials needing more than this many bits of saving to break even are skipped (0 = all).</summary>
+    private static double RdoqSkipBits => Av1StillImageEncoder.RdoqSkipBits;
     internal static readonly bool RdoqCheck = Environment.GetEnvironmentVariable("AV1_RDOQCHECK") == "1";
     [ThreadStatic] private static RdoqCost? t_rdoqCost;
     private static readonly short[]?[] InvScans = new short[]?[Av1Tables.Scans.Length];
