@@ -693,7 +693,12 @@ public static class Av1Decode
     /// <summary>Dev hook: every decoded intra block (visible w4 x h4) after its mode info, for encoder statistics.</summary>
     internal static Action<int, int, Av1Block>? BlockStatsHook;
     // Dev: every decoded intra block's position (4-units) and dav1d block size (encoder partition oracle).
-    internal static Action<int, int, int>? BlockPosHook;
+    internal static Action<int, int, Av1Block>? BlockPosHook;
+    // Dev: every decoded luma tx block with coefficients: position (4-units), tx size, tx type.
+    internal static Action<int, int, int, int>? TxbHook;
+    // Dev: a decoded luma tx block with coefficients: position, tx size, tx type, eob, dequantised coefficients
+    // (copy) and its prediction (copy, tw x th), before the residual is added.
+    internal static Action<int, int, int, int, int, int[], ushort[]>? TxbPredHook;
 
     public static int DecodeBlock(
         Av1TaskContext t,
@@ -952,7 +957,7 @@ public static class Av1Decode
                 cbx4, cby4, cbw4, cbh4, ssHor, ssVer,
                 haveLeft, haveTop, hasChroma, intraEdgeFlags);
             BlockStatsHook?.Invoke(w4, h4, b);
-            BlockPosHook?.Invoke(bx4, by4, b.BlockSize);
+            BlockPosHook?.Invoke(t.Bx, t.By, b);   // absolute 4-unit position (bx4 here is SB-relative)
 
             // === Reconstruction ===
             // Call intra reconstruction which does: prediction + coefficient decode + IDCT + residual add

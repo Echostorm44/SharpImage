@@ -815,6 +815,19 @@ public static class Av1Reconstruction
                                 dqTable, QmFor(fh, b.Tx, 0),
                                 lossless, fh.ReducedTxSet,
                                 fh.SegmentationQIdx[b.SegId], ctx.BitDepth, levels, layout);
+                            if (eob >= 0) Av1Decode.TxbHook?.Invoke(curBx, curBy, b.Tx, (int)txtp);
+                            if (eob >= 0 && Av1Decode.TxbPredHook != null)
+                            {
+                                int ptw = tDim.W * 4, pth = tDim.H * 4;
+                                var pc = new ushort[ptw * pth];
+                                for (int py = 0; py < pth; py++)
+                                    for (int px = 0; px < ptw; px++)
+                                    {
+                                        int o = dstOff + py * yStride + px;
+                                        pc[py * ptw + px] = o < yPlane.Length ? yPlane[o] : (ushort)0;
+                                    }
+                                Av1Decode.TxbPredHook(curBx, curBy, b.Tx, (int)txtp, eob, cf.Slice(0, Av1Tables.Scans[b.Tx].Length).ToArray(), pc);
+                            }
 
                             bool dbgTarget = dbgFirstErr;
                             if (dbgTarget)

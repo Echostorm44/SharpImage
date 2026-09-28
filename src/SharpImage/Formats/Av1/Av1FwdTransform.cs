@@ -33,6 +33,9 @@ internal static class Av1FwdTransform
     // optimum is a broad basin at bias 0.02-0.04 (0.04 best, -6.2% BD-rate vs the prior 0.008/30/0.20 tuning; all
     // six images improved). Bias 0.00 (pure round-to-nearest) slightly overshoots (-5.9%) — a hair of deadzone helps.
     internal static double DeadzoneBias = 0.04;
+    // The rounding bias in effect: 0 (round to nearest, libaom's FP quantiser ahead of its trellis) when the encode's
+    // speed preset asks for it.
+    internal static double Bias => Av1StillImageEncoder.RoundNearest ? 0 : DeadzoneBias;
 
     // Cached forward 1D matrices F = M^-1 (M = decoder's integer 1D inverse), keyed by (logSize<<2 | type1d).
     private static readonly ConcurrentDictionary<int, double[,]> FwdMatrixCache = new();
@@ -197,7 +200,7 @@ internal static class Av1FwdTransform
                 int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
                 double qf = acc * s / dq;
                 if (qfOut != null) qfOut[kx * sh + ky] = qf;
-                double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
+                double mag = Math.Abs(qf) + 0.5 - Bias;
                 levels[kx * sh + ky] = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
             }
 
@@ -244,7 +247,7 @@ internal static class Av1FwdTransform
                 int dq = (kx == 0 && ky == 0) ? dcDq : acDq;
                 double qf = acc * s / dq;
                 if (qfOut != null) qfOut[kx * n + ky] = qf;
-                double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
+                double mag = Math.Abs(qf) + 0.5 - Bias;
                 levels[kx * n + ky] = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
             }
         }
@@ -310,7 +313,7 @@ internal static class Av1FwdTransform
                 // Deadzone quantizer: |level| = floor(|qf| + 0.5 - bias), clamped at 0.
                 double qf = acc * k / dq;
                 if (qfOut != null) qfOut[kx * sh + ky] = qf;
-                double mag = Math.Abs(qf) + 0.5 - DeadzoneBias;
+                double mag = Math.Abs(qf) + 0.5 - Bias;
                 int q = mag < 1.0 ? 0 : (int)(Math.Sign(qf) * Math.Floor(mag));
                 levels[kx * sh + ky] = q;
             }
@@ -340,7 +343,7 @@ internal static class Av1FwdTransform
         var sv = Vector256.Create(s);
         var acv = Vector256.Create((double)acDq);
         var half = Vector256.Create(0.5);
-        var bias = Vector256.Create(DeadzoneBias);
+        var bias = Vector256.Create(Bias);
         var one = Vector256.Create(1.0);
         for (int kx = 0; kx < sw; kx++)
         {
@@ -530,7 +533,7 @@ internal static class Av1FwdTransform
         var kv = Vector256.Create(k);
         var acv = Vector256.Create((double)acDq);
         var half = Vector256.Create(0.5);
-        var bias = Vector256.Create(DeadzoneBias);
+        var bias = Vector256.Create(Bias);
         var one = Vector256.Create(1.0);
         for (int kx = 0; kx < kept; kx++)
         {

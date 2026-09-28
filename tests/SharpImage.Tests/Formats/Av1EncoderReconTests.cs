@@ -76,7 +76,7 @@ public sealed class Av1EncoderReconTests
     [Arguments(Av1PixelLayout.I420, 8, 2, false)]
     [Arguments(Av1PixelLayout.I400, 8, 0, false)]
     public async Task EncoderReconstruction_LibaomLuma_MatchesDecoder(Av1PixelLayout layout, int bitDepth, int speed, bool screen)
-        => await Run(layout, bitDepth, speed, screen, sp => { sp.LibaomLuma = true; sp.UseColorTxDepth = true; sp.AomTxInitDepthRect = 0; sp.AomTxInitDepthSqr = 0; sp.AomLuma64 = true; sp.AomTrellis = true; sp.AomTrellisFirst = true; sp.AomTxDomainDist = true; sp.AomPartAbReuse = true; sp.AomPartAbort = true; sp.AomPruneAb = true; sp.AomLessRectCheck = true; sp.UseIntraEdgeFilter = true; });
+        => await Run(layout, bitDepth, speed, screen, sp => { sp.LibaomLuma = true; sp.UseColorTxDepth = true; sp.AomTxInitDepthRect = 0; sp.AomTxInitDepthSqr = 0; sp.AomLuma64 = true; sp.AomChroma = true; sp.AomTrellis = true; sp.AomTrellisFirst = true; sp.AomTxDomainDist = true; sp.AomPartAbReuse = true; sp.AomPartAbort = true; sp.AomPruneAb = true; sp.AomLessRectCheck = true; sp.UseIntraEdgeFilter = true; });
 
     private static async Task Run(Av1PixelLayout layout, int bitDepth, int speed, bool screen, Action<Av1EncodeSpeed>? tweak)
     {

@@ -47,9 +47,12 @@ internal static partial class Av1StillImageEncoder
     [ThreadStatic] private static LeafScratch? t_scAom;
     // dev counters (AOM_STATS): searches, modes RD-evaluated, uniform-tx trials, tx blocks, RDOQ runs in the type loop
     internal static long StatSearch, StatModes, StatTrials, StatTxb, StatRdoq;
+    internal static readonly long[] OracleMiss = new long[19 * 16];
     internal static readonly bool CalOn = Environment.GetEnvironmentVariable("AOM_CAL") == "1";
     internal static readonly double[] CalPix = new double[19], CalCoef = new double[19];
     internal static readonly long[] CalN = new long[19];
+    internal static readonly double[] CalCmp = new double[8];
+    internal static bool OracleLevelsCompareOnly;
 
     // libaom uniform_txfm_yrd for an intra block: the w4 x h4 luma block coded on tx size stx (all tx blocks alike),
     // tx blocks in raster order, each predicted from the reconstruction with the decoder's per-tx edge flags
@@ -67,7 +70,14 @@ internal static partial class Av1StillImageEncoder
         var txSet = (full && symbolCoded) ? AomOrderFull : (symbolCoded ? AomOrderReduced : DctOnly);
         // search_tx_type's mask: the reduced intra set for this direction where the 7-type set applies
         int mask = (full && symbolCoded && Sp.AomReducedIntraTxSet) ? AomReducedIntraTxMask[Math.Min(yModeNoFilt, 12)] : 0xFFFF;
-        double lambda = RdLambdaK * c.AcDq * c.AcDq, rdoqLambda = RdoqLambdaScale * lambda;
+        double lambda = LamK * c.AcDq * c.AcDq, rdoqLambda = RdoqLambdaScale * lambda;
+        if (Sp.AomTrellisLam > 0)
+        {
+            // libaom's trellis lambda (4.25 rdmult in RDCOST units = 68 x its pixel-domain lambda rdmult / 2048, in our
+            // coefficient-domain units) times the factor
+            double dc = c.DcDq, rdm = dc * dc * (3.3 + 0.0015 * dc) / (1 << (2 * (Bd - 8)));
+            rdoqLambda = Sp.AomTrellisLam * 68 * rdm / 2048 * (1 << (2 * (Bd - 8)));
+        }
         // perform_block_coeff_opt: block_mse_q8 <= thr * qstep^2 (qstep = AC dequant >> 3 at 8 bits)
         double qstep = c.AcDq / (double)(1 << (Bd - 5));
         var scr = t_scAom ??= new LeafScratch();
@@ -125,19 +135,47 @@ internal static partial class Av1StillImageEncoder
                 }
                 System.Threading.Interlocked.Increment(ref StatTxb);
                 double budget = jLimit - jSum;   // ref_best_rd for this tx block
+                // dev oracle: the other encoder's tx type here, when it is one this tx size searches
+                int oTp = -1;
+                if (OracleTxtp != null && OracleTxtp.TryGetValue(tx4 | (ty4 << 16), out byte otp))
+                {
+                    foreach (var tt in txSet) if ((int)tt.Inv == otp) oTp = otp;
+                    if (oTp < 0) lock (OracleMiss) { OracleMiss[stx * 16 + otp]++; }
+                }
                 foreach (var (fwd, inv, idx) in txSet)
                 {
                     // adaptive_txb_search_level: the best so far already exceeds the remaining budget by the margin
                     if (Sp.AomAdaptiveTxb > 0 && bestJ != double.MaxValue && bestJ - bestJ / (1 << Sp.AomAdaptiveTxb) > budget) break;
                     // skip_tx_search: a type quantised to all zero ends the search
                     if (Sp.AomSkipTxSearch && bestCf != null && !HasNonZero(bestCf)) break;
-                    if ((mask >> (int)inv & 1) == 0) continue;
+                    if (oTp >= 0) { if ((int)inv != oTp) continue; }
+                    else if ((mask >> (int)inv & 1) == 0) continue;
                     int[] cf = Av1FwdTransform.ForwardQuantRect(res, tw, th, stx, c.DcDq, c.AcDq, sScan, fwd, qf);
                     bool oneD = inv == Av1TxType.VDct || inv == Av1TxType.HDct;
                     bool pre = false;
+                    bool olv = false;
+                    if (oTp >= 0 && OracleLevels != null && OracleLevels.TryGetValue(tx4 | (ty4 << 16), out var ol) && ol.Tx == stx)
+                    {
+                        if (!oneD && CalOn)
+                        {
+                            // compare our trellis on this residual with the oracle's levels, on our own cost function
+                            var mine = (int[])cf.Clone();
+                            double mb = HasNonZero(mine) ? Av1CoeffEncode.TrellisOptimize(c.Cdf.Coef, stx, 0, mine, qf, c.DcDq, c.AcDq, skc, snc, rdoqLambda,
+                                Av1CoeffEncode.IntraTxTypeBits(c.Cdf.Mode, stx, yModeNoFilt, idx, UseFullIntraTxSet))
+                                : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, mine, skc, snc, idx, fullSet: UseFullIntraTxSet);
+                            double lb = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, ol.Lv, skc, snc, idx, fullSet: UseFullIntraTxSet);
+                            double md = ReconSseCandRect(mine, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv);
+                            double ld = ReconSseCandRect(ol.Lv, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv);
+                            int agree = 0, n = 0;
+                            for (int k = 0; k < sScan; k++) if (mine[k] != 0 || ol.Lv[k] != 0) { n++; if (mine[k] == ol.Lv[k]) agree++; }
+                            lock (CalPix) { CalCmp[0] += n; CalCmp[1] += agree; CalCmp[2] += mb; CalCmp[3] += lb; CalCmp[4] += md; CalCmp[5] += ld;
+                                CalCmp[6] += md + lambda * mb < ld + lambda * lb ? 1 : 0; CalCmp[7] += 1; }
+                        }
+                        if (!OracleLevelsCompareOnly) { Array.Copy(ol.Lv, cf, sScan); olv = true; pre = true; }
+                    }
                     double preBits = -1;
                     // libaom's order (search_tx_type): quantise, trellis, then one rate + one distortion
-                    if (Sp.AomTrellisFirst && trellis && !oneD && HasNonZero(cf))
+                    if (!olv && Sp.AomTrellisFirst && trellis && !oneD && HasNonZero(cf))
                     {
                         preBits = Quantise(cf, qf, idx);
                         System.Threading.Interlocked.Increment(ref StatRdoq);
@@ -173,7 +211,7 @@ internal static partial class Av1StillImageEncoder
                     else Av1FwdTransform.ReturnLevels(cf);
                 }
                 // the coded levels are RDOQ'd (libaom's final encode trellises every block)
-                if (UseRdoq && (Sp.AomTrellisAll || trellis) && !bestRdoq && bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && HasNonZero(bestCf))
+                if (UseRdoq && (Sp.AomTrellisAll || trellis) && !bestRdoq && OracleLevels == null && bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && HasNonZero(bestCf))
                 {
                     double qb = Quantise(bestCf, qfBest, bestIdx);
                     double bits = qb >= 0 ? qb : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, bestCf, skc, snc, bestIdx, fullSet: UseFullIntraTxSet);
@@ -234,7 +272,7 @@ internal static partial class Av1StillImageEncoder
         Av1EdgeFlags edgeFlags, int intraFlags, bool angleOk, bool fiOk)
     {
         int w = w4 * 4, h = h4 * 4, bx = bx4 * 4, by = by4 * 4, bxR = bx4 & 31, byR = by4 & 31;
-        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        double lambda = LamK * c.AcDq * c.AcDq;
         int ymA = Av1Tables.IntraModeContext[c.AModeY[bxR]], ymL = Av1Tables.IntraModeContext[c.LModeY[byR]];
         var fullTD = Av1Tables.TxfmDimensions[lumaTx];
         int fullMax = fullTD.Max;
@@ -242,6 +280,10 @@ internal static partial class Av1StillImageEncoder
         bool txSelect = UseColorTxDepth && fullMax > (byte)Av1TxSize.Tx4x4;
         // choose_tx_size_type_from_rd: depths init..MAX_TX_DEPTH (2) from the largest rect tx, stopping at 4x4
         int initDepth = w4 == h4 ? Sp.AomTxInitDepthSqr : Sp.AomTxInitDepthRect;
+        // dev oracle: this block's mode / angle / tx size as another encoder chose them
+        (byte Bs, byte YMode, sbyte YAngle, byte Tx) om = default;
+        bool orc = OracleModes != null && OracleModes.TryGetValue(bx4 | (by4 << 16), out om) && om.Bs == lumaBs;
+        if (orc) initDepth = 0;
         if (!txSelect) initDepth = 2;
         var sizes = new int[3];
         int nSizes = 0;
@@ -271,6 +313,7 @@ internal static partial class Av1StillImageEncoder
             double[] rd = { double.MaxValue, double.MaxValue, double.MaxValue };
             for (int k = 0; k < nSizes; k++)
             {
+                if (orc && txSelect && sizes[k] != om.Tx) continue;
                 int codedDepth = k;   // sizes[k] is k splits below the largest tx (the coded tx_depth)
                 double extra = lambda * (modeBits + (txSelect ? Av1CoeffEncode.SymBits(c.Cdf.GetTxSzCdf(fullMax - 1, txCtx), codedDepth) : 0));
                 double limit = best.J - extra;
@@ -296,7 +339,7 @@ internal static partial class Av1StillImageEncoder
         // reuse_best_prediction_for_part_ab: only the cached winner's mode (all its angle deltas; filter intra only if
         // it won with filter intra)
         int ck = lumaBs * 256 + (by4 & 15) * 16 + (bx4 & 15), sbId = (bx4 >> 4) | ((by4 >> 4) << 16);
-        int cached = c.UseAomModeCache && c.AomModeCacheSb[ck] == sbId ? c.AomModeCache[ck] : 0;
+        int cached = !orc && c.UseAomModeCache && c.AomModeCacheSb[ck] == sbId ? c.AomModeCache[ck] : 0;
         bool cacheFilter = (cached >> 16 & 1) != 0;
         var cacheMode = (Av1IntraPredMode)(cached >> 8 & 0xFF);
         int cacheFm = (cached & 0xFF) - 8;
@@ -316,34 +359,36 @@ internal static partial class Av1StillImageEncoder
             Av1IntraPredMode m; int dl;
             if (mi < 13) { m = AomModeOrder[mi]; dl = 0; }
             else { int r = mi - 13; m = (Av1IntraPredMode)(1 + r / 6); int e = r % 6; dl = e < 3 ? e - 3 : e - 2; }
-            if (Sp.AomDisableSmoothHV && (m == Av1IntraPredMode.SmoothH || m == Av1IntraPredMode.SmoothV)) continue;
+            if (orc) { if ((int)m != om.YMode || dl != om.YAngle) continue; }
+            else if (Sp.AomDisableSmoothHV && (m == Av1IntraPredMode.SmoothH || m == Av1IntraPredMode.SmoothV)) continue;
             if (cached != 0 && m != (cacheFilter ? Av1IntraPredMode.Dc : cacheMode)) continue;
-            if (IsDirectional(m) && (hogMask >> (int)m & 1) != 0) continue;
+            if (!orc && IsDirectional(m) && cached == 0 && (hogMask >> (int)m & 1) != 0) continue;
             PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, m, dl, pred, edgeFlags, intraFlags);
             long model = AomModelRd(c, bx, by, pred, w, h);
             // prune_intra_y_mode: insert into the running top-k, prune if outside it or > 1.5x the best
             for (int i = 0; i < topK; i++)
                 if (model < top[i]) { for (int j = topK - 1; j > i; j--) top[j] = top[j - 1]; top[i] = model; break; }
-            if (top[topK - 1] != long.MaxValue && model > top[topK - 1]) continue;
-            if (bestModel != long.MaxValue && model > 1.5 * bestModel) continue;
+            if (!orc && top[topK - 1] != long.MaxValue && model > top[topK - 1]) continue;
+            if (!orc && bestModel != long.MaxValue && model > 1.5 * bestModel) continue;
             if (model < bestModel) bestModel = model;
             double mb = Av1CoeffEncode.SymBits(ymCdf, (int)m) + AngleBits(m, dl) + (m == Av1IntraPredMode.Dc ? fiZero : 0);
             TryMode(m, dl, (int)m, mb);
         }
 
         // rd_pick_filter_intra_sby: the (pruned) filter modes, model-pruned at 1.25x the best model cost
-        if (fiOk && best.Txb != null && (cached == 0 || cacheFilter))
+        if (fiOk && (best.Txb != null || orc) && (cached == 0 || cacheFilter) && (!orc || om.YMode == (byte)Av1IntraPredMode.Filter))
         {
             var fiCdf = c.Cdf.GetFilterIntraCdf((Av1BlockSize)lumaBs);
             double flag = Av1CoeffEncode.SymBits(fiCdf, 1) + Av1CoeffEncode.SymBits(ymCdf, (int)Av1IntraPredMode.Dc);
-            int fiMask = Sp.FilterIntraPrune ? FilterIntraModesFor(best.Mode) : 0x1F;
+            int fiMask = orc ? 0x1F : Sp.FilterIntraPrune ? FilterIntraModesFor(best.Mode) : 0x1F;
             for (int fm = 0; fm < 5; fm++)
             {
                 if ((fiMask >> fm & 1) == 0) continue;
                 if (cached != 0 && fm != cacheFm) continue;
+                if (orc && fm != om.YAngle) continue;
                 PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, Av1IntraPredMode.Filter, fm, pred, edgeFlags, intraFlags);
                 long model = AomModelRd(c, bx, by, pred, w, h);
-                if (bestModel != long.MaxValue && model > bestModel + (bestModel >> 2)) continue;
+                if (!orc && bestModel != long.MaxValue && model > bestModel + (bestModel >> 2)) continue;
                 if (model < bestModel) bestModel = model;
                 TryMode(Av1IntraPredMode.Filter, fm, Av1Tables.FilterModeToYMode[fm],
                     flag + Av1CoeffEncode.SymBits(c.Cdf.GetFilterIntraModeCdf(), fm));

@@ -2019,6 +2019,109 @@ public sealed class Av1HbdVerify
                     log.AppendLine("  uvmode " + string.Join(" ", uvm.Select(kv => $"{kv.Key}:{Pct(kv.Value)}")));
                     continue;
                 }
+                if (t[0] == "txcmp")
+                {
+                    // txcmp <aom.avif> <src.png> <420|444>: for every luma tx block libaom coded, our forward transform +
+                    // round-to-nearest quantisation of the same residual (source - libaom's prediction) against libaom's
+                    // levels: agreement, and where they differ which way (per tx size).
+                    var img = FormatRegistry.Read(t[2]);
+                    ushort[]? src = null; int sw = 0;
+                    Av1StillImageEncoder.SourceHook = (p, w, h) => { if (src == null) { src = (ushort[])p.Clone(); sw = w; } };
+                    HeifCoder.EncodeAvif(img, new AvifEncodeOptions { Quality = 50, Speed = 10, ChromaSubsampling = t[3] == "444" ? AvifChromaSubsampling.Yuv444 : AvifChromaSubsampling.Yuv420 });
+                    Av1StillImageEncoder.SourceHook = null;
+                    var hc = HeifContainer.Parse(File.ReadAllBytes(t[1]));
+                    var blocks = new List<(int X, int Y, int Tx, int Tp, int[] Cf, ushort[] Pred)>();
+                    SharpImage.Formats.Av1.Av1Decode.TxbPredHook = (x4, y4, tx, tp, eob, cf, pr) => { lock (blocks) blocks.Add((x4, y4, tx, tp, cf, pr)); };
+                    var dd = new Av1Decoder(); using (var yy = dd.Decode(hc.ItemData(hc.PrimaryId)!, 0, true)) { }
+                    SharpImage.Formats.Av1.Av1Decode.TxbPredHook = null;
+                    int qidx = dd.CurrentFrameHeader.QuantBaseQIdx;
+                    int dcDq = SharpImage.Formats.Av1.Av1Tables.DequantTable[0, qidx, 0], acDq = SharpImage.Formats.Av1.Av1Tables.DequantTable[0, qidx, 1];
+                    double oldBias = Av1FwdTransform.DeadzoneBias; Av1FwdTransform.DeadzoneBias = 0;
+                    var stat = new Dictionary<int, long[]>();   // tx -> [coefs, equal, oursHigher, oursLower, sum|qf|-frac...]
+                    var tstat = new Dictionary<int, long[]>();  // same after our TrellisOptimize at libaom's trellis lambda
+                    int qcat = qidx <= 20 ? 0 : qidx <= 60 ? 1 : qidx <= 120 ? 2 : 3;
+                    var tcdf = new SharpImage.Formats.Av1.Av1CdfContext(); SharpImage.Formats.Av1.Av1CdfDefaults.InitializeDefault(tcdf, qcat);
+                    double lamLib = dcDq * (double)dcDq * (3.3 + 0.0015 * dcDq) / 2048;   // libaom mode lambda, pixel SSE
+                    double trLam = 64 * 1.0625 * lamLib * (t.Length > 4 ? double.Parse(t[4], System.Globalization.CultureInfo.InvariantCulture) : 1.0);
+                    foreach (var bk in blocks)
+                    {
+                        var inv = (Av1TxType)bk.Tp;
+                        if (inv is not (Av1TxType.DctDct or Av1TxType.AdstDct or Av1TxType.DctAdst or Av1TxType.AdstAdst or Av1TxType.Identity)) continue;
+                        ref readonly var td = ref SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[bk.Tx];
+                        int tw = td.W * 4, th = td.H * 4, n = SharpImage.Formats.Av1.Av1Tables.Scans[bk.Tx].Length;
+                        if (tw > 32 || th > 32) continue;
+                        var res = new int[tw * th];
+                        for (int y = 0; y < th; y++)
+                            for (int x = 0; x < tw; x++) res[y * tw + x] = src![(bk.Y * 4 + y) * sw + bk.X * 4 + x] - bk.Pred[y * tw + x];
+                        var fwd = Enum.Parse<Av1FwdTransform.FwdTxType>(inv == Av1TxType.Identity ? "Identity" : inv.ToString());
+                        var qf = new double[n];
+                        int[] ours = Av1FwdTransform.ForwardQuantRect(res, tw, th, bk.Tx, dcDq, acDq, n, fwd, qf);
+                        int dqShift = Math.Max(0, td.Ctx - 2);
+                        if (!stat.TryGetValue(bk.Tx, out var st)) stat[bk.Tx] = st = new long[6];
+                        if (!tstat.TryGetValue(bk.Tx, out var tst)) tstat[bk.Tx] = tst = new long[6];
+                        var trl = (int[])ours.Clone();
+                        if (Array.Exists(trl, v => v != 0))
+                            Av1CoeffEncode.TrellisOptimize(tcdf.Coef, bk.Tx, 0, trl, qf, dcDq, acDq, 0, 0, trLam);
+                        for (int k = 0; k < n; k++)
+                        {
+                            int dq = k == 0 ? dcDq : acDq;
+                            int la = (int)Math.Round(Math.Abs(bk.Cf[k]) * (double)(1 << dqShift) / dq);
+                            int lo = Math.Abs(trl[k]);
+                            if (la == 0 && lo == 0) continue;
+                            tst[0]++;
+                            if (la == lo) tst[1]++; else if (lo > la) tst[2]++; else tst[3]++;
+                            tst[4] += lo; tst[5] += la;
+                        }
+                        for (int k = 0; k < n; k++)
+                        {
+                            int dq = k == 0 ? dcDq : acDq;
+                            int la = (int)Math.Round(Math.Abs(bk.Cf[k]) * (double)(1 << dqShift) / dq);
+                            int lo = Math.Abs(ours[k]);
+                            if (la == 0 && lo == 0) continue;
+                            st[0]++;
+                            if (la == lo) st[1]++; else if (lo > la) st[2]++; else st[3]++;
+                            st[4] += lo; st[5] += la;
+                        }
+                        Av1FwdTransform.ReturnLevels(ours);
+                    }
+                    Av1FwdTransform.DeadzoneBias = oldBias;
+                    log.AppendLine("txcmp types: " + string.Join(" ", blocks.GroupBy(bk => bk.Tp).OrderBy(g => g.Key).Select(g => $"{(Av1TxType)g.Key}={g.Count()} ({g.Sum(bk => bk.Cf.Count(v => v != 0))} nz)")));
+                    foreach (var (tx, st) in stat.OrderBy(kv => kv.Key))
+                    {
+                        log.AppendLine($"txcmp tx {tx}: nz {st[0]} equal {100.0 * st[1] / st[0]:F1}% oursHigher {100.0 * st[2] / st[0]:F1}% oursLower {100.0 * st[3] / st[0]:F1}% sum|L| ours {st[4]} aom {st[5]}");
+                        var ts2 = tstat[tx];
+                        log.AppendLine($"   trellis: nz {ts2[0]} equal {100.0 * ts2[1] / ts2[0]:F1}% oursHigher {100.0 * ts2[2] / ts2[0]:F1}% oursLower {100.0 * ts2[3] / ts2[0]:F1}% sum|L| ours {ts2[4]} aom {ts2[5]}");
+                    }
+                    continue;
+                }
+                if (t[0] == "blkcmp")
+                {
+                    // blkcmp <a.avif> <b.avif>: per block origin, how many blocks (and luma tx blocks) agree on size, luma
+                    // mode + angle, tx size, tx type between two streams of the same picture.
+                    (Dictionary<int, (byte, byte, sbyte, byte)> B, Dictionary<int, (byte, byte)> T) Grab(string f)
+                    {
+                        var bm = new Dictionary<int, (byte, byte, sbyte, byte)>(); var tm = new Dictionary<int, (byte, byte)>();
+                        SharpImage.Formats.Av1.Av1Decode.BlockPosHook = (x4, y4, blk) => { lock (bm) bm[x4 | (y4 << 16)] = (blk.BlockSize, blk.YMode, blk.YAngle, blk.Tx); };
+                        SharpImage.Formats.Av1.Av1Decode.TxbHook = (x4, y4, tx, tp) => { lock (tm) tm[x4 | (y4 << 16)] = ((byte)tx, (byte)tp); };
+                        var hc = HeifContainer.Parse(File.ReadAllBytes(f));
+                        var dd = new Av1Decoder(); using (var yy = dd.Decode(hc.ItemData(hc.PrimaryId)!, 0, true)) { }
+                        SharpImage.Formats.Av1.Av1Decode.BlockPosHook = null; SharpImage.Formats.Av1.Av1Decode.TxbHook = null;
+                        return (bm, tm);
+                    }
+                    var (ba, ta) = Grab(t[1]); var (bb, tb) = Grab(t[2]);
+                    int nb = 0, sBs = 0, sMode = 0, sTx = 0, nt = 0, sTp = 0;
+                    foreach (var (k, v) in ba)
+                    {
+                        nb++;
+                        if (!bb.TryGetValue(k, out var w) || w.Item1 != v.Item1) continue;
+                        sBs++;
+                        if (w.Item2 == v.Item2 && w.Item3 == v.Item3) sMode++;
+                        if (w.Item4 == v.Item4) sTx++;
+                    }
+                    foreach (var (k, v) in ta) { nt++; if (tb.TryGetValue(k, out var w) && w == v) sTp++; }
+                    log.AppendLine($"blkcmp blocks {nb} sameSize {sBs} sameMode {sMode} sameTx {sTx} | txb {nt} sameTxAndType {sTp} (b has {tb.Count})");
+                    continue;
+                }
                 if (t[0] == "hdrinfo")
                 {
                     // hdrinfo <avif...>: frame-header tool flags of each file's primary item (what an encoder turned on).
@@ -2083,8 +2186,18 @@ public sealed class Av1HbdVerify
                         var oc = HeifContainer.Parse(File.ReadAllBytes(Path.Combine(odir, Path.GetFileName(t[2]))));
                         int ow4 = (int)((img.Columns + 3) >> 2), oh4 = (int)((img.Rows + 3) >> 2);
                         var org = new int[ow4 * oh4]; var obs = new byte[ow4 * oh4];
-                        SharpImage.Formats.Av1.Av1Decode.BlockPosHook = (x4, y4, bs) =>
+                        var omodes = new Dictionary<int, (byte, byte, sbyte, byte)>(); var otx = new Dictionary<int, byte>();
+                        SharpImage.Formats.Av1.Av1Decode.TxbHook = (x4, y4, tx, tp) => { lock (otx) otx[x4 | (y4 << 16)] = (byte)tp; };
+                        var olv = new Dictionary<int, (int, int[])>();
+                        var oqh = new int[1];
+                        SharpImage.Formats.Av1.Av1Decode.TxbPredHook = (x4, y4, tx, tp, eob, cf, pr) =>
                         {
+                            lock (olv) olv[x4 | (y4 << 16)] = (tx, cf);   // dequantised; converted below once the qindex is known
+                        };
+                        SharpImage.Formats.Av1.Av1Decode.BlockPosHook = (x4, y4, blk) =>
+                        {
+                            int bs = blk.BlockSize;
+                            lock (omodes) omodes[x4 | (y4 << 16)] = (blk.BlockSize, blk.YMode, blk.YAngle, blk.Tx);
                             int bw = SharpImage.Formats.Av1.Av1Tables.BlockDimensions[bs, 0], bh = SharpImage.Formats.Av1.Av1Tables.BlockDimensions[bs, 1];
                             for (int yy = y4; yy < Math.Min(oh4, y4 + bh); yy++)
                                 for (int xx = x4; xx < Math.Min(ow4, x4 + bw); xx++) { org[yy * ow4 + xx] = x4 | (y4 << 16); obs[yy * ow4 + xx] = (byte)bs; }
@@ -2092,6 +2205,25 @@ public sealed class Av1HbdVerify
                         var odec = new Av1Decoder();
                         using (var oy = odec.Decode(oc.ItemData(oc.PrimaryId)!, 0, true)) { }
                         SharpImage.Formats.Av1.Av1Decode.BlockPosHook = null;
+                        SharpImage.Formats.Av1.Av1Decode.TxbHook = null;
+                        SharpImage.Formats.Av1.Av1Decode.TxbPredHook = null;
+                        SharpImage.Formats.Av1.Av1StillImageEncoder.OracleLevelsCompareOnly = Environment.GetEnvironmentVariable("ORACLE_LEVELS") == "2";
+                        if (Environment.GetEnvironmentVariable("ORACLE_LEVELS") is "1" or "2")
+                        {
+                            int oq = odec.CurrentFrameHeader.QuantBaseQIdx, bdi = odec.CurrentFrameHeader.QuantBaseQIdx >= 0 ? 0 : 0;
+                            int odc = SharpImage.Formats.Av1.Av1Tables.DequantTable[bdi, oq, 0], oac = SharpImage.Formats.Av1.Av1Tables.DequantTable[bdi, oq, 1];
+                            var lv = new Dictionary<int, (int Tx, int[] Lv)>();
+                            foreach (var (k, v) in olv)
+                            {
+                                int sh = Math.Max(0, SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[v.Item1].Ctx - 2);
+                                var l = new int[v.Item2.Length];
+                                for (int i = 0; i < l.Length; i++) { int dq = i == 0 ? odc : oac; l[i] = Math.Sign(v.Item2[i]) * (int)Math.Round(Math.Abs(v.Item2[i]) * (double)(1 << sh) / dq); }
+                                lv[k] = (v.Item1, l);
+                            }
+                            SharpImage.Formats.Av1.Av1StillImageEncoder.OracleLevels = lv;
+                        }
+                        if (Environment.GetEnvironmentVariable("ORACLE_MODES") == "1")
+                        { SharpImage.Formats.Av1.Av1StillImageEncoder.OracleModes = omodes; SharpImage.Formats.Av1.Av1StillImageEncoder.OracleTxtp = otx; }
                         SharpImage.Formats.Av1.Av1StillImageEncoder.ForceQIdx = odec.CurrentFrameHeader.QuantBaseQIdx;
                         if (Environment.GetEnvironmentVariable("ORACLE_QONLY") != "1")
                         {
@@ -2105,6 +2237,9 @@ public sealed class Av1HbdVerify
                     SharpImage.Formats.Av1.Av1StillImageEncoder.ForceQIdx = -1;
                     SharpImage.Formats.Av1.Av1StillImageEncoder.OracleOrigin = null;
                     SharpImage.Formats.Av1.Av1StillImageEncoder.OracleBs = null;
+                    SharpImage.Formats.Av1.Av1StillImageEncoder.OracleModes = null;
+                    SharpImage.Formats.Av1.Av1StillImageEncoder.OracleTxtp = null;
+                    SharpImage.Formats.Av1.Av1StillImageEncoder.OracleLevels = null;
                     if (allocL != null) log.Append(allocL.Report());
                     SharpImage.Formats.Av1.Av1StillImageEncoder.PhaseHook = null;
                     if (phases.Length > 0) log.AppendLine("  phases" + phases);
@@ -2113,6 +2248,17 @@ public sealed class Av1HbdVerify
                     Av1EncodeSpeed.TestOverride = null;
                     foreach (var (sf, old) in statics) sf.SetValue(null, old);
                     File.WriteAllBytes(t[2], outB);
+                    if (Av1StillImageEncoder.OracleMiss.Any(v => v > 0))
+                    {
+                        log.AppendLine("  oracle tx type misses (tx:type=n): " + string.Join(" ", Enumerable.Range(0, 19 * 16).Where(i => Av1StillImageEncoder.OracleMiss[i] > 0).Select(i => $"{i / 16}:{i % 16}={Av1StillImageEncoder.OracleMiss[i]}")));
+                        Array.Clear(Av1StillImageEncoder.OracleMiss);
+                    }
+                    if (Av1StillImageEncoder.CalOn && Av1StillImageEncoder.CalCmp[7] > 0)
+                    {
+                        var cc = Av1StillImageEncoder.CalCmp;
+                        log.AppendLine($"  trellis vs oracle levels: blocks {cc[7]} coefs {cc[0]} agree {100 * cc[1] / cc[0]:F1}% bits ours {cc[2]:F0} lib {cc[3]:F0} sse ours {cc[4]:F0} lib {cc[5]:F0} oursBetterJ {100 * cc[6] / cc[7]:F1}%");
+                        Array.Clear(cc);
+                    }
                     if (Av1StillImageEncoder.CalOn)
                         for (int k = 0; k < 19; k++)
                             if (Av1StillImageEncoder.CalN[k] > 0) log.AppendLine($"  cal tx {k} n {Av1StillImageEncoder.CalN[k]} pix/coef {Av1StillImageEncoder.CalPix[k] / Av1StillImageEncoder.CalCoef[k]:F5}");

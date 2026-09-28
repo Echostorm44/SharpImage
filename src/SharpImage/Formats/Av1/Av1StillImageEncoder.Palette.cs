@@ -238,7 +238,7 @@ internal static partial class Av1StillImageEncoder
         int palCtx = (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0);
         Span<ushort> lCol = stackalloc ushort[8], aCol = stackalloc ushort[8];
         var (lSz, aSz) = PaletteNeighbours(c, bx4, by4, lCol, aCol, uv: false);
-        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        double lambda = LamK * c.AcDq * c.AcDq;
         int scanLen = Av1Tables.Scans[lumaTx].Length;
         int ySign = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
         var txSet = LumaTxSet(lumaTx);
@@ -291,7 +291,7 @@ internal static partial class Av1StillImageEncoder
                 for (int x = 0; x < w; x++) res[y * w + x] = c.Luma[(by + y) * c.W + bx + x] - best.Pred[y * w + x];
             Av1FwdTransform.ForwardQuantRect(res, w, h, lumaTx, c.DcDq, c.AcDq, scanLen, FwdTypeForTxType(best.Inv), qf);
             Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)Av1IntraPredMode.Dc, best.Coeffs, qf,
-                c.DcDq, c.AcDq, 0, ySign, best.Idx, RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                c.DcDq, c.AcDq, 0, ySign, best.Idx, RdoqLambdaScale * LamK * c.AcDq * c.AcDq);
         }
         return best;
     }

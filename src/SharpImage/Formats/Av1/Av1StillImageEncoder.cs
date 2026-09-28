@@ -72,6 +72,19 @@ internal sealed class Av1EncodeSpeed
     public bool AomLuma64;
     // dev: lambda from libaom's rdmult(qindex) times this factor (0 = RdLambdaK * acDq^2)
     public double LambdaLibaom;
+    // the lambda constant LambdaLibaom derived for the frame being coded (set per encode on a copy; 0 = RdLambdaK)
+    public double LambdaKFrame;
+    // libaom intra_sb_rdmult_modifier: superblocks mixing flat and busy 4x4s code at up to 37.5% lower lambda
+    public bool AomSbLambda;
+    // libaom's chroma search in the rect leaf: every chroma candidate trellised and priced exactly; CfL alphas RD-searched
+    // per plane within AomCflRange of the SSE estimate (cfl_search_range 3 = +-2)
+    public bool AomChroma;
+    public int AomCflRange = 2;
+    // dev: luma trellis lambda = factor x libaom's trellis lambda for this qindex (0 = RdoqLambdaScale x ours)
+    public double AomTrellisLam;
+    // round-to-nearest quantisation (libaom's FP quantiser before its trellis) and the chroma trellis scale
+    public bool AomRoundNearest;
+    public double AomChromaLam;
     // search_tx_type early exits: adaptive_txb_search_level (0 off, 1 s0, 2 s1+) and skip_tx_search (s1+)
     public int AomAdaptiveTxb;
     public bool AomSkipTxSearch;
@@ -262,6 +275,11 @@ internal sealed class Av1EncodeSpeed
             p.AomDisableSmoothHV = speed >= 2;                         // disable_smooth_intra
             p.AomAdaptiveTxb = speed == 0 ? 1 : 2;                      // adaptive_txb_search_level
             p.AomPartAbReuse = speed >= 1;                             // reuse_best_prediction_for_part_ab
+            // libaom's lambda balance: its key-frame rdmult for the mode decisions, its trellis lambda (x0.9) for the
+            // luma trellis, the chroma trellis at plane_rd_mult_chroma's ratio, round-to-nearest before the trellis,
+            // and its chroma search (every candidate trellised, CfL alphas RD-searched): scoreboard s2 444 +1.15 ->
+            // +0.3..0.6, 420 -0.64 -> -0.8..-1.0
+            p.LambdaLibaom = 1; p.AomTrellisLam = 0.9; p.AomChroma = true; p.AomChromaLam = 36; p.AomRoundNearest = true;
         }
         // 2 keeps the T-shape and 4-way partitions (s2 +0.27% x0.53 -> -0.17% x0.85).
         if (speed >= 2) { p.RdModeCandidates = 4; p.EarlyTermBits = 32; }
@@ -376,21 +394,24 @@ internal static partial class Av1StillImageEncoder
     // LambdaLibaom (dev): the RD lambda follows libaom's key-frame rdmult for this qindex (av1_compute_rd_mult:
     // dcq^2 * (3.3 + 0.0015 dcq), >> 2(bd-8) beyond 8 bits; RDCOST -> pixel-SSE lambda = rdmult / 2048, with the SSE in
     // coded-bit-depth units) times the factor, as RdLambdaK * acDq^2. Restored on dispose.
+    // Per encode (never the shared static): the frame's lambda constant goes into a copy of this encode's speed
+    // settings, which worker threads inherit with t_speed.
     private readonly struct LambdaScope : IDisposable
     {
-        private readonly double prev;
+        private readonly Av1EncodeSpeed? prev;
         private readonly bool set;
         public LambdaScope(int qIdx)
         {
-            prev = RdLambdaK; set = false;
+            prev = t_speed; set = false;
             double f = Sp.LambdaLibaom;
             if (f <= 0) return;
             double dc = Av1Tables.DequantTable[BdIdx, qIdx, 0], ac = Av1Tables.DequantTable[BdIdx, qIdx, 1];
             double rdmult = dc * dc * (3.3 + 0.0015 * dc) / (1 << (2 * (Bd - 8)));
             double lam = rdmult / 2048 * (1 << (2 * (Bd - 8)));
-            RdLambdaK = f * lam / (ac * ac); set = true;
+            var sp = Sp.Clone(); sp.LambdaKFrame = f * lam / (ac * ac);
+            t_speed = sp; set = true;
         }
-        public void Dispose() { if (set) RdLambdaK = prev; }
+        public void Dispose() { if (set) t_speed = prev; }
     }
 
     // Layout-dependent preset adjustments for one colour encode: 4:4:4 / 4:2:2 turn on the rect-leaf tx split
@@ -1029,6 +1050,7 @@ internal static partial class Av1StillImageEncoder
         int ssX = layout == Av1PixelLayout.I444 ? 0 : 1, ssY = layout is Av1PixelLayout.I420 or Av1PixelLayout.I400 ? 1 : 0;
         int cwIn = mono ? 0 : (width + ssX) >> ssX, chIn = mono ? 0 : (height + ssY) >> ssY;   // ceil — odd dims keep a partial edge sample
         ushort[] padY = PadPlane(luma, width, height, pw, ph);
+        SourceHook?.Invoke(padY, pw, ph);
         ushort[] padU = mono ? new ushort[(pw >> 1) * (ph >> 1)] : PadPlane(u, cwIn, chIn, pw >> ssX, ph >> ssY);
         ushort[] padV = mono ? new ushort[(pw >> 1) * (ph >> 1)] : PadPlane(v, cwIn, chIn, pw >> ssX, ph >> ssY);
         // Loop restoration (a standalone still enables it in its sequence header only when used; shared-header streams
@@ -1079,7 +1101,7 @@ internal static partial class Av1StillImageEncoder
             int cStride = mono ? 0 : dpic?.Strides?[1] ?? 0;
             if (dpic?.Planes != null && Av1CdefSearch.Search(dpic.Planes[0], dpic.Strides![0], cU, cV, cStride,
                     dpic.RowsY, dpic.RowsC, dpic.Noskip!, dpic.W8, dpic.H8, srcY, srcU, srcV, width, height, cwIn, chIn,
-                    sbCols, sbRows, baseQIdx, Bd, RdLambdaK * acDq * acDq, ThreadCount, Sp.CdefSearchLevel, ssX, ssY) is { } r)
+                    sbCols, sbRows, baseQIdx, Bd, LamK * acDq * acDq, ThreadCount, Sp.CdefSearchLevel, ssX, ssY) is { } r)
             {
                 var tiles = new byte[logs!.Length][];
                 var cw2 = CdefIndexWriter(r.SbIdx, sbCols, r.Params.Bits);
@@ -1294,7 +1316,7 @@ internal static partial class Av1StillImageEncoder
         DecodedPicture? pic = null, sbyte[]? cdefIdx = null, bool sct = false)
     {
         int acDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1];
-        double lambda = RdLambdaK * acDq * acDq;
+        double lambda = LamK * acDq * acDq;
         bool i420 = layout == Av1PixelLayout.I420;
         int ssX = layout == Av1PixelLayout.I444 ? 0 : 1, ssY = i420 ? 1 : 0;
 
@@ -1641,7 +1663,9 @@ internal static partial class Av1StillImageEncoder
                         c.AModeUv = aModeUv[col];
                         c.APalSz = aPalSz[col]; c.APalCol = aPalCol[col]; c.APalSzUv = aPalSzUv[col]; c.APalColU = aPalColU[col];
                         c.Msac.Mark((sby << 16) | sbx);
+                        t_sbLamMul = Sp.AomSbLambda ? SbLambdaMul(c, sbx, sby) : 0;
                         EncodePartitionColor(c, 1, sbx * 16, sby * 16);
+                        t_sbLamMul = 0;
                     }
                 }
                 if (tileLogs != null) tileLogs[ti] = c.Msac.Log!;
@@ -1733,7 +1757,9 @@ internal static partial class Av1StillImageEncoder
                 c.AModeUv = st.AModeUv[col];
                 c.APalSz = st.APalSz[col]; c.APalCol = st.APalCol[col]; c.APalSzUv = st.APalSzUv[col]; c.APalColU = st.APalColU[col];
                 c.Msac.Mark((sby << 16) | sbx);
+                t_sbLamMul = Sp.AomSbLambda ? SbLambdaMul(c, sbx, sby) : 0;
                 EncodePartitionColor(c, 1, sbx * 16, sby * 16);
+                t_sbLamMul = 0;
                 if (k + 1 == st.SyncAfter && r + 1 < st.NRows)
                 {
                     var snap = new Av1CdfContext();
@@ -1807,6 +1833,14 @@ internal static partial class Av1StillImageEncoder
     internal static byte[]? OracleBs;
     internal static int OracleW4;
     internal static int ForceQIdx = -1;
+    // Dev: the padded luma plane (and its dims) each colour encode codes.
+    internal static Action<ushort[], int, int>? SourceHook;
+    // Dev decision oracle (ORACLE_MODES): per block origin (x | y << 16) the other encoder's block size, luma mode,
+    // angle delta (filter mode for filter intra) and tx size; per luma tx block origin its tx type.
+    internal static Dictionary<int, (byte Bs, byte YMode, sbyte YAngle, byte Tx)>? OracleModes;
+    internal static Dictionary<int, byte>? OracleTxtp;
+    // Dev level oracle (ORACLE_LEVELS): per luma tx block origin the other encoder's tx size and signed levels.
+    internal static Dictionary<int, (int Tx, int[] Lv)>? OracleLevels;
 
     private static int OracleChoice(int bx4, int by4, int n)
     {
@@ -1930,7 +1964,7 @@ internal static partial class Av1StillImageEncoder
                 // Rectangular HORZ/VERT at 32x32 (→32x16/16x32) and 16x16 (→16x8/8x16). Chroma-aware: a partition
                 // codes a chroma block per luma leaf, so include chroma coeff cost (λ·bits) in every candidate —
                 // otherwise HORZ/VERT (2 chroma blocks) look artificially cheap vs NONE (1).
-                double lambda = RdLambdaK * c.AcDq * c.AcDq;
+                double lambda = LamK * c.AcDq * c.AcDq;
                 int cbx = bx4 * 2, cby = by4 * 2;
                 int cBlk = blk4 * 2, cH = cBlk >> 1;    // chroma NONE size (px) and half (px)
                 // Per-level tx / block-size ordinals for the rect leaves and the chroma cost blocks.
@@ -2452,7 +2486,7 @@ internal static partial class Av1StillImageEncoder
             }
         }
 
-        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        double lambda = LamK * c.AcDq * c.AcDq;
         // A single candidate needs no snapshot: it is simply coded in place.
         var snap0 = nc > 1 ? SnapshotRd(c, bx4, by4, blk4, Pooled(c, bl * 3)) : null;
         int baseCount = snap0?.Msac.PrecarryCount ?? 0;
@@ -2855,7 +2889,7 @@ internal static partial class Av1StillImageEncoder
             int pSzC = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
             int pCtxC = (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0);
             double nonPalJ = t_leafJ + (yModeSym == (int)Av1IntraPredMode.Dc
-                ? RdLambdaK * c.AcDq * c.AcDq * Av1CoeffEncode.BoolBits(c.Cdf.GetPalYCdf(pSzC, pCtxC)[0], 0) : 0);
+                ? LamK * c.AcDq * c.AcDq * Av1CoeffEncode.BoolBits(c.Cdf.GetPalYCdf(pSzC, pCtxC)[0], 0) : 0);
             var pal = SearchLumaPalette(c, bs, tx, bx4, by4, n, n, ymCdfP, nonPalJ);
             if (pal != null && pal.J < nonPalJ)
             {
@@ -2870,7 +2904,7 @@ internal static partial class Av1StillImageEncoder
         int depth = 0;
         if (maxDepth > 0)
         {
-            double lambda = RdLambdaK * c.AcDq * c.AcDq;
+            double lambda = LamK * c.AcDq * c.AcDq;
             int txCtx = (c.LTxY[byR] >= maxTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= maxTDim.Lw ? 1 : 0);
             var txSzCdf = c.Cdf.GetTxSzCdf(maxTDim.Max - 1, txCtx);
             int txNsym = Math.Min((int)maxTDim.Max, 2);
@@ -2994,7 +3028,7 @@ internal static partial class Av1StillImageEncoder
         var qfU = new double[scanLenC]; var qfV = new double[scanLenC];
         int[] uC = ForwardResidual(c.U, c.Cw, cbx, cby, cn, dcU, c.DcDq, c.AcDq, scanLenC, qfU);
         int[] vC = ForwardResidual(c.V, c.Cw, cbx, cby, cn, dcV, c.DcDq, c.AcDq, scanLenC, qfV);
-        double clam0 = RdLambdaK * c.AcDq * c.AcDq;
+        double clam0 = LamK * c.AcDq * c.AcDq;
         var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, yModeSym);
         var dcuP = FlatPlane(dcU, cn); var dcvP = FlatPlane(dcV, cn);
 
@@ -3012,10 +3046,18 @@ internal static partial class Av1StillImageEncoder
             : CoeffCost(cu) + CoeffCost(cv);
         double CflRate(int aU, int aV) => exactC ? CflAlphaBits(eCdf, aU, aV) : (aU != 0 ? 5 : 0) + (aV != 0 ? 5 : 0);
         bool rdoqC = Sp.ChromaRdoqInSearch && UseChromaRdoq;
-        double eClam = ChromaRdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq;
+        double eClam = ChromaLamScale * LamK * c.AcDq * c.AcDq;
         int eDcDq = c.DcDq, eAcDq = c.AcDq;
+        // AomChroma: every candidate trellised (libaom av1_txfm_uvrd), the CfL alphas RD-searched per plane below
+        bool aomSqC = Sp.AomChroma && UseRdoq;
         void CRdoq(int[] cu, double[] qu, int[] cv, double[] qv)
         {
+            if (aomSqC)
+            {
+                if (HasNonZero(cu)) Av1CoeffEncode.TrellisOptimize(eCoef, eTx, 1, cu, qu, eDcDq, eAcDq, eUSkip, eUSign, eClam);
+                if (HasNonZero(cv)) Av1CoeffEncode.TrellisOptimize(eCoef, eTx, 1, cv, qv, eDcDq, eAcDq, eVSkip, eVSign, eClam);
+                return;
+            }
             if (!rdoqC) return;
             Av1CoeffEncode.RdoqOptimize(eCoef, eMode, eTx, 1, 0, cu, qu, eDcDq, eAcDq, eUSkip, eUSign, 0, eClam);
             Av1CoeffEncode.RdoqOptimize(eCoef, eMode, eTx, 1, 0, cv, qv, eDcDq, eAcDq, eVSkip, eVSign, 0, eClam);
@@ -3101,7 +3143,46 @@ internal static partial class Av1StillImageEncoder
             ComputeCflAcEnc(c.ReconY, c.W, bx, by, cn, ac);
             int aU = BestCflAlpha(c.U, c.Cw, cbx, cby, cn, dcU, ac);
             int aV = BestCflAlpha(c.V, c.Cw, cbx, cby, cn, dcV, ac);
-            if (aU != 0 || aV != 0)
+            if (aomSqC)
+            {
+                // cfl_rd_pick_alpha: each plane priced (trellised) at the alphas around its estimate; best pair, not both 0
+                int R = Math.Max(0, Sp.AomCflRange);
+                double PJ(ushort[] src, ushort[] pr, int skc, int sgc, out int[] lv, out double[] q)
+                {
+                    q = new double[scanLenC];
+                    lv = ForwardResidualPredRect(src, c.Cw, cbx, cby, pr, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, q);
+                    if (HasNonZero(lv)) Av1CoeffEncode.TrellisOptimize(eCoef, eTx, 1, lv, q, eDcDq, eAcDq, skc, sgc, eClam);
+                    return ChromaReconSse(lv, ctx0, cn, c.DcDq, c.AcDq, pr, src, c.Cw, cbx, cby)
+                         + clam0 * Av1CoeffEncode.EstimateCoefBits(eCoef, eMode, eTx, 1, 0, lv, skc, sgc, 0);
+                }
+                var ju = new double[33]; var jv = new double[33];
+                var lu = new int[33][]; var lvv = new int[33][]; var qu = new double[33][]; var qv = new double[33][];
+                var pu2 = new ushort[33][]; var pv2 = new ushort[33][];
+                for (int k = 0; k < 33; k++) { ju[k] = jv[k] = double.MaxValue; }
+                for (int a = Math.Max(-16, aU - R); a <= Math.Min(16, aU + R); a++)
+                { pu2[a + 16] = BuildCflPred(dcU, ac, cn, a); ju[a + 16] = PJ(c.U, pu2[a + 16], eUSkip, eUSign, out lu[a + 16], out qu[a + 16]); }
+                for (int a = Math.Max(-16, aV - R); a <= Math.Min(16, aV + R); a++)
+                { pv2[a + 16] = BuildCflPred(dcV, ac, cn, a); jv[a + 16] = PJ(c.V, pv2[a + 16], eVSkip, eVSign, out lvv[a + 16], out qv[a + 16]); }
+                double cflBest = double.MaxValue; int bu = 16, bv = 16;
+                double cflMode = Av1CoeffEncode.SymBits(uvModeCdf, (int)Av1IntraPredMode.ChromaFromLuma);
+                for (int x1 = 0; x1 < 33; x1++)
+                {
+                    if (ju[x1] == double.MaxValue) continue;
+                    for (int x2 = 0; x2 < 33; x2++)
+                    {
+                        if (jv[x2] == double.MaxValue || (x1 == 16 && x2 == 16)) continue;
+                        double jj = ju[x1] + jv[x2] + clam0 * (cflMode + CflAlphaBits(eCdf, x1 - 16, x2 - 16));
+                        if (jj < cflBest) { cflBest = jj; bu = x1; bv = x2; }
+                    }
+                }
+                if (cflBest < bestJ)
+                {
+                    bestJ = cflBest; useCfl = true; uvMode = (int)Av1IntraPredMode.ChromaFromLuma;
+                    alphaU = bu - 16; alphaV = bv - 16;
+                    uC = lu[bu]; vC = lvv[bv]; qfU = qu[bu]; qfV = qv[bv]; predU = pu2[bu]; predV = pv2[bv];
+                }
+            }
+            else if (aU != 0 || aV != 0)
             {
                 var pcflU = BuildCflPred(dcU, ac, cn, aU);
                 var pcflV = BuildCflPred(dcV, ac, cn, aV);
@@ -3145,9 +3226,9 @@ internal static partial class Av1StillImageEncoder
         // rate-distortion coefficient optimisation luma gets in the rect leaf. Chroma was previously left at
         // round-to-nearest quantisation, which over-codes it (measured 2-6 dB above luma at matched rate). Must
         // run before the skip/txb_skip decision below so an all-zeroed plane is coded as skipped.
-        if (UseChromaRdoq && !rdoqC)
+        if (UseChromaRdoq && !rdoqC && (!aomSqC || uvPal != null))
         {
-            double clam = ChromaRdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq;
+            double clam = ChromaRdoqLambdaScale * LamK * c.AcDq * c.AcDq;
             ref readonly var uvtd0 = ref Av1Tables.TxfmDimensions[ctx0];
             int ruSkip = Av1CoeffDecode.GetSkipCtx(in uvtd0, bs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
             int rvSkip = Av1CoeffDecode.GetSkipCtx(in uvtd0, bs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
@@ -3397,7 +3478,7 @@ internal static partial class Av1StillImageEncoder
                 PredictIntra(c.ReconY, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]));
                 int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
                 (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, lumaTx, c.DcDq, c.AcDq,
-                    predBuf, c.Luma, c.W, cbx4 * 4, cby4 * 4, RdLambdaK * c.AcDq * c.AcDq);
+                    predBuf, c.Luma, c.W, cbx4 * 4, cby4 * 4, LamK * c.AcDq * c.AcDq);
                 int skc = Av1CoeffDecode.GetSkipCtx(in lTDim, bs, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR), 0, 0);
                 int snc = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(cbxR), c.LLY.AsSpan(cbyR));
                 if (HasNonZero(cf))
@@ -3405,7 +3486,7 @@ internal static partial class Av1StillImageEncoder
                     var qfTx = new double[Av1Tables.Scans[lumaTx].Length];
                     Av1FwdTransform.ForwardQuantTyped(res, txN, c.DcDq, c.AcDq, qfTx.Length, FwdTypeForIdx(idx), qfTx);
                     Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, cf, qfTx,
-                        c.DcDq, c.AcDq, skc, snc, idx, RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                        c.DcDq, c.AcDq, skc, snc, idx, RdoqLambdaScale * LamK * c.AcDq * c.AcDq);
                 }
                 coefBits += Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, cf, skc, snc, idx, fullSet: UseFullIntraTxSet);
                 lumaTxb.Add((cf, inv, idx, skc, snc, cbx4 * 4, cby4 * 4));
@@ -3431,7 +3512,7 @@ internal static partial class Av1StillImageEncoder
         bool symbolCoded = sTD.Max <= (byte)Av1TxSize.Tx16x16;
         bool full = UseFullIntraTxSet && sTD.Min < (byte)Av1TxSize.Tx16x16;
         var txSet = (full && symbolCoded) ? IntraTxTypesFull : (symbolCoded ? IntraTxTypes : DctOnly);
-        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        double lambda = LamK * c.AcDq * c.AcDq;
         var scr = t_scSplit ??= new LeafScratch();
         var pred = scr.P1; var res = scr.R; var qf = scr.Q1; var qfBest = scr.Q2;
         bool sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0, sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0;
@@ -3533,7 +3614,7 @@ internal static partial class Av1StillImageEncoder
                 sse += (long)d * d;
             }
 
-        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        double lambda = LamK * c.AcDq * c.AcDq;
         return sse + (long)(lambda * (bestBits + HeaderCostBits));
     }
 
@@ -3692,7 +3773,7 @@ internal static partial class Av1StillImageEncoder
         Av1IntraPredMode yMode = Av1IntraPredMode.Dc; int yDelta = 0;
         Av1TxType yInv = Av1TxType.DctDct; int yTxIdx = 1;
         double best = double.MaxValue;
-        double rectLambda = RdLambdaK * c.AcDq * c.AcDq;   // true RD: D + λ·rate (rect edges want IDTX; DctDct-only misranks)
+        double rectLambda = LamK * c.AcDq * c.AcDq;   // true RD: D + λ·rate (rect edges want IDTX; DctDct-only misranks)
         // The tx-type symbol is coded for rect luma only when max tx dim <= 16 (16x8/8x16); 32x16/16x32 force DctDct.
         bool rectSymbolCoded = Av1Tables.TxfmDimensions[lumaTx].Max <= (byte)Av1TxSize.Tx16x16;
         // The full intra set (with V_DCT/H_DCT) exists only while the min tx dim < 16 (square 16x16 uses the reduced set).
@@ -3722,7 +3803,7 @@ internal static partial class Av1StillImageEncoder
         Span<int> topIdx = stackalloc int[RdModeCandidates];
         Span<long> topCost = stackalloc long[RdModeCandidates];
         topCost.Fill(long.MaxValue);
-        double satdLambda = Math.Sqrt(RdLambdaK) * c.AcDq;
+        double satdLambda = Math.Sqrt(LamK) * c.AcDq;
         uint hogMask = HogSkipMask(c.Luma, c.W, bx, by, w, h, c.Bw4 * 4, c.Bh4 * 4, Sp.HogLevel);
         int refine = Sp.AngleRefineTop;
         Span<long> baseCost = stackalloc long[16];
@@ -3779,7 +3860,7 @@ internal static partial class Av1StillImageEncoder
                 if (Sp.RdoqInSearch && !oneD && j < best * Sp.RdoqSearchMargin)
                 {
                     Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, qfCand, c.DcDq, c.AcDq, 0, ySign, idx,
-                        RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                        RdoqLambdaScale * LamK * c.AcDq * c.AcDq);
                     rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, 0, ySign, idx, fullSet: UseFullIntraTxSet) + modeBits;
                     j = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, pred, c.Luma, c.W, bx, by, inv) + rectLambda * rate;
                 }
@@ -3815,7 +3896,7 @@ internal static partial class Av1StillImageEncoder
                     if (Sp.RdoqInSearch && !oneD && j < best * Sp.RdoqSearchMargin)
                     {
                         Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, ymnf, cf, qfCand, c.DcDq, c.AcDq, 0, ySign, idx,
-                            RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                            RdoqLambdaScale * LamK * c.AcDq * c.AcDq);
                         rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, ymnf, cf, 0, ySign, idx, fullSet: UseFullIntraTxSet) + modeBits;
                         j = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, pred, c.Luma, c.W, bx, by, inv) + rectLambda * rate;
                     }
@@ -3851,7 +3932,7 @@ internal static partial class Av1StillImageEncoder
         // RDOQ-refine the winning luma coefficients (skipped for V_DCT/H_DCT: RdoqOptimize assumes the 2D scan).
         if (!aom && yPal == null && yInv != Av1TxType.VDct && yInv != Av1TxType.HDct && !Sp.RdoqInSearch)
             Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, yModeNoFilt, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, yTxIdx,
-                RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                RdoqLambdaScale * LamK * c.AcDq * c.AcDq);
 
         // tx_depth 1 (RectTxDepth): the winning mode re-coded on the split transform, each tx block predicted from the
         // reconstruction in the decoder's raster order with its own tx type; kept when its true RD beats the whole tx.
@@ -3991,7 +4072,7 @@ internal static partial class Av1StillImageEncoder
         int dcV = ChromaDc(c, c.ReconV, cbx, cby, cw, ch);
         int[] uC = ForwardResidualRectDc(c.U, c.Cw, cbx, cby, cw, ch, dcU, chromaTx, c.DcDq, c.AcDq, cScan);
         int[] vC = ForwardResidualRectDc(c.V, c.Cw, cbx, cby, cw, ch, dcV, chromaTx, c.DcDq, c.AcDq, cScan);
-        double clam0 = RdLambdaK * c.AcDq * c.AcDq;
+        double clam0 = LamK * c.AcDq * c.AcDq;
         var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, yModeSym);
         var dcuP = new ushort[cw * ch]; Array.Fill(dcuP, (ushort)Math.Clamp(dcU, 0, PixMax));
         var dcvP = new ushort[cw * ch]; Array.Fill(dcvP, (ushort)Math.Clamp(dcV, 0, PixMax));
@@ -4006,10 +4087,28 @@ internal static partial class Av1StillImageEncoder
             ? Av1CoeffEncode.EstimateCoefBits(eCoef, eMode, eTx, 1, 0, cu, eUSkip, eUSign, 0) + Av1CoeffEncode.EstimateCoefBits(eCoef, eMode, eTx, 1, 0, cv, eVSkip, eVSign, 0)
             : CoeffCost(cu) + CoeffCost(cv);
         double CflRate(int aU, int aV) => exactC ? CflAlphaBits(eCdf, aU, aV) : (aU != 0 ? 5 : 0) + (aV != 0 ? 5 : 0);
+        // libaom av1_txfm_uvrd (AomChroma): a chroma candidate is priced on its trellised levels (the chroma trellis
+        // lambda) with their exact rate and the reconstruction SSE, per plane.
+        bool aomC = Sp.AomChroma && UseRdoq;
+        double clamT = ChromaLamScale * LamK * c.AcDq * c.AcDq;
+        double PlaneJ(ushort[] src, ushort[] pred, Av1TxType t, int skc, int sgc, out int[] lv)
+        {
+            var qf = new double[cScan];
+            lv = ForwardResidualPredRect(src, c.Cw, cbx, cby, pred, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, qf, FwdTypeForTxType(t));
+            double bits = Av1CoeffEncode.TrellisOptimize(eCoef, chromaTx, 1, lv, qf, c.DcDq, c.AcDq, skc, sgc, clamT);
+            return ReconSseCandRect(lv, chromaTx, cw, ch, c.DcDq, c.AcDq, pred, src, c.Cw, cbx, cby, t) + clam0 * bits;
+        }
 
         int uvMode = 0, uvDelta = 0; bool useCfl = false;
         ushort[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
-        double bestJ = ReconSseCandRect(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcuP, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
+        double bestJ;
+        if (aomC)
+        {
+            Av1FwdTransform.ReturnLevels(uC); Av1FwdTransform.ReturnLevels(vC);
+            bestJ = PlaneJ(c.U, dcuP, Av1TxType.DctDct, eUSkip, eUSign, out uC) + PlaneJ(c.V, dcvP, Av1TxType.DctDct, eVSkip, eVSign, out vC)
+                  + clam0 * Av1CoeffEncode.SymBits(uvModeCdf, 0);
+        }
+        else bestJ = ReconSseCandRect(uC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcuP, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
                      + ReconSseCandRect(vC, chromaTx, cw, ch, c.DcDq, c.AcDq, dcvP, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
                      + clam0 * (CRate(uC, vC) + Av1CoeffEncode.SymBits(uvModeCdf, 0));
 
@@ -4052,13 +4151,19 @@ internal static partial class Av1StillImageEncoder
                 PredictIntraRect(c.ReconV, c.Cw, cbw4, cbh4, cbx4, cby4, cw, ch, mode, delta, pv, chromaEdge, cIntraFlags);
                 var uvTx = UvIntraTxType(chromaTx, (int)mode);
                 var uvFwd = FwdTypeForTxType(uvTx);
-                int[] uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, pu, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, null, uvFwd);
-                int[] vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, pv, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, null, uvFwd);
                 double modeBits = Av1CoeffEncode.SymBits(uvModeCdf, (int)mode)
                     + (IsDirectional(mode) && uvAngleOk ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0);
-                double j = ReconSseCandRect(uu, chromaTx, cw, ch, c.DcDq, c.AcDq, pu, c.U, c.Cw, cbx, cby, uvTx)
-                         + ReconSseCandRect(vv, chromaTx, cw, ch, c.DcDq, c.AcDq, pv, c.V, c.Cw, cbx, cby, uvTx)
-                         + clam0 * (CRate(uu, vv) + modeBits);
+                int[] uu, vv; double j;
+                if (aomC)
+                    j = PlaneJ(c.U, pu, uvTx, eUSkip, eUSign, out uu) + PlaneJ(c.V, pv, uvTx, eVSkip, eVSign, out vv) + clam0 * modeBits;
+                else
+                {
+                    uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, pu, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, null, uvFwd);
+                    vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, pv, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, null, uvFwd);
+                    j = ReconSseCandRect(uu, chromaTx, cw, ch, c.DcDq, c.AcDq, pu, c.U, c.Cw, cbx, cby, uvTx)
+                      + ReconSseCandRect(vv, chromaTx, cw, ch, c.DcDq, c.AcDq, pv, c.V, c.Cw, cbx, cby, uvTx)
+                      + clam0 * (CRate(uu, vv) + modeBits);
+                }
                 if (j < bestJ)
                 {
                     bestJ = j; uvMode = (int)mode; uvDelta = delta; useCfl = false;
@@ -4077,7 +4182,38 @@ internal static partial class Av1StillImageEncoder
             else CflAcAnyLayout(c, lumaBs, lumaTx, bx4, by4, acc);
             int aU = BestCflAlphaRect(c.U, c.Cw, cbx, cby, cw, ch, dcU, acc);
             int aV = BestCflAlphaRect(c.V, c.Cw, cbx, cby, cw, ch, dcV, acc);
-            if (aU != 0 || aV != 0)
+            if (aomC)
+            {
+                // cfl_rd_pick_alpha: each plane RD-priced at the alphas around its estimate, the best pair (not both
+                // zero) with the joint alpha signalling
+                int R = Math.Max(0, Sp.AomCflRange);
+                double[] ju = new double[33], jv = new double[33];
+                int[][] lu = new int[33][], lvv = new int[33][];
+                ushort[][] pu2 = new ushort[33][], pv2 = new ushort[33][];
+                for (int k = 0; k < 33; k++) { ju[k] = jv[k] = double.MaxValue; }
+                for (int a = Math.Max(-16, aU - R); a <= Math.Min(16, aU + R); a++)
+                { pu2[a + 16] = BuildCflPredRect(dcU, acc, cw, ch, a); ju[a + 16] = PlaneJ(c.U, pu2[a + 16], Av1TxType.DctDct, eUSkip, eUSign, out lu[a + 16]); }
+                for (int a = Math.Max(-16, aV - R); a <= Math.Min(16, aV + R); a++)
+                { pv2[a + 16] = BuildCflPredRect(dcV, acc, cw, ch, a); jv[a + 16] = PlaneJ(c.V, pv2[a + 16], Av1TxType.DctDct, eVSkip, eVSign, out lvv[a + 16]); }
+                double cflBest = double.MaxValue; int bu = 0, bv = 0;
+                double cflMode = Av1CoeffEncode.SymBits(uvModeCdf, (int)Av1IntraPredMode.ChromaFromLuma);
+                for (int x1 = 0; x1 < 33; x1++)
+                {
+                    if (ju[x1] == double.MaxValue) continue;
+                    for (int x2 = 0; x2 < 33; x2++)
+                    {
+                        if (jv[x2] == double.MaxValue || (x1 == 16 && x2 == 16)) continue;
+                        double jj = ju[x1] + jv[x2] + clam0 * (cflMode + CflAlphaBits(eCdf, x1 - 16, x2 - 16));
+                        if (jj < cflBest) { cflBest = jj; bu = x1; bv = x2; }
+                    }
+                }
+                if (cflBest < bestJ)
+                {
+                    bestJ = cflBest; useCfl = true; uvMode = (int)Av1IntraPredMode.ChromaFromLuma;
+                    alphaU = bu - 16; alphaV = bv - 16; uC = lu[bu]; vC = lvv[bv]; predU = pu2[bu]; predV = pv2[bv];
+                }
+            }
+            else if (aU != 0 || aV != 0)
             {
                 var pcflU = BuildCflPredRect(dcU, acc, cw, ch, aU);
                 var pcflV = BuildCflPredRect(dcV, acc, cw, ch, aV);
@@ -4112,13 +4248,13 @@ internal static partial class Av1StillImageEncoder
             }
         // RDOQ of the chroma winner (as the square 4:2:0 leaf): the pre-quant floats re-derived with its tx kernel.
         // Not for 4:2:0 rectangles: their chroma blocks are small, and there it cost time for a slight loss.
-        if (UseChromaRdoq && UseRdoq && uvPal == null && c.Layout != Av1PixelLayout.I420)
+        if (!aomC && UseChromaRdoq && UseRdoq && uvPal == null && c.Layout != Av1PixelLayout.I420)
         {
             var uvT = useCfl ? Av1TxType.DctDct : UvIntraTxType(chromaTx, uvMode);
             if (uvT is Av1TxType.DctDct or Av1TxType.AdstDct or Av1TxType.DctAdst or Av1TxType.AdstAdst)
             {
                 var fwdT = FwdTypeForTxType(uvT);
-                double clamR = ChromaRdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq;
+                double clamR = ChromaRdoqLambdaScale * LamK * c.AcDq * c.AcDq;
                 var qfC = new double[cScan];
                 if (HasNonZero(uC))
                 {
@@ -4281,7 +4417,7 @@ internal static partial class Av1StillImageEncoder
         var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode);
         int bDimW = Av1Tables.BlockDimensions[lumaBs, 2], bDimH = Av1Tables.BlockDimensions[lumaBs, 3];
         bool uvAngleOk = bDimW + bDimH >= 2;
-        double lambda = RdLambdaK * c.AcDq * c.AcDq;
+        double lambda = LamK * c.AcDq * c.AcDq;
         var pred = new ushort[tw * th];
 
         // Codes one plane with (mode, delta) through every tx block, reconstructing in place; returns SSE + λ·bits.
@@ -4512,7 +4648,7 @@ internal static partial class Av1StillImageEncoder
         var scr = t_scSub8 ??= new LeafScratch();
         var pred = scr.P1; var bestPred = scr.P2; var resBuf = scr.R;
         var qfCand = scr.Q1; var qfWin = scr.Q2;
-        double rectLambda = RdLambdaK * c.AcDq * c.AcDq;
+        double rectLambda = LamK * c.AcDq * c.AcDq;
         int[] yC = null!; Av1IntraPredMode yMode = Av1IntraPredMode.Dc; Av1TxType yInv = Av1TxType.DctDct; int yTxIdx = 1;
         double best = double.MaxValue;
         // Faster presets: only the Sub8ModeCandidates base modes with the lowest prediction SAD reach the RD loop.
@@ -4568,7 +4704,7 @@ internal static partial class Av1StillImageEncoder
                 if (Sp.RdoqInSearch && !oneD && j < best * Sp.RdoqSearchMargin)
                 {
                     Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, qfCand, c.DcDq, c.AcDq, 0, ySign, idx,
-                        RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                        RdoqLambdaScale * LamK * c.AcDq * c.AcDq);
                     rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)mode, cf, 0, ySign, idx, fullSet: UseFullIntraTxSet);
                     j = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, pred, c.Luma, c.W, bx, by, inv) + rectLambda * (rate + modeBits);
                 }
@@ -4578,7 +4714,7 @@ internal static partial class Av1StillImageEncoder
         }
         if (yInv != Av1TxType.VDct && yInv != Av1TxType.HDct && !Sp.RdoqInSearch)
             Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, qfWin, c.DcDq, c.AcDq, 0, ySign, yTxIdx,
-                RdoqLambdaScale * RdLambdaK * c.AcDq * c.AcDq);
+                RdoqLambdaScale * LamK * c.AcDq * c.AcDq);
 
         // Reconstruct this sub-block's luma into ReconY now — the has_chroma sub-block's CfL reads the full 8x8 luma
         // (both sub-blocks are reconstructed by the time we reach it). Encoder-internal; emission order is unaffected.
@@ -4611,7 +4747,7 @@ internal static partial class Av1StillImageEncoder
                 ? Av1CoeffEncode.EstimateCoefBits(eCoef, eMode, chromaTx, 1, 0, cu, eUSkip, eUSign, 0) + Av1CoeffEncode.EstimateCoefBits(eCoef, eMode, chromaTx, 1, 0, cv, eVSkip, eVSign, 0)
                 : CoeffCost(cu) + CoeffCost(cv);
             var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode);
-            double lam = RdLambdaK * c.AcDq * c.AcDq;
+            double lam = LamK * c.AcDq * c.AcDq;
             double bestJ = ReconSseCandRect(uC, chromaTx, 4, 4, c.DcDq, c.AcDq, predU, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
                          + ReconSseCandRect(vC, chromaTx, 4, 4, c.DcDq, c.AcDq, predV, c.V, c.Cw, cbx, cby, Av1TxType.DctDct)
                          + lam * (CRate(uC, vC) + Av1CoeffEncode.SymBits(uvModeCdf, 0));
@@ -5044,7 +5180,7 @@ internal static partial class Av1StillImageEncoder
         {
             PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, bx4, by4, n, yMode, yDelta, c.Pred, edgeFlags, IntraEdgeFlags(c.AboveMode[bxR], c.LeftMode[byR]));
             int[] res = ComputeResidualPred(c.Luma, c.W, bx4 * 4, by4 * 4, c.Pred, n);
-            (coeffs0, invTx0, txIdx0) = ChooseTxType(res, n, maxTx, c.DcDq, c.AcDq, c.Pred, c.Luma, c.W, bx4 * 4, by4 * 4, RdLambdaK * c.AcDq * c.AcDq);
+            (coeffs0, invTx0, txIdx0) = ChooseTxType(res, n, maxTx, c.DcDq, c.AcDq, c.Pred, c.Luma, c.W, bx4 * 4, by4 * 4, LamK * c.AcDq * c.AcDq);
         }
         int skip = HasNonZero(coeffs0) ? 0 : 1;
 
@@ -5112,7 +5248,7 @@ internal static partial class Av1StillImageEncoder
                         ((ix > 0 || (sbHasBl == 0 && iy + txW4 >= blk4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
                     PredictIntra(c.Recon, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, predBuf, localEdge, IntraEdgeFlags(c.AboveMode[bxR], c.LeftMode[byR]));
                     int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, predBuf, txN);
-                    (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq, predBuf, c.Luma, c.W, cbx4 * 4, cby4 * 4, RdLambdaK * c.AcDq * c.AcDq);
+                    (int[] cf, Av1TxType inv, int idx) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq, predBuf, c.Luma, c.W, cbx4 * 4, cby4 * 4, LamK * c.AcDq * c.AcDq);
                     // Coeff-skip context is neighbour-based for sub-block transforms (0 only when tx == block size).
                     int coefSkipCtx = Av1CoeffDecode.GetSkipCtx(in tDim, BlToBs(bl), c.AboveLCoef.AsSpan(cbxR), c.LeftLCoef.AsSpan(cbyR), 0, 0);
                     int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, c.AboveLCoef.AsSpan(cbxR), c.LeftLCoef.AsSpan(cbyR));
@@ -5155,7 +5291,7 @@ internal static partial class Av1StillImageEncoder
                 int cbx4 = bx4 + ix, cby4 = by4 + iy;
                 PredictIntra(c.Luma, c.W, c.Bw4, c.Bh4, cbx4, cby4, txN, yMode, yDelta, c.EstScratch);
                 int[] res = ComputeResidualPred(c.Luma, c.W, cbx4 * 4, cby4 * 4, c.EstScratch, txN);
-                (int[] cf, _, _) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq, c.EstScratch, c.Luma, c.W, cbx4 * 4, cby4 * 4, RdLambdaK * c.AcDq * c.AcDq);
+                (int[] cf, _, _) = ChooseTxType(res, txN, tx, c.DcDq, c.AcDq, c.EstScratch, c.Luma, c.W, cbx4 * 4, cby4 * 4, LamK * c.AcDq * c.AcDq);
                 cost += CoeffCost(cf) + 6; // per-tx-block overhead (all_zero + tx-type + eob)
             }
 
@@ -5192,6 +5328,33 @@ internal static partial class Av1StillImageEncoder
     // Re-swept 2026-09-26 against avifenc (-a tune=psnr, scoreboard, joint with RdoqLambdaScale): 0.0008 / 125
     // (effective RDOQ λ 0.1, was 0.0625): speed 2 +1.58 -> +0.27%, speed 4 -1.00 -> -2.11%, speed 6 -1.44 -> -2.98%.
     internal static double RdLambdaK = 0.0008;
+    internal static bool RoundNearest => Sp.AomRoundNearest;
+    // chroma trellis / RDOQ scale for the libaom chroma search (the preset's, else the dev static)
+    private static double ChromaLamScale => Sp.AomChroma && Sp.AomChromaLam > 0 ? Sp.AomChromaLam : ChromaRdoqLambdaScale;
+    // libaom allintra intra_sb_rdmult_modifier (AomSbLambda): this thread's superblock lambda factor (0 = 1).
+    [ThreadStatic] private static double t_sbLamMul;
+    private static double LamK
+    {
+        get { double k = Sp.LambdaKFrame > 0 ? Sp.LambdaKFrame : RdLambdaK; return t_sbLamMul == 0 ? k : k * t_sbLamMul; }
+    }
+
+    // libaom setup_block_rdmult (ALLINTRA): a superblock mixing near-flat (log 4x4 variance < 2) and busy (> 4) areas
+    // codes at a lower lambda: 128 - min(48, 6 * (max - min)) over 128.
+    private static double SbLambdaMul(ColorPartCtx c, int sbx, int sby)
+    {
+        int x0 = sbx * 64, y0 = sby * 64, w = Math.Min(64, c.Bw4 * 4 - x0), h = Math.Min(64, c.Bh4 * 4 - y0);
+        int vmin = int.MaxValue, vmax = 0;
+        for (int y = 0; y < h; y += 4)
+            for (int x = 0; x < w; x += 4)
+            {
+                int v = Var4x4Norm(c.Luma, c.W, x0 + x, y0 + y);
+                vmin = Math.Min(vmin, v); vmax = Math.Max(vmax, v);
+            }
+        double lmin = Math.Log(1 + vmin / 16.0), lmax = Math.Log(1 + vmax / 16.0);
+        int m = 128;
+        if (lmin < 2.0 && lmax > 4.0) m -= lmax - lmin > 8.0 ? 48 : (int)((lmax - lmin) * 6);
+        return m / 128.0;
+    }
 
     // Extra multiplier on the RDOQ lambda relative to the partition lambda. The partition lambda is tuned for
     // whole-block decisions; coefficient RDOQ needs a larger effective lambda to trade a marginal coefficient's
@@ -5279,7 +5442,7 @@ internal static partial class Av1StillImageEncoder
         int n = (32 >> bl) * 4;
         int tx = BlToTx(bl);
         var (_, _, satd) = ChooseIntraMode(luma, w, bw4, bh4, bx4, by4, n, luma, w, bx4 * 4, by4 * 4, scratch);
-        if (Sp.EstimateSatdOnly) return satd + (long)(Math.Sqrt(RdLambdaK) * acDq * HeaderCostBits);
+        if (Sp.EstimateSatdOnly) return satd + (long)(Math.Sqrt(LamK) * acDq * HeaderCostBits);
         if (Sp.EstimateCoefDist && n <= 32)
         {
             int scanLen = Av1Tables.Scans[tx].Length;
@@ -5299,7 +5462,7 @@ internal static partial class Av1StillImageEncoder
                 dist += e * e;
             }
             Av1FwdTransform.ReturnLevels(cq);
-            return (long)(dist * Sp.EstimateCoefDistScale + RdLambdaK * acDq * acDq * cbits);
+            return (long)(dist * Sp.EstimateCoefDistScale + LamK * acDq * acDq * cbits);
         }
         int[] coeffs = ForwardResidualPred(luma, w, bx4 * 4, by4 * 4, scratch, n, dcDq, acDq, Av1Tables.Scans[tx].Length);
         long bits = HeaderCostBits;
@@ -5317,7 +5480,7 @@ internal static partial class Av1StillImageEncoder
                 sse += (long)d * d;
             }
 
-        double lambda = RdLambdaK * acDq * acDq;
+        double lambda = LamK * acDq * acDq;
         return sse + (long)(lambda * bits);
     }
 
@@ -5824,7 +5987,7 @@ internal static partial class Av1StillImageEncoder
         Span<int> topIdx = stackalloc int[RdModeCandidates];
         Span<long> topCost = stackalloc long[RdModeCandidates];
         topCost.Fill(long.MaxValue);
-        double satdLambda = Math.Sqrt(RdLambdaK) * acDq; // ~rate weight in SATD units
+        double satdLambda = Math.Sqrt(LamK) * acDq; // ~rate weight in SATD units
         uint hogMask = HogSkipMask(luma, lumaW, bx4 * 4, by4 * 4, n, n, bw4 * 4, bh4 * 4, Sp.HogLevel);
         int refine = Sp.AngleRefineTop;
         Span<long> baseCost = stackalloc long[16];
@@ -5854,8 +6017,8 @@ internal static partial class Av1StillImageEncoder
         for (int t = 0; t < RdModeCandidates && t < t_topModes.Length; t++)
             if (topCost[t] != long.MaxValue) t_topModes[t_topModeCount++] = topIdx[t];
         double best = double.MaxValue;
-        double rdLambda = RdLambdaK * acDq * acDq;   // pixel-SSE units per bit (same λ as the palette RD gate)
-        double rdoqLambda = RdoqLambdaScale * RdLambdaK * acDq * acDq;
+        double rdLambda = LamK * acDq * acDq;   // pixel-SSE units per bit (same λ as the palette RD gate)
+        double rdoqLambda = RdoqLambdaScale * LamK * acDq * acDq;
         (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx) bestCand = default;
         bool fastTx = Sp.FastIntraTxType;
         for (int pass = 0; pass < (fastTx ? 2 : 1); pass++)
@@ -5944,7 +6107,7 @@ internal static partial class Av1StillImageEncoder
         // 1D scan), so its rate model doesn't apply — the deadzone-quantized 1D levels are coded as-is.
         if (bestCand.Coeffs != null && bestCand.Inv != Av1TxType.VDct && bestCand.Inv != Av1TxType.HDct && !Sp.RdoqInSearch)
         {
-            double lambda = RdoqLambdaScale * RdLambdaK * acDq * acDq;
+            double lambda = RdoqLambdaScale * LamK * acDq * acDq;
             int rdoqMode = bestCand.Mode == Av1IntraPredMode.Filter ? Av1Tables.FilterModeToYMode[bestCand.Delta] : (int)bestCand.Mode;
             Av1CoeffEncode.RdoqOptimize(cdf.Coef, cdf.Mode, tx, 0, rdoqMode, bestCand.Coeffs, qfWin,
                 dcDq, acDq, 0, dcSignCtx, bestCand.Idx, lambda);
