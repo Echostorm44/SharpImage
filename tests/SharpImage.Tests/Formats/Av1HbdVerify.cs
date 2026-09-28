@@ -2019,6 +2019,21 @@ public sealed class Av1HbdVerify
                     log.AppendLine("  uvmode " + string.Join(" ", uvm.Select(kv => $"{kv.Key}:{Pct(kv.Value)}")));
                     continue;
                 }
+                if (t[0] == "srcy")
+                {
+                    // srcy <src.png> <out.raw> <420|444|400>: the luma plane our encoder codes (8-bit, width x height)
+                    var img = FormatRegistry.Read(t[1]);
+                    ushort[]? src = null; int sw = 0;
+                    Av1StillImageEncoder.SourceHook = (pl, w, h) => { if (src == null) { src = (ushort[])pl.Clone(); sw = w; } };
+                    HeifCoder.EncodeAvif(img, new AvifEncodeOptions { Quality = 50, Speed = 10, ChromaSubsampling = t[3] switch { "444" => AvifChromaSubsampling.Yuv444, "400" => AvifChromaSubsampling.Yuv400, _ => AvifChromaSubsampling.Yuv420 } });
+                    Av1StillImageEncoder.SourceHook = null;
+                    int iw = (int)img.Columns, ih = (int)img.Rows;
+                    var outY = new byte[iw * ih];
+                    for (int y = 0; y < ih; y++) for (int x = 0; x < iw; x++) outY[y * iw + x] = (byte)src![y * sw + x];
+                    File.WriteAllBytes(t[2], outY);
+                    log.AppendLine($"srcy {iw}x{ih}");
+                    continue;
+                }
                 if (t[0] == "txcmp")
                 {
                     // txcmp <aom.avif> <src.png> <420|444>: for every luma tx block libaom coded, our forward transform +
@@ -2092,6 +2107,75 @@ public sealed class Av1HbdVerify
                         var ts2 = tstat[tx];
                         log.AppendLine($"   trellis: nz {ts2[0]} equal {100.0 * ts2[1] / ts2[0]:F1}% oursHigher {100.0 * ts2[2] / ts2[0]:F1}% oursLower {100.0 * ts2[3] / ts2[0]:F1}% sum|L| ours {ts2[4]} aom {ts2[5]}");
                     }
+                    continue;
+                }
+                if (t[0] == "blkrd")
+                {
+                    // blkrd <a.avif> <b.avif> <src.png> [lambda]: per block (same origin + size in both streams) the exact
+                    // coded bits (range-coder cost: all symbols / luma coefficients) and the luma SSE against the source of
+                    // the decoded picture (run with AV1_NODEBLOCK/AV1_NOCDEF/AV1_NOLR for the pre-filter reconstruction);
+                    // summed per block size, plus the blocks where a loses most on SSE + lambda * bits.
+                    var img = FormatRegistry.Read(t[3]);
+                    ushort[]? src = null; int srcW = 0;
+                    Av1StillImageEncoder.SourceHook = (p, w, h) => { if (src == null) { src = (ushort[])p.Clone(); srcW = w; } };
+                    HeifCoder.EncodeAvif(img, new AvifEncodeOptions { Quality = 50, Speed = 10, ChromaSubsampling = AvifChromaSubsampling.Yuv400 });
+                    Av1StillImageEncoder.SourceHook = null;
+                    double lamB = t.Length > 4 ? double.Parse(t[4], System.Globalization.CultureInfo.InvariantCulture) : 0;
+                    Dictionary<int, (int Bs, double All, double Coef, long Sse)> Grab(string f)
+                    {
+                        var order = new List<(int Key, int Bs, double All, double Coef)>();
+                        Av1Msac.AcctOn = true; Array.Clear(Av1Msac.PhaseBits); Av1Msac.Phase = 7;
+                        SharpImage.Formats.Av1.Av1Decode.BlockPosHook = (x4, y4, blk) =>
+                        {
+                            double all = 0; foreach (var v in Av1Msac.PhaseBits) all += v;
+                            order.Add((x4 | (y4 << 16), blk.BlockSize, all, Av1Msac.PhaseBits[5]));
+                        };
+                        var hc = HeifContainer.Parse(File.ReadAllBytes(f));
+                        var dd = new Av1Decoder();
+                        var res = new Dictionary<int, (int, double, double, long)>();
+                        using (var fr = dd.Decode(hc.ItemData(hc.PrimaryId)!, 0, true)!)
+                        {
+                            SharpImage.Formats.Av1.Av1Decode.BlockPosHook = null;
+                            double endAll = 0; foreach (var v in Av1Msac.PhaseBits) endAll += v;
+                            double endCoef = Av1Msac.PhaseBits[5];
+                            Av1Msac.AcctOn = false;
+                            var yp = fr.YPlane.Span; int ys = fr.YStride, fw = fr.Width, fh = fr.Height;
+                            for (int i = 0; i < order.Count; i++)
+                            {
+                                var o = order[i];
+                                // mode symbols precede the hook, coefficients follow it: block i = [hook i-1 coef end .. hook i+1)
+                                double allNext = i + 1 < order.Count ? order[i + 1].All : endAll;
+                                double coefNext = i + 1 < order.Count ? order[i + 1].Coef : endCoef;
+                                double allPrev = order[i].All;   // approx: coefs of i + mode symbols of i+1
+                                int x4 = o.Key & 0xFFFF, y4 = o.Key >> 16;
+                                int bw = SharpImage.Formats.Av1.Av1Tables.BlockDimensions[o.Bs, 0] * 4, bh = SharpImage.Formats.Av1.Av1Tables.BlockDimensions[o.Bs, 1] * 4;
+                                long sse = 0;
+                                for (int y = y4 * 4; y < Math.Min(fh, y4 * 4 + bh); y++)
+                                    for (int x = x4 * 4; x < Math.Min(fw, x4 * 4 + bw); x++) { int d = yp[y * ys + x] - src![y * srcW + x]; sse += (long)d * d; }
+                                res[o.Key] = (o.Bs, allNext - allPrev, coefNext - o.Coef, sse);
+                            }
+                        }
+                        return res;
+                    }
+                    var ga = Grab(t[1]); var gb = Grab(t[2]);
+                    var agg = new SortedDictionary<int, double[]>();
+                    double[] tot = new double[7];
+                    var diffs = new List<(double D, int Key, int Bs, double Ba, double Bb, long Sa, long Sb)>();
+                    foreach (var (k, a) in ga)
+                    {
+                        if (!gb.TryGetValue(k, out var b) || b.Bs != a.Bs) { tot[6]++; continue; }
+                        if (!agg.TryGetValue(a.Bs, out var ag)) agg[a.Bs] = ag = new double[7];
+                        ag[0]++; ag[1] += a.All; ag[2] += b.All; ag[3] += a.Coef; ag[4] += b.Coef; ag[5] += a.Sse; ag[6] += b.Sse;
+                        tot[0]++; tot[1] += a.All; tot[2] += b.All; tot[3] += a.Coef; tot[4] += b.Coef; tot[5] += a.Sse; tot[6] += 0;
+                        diffs.Add(((a.Sse - b.Sse) + lamB * (a.All - b.All), k, a.Bs, a.All, b.All, a.Sse, b.Sse));
+                    }
+                    long sseB = 0; foreach (var (k, a) in ga) if (gb.TryGetValue(k, out var b) && b.Bs == a.Bs) sseB += b.Sse;
+                    log.AppendLine($"blkrd matched {tot[0]} unmatched(a) {tot[6]} | bits a {tot[1]:F0} b {tot[2]:F0} | luma-coef a {tot[3]:F0} b {tot[4]:F0} | sse a {tot[5]:F0} b {sseB}");
+                    foreach (var (bs, ag) in agg)
+                        log.AppendLine($"  bs {bs,2} n {ag[0],5} bits a {ag[1],8:F0} b {ag[2],8:F0} ({100 * (ag[1] - ag[2]) / Math.Max(1, ag[2]),6:F2}%) coef a {ag[3],8:F0} b {ag[4],8:F0} sse a {ag[5],9:F0} b {ag[6],9:F0} ({100 * (ag[5] - ag[6]) / Math.Max(1, ag[6]),6:F2}%)");
+                    if (lamB > 0)
+                        foreach (var d in diffs.OrderByDescending(d => d.D).Take(25))
+                            log.AppendLine($"  worst ({d.Key & 0xFFFF},{d.Key >> 16}) bs {d.Bs} dJ {d.D:F0} bits {d.Ba:F0}/{d.Bb:F0} sse {d.Sa}/{d.Sb}");
                     continue;
                 }
                 if (t[0] == "blkcmp")
@@ -2189,10 +2273,12 @@ public sealed class Av1HbdVerify
                         var omodes = new Dictionary<int, (byte, byte, sbyte, byte)>(); var otx = new Dictionary<int, byte>();
                         SharpImage.Formats.Av1.Av1Decode.TxbHook = (x4, y4, tx, tp) => { lock (otx) otx[x4 | (y4 << 16)] = (byte)tp; };
                         var olv = new Dictionary<int, (int, int[])>();
+                        var opred = new Dictionary<int, ushort[]>();
                         var oqh = new int[1];
                         SharpImage.Formats.Av1.Av1Decode.TxbPredHook = (x4, y4, tx, tp, eob, cf, pr) =>
                         {
                             lock (olv) olv[x4 | (y4 << 16)] = (tx, cf);   // dequantised; converted below once the qindex is known
+                            lock (opred) opred[x4 | (y4 << 16)] = (ushort[])pr.Clone();
                         };
                         SharpImage.Formats.Av1.Av1Decode.BlockPosHook = (x4, y4, blk) =>
                         {
@@ -2208,7 +2294,9 @@ public sealed class Av1HbdVerify
                         SharpImage.Formats.Av1.Av1Decode.TxbHook = null;
                         SharpImage.Formats.Av1.Av1Decode.TxbPredHook = null;
                         SharpImage.Formats.Av1.Av1StillImageEncoder.OracleLevelsCompareOnly = Environment.GetEnvironmentVariable("ORACLE_LEVELS") == "2";
-                        if (Environment.GetEnvironmentVariable("ORACLE_LEVELS") is "1" or "2")
+                        // ORACLE_LEVELS=3: the other encoder's levels on its 1D (V_DCT / H_DCT) tx blocks only
+                        SharpImage.Formats.Av1.Av1StillImageEncoder.OracleLevels1DOnly = Environment.GetEnvironmentVariable("ORACLE_LEVELS") == "3";
+                        if (Environment.GetEnvironmentVariable("ORACLE_LEVELS") is "1" or "2" or "3")
                         {
                             int oq = odec.CurrentFrameHeader.QuantBaseQIdx, bdi = odec.CurrentFrameHeader.QuantBaseQIdx >= 0 ? 0 : 0;
                             int odc = SharpImage.Formats.Av1.Av1Tables.DequantTable[bdi, oq, 0], oac = SharpImage.Formats.Av1.Av1Tables.DequantTable[bdi, oq, 1];
@@ -2221,6 +2309,7 @@ public sealed class Av1HbdVerify
                                 lv[k] = (v.Item1, l);
                             }
                             SharpImage.Formats.Av1.Av1StillImageEncoder.OracleLevels = lv;
+                            SharpImage.Formats.Av1.Av1StillImageEncoder.OraclePred = opred;
                         }
                         if (Environment.GetEnvironmentVariable("ORACLE_MODES") == "1")
                         { SharpImage.Formats.Av1.Av1StillImageEncoder.OracleModes = omodes; SharpImage.Formats.Av1.Av1StillImageEncoder.OracleTxtp = otx; }
@@ -2240,6 +2329,7 @@ public sealed class Av1HbdVerify
                     SharpImage.Formats.Av1.Av1StillImageEncoder.OracleModes = null;
                     SharpImage.Formats.Av1.Av1StillImageEncoder.OracleTxtp = null;
                     SharpImage.Formats.Av1.Av1StillImageEncoder.OracleLevels = null;
+                    SharpImage.Formats.Av1.Av1StillImageEncoder.OraclePred = null;
                     if (allocL != null) log.Append(allocL.Report());
                     SharpImage.Formats.Av1.Av1StillImageEncoder.PhaseHook = null;
                     if (phases.Length > 0) log.AppendLine("  phases" + phases);

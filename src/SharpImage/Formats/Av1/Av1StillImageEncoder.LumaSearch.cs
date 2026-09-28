@@ -52,7 +52,7 @@ internal static partial class Av1StillImageEncoder
     {
         if (Sp.AomTrellisLam <= 0) return RdoqScale * LamK * c.AcDq * c.AcDq;
         double dc = c.DcDq, rdm = dc * dc * (3.3 + 0.0015 * dc) / (1 << (2 * (Bd - 8)));
-        return Sp.AomTrellisLam * 68 * rdm / 2048 * (1 << (2 * (Bd - 8)));
+        return Sp.AomTrellisLam * 68 * rdm / 2048 * (1 << (2 * (Bd - 8))) * (t_sbLamMul == 0 ? 1 : t_sbLamMul);   // x->rdmult carries the SB modifier
     }
     // dev counters (AOM_STATS): searches, modes RD-evaluated, uniform-tx trials, tx blocks, RDOQ runs in the type loop
     internal static long StatSearch, StatModes, StatTrials, StatTxb, StatRdoq;
@@ -61,7 +61,10 @@ internal static partial class Av1StillImageEncoder
     internal static readonly double[] CalPix = new double[19], CalCoef = new double[19];
     internal static readonly long[] CalN = new long[19];
     internal static readonly double[] CalCmp = new double[8];
-    internal static bool OracleLevelsCompareOnly;
+    internal static bool OracleLevelsCompareOnly, OracleLevels1DOnly;
+    // dev: the other encoder's luma prediction per tx block origin (CalCmp only counts blocks whose prediction is ours)
+    internal static Dictionary<int, ushort[]>? OraclePred;
+    internal static readonly double[] CalSame = new double[8];
 
     // libaom uniform_txfm_yrd for an intra block: the w4 x h4 luma block coded on tx size stx (all tx blocks alike),
     // tx blocks in raster order, each predicted from the reconstruction with the decoder's per-tx edge flags
@@ -159,7 +162,8 @@ internal static partial class Av1StillImageEncoder
                     bool olv = false;
                     if (oTp >= 0 && OracleLevels != null && OracleLevels.TryGetValue(tx4 | (ty4 << 16), out var ol) && ol.Tx == stx)
                     {
-                        if (!oneD && CalOn)
+                        bool samePred = OraclePred != null && OraclePred.TryGetValue(tx4 | (ty4 << 16), out var opr) && opr.AsSpan(0, tw * th).SequenceEqual(pred.AsSpan(0, tw * th));
+                        if (!oneD && CalOn && samePred)
                         {
                             // compare our trellis on this residual with the oracle's levels, on our own cost function
                             var mine = (int[])cf.Clone();
@@ -174,7 +178,7 @@ internal static partial class Av1StillImageEncoder
                             lock (CalPix) { CalCmp[0] += n; CalCmp[1] += agree; CalCmp[2] += mb; CalCmp[3] += lb; CalCmp[4] += md; CalCmp[5] += ld;
                                 CalCmp[6] += md + lambda * mb < ld + lambda * lb ? 1 : 0; CalCmp[7] += 1; }
                         }
-                        if (!OracleLevelsCompareOnly) { Array.Copy(ol.Lv, cf, sScan); olv = true; pre = true; }
+                        if (!OracleLevelsCompareOnly && (oneD || !OracleLevels1DOnly)) { Array.Copy(ol.Lv, cf, sScan); olv = true; pre = true; }
                     }
                     double preBits = -1;
                     // libaom's order (search_tx_type): quantise, trellis, then one rate + one distortion
@@ -214,7 +218,7 @@ internal static partial class Av1StillImageEncoder
                     else Av1FwdTransform.ReturnLevels(cf);
                 }
                 // the coded levels are RDOQ'd (libaom's final encode trellises every block)
-                if (UseRdoq && (Sp.AomTrellisAll || trellis) && !bestRdoq && OracleLevels == null && bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && HasNonZero(bestCf))
+                if (UseRdoq && (Sp.AomTrellisAll || trellis) && !bestRdoq && (OracleLevels == null || OracleLevels1DOnly) && bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && HasNonZero(bestCf))
                 {
                     double qb = Quantise(bestCf, qfBest, bestIdx);
                     double bits = qb >= 0 ? qb : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, bestCf, skc, snc, bestIdx, fullSet: UseFullIntraTxSet);

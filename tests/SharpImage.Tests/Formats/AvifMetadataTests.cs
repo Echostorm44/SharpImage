@@ -157,4 +157,21 @@ public sealed class AvifMetadataTests
         src.IccProfile = FakeIcc(500);
         await Assert.That(HeifCoder.Decode(HeifCoder.EncodeAvif(src)).IccProfile).IsEquivalentTo(src.IccProfile);
     }
+
+    [Test]
+    public async Task Icc_WhoseColourSpaceContradictsTheOutput_IsDropped()
+    {
+        // avifenc refuses a colour ICC on a 4:0:0 encode (and a gray one on a colour encode) unless --ignore-icc:
+        // the mismatched profile is dropped and the CICP falls back to sRGB; a matching one is kept.
+        var src = Gradient(64, 40);
+        byte[] rgb = FakeIcc(500), gray = FakeIcc(500);
+        "RGB "u8.CopyTo(rgb.AsSpan(16)); "GRAY"u8.CopyTo(gray.AsSpan(16));
+        var mono = new AvifEncodeOptions { ChromaSubsampling = AvifChromaSubsampling.Yuv400 };
+        src.IccProfile = rgb;
+        await Assert.That(HeifCoder.Decode(HeifCoder.EncodeAvif(src, mono)).IccProfile).IsNull();
+        await Assert.That(HeifCoder.Decode(HeifCoder.EncodeAvif(src)).IccProfile).IsEquivalentTo(rgb);
+        src.IccProfile = gray;
+        await Assert.That(HeifCoder.Decode(HeifCoder.EncodeAvif(src, mono)).IccProfile).IsEquivalentTo(gray);
+        await Assert.That(HeifCoder.Decode(HeifCoder.EncodeAvif(src)).IccProfile).IsNull();
+    }
 }

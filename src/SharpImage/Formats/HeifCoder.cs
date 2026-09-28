@@ -1902,7 +1902,7 @@ public static partial class HeifCoder
     {
         var x = new Av1.AvifContainerExtras
         {
-            Icc = image.Metadata.IccProfile?.Data ?? image.IccProfile,
+            Icc = AvifIcc(image, o),
             Exif = image.Metadata.ExifProfile is { } exif ? SharpImage.Metadata.ExifParser.SerializeForPngExif(exif) : null,
             Xmp = image.Metadata.Xmp is { Length: > 0 } xmp ? Encoding.UTF8.GetBytes(xmp) : null,
         };
@@ -1973,11 +1973,24 @@ public static partial class HeifCoder
         return ((int)cx, (int)cy, (int)cw, (int)ch);
     }
 
+    // The ICC profile an AVIF encode carries: the image's, unless its colour space contradicts the output — a colour
+    // profile on a 4:0:0 (grayscale) encode or a gray profile on a colour one, which libavif's avifenc refuses
+    // (avifpng.c: "incompatible with the requested output format ... Pass --ignore-icc"); dropped here as
+    // --ignore-icc would (the CICP then defaults to sRGB, as avifenc's does).
+    private static byte[]? AvifIcc(ImageFrame image, AvifEncodeOptions o)
+    {
+        byte[]? icc = image.Metadata.IccProfile?.Data ?? image.IccProfile;
+        if (icc is not { Length: >= 20 }) return icc;
+        bool grayIcc = icc[16] == 'G' && icc[17] == 'R' && icc[18] == 'A' && icc[19] == 'Y';   // header data colour space
+        bool grayOut = o.ChromaSubsampling == AvifChromaSubsampling.Yuv400;
+        return grayIcc == grayOut ? icc : null;
+    }
+
     // CICP for an AVIF encode, validated against what libavif can represent (reformat.c avifGetYUVColorSpaceInfo).
     private static Av1.Av1ObuWriter.Av1ColorDesc ResolveAvifColor(ImageFrame image, AvifEncodeOptions o, int bd)
     {
         var meta = image.Metadata.Cicp;
-        bool hasIcc = image.IccProfile != null || image.Metadata.IccProfile != null;
+        bool hasIcc = AvifIcc(image, o) != null;
         int cp = o.ColorPrimaries ?? meta?.ColorPrimaries ?? (hasIcc ? 2 : 1);
         int tc = o.TransferCharacteristics ?? meta?.TransferCharacteristics ?? (hasIcc ? 2 : 13);
         int mc = o.MatrixCoefficients ?? (meta?.MatrixCoefficients is 1 or 4 or 5 or 6 or 7 or 9 or 12 ? meta.MatrixCoefficients : 6);

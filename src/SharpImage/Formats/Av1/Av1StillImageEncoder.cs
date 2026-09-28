@@ -95,6 +95,8 @@ internal sealed class Av1EncodeSpeed
     // speeds 5 / 6 in 4:4:4 (LayoutSpeedScope): libaom's lambda balance; 5 adds the chroma search and drops loop
     // restoration (libaom has none from speed 5), 6 keeps LR with coarser statistics
     public int Aom444Tier;
+    // 4:2:0 / mono sub-8x8 leaves (8x4 / 4x8 / 4x4) through the rect leaf, i.e. the libaom luma / chroma searches
+    public bool AomSub8Rect;
     // search_tx_type early exits: adaptive_txb_search_level (0 off, 1 s0, 2 s1+) and skip_tx_search (s1+)
     public int AomAdaptiveTxb;
     public bool AomSkipTxSearch;
@@ -290,6 +292,9 @@ internal sealed class Av1EncodeSpeed
             // and its chroma search (every candidate trellised, CfL alphas RD-searched): scoreboard s2 444 +1.15 ->
             // +0.3..0.6, 420 -0.64 -> -0.8..-1.0
             p.LambdaLibaom = 1; p.AomTrellisLam = 0.9; p.AomChroma = true; p.AomChromaLam = 36; p.AomRoundNearest = true;
+            // 4:2:0 / mono sub-8x8 leaves through the same libaom luma / chroma search, the other RDOQ at 61: s2 420
+            // -1.34% -> -1.57% x0.98, 400 0.00% x1.04 -> -0.17% x1.01
+            p.AomSub8Rect = true; p.AomRdoqScale = 61;
         }
         // 2 keeps the T-shape and 4-way partitions (s2 +0.27% x0.53 -> -0.17% x0.85).
         if (speed >= 2) { p.RdModeCandidates = 4; p.EarlyTermBits = 32; }
@@ -4617,7 +4622,21 @@ internal static partial class Av1StillImageEncoder
     private static void EncodeSub8Pair(ColorPartCtx c, bool horz, int bx4, int by4, Span<ushort> partCdf, int nPart, int bx8, int by8, Av1EdgeNode node)
     {
         c.Msac.EncodeSymbolAdapt(partCdf, (int)(horz ? Av1BlockPartition.Horizontal : Av1BlockPartition.Vertical), nPart);
-        if (c.Layout == Av1PixelLayout.I444)
+        if (Sp.AomSub8Rect && (c.Layout == Av1PixelLayout.I420 || c.Mono))
+        {
+            // through the rect leaf (the libaom luma search): the second sub-block carries the 4x4 chroma of the 8x8
+            if (horz)
+            {
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x4, TxIdx8x4, (int)Av1TxSize.Tx4x4, bx4, by4, 2, 1, node.H0, -1);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs8x4, TxIdx8x4, (int)Av1TxSize.Tx4x4, bx4, by4 + 1, 2, 1, node.H1, 1);
+            }
+            else
+            {
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs4x8, TxIdx4x8, (int)Av1TxSize.Tx4x4, bx4, by4, 1, 2, node.V0, -1);
+                EncodeRectLeafColor(c, (int)Av1BlockSize.Bs4x8, TxIdx4x8, (int)Av1TxSize.Tx4x4, bx4 + 1, by4, 1, 2, node.V1, 1);
+            }
+        }
+        else if (c.Layout == Av1PixelLayout.I444)
         {
             // 4:4:4: every sub-block codes its own chroma, so each is a regular (layout-generic) rect leaf.
             if (horz)
@@ -4653,6 +4672,16 @@ internal static partial class Av1StillImageEncoder
     {
         c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
         const int bs = (int)Av1BlockSize.Bs4x4, tx = (int)Av1TxSize.Tx4x4;
+        if (Sp.AomSub8Rect && (c.Layout == Av1PixelLayout.I420 || c.Mono))
+        {
+            // through the rect leaf; the last (odd x, odd y) block carries the 4x4 chroma of the 8x8
+            EncodeRectLeafColor(c, bs, tx, tx, bx4, by4, 1, 1, Av1EdgeFlags.AllTrAndBl, -1);
+            EncodeRectLeafColor(c, bs, tx, tx, bx4 + 1, by4, 1, 1, node.Split0, -1);
+            EncodeRectLeafColor(c, bs, tx, tx, bx4, by4 + 1, 1, 1, node.Split1, -1);
+            EncodeRectLeafColor(c, bs, tx, tx, bx4 + 1, by4 + 1, 1, 1, node.Split2, 1);
+            FillPartCtx(c, 4, bx8, by8, 1, Av1BlockPartition.Split);
+            return;
+        }
         if (c.Layout == Av1PixelLayout.I444)
         {
             EncodeRectLeafColor(c, bs, tx, -1, bx4, by4, 1, 1, Av1EdgeFlags.AllTrAndBl);
