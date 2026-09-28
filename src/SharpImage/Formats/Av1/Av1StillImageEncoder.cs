@@ -39,6 +39,8 @@ internal sealed class Av1EncodeSpeed
     public int RdUvCandidates = 13;
     public bool UseFullIntraTxSet = true;
     public bool UseExtPartition = true;
+    // HORZ_4 / VERT_4 at 16x16 (16x4 / 4x16 strips; libaom codes them heavily on photos at its slowest speed)
+    public bool Part4At16;
     /// <summary>Angle deltas searched for the directional intra modes: 1 = all of -3..3, 0 = none (delta 0 only),
     /// 2 = {-2, 0, 2}, 3 = {-3, 0, 3}, 4 = {-3, -1, 0, 1, 3}.</summary>
     public int AngleDeltaSet = 1;
@@ -204,6 +206,9 @@ internal sealed class Av1EncodeSpeed
         // 0: tx-depth search and in-search RDOQ measured neutral-to-negative on the avifenc scoreboard (tx depth +0.2%,
         // RDOQ-in-search -0.05% for 2.2x time): off (s0 +1.03% x1.70 -> +0.29% x0.57).
         p.UseColorTxDepth = false; p.RdoqInSearch = false;
+        // 0-2: 16x4 / 4x16 strips (HORZ_4 / VERT_4 at 16x16): s0 +0.49% x0.55 -> -0.01% x0.58,
+        // s1 -0.12% x0.85 -> -0.54% x0.96, s2 -0.17% x0.78 -> -0.57% x0.89.
+        p.Part4At16 = speed <= 2;
         if (speed >= 1) { p.UseColorTxDepth = false; p.EarlyTermBits = 16; p.RdoqInSearch = false; p.RdUvCandidates = 6; }
         if (speed >= 1) { p.RdModeCandidates = 8; p.UsePartition64 = false; p.FilterIntraPrune = true; }
         // 2 keeps the T-shape and 4-way partitions (s2 +0.27% x0.53 -> -0.17% x0.85).
@@ -237,8 +242,8 @@ internal sealed class Av1EncodeSpeed
         // 6: libaom's 8x8 partition prunes (qindex, neighbour size, 4x4 variance spread, NONE mode): 4:2:0 scoreboard
         // -3.71% x3.78 -> -3.11% x2.43 vs avifenc.
         if (speed >= 6) { p.RectPruneQidx = true; p.Sub8PruneNeighbour = true; p.RectPruneVarDev = true; p.RectPruneNoneMode = true; }
-        // 6+: RDOQ skips level-down trials that would need > 6 bits of saving (4:2:0 s6 x0.96 -> x0.90, -0.05%).
-        if (speed >= 6) p.RdoqSkipBits = 6;
+        // 6+: RDOQ skips level-down trials that would need > 4 bits of saving (4:2:0 s6 x0.96 -> x0.89, 4:4:4 x1.07 -> x1.01).
+        if (speed >= 6) p.RdoqSkipBits = 4;
         // 7+: partitions from the fast estimate.
         if (speed >= 7) { p.UseTrueRd = false; p.EarlyTermBits = 8; }
         // 7-10 (measured on the speed corpus vs libaom's ladder, BD vs libaom speed 0 / fox 1204x800 1-thread time):
@@ -1898,6 +1903,30 @@ internal static partial class Av1StillImageEncoder
                 EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4 + hsz, hsz, Av1EdgeFlags.None);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.RightSplit);
             }
+            else if (bl == 3) // HORZ_4 / VERT_4 at 16x16: 16x4 / 4x16 strips; in 4:2:0 the odd strips carry the shared chroma
+            {
+                bool h4 = choice == 8;
+                int bs = h4 ? (int)Av1BlockSize.Bs16x4 : (int)Av1BlockSize.Bs4x16;
+                int tx = h4 ? (int)Av1RectTxSize.Rtx16x4 : (int)Av1RectTxSize.Rtx4x16;
+                int ctx = h4 ? (int)Av1RectTxSize.Rtx8x4 : (int)Av1RectTxSize.Rtx4x8;
+                int r0 = c.Layout == Av1PixelLayout.I420 ? -1 : 0, r1 = c.Layout == Av1PixelLayout.I420 ? 1 : 0;
+                c.Msac.EncodeSymbolAdapt(partCdf, (int)(h4 ? Av1BlockPartition.Horizontal4 : Av1BlockPartition.Vertical4), nPart);
+                if (h4)
+                {
+                    EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4, 4, 1, node.H0, r0);
+                    EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4 + 1, 4, 1, node.H4, r1);
+                    EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4 + 2, 4, 1, Av1EdgeFlags.AllLeftHasBottom, r0);
+                    EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4 + 3, 4, 1, node.H1, r1);
+                }
+                else
+                {
+                    EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4, 1, 4, node.V0, r0);
+                    EncodeRectLeafColor(c, bs, tx, ctx, bx4 + 1, by4, 1, 4, node.V4, r1);
+                    EncodeRectLeafColor(c, bs, tx, ctx, bx4 + 2, by4, 1, 4, Av1EdgeFlags.AllTopHasRight, r0);
+                    EncodeRectLeafColor(c, bs, tx, ctx, bx4 + 3, by4, 1, 4, node.V1, r1);
+                }
+                FillPartCtx(c, bl, bx8, by8, hsz, h4 ? Av1BlockPartition.Horizontal4 : Av1BlockPartition.Vertical4);
+            }
             else if (choice == 8) // PARTITION_HORZ_4: four strips, 32x8 at 32x32 / 64x16 at 64x64 (edge flags per decoder)
             {
                 int q = hsz >> 1;   // quarter-height step in 4-units
@@ -2096,7 +2125,7 @@ internal static partial class Av1StillImageEncoder
         { cands[nc++] = 4; cands[nc++] = 5; if (vertOk) { cands[nc++] = 6; cands[nc++] = 7; } }
         // HORZ_4/VERT_4 at 32x32 → 32x8/8x32 strips (normal 16x4 chroma). Only bl==2: the 16x16→16x4 case needs
         // sub-8x8-style shared chroma. The decoder still reads the symbol wherever we choose not to emit it.
-        if (UseExtPartition && (bl == 1 || bl == 2) && rectHere)
+        if (UseExtPartition && (bl == 1 || bl == 2 || (bl == 3 && Sp.Part4At16)) && rectHere)
         { cands[nc++] = 8; if (vertOk) cands[nc++] = 9; }
 
         Searched:
@@ -3233,9 +3262,11 @@ internal static partial class Av1StillImageEncoder
     // UV mode (DC), then Y/U/V coefficients (rect transforms), and reconstructs all three planes. Chroma is DC-
     // predicted (no CfL for rect yet). Mirrors EncodeLeafBlockColor for a w4 x h4 (in 4-units) rectangle.
     private static void EncodeRectLeafColor(ColorPartCtx c, int lumaBs, int lumaTx, int chromaTx,
-        int bx4, int by4, int w4, int h4, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
+        int bx4, int by4, int w4, int h4, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int chromaRef = 0)
     {
         // Layout-generic chroma geometry: (w >> SsX) x (h >> SsY); for 4:2:0 these are exactly the old w/2, h/2.
+        // chromaRef (4:2:0 16x4 / 4x16 strips, one 4-unit thin): -1 = no chroma (coded like a mono leaf), +1 = the
+        // odd strip that codes the chroma shared with the previous strip (8x4 / 4x8 over the 16x8 / 8x16 pair).
         int ssX = c.SsX, ssY = c.SsY;
         if (c.Layout != Av1PixelLayout.I420) chromaTx = Av1Tables.MaxTxfmSizeForBlockSize[lumaBs, (int)c.Layout];
         if (c.Mono) chromaTx = lumaTx;   // unused (no chroma), keeps the geometry lookups valid
@@ -3243,6 +3274,13 @@ internal static partial class Av1StillImageEncoder
         int bx = bx4 * 4, by = by4 * 4, cbx = bx >> ssX, cby = by >> ssY;
         int bxR = bx4 & 31, byR = by4 & 31, cxR = bxR >> ssX, cyR = byR >> ssY;
         int cw4 = Math.Max(1, w4 >> ssX), ch4 = Math.Max(1, h4 >> ssY);
+        if (chromaRef > 0)
+        {
+            int ox4 = bx4 & ~ssX, oy4 = by4 & ~ssY;
+            cw = (Math.Max(w4, 1 << ssX) * 4) >> ssX; ch = (Math.Max(h4, 1 << ssY) * 4) >> ssY;
+            cbx = (ox4 * 4) >> ssX; cby = (oy4 * 4) >> ssY; cxR = (ox4 & 31) >> ssX; cyR = (oy4 & 31) >> ssY;
+            cw4 = cw >> 2; ch4 = ch >> 2;
+        }
         ref readonly var cTDim = ref Av1Tables.TxfmDimensions[chromaTx];
         int lScan = Av1Tables.Scans[lumaTx].Length, cScan = Av1Tables.Scans[chromaTx].Length;
         bool cflAllowed = ((Av1Tables.CflAllowedMask >> lumaBs) & 1) != 0;
@@ -3384,7 +3422,7 @@ internal static partial class Av1StillImageEncoder
 
         // Luma palette (screen content), as in the square leaf.
         LumaPal? yPal = null;
-        bool palOk = c.ScreenContent && Math.Max(w4, h4) <= 16 && w4 + h4 >= 4 && bx4 + w4 <= c.Bw4 && by4 + h4 <= c.Bh4;
+        bool palOk = c.ScreenContent && chromaRef == 0 && Math.Max(w4, h4) <= 16 && w4 + h4 >= 4 && bx4 + w4 <= c.Bw4 && by4 + h4 <= c.Bh4;
         if (palOk)
         {
             int pSzC = Av1Tables.BlockDimensions[lumaBs, 2] + Av1Tables.BlockDimensions[lumaBs, 3] - 2;
@@ -3414,9 +3452,9 @@ internal static partial class Av1StillImageEncoder
         // symbol emission order below, which the decoder does luma-then-chroma too).
         byte cfY = DequantAndReconstructPredRect(yC, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, c.ReconY, c.W, bx, by, yInv);
 
-        if (c.Mono)
+        if (c.Mono || chromaRef < 0)
         {
-            // Monochrome: the colour syntax minus uv_mode / CfL / chroma coefficients.
+            // Monochrome (or a 4:2:0 strip without chroma): the colour syntax minus uv_mode / CfL / chroma coefficients.
             int mSkip = HasNonZero(yC) ? 0 : 1;
             c.Msac.EncodeBoolAdapt(c.Cdf.GetSkipCdf(c.ASkip[bxR] + c.LSkip[byR]), (uint)mSkip);
             if (mSkip == 0) c.Msac.Mark(CdefMarker(bx4, by4));
@@ -3546,7 +3584,7 @@ internal static partial class Av1StillImageEncoder
         if (cflAllowed && UseCfl)
         {
             var acc = new short[cw * ch];
-            if (c.Layout == Av1PixelLayout.I420) ComputeCflAcEncRect(c.ReconY, c.W, bx, by, cw, ch, acc);
+            if (c.Layout == Av1PixelLayout.I420) ComputeCflAcEncRect(c.ReconY, c.W, cbx * 2, cby * 2, cw, ch, acc);
             else CflAcAnyLayout(c, lumaBs, lumaTx, bx4, by4, acc);
             int aU = BestCflAlphaRect(c.U, c.Cw, cbx, cby, cw, ch, dcU, acc);
             int aV = BestCflAlphaRect(c.V, c.Cw, cbx, cby, cw, ch, dcV, acc);
