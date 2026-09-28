@@ -47,6 +47,9 @@ internal static partial class Av1StillImageEncoder
     [ThreadStatic] private static LeafScratch? t_scAom;
     // dev counters (AOM_STATS): searches, modes RD-evaluated, uniform-tx trials, tx blocks, RDOQ runs in the type loop
     internal static long StatSearch, StatModes, StatTrials, StatTxb, StatRdoq;
+    internal static readonly bool CalOn = Environment.GetEnvironmentVariable("AOM_CAL") == "1";
+    internal static readonly double[] CalPix = new double[19], CalCoef = new double[19];
+    internal static readonly long[] CalN = new long[19];
 
     // libaom uniform_txfm_yrd for an intra block: the w4 x h4 luma block coded on tx size stx (all tx blocks alike),
     // tx blocks in raster order, each predicted from the reconstruction with the decoder's per-tx edge flags
@@ -92,7 +95,15 @@ internal static partial class Av1StillImageEncoder
                 int skc = Av1CoeffDecode.GetSkipCtx(in sTD, lumaBs, c.ALY.AsSpan(txR), c.LLY.AsSpan(tyR), 0, 0);
                 int snc = Av1CoeffDecode.GetDcSignCtx(stx, c.ALY.AsSpan(txR), c.LLY.AsSpan(tyR));
                 int[] bestCf = null!; Av1TxType bestInv = Av1TxType.DctDct; int bestIdx = 1;
-                double bestJ = double.MaxValue; bool bestRdoq = false;
+                double bestJ = double.MaxValue, bestBits = 0; bool bestRdoq = false;
+                bool txDom = Sp.AomTxDomainDist && tw <= 32 && th <= 32;   // 64-point: the zeroed half is not in qf
+                // transform-domain distortion: sum ((qf - L) * dq)^2 / 64 tracks the pixel SSE (calibrated per tx size)
+                double TxDist(int[] lv, double[] q)
+                {
+                    double d = 0;
+                    for (int k = 0; k < sScan; k++) { double e = (q[k] - lv[k]) * (k == 0 ? c.DcDq : c.AcDq); d += e * e; }
+                    return d * (1.0 / 64);
+                }
                 // RDOQ of a candidate: libaom's single-pass trellis (AomTrellis) or our RdoqOptimize
                 // returns the coded bits when the trellis priced them (else -1)
                 double Quantise(int[] lv, double[] q, int ti)
@@ -132,7 +143,13 @@ internal static partial class Av1StillImageEncoder
                         System.Threading.Interlocked.Increment(ref StatRdoq);
                         pre = true;
                     }
-                    long sse = ReconSseCandRect(cf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv);
+                    double sse = txDom ? TxDist(cf, qf) : ReconSseCandRect(cf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv);
+                    if (CalOn && !oneD)
+                    {
+                        double cd = 0;
+                        for (int k = 0; k < sScan; k++) { double e = (qf[k] - cf[k]) * (k == 0 ? c.DcDq : c.AcDq); cd += e * e; }
+                        lock (CalPix) { CalPix[stx] += sse; CalCoef[stx] += cd; CalN[stx]++; }
+                    }
                     if (sse >= bestJ) { Av1FwdTransform.ReturnLevels(cf); continue; }
                     double bits = preBits >= 0 ? preBits : oneD
                         ? Av1CoeffEncode.EstimateCoefBits1D(c.Cdf.Coef, c.Cdf.Mode, stx, yModeNoFilt, inv, cf, skc, snc)
@@ -144,13 +161,13 @@ internal static partial class Av1StillImageEncoder
                         double qb = Quantise(cf, qf, idx);
                         System.Threading.Interlocked.Increment(ref StatRdoq);
                         bits = qb >= 0 ? qb : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, cf, skc, snc, idx, fullSet: UseFullIntraTxSet);
-                        j = ReconSseCandRect(cf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv) + lambda * bits;
+                        j = (txDom ? TxDist(cf, qf) : ReconSseCandRect(cf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv)) + lambda * bits;
                         rdoqd = true;
                     }
                     if (j < bestJ)
                     {
                         Av1FwdTransform.ReturnLevels(bestCf);
-                        bestJ = j; bestCf = cf; bestInv = inv; bestIdx = idx; bestRdoq = rdoqd;
+                        bestJ = j; bestBits = bits; bestCf = cf; bestInv = inv; bestIdx = idx; bestRdoq = rdoqd;
                         if (!rdoqd) Array.Copy(qf, qfBest, sScan);
                     }
                     else Av1FwdTransform.ReturnLevels(cf);
@@ -160,9 +177,18 @@ internal static partial class Av1StillImageEncoder
                 {
                     double qb = Quantise(bestCf, qfBest, bestIdx);
                     double bits = qb >= 0 ? qb : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, bestCf, skc, snc, bestIdx, fullSet: UseFullIntraTxSet);
-                    bestJ = ReconSseCandRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, bestInv) + lambda * bits;
+                    bestBits = bits;
+                    if (!txDom) bestJ = ReconSseCandRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, bestInv) + lambda * bits;
                 }
                 byte cfc = DequantAndReconstructPredRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.ReconY, c.W, px, py, bestInv);
+                if (txDom)
+                {
+                    // the winner's pixel distortion from its reconstruction (calc_pixel_domain_distortion_final)
+                    long psse = 0;
+                    for (int yy = 0; yy < th; yy++)
+                        for (int xx = 0; xx < tw; xx++) { int d = c.ReconY[(py + yy) * c.W + px + xx] - c.Luma[(py + yy) * c.W + px + xx]; psse += (long)d * d; }
+                    bestJ = psse + lambda * bestBits;
+                }
                 list.Add((bestCf, bestInv, bestIdx, skc, snc, px, py));
                 for (int i = 0; i < tw4 && txR + i < 32; i++) c.ALY[txR + i] = cfc;
                 for (int j = 0; j < th4 && tyR + j < 32; j++) c.LLY[tyR + j] = cfc;
@@ -235,7 +261,8 @@ internal static partial class Av1StillImageEncoder
         var saveL = c.LLY.AsSpan(byR, Math.Min(h4, 32 - byR)).ToArray();
         void Restore() { saveA.CopyTo(c.ALY.AsSpan(bxR)); saveL.CopyTo(c.LLY.AsSpan(byR)); }
 
-        var best = new LumaPick { J = double.MaxValue };
+        // pick_sb_modes' rd budget: the partition candidate's remaining J (the luma J alone must stay below it)
+        var best = new LumaPick { J = Sp.AomPartAbort ? PartRemaining(c) : double.MaxValue };
         // one mode: the tx-size loop (uniform_txfm_yrd per size), J including mode + tx_size bits
         System.Threading.Interlocked.Increment(ref StatSearch);
         void TryMode(Av1IntraPredMode m, int dl, int nf, double modeBits)
@@ -266,6 +293,13 @@ internal static partial class Av1StillImageEncoder
             }
         }
 
+        // reuse_best_prediction_for_part_ab: only the cached winner's mode (all its angle deltas; filter intra only if
+        // it won with filter intra)
+        int ck = lumaBs * 256 + (by4 & 15) * 16 + (bx4 & 15), sbId = (bx4 >> 4) | ((by4 >> 4) << 16);
+        int cached = c.UseAomModeCache && c.AomModeCacheSb[ck] == sbId ? c.AomModeCache[ck] : 0;
+        bool cacheFilter = (cached >> 16 & 1) != 0;
+        var cacheMode = (Av1IntraPredMode)(cached >> 8 & 0xFF);
+        int cacheFm = (cached & 0xFF) - 8;
         var ymCdf = c.Cdf.GetKfYModeCdf(ymA, ymL);
         double AngleBits(Av1IntraPredMode m, int dl) => IsDirectional(m) && angleOk
             ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)m - (int)Av1IntraPredMode.Vertical), dl + 3) : 0;
@@ -283,6 +317,7 @@ internal static partial class Av1StillImageEncoder
             if (mi < 13) { m = AomModeOrder[mi]; dl = 0; }
             else { int r = mi - 13; m = (Av1IntraPredMode)(1 + r / 6); int e = r % 6; dl = e < 3 ? e - 3 : e - 2; }
             if (Sp.AomDisableSmoothHV && (m == Av1IntraPredMode.SmoothH || m == Av1IntraPredMode.SmoothV)) continue;
+            if (cached != 0 && m != (cacheFilter ? Av1IntraPredMode.Dc : cacheMode)) continue;
             if (IsDirectional(m) && (hogMask >> (int)m & 1) != 0) continue;
             PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, m, dl, pred, edgeFlags, intraFlags);
             long model = AomModelRd(c, bx, by, pred, w, h);
@@ -297,7 +332,7 @@ internal static partial class Av1StillImageEncoder
         }
 
         // rd_pick_filter_intra_sby: the (pruned) filter modes, model-pruned at 1.25x the best model cost
-        if (fiOk && best.Txb != null)
+        if (fiOk && best.Txb != null && (cached == 0 || cacheFilter))
         {
             var fiCdf = c.Cdf.GetFilterIntraCdf((Av1BlockSize)lumaBs);
             double flag = Av1CoeffEncode.SymBits(fiCdf, 1) + Av1CoeffEncode.SymBits(ymCdf, (int)Av1IntraPredMode.Dc);
@@ -305,6 +340,7 @@ internal static partial class Av1StillImageEncoder
             for (int fm = 0; fm < 5; fm++)
             {
                 if ((fiMask >> fm & 1) == 0) continue;
+                if (cached != 0 && fm != cacheFm) continue;
                 PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, Av1IntraPredMode.Filter, fm, pred, edgeFlags, intraFlags);
                 long model = AomModelRd(c, bx, by, pred, w, h);
                 if (bestModel != long.MaxValue && model > bestModel + (bestModel >> 2)) continue;
@@ -317,6 +353,9 @@ internal static partial class Av1StillImageEncoder
         // leave the winner's reconstruction + coefficient contexts in place (deterministic re-run of its size)
         if (best.Txb != null)
         {
+            bool fw = best.Mode == Av1IntraPredMode.Filter;
+            c.AomModeCache[ck] = (1 << 20) | ((fw ? 1 : 0) << 16) | ((fw ? 0 : (int)best.Mode) << 8) | (best.Delta + 8);
+            c.AomModeCacheSb[ck] = sbId;
             foreach (var t in best.Txb) Av1FwdTransform.ReturnLevels(t.Cf);
             best.Txb = LumaUniformTx(c, lumaBs, best.Tx, bx4, by4, w4, h4, best.Mode, best.Delta, best.ModeNoFilt,
                 edgeFlags, intraFlags, double.MaxValue, thr).Txb;

@@ -58,6 +58,20 @@ internal sealed class Av1EncodeSpeed
     public bool AomTrellis;
     // trellis before the rate / distortion of each tx type (libaom search_tx_type); winner trellised even above the MSE gate
     public bool AomTrellisFirst, AomTrellisAll = true;
+    // tx-type loop distortion in the transform domain, the winner's from its reconstruction (tx_domain_dist_level)
+    public bool AomTxDomainDist;
+    // reuse_best_prediction_for_part_ab (libaom s1+): AB-partition leaves search only the mode that block size won
+    // at that position in the NONE / HORZ / VERT / SPLIT evaluations
+    public bool AomPartAbReuse;
+    // rd_try_subblock: a partition candidate stops once its sub-blocks' J reaches the best candidate's; each luma
+    // search starts from the remaining budget
+    public bool AomPartAbort;
+    // less_rectangular_check_level 1 (needs AomPartAbort) and prune_ext_partition_types_search_level 1 (AB shapes)
+    public bool AomLessRectCheck, AomPruneAb;
+    // the libaom luma search also for 64-wide / 64-tall leaves (64-point transforms: pixel-domain distortion)
+    public bool AomLuma64;
+    // dev: lambda from libaom's rdmult(qindex) times this factor (0 = RdLambdaK * acDq^2)
+    public double LambdaLibaom;
     // search_tx_type early exits: adaptive_txb_search_level (0 off, 1 s0, 2 s1+) and skip_tx_search (s1+)
     public int AomAdaptiveTxb;
     public bool AomSkipTxSearch;
@@ -235,6 +249,20 @@ internal sealed class Av1EncodeSpeed
         p.TxSplit444422 = speed <= 2; p.RectTxDepthAlt = 3;
         if (speed >= 1) { p.UseColorTxDepth = false; p.EarlyTermBits = 16; p.RdoqInSearch = false; p.RdUvCandidates = 6; }
         if (speed >= 1) { p.RdModeCandidates = 8; p.UsePartition64 = false; p.FilterIntraPrune = true; }
+        // 0-3: libaom's allintra luma search (LumaSearch.cs; its speed features per speed): modes x tx sizes x tx types
+        // jointly with the single-pass trellis, the intra edge filter, AB-partition prunes, rd_try_subblock budgets.
+        if (speed <= 3)
+        {
+            p.LibaomLuma = true; p.UseColorTxDepth = true; p.UseIntraEdgeFilter = true; p.TxSplit444422 = false;
+            p.AomTrellis = true; p.AomTrellisFirst = true; p.AomTxDomainDist = true; p.AomLuma64 = true;
+            p.AomPartAbort = true; p.AomPruneAb = true; p.AomLessRectCheck = true;
+            p.AomTopIntraModelCount = speed == 0 ? 4 : 3;              // top_intra_model_count_allowed
+            p.AomTxInitDepthRect = speed == 0 ? 0 : 1;                 // intra_tx_size_search_init_depth_rect
+            p.AomTrellisMseThr = speed switch { 0 => 3200, 1 => 1728, _ => 864 };   // coeff_opt_thresholds
+            p.AomDisableSmoothHV = speed >= 2;                         // disable_smooth_intra
+            p.AomAdaptiveTxb = speed == 0 ? 1 : 2;                      // adaptive_txb_search_level
+            p.AomPartAbReuse = speed >= 1;                             // reuse_best_prediction_for_part_ab
+        }
         // 2 keeps the T-shape and 4-way partitions (s2 +0.27% x0.53 -> -0.17% x0.85).
         if (speed >= 2) { p.RdModeCandidates = 4; p.EarlyTermBits = 32; }
         if (speed >= 3) { p.UseExtPartition = false; p.EarlyTermBits = 64; p.FastScreenDetection = true; }
@@ -343,6 +371,26 @@ internal static partial class Av1StillImageEncoder
             t_bd = bd;
         }
         public void Dispose() => t_bd = prev;
+    }
+
+    // LambdaLibaom (dev): the RD lambda follows libaom's key-frame rdmult for this qindex (av1_compute_rd_mult:
+    // dcq^2 * (3.3 + 0.0015 dcq), >> 2(bd-8) beyond 8 bits; RDCOST -> pixel-SSE lambda = rdmult / 2048, with the SSE in
+    // coded-bit-depth units) times the factor, as RdLambdaK * acDq^2. Restored on dispose.
+    private readonly struct LambdaScope : IDisposable
+    {
+        private readonly double prev;
+        private readonly bool set;
+        public LambdaScope(int qIdx)
+        {
+            prev = RdLambdaK; set = false;
+            double f = Sp.LambdaLibaom;
+            if (f <= 0) return;
+            double dc = Av1Tables.DequantTable[BdIdx, qIdx, 0], ac = Av1Tables.DequantTable[BdIdx, qIdx, 1];
+            double rdmult = dc * dc * (3.3 + 0.0015 * dc) / (1 << (2 * (Bd - 8)));
+            double lam = rdmult / 2048 * (1 << (2 * (Bd - 8)));
+            RdLambdaK = f * lam / (ac * ac); set = true;
+        }
+        public void Dispose() { if (set) RdLambdaK = prev; }
     }
 
     // Layout-dependent preset adjustments for one colour encode: 4:4:4 / 4:2:2 turn on the rect-leaf tx split
@@ -966,6 +1014,7 @@ internal static partial class Av1StillImageEncoder
             throw new ArgumentOutOfRangeException(nameof(layout));
         using var bdScope = new BitDepthScope(bitDepth);
         using var spScope = new LayoutSpeedScope(layout);
+        using var lamScope = new LambdaScope(baseQIdx);
         long phaseT = System.Diagnostics.Stopwatch.GetTimestamp();
         void Phase(string name)
         {
@@ -1460,6 +1509,19 @@ internal static partial class Av1StillImageEncoder
         public bool ScreenContent;     // allow_screen_content_tools: palette flags coded, palette searched
         public ushort[] Pred = new ushort[64 * 64];
         public ushort[] EstScratch = new ushort[64 * 64];
+        // libaom reuse_best_prediction_for_part_ab: the last luma winner per (block size, 4x4 position in the 64x64
+        // superblock) with the superblock it belongs to; AB-partition leaves search only that mode while set.
+        public readonly int[] AomModeCache = new int[22 * 256], AomModeCacheSb = new int[22 * 256];
+        public bool UseAomModeCache;
+        // libaom rd_try_subblock (AomPartAbort): the running candidate's budget (the best partition J so far), its
+        // start bits, coded-region SSE and lambda; set when it ran over (the candidate is then discarded).
+        public double PartBudget = double.PositiveInfinity, PartBits0, PartSse, PartLambda;
+        public bool PartAborted;
+        // Per partition level: the J of each sub-block of the SPLIT / HORZ / VERT candidates (MaxValue = not coded),
+        // SPLIT's sub-block count when it aborted and its J then (libaom rect_part_rd / split_rd, AB and rect prunes).
+        public readonly double[] SubJ = new double[6 * 3 * 4];
+        public readonly int[] SplitAbortN = new int[6];
+        public readonly double[] SplitAbortJ = new double[6];
         // EstimateBlockCost is a pure function of the source block (source prediction) and the quantizers, and the
         // partition decision evaluates each block twice (as a parent's SPLIT child, then as its own NONE): cached per
         // SB128 position (1 + 4 + 16 + 64 + 256 slots for levels 0..4), reset when the superblock changes.
@@ -1914,10 +1976,15 @@ internal static partial class Av1StillImageEncoder
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
             int c0 = Av1IntraEdgeTree.GetSplitChild(node, 0), c1 = Av1IntraEdgeTree.GetSplitChild(node, 1);
             int c2 = Av1IntraEdgeTree.GetSplitChild(node, 2), c3 = Av1IntraEdgeTree.GetSplitChild(node, 3);
+            double sb0 = c.Msac.MeasuredBits;
             EncodePartitionColor(c, bl + 1, bx4, by4, c0);
+            if (SubDone(c, bl, 0, 0, bx4, by4, hsz, hsz, ref sb0)) return;
             EncodePartitionColor(c, bl + 1, bx4 + hsz, by4, c1);
+            if (SubDone(c, bl, 0, 1, bx4 + hsz, by4, hsz, hsz, ref sb0)) return;
             EncodePartitionColor(c, bl + 1, bx4, by4 + hsz, c2);
+            if (SubDone(c, bl, 0, 2, bx4, by4 + hsz, hsz, hsz, ref sb0)) return;
             EncodePartitionColor(c, bl + 1, bx4 + hsz, by4 + hsz, c3);
+            SubDone(c, bl, 0, 3, bx4 + hsz, by4 + hsz, hsz, hsz, ref sb0);
             return;
         }
 
@@ -1926,8 +1993,12 @@ internal static partial class Av1StillImageEncoder
             if (bl == 4) { EncodeSub8Pair(c, horz: true, bx4, by4, partCdf, nPart, bx8, by8, node); return; }
             var rp = RectLeafParams(bl);
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Horizontal, nPart);
+            double hb0 = c.Msac.MeasuredBits;
             EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4, blk4, hsz, node.H0);
+            if (SubDone(c, bl, 1, 0, bx4, by4, blk4, hsz, ref hb0)) return;
             EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4 + hsz, blk4, hsz, node.H1);
+            SubDone(c, bl, 1, 1, bx4, by4 + hsz, blk4, hsz, ref hb0);
+            if (c.PartAborted) return;
             FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Horizontal);
             return;
         }
@@ -1937,8 +2008,12 @@ internal static partial class Av1StillImageEncoder
             if (bl == 4) { EncodeSub8Pair(c, horz: false, bx4, by4, partCdf, nPart, bx8, by8, node); return; }
             var rp = RectLeafParams(bl);
             c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Vertical, nPart);
+            double vb0 = c.Msac.MeasuredBits;
             EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4, by4, hsz, blk4, node.V0);
+            if (SubDone(c, bl, 2, 0, bx4, by4, hsz, blk4, ref vb0)) return;
             EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4 + hsz, by4, hsz, blk4, node.V1);
+            SubDone(c, bl, 2, 1, bx4 + hsz, by4, hsz, blk4, ref vb0);
+            if (c.PartAborted) return;
             FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Vertical);
             return;
         }
@@ -1947,12 +2022,15 @@ internal static partial class Av1StillImageEncoder
         // sub-block order + edge availability our decoder uses (Av1Decode TopSplit/BottomSplit/LeftSplit/RightSplit).
         if (choice >= 4)
         {
+            c.UseAomModeCache = Sp.AomPartAbReuse && choice <= 7;
             var rp = RectLeafParams(bl);
             if (choice == 4) // PARTITION_HORZ_A: two top quarters, then bottom half
             {
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.TopSplit, nPart);
                 EncodeLeafBlockColor(c, bl + 1, bx4, by4, hsz, Av1EdgeFlags.AllTrAndBl);
+                if (PartOver(c, bx4, by4, hsz, hsz)) return;
                 EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4, hsz, node.V1);
+                if (PartOver(c, bx4 + hsz, by4, hsz, hsz)) return;
                 EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4 + hsz, blk4, hsz, node.H1);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.TopSplit);
             }
@@ -1960,7 +2038,9 @@ internal static partial class Av1StillImageEncoder
             {
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.BottomSplit, nPart);
                 EncodeRectLeafColor(c, rp.BsH, rp.LumaTxH, rp.ChTxH, bx4, by4, blk4, hsz, node.H0);
+                if (PartOver(c, bx4, by4, blk4, hsz)) return;
                 EncodeLeafBlockColor(c, bl + 1, bx4, by4 + hsz, hsz, node.V0);
+                if (PartOver(c, bx4, by4 + hsz, hsz, hsz)) return;
                 EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4 + hsz, hsz, Av1EdgeFlags.None);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.BottomSplit);
             }
@@ -1968,7 +2048,9 @@ internal static partial class Av1StillImageEncoder
             {
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.LeftSplit, nPart);
                 EncodeLeafBlockColor(c, bl + 1, bx4, by4, hsz, Av1EdgeFlags.AllTrAndBl);
+                if (PartOver(c, bx4, by4, hsz, hsz)) return;
                 EncodeLeafBlockColor(c, bl + 1, bx4, by4 + hsz, hsz, node.H1);
+                if (PartOver(c, bx4, by4 + hsz, hsz, hsz)) return;
                 EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4 + hsz, by4, hsz, blk4, node.V1);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.LeftSplit);
             }
@@ -1976,7 +2058,9 @@ internal static partial class Av1StillImageEncoder
             {
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.RightSplit, nPart);
                 EncodeRectLeafColor(c, rp.BsV, rp.LumaTxV, rp.ChTxV, bx4, by4, hsz, blk4, node.V0);
+                if (PartOver(c, bx4, by4, hsz, blk4)) return;
                 EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4, hsz, node.H0);
+                if (PartOver(c, bx4 + hsz, by4, hsz, hsz)) return;
                 EncodeLeafBlockColor(c, bl + 1, bx4 + hsz, by4 + hsz, hsz, Av1EdgeFlags.None);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.RightSplit);
             }
@@ -1990,16 +2074,23 @@ internal static partial class Av1StillImageEncoder
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)(h4 ? Av1BlockPartition.Horizontal4 : Av1BlockPartition.Vertical4), nPart);
                 if (h4)
                 {
+                    // (checked per strip pair: in 4:2:0 the odd strip codes the pair's chroma)
                     EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4, 4, 1, node.H0, r0);
+                    if (c.PartAborted) return;
                     EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4 + 1, 4, 1, node.H4, r1);
+                    if (PartOver(c, bx4, by4, 4, 2)) return;
                     EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4 + 2, 4, 1, Av1EdgeFlags.AllLeftHasBottom, r0);
+                    if (c.PartAborted) return;
                     EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4 + 3, 4, 1, node.H1, r1);
                 }
                 else
                 {
                     EncodeRectLeafColor(c, bs, tx, ctx, bx4, by4, 1, 4, node.V0, r0);
+                    if (c.PartAborted) return;
                     EncodeRectLeafColor(c, bs, tx, ctx, bx4 + 1, by4, 1, 4, node.V4, r1);
+                    if (PartOver(c, bx4, by4, 2, 4)) return;
                     EncodeRectLeafColor(c, bs, tx, ctx, bx4 + 2, by4, 1, 4, Av1EdgeFlags.AllTopHasRight, r0);
+                    if (c.PartAborted) return;
                     EncodeRectLeafColor(c, bs, tx, ctx, bx4 + 3, by4, 1, 4, node.V1, r1);
                 }
                 FillPartCtx(c, bl, bx8, by8, hsz, h4 ? Av1BlockPartition.Horizontal4 : Av1BlockPartition.Vertical4);
@@ -2011,8 +2102,11 @@ internal static partial class Av1StillImageEncoder
                                               : ((int)Av1BlockSize.Bs32x8, (int)Av1RectTxSize.Rtx32x8, (int)Av1RectTxSize.Rtx16x4);
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Horizontal4, nPart);
                 EncodeRectLeafColor(c, hBs, hTx, hCh, bx4, by4, blk4, q, node.H0);
+                if (PartOver(c, bx4, by4, blk4, q)) return;
                 EncodeRectLeafColor(c, hBs, hTx, hCh, bx4, by4 + q, blk4, q, node.H4);
+                if (PartOver(c, bx4, by4 + q, blk4, q)) return;
                 EncodeRectLeafColor(c, hBs, hTx, hCh, bx4, by4 + 2 * q, blk4, q, Av1EdgeFlags.AllLeftHasBottom);
+                if (PartOver(c, bx4, by4 + 2 * q, blk4, q)) return;
                 EncodeRectLeafColor(c, hBs, hTx, hCh, bx4, by4 + 3 * q, blk4, q, node.H1);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Horizontal4);
             }
@@ -2023,11 +2117,15 @@ internal static partial class Av1StillImageEncoder
                                               : ((int)Av1BlockSize.Bs8x32, (int)Av1RectTxSize.Rtx8x32, (int)Av1RectTxSize.Rtx4x16);
                 c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Vertical4, nPart);
                 EncodeRectLeafColor(c, vBs, vTx, vCh, bx4, by4, q, blk4, node.V0);
+                if (PartOver(c, bx4, by4, q, blk4)) return;
                 EncodeRectLeafColor(c, vBs, vTx, vCh, bx4 + q, by4, q, blk4, node.V4);
+                if (PartOver(c, bx4 + q, by4, q, blk4)) return;
                 EncodeRectLeafColor(c, vBs, vTx, vCh, bx4 + 2 * q, by4, q, blk4, Av1EdgeFlags.AllTopHasRight);
+                if (PartOver(c, bx4 + 2 * q, by4, q, blk4)) return;
                 EncodeRectLeafColor(c, vBs, vTx, vCh, bx4 + 3 * q, by4, q, blk4, node.V1);
                 FillPartCtx(c, bl, bx8, by8, hsz, Av1BlockPartition.Vertical4);
             }
+            c.UseAomModeCache = false;
             return;
         }
 
@@ -2122,6 +2220,74 @@ internal static partial class Av1StillImageEncoder
     }
 
     // SSE of the reconstructed block (luma + chroma) vs the source planes — the distortion term for true-RD.
+    // rd_try_subblock's check after one coded sub-block of the running candidate: adds its region's SSE and aborts
+    // the candidate once SSE + lambda * bits so far reaches the budget.
+    private static bool PartOver(ColorPartCtx c, int x4, int y4, int w4, int h4)
+    {
+        if (c.PartAborted) return true;
+        if (double.IsPositiveInfinity(c.PartBudget)) return false;
+        c.PartSse += RegionSseColor(c, x4, y4, w4, h4);
+        if (c.PartSse + c.PartLambda * (c.Msac.MeasuredBits - c.PartBits0) >= c.PartBudget) { c.PartAborted = true; return true; }
+        return false;
+    }
+
+    // A SPLIT / HORZ / VERT sub-block is coded: record its J (region SSE + lambda * its bits) for the AB prune, then
+    // the budget check. kind 0 SPLIT, 1 HORZ, 2 VERT; bits0 = the measured bits before it (updated).
+    private static bool SubDone(ColorPartCtx c, int bl, int kind, int k, int x4, int y4, int w4, int h4, ref double bits0)
+    {
+        if (c.PartAborted) return true;
+        long sse = RegionSseColor(c, x4, y4, w4, h4);
+        double now = c.Msac.MeasuredBits;
+        c.SubJ[(bl * 3 + kind) * 4 + k] = sse + c.PartLambda * (now - bits0);
+        bits0 = now;
+        if (double.IsPositiveInfinity(c.PartBudget)) return false;
+        c.PartSse += sse;
+        if (c.PartSse + c.PartLambda * (now - c.PartBits0) >= c.PartBudget)
+        {
+            c.PartAborted = true;
+            if (kind == 0) { c.SplitAbortN[bl] = k + 1; c.SplitAbortJ[bl] = c.PartSse + c.PartLambda * (now - c.PartBits0); }
+            return true;
+        }
+        return false;
+    }
+
+    // Remaining budget for the next sub-block's luma search (+inf when none applies).
+    private static double PartRemaining(ColorPartCtx c) => double.IsPositiveInfinity(c.PartBudget) ? double.MaxValue
+        : c.PartBudget - (c.PartSse + c.PartLambda * (c.Msac.MeasuredBits - c.PartBits0));
+
+    private static long RegionSseColor(ColorPartCtx c, int x4, int y4, int w4, int h4)
+    {
+        int lpx = x4 * 4, lpy = y4 * 4;
+        int lw = Math.Min(w4 * 4, c.Bw4 * 4 - lpx), lh = Math.Min(h4 * 4, c.Bh4 * 4 - lpy);
+        long sse = 0;
+        for (int y = 0; y < lh; y++)
+            for (int x = 0; x < lw; x++)
+            { int d = c.ReconY[(lpy + y) * c.W + lpx + x] - c.Luma[(lpy + y) * c.W + lpx + x]; sse += (long)d * d; }
+        if (c.Mono) return sse;
+        int cpx = lpx >> c.SsX, cpy = lpy >> c.SsY;
+        int cnw = Math.Min(Math.Max(lw >> c.SsX, 1), ((c.Bw4 * 4) >> c.SsX) - cpx), cnh = Math.Min(Math.Max(lh >> c.SsY, 1), ((c.Bh4 * 4) >> c.SsY) - cpy);
+        for (int y = 0; y < cnh; y++)
+            for (int x = 0; x < cnw; x++)
+            {
+                int du = c.ReconU[(cpy + y) * c.Cw + cpx + x] - c.U[(cpy + y) * c.Cw + cpx + x];
+                int dv = c.ReconV[(cpy + y) * c.Cw + cpx + x] - c.V[(cpy + y) * c.Cw + cpx + x];
+                sse += (long)du * du + (long)dv * dv;
+            }
+        return sse;
+    }
+
+    // Per-pixel variance of the source luma block (libaom pb_source_variance, 8-bit scale).
+    private static double BlockSrcVar(ColorPartCtx c, int bx4, int by4, int blk4)
+    {
+        int x0 = bx4 * 4, y0 = by4 * 4, n = blk4 * 4;
+        int w = Math.Min(n, c.Bw4 * 4 - x0), h = Math.Min(n, c.Bh4 * 4 - y0);
+        long sum = 0, sq = 0;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) { int v = c.Luma[(y0 + y) * c.W + x0 + x]; sum += v; sq += (long)v * v; }
+        double np = Math.Max(1, w * h);
+        return (sq - sum * (double)sum / np) / np / (1 << (2 * (Bd - 8)));
+    }
+
     private static long BlockSseColor(ColorPartCtx c, int bx4, int by4, int blk4)
     {
         // Only in-frame samples count: a partial block's forced-split children never reconstruct the part past the
@@ -2307,8 +2473,34 @@ internal static partial class Av1StillImageEncoder
         // if NONE wins they are appended once — instead of copying NONE's tail out of the log and back.
         List<Av1MsacWriter.LogOp>? noneLog = null, mainLog = null;
         bool noneBest = false;
+        for (int k = 0; k < 12; k++) c.SubJ[bl * 12 + k] = double.MaxValue;
+        c.SplitAbortN[bl] = 0;
+        double noneJ = double.MaxValue;
+        bool noRect = false;
         for (int i = 0; i < nc; i++)
         {
+            int cand = cands[i];
+            // libaom less_rectangular_check_level 1: SPLIT stopped within its first two sub-blocks while NONE was
+            // better than its partial sum -> no rectangular / AB / 4-way shapes here
+            if (noRect && (cand is 1 or 2 || cand >= 4)) continue;
+            // libaom prune_ext_partition_types_search_level 1 (av1_prune_ab_partitions): AB shapes only when the best so
+            // far is the matching rect, SPLIT, or NONE on a flat block, and when their sub-blocks' known J (14/16) could
+            // still beat it
+            if (Sp.AomPruneAb && cand >= 4 && cand <= 7 && bestI >= 0)
+            {
+                int bp = cands[bestI];
+                bool horz = cand <= 5;
+                bool okType = bp == 3 || bp == (horz ? 1 : 2) || (bp == 0 && BlockSrcVar(c, bx4, by4, blk4) < 32);
+                double J(int kind, int k) { double v = c.SubJ[(bl * 3 + kind) * 4 + k]; return v == double.MaxValue ? 0 : v; }
+                double est = cand switch
+                {
+                    4 => J(1, 1) + J(0, 0) + J(0, 1),   // HORZ_A: bottom half + top quarters
+                    5 => J(1, 0) + J(0, 2) + J(0, 3),   // HORZ_B: top half + bottom quarters
+                    6 => J(2, 1) + J(0, 0) + J(0, 2),   // VERT_A: right half + left quarters
+                    _ => J(2, 0) + J(0, 1) + J(0, 3),   // VERT_B: left half + right quarters
+                };
+                if (!okType || est / 16 * 14 >= bestJ) continue;
+            }
             if (i > 0) RestoreRd(c, snap0!, bx4, by4, blk4);
             double b0 = c.Msac.MeasuredBits;
             if (i == 0 && nc > 1 && cands[0] == 0 && c.Msac.Log != null)
@@ -2318,10 +2510,18 @@ internal static partial class Av1StillImageEncoder
                 noneLog.Clear();
                 c.Msac.Log = noneLog;
             }
+            var svB = (c.PartBudget, c.PartBits0, c.PartSse, c.PartLambda, c.PartAborted);
+            c.PartBudget = Sp.AomPartAbort && bestJ != double.MaxValue ? bestJ : double.PositiveInfinity;
+            c.PartBits0 = b0; c.PartSse = 0; c.PartLambda = lambda; c.PartAborted = false;
             EncodeChoiceColor(c, cands[i], bl, bx4, by4, hsz, blk4, c.Cdf.GetPartitionCdf((Av1BlockLevel)bl, partCtx), nPart, bx8, by8, edgeIdx);
+            bool abortedCand = c.PartAborted;
+            (c.PartBudget, c.PartBits0, c.PartSse, c.PartLambda, c.PartAborted) = svB;
             if (i == 0 && noneLog != null) c.Msac.Log = mainLog;
             double bits = c.Msac.MeasuredBits - b0;
-            double j = BlockSseColor(c, bx4, by4, blk4) + lambda * bits;
+            double j = abortedCand ? double.MaxValue : BlockSseColor(c, bx4, by4, blk4) + lambda * bits;
+            if (cand == 0) noneJ = j;
+            if (cand == 3 && Sp.AomLessRectCheck && abortedCand && c.SplitAbortN[bl] > 0 && c.SplitAbortN[bl] <= 2
+                && noneJ < c.SplitAbortJ[bl]) noRect = true;
             if (i == 0 && pruneRect != 0 && cands[0] == 0)
             {
                 // prune_rect_part_using_none_pred_mode: NONE's luma mode steers the rect shapes (bit 0 HORZ, 1 VERT).
@@ -2611,7 +2811,7 @@ internal static partial class Av1StillImageEncoder
         // Luma: rate-distortion mode + tx-type decision (from reconstruction). Writes prediction into c.Pred.
         // libaom's slow-speed luma search (LumaSearch.cs): joint mode x tx size x tx type; it replaces ChooseLeafRdCore
         // and the tx-depth trials below, and leaves the winner reconstructed in ReconY.
-        bool aomSq = Sp.LibaomLuma && n <= 32 && bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
+        bool aomSq = Sp.LibaomLuma && (n <= 32 || Sp.AomLuma64) && bx4 + blk4 <= c.Bw4 && by4 + blk4 <= c.Bh4;
         LumaPick aomPickSq = default;
         (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx) rd;
         if (aomSq)
@@ -2619,6 +2819,7 @@ internal static partial class Av1StillImageEncoder
             var saveA = c.ALY.AsSpan(bxR, Math.Min(blk4, 32 - bxR)).ToArray();
             var saveL = c.LLY.AsSpan(byR, Math.Min(blk4, 32 - byR)).ToArray();
             aomPickSq = AomLumaSearch(c, bs, tx, bx4, by4, blk4, blk4, edgeFlags, IntraEdgeFlags(c.AModeY[bxR], c.LModeY[byR]), true, filterEligible);
+            if (aomPickSq.Txb == null) { c.PartAborted = true; return; }   // over the partition budget (rd_try_subblock)
             // depth 0 (and a palette winner) read their contexts from ALY / LLY: put the pre-block values back; a kept
             // split re-applies its per-tx contexts below
             saveA.CopyTo(c.ALY.AsSpan(bxR)); saveL.CopyTo(c.LLY.AsSpan(byR));
@@ -3506,11 +3707,12 @@ internal static partial class Av1StillImageEncoder
 
         // libaom's slow-speed luma search (Av1StillImageEncoder.LumaSearch.cs): modes x tx sizes x tx types jointly;
         // it replaces the prescreen / RD / filter-intra / RDOQ / depth steps below.
-        bool aom = Sp.LibaomLuma && w <= 32 && h <= 32 && bx4 + w4 <= c.Bw4 && by4 + h4 <= c.Bh4;
+        bool aom = Sp.LibaomLuma && (w <= 32 && h <= 32 || Sp.AomLuma64) && bx4 + w4 <= c.Bw4 && by4 + h4 <= c.Bh4;
         LumaPick aomPick = default;
         if (aom)
         {
             aomPick = AomLumaSearch(c, lumaBs, lumaTx, bx4, by4, w4, h4, edgeFlags, intraFlags, angleOk, fiOk);
+            if (aomPick.Txb == null) { c.PartAborted = true; return; }   // over the partition budget (rd_try_subblock)
             yMode = aomPick.Mode; yDelta = aomPick.Delta; best = aomPick.J;
             yC = aomPick.Txb![0].Cf; yInv = aomPick.Txb[0].Inv; yTxIdx = aomPick.Txb[0].Idx;
         }
@@ -3781,7 +3983,7 @@ internal static partial class Av1StillImageEncoder
         if (cw > cTDim.W * 4 || ch > cTDim.H * 4)
         {
             RectLeafChromaMultiTx(c, lumaBs, lumaTx, chromaTx, bx4, by4, w4, h4, edgeFlags, ymCdf,
-                yC, yMode, yDelta, yInv, yTxIdx, ySign, cfY);
+                yC, yMode, yDelta, yInv, yTxIdx, ySign, cfY, txb, emitTx, depth);
             return;
         }
 
@@ -4048,7 +4250,8 @@ internal static partial class Av1StillImageEncoder
     // reconstructed by the caller; this picks the UV mode by exact per-tx RD, then emits the whole block.
     private static void RectLeafChromaMultiTx(ColorPartCtx c, int lumaBs, int lumaTx, int chromaTx, int bx4, int by4,
         int w4, int h4, Av1EdgeFlags edgeFlags, Span<ushort> ymCdf, int[] yC, Av1IntraPredMode yMode, int yDelta,
-        Av1TxType yInv, int yTxIdx, int ySign, byte cfY)
+        Av1TxType yInv, int yTxIdx, int ySign, byte cfY,
+        List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? txb = null, int emitTx = -1, int depth = 0)
     {
         int ssX = c.SsX, ssY = c.SsY;
         ref readonly var ct = ref Av1Tables.TxfmDimensions[chromaTx];
@@ -4153,7 +4356,8 @@ internal static partial class Av1StillImageEncoder
         bool anyC = false;
         foreach (var l in bestU) anyC |= HasNonZero(l.Lv);
         foreach (var l in bestV) anyC |= HasNonZero(l.Lv);
-        int skip = (HasNonZero(yC) || anyC) ? 0 : 1;
+        bool lumaNz = txb == null ? HasNonZero(yC) : !txb.TrueForAll(t => !HasNonZero(t.Cf));
+        int skip = (lumaNz || anyC) ? 0 : 1;
 
         int uvNsym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
         int skipCtx = c.ASkip[bxR] + c.LSkip[byR];
@@ -4172,12 +4376,13 @@ internal static partial class Av1StillImageEncoder
         if (UseColorTxDepth && lTDim.Max > (byte)Av1TxSize.Tx4x4)
         {
             int txCtx = (c.LTxY[byR] >= lTDim.Lh ? 1 : 0) + (c.ATxY[bxR] >= lTDim.Lw ? 1 : 0);
-            c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(lTDim.Max - 1, txCtx), 0, Math.Min((int)lTDim.Max, 2));
+            c.Msac.EncodeSymbolAdapt(c.Cdf.GetTxSzCdf(lTDim.Max - 1, txCtx), depth, Math.Min((int)lTDim.Max, 2));
         }
 
         if (skip == 0)
         {
-            if (yInv == Av1TxType.VDct || yInv == Av1TxType.HDct)
+            if (txb != null) EmitSplitLuma(c, emitTx, (int)yMode, txb);
+            else if (yInv == Av1TxType.VDct || yInv == Av1TxType.HDct)
                 Av1CoeffEncode.EncodeCoefs1D(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, (int)yMode, yInv, yC, skipCtx: 0, dcSignCtx: ySign);
             else
                 Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)yMode, yC, skipCtx: 0, dcSignCtx: ySign, txTypeIdx: yTxIdx, fullSet: UseFullIntraTxSet);
@@ -4202,9 +4407,10 @@ internal static partial class Av1StillImageEncoder
 
         int yW = Math.Min(w4, c.Bw4 - bx4), yH = Math.Min(h4, c.Bh4 - by4);
         int cW = Math.Min(Math.Max(1, w4 >> ssX), (c.Bw4 - bx4 + ssX) >> ssX), cH = Math.Min(Math.Max(1, h4 >> ssY), (c.Bh4 - by4 + ssY) >> ssY);
-        sbyte txLw = (sbyte)lTDim.Lw, txLh = (sbyte)lTDim.Lh;
-        for (int i = 0; i < yW && bxR + i < 32; i++) { c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
-        for (int j = 0; j < yH && byR + j < 32; j++) { c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
+        ref readonly var eTDim = ref Av1Tables.TxfmDimensions[txb == null ? lumaTx : emitTx];
+        sbyte txLw = (sbyte)eTDim.Lw, txLh = (sbyte)eTDim.Lh;
+        for (int i = 0; i < yW && bxR + i < 32; i++) { if (txb == null) c.ALY[bxR + i] = cfY; c.AModeY[bxR + i] = (byte)yMode; c.ASkip[bxR + i] = (byte)skip; c.ATxY[bxR + i] = txLw; }
+        for (int j = 0; j < yH && byR + j < 32; j++) { if (txb == null) c.LLY[byR + j] = cfY; c.LModeY[byR + j] = (byte)yMode; c.LSkip[byR + j] = (byte)skip; c.LTxY[byR + j] = txLh; }
         for (int i = 0; i < cW && cxR + i < 32; i++) { if (skip != 0) { c.ACU[cxR + i] = 0x40; c.ACV[cxR + i] = 0x40; } c.AModeUv[cxR + i] = (byte)uvMode; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { if (skip != 0) { c.LCU[cyR + j] = 0x40; c.LCV[cyR + j] = 0x40; } c.LModeUv[cyR + j] = (byte)uvMode; }
         FillPaletteCtx(c, bx4, by4, yW, yH, null, null);

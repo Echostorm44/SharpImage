@@ -2113,6 +2113,9 @@ public sealed class Av1HbdVerify
                     Av1EncodeSpeed.TestOverride = null;
                     foreach (var (sf, old) in statics) sf.SetValue(null, old);
                     File.WriteAllBytes(t[2], outB);
+                    if (Av1StillImageEncoder.CalOn)
+                        for (int k = 0; k < 19; k++)
+                            if (Av1StillImageEncoder.CalN[k] > 0) log.AppendLine($"  cal tx {k} n {Av1StillImageEncoder.CalN[k]} pix/coef {Av1StillImageEncoder.CalPix[k] / Av1StillImageEncoder.CalCoef[k]:F5}");
                     if (Environment.GetEnvironmentVariable("AOM_STATS") == "1")
                     {
                         log.AppendLine($"  aomstats search {Av1StillImageEncoder.StatSearch} modes {Av1StillImageEncoder.StatModes} trials {Av1StillImageEncoder.StatTrials} txb {Av1StillImageEncoder.StatTxb} rdoq {Av1StillImageEncoder.StatRdoq}");

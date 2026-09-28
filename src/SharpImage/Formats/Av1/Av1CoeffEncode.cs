@@ -658,99 +658,51 @@ internal static class Av1CoeffEncode
         int dcDq, int acDq, int skipCtx, int dcSignCtx, double lambda, double txTypeBits = 0)
     {
         ushort[] scan = Av1Tables.Scans[tx];
+        ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
+        int cdfIdx = tDim.Ctx * 13 + skipCtx;
         int eob = -1;   // index of the last nonzero coefficient
         for (int i = scan.Length - 1; i >= 0; i--) if (signedLevels[scan[i]] != 0) { eob = i; break; }
-        var tDim0 = Av1Tables.TxfmDimensions[tx];
-        if (eob < 0) return BoolBits(coef.CoefSkip[tDim0.Ctx * 13 + skipCtx][0], 1);
+        double skipBits = BoolBits(coef.CoefSkip[cdfIdx][0], 1);
+        if (eob < 0) return skipBits;
+        double nonSkip = BoolBits(coef.CoefSkip[cdfIdx][0], 0);
 
-        Av1TxfmInfo tDim = Av1Tables.TxfmDimensions[tx];
-        int cdfIdx = tDim.Ctx * 13 + skipCtx;
-        int slw = Math.Min((int)tDim.Lw, (int)Av1TxSize.Tx32x32), slh = Math.Min((int)tDim.Lh, (int)Av1TxSize.Tx32x32);
-        int tx2dSzCtx = slw + slh;
-        int shift = slh + 2, stride = 4 << slh, mask = (4 << slh) - 1, loIdx = LoCtxOffsetsIdx(tx);
-        int eobBaseTokIdx = tDim.Ctx * 2 * 4 + chroma * 4, baseTokIdx = tDim.Ctx * 2 * 41 + chroma * 41;
-        int brTokIdx = Math.Min((int)tDim.Ctx, 3) * 2 * 21 + chroma * 21;
-        var levels = t_trLevels ??= new byte[32 * 34];
+        var tc = new TrCtx
+        {
+            Coef = coef, Chroma = chroma, Levels = t_trLevels ??= new byte[32 * 34],
+            Tx2dSzCtx = Math.Min((int)tDim.Lw, (int)Av1TxSize.Tx32x32) + Math.Min((int)tDim.Lh, (int)Av1TxSize.Tx32x32),
+            TxCtx = tDim.Ctx,
+        };
+        int slh = Math.Min((int)tDim.Lh, (int)Av1TxSize.Tx32x32);
+        tc.Shift = slh + 2; tc.Stride = 4 << slh; tc.Mask = (4 << slh) - 1; tc.LoIdx = LoCtxOffsetsIdx(tx);
+        tc.EobBaseTokIdx = tDim.Ctx * 2 * 4 + chroma * 4; tc.BaseTokIdx = tDim.Ctx * 2 * 41 + chroma * 41;
+        tc.BrTokIdx = Math.Min((int)tDim.Ctx, 3) * 2 * 21 + chroma * 21;
+        ushort dcF0 = coef.DcSign[chroma * 3 + dcSignCtx][0];
+        tc.DcSign0 = BoolBits(dcF0, 0); tc.DcSign1 = BoolBits(dcF0, 1);
+        var levels = tc.Levels;
         var nz = t_trNz ??= new int[3];
+        double dq0 = dcDq, dqA = acDq;
         // The level map is filled as positions become final (back to front), as EstimateCoefBits does: a context read
         // that wraps past the tx height (unpadded stride) lands on an earlier scan position and must see zero.
-        int eob0 = eob;   // every level-map write is at scan index <= eob0 (cleared at the end)
-
-        double Dist(int rc, int mag) { double e = (Math.Abs(qf[rc]) - mag) * (rc == 0 ? dcDq : acDq); return e * e; }
-        double EobBits(int last)
-        {
-            int eobPt = last <= 1 ? last : (31 - BitOperations.LeadingZeroCount((uint)last) - 1) + 2;
-            ReadOnlySpan<ushort> eobCdf = tx2dSzCtx switch
-            {
-                0 => coef.EobBin16[chroma * 2], 1 => coef.EobBin32[chroma * 2], 2 => coef.EobBin64[chroma * 2],
-                3 => coef.EobBin128[chroma * 2], 4 => coef.EobBin256[chroma * 2], 5 => coef.EobBin512[chroma],
-                _ => coef.EobBin1024[chroma],
-            };
-            double b = SymBits(eobCdf, eobPt);
-            if (last > 1)
-            {
-                int eobBin = eobPt - 2, hi = (last >> eobBin) & 1;
-                b += BoolBits(coef.EobHiBit[tDim.Ctx * 2 * 9 + chroma * 9 + eobBin][0], (uint)hi);
-                if (eobBin > 0) b += eobBin;
-            }
-            return b;
-        }
-        int EobCtx(int si) => si == 0 ? 0 : 1 + (si > (2 << tx2dSzCtx) ? 1 : 0) + (si > (4 << tx2dSzCtx) ? 1 : 0);
-        double SignGolomb(int rc, int mag, int sign) =>
-            mag == 0 ? 0 : (rc == 0 ? BoolBits(coef.DcSign[chroma * 3 + dcSignCtx][0], (uint)sign) : 1) + (mag >= 15 ? GolombBits((uint)(mag - 15)) : 0);
-        // cost of level mag at scan index si as the LAST coefficient (eob token + br with the eob br context)
-        double CostLast(int si, int rc, int mag, int sign)
-        {
-            double b = SymBits(coef.EobBaseTok[eobBaseTokIdx + EobCtx(si)], Math.Min(mag, 3) - 1);
-            if (mag > 2)
-            {
-                int x = rc >> shift, y = rc & mask;
-                b += HiTokBits(coef.BrTok[brTokIdx + (rc == 0 ? 0 : ((x | y) > 1) ? 14 : 7)], mag);
-            }
-            return b + SignGolomb(rc, mag, sign);
-        }
-        // cost of level mag at a non-last position (base token from the neighbour levels + br)
-        double CostMid(int rc, int mag, int sign)
-        {
-            int x = rc >> shift, y = rc & mask;
-            int loCtx = rc == 0 ? 0 : Av1CoeffDecode.GetLoCtx(levels.AsSpan(rc), Av1TxClass.TwoD, out uint hiMag, loIdx, x, y, stride);
-            double b = SymBits(coef.BaseTok[baseTokIdx + loCtx], Math.Min(mag, 3));
-            if (mag > 2)
-            {
-                uint mg;
-                int hiCtx;
-                if (rc == 0) { mg = (uint)(levels[1] + levels[stride] + levels[stride + 1]) & 63; hiCtx = (int)(mg > 12 ? 6u : (mg + 1) >> 1); }
-                else
-                {
-                    Av1CoeffDecode.GetLoCtx(levels.AsSpan(rc), Av1TxClass.TwoD, out uint hm, loIdx, x, y, stride);
-                    hm &= 63;
-                    hiCtx = (int)(((y | x) > 1 ? 14u : 7u) + (hm > 12 ? 6u : (hm + 1) >> 1));
-                }
-                b += HiTokBits(coef.BrTok[brTokIdx + hiCtx], mag);
-            }
-            return b + SignGolomb(rc, mag, sign);
-        }
-        void SetLevel(int rc, int mag)
-        {
-            int s = signedLevels[rc] < 0 ? -1 : 1;
-            signedLevels[rc] = s * mag;
-        }
-        void Final(int rc) => levels[rc] = LevelByte(Math.Abs(signedLevels[rc]));
+        int eob0 = eob;
 
         // --- the last coefficient ---
-        double accuRate = EobBits(eob), accuDist = 0;
+        double accuRate = TrEobBits(ref tc, eob), accuDist = 0;
         int si = eob, nzNum = 1;
         {
-            int rc = scan[si], mag = Math.Abs(signedLevels[rc]), sign = signedLevels[rc] < 0 ? 1 : 0;
+            int rc = scan[si], L = signedLevels[rc], mag = Math.Abs(L), sign = L < 0 ? 1 : 0;
+            double dq = rc == 0 ? dq0 : dqA, aq = Math.Abs(qf[rc]);
+            double d0 = aq * dq * (aq * dq);
+            double e = (aq - mag) * dq, d = e * e - d0;
             if (mag >= 2)
             {
-                double r = CostLast(si, rc, mag, sign), d = Dist(rc, mag) - Dist(rc, 0);
-                double rl = CostLast(si, rc, mag - 1, sign), dl = Dist(rc, mag - 1) - Dist(rc, 0);
-                if (dl + lambda * rl < d + lambda * r) { SetLevel(rc, mag - 1); accuRate += rl; accuDist += dl; }
+                double r = TrCostLast(ref tc, si, rc, mag, sign);
+                double el = (aq - mag + 1) * dq, dl = el * el - d0;
+                double rl = TrCostLast(ref tc, si, rc, mag - 1, sign);
+                if (dl + lambda * rl < d + lambda * r) { signedLevels[rc] = L < 0 ? -(mag - 1) : mag - 1; mag--; accuRate += rl; accuDist += dl; }
                 else { accuRate += r; accuDist += d; }
             }
-            else { accuRate += CostLast(si, rc, mag, sign); accuDist += Dist(rc, mag) - Dist(rc, 0); }
-            Final(rc);
+            else { accuRate += TrCostLast(ref tc, si, rc, mag, sign); accuDist += d; }
+            levels[rc] = LevelByte(mag);
             nz[0] = rc;
             si--;
         }
@@ -758,22 +710,26 @@ internal static class Av1CoeffEncode
         // --- update_coeff_eob: a new end of block here, while at most two nonzeros are kept ---
         for (; si >= 0 && nzNum <= 2; si--)
         {
-            int rc = scan[si], mag = Math.Abs(signedLevels[rc]), sign = signedLevels[rc] < 0 ? 1 : 0;
-            if (mag == 0) { accuRate += CostMid(rc, 0, 0); continue; }
-            double dist0 = Dist(rc, 0);
-            double d = Dist(rc, mag) - dist0, r = CostMid(rc, mag, sign);
+            int rc = scan[si], L = signedLevels[rc], mag = Math.Abs(L);
+            TrMidCtx(ref tc, rc, out var baseCdf, out var brCdf);
+            if (mag == 0) { accuRate += SymBits(baseCdf, 0); continue; }
+            int sign = L < 0 ? 1 : 0;
+            double dq = rc == 0 ? dq0 : dqA, aq = Math.Abs(qf[rc]);
+            double d0 = aq * dq * (aq * dq);
+            double e = (aq - mag) * dq, d = e * e - d0;
+            double r = TrCostAt(ref tc, baseCdf, brCdf, rc, mag, sign);
             double rd = accuDist + d + lambda * (accuRate + r);
             double dLow, rLow;
-            if (mag == 1) { dLow = 0; rLow = CostMid(rc, 0, 0); }
-            else { dLow = Dist(rc, mag - 1) - dist0; rLow = CostMid(rc, mag - 1, sign); }
+            if (mag == 1) { dLow = 0; rLow = SymBits(baseCdf, 0); }
+            else { double el = (aq - mag + 1) * dq; dLow = el * el - d0; rLow = TrCostAt(ref tc, baseCdf, brCdf, rc, mag - 1, sign); }
             double rdLow = accuDist + dLow + lambda * (accuRate + rLow);
             // this coefficient as the new last one
-            double newEobCost = EobBits(si);
-            double rEob = newEobCost + CostLast(si, rc, mag, sign), dEob = d;
+            double newEobCost = TrEobBits(ref tc, si);
+            double rEob = newEobCost + TrCostLast(ref tc, si, rc, mag, sign), dEob = d;
             bool lowerNewEob = false;
             if (mag > 1)
             {
-                double rEobLow = newEobCost + CostLast(si, rc, mag - 1, sign);
+                double rEobLow = newEobCost + TrCostLast(ref tc, si, rc, mag - 1, sign);
                 if (dLow + lambda * rEobLow < dEob + lambda * rEob) { lowerNewEob = true; rEob = rEobLow; dEob = dLow; }
             }
             bool lower = false;
@@ -784,16 +740,15 @@ internal static class Av1CoeffEncode
                 eob = si; nzNum = 0; accuRate = rEob; accuDist = dEob; lower = lowerNewEob;
             }
             else { accuRate += r; accuDist += d; }
-            if (lower) SetLevel(rc, mag - 1);
-            Final(rc);
-            if (signedLevels[rc] != 0) nz[nzNum++] = rc;
+            if (lower) { mag--; signedLevels[rc] = L < 0 ? -mag : mag; }
+            levels[rc] = LevelByte(mag);
+            if (mag != 0) nz[nzNum++] = rc;
         }
 
         // --- update_skip: all-zero vs what is kept (only when the pass above reached the DC) ---
-        double nonSkip = BoolBits(coef.CoefSkip[cdfIdx][0], 0), skipBits = BoolBits(coef.CoefSkip[cdfIdx][0], 1);
         if (si == -1 && nzNum <= 2 && lambda * skipBits < accuDist + lambda * (accuRate + nonSkip))
         {
-            for (int k = 0; k < nzNum; k++) { signedLevels[nz[k]] = 0; levels[nz[k]] = 0; }
+            for (int k = 0; k < nzNum; k++) signedLevels[nz[k]] = 0;
             for (int i = 0; i <= eob0; i++) levels[scan[i]] = 0;
             return skipBits;
         }
@@ -801,32 +756,111 @@ internal static class Av1CoeffEncode
         // --- update_coeff_simple: one level down for the rounded-up AC coefficients, their context final ---
         for (; si >= 1; si--)
         {
-            int rc = scan[si], mag = Math.Abs(signedLevels[rc]);
-            if (mag == 0) { accuRate += CostMid(rc, 0, 0); continue; }
-            int sign = signedLevels[rc] < 0 ? 1 : 0;
-            double r = CostMid(rc, mag, sign);
+            int rc = scan[si], L = signedLevels[rc], mag = Math.Abs(L);
+            TrMidCtx(ref tc, rc, out var baseCdf, out var brCdf);
+            if (mag == 0) { accuRate += SymBits(baseCdf, 0); continue; }
+            int sign = L < 0 ? 1 : 0;
+            double r = TrCostAt(ref tc, baseCdf, brCdf, rc, mag, sign);
+            double aq = Math.Abs(qf[rc]);
             // rounded down: lowering only adds distortion
-            if (mag < Math.Abs(qf[rc])) { accuRate += r; Final(rc); continue; }
-            double rl = CostMid(rc, mag - 1, sign);
-            if (Dist(rc, mag - 1) + lambda * rl < Dist(rc, mag) + lambda * r) { SetLevel(rc, mag - 1); accuRate += rl; }
+            if (mag < aq) { accuRate += r; levels[rc] = LevelByte(mag); continue; }
+            double rl = TrCostAt(ref tc, baseCdf, brCdf, rc, mag - 1, sign);
+            double e = (aq - mag) * dqA, el = (aq - mag + 1) * dqA;
+            if (el * el + lambda * rl < e * e + lambda * r) { mag--; signedLevels[rc] = L < 0 ? -mag : mag; accuRate += rl; }
             else accuRate += r;
-            Final(rc);
+            levels[rc] = LevelByte(mag);
         }
         // --- the DC (update_coeff_general, not last) ---
         if (si == 0 && eob > 0)
         {
-            int mag = Math.Abs(signedLevels[0]);
-            if (mag == 0) accuRate += CostMid(0, 0, 0);
+            int L = signedLevels[0], mag = Math.Abs(L);
+            TrMidCtx(ref tc, 0, out var baseCdf, out var brCdf);
+            if (mag == 0) accuRate += SymBits(baseCdf, 0);
             else
             {
-                int sign = signedLevels[0] < 0 ? 1 : 0;
-                double r = CostMid(0, mag, sign), rl = CostMid(0, mag - 1, sign);
-                if (Dist(0, mag - 1) + lambda * rl < Dist(0, mag) + lambda * r) { SetLevel(0, mag - 1); accuRate += rl; }
+                int sign = L < 0 ? 1 : 0;
+                double aq = Math.Abs(qf[0]);
+                double r = TrCostAt(ref tc, baseCdf, brCdf, 0, mag, sign), rl = TrCostAt(ref tc, baseCdf, brCdf, 0, mag - 1, sign);
+                double e = (aq - mag) * dq0, el = (aq - mag + 1) * dq0;
+                if (el * el + lambda * rl < e * e + lambda * r) { signedLevels[0] = L < 0 ? -(mag - 1) : mag - 1; accuRate += rl; }
                 else accuRate += r;
             }
         }
         for (int i = 0; i <= eob0; i++) levels[scan[i]] = 0;   // keep the shared scratch all-zero
         return accuRate + nonSkip + txTypeBits;
+    }
+
+    // TrellisOptimize's per-block constants.
+    private struct TrCtx
+    {
+        public Av1CdfCoefContext Coef;
+        public byte[] Levels;
+        public int Chroma, Tx2dSzCtx, TxCtx, Shift, Stride, Mask, LoIdx, EobBaseTokIdx, BaseTokIdx, BrTokIdx;
+        public double DcSign0, DcSign1;
+    }
+
+    // EOB position cost (EstimateCoefBits' eob terms) with `last` the index of the last nonzero coefficient.
+    private static double TrEobBits(ref TrCtx t, int last)
+    {
+        int eobPt = last <= 1 ? last : (31 - BitOperations.LeadingZeroCount((uint)last) - 1) + 2;
+        int ch = t.Chroma;
+        ushort[] eobCdf = t.Tx2dSzCtx switch
+        {
+            0 => t.Coef.EobBin16[ch * 2], 1 => t.Coef.EobBin32[ch * 2], 2 => t.Coef.EobBin64[ch * 2],
+            3 => t.Coef.EobBin128[ch * 2], 4 => t.Coef.EobBin256[ch * 2], 5 => t.Coef.EobBin512[ch],
+            _ => t.Coef.EobBin1024[ch],
+        };
+        double b = SymBits(eobCdf, eobPt);
+        if (last > 1)
+        {
+            int eobBin = eobPt - 2, hi = (last >> eobBin) & 1;
+            b += BoolBits(t.Coef.EobHiBit[t.TxCtx * 2 * 9 + ch * 9 + eobBin][0], (uint)hi);
+            if (eobBin > 0) b += eobBin;
+        }
+        return b;
+    }
+
+    private static double TrSignGolomb(ref TrCtx t, int rc, int mag, int sign) =>
+        (rc == 0 ? (sign != 0 ? t.DcSign1 : t.DcSign0) : 1) + (mag >= 15 ? GolombBits((uint)(mag - 15)) : 0);
+
+    // Cost of level mag at scan index si as the LAST coefficient (eob token + br with the eob br context).
+    private static double TrCostLast(ref TrCtx t, int si, int rc, int mag, int sign)
+    {
+        int ctx = si == 0 ? 0 : 1 + (si > (2 << t.Tx2dSzCtx) ? 1 : 0) + (si > (4 << t.Tx2dSzCtx) ? 1 : 0);
+        double b = SymBits(t.Coef.EobBaseTok[t.EobBaseTokIdx + ctx], Math.Min(mag, 3) - 1);
+        if (mag > 2)
+        {
+            int x = rc >> t.Shift, y = rc & t.Mask;
+            b += HiTokBits(t.Coef.BrTok[t.BrTokIdx + (rc == 0 ? 0 : ((x | y) > 1) ? 14 : 7)], mag);
+        }
+        return b + TrSignGolomb(ref t, rc, mag, sign);
+    }
+
+    // The base-token and br CDFs of a non-last position from its (final) later neighbours' levels.
+    private static void TrMidCtx(ref TrCtx t, int rc, out ushort[] baseCdf, out ushort[] brCdf)
+    {
+        var levels = t.Levels;
+        if (rc == 0)
+        {
+            uint mg = (uint)(levels[1] + levels[t.Stride] + levels[t.Stride + 1]) & 63;
+            baseCdf = t.Coef.BaseTok[t.BaseTokIdx];
+            brCdf = t.Coef.BrTok[t.BrTokIdx + (int)(mg > 12 ? 6u : (mg + 1) >> 1)];
+            return;
+        }
+        int x = rc >> t.Shift, y = rc & t.Mask;
+        int loCtx = Av1CoeffDecode.GetLoCtx(levels.AsSpan(rc), Av1TxClass.TwoD, out uint hm, t.LoIdx, x, y, t.Stride);
+        hm &= 63;
+        baseCdf = t.Coef.BaseTok[t.BaseTokIdx + loCtx];
+        brCdf = t.Coef.BrTok[t.BrTokIdx + (int)(((y | x) > 1 ? 14u : 7u) + (hm > 12 ? 6u : (hm + 1) >> 1))];
+    }
+
+    // Cost of level mag (>= 1) at a non-last position with its contexts' CDFs.
+    private static double TrCostAt(ref TrCtx t, ushort[] baseCdf, ushort[] brCdf, int rc, int mag, int sign)
+    {
+        if (mag == 0) return SymBits(baseCdf, 0);
+        double b = SymBits(baseCdf, Math.Min(mag, 3));
+        if (mag > 2) b += HiTokBits(brCdf, mag);
+        return b + TrSignGolomb(ref t, rc, mag, sign);
     }
 
     /// <summary>The intra luma tx-type symbol's cost (EstimateCoefBits' term for it).</summary>

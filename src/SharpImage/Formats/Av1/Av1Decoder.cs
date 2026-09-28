@@ -1177,7 +1177,7 @@ internal sealed class Av1Decoder
         AvDbg.W($"[CDEF-ENTRY] CdefBits={fh.CdefBits} LfMasksNull={ctx.LfMasks == null} Damping={fh.CdefDamping} y0={fh.CdefYStrength0}");
         // dav1d runs CDEF whenever the sequence enables it; blocks whose luma and chroma strengths are both 0 are
         // skipped inside (a frame with only a chroma strength still filters chroma).
-        if ((fh.CdefNBits > 0 || fh.CdefYStrength0 != 0 || fh.GetCdefUvStrength(0) != 0)
+        if (System.Environment.GetEnvironmentVariable("AV1_NOCDEF") != "1" && (fh.CdefNBits > 0 || fh.CdefYStrength0 != 0 || fh.GetCdefUvStrength(0) != 0)
             && System.Environment.GetEnvironmentVariable("AV1_NOCDEF") != "1")
         {
             ApplyCdef(ssHor, ssVer, hasChroma);
