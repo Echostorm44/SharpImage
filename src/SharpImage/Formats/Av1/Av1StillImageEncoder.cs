@@ -207,6 +207,9 @@ internal sealed class Av1EncodeSpeed
     /// <summary>Luma palette sizes are searched largest first; stop at the first size that does not improve on the
     /// previous (libaom prune_palette_search_level).</summary>
     public bool PaletteEarlyStop;
+    /// <summary>2 = libaom prune_palette_search_level 2 luma palette size order (ascending until no gain, then
+    /// descending), with its header-rd gating.</summary>
+    public int PaletteSearchLevel;
     /// <summary>libaom prune_filter_intra_level 1: only FILTER_DC and the filter mode matching the best regular mode so
     /// far (V, H, D157, Paeth) are tried.</summary>
     public bool FilterIntraPrune;
@@ -331,6 +334,10 @@ internal sealed class Av1EncodeSpeed
         // 5: no 4:2:0 loop restoration (libaom allintra 5+), libaom's 4x4-variance and NONE-mode 8x8 prunes, CDEF fast
         // level 3: scoreboard -1.64% x1.49 -> -1.26% x0.93.
         if (speed >= 5) { p.LrSkip420 = true; p.RectPruneVarDev = true; p.RectPruneNoneMode = true; p.CdefSearchLevel = 3; }
+        // 5: no 4:2:2 loop restoration either (libaom allintra 5+ disables Wiener and self-guided: 422 x1.07 -> x0.81,
+        // -1.54 -> -1.44%) and libaom's level-2 luma palette size order (at 3 it lost 0.16% on 4:4:4; here mono
+        // x1.05 -> x1.01 on the screen content for 0.06%)
+        if (speed >= 5) { p.LrSkip422 = true; p.PaletteSearchLevel = 2; }
         // 6 keeps the trial-encode partition search (libaom's speed 6 is RD with pruning): corpus BD vs libaom
         // cpu-used 6 -0.3% (the estimate-driven partitions it used before: +9.3%), fox 1204x800 0.62 s all threads.
         // 6: no rectangular partitions above 8x8 and no filter intra (libaom prune_filter_intra_level 2).

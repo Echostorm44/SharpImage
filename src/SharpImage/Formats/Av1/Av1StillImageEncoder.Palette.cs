@@ -230,13 +230,13 @@ internal static partial class Av1StillImageEncoder
         double bound = double.MaxValue)
     {
         int bx = bx4 * 4, by = by4 * 4, bxR = bx4 & 31, byR = by4 & 31;
-        Span<ushort> vals = stackalloc ushort[64]; Span<int> cnts = stackalloc int[64];
+        var vals = new ushort[64]; var cnts = new int[64];   // arrays: captured by Eval below
         int nv = CountColors(c.Luma, c.W, bx, by, w, h, 64, vals, cnts);
         if (nv < 2) return null;
         int bw4 = w >> 2, bh4 = h >> 2;
         int szCtx = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
         int palCtx = (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0);
-        Span<ushort> lCol = stackalloc ushort[8], aCol = stackalloc ushort[8];
+        var lCol = new ushort[8]; var aCol = new ushort[8];
         var (lSz, aSz) = PaletteNeighbours(c, bx4, by4, lCol, aCol, uv: false);
         double lambda = LamK * c.AcDq * c.AcDq;
         int scanLen = Av1Tables.Scans[lumaTx].Length;
@@ -250,12 +250,15 @@ internal static partial class Av1StillImageEncoder
         var qf = new double[scanLen];
         var res = new int[w * h];
         double prevJ = double.MaxValue;
-        for (int k = Math.Min(nv, 8); k >= 2; k--)
+        // Evaluates the k-colour palette; returns 1 when it beat the best so far (bound included), 0 when not, -1 when
+        // its side information alone already lost (libaom's header-rd gating)
+        int Eval(int k)
         {
+            double before = Math.Min(bound, best?.J ?? double.MaxValue);
             int size;
             if (nv <= 8 && k == nv) { for (int i = 0; i < nv; i++) colors[i] = vals[i]; size = nv; }
             else size = KMeans1D(vals, cnts, nv, k, maxVal, colors);
-            if (size < 2) continue;
+            if (size < 2) return 0;
             var cand = new LumaPal { Size = size, Map = new byte[w * h], Pred = new ushort[w * h] };
             Array.Copy(colors, cand.Colors, size);
             PaletteMap(c.Luma, c.W, bx, by, w, h, cand.Colors, size, cand.Map, cand.Pred);
@@ -263,7 +266,7 @@ internal static partial class Av1StillImageEncoder
                 + Av1CoeffEncode.LumaPaletteColorBits(cand.Colors, size, lCol, lSz, aCol, aSz, Bd)
                 + EstimatePaletteIndexBits(c.Cdf.Mode, cand.Map, size, w, h, bw4, bh4);
             double limit = Math.Min(bound, best?.J ?? double.MaxValue);
-            if (lambda * palBits >= limit) continue;   // the side information alone already loses (exact)
+            if (lambda * palBits >= limit) return -1;   // the side information alone already loses (exact)
             for (int y = 0; y < h; y++)
                 for (int x = 0; x < w; x++) res[y * w + x] = c.Luma[(by + y) * c.W + bx + x] - cand.Pred[y * w + x];
             double bestJ = double.MaxValue;
@@ -282,13 +285,35 @@ internal static partial class Av1StillImageEncoder
                 double j = sse + lambda * (rate + palBits);
                 if (j < bestJ) { bestJ = j; cand.Coeffs = cf; cand.Inv = inv; cand.Idx = idx; }
             }
-            if (cand.Coeffs == null) continue;
+            if (cand.Coeffs == null) return 0;
             cand.J = bestJ;
             if (best == null || cand.J < best.J) best = cand;
-            // libaom prune_palette_search_level: sizes descend; stop once a smaller palette no longer improves
-            if (Sp.PaletteEarlyStop && bestJ > prevJ) break;
-            prevJ = bestJ;
+            return bestJ < before ? 1 : 0;
         }
+        int maxN = Math.Min(nv, 8);
+        if (Sp.PaletteSearchLevel >= 2)
+        {
+            // libaom prune_palette_search_level 2 (+ header-rd gating, prune_luma_palette_size_search_level): sizes
+            // ascending until one fails to beat the block's best so far, then descending from the largest down to it
+            int last = 2;
+            for (int k = 2; k <= maxN; k++)
+            {
+                last = k;
+                int r = Eval(k);
+                if (r < 0) { last = maxN; break; }
+                if (r == 0) break;
+            }
+            for (int k = maxN; k > last; k--) if (Eval(k) <= 0) break;
+        }
+        else
+            for (int k = maxN; k >= 2; k--)
+            {
+                int r = Eval(k);
+                // libaom prune_palette_search_level: sizes descend; stop once a smaller palette no longer improves
+                double j = best?.J ?? double.MaxValue;
+                if (Sp.PaletteEarlyStop && r >= 0 && j > prevJ) break;
+                prevJ = j;
+            }
         if (best != null && Sp.UseRdoq && !(Sp.LibaomLuma && Sp.AomTrellis))
         {
             // RDOQ the winner (as the regular leaf does after its choice)
