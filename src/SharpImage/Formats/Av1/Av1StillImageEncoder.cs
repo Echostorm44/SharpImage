@@ -1213,10 +1213,10 @@ internal static partial class Av1StillImageEncoder
         }
         Phase("cdef");
         byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: mono, tile, best, lfLevel, screenContent: sct);
-        if (lrOn && logs != null && TryLoopRestoration(seqCfg, seqObu, frameObu, logs, sbCols, sbRows, width, height, layout, monochrome: mono,
-                srcY, srcU, srcV, cwIn, chIn, baseQIdx, best, lfLevel, pic, cdefIdx, sct) is { } withLr)
-            return withLr;
-        return (seqObu, frameObu);
+        var lrRes = lrOn && logs != null ? TryLoopRestoration(seqCfg, seqObu, frameObu, logs, sbCols, sbRows, width, height, layout, monochrome: mono,
+            srcY, srcU, srcV, cwIn, chIn, baseQIdx, best, lfLevel, pic, cdefIdx, sct) : null;
+        Phase("lr");
+        return lrRes ?? (seqObu, frameObu);
     }
 
     /// <summary>A decoded (grain-free) frame: its SSE vs the source and, when kept, the native-depth planes.</summary>
@@ -1877,7 +1877,15 @@ internal static partial class Av1StillImageEncoder
 
         // Progress waits: a short spin, then the shared monitor (Publish pulses it) — never Thread.Sleep(1), whose
         // timer-tick granularity would stall the wavefront.
+        long waitTicks = 0;   // dev (PhaseHook "rowwait"): total time workers waited on the row above
         void WaitFor(TileMt st, int row, int count)
+        {
+            if (System.Threading.Volatile.Read(ref st.Progress[row]) >= count) return;
+            long w0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            try { WaitFor2(st, row, count); }
+            finally { System.Threading.Interlocked.Add(ref waitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - w0); }
+        }
+        void WaitFor2(TileMt st, int row, int count)
         {
             for (int i = 0; i < 64; i++)
             {
@@ -1976,8 +1984,11 @@ internal static partial class Av1StillImageEncoder
         if (Sp.RowMt)
         {
             int workers = Math.Max(1, Math.Min(ThreadCount, work.Count));
+            long tRows = System.Diagnostics.Stopwatch.GetTimestamp();
             if (workers == 1) Worker(0);
             else System.Threading.Tasks.Parallel.For(0, workers, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = workers }, Worker);
+            PhaseHook?.Invoke("rows", System.Diagnostics.Stopwatch.GetElapsedTime(tRows).TotalMilliseconds);
+            PhaseHook?.Invoke("rowwait", waitTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
             if (tiles.Length > 1 && ThreadCount > 1)
                 System.Threading.Tasks.Parallel.For(0, tiles.Length, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = ThreadCount }, FinishTile);
             else

@@ -2454,6 +2454,8 @@ public sealed class Av1HbdVerify
                             "444" => AvifChromaSubsampling.Yuv444, "422" => AvifChromaSubsampling.Yuv422,
                             "400" => AvifChromaSubsampling.Yuv400, _ => AvifChromaSubsampling.Yuv420,
                         },
+                        // PROBE_THREADS=n: this many encoder threads (default all)
+                        MaxThreads = int.TryParse(Environment.GetEnvironmentVariable("PROBE_THREADS"), out int pth) ? pth : 0,
                     };
                     // Field=Value: an Av1EncodeSpeed field, else an internal static of the encoder / forward transform
                     // (RdLambdaK, DeadzoneBias, ...), restored after this encode.
@@ -2612,12 +2614,18 @@ public sealed class Av1HbdVerify
                             }
                         } : null;
                         byte[] outBytes = [];
+                        // PROBE_PHASES=1: the encoder's phase wall times of the last repetition
+                        var tph = new System.Text.StringBuilder();
                         for (int r = 0; r <= reps; r++)
                         {
+                            if (r == reps && Environment.GetEnvironmentVariable("PROBE_PHASES") == "1")
+                                SharpImage.Formats.Av1.Av1StillImageEncoder.PhaseHook = (nm, ms) => { lock (tph) tph.Append($" {nm} {ms:F1}"); };
                             var sw = System.Diagnostics.Stopwatch.StartNew();
                             outBytes = HeifCoder.EncodeAvif(img, eo);
                             if (r > 0) best = Math.Min(best, sw.Elapsed.TotalSeconds);
                         }
+                        SharpImage.Formats.Av1.Av1StillImageEncoder.PhaseHook = null;
+                        if (tph.Length > 0) log.AppendLine("  phases" + tph);
                         File.WriteAllBytes(t[2], outBytes);
                         using var back = HeifCoder.Decode(outBytes);
                         double sse = 0; long cnt = 0;
