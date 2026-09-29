@@ -1787,12 +1787,45 @@ public static class Av1IntraPred
         if (!upsampleAbove)
         {
             ReadOnlySpan<ushort> top = edge.Slice(edgeCenter);
+            Span<int> xsRow = stackalloc int[height];
             for (int y = 0, xpos = (1 << 6) - dx; y < height; y++, xpos -= dx)
             {
                 var row = dst.Slice(y * dstStride, width);
                 int baseX = xpos >> 6;
-                int xs = Math.Clamp(-baseX, 0, width);   // pixels x >= xs read the top edge (baseX + x >= 0)
-                for (int x = 0, ypos = (y << (6 + (upsampleLeft ? 1 : 0))) - dy; x < xs; x++, ypos -= dy)
+                int xs = xsRow[y] = Math.Clamp(-baseX, 0, width);   // pixels x >= xs read the top edge (baseX + x >= 0)
+                if (xs < width) InterpRun(row.Slice(xs), top, baseX + xs, xpos & 0x3E, width - xs, bitDepth);
+            }
+            if (!upsampleLeft)
+            {
+                // The left-edge pixels by column: down a column the left position steps one sample per row at a fixed
+                // fraction, a run over the left edge read upwards (revL[k] = edge[edgeCenter - k], k = baseY + 1).
+                Span<ushort> revL = stackalloc ushort[height + 1];
+                for (int k = 0; k <= height; k++) revL[k] = edge[edgeCenter - k];
+                Span<ushort> col = stackalloc ushort[height];
+                for (int x = 0, ys = 0; x < width; x++)
+                {
+                    while (ys < height && xsRow[ys] <= x) ys++;   // rows ys.. read the left edge at this column
+                    if (ys >= height) break;
+                    int ypos = (ys << 6) - (x + 1) * dy, n = height - ys;
+                    if ((ypos >> 6) + 1 < 0 || (ypos >> 6) + 1 + n > height)
+                    {
+                        // past the left edge's ends (only off the AV1 angle grid): the per-pixel form
+                        for (int j = 0; j < n; j++, ypos += 64)
+                        {
+                            int baseY = ypos >> 6, fracY = ypos & 0x3E;
+                            dst[(ys + j) * dstStride + x] = (ushort)((edge[edgeCenter - 1 - baseY] * (64 - fracY) + edge[edgeCenter - 2 - baseY] * fracY + 32) >> 6);
+                        }
+                        continue;
+                    }
+                    InterpRun(col, revL, (ypos >> 6) + 1, ypos & 0x3E, n, bitDepth);
+                    for (int j = 0; j < n; j++) dst[(ys + j) * dstStride + x] = col[j];
+                }
+                return;
+            }
+            for (int y = 0; y < height; y++)
+            {
+                var row = dst.Slice(y * dstStride, width);
+                for (int x = 0, ypos = (y << 7) - dy; x < xsRow[y]; x++, ypos -= dy)
                 {
                     int baseY = ypos >> 6;
                     int fracY = ypos & 0x3E;
@@ -1800,7 +1833,6 @@ public static class Av1IntraPred
                             edge[edgeCenter - leftStep - baseY - 1] * fracY;
                     row[x] = (ushort)((v + 32) >> 6);
                 }
-                if (xs < width) InterpRun(row.Slice(xs), top, baseX + xs, xpos & 0x3E, width - xs, bitDepth);
             }
             return;
         }
@@ -1927,28 +1959,34 @@ public static class Av1IntraPred
         ReadOnlySpan<ushort> input, int inputOffset,
         int from, int to, int strength)
     {
-        ReadOnlySpan<byte> kernel0 = stackalloc byte[] { 0, 4, 8, 4, 0 };
-        ReadOnlySpan<byte> kernel1 = stackalloc byte[] { 0, 5, 6, 5, 0 };
-        ReadOnlySpan<byte> kernel2 = stackalloc byte[] { 2, 4, 4, 4, 2 };
-        var kernel = strength switch
+        // taps {k0, k1, k2, k1, k0}: {0,4,8,4,0}, {0,5,6,5,0}, {2,4,4,4,2}
+        int k0 = strength >= 3 ? 2 : 0, k1 = strength == 1 ? 4 : strength == 2 ? 5 : 4, k2 = strength == 1 ? 8 : strength == 2 ? 6 : 4;
+        // the input clamped to [from, to) once: pad[k] = input[clamp(k - 2)] (+16 slack for the vector tail)
+        Span<ushort> pad = stackalloc ushort[sz + 4 + 16];
+        ushort lo = input[inputOffset + from], hi = input[inputOffset + to - 1];
+        for (int k = 0; k < sz + 4 + 16; k++)
         {
-            1 => kernel0,
-            2 => kernel1,
-            _ => kernel2
-        };
-
-        int i = 0;
-        for (; i < Math.Min(sz, limFrom); i++)
-            output[i] = input[inputOffset + Math.Clamp(i, from, to - 1)];
-        for (; i < Math.Min(limTo, sz); i++)
-        {
-            int s = 0;
-            for (int j = 0; j < 5; j++)
-                s += input[inputOffset + Math.Clamp(i - 2 + j, from, to - 1)] * kernel[j];
-            output[i] = (ushort)((s + 8) >> 4);
+            int p = k - 2;
+            pad[k] = p < from ? lo : p >= to ? hi : input[inputOffset + p];
         }
-        for (; i < sz; i++)
-            output[i] = input[inputOffset + Math.Clamp(i, from, to - 1)];
+        int i = 0, end = Math.Min(limTo, sz);
+        for (; i < Math.Min(sz, limFrom); i++) output[i] = pad[i + 2];
+        // 16 * 4095 + 8 < 65536: ushort lanes are exact up to 12 bits
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var v0 = Vector256.Create((ushort)k0); var v1 = Vector256.Create((ushort)k1); var v2 = Vector256.Create((ushort)k2);
+            var r8 = Vector256.Create((ushort)8);
+            for (; i + 16 <= end; i += 16)
+            {
+                var s = (Vector256.Create(pad.Slice(i, 16)) + Vector256.Create(pad.Slice(i + 4, 16))) * v0
+                      + (Vector256.Create(pad.Slice(i + 1, 16)) + Vector256.Create(pad.Slice(i + 3, 16))) * v1
+                      + Vector256.Create(pad.Slice(i + 2, 16)) * v2 + r8;
+                Vector256.ShiftRightLogical(s, 4).CopyTo(output.Slice(i, 16));
+            }
+        }
+        for (; i < end; i++)
+            output[i] = (ushort)(((pad[i] + pad[i + 4]) * k0 + (pad[i + 1] + pad[i + 3]) * k1 + pad[i + 2] * k2 + 8) >> 4);
+        for (; i < sz; i++) output[i] = pad[i + 2];
     }
 
     private static void UpsampleEdge16(

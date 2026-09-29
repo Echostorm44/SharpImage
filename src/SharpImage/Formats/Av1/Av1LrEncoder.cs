@@ -299,9 +299,13 @@ internal static class Av1LrEncoder
         public readonly ushort[][] F0 = Empty16(), F1 = Empty16();
         private static ushort[][] Empty16() { var a = new ushort[16][]; Array.Fill(a, Array.Empty<ushort>()); return a; }
         public double[] Pad = [], VBuf = [], HBuf = [];
+        public int[] P = [], Sv = [];
+        public readonly int[][] T0 = EmptyI16(), T1 = EmptyI16();
+        private static int[][] EmptyI16() { var a = new int[16][]; Array.Fill(a, Array.Empty<int>()); return a; }
         public static T[] Get<T>(ref T[] a, int n) { if (a.Length < n) a = new T[n]; return a; }
     }
     [ThreadStatic] private static Scratch? t_scratch;
+    private static readonly bool SgrSlow = Environment.GetEnvironmentVariable("AV1_LRSLOW") == "1";
 
     private static (long, long, Unit, long, Unit) EvalUnit(ushort[] src, ushort[] rec, int srcStride, int recStride,
         int planeW, int x0, int y0, int uw, int uh, bool chroma, int bitDepth, int sgrSets, int wienerRounds, int statsStep,
@@ -379,8 +383,49 @@ internal static class Av1LrEncoder
             else Av1LoopRestoration.Sgr3x3(f, 0, stride, left, 0, 4, Lpf(stride), 0, uw, uh, s, 128, edges);
             return f;
         }
+        // AVX2: the filters' exact 4-fraction-bit outputs on the padded unit, scored with the decoder's weighting
+        bool fast = Av1LrSgrFast.Supported && !SgrSlow && !skipSgr && sgrSets > 0;
+        int fs = 0; int[] pInt = [], sInt = [];
+        if (fast)
+        {
+            fs = Av1LrSgrFast.Stride(uw);
+            pInt = Scratch.Get(ref sc.P, (uh + 6) * (fs + 8));
+            sInt = Scratch.Get(ref sc.Sv, uh * fs);
+            Av1LrSgrFast.Pad(pInt, baseBuf, stride, left, haveLeft, haveRight ? Math.Min(3, planeW - x0 - uw) : 0, uw, uh);
+            for (int y = 0; y < uh; y++)
+            {
+                int so = (y0 + y) * srcStride + x0, o = y * fs;
+                for (int x = 0; x < uw; x++) sInt[o + x] = src[so + x];
+            }
+        }
+        long TrySetFast(int set)
+        {
+            int s0 = Av1Tables.SgrParams[set, 0], s1 = Av1Tables.SgrParams[set, 1];
+            int[]? t0 = null, t1 = null;
+            if (s0 != 0) Av1LrSgrFast.Flt(pInt, uw, uh, 2, s0, bitDepth, t0 = Scratch.Get(ref sc.T0[set], uh * fs));
+            if (s1 != 0) Av1LrSgrFast.Flt(pInt, uw, uh, 1, s1, bitDepth, t1 = Scratch.Get(ref sc.T1[set], uh * fs));
+            // minimise Σ (e - (a·t0 + b·t1) / 2048)², e = src - u
+            Span<double> m = stackalloc double[5];
+            Av1LrSgrFast.Moments(pInt, sInt, (t0 ?? t1)!, t0 != null ? t1 : null, uw, uh, m);
+            double a = 0, b = 0;
+            if (t0 != null && t1 != null)
+            {
+                double det = m[0] * m[2] - m[1] * m[1];
+                if (Math.Abs(det) < 1e-9) return long.MaxValue;
+                a = 2048 * (m[3] * m[2] - m[4] * m[1]) / det; b = 2048 * (m[4] * m[0] - m[3] * m[1]) / det;
+            }
+            else if (t0 != null) { if (m[0] < 1e-9) return long.MaxValue; a = 2048 * m[3] / m[0]; }
+            else { if (m[0] < 1e-9) return long.MaxValue; b = 2048 * m[3] / m[0]; }
+            int xq0 = t0 != null ? Math.Clamp((int)Math.Round(a), XqdMin0, XqdMax0) : 0;
+            int xq1 = t1 != null ? Math.Clamp(128 - xq0 - (int)Math.Round(b), XqdMin1, XqdMax1) : 95;
+            long e2 = Av1LrSgrFast.Sse(pInt, sInt, t0, xq0, t1, 128 - xq0 - xq1, uw, uh, (1 << bitDepth) - 1);
+            var cu = new Unit { Type = Av1RestorationType.SelfGuided + (byte)set, W0 = (sbyte)xq0, W1 = (sbyte)xq1 };
+            if (e2 < sseS) { sseS = e2; sUnit = cu; }
+            return e2;
+        }
         long TrySet(int set)
         {
+            if (fast) return TrySetFast(set);
             int s0 = Av1Tables.SgrParams[set, 0], s1 = Av1Tables.SgrParams[set, 1];
             ushort[]? f0 = s0 != 0 ? Filtered(true, set, s0) : null, f1 = s1 != 0 ? Filtered(false, set, s1) : null;
             // minimise Σ (src - u - a·(f0-u)/128 - b·(f1-u)/128)²

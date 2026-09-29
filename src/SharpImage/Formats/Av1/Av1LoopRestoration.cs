@@ -48,7 +48,7 @@ public static class Av1LoopRestoration
     };
 
     // SGR x_by_x lookup table (tables.c: dav1d_sgr_x_by_x)
-    private static readonly byte[] SgrXByX = new byte[256]
+    internal static readonly byte[] SgrXByX = new byte[256]
     {
         255, 128,  85,  64,  51,  43,  37,  32,  28,  26,  23,  21,  20,  18,  17,
          16,  15,  14,  13,  13,  12,  12,  11,  11,  10,  10,   9,   9,   9,   9,
