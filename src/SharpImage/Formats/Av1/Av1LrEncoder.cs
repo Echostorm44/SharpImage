@@ -147,7 +147,8 @@ internal static class Av1LrEncoder
     /// <paramref name="src"/> (planes Y, U, V; U/V null when monochrome) minimising SSE + λ·bits. Returns null when no
     /// restoration pays.</summary>
     internal static Plan? Search(ushort[][] src, ushort[][] rec, int[] widths, int[] heights, int[] srcStrides, int[] recStrides,
-        bool monochrome, bool i420, int bitDepth, double lambda, int sgrSets, int wienerRounds, int statsStep, int threads, int[]? unitShifts = null)
+        bool monochrome, bool i420, int bitDepth, double lambda, int sgrSets, int wienerRounds, int statsStep, int threads, int[]? unitShifts = null,
+        LrPrune prune = default)
     {
         int[] shifts = unitShifts ?? [0, 1, 2];
         Av1LoopRestoration.WienerBitDepth = bitDepth;
@@ -161,7 +162,7 @@ internal static class Av1LrEncoder
                 pp = new Plan();
                 pp.SizeLog2[p] = log2;
                 pp.Cost = SearchPlane(pp, p, src[p], rec[p], widths[p], heights[p], srcStrides[p], recStrides[p],
-                    bitDepth, lambda, sgrSets, wienerRounds, statsStep, threads);
+                    bitDepth, lambda, sgrSets, wienerRounds, statsStep, threads, prune);
                 memo[(p, log2)] = pp;
             }
             return pp.Cost;
@@ -188,7 +189,7 @@ internal static class Av1LrEncoder
     // Per plane: evaluates every unit's none / Wiener / self-guided options, then picks the frame type (switchable,
     // Wiener-only, self-guided-only or none) with the least total cost; returns that cost relative to none.
     private static double SearchPlane(Plan plan, int p, ushort[] src, ushort[] rec, int w, int h, int srcStride, int recStride,
-        int bitDepth, double lambda, int sgrSets, int wienerRounds, int statsStep, int threads)
+        int bitDepth, double lambda, int sgrSets, int wienerRounds, int statsStep, int threads, LrPrune prune)
     {
         int log2 = plan.SizeLog2[p], size = 1 << log2;
         int cols = Math.Max(1, (w + (size >> 1)) >> log2), rows = Math.Max(1, (h + (size >> 1)) >> log2);
@@ -199,7 +200,8 @@ internal static class Av1LrEncoder
             int ux = i % cols, uy = i / cols;
             int x0 = ux << log2, y0 = uy << log2;
             int x1 = ux == cols - 1 ? w : x0 + size, y1 = uy == rows - 1 ? h : y0 + size;
-            cand[i] = EvalUnit(src, rec, srcStride, recStride, w, x0, y0, x1 - x0, y1 - y0, p != 0, bitDepth, sgrSets, wienerRounds, statsStep);
+            cand[i] = EvalUnit(src, rec, srcStride, recStride, w, x0, y0, x1 - x0, y1 - y0, p != 0, bitDepth, sgrSets, wienerRounds, statsStep,
+                prune, lambda);
         }
         if (threads > 1)
             System.Threading.Tasks.Parallel.For(0, cand.Length, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads },
@@ -223,7 +225,12 @@ internal static class Av1LrEncoder
                 if (ft != 3 && c.W.Type == Av1RestorationType.Wiener)
                     jW = (c.SseW - c.SseNone) + lambda * WienerBits(r, c.W, p != 0);
                 if (ft != 2 && c.S.Type >= Av1RestorationType.SelfGuided)
+                {
                     jS = (c.SseS - c.SseNone) + lambda * SgrBits(r, c.S);
+                    // dual_sgr_penalty_level: a two-filter set's (ep < 10) RD cost x (1 + 0.01 * level)
+                    if (prune.DualSgrPenalty > 0 && c.S.Type - Av1RestorationType.SelfGuided < 10)
+                        jS += 0.01 * prune.DualSgrPenalty * (c.SseS + lambda * SgrBits(r, c.S));
+                }
                 double j = Math.Min(jNone, Math.Min(jW, jS));
                 cost += j + lambda * flagBits;
                 if (j == jNone) units[i] = new Unit { Type = Av1RestorationType.None };
@@ -265,6 +272,23 @@ internal static class Av1LrEncoder
                  + (Av1Tables.SgrParams[set, 1] != 0 ? SubexpBits(r.W1 + 32, 128, 4, u.W1 + 32) : 0);
     }
 
+    /// <summary>libaom's loop-restoration search prunes (pickrst.c, lpf_sf): SgrEp = enable_sgr_ep_pruning (1: 4 seed
+    /// sets, the winner's neighbours, then 2 of groups 2-3), SgrOnWiener = prune_sgr_based_on_wiener (1: skip
+    /// self-guided when Wiener's cost exceeds 1.01x none's; 2: when Wiener loses to none or was pruned),
+    /// WienerSrcVar = prune_wiener_based_on_src_var (skip Wiener when the source unit's variance sum is below
+    /// (dc_q >> 3)^2 * level / 16), ReduceWiener = reduce_wiener_window_size (5-tap luma), DualSgrPenalty =
+    /// dual_sgr_penalty_level; Qs = the frame's dc_q >> 3.</summary>
+    internal readonly record struct LrPrune(int SgrEp, int SgrOnWiener, int WienerSrcVar, bool ReduceWiener, int DualSgrPenalty, int Qs);
+
+    // enable_sgr_ep_pruning's search: seeds of group 1 (sets 0-9), then per group-1 winner one set of each of groups 2, 3
+    private static readonly int[] SgrEpSeeds = { 0, 3, 6, 9 };
+    private static readonly int[][] SgrEpGrp23 =
+    {
+        new[] { 10, 10, 11, 11, 12, 12, 13, 13, 13, 13, -1, -1, -1, -1 },
+        new[] { 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15 },
+    };
+    private static readonly Unit DefaultRef = new() { V0 = 3, V1 = -7, V2 = 15, H0 = 3, H1 = -7, H2 = 15, W0 = -32, W1 = 31 };
+
     // ---- per-unit evaluation ---------------------------------------------------------------------------------------
 
     // Per-thread scratch (units are evaluated in parallel; per-unit arrays of these sizes would be large-object-heap
@@ -280,7 +304,8 @@ internal static class Av1LrEncoder
     [ThreadStatic] private static Scratch? t_scratch;
 
     private static (long, long, Unit, long, Unit) EvalUnit(ushort[] src, ushort[] rec, int srcStride, int recStride,
-        int planeW, int x0, int y0, int uw, int uh, bool chroma, int bitDepth, int sgrSets, int wienerRounds, int statsStep)
+        int planeW, int x0, int y0, int uw, int uh, bool chroma, int bitDepth, int sgrSets, int wienerRounds, int statsStep,
+        LrPrune prune = default, double lambda = 0)
     {
         if (uw < 4 || uh < 4) return (0, long.MaxValue, default, long.MaxValue, default);   // degenerate unit: none
         // Working copy: the unit plus 3 real columns right (Right edge flag) and 4 left columns (the left[] input).
@@ -312,14 +337,36 @@ internal static class Av1LrEncoder
 
         // --- Wiener: separable symmetric taps by alternating least squares on the float model, quantised to range.
         Unit wUnit = default; long sseW = long.MaxValue;
+        bool skipSgr = false;
+        bool pruneWiener = false;
+        if (prune.WienerSrcVar > 0)
         {
-            var (hTaps, vTaps) = FitWiener(src, srcStride, baseBuf, stride, left, haveLeft, haveRight, x0, y0, uw, uh, chroma,
-                wienerRounds, statsStep);
+            // prune_wiener_based_on_src_var: a flat source unit (or an exact reconstruction) gets no Wiener search
+            long ss = 0, s = 0;
+            for (int y = 0; y < uh; y++)
+            {
+                int so = (y0 + y) * srcStride + x0;
+                for (int x = 0; x < uw; x++) { long v = src[so + x]; ss += v * v; s += v; }
+            }
+            long vsum = ss - s * s / (uw * uh), thresh = ((long)prune.Qs * prune.Qs * prune.WienerSrcVar) >> 4;
+            pruneWiener = vsum < thresh || sseNone == 0;
+            if (pruneWiener && prune.SgrOnWiener == 2) skipSgr = true;
+        }
+        if (!pruneWiener)
+        {
+            var (hTaps, vTaps) = FitWiener(src, srcStride, baseBuf, stride, left, haveLeft, haveRight, x0, y0, uw, uh,
+                chroma || prune.ReduceWiener, wienerRounds, statsStep);
             wUnit = new Unit { Type = Av1RestorationType.Wiener, H0 = (sbyte)hTaps[0], H1 = (sbyte)hTaps[1], H2 = (sbyte)hTaps[2],
                 V0 = (sbyte)vTaps[0], V1 = (sbyte)vTaps[1], V2 = (sbyte)vTaps[2] };
             Array.Copy(baseBuf, work, n);
             ApplyWiener(work, stride, left, uw, uh, wUnit, bitDepth, edges);
             sseW = Sse(work);
+            if (prune.SgrOnWiener > 0)
+            {
+                // prune_sgr_based_on_wiener (the unit's none / Wiener RD costs, bits against the default reference)
+                double costNone = sseNone + lambda, costW = sseW + lambda * (1 + WienerBits(DefaultRef, wUnit, chroma));
+                skipSgr = prune.SgrOnWiener == 1 ? costW > 1.01 * costNone : !(costW < costNone);
+            }
         }
 
         // --- Self-guided: each set's 5x5 / 3x3 outputs at full weight, least-squares projection weights.
@@ -332,7 +379,7 @@ internal static class Av1LrEncoder
             else Av1LoopRestoration.Sgr3x3(f, 0, stride, left, 0, 4, Lpf(stride), 0, uw, uh, s, 128, edges);
             return f;
         }
-        foreach (int set in SgrSetOrder(sgrSets))
+        long TrySet(int set)
         {
             int s0 = Av1Tables.SgrParams[set, 0], s1 = Av1Tables.SgrParams[set, 1];
             ushort[]? f0 = s0 != 0 ? Filtered(true, set, s0) : null, f1 = s1 != 0 ? Filtered(false, set, s1) : null;
@@ -352,11 +399,11 @@ internal static class Av1LrEncoder
             if (f0 != null && f1 != null)
             {
                 double det = s00 * s11 - s01 * s01;
-                if (Math.Abs(det) < 1e-9) continue;
+                if (Math.Abs(det) < 1e-9) return long.MaxValue;
                 a = 128 * (t0 * s11 - t1 * s01) / det; b = 128 * (t1 * s00 - t0 * s01) / det;
             }
-            else if (f0 != null) { if (s00 < 1e-9) continue; a = 128 * t0 / s00; }
-            else { if (s11 < 1e-9) continue; b = 128 * t1 / s11; }
+            else if (f0 != null) { if (s00 < 1e-9) return long.MaxValue; a = 128 * t0 / s00; }
+            else { if (s11 < 1e-9) return long.MaxValue; b = 128 * t1 / s11; }
             int xq0 = f0 != null ? Math.Clamp((int)Math.Round(a), XqdMin0, XqdMax0) : 0;
             int xq1 = f1 != null ? Math.Clamp(128 - xq0 - (int)Math.Round(b), XqdMin1, XqdMax1) : 95;
             var cu = new Unit { Type = Av1RestorationType.SelfGuided + (byte)set, W0 = (sbyte)xq0, W1 = (sbyte)xq1 };
@@ -378,7 +425,24 @@ internal static class Av1LrEncoder
                 }
             }
             if (e2 < sseS) { sseS = e2; sUnit = cu; }
+            return e2;
         }
+        if (skipSgr || sgrSets <= 0) { }
+        else if (prune.SgrEp > 0)
+        {
+            // enable_sgr_ep_pruning (search_selfguided_restoration): best of the 4 seeds, its neighbours in 0-9 (level 1),
+            // then the group 2 / 3 set paired with the best so far
+            int bestEp = -1; long bestErr = long.MaxValue;
+            void Ep(int ep) { long e = TrySet(ep); if (bestEp < 0 || e < bestErr) { bestErr = e; bestEp = ep; } }
+            foreach (int ep in SgrEpSeeds) Ep(ep);
+            if (prune.SgrEp < 2)
+            {
+                int refEp = bestEp;
+                for (int ep = refEp - 1; ep < refEp + 2; ep += 2) if (ep >= 0 && ep <= 9) Ep(ep);
+                for (int g = 0; g < 2; g++) { int ep = SgrEpGrp23[g][bestEp]; if (ep >= 0) Ep(ep); }
+            }
+        }
+        else foreach (int set in SgrSetOrder(sgrSets)) TrySet(set);
         return (sseNone, sseW, wUnit, sseS, sUnit);
     }
 

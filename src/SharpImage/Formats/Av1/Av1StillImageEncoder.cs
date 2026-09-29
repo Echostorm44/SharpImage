@@ -68,6 +68,11 @@ internal sealed class Av1EncodeSpeed
     public bool AomPartAbort;
     // less_rectangular_check_level 1 (needs AomPartAbort) and prune_ext_partition_types_search_level 1 (AB shapes)
     public bool AomLessRectCheck, AomPruneAb;
+    /// <summary>libaom prune_ext_part_using_split_info 1 (prune_4_partition_using_split_info): HORZ_4 / VERT_4 only when
+    /// enough of the SPLIT sub-blocks' own HORZ / VERT searches won (or were not searched).</summary>
+    public bool AomPrune4Split;
+    /// <summary>T-shape / 4-way partitions for 4:4:4 / 4:2:2 only (LayoutSpeedScope) when UseExtPartition is off.</summary>
+    public bool ExtNon420;
     // the libaom luma search also for 64-wide / 64-tall leaves (64-point transforms: pixel-domain distortion)
     public bool AomLuma64;
     // dev: lambda from libaom's rdmult(qindex) times this factor (0 = RdLambdaK * acDq^2)
@@ -225,6 +230,11 @@ internal sealed class Av1EncodeSpeed
     /// <summary>No loop restoration for 4:2:2 either (speed 6: 0.2% for 6% of the time; 4:4:4 keeps it).</summary>
     public bool LrSkip422;
     public int LrSgrSets = 16;
+    /// <summary>libaom's loop-restoration search prunes (Av1LrEncoder.LrPrune): enable_sgr_ep_pruning,
+    /// prune_sgr_based_on_wiener (…Screen with screen content tools), prune_wiener_based_on_src_var,
+    /// reduce_wiener_window_size, dual_sgr_penalty_level.</summary>
+    public int LrSgrEp, LrSgrOnWiener, LrSgrOnWienerScreen, LrWienerSrcVar, LrDualSgrPenalty;
+    public bool LrReduceWiener;
     /// <summary>Luma restoration unit sizes searched, as a mask of lr_unit_shift (bit 0 = 64, 1 = 128, 2 = 256).</summary>
     public int LrUnitShiftMask = 7;
     public int LrWienerRounds = 3;
@@ -298,13 +308,21 @@ internal sealed class Av1EncodeSpeed
         }
         // 2 keeps the T-shape and 4-way partitions (s2 +0.27% x0.53 -> -0.17% x0.85).
         if (speed >= 2) { p.RdModeCandidates = 4; p.EarlyTermBits = 32; }
-        if (speed >= 3) { p.UseExtPartition = false; p.EarlyTermBits = 64; p.FastScreenDetection = true; }
+        if (speed >= 3) { p.EarlyTermBits = 64; p.FastScreenDetection = true; }
+        // 3: T-shape and 4-way partitions as libaom searches them (4-way pruned by the split sub-blocks' rect wins) for
+        // 4:4:4 / 4:2:2 only: 444 +0.23% x0.77 -> -0.07% x0.96; in 4:2:0 they gain 0.4% for 27% more time
+        if (speed >= 3) { p.UseExtPartition = false; p.AomPrune4Split = true; p.ExtNon420 = speed == 3; }
         // 0-5: deblocking levels per plane around libaom's q fit (scoreboard s4 -0.1%).
         if (speed <= 5) { p.DeblockPerPlane = true; p.LfGuessLibaom = true; }
         if (speed >= 4) p.CflSearchRange = 2;
         // 4+: sub-8x8 leaves stay (worth ~4.5% here) with their luma modes prescreened to 4.
         if (speed >= 4) { p.RdModeCandidates = 2; p.Sub8ModeCandidates = 4; p.UseSplit4x4 = false; p.EarlyTermBits = 32; }
         if (speed >= 4) p.LrSgrSets = 8;
+        // libaom allintra loop-restoration search prunes (speed 1: sgr ep pruning + dual-sgr penalty; 2: Wiener skipped
+        // on flat units, self-guided skipped when Wiener did not pay; 3: harsher, 5-tap luma Wiener)
+        if (speed >= 1) { p.LrSgrEp = 1; p.LrDualSgrPenalty = 1; }
+        if (speed >= 2) { p.LrWienerSrcVar = 1; p.LrSgrOnWiener = p.LrSgrOnWienerScreen = 1; }
+        if (speed >= 3) { p.LrWienerSrcVar = 2; p.LrSgrOnWiener = 2; p.LrReduceWiener = true; }
         p.AomS4Non420 = speed == 4;
         p.Aom444Tier = speed is 5 or 6 ? speed : 0;
         // 5-6 keep the full intra tx set (V_DCT / H_DCT: s6 4:4:4 +0.17 -> -0.27%, 4:2:0 -3.14 -> -3.45%, no time cost)
@@ -441,6 +459,11 @@ internal static partial class Av1StillImageEncoder
         {
             prev = t_speed; swapped = false;
             var sp = Sp;
+            if (sp.ExtNon420 && !sp.UseExtPartition && layout is Av1PixelLayout.I444 or Av1PixelLayout.I422)
+            {
+                sp = sp.Clone(); sp.UseExtPartition = true;
+                t_speed = sp; swapped = true;
+            }
             if (sp.TxSplit444422 && layout is Av1PixelLayout.I444 or Av1PixelLayout.I422 && !(sp.UseColorTxDepth && sp.RectTxDepth))
             {
                 var s = sp.Clone(); s.UseColorTxDepth = true; s.RectTxDepth = true;
@@ -1365,7 +1388,9 @@ internal static partial class Av1StillImageEncoder
         ushort[][] src = monochrome ? [srcY] : [srcY, srcU!, srcV!];
         var plan = Av1LrEncoder.Search(src, rec, [width, cw, cw], [height, ch, ch], [width, cw, cw], recStrides,
             monochrome, i420, Bd, lambda, LrSgrSets, LrWienerRounds, LrStatsStep, ThreadCount,
-            Enumerable.Range(0, 3).Where(sh => (LrUnitShiftMask >> sh & 1) != 0).ToArray());
+            Enumerable.Range(0, 3).Where(sh => (LrUnitShiftMask >> sh & 1) != 0).ToArray(),
+            new Av1LrEncoder.LrPrune(Sp.LrSgrEp, sct ? Sp.LrSgrOnWienerScreen : Sp.LrSgrOnWiener, Sp.LrWienerSrcVar, Sp.LrReduceWiener,
+                Sp.LrDualSgrPenalty, Av1Tables.DequantTable[BdIdx, baseQIdx, 0] >> 3));
         if (plan == null) return null;
 
         // Replay each tile with the restoration syntax at its superblocks (fresh restoration CDFs / references per tile).
@@ -1582,6 +1607,9 @@ internal static partial class Av1StillImageEncoder
         public readonly double[] SubJ = new double[6 * 3 * 4];
         public readonly int[] SplitAbortN = new int[6];
         public readonly double[] SplitAbortJ = new double[6];
+        // Per partition level and quadrant: whether that block's own HORZ (bit 0) / VERT (bit 1) search won when it
+        // ran (set = won or not searched; libaom split_part_rect_win), read by the parent's 4-way prune.
+        public readonly byte[] RectWin = new byte[7 * 4];
         // EstimateBlockCost is a pure function of the source block (source prediction) and the quantizers, and the
         // partition decision evaluates each block twice (as a parent's SPLIT child, then as its own NONE): cached per
         // SB128 position (1 + 4 + 16 + 64 + 256 slots for levels 0..4), reset when the superblock changes.
@@ -2547,6 +2575,9 @@ internal static partial class Av1StillImageEncoder
         bool noneBest = false;
         for (int k = 0; k < 12; k++) c.SubJ[bl * 12 + k] = double.MaxValue;
         c.SplitAbortN[bl] = 0;
+        int quad = ((bx4 / blk4) & 1) | (((by4 / blk4) & 1) << 1);
+        c.RectWin[bl * 4 + quad] = 3;
+        for (int k = 0; k < 4; k++) c.RectWin[(bl + 1) * 4 + k] = 3;   // SPLIT sub-blocks not searched count as wins
         double noneJ = double.MaxValue;
         bool noRect = false;
         for (int i = 0; i < nc; i++)
@@ -2558,6 +2589,13 @@ internal static partial class Av1StillImageEncoder
             // libaom prune_ext_partition_types_search_level 1 (av1_prune_ab_partitions): AB shapes only when the best so
             // far is the matching rect, SPLIT, or NONE on a flat block, and when their sub-blocks' known J (14/16) could
             // still beat it
+            if (Sp.AomPrune4Split && cand >= 8)
+            {
+                // prune_4_partition_using_split_info: conservative at high quantizers
+                int bit = cand == 8 ? 1 : 2, wins = 0, thr = Math.Min(3 * (255 - c.QIdx) / 255 + 1, 3);
+                for (int k = 0; k < 4; k++) if ((c.RectWin[(bl + 1) * 4 + k] & bit) != 0) wins++;
+                if (wins < thr) continue;
+            }
             if (Sp.AomPruneAb && cand >= 4 && cand <= 7 && bestI >= 0)
             {
                 int bp = cands[bestI];
@@ -2592,6 +2630,7 @@ internal static partial class Av1StillImageEncoder
             double bits = c.Msac.MeasuredBits - b0;
             double j = abortedCand ? double.MaxValue : BlockSseColor(c, bx4, by4, blk4) + lambda * bits;
             if (cand == 0) noneJ = j;
+            if (cand is 1 or 2 && !(j < bestJ)) c.RectWin[bl * 4 + quad] &= (byte)~cand;   // rect_part_win = false
             if (cand == 3 && Sp.AomLessRectCheck && abortedCand && c.SplitAbortN[bl] > 0 && c.SplitAbortN[bl] <= 2
                 && noneJ < c.SplitAbortJ[bl]) noRect = true;
             if (i == 0 && pruneRect != 0 && cands[0] == 0)
