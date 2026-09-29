@@ -102,7 +102,7 @@ internal static partial class Av1StillImageEncoder
         bool sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0, sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0;
         var list = new List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>((w4 / tw4) * (h4 / th4));
         double jSum = 0;
-        System.Threading.Interlocked.Increment(ref StatTrials);
+        if (StatsOn) System.Threading.Interlocked.Increment(ref StatTrials);
         for (int iy = 0; iy < h4; iy += th4)
             for (int ix = 0; ix < w4; ix += tw4)
             {
@@ -142,7 +142,7 @@ internal static partial class Av1StillImageEncoder
                     Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, lv, q, c.DcDq, c.AcDq, skc, snc, ti, rdoqLambda);
                     return -1;
                 }
-                System.Threading.Interlocked.Increment(ref StatTxb);
+                if (StatsOn) System.Threading.Interlocked.Increment(ref StatTxb);
                 double budget = jLimit - jSum;   // ref_best_rd for this tx block
                 // dev oracle: the other encoder's tx type here, when it is one this tx size searches
                 int oTp = -1;
@@ -194,7 +194,7 @@ internal static partial class Av1StillImageEncoder
                         if (TimingOn) Tick(7, ref tq);
                         preBits = Quantise(cf, qf, idx, cfEob);
                         if (TimingOn) Tick(3, ref tq);
-                        System.Threading.Interlocked.Increment(ref StatRdoq);
+                        if (StatsOn) System.Threading.Interlocked.Increment(ref StatRdoq);
                         pre = true;
                     }
                     if (TimingOn) Tick(7, ref tq);
@@ -218,7 +218,7 @@ internal static partial class Av1StillImageEncoder
                     if (!pre && trellis && !oneD && (cfEob == -2 ? HasNonZero(cf) : cfEob >= 0) && j < bestJ * Sp.RdoqSearchMargin)
                     {
                         double qb = Quantise(cf, qf, idx, cfEob);
-                        System.Threading.Interlocked.Increment(ref StatRdoq);
+                        if (StatsOn) System.Threading.Interlocked.Increment(ref StatRdoq);
                         bits = qb >= 0 ? qb : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, cf, skc, snc, idx, fullSet: UseFullIntraTxSet);
                         j = (txDom ? TxDist(cf, qf) : ReconSseCandRect(cf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv)) + lambda * bits;
                         rdoqd = true;
@@ -393,10 +393,10 @@ internal static partial class Av1StillImageEncoder
         int kEnd = winnerTx ? 1 : nSizes, kStart = 0;
         double bestModeBits = 0;
         // one mode: the tx-size loop (uniform_txfm_yrd per size), J including mode + tx_size bits
-        System.Threading.Interlocked.Increment(ref StatSearch);
+        if (StatsOn) System.Threading.Interlocked.Increment(ref StatSearch);
         void TryMode(Av1IntraPredMode m, int dl, int nf, double modeBits)
         {
-            System.Threading.Interlocked.Increment(ref StatModes);
+            if (StatsOn) System.Threading.Interlocked.Increment(ref StatModes);
             Span<double> rd = stackalloc double[3];
             rd.Fill(double.MaxValue);
             for (int k = kStart; k < kEnd; k++)

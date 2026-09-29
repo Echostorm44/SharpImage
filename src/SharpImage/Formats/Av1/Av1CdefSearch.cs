@@ -1,3 +1,5 @@
+using System.Runtime.Intrinsics;
+
 namespace SharpImage.Formats.Av1;
 
 /// <summary>
@@ -265,6 +267,11 @@ internal static class Av1CdefSearch
             // The padded neighbourhood does not depend on the strength: build it once, filter every code from it.
             Span<short> tmp = stackalloc short[144];
             Av1Cdef.PadBlock(tmp, plane, off, stride, left, 0, 2, plane, topOff, plane, botOff, nw, nh, edges, stride);
+            // a whole block (16 / 32 / 64 pixels): the source once as contiguous rows, each code's SSE in 16-bit lanes
+            bool full = w == nw && h == nh;
+            Span<ushort> srcBlk = stackalloc ushort[64];
+            if (full)
+                for (int y = 0; y < nh; y++) src.AsSpan((py + y) * srcStride + px, nw).CopyTo(srcBlk.Slice(y * nw));
             foreach (int code in codes)
             {
                 int pri = (code >> 2) << bdMin8;
@@ -275,8 +282,21 @@ internal static class Av1CdefSearch
                 if (adjPri == 0 && sec == 0) { acc[code] += sse0; continue; }
                 Av1Cdef.FilterPadded(tmp, scratch, 0, nw, adjPri, sec, pri != 0 ? dir : 0, damping, nw, nh, bitDepth);
                 long sse = 0;
-                for (int y = 0; y < h; y++)
-                    for (int x = 0; x < w; x++) { int d = scratch[y * nw + x] - src[(py + y) * srcStride + px + x]; sse += d * d; }
+                if (full)
+                {
+                    // differences within +-4095 and pair sums of squares within int: pmaddwd, 4 vectors at most
+                    var s = System.Runtime.Intrinsics.Vector256<int>.Zero;
+                    for (int i = 0; i < nw * nh; i += 16)
+                    {
+                        var d = System.Runtime.Intrinsics.Vector256.Create(scratch.Slice(i, 16)).AsInt16()
+                              - System.Runtime.Intrinsics.Vector256.Create(srcBlk.Slice(i, 16)).AsInt16();
+                        s += System.Runtime.Intrinsics.X86.Avx2.MultiplyAddAdjacent(d, d);
+                    }
+                    sse = System.Runtime.Intrinsics.Vector256.Sum(s);
+                }
+                else
+                    for (int y = 0; y < h; y++)
+                        for (int x = 0; x < w; x++) { int d = scratch[y * nw + x] - src[(py + y) * srcStride + px + x]; sse += d * d; }
                 acc[code] += sse;
             }
             return;

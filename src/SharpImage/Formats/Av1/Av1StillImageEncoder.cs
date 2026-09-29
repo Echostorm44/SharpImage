@@ -2842,7 +2842,6 @@ internal static partial class Av1StillImageEncoder
 
     private static int BestCflAlpha(ushort[] plane, int planeW, int cbx, int cby, int cn, int dcPred, short[] ac)
     {
-        int bestAlpha = 0; long bestSse = long.MaxValue;
         int lo = -16, hi = 16;
         if (Sp.CflSearchRange > 0)
         {
@@ -2856,23 +2855,47 @@ internal static partial class Av1StillImageEncoder
             int est = den == 0 ? 0 : (int)Math.Clamp(Math.Round(64.0 * num / den), -16, 16);
             lo = Math.Max(-16, est - Sp.CflSearchRange); hi = Math.Min(16, est + Sp.CflSearchRange);
         }
+        return CflAlphaSearch(plane, planeW, cbx, cby, cn, cn, dcPred, ac, lo, hi);
+    }
+
+    // The alpha in [lo, hi] (first on ties) whose CfL prediction dc + round(ac * alpha / 64) (clamped) has the least
+    // SSE against the plane block; cw x ch = 16 .. 4096 pixels, 8 lanes at a time.
+    private static int CflAlphaSearch(ushort[] plane, int planeW, int cbx, int cby, int cw, int ch, int dcPred, short[] ac, int lo, int hi)
+    {
+        int n = cw * ch;
+        Span<int> src = stackalloc int[n], a = stackalloc int[n];
+        for (int y = 0; y < ch; y++)
+            for (int x = 0; x < cw; x++) { src[y * cw + x] = plane[(cby + y) * planeW + cbx + x]; a[y * cw + x] = ac[y * cw + x]; }
+        var dc = Vector256.Create(dcPred); var max = Vector256.Create(PixMax); var r32 = Vector256.Create(32);
+        int bestAlpha = 0; long bestSse = long.MaxValue;
         for (int alpha = lo; alpha <= hi; alpha++)
         {
+            var va = Vector256.Create(alpha);
             long sse = 0;
-            for (int y = 0; y < cn; y++)
+            for (int i0 = 0; i0 < n; i0 += 512)
             {
-                int row = (cby + y) * planeW + cbx;
-                for (int x = 0; x < cn; x++)
+                // <= 64 squares (each < 2^24) per lane before widening
+                var acc = Vector256<int>.Zero;
+                int i = i0, e = Math.Min(n, i0 + 512);
+                for (; i + 8 <= e; i += 8)
                 {
-                    int diff = ac[y * cn + x] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6;
-                    int e = plane[row + x] - Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax);
-                    sse += (long)e * e;
+                    var diff = Vector256.Create(a.Slice(i, 8)) * va;
+                    var mag = Vector256.ShiftRightArithmetic(Vector256.Abs(diff) + r32, 6);
+                    var pred = Vector256.Min(Vector256.Max(dc + Vector256.ConditionalSelect(Vector256.LessThan(diff, Vector256<int>.Zero), -mag, mag),
+                        Vector256<int>.Zero), max);
+                    var d = Vector256.Create(src.Slice(i, 8)) - pred;
+                    acc += d * d;
+                }
+                sse += SumInt(acc);
+                for (; i < e; i++)
+                {
+                    int diff = a[i] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6;
+                    int d = src[i] - Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax);
+                    sse += (long)d * d;
                 }
             }
-
             if (sse < bestSse) { bestSse = sse; bestAlpha = alpha; }
         }
-
         return bestAlpha;
     }
 
@@ -2906,7 +2929,6 @@ internal static partial class Av1StillImageEncoder
 
     private static int BestCflAlphaRect(ushort[] plane, int planeW, int cbx, int cby, int cw, int ch, int dcPred, short[] ac)
     {
-        int bestAlpha = 0; long bestSse = long.MaxValue;
         int lo = -16, hi = 16;
         if (Sp.CflSearchRange > 0)
         {
@@ -2919,22 +2941,7 @@ internal static partial class Av1StillImageEncoder
             int est = den == 0 ? 0 : (int)Math.Clamp(Math.Round(64.0 * num / den), -16, 16);
             lo = Math.Max(-16, est - Sp.CflSearchRange); hi = Math.Min(16, est + Sp.CflSearchRange);
         }
-        for (int alpha = lo; alpha <= hi; alpha++)
-        {
-            long sse = 0;
-            for (int y = 0; y < ch; y++)
-            {
-                int row = (cby + y) * planeW + cbx;
-                for (int x = 0; x < cw; x++)
-                {
-                    int diff = ac[y * cw + x] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6;
-                    int e = plane[row + x] - Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax);
-                    sse += (long)e * e;
-                }
-            }
-            if (sse < bestSse) { bestSse = sse; bestAlpha = alpha; }
-        }
-        return bestAlpha;
+        return CflAlphaSearch(plane, planeW, cbx, cby, cw, ch, dcPred, ac, lo, hi);
     }
 
     // Op-log marker ids for cdef_idx (read after the skip flag of a 64x64's first non-skip block): negative, so the

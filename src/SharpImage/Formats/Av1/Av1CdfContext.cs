@@ -3,6 +3,8 @@
 
 using System;
 using System.IO;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace SharpImage.Formats.Av1;
 
@@ -183,7 +185,7 @@ public sealed class Av1CdfContext
         CopyModeIntra(src.Mode, Mode);
         Array.Copy(src.Mode.Intrabc, Mode.Intrabc, 2);
         for (int i = 0; i < 25; i++)
-            Array.Copy(src.Kfym[i], Kfym[i], 16);
+            CopyCdf(src.Kfym[i], Kfym[i]);
     }
 
     public void CopyFrom(Av1CdfContext src)
@@ -194,7 +196,7 @@ public sealed class Av1CdfContext
         CopyMvComponent(src.Mv.Comp1, Mv.Comp1);
         Array.Copy(src.Mv.Joint, Mv.Joint, Mv.Joint.Length);
         for (int i = 0; i < 25; i++)
-            Array.Copy(src.Kfym[i], Kfym[i], 16);
+            CopyCdf(src.Kfym[i], Kfym[i]);
     }
 
     /// <summary>
@@ -324,10 +326,20 @@ public sealed class Av1CdfContext
     public Span<ushort> GetFilterCdf(int ctx) => Mode.Filter[ctx];
     public Span<ushort> GetCompInterModeCdf(int ctx) => Mode.CompInterMode[ctx];
 
+    // The encoder snapshots / restores whole contexts per partition trial: a raw block copy per CDF (same shapes on
+    // both sides, checked) instead of Array.Copy's per-call type checks over ~1000 small arrays.
     private static void CopyJagged(ushort[][] src, ushort[][] dst)
     {
-        for (int i = 0; i < src.Length; i++)
-            Array.Copy(src[i], dst[i], src[i].Length);
+        if (dst.Length < src.Length) throw new ArgumentException("CDF shape mismatch");
+        for (int i = 0; i < src.Length; i++) CopyCdf(src[i], dst[i]);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void CopyCdf(ushort[] s, ushort[] d)
+    {
+        if (d.Length < s.Length) throw new ArgumentException("CDF shape mismatch");
+        Unsafe.CopyBlockUnaligned(ref Unsafe.As<ushort, byte>(ref MemoryMarshal.GetArrayDataReference(d)),
+            ref Unsafe.As<ushort, byte>(ref MemoryMarshal.GetArrayDataReference(s)), (uint)s.Length * 2);
     }
 
     private static void CopyCoef(Av1CdfCoefContext src, Av1CdfCoefContext dst)

@@ -537,7 +537,7 @@ internal static class Av1LrEncoder
         int[] hT = { 0, 0, 0 }, vT = { 0, 0, 0 };
         var vBuf = Scratch.Get(ref sc.VBuf, uh * pw);   // vertically filtered, unit rows x padded cols
         var hBuf = Scratch.Get(ref sc.HBuf, ph * uw);   // horizontally filtered, padded rows x unit cols
-        Span<double> f = stackalloc double[3];
+        Span<double> f = stackalloc double[3], aug = stackalloc double[12], sol = stackalloc double[3];
         for (int round = 0; round < rounds; round++)
         {
             for (int axis = 0; axis < 2; axis++)
@@ -582,11 +582,10 @@ internal static class Av1LrEncoder
                         a00 += f0 * f0; a01 += f0 * f1; a02 += f0 * f2; a11 += f1 * f1; a12 += f1 * f2; a22 += f2 * f2;
                         b0 += f0 * target; b1 += f1 * target; b2 += f2 * target;
                     }
-                var ata = new double[m, m]; var atb = new double[m];
-                ata[0, 0] = a00; ata[0, 1] = ata[1, 0] = a01; ata[1, 1] = a11; atb[0] = b0; atb[1] = b1;
-                if (m > 2) { ata[0, 2] = ata[2, 0] = a02; ata[1, 2] = ata[2, 1] = a12; ata[2, 2] = a22; atb[2] = b2; }
-                var sol = Solve(ata, atb, m);
-                if (sol == null) continue;
+                // the normal equations as an m x (m + 1) augmented matrix
+                if (m > 2) { aug[0] = a00; aug[1] = a01; aug[2] = a02; aug[3] = b0; aug[4] = a01; aug[5] = a11; aug[6] = a12; aug[7] = b1; aug[8] = a02; aug[9] = a12; aug[10] = a22; aug[11] = b2; }
+                else { aug[0] = a00; aug[1] = a01; aug[2] = b0; aug[3] = a01; aug[4] = a11; aug[5] = b1; }
+                if (!Solve(aug, m, sol)) continue;
                 var t = axis == 0 ? hT : vT;
                 for (int a = 0; a < m; a++) t[a + off] = Math.Clamp((int)Math.Round(sol[a]), WMin[a + off], WMax[a + off]);
             }
@@ -596,25 +595,24 @@ internal static class Av1LrEncoder
 
     private static double[] Kernel(int[] t) => new double[] { t[0], t[1], t[2], 128 - 2 * (t[0] + t[1] + t[2]), t[2], t[1], t[0] };
 
-    private static double[]? Solve(double[,] a, double[] b, int n)
+    // Gauss-Jordan with partial pivoting on the n x (n + 1) augmented matrix m (row-major, in place); false if singular.
+    private static bool Solve(Span<double> m, int n, Span<double> x)
     {
-        var m = new double[n, n + 1];
-        for (int i = 0; i < n; i++) { for (int j = 0; j < n; j++) m[i, j] = a[i, j]; m[i, n] = b[i]; }
+        int w = n + 1;
         for (int c = 0; c < n; c++)
         {
             int piv = c;
-            for (int r = c + 1; r < n; r++) if (Math.Abs(m[r, c]) > Math.Abs(m[piv, c])) piv = r;
-            if (Math.Abs(m[piv, c]) < 1e-9) return null;
-            for (int j = 0; j <= n; j++) (m[c, j], m[piv, j]) = (m[piv, j], m[c, j]);
+            for (int r = c + 1; r < n; r++) if (Math.Abs(m[r * w + c]) > Math.Abs(m[piv * w + c])) piv = r;
+            if (Math.Abs(m[piv * w + c]) < 1e-9) return false;
+            for (int j = 0; j <= n; j++) (m[c * w + j], m[piv * w + j]) = (m[piv * w + j], m[c * w + j]);
             for (int r = 0; r < n; r++)
             {
                 if (r == c) continue;
-                double f = m[r, c] / m[c, c];
-                for (int j = c; j <= n; j++) m[r, j] -= f * m[c, j];
+                double f = m[r * w + c] / m[c * w + c];
+                for (int j = c; j <= n; j++) m[r * w + j] -= f * m[c * w + j];
             }
         }
-        var x = new double[n];
-        for (int i = 0; i < n; i++) x[i] = m[i, n] / m[i, i];
-        return x;
+        for (int i = 0; i < n; i++) x[i] = m[i * w + n] / m[i * w + i];
+        return true;
     }
 }
