@@ -2439,6 +2439,7 @@ internal static partial class Av1StillImageEncoder
     private static void EncodePartitionColorTrueRd(ColorPartCtx c, int bl, int bx4, int by4, int hsz, int blk4,
         Span<ushort> partCdf, int nPart, int bx8, int by8, int edgeIdx, bool fullyInside)
     {
+        if (StatsOn) System.Threading.Interlocked.Increment(ref StatPart[bl]);
         // Candidates: NONE and SPLIT always; HORZ/VERT at 32x32/16x16 when rect is enabled AND the block is fully
         // inside the frame (the rect leaves assume in-frame dimensions). For partial blocks only NONE vs SPLIT.
         Span<int> cands = stackalloc int[10];

@@ -2354,8 +2354,9 @@ public sealed class Av1HbdVerify
                             if (Av1StillImageEncoder.CalN[k] > 0) log.AppendLine($"  cal tx {k} n {Av1StillImageEncoder.CalN[k]} pix/coef {Av1StillImageEncoder.CalPix[k] / Av1StillImageEncoder.CalCoef[k]:F5}");
                     if (Environment.GetEnvironmentVariable("AOM_STATS") == "1")
                     {
-                        log.AppendLine($"  aomstats search {Av1StillImageEncoder.StatSearch} modes {Av1StillImageEncoder.StatModes} trials {Av1StillImageEncoder.StatTrials} txb {Av1StillImageEncoder.StatTxb} rdoq {Av1StillImageEncoder.StatRdoq}");
+                        log.AppendLine($"  aomstats search {Av1StillImageEncoder.StatSearch} modes {Av1StillImageEncoder.StatModes} trials {Av1StillImageEncoder.StatTrials} txb {Av1StillImageEncoder.StatTxb} typeTrials {Av1StillImageEncoder.StatTypeTrials} rdoq {Av1StillImageEncoder.StatRdoq} palY {Av1StillImageEncoder.StatPal} palCand {Av1StillImageEncoder.StatPalCand} part " + string.Join(" ", Av1StillImageEncoder.StatPart.Select((v, i) => $"bl{i}:{v}")));
                         Av1StillImageEncoder.StatSearch = Av1StillImageEncoder.StatModes = Av1StillImageEncoder.StatTrials = Av1StillImageEncoder.StatTxb = Av1StillImageEncoder.StatRdoq = 0;
+                        Av1StillImageEncoder.StatTypeTrials = Av1StillImageEncoder.StatPal = Av1StillImageEncoder.StatPalCand = 0; Array.Clear(Av1StillImageEncoder.StatPart);
                     }
                     log.AppendLine($"encq {Path.GetFileName(t[2])} {outB.Length} {secs:F3} gc {gcMs:F1}ms alloc {allocMb}MB g{GC.CollectionCount(0) - g0c}/{GC.CollectionCount(1) - g1c}/{GC.CollectionCount(2) - g2c}");
                     continue;

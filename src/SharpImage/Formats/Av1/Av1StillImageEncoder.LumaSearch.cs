@@ -55,7 +55,9 @@ internal static partial class Av1StillImageEncoder
         return Sp.AomTrellisLam * 68 * rdm / 2048 * (1 << (2 * (Bd - 8))) * (t_sbLamMul == 0 ? 1 : t_sbLamMul);   // x->rdmult carries the SB modifier
     }
     // dev counters (AOM_STATS): searches, modes RD-evaluated, uniform-tx trials, tx blocks, RDOQ runs in the type loop
-    internal static long StatSearch, StatModes, StatTrials, StatTxb, StatRdoq;
+    internal static long StatSearch, StatModes, StatTrials, StatTxb, StatRdoq, StatTypeTrials, StatPal, StatPalCand;
+    internal static readonly long[] StatPart = new long[6];
+    internal static readonly bool StatsOn = Environment.GetEnvironmentVariable("AOM_STATS") == "1";
     internal static readonly long[] OracleMiss = new long[19 * 16];
     internal static readonly bool CalOn = Environment.GetEnvironmentVariable("AOM_CAL") == "1";
     internal static readonly double[] CalPix = new double[19], CalCoef = new double[19];
@@ -89,7 +91,7 @@ internal static partial class Av1StillImageEncoder
         var scr = t_scAom ??= new LeafScratch();
         var pred = scr.P1; var res = scr.R; var qf = scr.Q1; var qfBest = scr.Q2;
         bool sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0, sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0;
-        var list = new List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>();
+        var list = new List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>((w4 / tw4) * (h4 / th4));
         double jSum = 0;
         System.Threading.Interlocked.Increment(ref StatTrials);
         for (int iy = 0; iy < h4; iy += th4)
@@ -156,6 +158,7 @@ internal static partial class Av1StillImageEncoder
                     if (Sp.AomSkipTxSearch && bestCf != null && !HasNonZero(bestCf)) break;
                     if (oTp >= 0) { if ((int)inv != oTp) continue; }
                     else if ((mask >> (int)inv & 1) == 0) continue;
+                    if (StatsOn) System.Threading.Interlocked.Increment(ref StatTypeTrials);
                     int[] cf = Av1FwdTransform.ForwardQuantRect(res, tw, th, stx, c.DcDq, c.AcDq, sScan, fwd, qf);
                     bool oneD = inv == Av1TxType.VDct || inv == Av1TxType.HDct;
                     bool pre = false;
@@ -213,7 +216,7 @@ internal static partial class Av1StillImageEncoder
                     {
                         Av1FwdTransform.ReturnLevels(bestCf);
                         bestJ = j; bestBits = bits; bestCf = cf; bestInv = inv; bestIdx = idx; bestRdoq = rdoqd;
-                        if (!rdoqd) Array.Copy(qf, qfBest, sScan);
+                        if (!rdoqd) (qf, qfBest) = (qfBest, qf);   // keep this type's unquantised coefficients (no copy)
                     }
                     else Av1FwdTransform.ReturnLevels(cf);
                 }
@@ -322,7 +325,8 @@ internal static partial class Av1StillImageEncoder
         void TryMode(Av1IntraPredMode m, int dl, int nf, double modeBits)
         {
             System.Threading.Interlocked.Increment(ref StatModes);
-            double[] rd = { double.MaxValue, double.MaxValue, double.MaxValue };
+            Span<double> rd = stackalloc double[3];
+            rd.Fill(double.MaxValue);
             for (int k = kStart; k < kEnd; k++)
             {
                 if (orc && txSelect && sizes[k] != om.Tx) continue;

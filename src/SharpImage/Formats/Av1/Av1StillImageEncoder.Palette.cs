@@ -233,6 +233,7 @@ internal static partial class Av1StillImageEncoder
         var vals = new ushort[64]; var cnts = new int[64];   // arrays: captured by Eval below
         int nv = CountColors(c.Luma, c.W, bx, by, w, h, 64, vals, cnts);
         if (nv < 2) return null;
+        if (StatsOn) System.Threading.Interlocked.Increment(ref StatPal);
         int bw4 = w >> 2, bh4 = h >> 2;
         int szCtx = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
         int palCtx = (c.APalSz[bxR] > 0 ? 1 : 0) + (c.LPalSz[byR] > 0 ? 1 : 0);
@@ -267,6 +268,7 @@ internal static partial class Av1StillImageEncoder
                 + EstimatePaletteIndexBits(c.Cdf.Mode, cand.Map, size, w, h, bw4, bh4);
             double limit = Math.Min(bound, best?.J ?? double.MaxValue);
             if (lambda * palBits >= limit) return -1;   // the side information alone already loses (exact)
+            if (StatsOn) System.Threading.Interlocked.Increment(ref StatPalCand);
             for (int y = 0; y < h; y++)
                 for (int x = 0; x < w; x++) res[y * w + x] = c.Luma[(by + y) * c.W + bx + x] - cand.Pred[y * w + x];
             double bestJ = double.MaxValue;
