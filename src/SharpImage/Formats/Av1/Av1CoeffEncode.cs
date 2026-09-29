@@ -450,7 +450,8 @@ internal static class Av1CoeffEncode
     /// <summary>Estimated bit cost of coding one 2D transform block's coefficients with the given contexts, from
     /// the current CDF probabilities (no side effects). Mirrors EncodeCoefs symbol-for-symbol.</summary>
     internal static double EstimateCoefBits(Av1CdfCoefContext coef, Av1CdfModeContext modeCdf, int tx, int chroma,
-        int yMode, ReadOnlySpan<int> signedLevels, int skipCtx, int dcSignCtx, int txTypeIdx, bool fullSet = false, bool inter = false)
+        int yMode, ReadOnlySpan<int> signedLevels, int skipCtx, int dcSignCtx, int txTypeIdx, bool fullSet = false, bool inter = false,
+        int eobHint = -2)
     {
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
         int cdfIdx = tDim.Ctx * 13 + skipCtx;
@@ -460,8 +461,9 @@ internal static class Av1CoeffEncode
         ushort[] scan = Av1Tables.Scans[tx];
         int shift = slh + 2, stride = 4 << slh, mask = (4 << slh) - 1;
 
-        int eob = -1;
-        for (int i = scan.Length - 1; i >= 0; i--) if (signedLevels[scan[i]] != 0) { eob = i; break; }
+        int eob = eobHint;
+        if (eob == -2) { eob = -1; for (int i = scan.Length - 1; i >= 0; i--) if (signedLevels[scan[i]] != 0) { eob = i; break; } }
+        if (EobCheck && eobHint != -2) { int e2 = -1; for (int i = scan.Length - 1; i >= 0; i--) if (signedLevels[scan[i]] != 0) { e2 = i; break; } if (e2 != eobHint) throw new InvalidOperationException($"EstimateCoefBits eob hint {eobHint} != {e2} (tx {tx})"); }
 
         if (eob < 0) return CSkip(coef, cdfIdx, 1);
         double bits = CSkip(coef, cdfIdx, 0);
@@ -660,6 +662,7 @@ internal static class Av1CoeffEncode
         }
     }
 
+    internal static readonly bool EobCheck = Environment.GetEnvironmentVariable("AV1_EOBCHECK") == "1";
     [ThreadStatic] private static byte[]? t_trLevels;   // TrellisOptimize level map (all zero between calls)
     [ThreadStatic] private static int[]? t_trNz;
 
@@ -673,14 +676,15 @@ internal static class Av1CoeffEncode
     /// Returns the coefficient bits of the result as EstimateCoefBits prices them (txTypeBits is the tx-type symbol's
     /// cost, added when the block is not all-zero): each rate term is taken once every later coefficient is final.
     internal static double TrellisOptimize(Av1CdfCoefContext coef, int tx, int chroma, int[] signedLevels, double[] qf,
-        int dcDq, int acDq, int skipCtx, int dcSignCtx, double lambda, double txTypeBits = 0)
+        int dcDq, int acDq, int skipCtx, int dcSignCtx, double lambda, double txTypeBits = 0, int eobHint = -2)
     {
         long tt = Av1StillImageEncoder.TimingOn ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         ushort[] scan = Av1Tables.Scans[tx];
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
         int cdfIdx = tDim.Ctx * 13 + skipCtx;
-        int eob = -1;   // index of the last nonzero coefficient
-        for (int i = scan.Length - 1; i >= 0; i--) if (signedLevels[scan[i]] != 0) { eob = i; break; }
+        int eob = eobHint;   // index of the last nonzero coefficient (the quantiser's when it hands it over)
+        if (eob == -2) { eob = -1; for (int i = scan.Length - 1; i >= 0; i--) if (signedLevels[scan[i]] != 0) { eob = i; break; } }
+        if (EobCheck && eobHint != -2) { int e2 = -1; for (int i = scan.Length - 1; i >= 0; i--) if (signedLevels[scan[i]] != 0) { e2 = i; break; } if (e2 != eobHint) throw new InvalidOperationException($"TrellisOptimize eob hint {eobHint} != {e2} (tx {tx})"); }
         if (Av1StillImageEncoder.TimingOn) Av1StillImageEncoder.Tick(8, ref tt);
         double skipBits = CSkip(coef, cdfIdx, 1);
         if (eob < 0) return skipBits;

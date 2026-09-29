@@ -61,6 +61,7 @@ internal static partial class Av1StillImageEncoder
     internal static long StatSearch, StatModes, StatTrials, StatTxb, StatRdoq, StatTypeTrials, StatPal, StatPalCand;
     internal static readonly long[] StatPart = new long[6];
     internal static readonly bool StatsOn = Environment.GetEnvironmentVariable("AOM_STATS") == "1";
+    internal static readonly bool NoEobHint = Environment.GetEnvironmentVariable("AV1_NOEOBHINT") == "1";
     // dev (AV1_TIMING=1): luma tx search time per stage: 0 predict, 1 residual, 2 forward+quant, 3 trellis, 4 distortion,
     // 5 rate estimate, 6 reconstruction, 7 other type-loop work
     internal static readonly bool TimingOn = Environment.GetEnvironmentVariable("AV1_TIMING") == "1";
@@ -118,19 +119,19 @@ internal static partial class Av1StillImageEncoder
                 int skc = Av1CoeffDecode.GetSkipCtx(in sTD, lumaBs, c.ALY.AsSpan(txR), c.LLY.AsSpan(tyR), 0, 0);
                 int snc = Av1CoeffDecode.GetDcSignCtx(stx, c.ALY.AsSpan(txR), c.LLY.AsSpan(tyR));
                 int[] bestCf = null!; Av1TxType bestInv = Av1TxType.DctDct; int bestIdx = 1;
-                double bestJ = double.MaxValue, bestBits = 0; bool bestRdoq = false;
+                double bestJ = double.MaxValue, bestBits = 0; bool bestRdoq = false; int bestEob = -2;
                 bool txDom = Sp.AomTxDomainDist && tw <= 32 && th <= 32;   // 64-point: the zeroed half is not in qf
                 // transform-domain distortion: sum ((qf - L) * dq)^2 / 64 tracks the pixel SSE (calibrated per tx size)
                 double TxDist(int[] lv, double[] q) => TxDistV(lv, q, sScan, c.DcDq, c.AcDq);
                 // RDOQ of a candidate: libaom's single-pass trellis (AomTrellis) or our RdoqOptimize
                 // returns the coded bits when the trellis priced them (else -1)
-                double Quantise(int[] lv, double[] q, int ti)
+                double Quantise(int[] lv, double[] q, int ti, int eobHint = -2)
                 {
                     if (Sp.AomTrellis)
                     {
                         int[]? before = Av1CoeffEncode.RdoqCheck ? (int[])lv.Clone() : null;
                         double tb = Av1CoeffEncode.TrellisOptimize(c.Cdf.Coef, stx, 0, lv, q, c.DcDq, c.AcDq, skc, snc, rdoqLambda,
-                            Av1CoeffEncode.IntraTxTypeBits(c.Cdf.Mode, stx, yModeNoFilt, ti, UseFullIntraTxSet));
+                            Av1CoeffEncode.IntraTxTypeBits(c.Cdf.Mode, stx, yModeNoFilt, ti, UseFullIntraTxSet), Av1CoeffEncode.RdoqCheck ? -2 : eobHint);
                         if (Av1CoeffEncode.RdoqCheck)
                         {
                             double full = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, lv, skc, snc, ti, fullSet: UseFullIntraTxSet);
@@ -161,6 +162,7 @@ internal static partial class Av1StillImageEncoder
                     if (StatsOn) System.Threading.Interlocked.Increment(ref StatTypeTrials);
                     long tq = TimingOn ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     int[] cf = Av1FwdTransform.ForwardQuantRect(res, tw, th, stx, c.DcDq, c.AcDq, sScan, fwd, qf);
+                    int cfEob = NoEobHint ? -2 : Av1FwdTransform.LastEob;   // valid while cf is the quantiser's output
                     if (TimingOn) Tick(2, ref tq);
                     bool oneD = inv == Av1TxType.VDct || inv == Av1TxType.HDct;
                     bool pre = false;
@@ -187,10 +189,10 @@ internal static partial class Av1StillImageEncoder
                     }
                     double preBits = -1;
                     // libaom's order (search_tx_type): quantise, trellis, then one rate + one distortion
-                    if (!olv && Sp.AomTrellisFirst && trellis && !oneD && HasNonZero(cf))
+                    if (!olv && Sp.AomTrellisFirst && trellis && !oneD && (cfEob == -2 ? HasNonZero(cf) : cfEob >= 0))
                     {
                         if (TimingOn) Tick(7, ref tq);
-                        preBits = Quantise(cf, qf, idx);
+                        preBits = Quantise(cf, qf, idx, cfEob);
                         if (TimingOn) Tick(3, ref tq);
                         System.Threading.Interlocked.Increment(ref StatRdoq);
                         pre = true;
@@ -208,13 +210,14 @@ internal static partial class Av1StillImageEncoder
                     if (TimingOn) Tick(7, ref tq);
                     double bits = preBits >= 0 ? preBits : oneD
                         ? Av1CoeffEncode.EstimateCoefBits1D(c.Cdf.Coef, c.Cdf.Mode, stx, yModeNoFilt, inv, cf, skc, snc)
-                        : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, cf, skc, snc, idx, fullSet: UseFullIntraTxSet);
+                        : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, cf, skc, snc, idx, fullSet: UseFullIntraTxSet,
+                            eobHint: pre || olv ? -2 : cfEob);
                     if (TimingOn) Tick(5, ref tq);
                     double j = sse + lambda * bits;
                     bool rdoqd = pre;
-                    if (!pre && trellis && !oneD && HasNonZero(cf) && j < bestJ * Sp.RdoqSearchMargin)
+                    if (!pre && trellis && !oneD && (cfEob == -2 ? HasNonZero(cf) : cfEob >= 0) && j < bestJ * Sp.RdoqSearchMargin)
                     {
-                        double qb = Quantise(cf, qf, idx);
+                        double qb = Quantise(cf, qf, idx, cfEob);
                         System.Threading.Interlocked.Increment(ref StatRdoq);
                         bits = qb >= 0 ? qb : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, cf, skc, snc, idx, fullSet: UseFullIntraTxSet);
                         j = (txDom ? TxDist(cf, qf) : ReconSseCandRect(cf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv)) + lambda * bits;
@@ -223,7 +226,7 @@ internal static partial class Av1StillImageEncoder
                     if (j < bestJ)
                     {
                         Av1FwdTransform.ReturnLevels(bestCf);
-                        bestJ = j; bestBits = bits; bestCf = cf; bestInv = inv; bestIdx = idx; bestRdoq = rdoqd;
+                        bestJ = j; bestBits = bits; bestCf = cf; bestInv = inv; bestIdx = idx; bestRdoq = rdoqd; bestEob = rdoqd || olv ? -2 : cfEob;
                         if (!rdoqd) (qf, qfBest) = (qfBest, qf);   // keep this type's unquantised coefficients (no copy)
                     }
                     else Av1FwdTransform.ReturnLevels(cf);
@@ -231,7 +234,7 @@ internal static partial class Av1StillImageEncoder
                 // the coded levels are RDOQ'd (libaom's final encode trellises every block)
                 if (UseRdoq && (Sp.AomTrellisAll || trellis) && !bestRdoq && (OracleLevels == null || OracleLevels1DOnly) && bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && HasNonZero(bestCf))
                 {
-                    double qb = Quantise(bestCf, qfBest, bestIdx);
+                    double qb = Quantise(bestCf, qfBest, bestIdx, bestEob);
                     double bits = qb >= 0 ? qb : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, bestCf, skc, snc, bestIdx, fullSet: UseFullIntraTxSet);
                     bestBits = bits;
                     if (!txDom) bestJ = ReconSseCandRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, bestInv) + lambda * bits;

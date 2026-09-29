@@ -2109,6 +2109,52 @@ public sealed class Av1HbdVerify
                     }
                     continue;
                 }
+                if (t[0] == "fmatest")
+                {
+                    // fmatest x: does the JIT fuse Vector256<double> a * b + c (and scalar) into one rounding, cold vs warm?
+                    static double VecMulAdd(double a, double b, double c) { var r = System.Runtime.Intrinsics.Vector256.Create(a) * System.Runtime.Intrinsics.Vector256.Create(b) + System.Runtime.Intrinsics.Vector256.Create(c); return System.Runtime.Intrinsics.Vector256.GetElement(r, 0); }
+                    static double ScalMulAdd(double a, double b, double c) => a * b + c;
+                    double x = 1 + Math.Pow(2, -30), y = 1 + Math.Pow(2, -30), z = -1;
+                    double fused = Math.FusedMultiplyAdd(x, y, z), plain = (double)(x * y) + z;
+                    var sbf = new System.Text.StringBuilder($"fmatest plain {plain:R} fused {fused:R} |");
+                    foreach (int iters in new[] { 1, 100, 100000, 3000000 })
+                    {
+                        double v = 0, sc = 0;
+                        for (int i = 0; i < iters; i++) { v = VecMulAdd(x, y, z); sc = ScalMulAdd(x, y, z); }
+                        System.Threading.Thread.Sleep(300);
+                        v = VecMulAdd(x, y, z); sc = ScalMulAdd(x, y, z);
+                        sbf.Append($" after {iters}: vec {(v == fused ? "FUSED" : v == plain ? "plain" : "?")} scalar {(sc == fused ? "FUSED" : sc == plain ? "plain" : "?")};");
+                    }
+                    log.AppendLine(sbf.ToString());
+                    continue;
+                }
+                if (t[0] == "blkdiff")
+                {
+                    // blkdiff <a.avif> <b.avif>: the first blocks (decode order) whose size / mode / tx differ
+                    List<(int X, int Y, int Bs, int M, int A, int Tx, int Uv)> Grab(string f)
+                    {
+                        var l = new List<(int, int, int, int, int, int, int)>();
+                        SharpImage.Formats.Av1.Av1Decode.BlockPosHook = (x4, y4, blk) => { lock (l) l.Add((x4, y4, blk.BlockSize, blk.YMode, blk.YAngle, blk.Tx, blk.UvMode)); };
+                        var hc = HeifContainer.Parse(File.ReadAllBytes(f));
+                        using (var y = new Av1Decoder().Decode(hc.ItemData(hc.PrimaryId)!, 0, true)) { }
+                        SharpImage.Formats.Av1.Av1Decode.BlockPosHook = null;
+                        return l;
+                    }
+                    var la = Grab(t[1]); var lb = Grab(t[2]); int shown = 0;
+                    for (int i = 0; i < Math.Min(la.Count, lb.Count) && shown < 8; i++)
+                        if (la[i] != lb[i]) { log.AppendLine($"blkdiff #{i}: a {la[i]} b {lb[i]}"); shown++; }
+                    continue;
+                }
+                if (t[0] == "scancheck")
+                {
+                    for (int tx = 0; tx < 19; tx++)
+                    {
+                        ref readonly var td = ref SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[tx];
+                        var sc = SharpImage.Formats.Av1.Av1Tables.Scans[tx];
+                        log.AppendLine($"scancheck tx {tx} {td.W * 4}x{td.H * 4} len {sc.Length} n {Math.Min(td.W * 4, 32) * Math.Min(td.H * 4, 32)} max {sc.Max()} distinct {sc.Distinct().Count()}");
+                    }
+                    continue;
+                }
                 if (t[0] == "invcheck")
                 {
                     // invcheck x: vector vs scalar InvTxfmAdd16 on random blocks of every size / type (8 and 10 bits): mismatches.

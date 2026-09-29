@@ -1645,10 +1645,25 @@ internal static class Av1FwdTxfmAom
     /// <summary>libaom's forward transform of a w x h residual (row-major, stride w) with 1D kinds hKind (rows) / vKind
     /// (columns), quantised as libaom's quantiser sees it: qf = c * 2^tx_scale / dq (dc for rc 0), level = |qf| + 0.5 - bias
     /// floored (0 below 1), in the decoder's layout rc = ky + kx * min(h, 32) (the retained 32 x 32 of 64-point axes).</summary>
+    // inverse scans (position -> scan index) per tx size, for the eob
+    private static readonly int[]?[] InvScans = new int[]?[19];
+    private static int[] InvScan(int tx)
+    {
+        var a = InvScans[tx];
+        if (a != null) return a;
+        var scan = Av1Tables.Scans[tx];
+        a = new int[scan.Length];
+        for (int i = 0; i < scan.Length; i++) a[scan[i]] = i;
+        return InvScans[tx] = a;
+    }
+
+    // (ForwardQuant returns the eob: the scan index of the last nonzero level, -1 when all are zero)
     [SkipLocalsInit]
-    internal static void ForwardQuant(ReadOnlySpan<int> residual, int w, int h, int txSize, int hKind, int vKind,
+    internal static int ForwardQuant(ReadOnlySpan<int> residual, int w, int h, int txSize, int hKind, int vKind,
         double dcDq, double acDq, double bias, int[] levels, double[]? qfOut)
     {
+        ref int inv0 = ref MemoryMarshal.GetArrayDataReference(InvScan(txSize));
+        var eobV = Vector128.Create(-1);   // per lane: the largest scan index of a nonzero level seen
         int lw = System.Numerics.BitOperations.Log2((uint)w) - 2, lh = System.Numerics.BitOperations.Log2((uint)h) - 2;
         int sh0 = Shift[txSize * 3], sh1 = -Shift[txSize * 3 + 1], sh2 = -Shift[txSize * 3 + 2];
         int cosCol = CosBitCol[lw * 5 + lh], cosRow = CosBitRow[lw * 5 + lh];
@@ -1686,6 +1701,7 @@ internal static class Av1FwdTxfmAom
         var rnd2 = Vector256.Create(sh2 > 0 ? 1 << (sh2 - 1) : 0);
         var vdc = Vector256.Create(scale / dcDq, scale / acDq, scale / acDq, scale / acDq); var vac = Vector256.Create(scale / acDq);
         var half = Vector256.Create(0.5); var vbias = Vector256.Create(bias); var one = Vector256.Create(1.0);
+        var m1 = Vector128.Create(-1);
         ref int lv0 = ref MemoryArrayRef(levels);
         for (int r0 = 0; r0 < sh; r0 += 8)
         {
@@ -1705,17 +1721,22 @@ internal static class Av1FwdTxfmAom
                 if (sh2 > 0) v = Vector256.ShiftRightArithmetic(v + rnd2, sh2);
                 if (rect2) v = MulRound(v, 5793, 12);
                 int rc = c * sh + r0;
-                Quant4(Avx.ConvertToVector256Double(v.GetLower()), rc == 0 ? vdc : vac, half, vbias, one, ref Unsafe.Add(ref lv0, rc), qfOut, rc);
+                var q = Quant4(Avx.ConvertToVector256Double(v.GetLower()), rc == 0 ? vdc : vac, half, vbias, one, ref Unsafe.Add(ref lv0, rc), qfOut, rc);
+                eobV = Vector128.Max(eobV, Vector128.ConditionalSelect(Vector128.Equals(q, Vector128<int>.Zero), m1, Vector128.LoadUnsafe(ref inv0, (nuint)rc)));
                 if (nr == 8)
-                    Quant4(Avx.ConvertToVector256Double(v.GetUpper()), vac, half, vbias, one, ref Unsafe.Add(ref lv0, rc + 4), qfOut, rc + 4);
+                {
+                    q = Quant4(Avx.ConvertToVector256Double(v.GetUpper()), vac, half, vbias, one, ref Unsafe.Add(ref lv0, rc + 4), qfOut, rc + 4);
+                    eobV = Vector128.Max(eobV, Vector128.ConditionalSelect(Vector128.Equals(q, Vector128<int>.Zero), m1, Vector128.LoadUnsafe(ref inv0, (nuint)(rc + 4))));
+                }
             }
         }
+        return Math.Max(Math.Max(eobV.GetElement(0), eobV.GetElement(1)), Math.Max(eobV.GetElement(2), eobV.GetElement(3)));
     }
 
     private static ref int MemoryArrayRef(int[] a) => ref MemoryMarshal.GetArrayDataReference(a);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Quant4(Vector256<double> c, Vector256<double> mul, Vector256<double> half,
+    private static Vector128<int> Quant4(Vector256<double> c, Vector256<double> mul, Vector256<double> half,
         Vector256<double> bias, Vector256<double> one, ref int dst, double[]? qfOut, int at)
     {
         var qf = c * mul;   // c * 2^tx_scale / dq
@@ -1724,6 +1745,8 @@ internal static class Av1FwdTxfmAom
         var fl = Vector256.Floor(mag);
         var sgn = Vector256.ConditionalSelect(Vector256.LessThan(qf, Vector256<double>.Zero), -fl, fl);
         var lv = Vector256.ConditionalSelect(Vector256.LessThan(mag, one), Vector256<double>.Zero, sgn);
-        Avx.ConvertToVector128Int32WithTruncation(lv).StoreUnsafe(ref dst);
+        var li = Avx.ConvertToVector128Int32WithTruncation(lv);
+        li.StoreUnsafe(ref dst);
+        return li;
     }
 }

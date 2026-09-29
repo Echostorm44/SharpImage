@@ -42,17 +42,26 @@ internal static class Av1FwdTransform
 
     // Forward + quantise through Av1FwdTxfmAom: libaom's coefficients c, qf = c * 2^tx_scale / dq (its quantiser's
     // input: dequantisation is (level * dq) >> tx_scale), then the same rounding / deadzone as the matrix path.
+    
     [System.Runtime.CompilerServices.SkipLocalsInit]
     private static int[] AomForwardQuant(ReadOnlySpan<int> residual, int w, int h, int txSize, FwdTxType txType,
         int dcDq, int acDq, int rcCount, double[]? qfOut)
     {
         (int hType, int vType) = AxisTypes(txType);
         var levels = RentLevels(rcCount);
-        Av1FwdTxfmAom.ForwardQuant(residual, w, h, txSize, hType, vType, dcDq, acDq, Bias, levels, qfOut);
+        // AV1 defines ADST (and V_DCT / H_DCT) up to 16 points and identity up to 32: anything else is a caller bug (the
+        // 1-D kernels would read unwritten scratch), not a transform to approximate
+        if ((hType == Av1InvTransform.Type1dAdst && w > 16) || (vType == Av1InvTransform.Type1dAdst && h > 16)
+            || (hType == Av1InvTransform.Type1dIdentity && w > 32) || (vType == Av1InvTransform.Type1dIdentity && h > 32))
+            throw new InvalidOperationException($"AV1 forward transform {txType} is not defined for {w}x{h}");
+        LastEob = Av1FwdTxfmAom.ForwardQuant(residual, w, h, txSize, hType, vType, dcDq, acDq, Bias, levels, qfOut);
         return levels;
     }
 
     private static bool AomFwdOk => UseAomFwd && System.Runtime.Intrinsics.X86.Avx2.IsSupported;
+    /// <summary>The eob (last nonzero scan index, -1 all zero) of this thread's latest libaom-forward quantisation; -2
+    /// after a matrix-forward one (unknown).</summary>
+    [ThreadStatic] internal static int LastEob;
     private static int SquareTx(int n) => System.Numerics.BitOperations.Log2((uint)n) - 2;   // Tx4x4 .. Tx64x64
 
     // Cached forward 1D matrices F = M^-1 (M = decoder's integer 1D inverse), keyed by (logSize<<2 | type1d).
@@ -178,6 +187,7 @@ internal static class Av1FwdTransform
         int dcDq, int acDq, int rcCount, FwdTxType txType, double[]? qfOut)
     {
         if (AomFwdOk) return AomForwardQuant(residual, w, h, txSizeIdx, txType, dcDq, acDq, rcCount, qfOut);
+        LastEob = -2;
         // 64-point axes zero their upper 32 inputs, so the probed matrix is singular — TX_64X64 uses the square
         // orthonormal path (DCT_DCT is the only type there).
         if (w == 64 && h == 64)
@@ -347,6 +357,7 @@ internal static class Av1FwdTransform
     // Matrix forward + deadzone quant of a w x h residual with transposed forward matrices (fhT[x * sw + kx] =
     // Fh[kx][x], fvT[y * sh + ky] = Fv[ky][y]; sw = min(w, 32), sh = min(h, 32)), 4 coefficients per Vector256: every
     // lane is the scalar dot product in the same order (no FMA), so levels / qf are identical to the scalar loops.
+    
     [System.Runtime.CompilerServices.SkipLocalsInit]
     private static int[] MatForwardV(ReadOnlySpan<int> residual, int w, int h, double[] fhT, double[] fvT, double s,
         int dcDq, int acDq, int rcCount, double[]? qfOut)
@@ -537,6 +548,7 @@ internal static class Av1FwdTransform
 
     // ForwardQuantSquare with 4 output coefficients per Vector256 lane group: each lane is the same scalar dot product
     // (double(int) * basis, added in x / y order; no FMA contraction), so the doubles are identical.
+    
     [System.Runtime.CompilerServices.SkipLocalsInit]
     private static int[] ForwardQuantSquareV(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, double k, double[]? qfOut)
     {

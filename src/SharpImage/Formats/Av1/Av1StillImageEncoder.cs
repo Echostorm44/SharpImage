@@ -3213,10 +3213,10 @@ internal static partial class Av1StillImageEncoder
                 (Av1IntraPredMode mode, int delta) = CandidateModes[topIdx[t]];
                 PredictIntra(c.ReconU, c.Cw, cbw4, cbh4, cbx4, cby4, cn, mode, delta, pu, chromaEdge, cIntraFlags);
                 PredictIntra(c.ReconV, c.Cw, cbw4, cbh4, cbx4, cby4, cn, mode, delta, pv, chromaEdge, cIntraFlags);
-                // Chroma tx-type is DERIVED from the UV mode (TxTypeFromUvMode) — no symbol coded. All map to
-                // TX_CLASS_2D so the scan/coeff-coding is unchanged, but the transform KERNEL differs, so the
-                // forward transform and the reconstruction SSE MUST use it (coding DctDct here desyncs vs libdav1d).
-                var uvTx = (Av1TxType)Av1Tables.TxTypeFromUvMode[(int)mode];
+                // Chroma tx-type is DERIVED from the UV mode (TxTypeFromUvMode; DCT_DCT once the chroma tx reaches 32,
+                // UvIntraTxType) — no symbol coded. All map to TX_CLASS_2D so the scan/coeff-coding is unchanged, but the
+                // transform KERNEL differs, so the forward transform and the reconstruction SSE MUST use it.
+                var uvTx = UvIntraTxType(ctx0, (int)mode);
                 var uvFwd = FwdTypeForTxType(uvTx);
                 var qfu2 = new double[scanLenC]; var qfv2 = new double[scanLenC];
                 int[] uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, pu, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qfu2, uvFwd);
@@ -3425,7 +3425,7 @@ internal static partial class Av1StillImageEncoder
             Av1CoeffEncode.EncodeCoefs(c.Msac, c.Cdf.Coef, c.Cdf.Mode, ctx0, 1, 0, vC, skipCtx: vSkip, dcSignCtx: vSign);
 
             {
-                var uvTxR = (Av1TxType)Av1Tables.TxTypeFromUvMode[uvSym];
+                var uvTxR = UvIntraTxType(ctx0, uvSym);
                 cfU = DequantAndReconstructPredRect(uC, ctx0, cn, cn, c.DcDq, c.AcDq, predU, c.ReconU, c.Cw, cbx, cby, uvTxR);
                 cfV = DequantAndReconstructPredRect(vC, ctx0, cn, cn, c.DcDq, c.AcDq, predV, c.ReconV, c.Cw, cbx, cby, uvTxR);
             }
