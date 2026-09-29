@@ -1229,6 +1229,66 @@ internal static partial class Av1StillImageEncoder
         public int W8, H8, RowsY, RowsC;
     }
 
+    /// <summary>The deblocking search's frames without a decode per level: the tiles decoded once without deblocking
+    /// (loop-filter masks kept, Av1Decoder.KeepDeblockMasks), then each level deblocks a copy of those planes as a
+    /// decode with that level (and no CDEF / restoration) would. AV1_NOREPLAY=1 decodes every candidate instead.</summary>
+    private sealed class DeblockReplay
+    {
+        private static readonly bool Off = Environment.GetEnvironmentVariable("AV1_NOREPLAY") == "1";
+        private readonly Av1Decoder dec;
+        private readonly ushort[][] pre;
+        private readonly int[] strides;
+        private DeblockReplay(Av1Decoder dec, ushort[][] pre, int[] strides) { this.dec = dec; this.pre = pre; this.strides = strides; }
+
+        public static DeblockReplay? Create(byte[] seqObu, byte[] tile, int baseQIdx, int sbCols, int sbRows, bool mono, bool sct, int threads)
+        {
+            if (Off) return null;
+            // any nonzero levels: the decoder builds the masks, and the level cache marks every coded block
+            var dec = new Av1Decoder { ApplyFilmGrain = false, MaxThreads = threads, KeepDeblockMasks = true };
+            using var yuv = dec.Decode([.. seqObu, .. BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, Av1ObuWriter.CdefParams.None,
+                new Av1ObuWriter.LfLevels(1, 1, 1, 1), screenContent: sct)], 0, isKeyframe: true);
+            if (yuv == null) return null;
+            var pre = dec.CopyInternalPlanes(out var st);
+            return new DeblockReplay(dec, pre, st);
+        }
+
+        public DecodedPicture Picture(Av1ObuWriter.LfLevels lf, ushort[] srcY, ushort[]? srcU, ushort[]? srcV,
+            int width, int height, int cw, int ch, bool monochrome, bool keep, bool noskip = false)
+        {
+            var planes = new ushort[pre.Length][];
+            for (int i = 0; i < pre.Length; i++) planes[i] = (ushort[])pre[i].Clone();
+            dec.Redeblock(planes, lf.Y0, lf.Y1, lf.U, lf.V);
+            var d = new DecodedPicture { SseY = PlaneSse(planes[0], strides[0], srcY, width, height) };
+            if (!monochrome && srcU != null && srcV != null && planes.Length > 2)
+            {
+                d.SseU = PlaneSse(planes[1], strides[1], srcU, cw, ch);
+                d.SseV = PlaneSse(planes[2], strides[2], srcV, cw, ch);
+            }
+            d.Sse = d.SseY + d.SseU + d.SseV;
+            if (!keep) return d;
+            d.Strides = strides;
+            d.Planes = planes;
+            if (noskip)
+            {
+                // as DecodePicture: the MI grid (8-aligned) plus two rows below, rows past the buffer repeating its last
+                d.Noskip = dec.NoskipMap8x8(out d.W8, out d.H8);
+                d.RowsY = d.H8 * 8 + 2;
+                d.RowsC = ((d.H8 * 8) >> (ch < height ? 1 : 0)) + 2;
+                for (int i = 0; i < planes.Length; i++)
+                {
+                    int rows = i == 0 ? d.RowsY : d.RowsC, stride = strides[i];
+                    if (planes[i].Length >= stride * rows) continue;
+                    var a = new ushort[stride * rows];
+                    int avail = Math.Min(rows, planes[i].Length / stride) * stride;
+                    Array.Copy(planes[i], a, avail);
+                    for (int o = avail; o + stride <= a.Length; o += stride) Array.Copy(a, avail - stride, a, o, stride);
+                    planes[i] = a;
+                }
+            }
+            return d;
+        }
+    }
+
     private static DecodedPicture? DecodePicture(byte[] seqObu, byte[] frameObu, ushort[] srcY, ushort[]? srcU, ushort[]? srcV,
         int width, int height, int cw, int ch, bool monochrome, bool keep, int threads = 1, bool noskip = false)
     {
@@ -1295,6 +1355,12 @@ internal static partial class Av1StillImageEncoder
         var none = Av1ObuWriter.CdefParams.None;
         if (FilterPickFromQ) return (dbOn ? guess : 0, cdOn ? heur : none, null);
         if (!dbOn && !cdOn) return (0, none, null);
+        DeblockReplay? replay = null; bool replayTried = false;
+        DeblockReplay? Replay()
+        {
+            if (!replayTried) { replayTried = true; replay = DeblockReplay.Create(seqObu, tile, baseQIdx, sbCols, sbRows, mono, sct, ThreadCount); }
+            return replay;
+        }
         if (Sp.DeblockPickFromQ && dbOn)
         {
             // Deblocking level from q (libaom LPF_PICK_FROM_Q); CDEF still chosen (here, or per superblock afterwards).
@@ -1312,10 +1378,12 @@ internal static partial class Av1StillImageEncoder
             foreach (double f in new[] { 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0 }) ladder.Add(Math.Clamp((int)Math.Round(guess * f), 1, 63));
             var lv = ladder.ToList();
             var pics = new DecodedPicture?[lv.Count];
+            var rpl = Replay();
             EvaluateAll(lv.Count, i =>
             {
-                pics[i] = DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, none, lv[i], screenContent: sct),
-                    srcY, srcU, srcV, width, height, cw, ch, mono, false, Math.Max(1, ThreadCount / lv.Count));
+                pics[i] = rpl != null ? rpl.Picture(lv[i], srcY, srcU, srcV, width, height, cw, ch, mono, false)
+                    : DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, none, lv[i], screenContent: sct),
+                        srcY, srcU, srcV, width, height, cw, ch, mono, false, Math.Max(1, ThreadCount / lv.Count));
                 return pics[i]?.Sse ?? long.MaxValue;
             });
             var sse = new Dictionary<int, (long Y, long U, long V)>();
@@ -1341,9 +1409,10 @@ internal static partial class Av1StillImageEncoder
                 {
                     var t = tri[i];
                     if (t.Y == 0) return long.MaxValue;   // chroma levels are not coded with luma off
-                    rp[i] = DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, none,
-                            new Av1ObuWriter.LfLevels(t.Y, t.Y, t.U, t.V), screenContent: sct),
-                        srcY, srcU, srcV, width, height, cw, ch, mono, false, Math.Max(1, ThreadCount / tri.Length));
+                    var tl = new Av1ObuWriter.LfLevels(t.Y, t.Y, t.U, t.V);
+                    rp[i] = rpl != null ? rpl.Picture(tl, srcY, srcU, srcV, width, height, cw, ch, mono, false)
+                        : DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, none, tl, screenContent: sct),
+                            srcY, srcU, srcV, width, height, cw, ch, mono, false, Math.Max(1, ThreadCount / tri.Length));
                     return rp[i]?.Sse ?? long.MaxValue;
                 });
                 for (int i = 0; i < tri.Length; i++)
@@ -1358,16 +1427,19 @@ internal static partial class Av1StillImageEncoder
             }
             var best = by == 0 ? new Av1ObuWriter.LfLevels(0, 0, 0, 0) : new Av1ObuWriter.LfLevels(by, by, bu, bv);
             // the winner's decode (planes and noskip map when the caller needs them)
-            var wp = keepPicture ? DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, none, best, screenContent: sct),
-                srcY, srcU, srcV, width, height, cw, ch, mono, true, ThreadCount, keepNoskip) : null;
+            var wp = !keepPicture ? null : rpl != null ? rpl.Picture(best, srcY, srcU, srcV, width, height, cw, ch, mono, true, keepNoskip)
+                : DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, none, best, screenContent: sct),
+                    srcY, srcU, srcV, width, height, cw, ch, mono, true, ThreadCount, keepNoskip);
             return (best, none, wp);
         }
 
         (int, Av1ObuWriter.CdefParams, DecodedPicture?) Best(List<(int Lf, Av1ObuWriter.CdefParams Cdef)> cands, bool keep)
         {
             var pics = new DecodedPicture?[cands.Count];
+            var rpl = cands.TrueForAll(c => c.Cdef.Equals(none)) ? Replay() : null;
             EvaluateAll(cands.Count, i =>
             {
+                if (rpl != null) { pics[i] = rpl.Picture(cands[i].Lf, srcY, srcU, srcV, width, height, cw, ch, mono, keep, keepNoskip); return pics[i]!.Sse; }
                 pics[i] = DecodePicture(seqObu, BuildFrameObu(baseQIdx, sbCols, sbRows, mono, tile, cands[i].Cdef, cands[i].Lf, screenContent: sct),
                     srcY, srcU, srcV, width, height, cw, ch, mono, keep, Math.Max(1, ThreadCount / cands.Count), keepNoskip);
                 return pics[i]?.Sse ?? long.MaxValue;

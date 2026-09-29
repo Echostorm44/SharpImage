@@ -91,6 +91,60 @@ internal sealed class Av1Decoder
         }
     }
 
+    /// <summary>Encoder deblocking search: the frame decodes without deblocking but keeps every SB row's loop-filter
+    /// masks (the header's levels must be nonzero so they are built); Redeblock then filters copies of the pre-deblock
+    /// planes at any levels without decoding again. Assumes one level per plane and direction (no segmentation, delta
+    /// LF or mode / ref deltas), as the still encoder codes.</summary>
+    internal bool KeepDeblockMasks { get; set; }
+    private byte[,]? lfLevelRec;   // the decode's level cache (nonzero where a block was coded)
+
+    /// <summary>Copies of the (pre-deblock, with KeepDeblockMasks) internal planes and their strides.</summary>
+    internal ushort[][] CopyInternalPlanes(out int[] strides)
+    {
+        int n = ctx.CurrentPlanes[1] != null ? 3 : 1;
+        strides = new int[n];
+        var planes = new ushort[n][];
+        for (int i = 0; i < n; i++) { strides[i] = ctx.CurrentStrides[i]; planes[i] = (ushort[])ctx.CurrentPlanes[i]!.Clone(); }
+        return planes;
+    }
+
+    /// <summary>Deblocks <paramref name="planes"/> (copies of the KeepDeblockMasks decode's internal planes) in place at
+    /// levels (y0, y1, u, v), as a decode with those levels would. Thread-safe once the first call has returned.</summary>
+    internal void Redeblock(ushort[][] planes, int y0, int y1, int u, int v)
+    {
+        if (y0 == 0 && y1 == 0) return;
+        lock (lfSnap)
+        {
+            if (lfLevelRec == null)
+            {
+                for (int sby = 0; sby < ctx.SuperBlockRows; sby++)
+                    Av1LoopFilter.FixTileBoundaryStrength(ctx, lfSnap[sby], sby, ctx.StartOfTileRow.Length > sby ? ctx.StartOfTileRow[sby] : 0);
+                lfLevelRec = ctx.LfLevel;
+            }
+        }
+        int n = lfLevelRec.GetLength(0);
+        var lv = new byte[n, 4];
+        for (int i = 0; i < n; i++)
+        {
+            if (lfLevelRec[i, 0] != 0) lv[i, 0] = (byte)y0;
+            if (lfLevelRec[i, 1] != 0) lv[i, 1] = (byte)y1;
+            if (lfLevelRec[i, 2] != 0) lv[i, 2] = (byte)u;
+            if (lfLevelRec[i, 3] != 0) lv[i, 3] = (byte)v;
+        }
+        int ssVer = ctx.PixelLayout == Av1PixelLayout.I420 ? 1 : 0;
+        bool hasChroma = planes.Length > 1, chroma = hasChroma && (u != 0 || v != 0);
+        Span<ushort> yPlane = planes[0], uPlane = hasChroma ? planes[1] : default, vPlane = hasChroma ? planes[2] : default;
+        int sbSz = seqHdr.Sb128 ? 32 : 16;
+        for (int sby = 0; sby < ctx.SuperBlockRows; sby++)
+        {
+            int yPixelRow = sby * sbSz * 4;
+            int yOff = yPixelRow * ctx.YStride, uvOff = (yPixelRow >> ssVer) * ctx.UvStride;
+            Av1LoopFilter.LoopFilterSbRowCols(ctx, yPlane, uPlane, vPlane, yOff, uvOff, uvOff, lfSnap[sby], sby,
+                ctx.StartOfTileRow.Length > sby ? ctx.StartOfTileRow[sby] : 0, lv, chroma);
+            Av1LoopFilter.LoopFilterSbRowRows(ctx, yPlane, uPlane, vPlane, yOff, uvOff, uvOff, lfSnap[sby], sby, lv, chroma);
+        }
+    }
+
     private Av1FilterMask[] SnapshotLfMasks(int sby)
     {
         var live = ctx.LfMasks!;
@@ -980,7 +1034,7 @@ internal sealed class Av1Decoder
         }
 
         DeblockPipeline? lfPipe = MaxThreads > 1 && (fh.LfLevelY0 != 0 || fh.LfLevelY1 != 0) && ctx.LfMasks != null
-            && !NoDeblock && !DumpPreDeblockY
+            && !NoDeblock && !DumpPreDeblockY && !KeepDeblockMasks
             ? new DeblockPipeline((row, masks) => ApplyInLoopFilters(row, ssHor, ssVer, hasChroma, masks)) : null;
         bool tileLoopDone = false;
         try
@@ -1064,7 +1118,8 @@ internal sealed class Av1Decoder
                 BackupIpredEdge(sby, by, ssHor, ssVer, hasChroma);
 
                 // Apply in-loop filters for this superblock row (on the pipeline worker when threaded)
-                if (lfPipe != null) lfPipe.Post(sby, SnapshotLfMasks(sby));
+                if (KeepDeblockMasks) { if (ctx.LfMasks != null) SnapshotLfMasks(sby); }
+                else if (lfPipe != null) lfPipe.Post(sby, SnapshotLfMasks(sby));
                 else ApplyInLoopFilters(sby, ssHor, ssVer, hasChroma);
                 // Save lfMask data for CDEF/LR (backup before next row overwrites)
                 if (ctx.LfMasksRows != null && ctx.LfMasks != null)

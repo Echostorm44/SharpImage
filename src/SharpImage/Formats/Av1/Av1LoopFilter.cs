@@ -961,6 +961,18 @@ public static class Av1LoopFilter
     // dav1d lf_apply_tmpl.c dav1d_loopfilter_sbrow_cols: the left/top edges of a tile were masked with *reset*
     // neighbour contexts, so clamp their filter size to the real neighbour — the previous tile column's saved right-edge
     // tx sizes, and the previous tile row's above context.
+    /// <summary>The tile-boundary strength fix-up LoopFilterSbRowCols applies to an SB row's masks (idempotent).</summary>
+    internal static void FixTileBoundaryStrength(Av1DecoderContext ctx, Av1FilterMask[] lflvl, int sby, int startOfTileRow)
+    {
+        int isSb64 = ctx.SequenceHeader.Sb128 ? 0 : 1;
+        int starty4 = (sby & isSb64) << 4;
+        int sbsz = 32 >> isSb64;
+        int endy4 = starty4 + Math.Min(ctx.H4 - sby * sbsz, sbsz);
+        int ssVer = ctx.PixelLayout == Av1PixelLayout.I420 ? 1 : 0;
+        int ssHor = ctx.PixelLayout != Av1PixelLayout.I444 ? 1 : 0;
+        FixTileBoundaryStrength(ctx, lflvl, sby, startOfTileRow, isSb64, starty4, endy4, (endy4 + ssVer) >> ssVer, ssHor, ssVer);
+    }
+
     private static void FixTileBoundaryStrength(Av1DecoderContext ctx, Av1FilterMask[] lflvl, int sby, int startOfTileRow,
         int isSb64, int starty4, int endy4, int uvEndy4, int ssHor, int ssVer)
     {
@@ -1041,8 +1053,9 @@ public static class Av1LoopFilter
 
     public static void LoopFilterSbRowCols(Av1DecoderContext ctx, Span<ushort> yPlane,
         Span<ushort> uPlane, Span<ushort> vPlane, int yOffset, int uOffset, int vOffset,
-        Av1FilterMask[] lflvl, int sby, int startOfTileRow)
+        Av1FilterMask[] lflvl, int sby, int startOfTileRow, byte[,]? levels = null, bool? chroma = null)
     {
+        levels ??= ctx.LfLevel;
         int bitDepth = ctx.BitDepth;
         ref readonly var fh = ref ctx.FrameHeader;
         ref readonly var sh = ref ctx.SequenceHeader;
@@ -1054,7 +1067,7 @@ public static class Av1LoopFilter
         int ssHor = ctx.PixelLayout != Av1PixelLayout.I444 ? 1 : 0;
         int uvEndy4 = (endy4 + ssVer) >> ssVer;
 
-        FixTileBoundaryStrength(ctx, lflvl, sby, startOfTileRow, isSb64, starty4, endy4, uvEndy4, ssHor, ssVer);
+        if (chroma == null) FixTileBoundaryStrength(ctx, lflvl, sby, startOfTileRow, isSb64, starty4, endy4, uvEndy4, ssHor, ssVer);
 
         // Filter luma columns
         int yOff = yOffset;
@@ -1062,12 +1075,12 @@ public static class Av1LoopFilter
         bool haveLeft = false;
         for (int x = 0; x < ctx.Sb128W; x++, haveLeft = true, yOff += 128)
         {
-            FilterPlaneColsY(ctx.LfLevel, levelOff + x * 32, ctx.B4Stride,
+            FilterPlaneColsY(levels, levelOff + x * 32, ctx.B4Stride,
                 lflvl[x], 0, yPlane, yOff, ctx.YStride,
                 Math.Min(32, ctx.W4 - x * 32), starty4, endy4, ctx.LfLimLut, haveLeft, bitDepth);
         }
 
-        if (fh.LfLevelU == 0 && fh.LfLevelV == 0) return;
+        if (!(chroma ?? (fh.LfLevelU != 0 || fh.LfLevelV != 0))) return;
 
         // Filter chroma columns
         int uvOff = uOffset;
@@ -1076,7 +1089,7 @@ public static class Av1LoopFilter
         for (int x = 0; x < ctx.Sb128W; x++, haveLeft = true,
              uvOff += 128 >> ssHor)
         {
-            FilterPlaneColsUv(ctx.LfLevel, uvLvlOff + (x * 32 >> ssHor), ctx.B4Stride,
+            FilterPlaneColsUv(levels, uvLvlOff + (x * 32 >> ssHor), ctx.B4Stride,
                 lflvl[x], 0, uPlane, uvOff, vPlane, uvOff, ctx.UvStride,
                 (Math.Min(32, ctx.W4 - x * 32) + ssHor) >> ssHor,
                 starty4 >> ssVer, uvEndy4, ssVer, ctx.LfLimLut, haveLeft, bitDepth);
@@ -1088,8 +1101,9 @@ public static class Av1LoopFilter
     /// </summary>
     public static void LoopFilterSbRowRows(Av1DecoderContext ctx, Span<ushort> yPlane,
         Span<ushort> uPlane, Span<ushort> vPlane, int yOffset, int uOffset, int vOffset,
-        Av1FilterMask[] lflvl, int sby)
+        Av1FilterMask[] lflvl, int sby, byte[,]? levels = null, bool? chroma = null)
     {
+        levels ??= ctx.LfLevel;
         int bitDepth = ctx.BitDepth;
         ref readonly var fh = ref ctx.FrameHeader;
         ref readonly var sh = ref ctx.SequenceHeader;
@@ -1107,12 +1121,12 @@ public static class Av1LoopFilter
         int levelOff = sby * sbsz * ctx.B4Stride;
         for (int x = 0; x < ctx.Sb128W; x++, yOff += 128)
         {
-            FilterPlaneRowsY(ctx.LfLevel, levelOff + x * 32, ctx.B4Stride,
+            FilterPlaneRowsY(levels, levelOff + x * 32, ctx.B4Stride,
                 lflvl[x], 0, yPlane, yOff, ctx.YStride,
                 Math.Min(32, ctx.W4 - x * 32), starty4, endy4, ctx.LfLimLut, haveTop, bitDepth);
         }
 
-        if (fh.LfLevelU == 0 && fh.LfLevelV == 0) return;
+        if (!(chroma ?? (fh.LfLevelU != 0 || fh.LfLevelV != 0))) return;
 
         // Filter chroma rows
         int uvOff = uOffset;
@@ -1120,7 +1134,7 @@ public static class Av1LoopFilter
         for (int x = 0; x < ctx.Sb128W; x++,
              uvOff += 128 >> ssHor)
         {
-            FilterPlaneRowsUv(ctx.LfLevel, uvLvlOff + (x * 32 >> ssHor), ctx.B4Stride,
+            FilterPlaneRowsUv(levels, uvLvlOff + (x * 32 >> ssHor), ctx.B4Stride,
                 lflvl[x], 0, uPlane, uvOff, vPlane, uvOff, ctx.UvStride,
                 (Math.Min(32, ctx.W4 - x * 32) + ssHor) >> ssHor,
                 starty4 >> ssVer, uvEndy4, ssHor, ctx.LfLimLut, haveTop, bitDepth);
