@@ -2109,6 +2109,75 @@ public sealed class Av1HbdVerify
                     }
                     continue;
                 }
+                if (t[0] == "invcheck")
+                {
+                    // invcheck x: vector vs scalar InvTxfmAdd16 on random blocks of every size / type (8 and 10 bits): mismatches.
+                    var rng = new Random(9); long bad = 0, runs = 0;
+                    var types = (SharpImage.Formats.Av1.Av1TxType[])Enum.GetValues(typeof(SharpImage.Formats.Av1.Av1TxType));
+                    for (int tx = 0; tx < 19; tx++)
+                    {
+                        ref readonly var td = ref SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[tx];
+                        int w = td.W * 4, h = td.H * 4, n = Math.Min(w, 32) * Math.Min(h, 32);
+                        foreach (var ty in types)
+                        {
+                            if (ty == SharpImage.Formats.Av1.Av1TxType.WhtWht || (int)ty >= 16) continue;
+                            bool big = Math.Max(w, h) > 16;
+                            if (big && ty != SharpImage.Formats.Av1.Av1TxType.DctDct && !(ty == SharpImage.Formats.Av1.Av1TxType.Identity && Math.Max(w, h) <= 32)) continue;
+                            if (Math.Max(w, h) == 64 && ty != SharpImage.Formats.Av1.Av1TxType.DctDct) continue;
+                            foreach (int bd in new[] { 8, 10 })
+                                for (int rep = 0; rep < 12; rep++)
+                                {
+                                    var cfA = new int[64 * 64]; var cfB = new int[64 * 64];
+                                    int k = rep < 6 ? n : 1 + rng.Next(Math.Min(n, 20));
+                                    var scan = SharpImage.Formats.Av1.Av1Tables.Scans[tx];
+                                    int lim = bd == 8 ? 900 : 3600;
+                                    for (int i = 0; i < k; i++) cfA[scan[i]] = cfB[scan[i]] = rng.Next(-lim, lim + 1) >> (rep % 3 == 0 ? 0 : 3);
+                                    var dA = new ushort[w * h]; var dB = new ushort[w * h];
+                                    for (int i = 0; i < dA.Length; i++) dA[i] = dB[i] = (ushort)rng.Next(1 << bd);
+                                    SharpImage.Formats.Av1.Av1InvTransform.ForceScalar = true;
+                                    SharpImage.Formats.Av1.Av1InvTransform.InvTxfmAdd16(dA, w, cfA, k - 1, tx, SharpImage.Formats.Av1.Av1InvTransform.TxShift[tx], ty, bd);
+                                    SharpImage.Formats.Av1.Av1InvTransform.ForceScalar = false;
+                                    SharpImage.Formats.Av1.Av1InvTransform.InvTxfmAdd16(dB, w, cfB, k - 1, tx, SharpImage.Formats.Av1.Av1InvTransform.TxShift[tx], ty, bd);
+                                    runs++;
+                                    if (!dA.AsSpan().SequenceEqual(dB) || Array.Exists(cfB, v => v != 0)) { bad++; if (bad < 6) log.AppendLine($"invcheck MISMATCH tx {tx} {ty} bd {bd} k {k}"); }
+                                }
+                        }
+                    }
+                    log.AppendLine($"invcheck runs {runs} mismatches {bad}");
+                    continue;
+                }
+                if (t[0] == "invbench")
+                {
+                    // invbench x: ns per Av1InvTransform.InvTxfmAdd16 (8-bit, DCT_DCT and ADST_ADST) per tx size, with k nonzero
+                    // low-frequency coefficients (k = 1, 4, 12) onto a mid-grey prediction.
+                    var rng = new Random(5);
+                    foreach (int tx in new[] { 0, 1, 2, 3, 7, 8, 13, 14 })
+                    {
+                        ref readonly var td = ref SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[tx];
+                        int w = td.W * 4, h = td.H * 4, sh = Math.Min(h, 32);
+                        var scan = SharpImage.Formats.Av1.Av1Tables.Scans[tx];
+                        var dst = new ushort[w * h]; var cf = new int[64 * 64];
+                        var sb = new System.Text.StringBuilder($"invbench {w}x{h}:");
+                        foreach (var ty in new[] { SharpImage.Formats.Av1.Av1TxType.DctDct, SharpImage.Formats.Av1.Av1TxType.AdstAdst })
+                        {
+                            if (Math.Max(w, h) > 16 && ty != SharpImage.Formats.Av1.Av1TxType.DctDct) continue;
+                            foreach (int k in new[] { 1, 4, 12 })
+                            {
+                                int iters = 200000 / Math.Max(1, w * h / 64);
+                                var sw = System.Diagnostics.Stopwatch.StartNew();
+                                for (int it = 0; it < iters; it++)
+                                {
+                                    Array.Fill(dst, (ushort)128);
+                                    for (int i = 0; i < k; i++) cf[scan[i]] = (i * 37 % 200) - 100;
+                                    SharpImage.Formats.Av1.Av1InvTransform.InvTxfmAdd16(dst, w, cf, k - 1, tx, SharpImage.Formats.Av1.Av1InvTransform.TxShift[tx], ty, 8);
+                                }
+                                sb.Append($" {(ty == SharpImage.Formats.Av1.Av1TxType.DctDct ? "dct" : "adst")}/k{k} {sw.Elapsed.TotalMilliseconds * 1e6 / iters:F0}");
+                            }
+                        }
+                        log.AppendLine(sb.ToString() + " ns");
+                    }
+                    continue;
+                }
                 if (t[0] == "trbench")
                 {
                     // trbench x: ns per TrellisOptimize call on Laplacian coefficient blocks (4x4 / 8x8 / 16x16 / 8x16 /

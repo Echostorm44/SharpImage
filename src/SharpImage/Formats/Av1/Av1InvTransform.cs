@@ -5,6 +5,7 @@
 
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 using System.Runtime.Intrinsics;
 
@@ -271,7 +272,7 @@ public static class Av1InvTransform
             }
         }
 
-        if (Avx2.IsSupported)
+        if (Avx2.IsSupported && !ForceScalar)
         {
             InvTxfmAdd16V(dst, dstStride, coeffs, rowMask, w, h, sw, sh, isRect2, rnd, shift, pixelMax,
                 rowClipMin, rowClipMax, colClipMin, colClipMax, tDim.Lw, tDim.Lh, txtp0, txtp1);
@@ -326,68 +327,102 @@ public static class Av1InvTransform
         int sw, int sh, bool isRect2, int rnd, int shift, int pixelMax, int rowClipMin, int rowClipMax,
         int colClipMin, int colClipMax, int lw, int lh, int txtp0, int txtp1)
     {
-        Span<int> tmp = stackalloc int[w * h];   // row-major intermediate
-        if (h > sh) tmp.Slice(sh * w).Clear();
-        Span<VI> v = stackalloc VI[64];
-        Span<int> lanes = stackalloc int[8];
-        VI rmin = rowClipMin, rmax = rowClipMax, cmin = colClipMin, cmax = colClipMax;
+        int wv = (w + 7) >> 3;                                    // 8-column groups
+        Span<Vector256<int>> tmpS = stackalloc Vector256<int>[h * wv];   // row-major intermediate: row y, group gi
+        ref Vector256<int> t0 = ref MemoryMarshal.GetReference(tmpS);
+        Span<Vector256<int>> v = stackalloc Vector256<int>[64];
+        Span<Vector256<int>> blkS = stackalloc Vector256<int>[8];
+        ref Vector256<int> blk = ref MemoryMarshal.GetReference(blkS);
+        ref int c0 = ref MemoryMarshal.GetReference(coeffs);
+        var rmin = Vector256.Create(rowClipMin); var rmax = Vector256.Create(rowClipMax);
+        var cmin = Vector256.Create(colClipMin); var cmax = Vector256.Create(colClipMax);
         var rndV = Vector256.Create(rnd);
+        var zero = Vector256<int>.Zero;
 
-        // Row pass: element x of rows y0..y0+g-1 is coeffs[x * sh + y0 ..] (contiguous).
-        for (int y0 = 0; y0 < sh; y0 += 8)
+        // Row pass, 8 rows at a time (lanes = rows): element x of rows y0.. is coeffs[x * sh + y0 ..] (contiguous, read and
+        // cleared); the results go through 8 x 8 transposes into the row-major intermediate.
+        for (int y0 = 0; y0 < h; y0 += 8)
         {
-            int g = Math.Min(8, sh - y0);
-            if (((rowMask >> y0) & (g == 8 ? 0xFFu : 0xFu)) == 0) { tmp.Slice(y0 * w, g * w).Clear(); continue; }
+            int g = Math.Min(8, h - y0);
+            if (y0 >= sh || ((rowMask >> y0) & (g == 8 ? 0xFFu : 0xFu)) == 0)
+            {
+                for (int k = 0; k < g; k++)
+                    for (int gi = 0; gi < wv; gi++) Unsafe.Add(ref t0, (y0 + k) * wv + gi) = zero;
+                continue;
+            }
             for (int x = 0; x < sw; x++)
             {
-                var src = coeffs.Slice(x * sh + y0, g);
-                var c = g == 8 ? Vector256.Create((ReadOnlySpan<int>)src)
-                               : Vector256.Create(Vector128.Create((ReadOnlySpan<int>)src), Vector128<int>.Zero);
+                ref int p = ref Unsafe.Add(ref c0, x * sh + y0);
+                Vector256<int> c;
+                if (g == 8) { c = Vector256.LoadUnsafe(ref p); zero.StoreUnsafe(ref p); }
+                else { c = Vector256.Create(Vector128.LoadUnsafe(ref p), Vector128<int>.Zero); Vector128<int>.Zero.StoreUnsafe(ref p); }
                 if (isRect2) c = Vector256.ShiftRightArithmetic(c * 181 + Vector256.Create(128), 8);
-                v[x] = new VI(c);
-                src.Clear();
+                v[x] = c;
             }
-            for (int x = sw; x < w; x++) v[x] = 0;
+            for (int x = sw; x < w; x++) v[x] = zero;
             Av1InvTransformV.Apply1d(v, 1, rmin, rmax, lw, txtp0);
-            for (int x = 0; x < w; x++)
+            for (int gi = 0; gi < wv; gi++)
             {
-                var r = Vector256.Min(Vector256.Max(Vector256.ShiftRightArithmetic(v[x].V + rndV, shift), cmin.V), cmax.V);
-                r.CopyTo(lanes);
-                for (int k = 0; k < g; k++) tmp[(y0 + k) * w + x] = lanes[k];
+                for (int k = 0; k < 8; k++)
+                {
+                    int x = gi * 8 + k;
+                    Unsafe.Add(ref blk, k) = x < w
+                        ? Vector256.Min(Vector256.Max(Vector256.ShiftRightArithmetic(v[x] + rndV, shift), cmin), cmax) : zero;
+                }
+                Transpose8(ref blk);
+                for (int k = 0; k < g; k++) Unsafe.Add(ref t0, (y0 + k) * wv + gi) = Unsafe.Add(ref blk, k);
             }
         }
 
-        // Column pass: element i of columns x0..x0+g-1 is tmp[i * w + x0 ..] (contiguous).
+        // Column pass, 8 columns at a time (lanes = columns), added onto the destination.
         var eight = Vector256.Create(8);
-        var zero = Vector256<int>.Zero;
         var pmax = Vector256.Create(pixelMax);
-        for (int x0 = 0; x0 < w; x0 += 8)
+        ref ushort d0 = ref MemoryMarshal.GetReference(dst);
+        for (int gi = 0; gi < wv; gi++)
         {
-            int g = Math.Min(8, w - x0);
-            for (int i = 0; i < h; i++)
-            {
-                ReadOnlySpan<int> s2 = tmp.Slice(i * w + x0, g);
-                v[i] = new VI(g == 8 ? Vector256.Create(s2) : Vector256.Create(Vector128.Create(s2), Vector128<int>.Zero));
-            }
+            for (int i = 0; i < h; i++) v[i] = Unsafe.Add(ref t0, i * wv + gi);
             Av1InvTransformV.Apply1d(v, 1, cmin, cmax, lh, txtp1);
-            for (int y = 0; y < h; y++)
-            {
-                var add = Vector256.ShiftRightArithmetic(v[y].V + eight, 4);
-                var row = dst.Slice(y * dstStride + x0, g);
-                if (g == 8)
+            int x0 = gi * 8;
+            if (w >= 8)
+                for (int y = 0; y < h; y++)
                 {
-                    var d = Avx2.ConvertToVector256Int32(Vector128.Create((ReadOnlySpan<ushort>)row));
+                    var add = Vector256.ShiftRightArithmetic(v[y] + eight, 4);
+                    ref ushort row = ref Unsafe.Add(ref d0, y * dstStride + x0);
+                    var d = Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref row));
                     var sum = Vector256.Min(Vector256.Max(d + add, zero), pmax);
-                    Vector256.Narrow(sum.AsUInt32(), Vector256<uint>.Zero).GetLower().CopyTo(row);
+                    Vector256.Narrow(sum.AsUInt32(), Vector256<uint>.Zero).GetLower().StoreUnsafe(ref row);
                 }
-                else
+            else
+                for (int y = 0; y < h; y++)
                 {
-                    add.CopyTo(lanes);
-                    for (int x = 0; x < g; x++) row[x] = (ushort)Math.Clamp(row[x] + lanes[x], 0, pixelMax);
+                    var add = Vector256.ShiftRightArithmetic(v[y] + eight, 4);
+                    ref ushort row = ref Unsafe.Add(ref d0, y * dstStride);
+                    for (int x = 0; x < 4; x++)
+                        Unsafe.Add(ref row, x) = (ushort)Math.Clamp(Unsafe.Add(ref row, x) + add.GetElement(x), 0, pixelMax);
                 }
-            }
         }
     }
+
+    // 8 x 8 transpose of the 32-bit lanes of r[0..7] (in place)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Transpose8(ref Vector256<int> r)
+    {
+        var a0 = r; var a1 = Unsafe.Add(ref r, 1); var a2 = Unsafe.Add(ref r, 2); var a3 = Unsafe.Add(ref r, 3);
+        var a4 = Unsafe.Add(ref r, 4); var a5 = Unsafe.Add(ref r, 5); var a6 = Unsafe.Add(ref r, 6); var a7 = Unsafe.Add(ref r, 7);
+        var t0 = Avx2.UnpackLow(a0, a1); var t1 = Avx2.UnpackHigh(a0, a1); var t2 = Avx2.UnpackLow(a2, a3); var t3 = Avx2.UnpackHigh(a2, a3);
+        var t4 = Avx2.UnpackLow(a4, a5); var t5 = Avx2.UnpackHigh(a4, a5); var t6 = Avx2.UnpackLow(a6, a7); var t7 = Avx2.UnpackHigh(a6, a7);
+        var u0 = Avx2.UnpackLow(t0.AsInt64(), t2.AsInt64()).AsInt32(); var u1 = Avx2.UnpackHigh(t0.AsInt64(), t2.AsInt64()).AsInt32();
+        var u2 = Avx2.UnpackLow(t1.AsInt64(), t3.AsInt64()).AsInt32(); var u3 = Avx2.UnpackHigh(t1.AsInt64(), t3.AsInt64()).AsInt32();
+        var u4 = Avx2.UnpackLow(t4.AsInt64(), t6.AsInt64()).AsInt32(); var u5 = Avx2.UnpackHigh(t4.AsInt64(), t6.AsInt64()).AsInt32();
+        var u6 = Avx2.UnpackLow(t5.AsInt64(), t7.AsInt64()).AsInt32(); var u7 = Avx2.UnpackHigh(t5.AsInt64(), t7.AsInt64()).AsInt32();
+        r = Avx2.Permute2x128(u0, u4, 0x20); Unsafe.Add(ref r, 1) = Avx2.Permute2x128(u1, u5, 0x20);
+        Unsafe.Add(ref r, 2) = Avx2.Permute2x128(u2, u6, 0x20); Unsafe.Add(ref r, 3) = Avx2.Permute2x128(u3, u7, 0x20);
+        Unsafe.Add(ref r, 4) = Avx2.Permute2x128(u0, u4, 0x31); Unsafe.Add(ref r, 5) = Avx2.Permute2x128(u1, u5, 0x31);
+        Unsafe.Add(ref r, 6) = Avx2.Permute2x128(u2, u6, 0x31); Unsafe.Add(ref r, 7) = Avx2.Permute2x128(u3, u7, 0x31);
+    }
+
+    /// <summary>Dev / tests: the scalar path even with AVX2 (vector-vs-scalar identity checks).</summary>
+    internal static bool ForceScalar;
 
     /// <summary>
     /// WHT 4x4 inverse transform and add (lossless mode only).

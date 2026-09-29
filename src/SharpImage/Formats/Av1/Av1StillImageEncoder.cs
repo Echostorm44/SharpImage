@@ -6329,12 +6329,9 @@ internal static partial class Av1StillImageEncoder
         int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
-        var block = (t_reconBlock ??= new ushort[64 * 64]).AsSpan(0, w * h);
-        predBlock.AsSpan(0, w * h).CopyTo(block);
-        Av1InvTransform.InvTxfmAdd16(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, Bd);
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-                recon[(by + y) * reconW + (bx + x)] = block[y * w + x];
+        // the prediction straight into the reconstruction, the inverse transform added there
+        for (int y = 0; y < h; y++) predBlock.AsSpan(y * w, w).CopyTo(recon.AsSpan((by + y) * reconW + bx, w));
+        Av1InvTransform.InvTxfmAdd16(recon.AsSpan(by * reconW + bx), reconW, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, Bd);
 
         return cfCtx;
     }
