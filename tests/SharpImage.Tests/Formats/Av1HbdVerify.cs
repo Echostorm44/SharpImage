@@ -2109,6 +2109,66 @@ public sealed class Av1HbdVerify
                     }
                     continue;
                 }
+                if (t[0] == "fwdbench")
+                {
+                    // fwdbench: ns per forward + quant call per tx size (DCT_DCT, residual +-64), matrix vs libaom forward.
+                    var rng = new Random(3);
+                    foreach (int tx in new[] { 0, 1, 2, 3, 4, 7, 8, 13, 14 })
+                    {
+                        ref readonly var td = ref SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[tx];
+                        int w = td.W * 4, h = td.H * 4, n = Math.Min(w, 32) * Math.Min(h, 32);
+                        var res = new int[w * h]; for (int i = 0; i < res.Length; i++) res[i] = rng.Next(-64, 65);
+                        var qf = new double[n];
+                        double[] ns = new double[2];
+                        for (int mode = 0; mode < 2; mode++)
+                        {
+                            Av1FwdTransform.UseAomFwd = mode == 1;
+                            int iters = Math.Max(2000, 4_000_000 / (w * h));
+                            for (int i = 0; i < 200; i++) Av1FwdTransform.ReturnLevels(Av1FwdTransform.ForwardQuantRect(res, w, h, tx, 40, 50, n, Av1FwdTransform.FwdTxType.DctDct, qf));
+                            var sw = System.Diagnostics.Stopwatch.StartNew();
+                            for (int i = 0; i < iters; i++) Av1FwdTransform.ReturnLevels(Av1FwdTransform.ForwardQuantRect(res, w, h, tx, 40, 50, n, Av1FwdTransform.FwdTxType.DctDct, qf));
+                            ns[mode] = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+                        }
+                        Av1FwdTransform.UseAomFwd = false;
+                        log.AppendLine($"fwdbench {w}x{h}: matrix {ns[0],8:F0} ns  aom {ns[1],8:F0} ns  x{ns[0] / ns[1]:F2}");
+                    }
+                    continue;
+                }
+                if (t[0] == "fwdcmp")
+                {
+                    // fwdcmp [amp]: per tx size / type, libaom's integer forward (Av1FwdTxfmAom) vs the matched matrix forward on
+                    // random residuals (+-amp): max / mean |qf difference| (dq = 1: raw coefficient units x 2^tx_scale).
+                    int amp = t.Length > 1 ? int.Parse(t[1]) : 255;
+                    var rng = new Random(7);
+                    var types = new[] { Av1FwdTransform.FwdTxType.DctDct, Av1FwdTransform.FwdTxType.AdstAdst, Av1FwdTransform.FwdTxType.AdstDct,
+                        Av1FwdTransform.FwdTxType.DctAdst, Av1FwdTransform.FwdTxType.Identity, Av1FwdTransform.FwdTxType.VDct, Av1FwdTransform.FwdTxType.HDct };
+                    for (int tx = 0; tx < 19; tx++)
+                    {
+                        ref readonly var td = ref SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[tx];
+                        int w = td.W * 4, h = td.H * 4, n = Math.Min(w, 32) * Math.Min(h, 32);
+                        foreach (var ty in types)
+                        {
+                            bool big = Math.Max(w, h) > 16;
+                            if (big && ty != Av1FwdTransform.FwdTxType.DctDct && !(ty == Av1FwdTransform.FwdTxType.Identity && Math.Max(w, h) <= 32)) continue;
+                            if (Math.Max(w, h) == 64 && ty != Av1FwdTransform.FwdTxType.DctDct) continue;
+                            double mx = 0, sum = 0, mag = 0; int cnt = 0;
+                            for (int rep = 0; rep < 20; rep++)
+                            {
+                                var res = new int[w * h];
+                                for (int i = 0; i < res.Length; i++) res[i] = rng.Next(-amp, amp + 1);
+                                var qa = new double[n]; var qb = new double[n];
+                                Av1FwdTransform.UseAomFwd = false;
+                                Av1FwdTransform.ReturnLevels(Av1FwdTransform.ForwardQuantRect(res, w, h, tx, 1, 1, n, ty, qa));
+                                Av1FwdTransform.UseAomFwd = true;
+                                Av1FwdTransform.ReturnLevels(Av1FwdTransform.ForwardQuantRect(res, w, h, tx, 1, 1, n, ty, qb));
+                                Av1FwdTransform.UseAomFwd = false;
+                                for (int i = 0; i < n; i++) { double d = Math.Abs(qa[i] - qb[i]); mx = Math.Max(mx, d); sum += d; mag += Math.Abs(qa[i]); cnt++; }
+                            }
+                            log.AppendLine($"fwdcmp tx {tx,2} {w}x{h} {ty,-8} max {mx,8:F2} mean {sum / cnt,7:F3} (mean |qf| {mag / cnt,9:F1})");
+                        }
+                    }
+                    continue;
+                }
                 if (t[0] == "blkrd")
                 {
                     // blkrd <a.avif> <b.avif> <src.png> [lambda]: per block (same origin + size in both streams) the exact

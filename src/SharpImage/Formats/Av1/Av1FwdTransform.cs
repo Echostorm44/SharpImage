@@ -37,20 +37,40 @@ internal static class Av1FwdTransform
     // speed preset asks for it.
     internal static double Bias => Av1StillImageEncoder.RoundNearest ? 0 : DeadzoneBias;
 
+    // libaom's integer forward transform (Av1FwdTxfmAom, its butterflies 8 lanes wide) instead of the matched matrix forward.
+    internal static bool UseAomFwd = Environment.GetEnvironmentVariable("AV1_AOMFWD") != "0";   // AV1_AOMFWD=0: the matrix forward
+
+    // Forward + quantise through Av1FwdTxfmAom: libaom's coefficients c, qf = c * 2^tx_scale / dq (its quantiser's
+    // input: dequantisation is (level * dq) >> tx_scale), then the same rounding / deadzone as the matrix path.
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    private static int[] AomForwardQuant(ReadOnlySpan<int> residual, int w, int h, int txSize, FwdTxType txType,
+        int dcDq, int acDq, int rcCount, double[]? qfOut)
+    {
+        (int hType, int vType) = AxisTypes(txType);
+        var levels = RentLevels(rcCount);
+        Av1FwdTxfmAom.ForwardQuant(residual, w, h, txSize, hType, vType, dcDq, acDq, Bias, levels, qfOut);
+        return levels;
+    }
+
+    private static bool AomFwdOk => UseAomFwd && System.Runtime.Intrinsics.X86.Avx2.IsSupported;
+    private static int SquareTx(int n) => System.Numerics.BitOperations.Log2((uint)n) - 2;   // Tx4x4 .. Tx64x64
+
     // Cached forward 1D matrices F = M^-1 (M = decoder's integer 1D inverse), keyed by (logSize<<2 | type1d).
     private static readonly ConcurrentDictionary<int, double[,]> FwdMatrixCache = new();
 
     /// <summary>Forward DCT_DCT + quantize a square residual (the common path). Sizes 4/8/16 use the matched
     /// matrix forward; 32/64 use the orthonormal DCT. rc layout: levels[kx*sh + ky], sh = min(N,32).</summary>
     internal static int[] ForwardQuantSquare(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount)
-        => n <= 16
+        => AomFwdOk ? AomForwardQuant(residual, n, n, SquareTx(n), FwdTxType.DctDct, dcDq, acDq, rcCount, null)
+        : n <= 16
             ? MatrixForward(residual, n, dcDq, acDq, rcCount, FwdTxType.DctDct, null)
             : ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, QuantScaleK, null);
 
     /// <summary>Forward transform + quantize for a chosen 2D type. ADST types are only valid for sizes 4/8/16;
     /// for 32/64 this falls back to DCT_DCT (orthonormal).</summary>
     internal static int[] ForwardQuantTyped(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, FwdTxType txType)
-        => n <= 16
+        => AomFwdOk ? AomForwardQuant(residual, n, n, SquareTx(n), n <= 16 ? txType : FwdTxType.DctDct, dcDq, acDq, rcCount, null)
+        : n <= 16
             ? MatrixForward(residual, n, dcDq, acDq, rcCount, txType, null)
             : ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, QuantScaleK, null);
 
@@ -58,7 +78,8 @@ internal static class Av1FwdTransform
     /// same rc indexing as the levels) so a caller can run rate-distortion optimized quantization. qfOut is in
     /// dq-normalized units: the dequant reconstruction error of level L is (qfOut[rc] - L)·dq in pixel domain.</summary>
     internal static int[] ForwardQuantTyped(ReadOnlySpan<int> residual, int n, int dcDq, int acDq, int rcCount, FwdTxType txType, double[] qfOut)
-        => n <= 16
+        => AomFwdOk ? AomForwardQuant(residual, n, n, SquareTx(n), n <= 16 ? txType : FwdTxType.DctDct, dcDq, acDq, rcCount, qfOut)
+        : n <= 16
             ? MatrixForward(residual, n, dcDq, acDq, rcCount, txType, qfOut)
             : ForwardQuantSquare(residual, n, dcDq, acDq, rcCount, QuantScaleK, qfOut);
 
@@ -156,6 +177,7 @@ internal static class Av1FwdTransform
     internal static int[] ForwardQuantRect(ReadOnlySpan<int> residual, int w, int h, int txSizeIdx,
         int dcDq, int acDq, int rcCount, FwdTxType txType, double[]? qfOut)
     {
+        if (AomFwdOk) return AomForwardQuant(residual, w, h, txSizeIdx, txType, dcDq, acDq, rcCount, qfOut);
         // 64-point axes zero their upper 32 inputs, so the probed matrix is singular — TX_64X64 uses the square
         // orthonormal path (DCT_DCT is the only type there).
         if (w == 64 && h == 64)
