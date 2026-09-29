@@ -2109,6 +2109,53 @@ public sealed class Av1HbdVerify
                     }
                     continue;
                 }
+                if (t[0] == "trbench")
+                {
+                    // trbench x: ns per TrellisOptimize call on Laplacian coefficient blocks (4x4 / 8x8 / 16x16 / 8x16 /
+                    // 32x32, default CDFs at qcat 2), with a checksum of the resulting levels and rates (optimisations must
+                    // leave it unchanged).
+                    var rng = new Random(11);
+                    var cdf = new SharpImage.Formats.Av1.Av1CdfContext(); SharpImage.Formats.Av1.Av1CdfDefaults.InitializeDefault(cdf, 2);
+                    double lam = 68 * 0.9 * 40.0 * 40 * (3.3 + 0.0015 * 40) / 2048;
+                    foreach (int tx in new[] { 0, 1, 2, 7, 3 })
+                    {
+                        int n = SharpImage.Formats.Av1.Av1Tables.Scans[tx].Length;
+                        const int blocks = 256;
+                        var qfs = new double[blocks][]; var lvs = new int[blocks][];
+                        for (int b = 0; b < blocks; b++)
+                        {
+                            qfs[b] = new double[n]; lvs[b] = new int[n];
+                            ref readonly var td = ref SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[tx];
+                            int hh = Math.Min(td.H * 4, 32);
+                            for (int i = 0; i < n; i++)
+                            {
+                                int kx = i / hh, ky = i % hh;
+                                double sc = 3.0 / (1 + 0.6 * (kx + ky)) * (b % 4 + 1) / 2;
+                                double u = rng.NextDouble() - 0.5, v = -sc * Math.Sign(u) * Math.Log(1 - 2 * Math.Abs(u));
+                                qfs[b][i] = v; lvs[b][i] = (int)(Math.Sign(v) * Math.Floor(Math.Abs(v) + 0.5));
+                            }
+                        }
+                        double chk = 0; var work = new int[n];
+                        for (int b = 0; b < blocks; b++)
+                        {
+                            Array.Copy(lvs[b], work, n);
+                            if (!Array.Exists(work, v => v != 0)) continue;
+                            chk += Av1CoeffEncode.TrellisOptimize(cdf.Coef, tx, 0, work, qfs[b], 40, 50, 0, 0, lam, 1.5);
+                            for (int i = 0; i < n; i++) chk += work[i] * (i + 1) * 1e-3;
+                        }
+                        int iters = Math.Max(20, 2_000_000 / (n * blocks));
+                        var sw = System.Diagnostics.Stopwatch.StartNew(); long calls = 0;
+                        for (int it = 0; it < iters; it++)
+                            for (int b = 0; b < blocks; b++)
+                            {
+                                Array.Copy(lvs[b], work, n);
+                                if (!Array.Exists(work, v => v != 0)) continue;
+                                Av1CoeffEncode.TrellisOptimize(cdf.Coef, tx, 0, work, qfs[b], 40, 50, 0, 0, lam, 1.5); calls++;
+                            }
+                        log.AppendLine($"trbench tx {tx,2} n {n,4}: {sw.Elapsed.TotalMilliseconds * 1e6 / calls,8:F0} ns/call  checksum {chk:R}");
+                    }
+                    continue;
+                }
                 if (t[0] == "fwdbench")
                 {
                     // fwdbench: ns per forward + quant call per tx size (DCT_DCT, residual +-64), matrix vs libaom forward.
@@ -2417,6 +2464,12 @@ public sealed class Av1HbdVerify
                         log.AppendLine($"  aomstats search {Av1StillImageEncoder.StatSearch} modes {Av1StillImageEncoder.StatModes} trials {Av1StillImageEncoder.StatTrials} txb {Av1StillImageEncoder.StatTxb} typeTrials {Av1StillImageEncoder.StatTypeTrials} rdoq {Av1StillImageEncoder.StatRdoq} palY {Av1StillImageEncoder.StatPal} palCand {Av1StillImageEncoder.StatPalCand} part " + string.Join(" ", Av1StillImageEncoder.StatPart.Select((v, i) => $"bl{i}:{v}")));
                         Av1StillImageEncoder.StatSearch = Av1StillImageEncoder.StatModes = Av1StillImageEncoder.StatTrials = Av1StillImageEncoder.StatTxb = Av1StillImageEncoder.StatRdoq = 0;
                         Av1StillImageEncoder.StatTypeTrials = Av1StillImageEncoder.StatPal = Av1StillImageEncoder.StatPalCand = 0; Array.Clear(Av1StillImageEncoder.StatPart);
+                        if (Av1StillImageEncoder.TimingOn)
+                        {
+                            string[] nm = { "predict", "residual", "fwd+quant", "trellis", "dist", "estimate", "recon", "other", "tr:eobscan", "tr:eobphase", "tr:main", "tr:clear" };
+                            log.AppendLine("  timing(ms) " + string.Join(" ", nm.Select((x, i) => $"{x} {Av1StillImageEncoder.TimeAcc[i] * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0}")));
+                            Array.Clear(Av1StillImageEncoder.TimeAcc);
+                        }
                     }
                     log.AppendLine($"encq {Path.GetFileName(t[2])} {outB.Length} {secs:F3} gc {gcMs:F1}ms alloc {allocMb}MB g{GC.CollectionCount(0) - g0c}/{GC.CollectionCount(1) - g1c}/{GC.CollectionCount(2) - g2c}");
                     continue;

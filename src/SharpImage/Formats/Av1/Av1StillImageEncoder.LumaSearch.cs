@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace SharpImage.Formats.Av1;
 
@@ -58,6 +61,11 @@ internal static partial class Av1StillImageEncoder
     internal static long StatSearch, StatModes, StatTrials, StatTxb, StatRdoq, StatTypeTrials, StatPal, StatPalCand;
     internal static readonly long[] StatPart = new long[6];
     internal static readonly bool StatsOn = Environment.GetEnvironmentVariable("AOM_STATS") == "1";
+    // dev (AV1_TIMING=1): luma tx search time per stage: 0 predict, 1 residual, 2 forward+quant, 3 trellis, 4 distortion,
+    // 5 rate estimate, 6 reconstruction, 7 other type-loop work
+    internal static readonly bool TimingOn = Environment.GetEnvironmentVariable("AV1_TIMING") == "1";
+    internal static readonly long[] TimeAcc = new long[12];
+    internal static void Tick(int k, ref long t) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); System.Threading.Interlocked.Add(ref TimeAcc[k], n - t); t = n; }
     internal static readonly long[] OracleMiss = new long[19 * 16];
     internal static readonly bool CalOn = Environment.GetEnvironmentVariable("AOM_CAL") == "1";
     internal static readonly double[] CalPix = new double[19], CalCoef = new double[19];
@@ -100,14 +108,11 @@ internal static partial class Av1StillImageEncoder
                 int tx4 = bx4 + ix, ty4 = by4 + iy, txR = tx4 & 31, tyR = ty4 & 31, px = tx4 * 4, py = ty4 * 4;
                 var localEdge = (((iy > 0 || !sbHasTr) && ix + tw4 >= w4) ? 0 : Av1EdgeFlags.I444TopHasRight) |
                                 ((ix > 0 || (!sbHasBl && iy + th4 >= h4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
+                long tq0 = TimingOn ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, tx4, ty4, tw, th, yMode, yDelta, pred, localEdge, intraFlags);
-                long resSse = 0;
-                for (int yy = 0; yy < th; yy++)
-                    for (int xx = 0; xx < tw; xx++)
-                    {
-                        int d = c.Luma[(py + yy) * c.W + px + xx] - pred[yy * tw + xx];
-                        res[yy * tw + xx] = d; resSse += (long)d * d;
-                    }
+                if (TimingOn) Tick(0, ref tq0);
+                long resSse = ResidualSse(c.Luma, c.W, px, py, pred, res, tw, th);
+                if (TimingOn) Tick(1, ref tq0);
                 double mseQ8 = 256.0 * resSse / (tw * th) / (1 << (2 * (Bd - 8)));
                 bool trellis = UseRdoq && mseQ8 <= trellisMseThr * qstep * qstep;
                 int skc = Av1CoeffDecode.GetSkipCtx(in sTD, lumaBs, c.ALY.AsSpan(txR), c.LLY.AsSpan(tyR), 0, 0);
@@ -116,12 +121,7 @@ internal static partial class Av1StillImageEncoder
                 double bestJ = double.MaxValue, bestBits = 0; bool bestRdoq = false;
                 bool txDom = Sp.AomTxDomainDist && tw <= 32 && th <= 32;   // 64-point: the zeroed half is not in qf
                 // transform-domain distortion: sum ((qf - L) * dq)^2 / 64 tracks the pixel SSE (calibrated per tx size)
-                double TxDist(int[] lv, double[] q)
-                {
-                    double d = 0;
-                    for (int k = 0; k < sScan; k++) { double e = (q[k] - lv[k]) * (k == 0 ? c.DcDq : c.AcDq); d += e * e; }
-                    return d * (1.0 / 64);
-                }
+                double TxDist(int[] lv, double[] q) => TxDistV(lv, q, sScan, c.DcDq, c.AcDq);
                 // RDOQ of a candidate: libaom's single-pass trellis (AomTrellis) or our RdoqOptimize
                 // returns the coded bits when the trellis priced them (else -1)
                 double Quantise(int[] lv, double[] q, int ti)
@@ -159,7 +159,9 @@ internal static partial class Av1StillImageEncoder
                     if (oTp >= 0) { if ((int)inv != oTp) continue; }
                     else if ((mask >> (int)inv & 1) == 0) continue;
                     if (StatsOn) System.Threading.Interlocked.Increment(ref StatTypeTrials);
+                    long tq = TimingOn ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     int[] cf = Av1FwdTransform.ForwardQuantRect(res, tw, th, stx, c.DcDq, c.AcDq, sScan, fwd, qf);
+                    if (TimingOn) Tick(2, ref tq);
                     bool oneD = inv == Av1TxType.VDct || inv == Av1TxType.HDct;
                     bool pre = false;
                     bool olv = false;
@@ -187,11 +189,15 @@ internal static partial class Av1StillImageEncoder
                     // libaom's order (search_tx_type): quantise, trellis, then one rate + one distortion
                     if (!olv && Sp.AomTrellisFirst && trellis && !oneD && HasNonZero(cf))
                     {
+                        if (TimingOn) Tick(7, ref tq);
                         preBits = Quantise(cf, qf, idx);
+                        if (TimingOn) Tick(3, ref tq);
                         System.Threading.Interlocked.Increment(ref StatRdoq);
                         pre = true;
                     }
+                    if (TimingOn) Tick(7, ref tq);
                     double sse = txDom ? TxDist(cf, qf) : ReconSseCandRect(cf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv);
+                    if (TimingOn) Tick(4, ref tq);
                     if (CalOn && !oneD)
                     {
                         double cd = 0;
@@ -199,9 +205,11 @@ internal static partial class Av1StillImageEncoder
                         lock (CalPix) { CalPix[stx] += sse; CalCoef[stx] += cd; CalN[stx]++; }
                     }
                     if (sse >= bestJ) { Av1FwdTransform.ReturnLevels(cf); continue; }
+                    if (TimingOn) Tick(7, ref tq);
                     double bits = preBits >= 0 ? preBits : oneD
                         ? Av1CoeffEncode.EstimateCoefBits1D(c.Cdf.Coef, c.Cdf.Mode, stx, yModeNoFilt, inv, cf, skc, snc)
                         : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, cf, skc, snc, idx, fullSet: UseFullIntraTxSet);
+                    if (TimingOn) Tick(5, ref tq);
                     double j = sse + lambda * bits;
                     bool rdoqd = pre;
                     if (!pre && trellis && !oneD && HasNonZero(cf) && j < bestJ * Sp.RdoqSearchMargin)
@@ -228,7 +236,9 @@ internal static partial class Av1StillImageEncoder
                     bestBits = bits;
                     if (!txDom) bestJ = ReconSseCandRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, bestInv) + lambda * bits;
                 }
+                if (TimingOn) tq0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 byte cfc = DequantAndReconstructPredRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.ReconY, c.W, px, py, bestInv);
+                if (TimingOn) Tick(6, ref tq0);
                 if (txDom)
                 {
                     // the winner's pixel distortion from its reconstruction (calc_pixel_domain_distortion_final)
@@ -248,6 +258,65 @@ internal static partial class Av1StillImageEncoder
                 }
             }
         return (jSum, list);
+    }
+
+    // residual = source - prediction for a tw x th block at (px, py) (res row-major, stride tw); returns its SSE.
+    private static long ResidualSse(ushort[] src, int stride, int px, int py, ushort[] pred, int[] res, int tw, int th)
+    {
+        long sse = 0;
+        if (tw >= 8)
+        {
+            for (int yy = 0; yy < th; yy++)
+            {
+                ref ushort s0 = ref src[(py + yy) * stride + px];
+                ref ushort p0 = ref pred[yy * tw];
+                ref int r0 = ref res[yy * tw];
+                var acc = Vector256<int>.Zero;
+                for (int xx = 0; xx < tw; xx += 8)
+                {
+                    var sv = Vector256.WidenLower(Vector256.Create(Vector128.LoadUnsafe(ref s0, (nuint)xx), Vector128<ushort>.Zero)).AsInt32();
+                    var pv = Vector256.WidenLower(Vector256.Create(Vector128.LoadUnsafe(ref p0, (nuint)xx), Vector128<ushort>.Zero)).AsInt32();
+                    var d = sv - pv;
+                    d.StoreUnsafe(ref r0, (nuint)xx);
+                    acc += d * d;
+                }
+                sse += SumInt(acc);
+            }
+            return sse;
+        }
+        for (int yy = 0; yy < th; yy++)
+            for (int xx = 0; xx < tw; xx++)
+            {
+                int d = src[(py + yy) * stride + px + xx] - pred[yy * tw + xx];
+                res[yy * tw + xx] = d; sse += (long)d * d;
+            }
+        return sse;
+    }
+
+    // sum of the 8 non-negative lanes (each < 2^31) as a long
+    private static long SumInt(Vector256<int> v)
+    {
+        var lo = Vector256.WidenLower(v.AsUInt32()).AsInt64() + Vector256.WidenUpper(v.AsUInt32()).AsInt64();
+        return Vector256.Sum(lo);
+    }
+
+    // transform-domain distortion sum ((q - L) * dq)^2 / 64 (dc dequantiser at 0), 4 lanes at a time
+    private static double TxDistV(int[] lv, double[] q, int n, double dcDq, double acDq)
+    {
+        ref int l0 = ref MemoryMarshal.GetArrayDataReference(lv);
+        ref double q0 = ref MemoryMarshal.GetArrayDataReference(q);
+        var acc = Vector256<double>.Zero;
+        var dq = Vector256.Create(dcDq, acDq, acDq, acDq);
+        var ac = Vector256.Create(acDq);
+        int k = 0;
+        for (; k + 4 <= n; k += 4)
+        {
+            var e = (Vector256.LoadUnsafe(ref q0, (nuint)k) - Avx.ConvertToVector256Double(Vector128.LoadUnsafe(ref l0, (nuint)k))) * (k == 0 ? dq : ac);
+            acc += e * e;
+        }
+        double d = Vector256.Sum(acc);
+        for (; k < n; k++) { double e = (q[k] - lv[k]) * (k == 0 ? dcDq : acDq); d += e * e; }
+        return d * (1.0 / 64);
     }
 
     // Hadamard model cost of a prediction (intra_model_rd): SATD over 8x8 tiles, 4x4 where a side is 4.

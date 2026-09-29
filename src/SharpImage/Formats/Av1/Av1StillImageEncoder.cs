@@ -772,7 +772,8 @@ internal static partial class Av1StillImageEncoder
         return Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, Av1Tables.Scans[tx].Length);
     }
 
-    private static bool HasNonZero(int[] a)
+    private static bool HasNonZero(int[] a) => a.AsSpan().ContainsAnyExcept(0);
+    private static bool HasNonZeroScalar(int[] a)
     {
         foreach (int c in a)
         {
