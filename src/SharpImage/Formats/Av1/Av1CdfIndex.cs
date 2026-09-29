@@ -44,6 +44,29 @@ internal sealed class Av1CdfIndex
         return (c, new Av1CdfIndex(arrays));
     }
 
+    // Pinned contexts (with their index) of finished superblock rows: pinning every array through the reflection walk
+    // costs more than a whole fast-speed encode of a small picture, and a returned context only needs new values.
+    private static readonly System.Collections.Concurrent.ConcurrentBag<(Av1CdfContext Cdf, Av1CdfIndex Index)> Pool = new();
+    private static readonly bool PoolCheck = Environment.GetEnvironmentVariable("AV1_CDFPOOLCHECK") == "1";
+
+    /// <summary>A pinned context holding the given one's values: a pooled one when available (see Return).</summary>
+    internal static (Av1CdfContext Cdf, Av1CdfIndex Index) RentPinned(Av1CdfContext from)
+    {
+        if (!Pool.TryTake(out var e)) return CreatePinned(from);
+        e.Cdf.CopyFrom(from);
+        if (PoolCheck)
+        {
+            // dev: CopyFrom must restore every indexed array (else values of an earlier encode would leak in)
+            var a = Arrays(e.Cdf); var b = Arrays(from);
+            for (int i = 0; i < a.Length; i++)
+                if (!a[i].AsSpan().SequenceEqual(b[i])) throw new InvalidOperationException($"pooled CDF array {i} not restored by CopyFrom");
+        }
+        return e;
+    }
+
+    /// <summary>Gives a rented context back once nothing codes with it any more.</summary>
+    internal static void Return(Av1CdfContext cdf, Av1CdfIndex index) => Pool.Add((cdf, index));
+
     /// <summary>Every CDF array of the context, in id order.</summary>
     internal static ushort[][] Arrays(Av1CdfContext c)
     {

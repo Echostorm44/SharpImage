@@ -22,6 +22,8 @@ internal sealed class Av1EncodeSpeed
     public bool UseRectPartition = true;
     public bool UseSub8Partition = true;
     public bool UseTrueRd = true;
+    /// <summary>Trial-encode partition RD for screen content even when UseTrueRd is off (speeds 7-8).</summary>
+    public bool TrueRdScreen;
     public bool UseCfl = true;
     public bool UseColorTxDepth = true;
     /// <summary>Deepest luma tx split searched with UseColorTxDepth (libaom allintra: 1, i.e. full and half size).</summary>
@@ -73,6 +75,8 @@ internal sealed class Av1EncodeSpeed
     public bool AomPrune4Split;
     /// <summary>T-shape / 4-way partitions for 4:4:4 / 4:2:2 only (LayoutSpeedScope) when UseExtPartition is off.</summary>
     public bool ExtNon420;
+    /// <summary>No CfL for 4:4:4 (LayoutSpeedScope): its full-size chroma makes the alpha search costly.</summary>
+    public bool NoCfl444;
     // the libaom luma search also for 64-wide / 64-tall leaves (64-point transforms: pixel-domain distortion)
     public bool AomLuma64;
     // dev: lambda from libaom's rdmult(qindex) times this factor (0 = RdLambdaK * acDq^2)
@@ -318,6 +322,7 @@ internal sealed class Av1EncodeSpeed
         // 0-5: deblocking levels per plane around libaom's q fit (scoreboard s4 -0.1%).
         if (speed <= 5) { p.DeblockPerPlane = true; p.LfGuessLibaom = true; }
         if (speed >= 4) p.CflSearchRange = 2;
+        if (speed >= 6) p.CflSearchRange = 1;   // libaom cfl_search_range 1 from 6 (444 s6 x1.02 -> x0.99, 0.03%)
         // 4+: sub-8x8 leaves stay (worth ~4.5% here) with their luma modes prescreened to 4.
         if (speed >= 4) { p.RdModeCandidates = 2; p.Sub8ModeCandidates = 4; p.UseSplit4x4 = false; p.EarlyTermBits = 32; }
         if (speed >= 4) p.LrSgrSets = 8;
@@ -358,6 +363,10 @@ internal sealed class Av1EncodeSpeed
         if (speed >= 6) p.RdoqSkipBits = 4;
         // 7+: partitions from the fast estimate.
         if (speed >= 7) { p.UseTrueRd = false; p.EarlyTermBits = 8; }
+        // 7: screen content keeps the trial-encode partition search (the estimate misjudges flat / sharp-edged blocks):
+        // scoreboard 444 +3.34% x0.64 -> -2.97% x0.89, mono +1.68% -> -3.70%, 420 -3.17% -> -6.82% (x0.86). At 8 it is
+        // x1.12-1.24 (and 8 is under par without it).
+        p.TrueRdScreen = speed == 7;
         // 7-10 (measured on the speed corpus vs libaom's ladder, BD vs libaom speed 0 / fox 1204x800 1-thread time):
         // 7 +20.1% 0.30 s (aom s7 +22.3%), 8 +24.1% 0.22 s (aom s8 +26.5% 0.25 s), 9 +30.7% 0.20 s,
         // 10 +33.6% 0.18 s (aom s9/s10 +54.6%, 0.11 s).
@@ -374,6 +383,8 @@ internal sealed class Av1EncodeSpeed
         // s9 -12.4% x1.15 -> -11.3% x0.96, s10 -8.9% x1.12 -> -8.6% x0.99.
         if (speed >= 9) { p.EstimateCoefDist = true; p.UseUvModeSearch = false; }
         if (speed >= 10) p.UseCfl = false;
+        // 9: no CfL in 4:4:4 either (444 s9 x1.10 -> x0.97 best-of-3, -11.74 -> -10.53%)
+        p.NoCfl444 = speed >= 9;
         TestOverride?.Invoke(p);
         return p;
     }
@@ -469,6 +480,11 @@ internal static partial class Av1StillImageEncoder
             if (sp.ExtNon420 && !sp.UseExtPartition && layout is Av1PixelLayout.I444 or Av1PixelLayout.I422)
             {
                 sp = sp.Clone(); sp.UseExtPartition = true;
+                t_speed = sp; swapped = true;
+            }
+            if (sp.NoCfl444 && sp.UseCfl && layout == Av1PixelLayout.I444)
+            {
+                sp = sp.Clone(); sp.UseCfl = false;
                 t_speed = sp; swapped = true;
             }
             if (sp.TxSplit444422 && layout is Av1PixelLayout.I444 or Av1PixelLayout.I422 && !(sp.UseColorTxDepth && sp.RectTxDepth))
@@ -1806,7 +1822,7 @@ internal static partial class Av1StillImageEncoder
             var st = mts[ti];
             SetTileWindow(st.C0 * 16, st.R0 * 16, Math.Min((st.C0 + st.NCols) * 16, bw4), Math.Min((st.R0 + st.NRows) * 16, bh4), w, ssX, ssY);
             if (r > 0) WaitFor(st, r - 1, st.SyncAfter);
-            var (rcdf, index) = Av1CdfIndex.CreatePinned(st.RowInit[r]!);
+            var (rcdf, index) = Av1CdfIndex.RentPinned(st.RowInit[r]!);
             st.RowInit[r] = null;
             var c = new ColorPartCtx
             {
@@ -1842,6 +1858,7 @@ internal static partial class Av1StillImageEncoder
                 Publish(st, r, k + 1);
             }
             st.RowLogs[r] = c.Msac.Log!;
+            Av1CdfIndex.Return(rcdf, index);   // the log holds symbolic ops only: the row context is free again
         }
 
         void Worker(int _)
@@ -2014,7 +2031,7 @@ internal static partial class Av1StillImageEncoder
         // those were previously forced to a single large NONE, wasting bits on the padded region — RD now splits
         // them. The SPLIT recursion terminates cleanly at 8x8 (bw4/bh4 are always even, so 8x8 tiles edges exactly;
         // the 4x4 forced-split throw is unreachable). Rect HORZ/VERT candidates are only offered when fully inside.
-        if (UseTrueRd && (long)c.Bw4 * c.Bh4 * 16 <= TrueRdPixelBudget && bl >= Math.Max(1, Sp.TrueRdFromBl) && bl <= Sp.TrueRdToBl
+        if ((UseTrueRd || (Sp.TrueRdScreen && c.ScreenContent)) && (long)c.Bw4 * c.Bh4 * 16 <= TrueRdPixelBudget && bl >= Math.Max(1, Sp.TrueRdFromBl) && bl <= Sp.TrueRdToBl
             && (bl < 4 || (bl == 4 && UseSub8Partition && fullyInside)))
         {
             EncodePartitionColorTrueRd(c, bl, bx4, by4, hsz, blk4, partCdf, nPart, bx8, by8, edgeIdx, fullyInside);
