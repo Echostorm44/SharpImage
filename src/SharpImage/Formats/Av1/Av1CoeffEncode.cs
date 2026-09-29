@@ -418,20 +418,21 @@ internal static class Av1CoeffEncode
     }
     // Symbol costs of a coefficient-CDF context's current probabilities, by table index.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double CBase(Av1CdfCoefContext c, int i, int s) => SymBits(c.BaseTok[i], s);
+    private static double CBase(Av1CdfCoefContext c, int i, int s) => c.Tab is { } k ? k.Base[i * 4 + s] : SymBits(c.BaseTok[i], s);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double CEobBase(Av1CdfCoefContext c, int i, int s) => SymBits(c.EobBaseTok[i], s);
+    private static double CEobBase(Av1CdfCoefContext c, int i, int s) => c.Tab is { } k ? k.EobBase[i * 3 + s] : SymBits(c.EobBaseTok[i], s);
     private static double CEobBase(Av1CdfCoefContext c, long i, int s) => CEobBase(c, (int)i, s);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double CBr(Av1CdfCoefContext c, int i, int mag) => HiTokBits(c.BrTok[i], mag);
+    private static double CBr(Av1CdfCoefContext c, int i, int mag) => c.Tab is { } k ? k.Br[i * 16 + Math.Min(mag, 15)] : HiTokBits(c.BrTok[i], mag);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double CSkip(Av1CdfCoefContext c, int i, uint v) => BoolBits(c.CoefSkip[i][0], v);
+    private static double CSkip(Av1CdfCoefContext c, int i, uint v) => c.Tab is { } k ? k.Skip[i * 2 + (int)v] : BoolBits(c.CoefSkip[i][0], v);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double CEobHi(Av1CdfCoefContext c, int i, uint v) => BoolBits(c.EobHiBit[i][0], v);
+    private static double CEobHi(Av1CdfCoefContext c, int i, uint v) => c.Tab is { } k ? k.EobHi[i * 2 + (int)v] : BoolBits(c.EobHiBit[i][0], v);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double CDcSign(Av1CdfCoefContext c, int i, uint v) => BoolBits(c.DcSign[i][0], v);
+    private static double CDcSign(Av1CdfCoefContext c, int i, uint v) => c.Tab is { } k ? k.DcSign[i * 2 + (int)v] : BoolBits(c.DcSign[i][0], v);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double CEobPt(Av1CdfCoefContext c, int sz, int slot, int pt) => SymBits(EobCdf(c, sz, slot), pt);
+    private static double CEobPt(Av1CdfCoefContext c, int sz, int slot, int pt) => c.Tab is { } k ? k.EobPt[(sz * 4 + slot) * 16 + pt] : SymBits(EobCdf(c, sz, slot), pt);
+    internal static double HiTokBitsOf(ReadOnlySpan<ushort> brCdf, int mag) => HiTokBits(brCdf, mag);
     internal static ushort[] EobCdf(Av1CdfCoefContext c, int sz, int slot) => sz switch
     {
         0 => c.EobBin16[slot], 1 => c.EobBin32[slot], 2 => c.EobBin64[slot], 3 => c.EobBin128[slot], 4 => c.EobBin256[slot],
@@ -701,6 +702,13 @@ internal static class Av1CoeffEncode
         tc.EobBaseTokIdx = tDim.Ctx * 2 * 4 + chroma * 4; tc.BaseTokIdx = tDim.Ctx * 2 * 41 + chroma * 41;
         tc.BrTokIdx = Math.Min((int)tDim.Ctx, 3) * 2 * 21 + chroma * 21;
         tc.DcSign0 = CDcSign(coef, chroma * 3 + dcSignCtx, 0); tc.DcSign1 = CDcSign(coef, chroma * 3 + dcSignCtx, 1);
+        if (coef.Tab is { } tab)
+        {
+            tc.HasTab = true;
+            tc.BaseC = ref MemoryMarshal.GetArrayDataReference(tab.Base);
+            tc.BrC = ref MemoryMarshal.GetArrayDataReference(tab.Br);
+            tc.EobBaseC = ref MemoryMarshal.GetArrayDataReference(tab.EobBase);
+        }
         var levels = tc.Levels;
         var nz = t_trNz ??= new int[3];
         double dq0 = dcDq, dqA = acDq;
@@ -735,7 +743,7 @@ internal static class Av1CoeffEncode
         {
             int rc = scan[si], L = signedLevels[rc], mag = Math.Abs(L);
             TrMidCtx(ref tc, rc, out var baseCdf, out var brCdf);
-            if (mag == 0) { accuRate += CBase(coef, baseCdf, 0); continue; }
+            if (mag == 0) { accuRate += TBase(ref tc, baseCdf, 0); continue; }
             int sign = L < 0 ? 1 : 0;
             double dq = rc == 0 ? dq0 : dqA, aq = Math.Abs(qf[rc]);
             double d0 = aq * dq * (aq * dq);
@@ -743,7 +751,7 @@ internal static class Av1CoeffEncode
             double r = TrCostAt(ref tc, baseCdf, brCdf, rc, mag, sign);
             double rd = accuDist + d + lambda * (accuRate + r);
             double dLow, rLow;
-            if (mag == 1) { dLow = 0; rLow = CBase(coef, baseCdf, 0); }
+            if (mag == 1) { dLow = 0; rLow = TBase(ref tc, baseCdf, 0); }
             else { double el = (aq - mag + 1) * dq; dLow = el * el - d0; rLow = TrCostAt(ref tc, baseCdf, brCdf, rc, mag - 1, sign); }
             double rdLow = accuDist + dLow + lambda * (accuRate + rLow);
             // this coefficient as the new last one
@@ -782,7 +790,7 @@ internal static class Av1CoeffEncode
         {
             int rc = scan[si], L = signedLevels[rc], mag = Math.Abs(L);
             TrMidCtx(ref tc, rc, out var baseCdf, out var brCdf);
-            if (mag == 0) { accuRate += CBase(coef, baseCdf, 0); continue; }
+            if (mag == 0) { accuRate += TBase(ref tc, baseCdf, 0); continue; }
             int sign = L < 0 ? 1 : 0;
             double r = TrCostAt(ref tc, baseCdf, brCdf, rc, mag, sign);
             double aq = Math.Abs(qf[rc]);
@@ -799,7 +807,7 @@ internal static class Av1CoeffEncode
         {
             int L = signedLevels[0], mag = Math.Abs(L);
             TrMidCtx(ref tc, 0, out var baseCdf, out var brCdf);
-            if (mag == 0) accuRate += CBase(coef, baseCdf, 0);
+            if (mag == 0) accuRate += TBase(ref tc, baseCdf, 0);
             else
             {
                 int sign = L < 0 ? 1 : 0;
@@ -817,8 +825,11 @@ internal static class Av1CoeffEncode
     }
 
     // TrellisOptimize's per-block constants.
-    private struct TrCtx
+    private ref struct TrCtx
     {
+        // with a cost table: its base / br / eob-base rows (one load per symbol cost)
+        public bool HasTab;
+        public ref double BaseC, BrC, EobBaseC;
         public Av1CdfCoefContext Coef;
         public byte[] Levels;
         public short[] Pos;
@@ -851,14 +862,19 @@ internal static class Av1CoeffEncode
     private static double TrCostLast(ref TrCtx t, int si, int rc, int mag, int sign)
     {
         int ctx = si == 0 ? 0 : 1 + (si > (2 << t.Tx2dSzCtx) ? 1 : 0) + (si > (4 << t.Tx2dSzCtx) ? 1 : 0);
-        double b = CEobBase(t.Coef, t.EobBaseTokIdx + ctx, Math.Min(mag, 3) - 1);
+        double b = t.HasTab ? Unsafe.Add(ref t.EobBaseC, (t.EobBaseTokIdx + ctx) * 3 + Math.Min(mag, 3) - 1)
+            : SymBits(t.Coef.EobBaseTok[t.EobBaseTokIdx + ctx], Math.Min(mag, 3) - 1);
         if (mag > 2)
         {
             int x = rc >> t.Shift, y = rc & t.Mask;
-            b += CBr(t.Coef, t.BrTokIdx + (rc == 0 ? 0 : ((x | y) > 1) ? 14 : 7), mag);
+            int bi = t.BrTokIdx + (rc == 0 ? 0 : ((x | y) > 1) ? 14 : 7);
+            b += t.HasTab ? Unsafe.Add(ref t.BrC, bi * 16 + Math.Min(mag, 15)) : HiTokBits(t.Coef.BrTok[bi], mag);
         }
         return b + TrSignGolomb(ref t, rc, mag, sign);
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static double TBase(ref TrCtx t, int idx, int s) => t.HasTab ? Unsafe.Add(ref t.BaseC, idx * 4 + s) : SymBits(t.Coef.BaseTok[idx], s);
 
     // The base-token and br CDFs of a non-last position from its (final) later neighbours' levels.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -910,9 +926,9 @@ internal static class Av1CoeffEncode
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static double TrCostAt(ref TrCtx t, int baseCdf, int brCdf, int rc, int mag, int sign)
     {
-        if (mag == 0) return CBase(t.Coef, baseCdf, 0);
-        double b = CBase(t.Coef, baseCdf, Math.Min(mag, 3));
-        if (mag > 2) b += CBr(t.Coef, brCdf, mag);
+        if (mag == 0) return TBase(ref t, baseCdf, 0);
+        double b = TBase(ref t, baseCdf, Math.Min(mag, 3));
+        if (mag > 2) b += t.HasTab ? Unsafe.Add(ref t.BrC, brCdf * 16 + Math.Min(mag, 15)) : HiTokBits(t.Coef.BrTok[brCdf], mag);
         return b + TrSignGolomb(ref t, rc, mag, sign);
     }
 

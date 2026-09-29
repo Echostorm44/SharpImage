@@ -73,6 +73,8 @@ internal sealed class Av1EncodeSpeed
     /// <summary>libaom prune_ext_part_using_split_info 1 (prune_4_partition_using_split_info): HORZ_4 / VERT_4 only when
     /// enough of the SPLIT sub-blocks' own HORZ / VERT searches won (or were not searched).</summary>
     public bool AomPrune4Split;
+    /// <summary>libaom's per-superblock coefficient cost tables for the rate estimates (Av1CoefCostTab).</summary>
+    public bool CoefCostTab;
     /// <summary>T-shape / 4-way partitions for 4:4:4 / 4:2:2 only (LayoutSpeedScope) when UseExtPartition is off.</summary>
     public bool ExtNon420;
     /// <summary>No CfL for 4:4:4 (LayoutSpeedScope): its full-size chroma makes the alpha search costly.</summary>
@@ -326,6 +328,9 @@ internal sealed class Av1EncodeSpeed
         // 4+: sub-8x8 leaves stay (worth ~4.5% here) with their luma modes prescreened to 4.
         if (speed >= 4) { p.RdModeCandidates = 2; p.Sub8ModeCandidates = 4; p.UseSplit4x4 = false; p.EarlyTermBits = 32; }
         if (speed >= 4) p.LrSgrSets = 8;
+        // 0-6: libaom's per-superblock coefficient cost tables (av1_fill_coeff_costs) for the rate estimates: the luma trellis
+        // 14% faster; scoreboard 420 s2 -1.84 -> -1.73%, 444 -0.36 -> -0.31%, mono -0.53 -> -0.59%, s5 -3.76 -> -3.67%
+        p.CoefCostTab = speed <= 6;
         // libaom allintra loop-restoration search prunes (speed 1: sgr ep pruning + dual-sgr penalty; 2: Wiener skipped
         // on flat units, self-guided skipped when Wiener did not pay; 3: harsher, 5-tap luma Wiener)
         if (speed >= 1) { p.LrSgrEp = 1; p.LrDualSgrPenalty = 1; }
@@ -1753,6 +1758,7 @@ internal static partial class Av1StillImageEncoder
                         c.AModeUv = aModeUv[col];
                         c.APalSz = aPalSz[col]; c.APalCol = aPalCol[col]; c.APalSzUv = aPalSzUv[col]; c.APalColU = aPalColU[col];
                         c.Msac.Mark((sby << 16) | sbx);
+                        SbCosts(c);
                         t_sbLamMul = Sp.AomSbLambda ? SbLambdaMul(c, sbx, sby) : 0;
                         EncodePartitionColor(c, 1, sbx * 16, sby * 16);
                         t_sbLamMul = 0;
@@ -1847,6 +1853,7 @@ internal static partial class Av1StillImageEncoder
                 c.AModeUv = st.AModeUv[col];
                 c.APalSz = st.APalSz[col]; c.APalCol = st.APalCol[col]; c.APalSzUv = st.APalSzUv[col]; c.APalColU = st.APalColU[col];
                 c.Msac.Mark((sby << 16) | sbx);
+                SbCosts(c);
                 t_sbLamMul = Sp.AomSbLambda ? SbLambdaMul(c, sbx, sby) : 0;
                 EncodePartitionColor(c, 1, sbx * 16, sby * 16);
                 t_sbLamMul = 0;
@@ -5469,6 +5476,16 @@ internal static partial class Av1StillImageEncoder
     private static double RdoqScale => Sp.AomRdoqScale > 0 ? Sp.AomRdoqScale : RdoqLambdaScale;
     // chroma trellis / RDOQ scale for the libaom chroma search (the preset's, else the dev static)
     private static double ChromaLamScale => Sp.AomChroma && Sp.AomChromaLam > 0 ? Sp.AomChromaLam : ChromaRdoqLambdaScale;
+    // Per-superblock coefficient cost tables (CoefCostTab; AV1_COSTTAB=0 / 1 overrides): rebuilt from the row's CDFs at
+    // every superblock start, as libaom's av1_fill_coeff_costs.
+    private static readonly string? CostTabEnv = Environment.GetEnvironmentVariable("AV1_COSTTAB");
+    private static void SbCosts(ColorPartCtx c)
+    {
+        var coef = c.Cdf.Coef;
+        if (CostTabEnv == "0" || (CostTabEnv != "1" && !Sp.CoefCostTab)) { coef.Tab = null; return; }
+        (coef.Tab ??= new Av1CoefCostTab()).Build(coef);
+    }
+
     // libaom allintra intra_sb_rdmult_modifier (AomSbLambda): this thread's superblock lambda factor (0 = 1).
     [ThreadStatic] private static double t_sbLamMul;
     private static double LamK

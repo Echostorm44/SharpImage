@@ -106,6 +106,8 @@ public sealed class Av1CdfCoefContext
     public ushort[][] EobHiBit = Alloc(5 * 2 * 9, 2);   // [N_TX_SIZES][2][9][2]
     public ushort[][] CoefSkip = Alloc(5 * 13, 2);      // [N_TX_SIZES][13][2]
     public ushort[][] DcSign = Alloc(2 * 3, 2);          // [2][3][2]
+    // The still encoder's per-superblock symbol cost tables for rate estimates (not a CDF: never copied or coded).
+    internal Av1CoefCostTab? Tab;
 
     private static ushort[][] Alloc(int rows, int cols)
     {
