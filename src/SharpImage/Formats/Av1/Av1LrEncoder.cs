@@ -7,6 +7,7 @@
 // pre-CDEF stripe lines there), so the search SSE is a close estimate and the decoded result is authoritative.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace SharpImage.Formats.Av1;
 
@@ -168,6 +169,33 @@ internal static class Av1LrEncoder
             return pp.Cost;
         }
         Plan? best = null; double bestCost = 0;   // cost relative to no restoration
+        Plan Combine(int shift, int uvShift)
+        {
+            var plan = new Plan { UnitShift = shift, UvShift = uvShift };
+            for (int p = 0; p < np; p++)
+            {
+                var pp = memo[(p, 6 + shift - (p != 0 ? uvShift : 0))];
+                plan.SizeLog2[p] = pp.SizeLog2[p]; plan.FrameType[p] = pp.FrameType[p]; plan.Units[p] = pp.Units[p];
+                plan.Cols[p] = pp.Cols[p]; plan.Rows[p] = pp.Rows[p];
+            }
+            return plan;
+        }
+        if (prune.AomSizes)
+        {
+            // av1_pick_filter_restoration: unit sizes from the largest down, chroma units the luma size (lr_uv_shift 0);
+            // stop once a smaller size does not beat the best so far, or nothing restores
+            var desc = shifts.OrderByDescending(v => v).ToArray();
+            foreach (int shift in desc)
+            {
+                double total = 0;
+                for (int p = 0; p < np; p++) total += PlaneCost(p, 6 + shift);
+                var plan = Combine(shift, 0);
+                if (plan.Any) total += lambda * (3 + (i420 ? 1 : 0));
+                if (!(total < bestCost)) break;
+                bestCost = total; best = plan;
+            }
+            return best;
+        }
         foreach (int shift in shifts)
             for (int uvShift = 0; uvShift <= (i420 && !monochrome ? 1 : 0); uvShift++)
             {
@@ -278,7 +306,8 @@ internal static class Av1LrEncoder
     /// WienerSrcVar = prune_wiener_based_on_src_var (skip Wiener when the source unit's variance sum is below
     /// (dc_q >> 3)^2 * level / 16), ReduceWiener = reduce_wiener_window_size (5-tap luma), DualSgrPenalty =
     /// dual_sgr_penalty_level; Qs = the frame's dc_q >> 3.</summary>
-    internal readonly record struct LrPrune(int SgrEp, int SgrOnWiener, int WienerSrcVar, bool ReduceWiener, int DualSgrPenalty, int Qs);
+    internal readonly record struct LrPrune(int SgrEp, int SgrOnWiener, int WienerSrcVar, bool ReduceWiener, int DualSgrPenalty, int Qs,
+        bool AomSizes = false);
 
     // enable_sgr_ep_pruning's search: seeds of group 1 (sets 0-9), then per group-1 winner one set of each of groups 2, 3
     private static readonly int[] SgrEpSeeds = { 0, 3, 6, 9 };

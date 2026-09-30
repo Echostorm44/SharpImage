@@ -75,6 +75,9 @@ internal sealed class Av1EncodeSpeed
     public bool AomPrune4Split;
     /// <summary>libaom's per-superblock coefficient cost tables for the rate estimates (Av1CoefCostTab).</summary>
     public bool CoefCostTab;
+    /// <summary>libaom's restoration unit-size search: largest first, chroma units the luma size, stop at the first
+    /// size that does not improve (av1_pick_filter_restoration).</summary>
+    public bool LrAomSizes;
     /// <summary>T-shape / 4-way partitions for 4:4:4 / 4:2:2 only (LayoutSpeedScope) when UseExtPartition is off.</summary>
     public bool ExtNon420;
     /// <summary>No CfL for 4:4:4 (LayoutSpeedScope): its full-size chroma makes the alpha search costly.</summary>
@@ -273,6 +276,9 @@ internal sealed class Av1EncodeSpeed
     {
         var p = new Av1EncodeSpeed();
         speed = Math.Clamp(speed, 0, 10);
+        // libaom's restoration unit-size search (largest first, early stop; chroma units the luma size): fox s2 LR 58 -> 44 ms,
+        // scoreboard BD unchanged (420 s2 -1.64 -> -1.63, 444 s2 -0.31).
+        p.LrAomSizes = true;
         if (speed >= 1) p.CnnPruneLevel = 2;
         if (speed >= 5) p.CnnPruneLevelScreen = 1;
         if (speed >= 2) p.HogLevel = 2;
@@ -1491,7 +1497,7 @@ internal static partial class Av1StillImageEncoder
             monochrome, i420, Bd, lambda, LrSgrSets, LrWienerRounds, LrStatsStep, ThreadCount,
             Enumerable.Range(0, 3).Where(sh => (LrUnitShiftMask >> sh & 1) != 0).ToArray(),
             new Av1LrEncoder.LrPrune(Sp.LrSgrEp, sct ? Sp.LrSgrOnWienerScreen : Sp.LrSgrOnWiener, Sp.LrWienerSrcVar, Sp.LrReduceWiener,
-                Sp.LrDualSgrPenalty, Av1Tables.DequantTable[BdIdx, baseQIdx, 0] >> 3));
+                Sp.LrDualSgrPenalty, Av1Tables.DequantTable[BdIdx, baseQIdx, 0] >> 3, Sp.LrAomSizes));
         if (plan == null) return null;
 
         // Replay each tile with the restoration syntax at its superblocks (fresh restoration CDFs / references per tile).

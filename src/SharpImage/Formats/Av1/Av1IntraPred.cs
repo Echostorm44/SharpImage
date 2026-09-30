@@ -1717,6 +1717,40 @@ public static class Av1IntraPred
         }
     }
 
+    /// <summary>dst[y * dstStride + x] = src[x * srcStride + y] for x &lt; w, y &lt; h (a column-major w x h block to rows):
+    /// 8 x 8 tiles of 16-bit lanes where both sides allow, scalar at the ragged edges.</summary>
+    private static void TransposeU16(ReadOnlySpan<ushort> src, int srcStride, Span<ushort> dst, int dstStride, int w, int h)
+    {
+        int w8 = Vector128.IsHardwareAccelerated ? w & ~7 : 0, h8 = Vector128.IsHardwareAccelerated ? h & ~7 : 0;
+        for (int x0 = 0; x0 < w8; x0 += 8)
+            for (int y0 = 0; y0 < h8; y0 += 8)
+            {
+                // rows of the tile = src columns x0..x0+7 (8 samples each at y0..)
+                var r0 = Vector128.Create(src.Slice((x0 + 0) * srcStride + y0, 8)).AsInt16(); var r1 = Vector128.Create(src.Slice((x0 + 1) * srcStride + y0, 8)).AsInt16();
+                var r2 = Vector128.Create(src.Slice((x0 + 2) * srcStride + y0, 8)).AsInt16(); var r3 = Vector128.Create(src.Slice((x0 + 3) * srcStride + y0, 8)).AsInt16();
+                var r4 = Vector128.Create(src.Slice((x0 + 4) * srcStride + y0, 8)).AsInt16(); var r5 = Vector128.Create(src.Slice((x0 + 5) * srcStride + y0, 8)).AsInt16();
+                var r6 = Vector128.Create(src.Slice((x0 + 6) * srcStride + y0, 8)).AsInt16(); var r7 = Vector128.Create(src.Slice((x0 + 7) * srcStride + y0, 8)).AsInt16();
+                var a0 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(r0, r1).AsInt32(); var a1 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(r0, r1).AsInt32();
+                var a2 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(r2, r3).AsInt32(); var a3 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(r2, r3).AsInt32();
+                var a4 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(r4, r5).AsInt32(); var a5 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(r4, r5).AsInt32();
+                var a6 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(r6, r7).AsInt32(); var a7 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(r6, r7).AsInt32();
+                var b0 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(a0, a2).AsInt64(); var b1 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(a0, a2).AsInt64();
+                var b2 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(a1, a3).AsInt64(); var b3 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(a1, a3).AsInt64();
+                var b4 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(a4, a6).AsInt64(); var b5 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(a4, a6).AsInt64();
+                var b6 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(a5, a7).AsInt64(); var b7 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(a5, a7).AsInt64();
+                System.Runtime.Intrinsics.X86.Sse2.UnpackLow(b0, b4).AsUInt16().CopyTo(dst.Slice((y0 + 0) * dstStride + x0, 8));
+                System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(b0, b4).AsUInt16().CopyTo(dst.Slice((y0 + 1) * dstStride + x0, 8));
+                System.Runtime.Intrinsics.X86.Sse2.UnpackLow(b1, b5).AsUInt16().CopyTo(dst.Slice((y0 + 2) * dstStride + x0, 8));
+                System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(b1, b5).AsUInt16().CopyTo(dst.Slice((y0 + 3) * dstStride + x0, 8));
+                System.Runtime.Intrinsics.X86.Sse2.UnpackLow(b2, b6).AsUInt16().CopyTo(dst.Slice((y0 + 4) * dstStride + x0, 8));
+                System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(b2, b6).AsUInt16().CopyTo(dst.Slice((y0 + 5) * dstStride + x0, 8));
+                System.Runtime.Intrinsics.X86.Sse2.UnpackLow(b3, b7).AsUInt16().CopyTo(dst.Slice((y0 + 6) * dstStride + x0, 8));
+                System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(b3, b7).AsUInt16().CopyTo(dst.Slice((y0 + 7) * dstStride + x0, 8));
+            }
+        for (int x = 0; x < w; x++)
+            for (int y = x < w8 ? h8 : 0; y < h; y++) dst[y * dstStride + x] = src[x * srcStride + y];
+    }
+
     /// <summary>row[x] = (src[b + x] * (64 - frac) + src[b + x + 1] * frac + 32) >> 6 for x &lt; n. For bit depths up to
     /// 10 the sum stays below 65536, so 16-bit vector lanes give the identical result.</summary>
     private static void InterpRun(Span<ushort> row, ReadOnlySpan<ushort> src, int b, int frac, int n, int bitDepth)
@@ -2036,14 +2070,16 @@ public static class Av1IntraPred
             Span<ushort> rev = stackalloc ushort[maxBaseY + 1];
             for (int i = 0; i <= maxBaseY; i++) rev[i] = srcL[leftOffset - i];
             ushort fill = rev[maxBaseY];
-            Span<ushort> col = stackalloc ushort[height];
+            // column x is a run down the left edge: computed as row x of a column-major block, then transposed
+            Span<ushort> cols = stackalloc ushort[width * height];
             for (int x = 0, ypos = dy; x < width; x++, ypos += dy)
             {
+                var col = cols.Slice(x * height, height);
                 int b = ypos >> 6, n = Math.Clamp(maxBaseY - b, 0, height);
                 InterpRun(col, rev, b, ypos & 0x3E, n, bitDepth);
                 if (n < height) col.Slice(n).Fill(fill);
-                for (int y = 0; y < height; y++) dst[y * dstStride + x] = col[y];
             }
+            TransposeU16(cols, height, dst, dstStride, width, height);
             return;
         }
         for (int x = 0, ypos = dy; x < width; x++, ypos += dy)
