@@ -2116,10 +2116,12 @@ public static class Av1IntraPred
         // the input clamped to [from, to) once: pad[k] = input[clamp(k - 2)] (+16 slack for the vector tail)
         Span<ushort> pad = stackalloc ushort[sz + 4 + 16];
         ushort lo = input[inputOffset + from], hi = input[inputOffset + to - 1];
-        for (int k = 0; k < sz + 4 + 16; k++)
         {
-            int p = k - 2;
-            pad[k] = p < from ? lo : p >= to ? hi : input[inputOffset + p];
+            // pad[k] = input[clamp(k - 2, from, to - 1)]: [0, a) = lo, [a, b) copied, [b, end) = hi
+            int n = sz + 4 + 16, a = Math.Clamp(from + 2, 0, n), b = Math.Clamp(to + 2, a, n);
+            pad.Slice(0, a).Fill(lo);
+            if (b > a) input.Slice(inputOffset + a - 2, b - a).CopyTo(pad.Slice(a));
+            pad.Slice(b).Fill(hi);
         }
         int i = 0, end = Math.Min(limTo, sz);
         for (; i < Math.Min(sz, limFrom); i++) output[i] = pad[i + 2];
