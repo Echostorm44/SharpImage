@@ -56,7 +56,7 @@ internal struct AomPaletteModeInfo
 }
 
 /// <summary>MB_MODE_INFO (the intra key-frame fields).</summary>
-internal sealed class AomMbModeInfo
+internal sealed partial class AomMbModeInfo
 {
     public int Bsize;
     public int Partition;
@@ -102,7 +102,7 @@ internal struct AomBuf2d
 }
 
 /// <summary>struct macroblock_plane (MACROBLOCK_PLANE).</summary>
-internal sealed class AomMbPlane
+internal sealed partial class AomMbPlane
 {
     public const int MaxSbSquare = 128 * 128;
     public readonly short[] SrcDiff = new short[MaxSbSquare];
@@ -118,7 +118,7 @@ internal sealed class AomMbPlane
 }
 
 /// <summary>struct macroblockd_plane (MACROBLOCKD_PLANE).</summary>
-internal sealed class AomMbdPlane
+internal sealed partial class AomMbdPlane
 {
     public int PlaneType;
     public int SubsamplingX, SubsamplingY;

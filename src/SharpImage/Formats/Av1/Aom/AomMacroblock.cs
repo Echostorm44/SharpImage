@@ -4,7 +4,7 @@ using static SharpImage.Formats.Av1.AomTables;
 namespace SharpImage.Formats.Av1;
 
 /// <summary>MACROBLOCKD (av1/common/blockd.h): the decoder-side view of the current block.</summary>
-internal sealed class AomMacroblockD
+internal sealed partial class AomMacroblockD
 {
     public const int MaxMibSize = 32;          // MAX_MIB_SIZE (128 / 4)
     public int MiRow, MiCol;
@@ -44,7 +44,7 @@ internal sealed class AomMacroblockD
 }
 
 /// <summary>CFL_CTX (av1/common/blockd.h).</summary>
-internal sealed class AomCflCtx
+internal sealed partial class AomCflCtx
 {
     public const int CflBufLine = 32, CflBufSquare = CflBufLine * CflBufLine;
     public readonly ushort[] ReconBufQ3 = new ushort[CflBufSquare];
@@ -114,4 +114,26 @@ internal sealed class AomPickModeContext
     public int RdModeIsReady;
     public bool[] Blk_skip = Array.Empty<bool>();
     // coefficient buffers of the chosen mode (for the final encode reuse): not used on the all-intra path
+}
+
+/// <summary>MACROBLOCK (av1/encoder/block.h): the encoder-side state of the current block (partial: the port's files
+/// add the fields their functions use).</summary>
+internal sealed partial class AomMacroblock
+{
+    public readonly AomMbPlane[] Plane = { new(), new(), new() };
+    public readonly AomMacroblockD E = new();
+    public int Qindex;
+    public int DeltaQindex;
+    public int Rdmult;
+    public int IntraSbRdmultModifier = 128;
+    public readonly AomModeCosts ModeCosts = new();
+    public readonly AomCoeffCosts CoeffCosts = new();
+    public int Errorperbit;
+    public readonly AomTxfmSearchParams TxfmSearchParams = new();
+    public AomWinnerModeStats[] WinnerModeStats = System.Array.Empty<AomWinnerModeStats>();
+    public int WinnerModeCount;
+    public int RdModel;                       // TXFM_RD_MODEL: FULL_TXFM_RD / LOW_TXFM_RD
+    public int[] DqcoeffBuf = new int[AomMbPlane.MaxSbSquare];
+    public uint SourceVariance;
+    public bool MustFindValidPartition;
 }
