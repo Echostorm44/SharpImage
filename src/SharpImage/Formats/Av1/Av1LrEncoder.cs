@@ -8,6 +8,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace SharpImage.Formats.Av1;
 
@@ -327,7 +329,7 @@ internal static class Av1LrEncoder
         public ushort[] Base = [], Left = [], Work = [];
         public readonly ushort[][] F0 = Empty16(), F1 = Empty16();
         private static ushort[][] Empty16() { var a = new ushort[16][]; Array.Fill(a, Array.Empty<ushort>()); return a; }
-        public double[] Pad = [], VBuf = [], HBuf = [];
+        public int[] PadI = [], VBufI = [], HBufI = [];
         public int[] P = [], Sv = [];
         public readonly int[][] T0 = EmptyI16(), T1 = EmptyI16();
         private static int[][] EmptyI16() { var a = new int[16][]; Array.Fill(a, Array.Empty<int>()); return a; }
@@ -547,15 +549,18 @@ internal static class Av1LrEncoder
     private static (int[] H, int[] V) FitWiener(ushort[] src, int srcStride, ushort[] buf, int stride, ushort[] left,
         bool haveLeft, bool haveRight, int x0, int y0, int uw, int uh, bool chroma, int rounds, int step)
     {
+        // Integer form of the model: with taps k (sum 128) the filtered values are F = sum k * pad (= 128 x the float
+        // model), the features f = F-differences / 128^2 and the target = (128 * src - F) / 128, so the normal
+        // equations are the exact 64-bit sums A = sum Fa * Fb, B = sum Fa * T scaled by 2^-28 / 2^-21: sol = 128 A^-1 B.
         int pw = uw + 6, ph = uh + 6;
         var sc = t_scratch ??= new Scratch();
-        var pad = Scratch.Get(ref sc.Pad, pw * ph);
+        var pad = Scratch.Get(ref sc.PadI, pw * ph + 8);
         for (int y = 0; y < ph; y++)
         {
             int sy = Math.Clamp(y - 3, 0, uh - 1);
             for (int x = 0; x < pw; x++)
             {
-                int sx = x - 3; double v;
+                int sx = x - 3; int v;
                 if (sx < 0) v = haveLeft ? left[sy * 4 + 4 + sx] : buf[sy * stride];
                 else if (sx >= uw) v = haveRight ? buf[sy * stride + Math.Min(sx, uw + 2)] : buf[sy * stride + uw - 1];
                 else v = buf[sy * stride + sx];
@@ -564,63 +569,133 @@ internal static class Av1LrEncoder
         }
         int m = chroma ? 2 : 3, off = chroma ? 1 : 0;   // chroma is 5-tap: tap 0 stays 0
         int[] hT = { 0, 0, 0 }, vT = { 0, 0, 0 };
-        var vBuf = Scratch.Get(ref sc.VBuf, uh * pw);   // vertically filtered, unit rows x padded cols
-        var hBuf = Scratch.Get(ref sc.HBuf, ph * uw);   // horizontally filtered, padded rows x unit cols
-        Span<double> f = stackalloc double[3], aug = stackalloc double[12], sol = stackalloc double[3];
+        var vBuf = Scratch.Get(ref sc.VBufI, uh * pw + 8);   // vertically filtered (x128), unit rows x padded cols
+        var hBuf = Scratch.Get(ref sc.HBufI, ph * uw + 8);   // horizontally filtered (x128), padded rows x unit cols
+        Span<double> aug = stackalloc double[12], sol = stackalloc double[3];
+        Span<long> acc = stackalloc long[9];
+        bool vec = Avx2.IsSupported && step == 1;
         for (int round = 0; round < rounds; round++)
         {
             for (int axis = 0; axis < 2; axis++)
             {
-                double a00 = 0, a01 = 0, a02 = 0, a11 = 0, a12 = 0, a22 = 0, b0 = 0, b1 = 0, b2 = 0;
+                var t = axis == 0 ? vT : hT;   // the fixed axis' taps
+                int k0 = t[0], k1 = t[1], k2 = t[2], k3 = 128 - 2 * (k0 + k1 + k2);
                 if (axis == 0)
                 {
-                    double[] kv = Kernel(vT);
                     for (int y = 0; y < uh; y += step)
-                        for (int x = 0; x < pw; x++)
-                        {
-                            double sum = 0; for (int j = 0; j < 7; j++) sum += kv[j] * pad[(y + j) * pw + x];
-                            vBuf[y * pw + x] = sum / 128;
-                        }
+                    {
+                        int o = y * pw;
+                        int x = 0;
+                        if (vec)
+                            for (; x < pw; x += 8)
+                            {
+                                var s = Vector256.Create(k0) * (Ld(pad, o + x) + Ld(pad, o + 6 * pw + x))
+                                      + Vector256.Create(k1) * (Ld(pad, o + pw + x) + Ld(pad, o + 5 * pw + x))
+                                      + Vector256.Create(k2) * (Ld(pad, o + 2 * pw + x) + Ld(pad, o + 4 * pw + x))
+                                      + Vector256.Create(k3) * Ld(pad, o + 3 * pw + x);
+                                s.CopyTo(vBuf.AsSpan(o + x, 8));
+                            }
+                        for (; x < pw; x++)
+                            vBuf[o + x] = k0 * (pad[o + x] + pad[o + 6 * pw + x]) + k1 * (pad[o + pw + x] + pad[o + 5 * pw + x])
+                                        + k2 * (pad[o + 2 * pw + x] + pad[o + 4 * pw + x]) + k3 * pad[o + 3 * pw + x];
+                    }
                 }
                 else
                 {
-                    double[] kh = Kernel(hT);
                     for (int y = 0; y < ph; y++)
-                        for (int x = 0; x < uw; x += step)
-                        {
-                            double sum = 0; for (int i = 0; i < 7; i++) sum += kh[i] * pad[y * pw + x + i];
-                            hBuf[y * uw + x] = sum / 128;
-                        }
-                }
-                for (int y = 0; y < uh; y += step)
-                    for (int x = 0; x < uw; x += step)
                     {
-                        double centre;
+                        int o = y * pw, oh = y * uw;
+                        int x = 0;
+                        if (vec)
+                            for (; x < uw; x += 8)
+                            {
+                                var s = Vector256.Create(k0) * (Ld(pad, o + x) + Ld(pad, o + x + 6))
+                                      + Vector256.Create(k1) * (Ld(pad, o + x + 1) + Ld(pad, o + x + 5))
+                                      + Vector256.Create(k2) * (Ld(pad, o + x + 2) + Ld(pad, o + x + 4))
+                                      + Vector256.Create(k3) * Ld(pad, o + x + 3);
+                                s.CopyTo(hBuf.AsSpan(oh + x, 8));
+                            }
+                        for (; x < uw; x += step)
+                            hBuf[oh + x] = k0 * (pad[o + x] + pad[o + x + 6]) + k1 * (pad[o + x + 1] + pad[o + x + 5])
+                                         + k2 * (pad[o + x + 2] + pad[o + x + 4]) + k3 * pad[o + x + 3];
+                    }
+                }
+                acc.Clear();
+                for (int y = 0; y < uh; y += step)
+                {
+                    int x = 0;
+                    int so = (y0 + y) * srcStride + x0;
+                    if (vec)
+                    {
+                        var s00 = Vector256<long>.Zero; var s01 = s00; var s02 = s00; var s11 = s00; var s12 = s00; var s22 = s00;
+                        var t0 = s00; var t1 = s00; var t2 = s00;
+                        for (; x + 8 <= uw; x += 8)
+                        {
+                            Vector256<int> c, fa0, fa1, fa2;
+                            if (axis == 0)
+                            {
+                                int o = y * pw + x + 3; c = Ld(vBuf, o);
+                                fa0 = Feat(vBuf, o, 3 - off, c); fa1 = Feat(vBuf, o, 2 - off, c);
+                                fa2 = m > 2 ? Feat(vBuf, o, 1, c) : Vector256<int>.Zero;
+                            }
+                            else
+                            {
+                                int o = (y + 3) * uw + x; c = Ld(hBuf, o);
+                                fa0 = FeatV(hBuf, o, (3 - off) * uw, c); fa1 = FeatV(hBuf, o, (2 - off) * uw, c);
+                                fa2 = m > 2 ? FeatV(hBuf, o, uw, c) : Vector256<int>.Zero;
+                            }
+                            var tg = Vector256.ShiftLeft(Avx2.ConvertToVector256Int32(Vector128.Create(src.AsSpan(so + x, 8))), 7) - c;
+                            Mac(ref s00, fa0, fa0); Mac(ref s01, fa0, fa1); Mac(ref s11, fa1, fa1); Mac(ref t0, fa0, tg); Mac(ref t1, fa1, tg);
+                            if (m > 2) { Mac(ref s02, fa0, fa2); Mac(ref s12, fa1, fa2); Mac(ref s22, fa2, fa2); Mac(ref t2, fa2, tg); }
+                        }
+                        acc[0] += Vector256.Sum(s00); acc[1] += Vector256.Sum(s01); acc[2] += Vector256.Sum(s02);
+                        acc[3] += Vector256.Sum(s11); acc[4] += Vector256.Sum(s12); acc[5] += Vector256.Sum(s22);
+                        acc[6] += Vector256.Sum(t0); acc[7] += Vector256.Sum(t1); acc[8] += Vector256.Sum(t2);
+                    }
+                    for (; x < uw; x += step)
+                    {
+                        long c, g0, g1, g2 = 0;
                         if (axis == 0)
                         {
-                            int o = y * pw + x + 3; centre = vBuf[o];
-                            for (int a = 0; a < m; a++) { int d = 3 - (a + off); f[a] = (vBuf[o - d] + vBuf[o + d] - 2 * centre) / 128; }
+                            int o = y * pw + x + 3; c = vBuf[o];
+                            g0 = vBuf[o - 3 + off] + vBuf[o + 3 - off] - 2 * c; g1 = vBuf[o - 2 + off] + vBuf[o + 2 - off] - 2 * c;
+                            if (m > 2) g2 = vBuf[o - 1] + vBuf[o + 1] - 2 * c;
                         }
                         else
                         {
-                            int o = (y + 3) * uw + x; centre = hBuf[o];
-                            for (int a = 0; a < m; a++) { int d = 3 - (a + off); f[a] = (hBuf[o - d * uw] + hBuf[o + d * uw] - 2 * centre) / 128; }
+                            int o = (y + 3) * uw + x; c = hBuf[o];
+                            g0 = hBuf[o - (3 - off) * uw] + hBuf[o + (3 - off) * uw] - 2 * c; g1 = hBuf[o - (2 - off) * uw] + hBuf[o + (2 - off) * uw] - 2 * c;
+                            if (m > 2) g2 = hBuf[o - uw] + hBuf[o + uw] - 2 * c;
                         }
-                        double target = src[(y0 + y) * srcStride + x0 + x] - centre;
-                        double f0 = f[0], f1 = f[1], f2 = m > 2 ? f[2] : 0;
-                        a00 += f0 * f0; a01 += f0 * f1; a02 += f0 * f2; a11 += f1 * f1; a12 += f1 * f2; a22 += f2 * f2;
-                        b0 += f0 * target; b1 += f1 * target; b2 += f2 * target;
+                        long tg = 128L * src[so + x] - c;
+                        acc[0] += g0 * g0; acc[1] += g0 * g1; acc[2] += g0 * g2; acc[3] += g1 * g1; acc[4] += g1 * g2; acc[5] += g2 * g2;
+                        acc[6] += g0 * tg; acc[7] += g1 * tg; acc[8] += g2 * tg;
                     }
-                // the normal equations as an m x (m + 1) augmented matrix
+                }
+                // the normal equations as an m x (m + 1) augmented matrix (right side x 128: the 2^-28 / 2^-21 scales)
+                double a00 = acc[0], a01 = acc[1], a02 = acc[2], a11 = acc[3], a12 = acc[4], a22 = acc[5];
+                double b0 = acc[6] * 128.0, b1 = acc[7] * 128.0, b2 = acc[8] * 128.0;
                 if (m > 2) { aug[0] = a00; aug[1] = a01; aug[2] = a02; aug[3] = b0; aug[4] = a01; aug[5] = a11; aug[6] = a12; aug[7] = b1; aug[8] = a02; aug[9] = a12; aug[10] = a22; aug[11] = b2; }
                 else { aug[0] = a00; aug[1] = a01; aug[2] = b0; aug[3] = a01; aug[4] = a11; aug[5] = b1; }
                 if (!Solve(aug, m, sol)) continue;
-                var t = axis == 0 ? hT : vT;
-                for (int a = 0; a < m; a++) t[a + off] = Math.Clamp((int)Math.Round(sol[a]), WMin[a + off], WMax[a + off]);
+                var tt = axis == 0 ? hT : vT;
+                for (int a = 0; a < m; a++) tt[a + off] = Math.Clamp((int)Math.Round(sol[a]), WMin[a + off], WMax[a + off]);
             }
         }
         return (hT, vT);
     }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static Vector256<int> Ld(int[] a, int at) => Vector256.Create(a.AsSpan(at, 8));
+    // F[o - d] + F[o + d] - 2 F[o] along a row / down a column (stride sd)
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static Vector256<int> Feat(int[] a, int o, int d, Vector256<int> c) => Ld(a, o - d) + Ld(a, o + d) - c - c;
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static Vector256<int> FeatV(int[] a, int o, int sd, Vector256<int> c) => Ld(a, o - sd) + Ld(a, o + sd) - c - c;
+    // acc += a * b per lane, in 64 bits (vpmuldq on the even and the odd 32-bit lanes)
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void Mac(ref Vector256<long> acc, Vector256<int> a, Vector256<int> b)
+        => acc += Avx2.Multiply(a, b) + Avx2.Multiply(Avx2.ShiftRightLogical(a.AsInt64(), 32).AsInt32(), Avx2.ShiftRightLogical(b.AsInt64(), 32).AsInt32());
 
     private static double[] Kernel(int[] t) => new double[] { t[0], t[1], t[2], 128 - 2 * (t[0] + t[1] + t[2]), t[2], t[1], t[0] };
 
