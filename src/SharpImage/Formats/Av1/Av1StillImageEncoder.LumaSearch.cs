@@ -157,7 +157,7 @@ internal static partial class Av1StillImageEncoder
                     // adaptive_txb_search_level: the best so far already exceeds the remaining budget by the margin
                     if (Sp.AomAdaptiveTxb > 0 && bestJ != double.MaxValue && bestJ - bestJ / (1 << Sp.AomAdaptiveTxb) > budget) break;
                     // skip_tx_search: a type quantised to all zero ends the search
-                    if (Sp.AomSkipTxSearch && bestCf != null && !HasNonZero(bestCf)) break;
+                    if (Sp.AomSkipTxSearch && bestCf != null && !(bestEob != -2 ? bestEob >= 0 : HasNonZero(bestCf))) break;
                     if (oTp >= 0) { if ((int)inv != oTp) continue; }
                     else if ((mask >> (int)inv & 1) == 0) continue;
                     if (StatsOn) System.Threading.Interlocked.Increment(ref StatTypeTrials);
@@ -236,7 +236,7 @@ internal static partial class Av1StillImageEncoder
                     else Av1FwdTransform.ReturnLevels(cf);
                 }
                 // the coded levels are RDOQ'd (libaom's final encode trellises every block)
-                if (UseRdoq && (Sp.AomTrellisAll || trellis) && !bestRdoq && (OracleLevels == null || OracleLevels1DOnly) && bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && HasNonZero(bestCf))
+                if (UseRdoq && (Sp.AomTrellisAll || trellis) && !bestRdoq && (OracleLevels == null || OracleLevels1DOnly) && bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && (bestEob != -2 ? bestEob >= 0 : HasNonZero(bestCf)))
                 {
                     double qb = Quantise(bestCf, qfBest, bestIdx, bestEob);
                     bestEob = Sp.AomTrellis ? Av1CoeffEncode.LastTrellisEob : -2;

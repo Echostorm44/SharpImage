@@ -5814,10 +5814,12 @@ internal static partial class Av1StillImageEncoder
     // Predicts an n x n luma block with the given intra mode into dst (stride n), reusing the decoder's own edge
     // preparation + prediction so encoder and decoder agree bit-for-bit. recon is the reconstruction plane
     // (stride reconW), bx4/by4 the block position in 4-unit units, bw4/bh4 the frame size in 4-unit units.
+    [System.Runtime.CompilerServices.SkipLocalsInit]   // the edge buffer: only filled entries are read (AV1_EDGEPOISON=1 checks)
     private static void PredictIntra(ushort[] recon, int reconW, int bw4, int bh4, int bx4, int by4, int n,
         Av1IntraPredMode mode, int delta, ushort[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
     {
         Span<ushort> edge = stackalloc ushort[257];
+        if (EdgePoison) edge.Fill(0xB33F);   // dev: prove the predictors never read an unfilled edge entry
         const int edgeCenter = 128;
         int dstOff = (by4 * 4) * reconW + (bx4 * 4);
         int tw4 = n >> 2;
@@ -6388,11 +6390,15 @@ internal static partial class Av1StillImageEncoder
     // Used by PARTITION_HORZ / PARTITION_VERT leaves. Prediction/reconstruction reuse the decoder's own
     // PrepareIntraEdges + Av1IntraPred.Predict + InvTxfmAdd, so they are conformant by construction. ===
 
+    private static readonly bool EdgePoison = Environment.GetEnvironmentVariable("AV1_EDGEPOISON") == "1";
+
     // Intra prediction for a w x h block into dst (h rows x w cols, stride w).
+    [System.Runtime.CompilerServices.SkipLocalsInit]   // the edge buffer: only filled entries are read (AV1_EDGEPOISON=1 checks)
     private static void PredictIntraRect(ushort[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
         int w, int h, Av1IntraPredMode mode, int delta, ushort[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
     {
         Span<ushort> edge = stackalloc ushort[257];
+        if (EdgePoison) edge.Fill(0xB33F);   // dev: prove the predictors never read an unfilled edge entry
         const int edgeCenter = 128;
         int dstOff = (by4 * 4) * reconW + (bx4 * 4);
         int tw4 = w >> 2, th4 = h >> 2;
