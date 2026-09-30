@@ -59,7 +59,17 @@ public sealed class AomEncoderSmoke
             using var bsTrace = bsTracePath != null ? new StreamWriter(bsTracePath) : null;
             // AOM_SMOKE_NEG=1 (negative control): pack with disable_cdf_update, which must no longer match libaom
             if (Environment.GetEnvironmentVariable("AOM_SMOKE_NEG") == "1") cpi.DisableCdfUpdate = true;
-            File.WriteAllBytes(obuPath, AomBitstream.PackFrame(cpi, trace: bsTrace));
+            // AOM_SMOKE_CICP=cp,tc,mc / AOM_SMOKE_RANGE=0 (studio) / AOM_SMOKE_CSP=<chroma sample position>
+            var seqCfg = new AomSequenceConfig();
+            string? cicp = Environment.GetEnvironmentVariable("AOM_SMOKE_CICP");
+            if (cicp != null)
+            {
+                var parts = cicp.Split(',').Select(int.Parse).ToArray();
+                (seqCfg.ColorPrimaries, seqCfg.TransferCharacteristics, seqCfg.MatrixCoefficients) = (parts[0], parts[1], parts[2]);
+            }
+            if (Environment.GetEnvironmentVariable("AOM_SMOKE_RANGE") == "0") seqCfg.ColorRange = 0;
+            if (Environment.GetEnvironmentVariable("AOM_SMOKE_CSP") is string csp) seqCfg.ChromaSamplePosition = int.Parse(csp);
+            File.WriteAllBytes(obuPath, AomBitstream.PackFrame(cpi, seqCfg, bsTrace));
         }
         // AOM_SMOKE_RECON=<path>: the reconstruction as 8-bit 4:2:0 planes (compare with a decoder's output)
         string? reconPath = Environment.GetEnvironmentVariable("AOM_SMOKE_RECON");
