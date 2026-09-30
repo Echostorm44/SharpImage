@@ -2192,6 +2192,32 @@ public sealed class Av1HbdVerify
                     log.AppendLine($"invcheck runs {runs} mismatches {bad}");
                     continue;
                 }
+                if (t[0] == "predbench")
+                {
+                    // predbench: ns per Predict16 call (8-bit samples) per implementation mode / size, edge filter on
+                    var rng = new Random(5);
+                    var edge = new ushort[513]; for (int i = 0; i < edge.Length; i++) edge[i] = (ushort)rng.Next(256);
+                    var dst = new ushort[64 * 64];
+                    // impl modes as Av1IntraPred.Predict16's switch: 0 DC, 1 V, 2 H, 3 Paeth, 4 Smooth, 10 Z1, 11 Z2, 12 Z3, 13 filter
+                    var modes = new (string Name, int Impl, int Angle)[] { ("dc", 0, 0), ("v", 1, 0), ("h", 2, 0), ("paeth", 3, 0), ("smooth", 4, 0),
+                        ("z1-67", 10, 67), ("z1-45", 10, 45), ("z2-135", 11, 135), ("z2-113", 11, 113), ("z3-203", 12, 203), ("filter", 13, 0) };
+                    foreach (int n in new[] { 4, 8, 16, 32 })
+                    {
+                        var sb = new System.Text.StringBuilder($"predbench {n}x{n}:");
+                        foreach (var (name, impl, ang) in modes)
+                        {
+                            if (impl == 13 && n > 32) continue;
+                            int a = ang | (1 << 10);   // edge filter enabled
+                            for (int i = 0; i < 2000; i++) Av1IntraPred.Predict16(impl, dst, n, edge, 256, n, n, a, n, n, 8);
+                            int iters = Math.Max(20000, 2_000_000 / (n * n));
+                            var sw = System.Diagnostics.Stopwatch.StartNew();
+                            for (int i = 0; i < iters; i++) Av1IntraPred.Predict16(impl, dst, n, edge, 256, n, n, a, n, n, 8);
+                            sb.Append($" {name} {sw.Elapsed.TotalMilliseconds * 1e6 / iters:F0}");
+                        }
+                        log.AppendLine(sb.ToString());
+                    }
+                    continue;
+                }
                 if (t[0] == "invbench")
                 {
                     // invbench x: ns per Av1InvTransform.InvTxfmAdd16 (8-bit, DCT_DCT and ADST_ADST) per tx size, with k nonzero

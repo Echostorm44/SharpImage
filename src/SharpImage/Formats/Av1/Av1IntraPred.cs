@@ -7,6 +7,7 @@ using System.Runtime.Intrinsics;
 using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace SharpImage.Formats.Av1;
 
@@ -1326,6 +1327,47 @@ public static class Av1IntraPred
         int width, int height)
     {
         int tl = edgeBuf[center];
+        if (Vector256.IsHardwareAccelerated && width >= 16)
+        {
+            // 16 lanes: |left - base| = |top - tl|, |top - base| = |left - tl|, |tl - base| = |left + top - 2tl|
+            // (within 16 bits at <= 12-bit samples)
+            var vtl = Vector256.Create((short)tl);
+            for (int y = 0; y < height; y++)
+            {
+                int left = edgeBuf[center - 1 - y];
+                var vl = Vector256.Create((short)left);
+                var tdiff = Vector256.Create((short)Math.Abs(left - tl));
+                var row = dst.Slice(y * dstStride, width);
+                for (int x = 0; x < width; x += 16)
+                {
+                    var top = Vector256.Create(edgeBuf.Slice(center + 1 + x, 16)).AsInt16();
+                    var ldiff = Vector256.Abs(top - vtl);
+                    var tldiff = Vector256.Abs(vl + top - vtl - vtl);
+                    var useLeft = Vector256.LessThanOrEqual(ldiff, tdiff) & Vector256.LessThanOrEqual(ldiff, tldiff);
+                    var useTop = Vector256.LessThanOrEqual(tdiff, tldiff);
+                    var v = Vector256.ConditionalSelect(useLeft, vl, Vector256.ConditionalSelect(useTop, top, vtl));
+                    v.AsUInt16().CopyTo(row.Slice(x, 16));
+                }
+            }
+            return;
+        }
+        if (Vector128.IsHardwareAccelerated && width == 8)
+        {
+            var vtl = Vector128.Create((short)tl);
+            var top = Vector128.Create(edgeBuf.Slice(center + 1, 8)).AsInt16();
+            var ldiff = Vector128.Abs(top - vtl);
+            for (int y = 0; y < height; y++)
+            {
+                int left = edgeBuf[center - 1 - y];
+                var vl = Vector128.Create((short)left);
+                var tdiff = Vector128.Create((short)Math.Abs(left - tl));
+                var tldiff = Vector128.Abs(vl + top - vtl - vtl);
+                var useLeft = Vector128.LessThanOrEqual(ldiff, tdiff) & Vector128.LessThanOrEqual(ldiff, tldiff);
+                var useTop = Vector128.LessThanOrEqual(tdiff, tldiff);
+                Vector128.ConditionalSelect(useLeft, vl, Vector128.ConditionalSelect(useTop, top, vtl)).AsUInt16().CopyTo(dst.Slice(y * dstStride, 8));
+            }
+            return;
+        }
         for (int y = 0; y < height; y++)
         {
             int left = edgeBuf[center - 1 - y];
@@ -1352,6 +1394,34 @@ public static class Av1IntraPred
         var weightsV = Av1Tables.SmoothWeights.AsSpan(height, height);
         int right = edgeBuf[center + width];
         int bottom = edgeBuf[center - height];
+        if (Vector256.IsHardwareAccelerated && width >= 8)
+        {
+            // per column: top, wH and (256 - wH) * right + 256 fixed; per row two broadcasts
+            int nc = width >> 3;
+            Span<Vector256<int>> colTop = stackalloc Vector256<int>[nc], colW = stackalloc Vector256<int>[nc], colC = stackalloc Vector256<int>[nc];
+            Span<int> tmp = stackalloc int[8];
+            for (int k = 0; k < nc; k++)
+            {
+                for (int i = 0; i < 8; i++) tmp[i] = edgeBuf[center + 1 + k * 8 + i];
+                colTop[k] = Vector256.Create<int>(tmp);
+                for (int i = 0; i < 8; i++) tmp[i] = weightsH[k * 8 + i];
+                colW[k] = Vector256.Create<int>(tmp);
+                colC[k] = (Vector256.Create(256) - colW[k]) * right + Vector256.Create(256);
+            }
+            for (int y = 0; y < height; y++)
+            {
+                var wv = Vector256.Create((int)weightsV[y]);
+                var c = Vector256.Create((256 - weightsV[y]) * bottom);
+                var l = Vector256.Create((int)edgeBuf[center - 1 - y]);
+                var row = dst.Slice(y * dstStride, width);
+                for (int k = 0; k < nc; k++)
+                {
+                    var pred = Vector256.ShiftRightArithmetic(wv * colTop[k] + c + colW[k] * l + colC[k], 9);
+                    Vector128.Narrow(pred.GetLower().AsUInt32(), pred.GetUpper().AsUInt32()).CopyTo(row.Slice(k * 8, 8));
+                }
+            }
+            return;
+        }
 
         for (int y = 0; y < height; y++)
         {
@@ -1374,6 +1444,29 @@ public static class Av1IntraPred
     {
         var weightsV = Av1Tables.SmoothWeights.AsSpan(height, height);
         int bottom = edgeBuf[center - height];
+        if (Vector256.IsHardwareAccelerated && width >= 8)
+        {
+            int nc = width >> 3;
+            Span<Vector256<int>> colTop = stackalloc Vector256<int>[nc];
+            Span<int> tmp = stackalloc int[8];
+            for (int k = 0; k < nc; k++)
+            {
+                for (int i = 0; i < 8; i++) tmp[i] = edgeBuf[center + 1 + k * 8 + i];
+                colTop[k] = Vector256.Create<int>(tmp);
+            }
+            for (int y = 0; y < height; y++)
+            {
+                var wv = Vector256.Create((int)weightsV[y]);
+                var c = Vector256.Create((256 - weightsV[y]) * bottom + 128);
+                var row = dst.Slice(y * dstStride, width);
+                for (int k = 0; k < nc; k++)
+                {
+                    var pred = Vector256.ShiftRightArithmetic(wv * colTop[k] + c, 8);
+                    Vector128.Narrow(pred.GetLower().AsUInt32(), pred.GetUpper().AsUInt32()).CopyTo(row.Slice(k * 8, 8));
+                }
+            }
+            return;
+        }
 
         for (int y = 0; y < height; y++)
         {
@@ -1394,6 +1487,29 @@ public static class Av1IntraPred
     {
         var weightsH = Av1Tables.SmoothWeights.AsSpan(width, width);
         int right = edgeBuf[center + width];
+        if (Vector256.IsHardwareAccelerated && width >= 8)
+        {
+            int nc = width >> 3;
+            Span<Vector256<int>> colW = stackalloc Vector256<int>[nc], colC = stackalloc Vector256<int>[nc];
+            Span<int> tmp = stackalloc int[8];
+            for (int k = 0; k < nc; k++)
+            {
+                for (int i = 0; i < 8; i++) tmp[i] = weightsH[k * 8 + i];
+                colW[k] = Vector256.Create<int>(tmp);
+                colC[k] = (Vector256.Create(256) - colW[k]) * right + Vector256.Create(128);
+            }
+            for (int y = 0; y < height; y++)
+            {
+                var l = Vector256.Create((int)edgeBuf[center - 1 - y]);
+                var row = dst.Slice(y * dstStride, width);
+                for (int k = 0; k < nc; k++)
+                {
+                    var pred = Vector256.ShiftRightArithmetic(colW[k] * l + colC[k], 8);
+                    Vector128.Narrow(pred.GetLower().AsUInt32(), pred.GetUpper().AsUInt32()).CopyTo(row.Slice(k * 8, 8));
+                }
+            }
+            return;
+        }
 
         for (int y = 0; y < height; y++)
         {
@@ -2017,6 +2133,7 @@ public static class Av1IntraPred
         int max = (1 << bitDepth) - 1;
         int topIdx = center + 1;
         int dstOffset = 0;
+        if (Vector256.IsHardwareAccelerated) { PredFilter16V(dst, dstStride, edgeBuf, center, width, height, filterIndex, max); return; }
 
         for (int y = 0; y < height; y += 2)
         {
@@ -2078,6 +2195,58 @@ public static class Av1IntraPred
                     topleftEdgeIdx = topIdx + x + 3;
             }
 
+            dstOffset += dstStride * 2;
+        }
+    }
+
+    // FilterIntraTaps rearranged: [index][k 0..6][position 0..7] = tap of neighbour p_k for output position (row 0 x 0-3,
+    // row 1 x 0-3), so a 4 x 2 block is seven broadcast multiply-adds.
+    private static readonly int[] FilterTapsByNeighbour = BuildFilterTapsByNeighbour();
+    private static int[] BuildFilterTapsByNeighbour()
+    {
+        var t = new int[5 * 7 * 8];
+        for (int f = 0; f < 5; f++)
+            for (int k = 0; k < 7; k++)
+                for (int pos = 0; pos < 8; pos++) t[(f * 7 + k) * 8 + pos] = Av1Tables.FilterIntraTaps[f, pos + 8 * k];
+        return t;
+    }
+
+    // PredFilter16 with one 4 x 2 block per vector (the blocks stay a serial chain: each reads its left / above neighbours'
+    // outputs); identical arithmetic.
+    private static void PredFilter16V(Span<ushort> dst, int dstStride, ReadOnlySpan<ushort> edgeBuf, int center,
+        int width, int height, int filterIndex, int max)
+    {
+        ref int tp = ref MemoryMarshal.GetArrayDataReference(FilterTapsByNeighbour);
+        tp = ref Unsafe.Add(ref tp, filterIndex * 56);
+        var k0 = Vector256.LoadUnsafe(ref tp); var k1 = Vector256.LoadUnsafe(ref tp, 8); var k2 = Vector256.LoadUnsafe(ref tp, 16);
+        var k3 = Vector256.LoadUnsafe(ref tp, 24); var k4 = Vector256.LoadUnsafe(ref tp, 32); var k5 = Vector256.LoadUnsafe(ref tp, 40);
+        var k6 = Vector256.LoadUnsafe(ref tp, 48);
+        var r8 = Vector256.Create(8); var vmax = Vector256.Create(max);
+        int topIdx = center + 1, dstOffset = 0;
+        for (int y = 0; y < height; y += 2)
+        {
+            int topleftEdgeIdx = center - y;
+            for (int x = 0; x < width; x += 4)
+            {
+                int p0 = y == 0 ? edgeBuf[topleftEdgeIdx] : x == 0 ? edgeBuf[center - y] : dst[dstOffset - dstStride + x - 1];
+                int p1, p2, p3, p4;
+                if (y == 0) { p1 = edgeBuf[topIdx + x]; p2 = edgeBuf[topIdx + x + 1]; p3 = edgeBuf[topIdx + x + 2]; p4 = edgeBuf[topIdx + x + 3]; }
+                else
+                {
+                    int a = dstOffset - dstStride + x;
+                    p1 = dst[a]; p2 = dst[a + 1]; p3 = dst[a + 2]; p4 = dst[a + 3];
+                }
+                int p5, p6;
+                if (x == 0) { p5 = edgeBuf[center - y - 1]; p6 = edgeBuf[center - y - 2]; }
+                else { p5 = dst[dstOffset + x - 1]; p6 = dst[dstOffset + dstStride + x - 1]; }
+                var acc = k0 * Vector256.Create(p0) + k1 * Vector256.Create(p1) + k2 * Vector256.Create(p2) + k3 * Vector256.Create(p3)
+                        + k4 * Vector256.Create(p4) + k5 * Vector256.Create(p5) + k6 * Vector256.Create(p6);
+                var o = Vector256.Min(Vector256.Max(Vector256.ShiftRightArithmetic(acc + r8, 4), Vector256<int>.Zero), vmax);
+                var n = Vector128.Narrow(o.GetLower().AsUInt32(), o.GetUpper().AsUInt32()).AsUInt64();
+                MemoryMarshal.Write(MemoryMarshal.AsBytes(dst.Slice(dstOffset + x, 4)), n.GetElement(0));
+                MemoryMarshal.Write(MemoryMarshal.AsBytes(dst.Slice(dstOffset + dstStride + x, 4)), n.GetElement(1));
+                if (y == 0) topleftEdgeIdx = topIdx + x + 3;
+            }
             dstOffset += dstStride * 2;
         }
     }
