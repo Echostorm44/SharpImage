@@ -58,6 +58,27 @@ internal static class Av1FwdTransform
         return levels;
     }
 
+    /// <summary>ForwardQuantRect through libaom's integer forward for the hot search loops: the caller's level pool (this
+    /// thread's, fetched once per block: <see cref="ThreadLevels"/>) and bias, the eob returned (no thread-local traffic
+    /// per call). Bit-identical to ForwardQuantRect.</summary>
+    internal static int[] ForwardQuantLean(ReadOnlySpan<int> residual, int w, int h, int txSize, FwdTxType txType,
+        int dcDq, int acDq, double bias, int rcCount, double[]? qfOut, LevelPool pool, out int eob)
+    {
+        if (!AomFwdOk)
+        {
+            var r = ForwardQuantRect(residual, w, h, txSize, dcDq, acDq, rcCount, txType, qfOut);
+            eob = LastEob;
+            return r;
+        }
+        (int hType, int vType) = AxisTypes(txType);
+        if ((hType == Av1InvTransform.Type1dAdst && w > 16) || (vType == Av1InvTransform.Type1dAdst && h > 16)
+            || (hType == Av1InvTransform.Type1dIdentity && w > 32) || (vType == Av1InvTransform.Type1dIdentity && h > 32))
+            throw new InvalidOperationException($"AV1 forward transform {txType} is not defined for {w}x{h}");
+        var levels = pool.Rent(rcCount);
+        eob = Av1FwdTxfmAom.ForwardQuant(residual, w, h, txSize, hType, vType, dcDq, acDq, bias, levels, qfOut);
+        return levels;
+    }
+
     private static bool AomFwdOk => UseAomFwd && System.Runtime.Intrinsics.X86.Avx2.IsSupported;
     /// <summary>The eob (last nonzero scan index, -1 all zero) of this thread's latest libaom-forward quantisation; -2
     /// after a matrix-forward one (unknown).</summary>
@@ -513,25 +534,31 @@ internal static class Av1FwdTransform
     // Per-thread recycling of the quantised-level arrays (the RD searches transform every candidate and keep only the
     // winner): a search returns its losing candidates with ReturnLevels. Every entry of a rented array is overwritten
     // by the forward transform, so no clearing is needed. Pools by power-of-two length 16 .. 1024, a few arrays each.
-    [ThreadStatic] private static int[][][]? t_levelPool;
-    [ThreadStatic] private static int[]? t_levelPoolN;
-    internal static int[] RentLevels(int count)
+    /// <summary>A thread's pool of level arrays (power-of-two sizes 16 .. 1024, 8 each).</summary>
+    internal sealed class LevelPool
     {
-        int b = System.Numerics.BitOperations.Log2((uint)count);
-        if ((count & (count - 1)) == 0 && b >= 4 && b <= 10 && t_levelPool != null && t_levelPoolN![b] > 0)
-            return t_levelPool[b][--t_levelPoolN[b]];
-        return new int[count];
+        private readonly int[][][] arrays = new int[11][][];
+        private readonly int[] counts = new int[11];
+        public int[] Rent(int count)
+        {
+            int b = System.Numerics.BitOperations.Log2((uint)count);
+            if ((count & (count - 1)) == 0 && b >= 4 && b <= 10 && counts[b] > 0) return arrays[b][--counts[b]];
+            return new int[count];
+        }
+        public void Return(int[]? a)
+        {
+            if (a == null) return;
+            int count = a.Length, b = System.Numerics.BitOperations.Log2((uint)count);
+            if ((count & (count - 1)) != 0 || b < 4 || b > 10) return;
+            var st = arrays[b] ??= new int[8][];
+            if (counts[b] < st.Length) st[counts[b]++] = a;
+        }
     }
-    internal static void ReturnLevels(int[]? a)
-    {
-        if (a == null) return;
-        int count = a.Length, b = System.Numerics.BitOperations.Log2((uint)count);
-        if ((count & (count - 1)) != 0 || b < 4 || b > 10) return;
-        t_levelPool ??= new int[11][][];
-        t_levelPoolN ??= new int[11];
-        var st = t_levelPool[b] ??= new int[8][];
-        if (t_levelPoolN[b] < st.Length) st[t_levelPoolN[b]++] = a;
-    }
+    [ThreadStatic] private static LevelPool? t_levels;
+    /// <summary>This thread's level pool (RentLevels / ReturnLevels use it too).</summary>
+    internal static LevelPool ThreadLevels => t_levels ??= new LevelPool();
+    internal static int[] RentLevels(int count) => ThreadLevels.Rent(count);
+    internal static void ReturnLevels(int[]? a) { if (a != null) ThreadLevels.Return(a); }
 
     // Indexed by (logSize << 2) | type1d; filled on first use (a benign race builds identical arrays).
     private static readonly double[]?[] FwdMatrixFlatTCache = new double[]?[32];

@@ -101,6 +101,8 @@ internal static partial class Av1StillImageEncoder
         var pred = scr.P1; var res = scr.R; var qf = scr.Q1; var qfBest = scr.Q2;
         bool sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0, sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0;
         var list = RentTxbList((w4 / tw4) * (h4 / th4));
+        var lvPool = Av1FwdTransform.ThreadLevels;
+        double fwdBias = Av1FwdTransform.Bias;
         double jSum = 0;
         if (StatsOn) System.Threading.Interlocked.Increment(ref StatTrials);
         for (int iy = 0; iy < h4; iy += th4)
@@ -161,8 +163,8 @@ internal static partial class Av1StillImageEncoder
                     else if ((mask >> (int)inv & 1) == 0) continue;
                     if (StatsOn) System.Threading.Interlocked.Increment(ref StatTypeTrials);
                     long tq = TimingOn ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    int[] cf = Av1FwdTransform.ForwardQuantRect(res, tw, th, stx, c.DcDq, c.AcDq, sScan, fwd, qf);
-                    int cfEob = NoEobHint ? -2 : Av1FwdTransform.LastEob;   // valid while cf is the quantiser's output
+                    int[] cf = Av1FwdTransform.ForwardQuantLean(res, tw, th, stx, fwd, c.DcDq, c.AcDq, fwdBias, sScan, qf, lvPool, out int qEob);
+                    int cfEob = NoEobHint ? -2 : qEob;   // valid while cf is the quantiser's output
                     if (TimingOn) Tick(2, ref tq);
                     bool oneD = inv == Av1TxType.VDct || inv == Av1TxType.HDct;
                     bool pre = false;
@@ -208,7 +210,7 @@ internal static partial class Av1StillImageEncoder
                         for (int k = 0; k < sScan; k++) { double e = (qf[k] - cf[k]) * (k == 0 ? c.DcDq : c.AcDq); cd += e * e; }
                         lock (CalPix) { CalPix[stx] += sse; CalCoef[stx] += cd; CalN[stx]++; }
                     }
-                    if (sse >= bestJ) { Av1FwdTransform.ReturnLevels(cf); continue; }
+                    if (sse >= bestJ) { lvPool.Return(cf); continue; }
                     if (TimingOn) Tick(7, ref tq);
                     double bits = preBits >= 0 ? preBits : oneD
                         ? Av1CoeffEncode.EstimateCoefBits1D(c.Cdf.Coef, c.Cdf.Mode, stx, yModeNoFilt, inv, cf, skc, snc)
@@ -228,11 +230,11 @@ internal static partial class Av1StillImageEncoder
                     }
                     if (j < bestJ)
                     {
-                        Av1FwdTransform.ReturnLevels(bestCf);
+                        lvPool.Return(bestCf);
                         bestJ = j; bestBits = bits; bestCf = cf; bestInv = inv; bestIdx = idx; bestRdoq = rdoqd; bestEob = olv ? -2 : candEob;
                         if (!rdoqd) (qf, qfBest) = (qfBest, qf);   // keep this type's unquantised coefficients (no copy)
                     }
-                    else Av1FwdTransform.ReturnLevels(cf);
+                    else lvPool.Return(cf);
                 }
                 // the coded levels are RDOQ'd (libaom's final encode trellises every block)
                 if (UseRdoq && (Sp.AomTrellisAll || trellis) && !bestRdoq && (OracleLevels == null || OracleLevels1DOnly) && bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && (bestEob != -2 ? bestEob >= 0 : HasNonZero(bestCf)))
@@ -258,7 +260,7 @@ internal static partial class Av1StillImageEncoder
                 jSum += bestJ;
                 if (jSum > jLimit)
                 {
-                    foreach (var t in list) Av1FwdTransform.ReturnLevels(t.Cf);
+                    foreach (var t in list) lvPool.Return(t.Cf);
                     ReturnTxbList(list);
                     return (double.PositiveInfinity, null);
                 }
