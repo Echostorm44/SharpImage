@@ -3244,7 +3244,10 @@ internal static partial class Av1StillImageEncoder
         int dcU = ChromaDc(c, c.ReconU, cbx, cby, cn, cn);
         int dcV = ChromaDc(c, c.ReconV, cbx, cby, cn, cn);
         int scanLenC = Av1Tables.Scans[ctx0].Length;
-        var qfU = new double[scanLenC]; var qfV = new double[scanLenC];
+        // the chroma candidates' pre-quantisation arrays live until the end of this leaf: taken from the thread's arena
+        var qArena = Av1FwdTransform.ThreadDoubles;
+        int qMark = qArena.Mark();
+        var qfU = qArena.Take(scanLenC); var qfV = qArena.Take(scanLenC);
         int[] uC = ForwardResidual(c.U, c.Cw, cbx, cby, cn, dcU, c.DcDq, c.AcDq, scanLenC, qfU);
         int[] vC = ForwardResidual(c.V, c.Cw, cbx, cby, cn, dcV, c.DcDq, c.AcDq, scanLenC, qfV);
         double clam0 = LamK * c.AcDq * c.AcDq;
@@ -3334,7 +3337,7 @@ internal static partial class Av1StillImageEncoder
                 // transform KERNEL differs, so the forward transform and the reconstruction SSE MUST use it.
                 var uvTx = UvIntraTxType(ctx0, (int)mode);
                 var uvFwd = FwdTypeForTxType(uvTx);
-                var qfu2 = new double[scanLenC]; var qfv2 = new double[scanLenC];
+                var qfu2 = qArena.Take(scanLenC); var qfv2 = qArena.Take(scanLenC);
                 int[] uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, pu, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qfu2, uvFwd);
                 int[] vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, pv, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qfv2, uvFwd);
                 CRdoq(uu, qfu2, vv, qfv2);
@@ -3368,7 +3371,7 @@ internal static partial class Av1StillImageEncoder
                 int R = Math.Max(0, Sp.AomCflRange);
                 double PJ(TP[] src, TP[] pr, int skc, int sgc, out int[] lv, out double[] q)
                 {
-                    q = new double[scanLenC];
+                    q = qArena.Take(scanLenC);
                     lv = ForwardResidualPredRect(src, c.Cw, cbx, cby, pr, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, q);
                     if (HasNonZero(lv)) Av1CoeffEncode.TrellisOptimize(eCoef, eTx, 1, lv, q, eDcDq, eAcDq, skc, sgc, eClam);
                     return ChromaReconSse(lv, ctx0, cn, c.DcDq, c.AcDq, pr, src, c.Cw, cbx, cby)
@@ -3405,7 +3408,7 @@ internal static partial class Av1StillImageEncoder
             {
                 var pcflU = BuildCflPred<TP>(dcU, ac, cn, aU);
                 var pcflV = BuildCflPred<TP>(dcV, ac, cn, aV);
-                var qfUcfl = new double[scanLenC]; var qfVcfl = new double[scanLenC];
+                var qfUcfl = qArena.Take(scanLenC); var qfVcfl = qArena.Take(scanLenC);
                 int[] uCcfl = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, pcflU, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qfUcfl);
                 int[] vCcfl = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, pcflV, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qfVcfl);
                 CRdoq(uCcfl, qfUcfl, vCcfl, qfVcfl);
@@ -3427,7 +3430,7 @@ internal static partial class Av1StillImageEncoder
         {
             foreach (var cp in UvPaletteCandidates(c, cbx, cby, cn, cn))
             {
-                var qu = new double[scanLenC]; var qv = new double[scanLenC];
+                var qu = qArena.Take(scanLenC); var qv = qArena.Take(scanLenC);
                 int[] uu = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cp.PredU, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qu);
                 int[] vv = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cp.PredV, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qv);
                 if (aomSqC) CRdoq(uu, qu, vv, qv);
@@ -3564,6 +3567,7 @@ internal static partial class Av1StillImageEncoder
         for (int i = 0; i < cW && cxR + i < 32; i++) { c.ACU[cxR + i] = cfU; c.ACV[cxR + i] = cfV; c.AModeUv[cxR + i] = (byte)uvSym; }
         for (int j = 0; j < cH && cyR + j < 32; j++) { c.LCU[cyR + j] = cfU; c.LCV[cyR + j] = cfV; c.LModeUv[cyR + j] = (byte)uvSym; }
         FillPaletteCtx(c, bx4, by4, yW, yH, yPal, uvPal);
+        qArena.Release(qMark);
     }
 
     // Emits a fully-inside DC luma block as a palette block, in the decoder's exact order: skip=1, y_mode=DC,

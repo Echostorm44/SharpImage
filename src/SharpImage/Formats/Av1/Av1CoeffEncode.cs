@@ -99,8 +99,8 @@ internal static class Av1CoeffEncode
         int baseTokIdx = tDim.Ctx * 2 * 41 + chroma * 41;
         int brTokIdx = Math.Min((int)tDim.Ctx, 3) * 2 * 21 + chroma * 21;
 
-        // Level buffer for GetLoCtx neighbours (same layout/size as decode; padded by +2 in each dim).
-        var levels = new byte[stride * ((4 << slw) + 2)];
+        // Level buffer for GetLoCtx neighbours (same layout/size as decode; padded by +2 in each dim), zeroed on the stack.
+        Span<byte> levels = stackalloc byte[stride * ((4 << slw) + 2)];
 
         if (eob != 0)
         {
@@ -130,7 +130,7 @@ internal static class Av1CoeffEncode
                 int y = rcI & mask;
                 int mag = Math.Abs(signedLevels[rcI]);
 
-                int loCtx = Av1CoeffDecode.GetLoCtx(levels.AsSpan(rcI), Av1TxClass.TwoD, out uint hiMag,
+                int loCtx = Av1CoeffDecode.GetLoCtx(levels.Slice(rcI), Av1TxClass.TwoD, out uint hiMag,
                     LoCtxOffsetsIdx(tx), x, y, stride);
 
                 int tok = Math.Min(mag, 3);
@@ -243,7 +243,7 @@ internal static class Av1CoeffEncode
         int eobBaseTokIdx = tDim.Ctx * 2 * 4;
         int baseTokIdx = tDim.Ctx * 2 * 41;
         int brTokIdx = Math.Min((int)tDim.Ctx, 3) * 2 * 21;
-        var levels = new byte[stride * 20];
+        Span<byte> levels = stackalloc byte[stride * 20];
 
         if (eob != 0)
         {
@@ -261,7 +261,7 @@ internal static class Av1CoeffEncode
             {
                 int x = i & mask, y = i >> shift, levelIdx = x * stride + y;
                 int mag = Math.Abs(signedLevels[Rc1d(i, cls, shift, shift2, mask)]);
-                int loCtx = Av1CoeffDecode.GetLoCtx(levels.AsSpan(levelIdx), cls, out uint hiMag, -1, x, y, stride);
+                int loCtx = Av1CoeffDecode.GetLoCtx(levels.Slice(levelIdx), cls, out uint hiMag, -1, x, y, stride);
                 int tok = Math.Min(mag, 3);
                 w.EncodeSymbolAdapt(coef.BaseTok[baseTokIdx + loCtx], tok, 3);
                 if (tok == 3)
@@ -319,9 +319,14 @@ internal static class Av1CoeffEncode
         else { shift = slw + 2; shift2 = slh + 2; mask = (4 << slw) - 1; }
         int area = (4 << slw) * (4 << slh);
 
-        int eob = -1;
-        for (int i = area - 1; i >= 0; i--)
-            if (signedLevels[Rc1d(i, cls, shift, shift2, mask)] != 0) { eob = i; break; }
+        int eob;
+        if (cls == Av1TxClass.Horizontal) eob = signedLevels.Slice(0, area).LastIndexOfAnyExcept(0);   // the scan is rc order
+        else
+        {
+            eob = -1;
+            for (int i = area - 1; i >= 0; i--)
+                if (signedLevels[Rc1d(i, cls, shift, shift2, mask)] != 0) { eob = i; break; }
+        }
 
         if (eob < 0) return CSkip(coef, cdfIdx, 1);
         double bits = CSkip(coef, cdfIdx, 0);
@@ -341,7 +346,7 @@ internal static class Av1CoeffEncode
         int eobBaseTokIdx = tDim.Ctx * 2 * 4;
         int baseTokIdx = tDim.Ctx * 2 * 41;
         int brTokIdx = Math.Min((int)tDim.Ctx, 3) * 2 * 21;
-        var levels = new byte[stride * 20];
+        Span<byte> levels = stackalloc byte[stride * 20];
 
         if (eob != 0)
         {
@@ -354,7 +359,7 @@ internal static class Av1CoeffEncode
             for (int i = eob - 1; i > 0; i--)
             {
                 int x = i & mask, y = i >> shift, levelIdx = x * stride + y, mag = Math.Abs(signedLevels[Rc1d(i, cls, shift, shift2, mask)]);
-                int loCtx = Av1CoeffDecode.GetLoCtx(levels.AsSpan(levelIdx), cls, out uint hiMag, -1, x, y, stride);
+                int loCtx = Av1CoeffDecode.GetLoCtx(levels.Slice(levelIdx), cls, out uint hiMag, -1, x, y, stride);
                 int tok = Math.Min(mag, 3);
                 bits += CBase(coef, baseTokIdx + loCtx, tok);
                 if (tok == 3)

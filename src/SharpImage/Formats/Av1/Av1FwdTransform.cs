@@ -534,7 +534,8 @@ internal static class Av1FwdTransform
     // Per-thread recycling of the quantised-level arrays (the RD searches transform every candidate and keep only the
     // winner): a search returns its losing candidates with ReturnLevels. Every entry of a rented array is overwritten
     // by the forward transform, so no clearing is needed. Pools by power-of-two length 16 .. 1024, a few arrays each.
-    /// <summary>A thread's pool of level arrays (power-of-two sizes 16 .. 1024, 8 each).</summary>
+    /// <summary>A thread's pool of level arrays (power-of-two sizes 16 .. 1024, up to 64 each: a partition search holds
+    /// many candidates' levels at once).</summary>
     internal sealed class LevelPool
     {
         private readonly int[][][] arrays = new int[11][][];
@@ -550,10 +551,40 @@ internal static class Av1FwdTransform
             if (a == null) return;
             int count = a.Length, b = System.Numerics.BitOperations.Log2((uint)count);
             if ((count & (count - 1)) != 0 || b < 4 || b > 10) return;
-            var st = arrays[b] ??= new int[8][];
+            var st = arrays[b] ??= new int[64][];
             if (counts[b] < st.Length) st[counts[b]++] = a;
         }
     }
+    /// <summary>A thread's stack of double scratch arrays by size: Take hands out an array (contents stale: callers write
+    /// before they read), Release(mark) gives back everything taken since Mark.</summary>
+    internal sealed class DoubleArena
+    {
+        private readonly Stack<double[]>[] free = new Stack<double[]>[12];
+        private double[][] taken = new double[64][];
+        private int n;
+        public int Mark() => n;
+        public double[] Take(int count)
+        {
+            int b = System.Numerics.BitOperations.Log2((uint)Math.Max(count, 1));
+            if ((1 << b) < count) b++;
+            double[] a = b < free.Length && free[b] is { Count: > 0 } st ? st.Pop() : new double[b < free.Length ? 1 << b : count];
+            if (n == taken.Length) Array.Resize(ref taken, n * 2);
+            taken[n++] = a;
+            return a;
+        }
+        public void Release(int mark)
+        {
+            while (n > mark)
+            {
+                var a = taken[--n]; taken[n] = null!;
+                int b = System.Numerics.BitOperations.Log2((uint)a.Length);
+                if ((1 << b) == a.Length && b < free.Length) (free[b] ??= new Stack<double[]>()).Push(a);
+            }
+        }
+    }
+    [ThreadStatic] private static DoubleArena? t_dArena;
+    internal static DoubleArena ThreadDoubles => t_dArena ??= new DoubleArena();
+
     [ThreadStatic] private static LevelPool? t_levels;
     /// <summary>This thread's level pool (RentLevels / ReturnLevels use it too).</summary>
     internal static LevelPool ThreadLevels => t_levels ??= new LevelPool();
