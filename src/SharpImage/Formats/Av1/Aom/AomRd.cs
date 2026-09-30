@@ -11,7 +11,11 @@ internal static class AomRd
 
     /// <summary>RDCOST(RM, R, D): ROUND_POWER_OF_TWO(R * RM, AV1_PROB_COST_SHIFT) + D * 2^RDDIV_BITS.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static long RdCost(int rdmult, long rate, long dist) => ((rate * rdmult + 256) >> AomCost.ProbCostShift) + (dist << RdDivBits);
+    internal static long RdCost(int rdmult, long rate, long dist) => ((rate * rdmult + 256) >> AomCost.ProbCostShift) + dist * (1 << RdDivBits);
+
+    /// <summary>RDCOST with a 64-bit multiplier (the trellis' scaled rdmult).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static long RdCost64(long rdmult, long rate, long dist) => ((rate * rdmult + 256) >> AomCost.ProbCostShift) + dist * (1 << RdDivBits);
 
     /// <summary>av1_compute_rd_mult_based_on_qindex for a key frame (KF_UPDATE) with tune=psnr: q = the DC dequantizer,
     /// rdmult = q^2 * (3.3 + 0.0015 q), rounded down to the bit depth.</summary>

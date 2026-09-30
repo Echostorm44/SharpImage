@@ -6,10 +6,12 @@ namespace SharpImage.Tests.Formats;
 // Twins of the libaom encoder port (src/SharpImage/Formats/Av1/Aom): each ported function against libaom 3.14.1's own,
 // through aomtwin.dll (a thin export layer built against libaom.a; see scratchpad aomtwin/aomtwin.c). Opt-in: point
 // SHARPIMAGE_AOMTWIN at aomtwin.dll; without it the tests pass without checking.
+[NotInParallel]
 public sealed class AomTwinTests
 {
     private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN");
-    private static readonly bool Available = DllPath != null && File.Exists(DllPath) && Load();
+    private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
+        ? Load() : throw new FileNotFoundException("SHARPIMAGE_AOMTWIN is set but the DLL does not exist", DllPath));
 
     private static bool Load()
     {
@@ -31,6 +33,68 @@ public sealed class AomTwinTests
         [DllImport("aomtwin")] public static extern int twin_quantize_b(int* coeff, int n, int txSize, int txType, short* zbin2, short* round2,
             short* quant2, short* shift2, short* dequant2, int logScale, int* qcoeff, int* dqcoeff);
         [DllImport("aomtwin")] public static extern void twin_scan(int txSize, int txType, short* outp, int n);
+        [DllImport("aomtwin")] public static extern int twin_default_coeff_costs(int baseQindex, int* outp, int outLen);
+        [DllImport("aomtwin")] public static extern int twin_cost_coeffs_txb(int* costs, int plane, int txSize, int txType, int txbSkipCtx,
+            int dcSignCtx, int* qcoeff, int eob);
+        [DllImport("aomtwin")] public static extern int twin_optimize_txb(int* costs, int plane, int txSize, int txType, int txbSkipCtx,
+            int dcSignCtx, int* coeff, int* qcoeff, int* dqcoeff, int eob, short* dequant2, int rdmult, int sharpness,
+            int chromaTrellisMult, int* rate);
+    }
+
+    // CoeffCosts in libaom's struct layout (coeff_costs[5][2] then eob_costs[7][2])
+    private static int[] Flatten(AomCoeffCosts c)
+    {
+        var l = new List<int>();
+        foreach (var k in c.Coeff) { l.AddRange(k.TxbSkip); l.AddRange(k.BaseEob); l.AddRange(k.Base); l.AddRange(k.EobExtra); l.AddRange(k.DcSign); l.AddRange(k.Lps); }
+        foreach (var e in c.Eob) l.AddRange(e);
+        return l.ToArray();
+    }
+
+    private static int QCat(int q) => q <= 20 ? 0 : q <= 60 ? 1 : q <= 120 ? 2 : 3;
+
+    private static AomCoeffCosts OurDefaultCosts(int q)
+    {
+        var fc = new Av1CdfCoefContext();
+        Av1CdfDefaults.InitializeCoef(fc, QCat(q));
+        var c = new AomCoeffCosts();
+        c.Fill(fc, 3);
+        return c;
+    }
+
+    private static ushort[] LibaomScan(int tx, int txType)
+    {
+        int n = Math.Min(AomTables.TxSizeWide[tx], 32) * Math.Min(AomTables.TxSizeHigh[tx], 32);
+        var s = new short[n];
+        unsafe { fixed (short* p = s) Native.twin_scan(tx, txType, p, n); }
+        return s.Select(v => (ushort)v).ToArray();
+    }
+
+    // the tx types a tx size can use (2D everywhere it is defined, the 1D classes up to 16 points)
+    private static int RandomTxType(Random rng, int tx)
+    {
+        int w = AomTables.TxSizeWide[tx], h = AomTables.TxSizeHigh[tx];
+        if (Math.Max(w, h) <= 16) return rng.Next(16);
+        if (Math.Max(w, h) == 32) return rng.Next(2) == 0 ? AomTables.DCT_DCT : AomTables.IDTX;
+        return AomTables.DCT_DCT;
+    }
+
+    private static short[] IScanOf(ushort[] scan)
+    {
+        var a = new short[scan.Length];
+        for (int i = 0; i < scan.Length; i++) a[scan[i]] = (short)i;
+        return a;
+    }
+
+    private static int[] RandomLevels(Random rng, ushort[] scan, int eob, int n)
+    {
+        var q = new int[n];
+        for (int i = 0; i < eob; i++)
+        {
+            int v = rng.Next(10) switch { < 5 => 0, < 8 => rng.Next(1, 3), 8 => rng.Next(3, 16), _ => rng.Next(16, 300) };
+            if (i == eob - 1 && v == 0) v = 1;
+            q[scan[i]] = rng.Next(2) == 0 ? v : -v;
+        }
+        return q;
     }
 
     [Test]
@@ -138,5 +202,120 @@ public sealed class AomTwinTests
             if (eb != ea || !bq.AsSpan().SequenceEqual(aq) || !bdq.AsSpan().SequenceEqual(adq))
                 await Assert.That($"quantize_b tx {tx} q {qi}: eob {eb} vs {ea}").IsEqualTo("equal");
         }
+    }
+
+    [Test]
+    public async Task DefaultCoeffCosts_AllQContexts()
+    {
+        if (!Available) return;
+        foreach (int q in new[] { 0, 20, 21, 60, 61, 120, 121, 255 })
+        {
+            var ours = Flatten(OurDefaultCosts(q));
+            var theirs = new int[ours.Length];
+            int n;
+            unsafe { fixed (int* p = theirs) n = Native.twin_default_coeff_costs(q, p, theirs.Length); }
+            await Assert.That(n).IsEqualTo(ours.Length);
+            // base_cost context 41 (libaom's SIG_COEF_CONTEXTS = 42) is allocated but never used
+            int per = 13 * 2 + 4 * 3 + 42 * 8 + 9 * 2 + 3 * 2 + 21 * 26, baseOff = 13 * 2 + 4 * 3;
+            for (int i = 0; i < ours.Length; i++)
+            {
+                int k = i % per;
+                if (i < 10 * per && k >= baseOff + 41 * 8 && k < baseOff + 42 * 8) continue;
+                // eob costs of the 512 / 1024 sizes in the 1D context: libaom keeps a separate (never used) CDF there
+                if (i >= 10 * per && (i - 10 * per) / 22 >= 10 && (i - 10 * per) % 22 >= 11) continue;
+                if (ours[i] != theirs[i])
+                {
+                    await Assert.That($"q {q} index {i} (block {i / per} offset {k}): {ours[i]}").IsEqualTo($"q {q} index {i} (block {i / per} offset {k}): {theirs[i]}");
+                    break;
+                }
+            }
+        }
+    }
+
+    [Test]
+    public async Task CostCoeffsTxb_Random()
+    {
+        if (!Available) return;
+        var rng = new Random(3);
+        var costsByQ = new[] { 10, 40, 100, 200 }.Select(OurDefaultCosts).ToArray();
+        var flat = costsByQ.Select(Flatten).ToArray();
+        for (int iter = 0; iter < 20000; iter++)
+        {
+            int qi = rng.Next(4), tx = rng.Next(19), txType = RandomTxType(rng, tx), plane = rng.Next(3);
+            var scan = LibaomScan(tx, txType);
+            int n = scan.Length, eob = rng.Next(4) == 0 ? rng.Next(1, 4) : rng.Next(1, n + 1);
+            var q = RandomLevels(rng, scan, eob, n);
+            int skipCtx = plane == 0 ? rng.Next(7) : rng.Next(7, 13), dcCtx = rng.Next(3);
+            int ours = AomTxb.CostCoeffsTxb(costsByQ[qi], tx, txType, plane == 0 ? 0 : 1, new AomTxbCtx { TxbSkipCtx = skipCtx, DcSignCtx = dcCtx },
+                q, eob, 0, scan);
+            int theirs;
+            var qq = (int[])q.Clone();
+            unsafe { fixed (int* c = flat[qi]) fixed (int* pq = qq) theirs = Native.twin_cost_coeffs_txb(c, plane, tx, txType, skipCtx, dcCtx, pq, eob); }
+            if (ours != theirs)
+            {
+                await Assert.That($"tx {tx} type {txType} eob {eob}: {ours}").IsEqualTo($"tx {tx} type {txType} eob {eob}: {theirs}");
+                break;
+            }
+        }
+    }
+
+    [Test]
+    public async Task OptimizeTxb_Random()
+    {
+        if (!Available) return;
+        var rng = new Random(4);
+        var quants = new AomQuants(8, 0, 0, 0, 0, 0, 0);
+        var costsByQ = new[] { 10, 40, 100, 200 }.Select(OurDefaultCosts).ToArray();
+        var flat = costsByQ.Select(Flatten).ToArray();
+        int checkedN = 0;
+        var fails = new Dictionary<string, int>();
+        string? firstDump = null;
+        for (int iter = 0; iter < 30000; iter++)
+        {
+            int qi = rng.Next(4), q = rng.Next(1, 256), tx = rng.Next(19), txType = RandomTxType(rng, tx), plane = rng.Next(3);
+            int sharp = rng.Next(4) == 0 ? rng.Next(1, 8) : 0;
+            bool chromaMult = rng.Next(2) == 0;
+            var scan = LibaomScan(tx, txType);
+            int n = scan.Length, logScale = AomQuantize.TxScale(tx);
+            int dq1 = quants.Dequant[0, q, 1];
+            // coefficients spread around the quantizer step so levels land near the rounding boundaries
+            var coeff = new int[n];
+            int active = rng.Next(1, n + 1);
+            for (int i = 0; i < active; i++)
+                coeff[scan[i]] = (rng.Next(2) == 0 ? 1 : -1) * (int)(rng.NextDouble() * rng.NextDouble() * (rng.Next(3) == 0 ? 40 : 4) * dq1 * (1 << logScale));
+            var qc = new int[n]; var dqc = new int[n];
+            int eob = AomQuantize.QuantizeFpAvx2(coeff, n, IScanOf(scan), quants.RoundFp[0, q, 0], quants.RoundFp[0, q, 1],
+                quants.QuantFp[0, q, 0], quants.QuantFp[0, q, 1], quants.Dequant[0, q, 0], quants.Dequant[0, q, 1], logScale, qc, dqc);
+            if (eob == 0) continue;
+            int rdmult = AomRd.RdMultKeyFrame(q, 8);
+            int skipCtx = plane == 0 ? rng.Next(7) : rng.Next(7, 13), dcCtx = rng.Next(3);
+            var qcA = (int[])qc.Clone(); var dqcA = (int[])dqc.Clone(); var cA = (int[])coeff.Clone(); var qcIn = (int[])qc.Clone(); var dqcIn = (int[])dqc.Clone();
+            short[] deq = { quants.Dequant[0, q, 0], quants.Dequant[0, q, 1] };
+            int rateA, eobA;
+            unsafe
+            {
+                fixed (int* c = flat[qi]) fixed (int* pc = cA) fixed (int* pq = qcA) fixed (int* pd = dqcA) fixed (short* pdq = deq)
+                    eobA = Native.twin_optimize_txb(c, plane, tx, txType, skipCtx, dcCtx, pc, pq, pd, eob, pdq, rdmult, sharp, chromaMult ? 1 : 0, &rateA);
+            }
+            int eobB = AomTxb.OptimizeTxb(costsByQ[qi], tx, txType, plane == 0 ? 0 : 1, false, new AomTxbCtx { TxbSkipCtx = skipCtx, DcSignCtx = dcCtx },
+                coeff, qc, dqc, eob, deq[0], deq[1], rdmult, 8, sharp, chromaMult, false, 0, scan, out int rateB);
+            checkedN++;
+            if (eobA != eobB || rateA != rateB || !qc.AsSpan().SequenceEqual(qcA) || !dqc.AsSpan().SequenceEqual(dqcA))
+            {
+                string key = $"tx{tx} sharp{(sharp > 0 ? 1 : 0)} cls{AomTxb.TxTypeToClass[txType]} " + (eobA != eobB ? "eob" : rateA != rateB ? "rate" : "levels");
+                fails[key] = fails.GetValueOrDefault(key) + 1;
+                if (firstDump == null && Environment.GetEnvironmentVariable("AOMTWIN_CASE") is { } casePath)
+                    File.WriteAllLines(casePath, new[] {
+                        $"{qi} {plane} {tx} {txType} {skipCtx} {dcCtx} {eob} {deq[0]} {deq[1]} {rdmult} {sharp} {(chromaMult ? 1 : 0)}",
+                        string.Join(" ", coeff), string.Join(" ", qcIn), string.Join(" ", dqcIn), string.Join(" ", qcA), string.Join(" ", dqcA), $"{rateA} {eobA}" });
+                if (tx == 0 && firstDump == null)
+                    firstDump = $"type {txType} plane {plane} q {q} rdmult {rdmult} eob {eob}->{eobB}/{eobA} rate {rateB}/{rateA} coeff [{string.Join(",", coeff)}] " +
+                        $"qin [{string.Join(",", qcIn)}] ours [{string.Join(",", qc)}] libaom [{string.Join(",", qcA)}] scan [{string.Join(",", scan)}] ctx {skipCtx}/{dcCtx}";
+            }
+        }
+        if (firstDump != null && Environment.GetEnvironmentVariable("AOMTWIN_DUMP") is { } dumpPath) File.WriteAllText(dumpPath, firstDump);
+        await Assert.That(firstDump ?? "").IsEqualTo("");
+        await Assert.That(string.Join("; ", fails.OrderBy(k => k.Key).Select(k => $"{k.Key}: {k.Value}"))).IsEqualTo("");
+        await Assert.That(checkedN).IsGreaterThan(10000);
     }
 }

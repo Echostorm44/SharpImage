@@ -1,0 +1,906 @@
+using System;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using static SharpImage.Formats.Av1.AomTables;
+
+namespace SharpImage.Formats.Av1;
+
+/// <summary>LV_MAP_COEFF_COST (av1/encoder/block.h): one tx-size class / plane type's coefficient symbol costs.</summary>
+internal sealed class AomLvMapCoeffCost
+{
+    public const int TxbSkipContexts = 13, SigCoefContextsEob = 4, SigCoefContexts = 42, EobCoefContexts = 9,
+        DcSignContexts = 3, LevelContexts = 21, LpsStride = AomTxb.CoeffBaseRange + 1 + AomTxb.CoeffBaseRange + 1;
+    public readonly int[] TxbSkip = new int[TxbSkipContexts * 2];        // [ctx][2]
+    public readonly int[] BaseEob = new int[SigCoefContextsEob * 3];     // [ctx][3]
+    public readonly int[] Base = new int[SigCoefContexts * 8];           // [ctx][8]
+    public readonly int[] EobExtra = new int[EobCoefContexts * 2];       // [ctx][2]
+    public readonly int[] DcSign = new int[DcSignContexts * 2];          // [ctx][2]
+    public readonly int[] Lps = new int[LevelContexts * LpsStride];      // [ctx][28]
+}
+
+/// <summary>CoeffCosts (av1/encoder/block.h) and av1_fill_coeff_costs (rd.c) from the tile's coefficient CDFs.</summary>
+internal sealed class AomCoeffCosts
+{
+    public readonly AomLvMapCoeffCost[] Coeff = new AomLvMapCoeffCost[5 * 2];   // [txs_ctx][plane_type]
+    public readonly int[][] Eob = new int[7 * 2][];                               // [eob_multi_size][plane_type] -> [2][11]
+
+    public AomCoeffCosts()
+    {
+        for (int i = 0; i < Coeff.Length; i++) Coeff[i] = new AomLvMapCoeffCost();
+        for (int i = 0; i < Eob.Length; i++) Eob[i] = new int[2 * 11];
+    }
+
+    public AomLvMapCoeffCost Get(int txsCtx, int planeType) => Coeff[txsCtx * 2 + planeType];
+    public int[] GetEob(int eobMultiSize, int planeType) => Eob[eobMultiSize * 2 + planeType];
+
+    /// <summary>av1_fill_coeff_costs.</summary>
+    public void Fill(Av1CdfCoefContext fc, int numPlanes)
+    {
+        int nplanes = Math.Min(numPlanes, 2);
+        Span<int> tmp = stackalloc int[16];
+        for (int ems = 0; ems < 7; ems++)
+            for (int plane = 0; plane < nplanes; plane++)
+            {
+                var pcost = GetEob(ems, plane);
+                for (int ctx = 0; ctx < 2; ctx++)
+                {
+                    ushort[] cdf = ems switch
+                    {
+                        0 => fc.EobBin16[plane * 2 + ctx], 1 => fc.EobBin32[plane * 2 + ctx], 2 => fc.EobBin64[plane * 2 + ctx],
+                        3 => fc.EobBin128[plane * 2 + ctx], 4 => fc.EobBin256[plane * 2 + ctx], 5 => fc.EobBin512[plane], _ => fc.EobBin1024[plane],
+                    };
+                    // eob_flag_cdf512 / 1024 have no 1D context in libaom's layout either (ctx 1 = the same CDF)
+                    AomCost.CostTokensFromCdf(pcost.AsSpan(ctx * 11), cdf, ems + 5);
+                }
+            }
+        for (int txSize = 0; txSize < 5; txSize++)
+            for (int plane = 0; plane < nplanes; plane++)
+            {
+                var pcost = Get(txSize, plane);
+                for (int ctx = 0; ctx < AomLvMapCoeffCost.TxbSkipContexts; ctx++)
+                    AomCost.CostTokensFromCdf(pcost.TxbSkip.AsSpan(ctx * 2), fc.CoefSkip[txSize * 13 + ctx], 2);
+                for (int ctx = 0; ctx < AomLvMapCoeffCost.SigCoefContextsEob; ctx++)
+                    AomCost.CostTokensFromCdf(pcost.BaseEob.AsSpan(ctx * 3), fc.EobBaseTok[(txSize * 2 + plane) * 4 + ctx], 3);
+                for (int ctx = 0; ctx < AomLvMapCoeffCost.SigCoefContexts; ctx++)
+                {
+                    // libaom's SIG_COEF_CONTEXTS = 42 contexts; the last is never used (the decoder tables stop at 41)
+                    if (ctx < 41) AomCost.CostTokensFromCdf(pcost.Base.AsSpan(ctx * 8), fc.BaseTok[(txSize * 2 + plane) * 41 + ctx], 4);
+                    else pcost.Base.AsSpan(ctx * 8, 4).Clear();
+                }
+                for (int ctx = 0; ctx < AomLvMapCoeffCost.SigCoefContexts; ctx++)
+                {
+                    var b = pcost.Base.AsSpan(ctx * 8);
+                    b[4] = 0;
+                    b[5] = b[1] + AomCost.CostLiteral(1) - b[0];
+                    b[6] = b[2] - b[1];
+                    b[7] = b[3] - b[2];
+                }
+                for (int ctx = 0; ctx < AomLvMapCoeffCost.EobCoefContexts; ctx++)
+                    AomCost.CostTokensFromCdf(pcost.EobExtra.AsSpan(ctx * 2), fc.EobHiBit[(txSize * 2 + plane) * 9 + ctx], 2);
+                for (int ctx = 0; ctx < AomLvMapCoeffCost.DcSignContexts; ctx++)
+                    AomCost.CostTokensFromCdf(pcost.DcSign.AsSpan(ctx * 2), fc.DcSign[plane * 3 + ctx], 2);
+                const int stride = AomLvMapCoeffCost.LpsStride;
+                for (int ctx = 0; ctx < AomLvMapCoeffCost.LevelContexts; ctx++)
+                {
+                    Span<int> brRate = tmp.Slice(0, 4);
+                    AomCost.CostTokensFromCdf(brRate, fc.BrTok[(Math.Min(txSize, 3) * 2 + plane) * 21 + ctx], 4);
+                    var lps = pcost.Lps.AsSpan(ctx * stride);
+                    int prevCost = 0, i, j = 0;
+                    for (i = 0; i < AomTxb.CoeffBaseRange; i += 4 - 1)
+                    {
+                        for (j = 0; j < 4 - 1; j++) lps[i + j] = prevCost + brRate[j];
+                        prevCost += brRate[j];
+                    }
+                    lps[i] = prevCost;
+                }
+                for (int ctx = 0; ctx < AomLvMapCoeffCost.LevelContexts; ctx++)
+                {
+                    var lps = pcost.Lps.AsSpan(ctx * stride);
+                    lps[AomTxb.CoeffBaseRange + 1] = lps[0];
+                    for (int i = 1; i <= AomTxb.CoeffBaseRange; i++)
+                        lps[i + AomTxb.CoeffBaseRange + 1] = lps[i] - lps[i - 1];
+                }
+            }
+    }
+}
+
+/// <summary>TXB_CTX (av1/common/txb_common.h).</summary>
+internal struct AomTxbCtx
+{
+    public int TxbSkipCtx, DcSignCtx;
+}
+
+// Port of libaom av1/common/txb_common.{h,c}, av1/encoder/encodetxb.c (the level map, contexts, eob tokens, entropy
+// context) and av1/encoder/txb_rdopt.{c,h} (av1_cost_coeffs_txb, av1_cost_coeffs_txb_laplacian, av1_optimize_txb).
+// Coefficient arrays in libaom's layout: index = col * height + row (column-major, height = the adjusted tx's).
+internal static class AomTxb
+{
+    internal const int NumBaseLevels = 2, CoeffBaseRange = 12, MaxBaseBrRange = CoeffBaseRange + NumBaseLevels + 1;
+    internal const int CoeffContextBits = 3, CoeffContextMask = 7;
+    internal const int TxPadHorLog2 = 2, TxPadHor = 4, TxPadTop = 0, TxPadBottom = 4, TxPadEnd = 16;
+    internal const int TxPad2d = (32 + TxPadHor) * (32 + TxPadTop + TxPadBottom) + TxPadEnd;
+    private const int NzMapCtx0 = 26, NzMapCtx5 = NzMapCtx0 + 5, NzMapCtx10 = NzMapCtx0 + 10;
+
+    // tx_type_to_class
+    internal static readonly byte[] TxTypeToClass =
+    {
+        TX_CLASS_2D, TX_CLASS_2D, TX_CLASS_2D, TX_CLASS_2D, TX_CLASS_2D, TX_CLASS_2D, TX_CLASS_2D, TX_CLASS_2D,
+        TX_CLASS_2D, TX_CLASS_2D, TX_CLASS_VERT, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_CLASS_HORIZ,
+    };
+
+    // plane_rd_mult / plane_rd_mult_chroma [is_inter][plane_type]
+    private static readonly int[] PlaneRdMult = { 17, 20, 16, 20 };
+    private static readonly int[] PlaneRdMultChroma = { 17, 13, 16, 10 };
+
+    private static readonly sbyte[][] NzMapCtxOffset =
+    {
+        NzMapCtxOffset4x4, NzMapCtxOffset8x8, NzMapCtxOffset16x16, NzMapCtxOffset32x32, NzMapCtxOffset32x32,
+        NzMapCtxOffset4x8, NzMapCtxOffset16x4, NzMapCtxOffset8x16, NzMapCtxOffset32x8, NzMapCtxOffset16x32,
+        NzMapCtxOffset32x16, NzMapCtxOffset32x64, NzMapCtxOffset64x32, NzMapCtxOffset4x16, NzMapCtxOffset16x4,
+        NzMapCtxOffset8x32, NzMapCtxOffset32x8, NzMapCtxOffset32x64, NzMapCtxOffset32x16,
+    };
+
+    private static readonly int[] NzMapCtxOffset1d =
+    {
+        NzMapCtx0, NzMapCtx5, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10,
+        NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10,
+        NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10, NzMapCtx10,
+        NzMapCtx10, NzMapCtx10,
+    };
+
+    private static readonly int[] GolombBitsCost =
+    {
+        0, 512, 512 * 3, 512 * 3, 512 * 5, 512 * 5, 512 * 5, 512 * 5, 512 * 7, 512 * 7, 512 * 7, 512 * 7, 512 * 7, 512 * 7, 512 * 7, 512 * 7,
+        512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9, 512 * 9,
+    };
+    private static readonly int[] GolombCostDiff =
+    {
+        0, 512, 512 * 2, 0, 512 * 2, 0, 0, 0, 512 * 2, 0, 0, 0, 0, 0, 0, 0,
+        512 * 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    };
+    // costLUT / const_term / loge_par (txb_rdopt_utils.h)
+    private static readonly int[] CostLut = { -1143, 53, 545, 825, 1031, 1209, 1393, 1577, 1763, 1947, 2132, 2317, 2501, 2686, 2871 };
+    private const int ConstTerm = 1 << AomCost.ProbCostShift;
+    private const int LogePar = ((14427 << AomCost.ProbCostShift) + 5000) / 10000;
+
+    // clip_max3
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] private static int ClipMax3(int v) => v > 3 ? 3 : v;
+
+    /// <summary>av1_get_adjusted_tx_size: 64-point axes as 32.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int AdjustedTxSize(int txSize) => txSize switch
+    {
+        TX_64X64 or TX_64X32 or TX_32X64 => TX_32X32,
+        TX_16X64 => TX_16X32,
+        TX_64X16 => TX_32X16,
+        _ => txSize,
+    };
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] internal static int TxbBhl(int txSize) => TxSizeHighLog2[AdjustedTxSize(txSize)];
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] internal static int TxbWide(int txSize) => TxSizeWide[AdjustedTxSize(txSize)];
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] internal static int TxbHigh(int txSize) => TxSizeHigh[AdjustedTxSize(txSize)];
+    /// <summary>get_txsize_entropy_ctx.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int TxsizeEntropyCtx(int txSize) => (TxsizeSqrMap[txSize] + TxsizeSqrUpMap[txSize] + 1) >> 1;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int PaddedIdx(int idx, int bhl) => idx + ((idx >> bhl) << TxPadHorLog2);
+
+    /// <summary>av1_txb_init_levels: |coeff| clipped to 127 into the column-padded map (stride height + 4), the rows
+    /// past the last column and the tail zeroed.</summary>
+    internal static void InitLevels(ReadOnlySpan<int> coeff, int width, int height, Span<byte> levels)
+    {
+        int stride = height + TxPadHor;
+        levels.Slice(stride * width, TxPadBottom * stride + TxPadEnd).Clear();
+        int ls = 0;
+        for (int i = 0; i < width; i++)
+        {
+            for (int j = 0; j < height; j++) levels[ls++] = (byte)Math.Min(Math.Abs(coeff[i * height + j]), 127);
+            for (int j = 0; j < TxPadHor; j++) levels[ls++] = 0;
+        }
+    }
+
+    /// <summary>av1_get_eob_pos_token.</summary>
+    internal static int EobPosToken(int eob, out int extra)
+    {
+        int t = eob < 33 ? EobToPosSmall[eob] : EobToPosLarge[Math.Min((eob - 1) >> 5, 16)];
+        extra = eob - EobGroupStart[t];
+        return t;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int NzMag(ReadOnlySpan<byte> levels, int p, int bhl, int txClass)
+    {
+        int mag = ClipMax3(levels[p + (1 << bhl) + TxPadHor]) + ClipMax3(levels[p + 1]);
+        if (txClass == TX_CLASS_2D)
+        {
+            mag += ClipMax3(levels[p + (1 << bhl) + TxPadHor + 1]);
+            mag += ClipMax3(levels[p + (2 << bhl) + (2 << TxPadHorLog2)]);
+            mag += ClipMax3(levels[p + 2]);
+        }
+        else if (txClass == TX_CLASS_VERT)
+        {
+            mag += ClipMax3(levels[p + 2]) + ClipMax3(levels[p + 3]) + ClipMax3(levels[p + 4]);
+        }
+        else
+        {
+            mag += ClipMax3(levels[p + (2 << bhl) + (2 << TxPadHorLog2)]);
+            mag += ClipMax3(levels[p + (3 << bhl) + (3 << TxPadHorLog2)]);
+            mag += ClipMax3(levels[p + (4 << bhl) + (4 << TxPadHorLog2)]);
+        }
+        return mag;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int NzMapCtxFromStats(int stats, int coeffIdx, int bhl, int txSize, int txClass)
+    {
+        if ((txClass | coeffIdx) == 0) return 0;
+        int ctx = Math.Min((stats + 1) >> 1, 4);
+        switch (txClass)
+        {
+            case TX_CLASS_2D: return ctx + NzMapCtxOffset[txSize][coeffIdx];
+            case TX_CLASS_HORIZ: return ctx + NzMapCtxOffset1d[coeffIdx >> bhl];
+            default:
+                {
+                    int col = coeffIdx >> bhl;
+                    return ctx + NzMapCtxOffset1d[coeffIdx - (col << bhl)];
+                }
+        }
+    }
+
+    /// <summary>get_lower_levels_ctx_eob.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int LowerLevelsCtxEob(int bhl, int width, int scanIdx)
+    {
+        if (scanIdx == 0) return 0;
+        if (scanIdx <= (width << bhl) / 8) return 1;
+        if (scanIdx <= (width << bhl) / 4) return 2;
+        return 3;
+    }
+
+    /// <summary>get_lower_levels_ctx.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int LowerLevelsCtx(ReadOnlySpan<byte> levels, int coeffIdx, int bhl, int txSize, int txClass)
+        => NzMapCtxFromStats(NzMag(levels, PaddedIdx(coeffIdx, bhl), bhl, txClass), coeffIdx, bhl, txSize, txClass);
+
+    /// <summary>get_lower_levels_ctx_general.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int LowerLevelsCtxGeneral(bool isLast, int scanIdx, int bhl, int width, ReadOnlySpan<byte> levels, int coeffIdx, int txSize, int txClass)
+    {
+        if (isLast)
+        {
+            if (scanIdx == 0) return 0;
+            if (scanIdx <= (width << bhl) >> 3) return 1;
+            if (scanIdx <= (width << bhl) >> 2) return 2;
+            return 3;
+        }
+        return LowerLevelsCtx(levels, coeffIdx, bhl, txSize, txClass);
+    }
+
+    /// <summary>get_br_ctx_eob.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int BrCtxEob(int c, int bhl, int txClass)
+    {
+        int col = c >> bhl, row = c - (col << bhl);
+        if (c == 0) return 0;
+        if ((txClass == TX_CLASS_2D && row < 2 && col < 2) || (txClass == TX_CLASS_HORIZ && col == 0) || (txClass == TX_CLASS_VERT && row == 0))
+            return 7;
+        return 14;
+    }
+
+    /// <summary>get_br_ctx.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int BrCtx(ReadOnlySpan<byte> levels, int c, int bhl, int txClass)
+    {
+        int col = c >> bhl, row = c - (col << bhl);
+        int stride = (1 << bhl) + TxPadHor, pos = col * stride + row;
+        int mag = levels[pos + 1] + levels[pos + stride];
+        switch (txClass)
+        {
+            case TX_CLASS_2D:
+                mag += levels[pos + stride + 1];
+                mag = Math.Min((mag + 1) >> 1, 6);
+                if (c == 0) return mag;
+                if (row < 2 && col < 2) return mag + 7;
+                break;
+            case TX_CLASS_HORIZ:
+                mag += levels[pos + (stride << 1)];
+                mag = Math.Min((mag + 1) >> 1, 6);
+                if (c == 0) return mag;
+                if (col == 0) return mag + 7;
+                break;
+            default:
+                mag += levels[pos + 2];
+                mag = Math.Min((mag + 1) >> 1, 6);
+                if (c == 0) return mag;
+                if (row == 0) return mag + 7;
+                break;
+        }
+        return mag + 14;
+    }
+
+    /// <summary>get_eob_cost.</summary>
+    private static int EobCost(int eob, int[] txbEobCosts, AomLvMapCoeffCost txbCosts, int txClass)
+    {
+        int eobPt = EobPosToken(eob, out int eobExtra);
+        int eobMultiCtx = txClass == TX_CLASS_2D ? 0 : 1;
+        int cost = txbEobCosts[eobMultiCtx * 11 + eobPt - 1];
+        if (EobOffsetBits[eobPt] > 0)
+        {
+            int eobCtx = eobPt - 3, eobShift = EobOffsetBits[eobPt] - 1;
+            int bit = (eobExtra & (1 << eobShift)) != 0 ? 1 : 0;
+            cost += txbCosts.EobExtra[eobCtx * 2 + bit];
+            int offsetBits = EobOffsetBits[eobPt];
+            if (offsetBits > 1) cost += AomCost.CostLiteral(offsetBits - 1);
+        }
+        return cost;
+    }
+
+    /// <summary>get_golomb_cost.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int GolombCost(int absQc)
+    {
+        if (absQc >= 1 + NumBaseLevels + CoeffBaseRange)
+        {
+            int r = absQc - CoeffBaseRange - NumBaseLevels;
+            int length = BitOperations.Log2((uint)r) + 1;
+            return AomCost.CostLiteral(2 * length - 1);
+        }
+        return 0;
+    }
+
+    /// <summary>get_br_cost.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int BrCost(int level, ReadOnlySpan<int> lps) => lps[Math.Min(level - 1 - NumBaseLevels, CoeffBaseRange)] + GolombCost(level);
+
+    /// <summary>get_br_cost_with_diff.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int BrCostWithDiff(int level, ReadOnlySpan<int> lps, ref int diff)
+    {
+        int baseRange = Math.Min(level - 1 - NumBaseLevels, CoeffBaseRange);
+        int golombBits = 0;
+        if (level <= CoeffBaseRange + 1 + NumBaseLevels) diff += lps[baseRange + CoeffBaseRange + 1];
+        if (level >= CoeffBaseRange + 1 + NumBaseLevels)
+        {
+            int r = level - CoeffBaseRange - NumBaseLevels;
+            if (r < 32)
+            {
+                golombBits = GolombBitsCost[r];
+                diff += GolombCostDiff[r];
+            }
+            else
+            {
+                golombBits = GolombCost(level);
+                diff += (r & (r - 1)) == 0 ? 1024 : 0;
+            }
+        }
+        return lps[baseRange] + golombBits;
+    }
+
+    /// <summary>get_two_coeff_cost_simple.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int TwoCoeffCostSimple(int ci, int absQc, int coeffCtx, AomLvMapCoeffCost txbCosts, int bhl, int txClass,
+        ReadOnlySpan<byte> levels, out int costLow)
+    {
+        int cost = txbCosts.Base[coeffCtx * 8 + Math.Min(absQc, 3)];
+        int diff = 0;
+        if (absQc <= 3) diff = txbCosts.Base[coeffCtx * 8 + absQc + 4];
+        if (absQc != 0)
+        {
+            cost += AomCost.CostLiteral(1);
+            if (absQc > NumBaseLevels)
+            {
+                int brCtx = BrCtx(levels, ci, bhl, txClass);
+                int brcostDiff = 0;
+                cost += BrCostWithDiff(absQc, txbCosts.Lps.AsSpan(brCtx * AomLvMapCoeffCost.LpsStride), ref brcostDiff);
+                diff += brcostDiff;
+            }
+        }
+        costLow = cost - diff;
+        return cost;
+    }
+
+    /// <summary>get_coeff_cost_eob.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int CoeffCostEob(int ci, int absQc, int sign, int coeffCtx, int dcSignCtx, AomLvMapCoeffCost txbCosts, int bhl, int txClass)
+    {
+        int cost = txbCosts.BaseEob[coeffCtx * 3 + Math.Min(absQc, 3) - 1];
+        if (absQc != 0)
+        {
+            cost += ci == 0 ? txbCosts.DcSign[dcSignCtx * 2 + sign] : AomCost.CostLiteral(1);
+            if (absQc > NumBaseLevels)
+                cost += BrCost(absQc, txbCosts.Lps.AsSpan(BrCtxEob(ci, bhl, txClass) * AomLvMapCoeffCost.LpsStride));
+        }
+        return cost;
+    }
+
+    /// <summary>get_coeff_cost_general.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int CoeffCostGeneral(bool isLast, int ci, int absQc, int sign, int coeffCtx, int dcSignCtx, AomLvMapCoeffCost txbCosts,
+        int bhl, int txClass, ReadOnlySpan<byte> levels)
+    {
+        int cost = isLast ? txbCosts.BaseEob[coeffCtx * 3 + Math.Min(absQc, 3) - 1] : txbCosts.Base[coeffCtx * 8 + Math.Min(absQc, 3)];
+        if (absQc != 0)
+        {
+            cost += ci == 0 ? txbCosts.DcSign[dcSignCtx * 2 + sign] : AomCost.CostLiteral(1);
+            if (absQc > NumBaseLevels)
+            {
+                int brCtx = isLast ? BrCtxEob(ci, bhl, txClass) : BrCtx(levels, ci, bhl, txClass);
+                cost += BrCost(absQc, txbCosts.Lps.AsSpan(brCtx * AomLvMapCoeffCost.LpsStride));
+            }
+        }
+        return cost;
+    }
+
+    /// <summary>av1_cost_coeffs_txb (warehouse_efficients_txb): the coded bits (1/512) of a tx block's levels with the
+    /// given contexts; txTypeCost = get_tx_type_cost's value for this block.</summary>
+    internal static int CostCoeffsTxb(AomCoeffCosts costs, int txSize, int txType, int planeType, AomTxbCtx txbCtx,
+        ReadOnlySpan<int> qcoeff, int eob, int txTypeCost, ReadOnlySpan<ushort> scan)
+    {
+        int txsCtx = TxsizeEntropyCtx(txSize);
+        var coeffCosts = costs.Get(txsCtx, planeType);
+        if (eob == 0) return coeffCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 1];
+        int txClass = TxTypeToClass[txType];
+        int bhl = TxbBhl(txSize), width = TxbWide(txSize), height = TxbHigh(txSize);
+        Span<byte> levels = stackalloc byte[TxPad2d];
+        Span<sbyte> coeffContexts = stackalloc sbyte[32 * 32];
+        var eobCosts = costs.GetEob(TxsizeLog2Minus4[txSize], planeType);
+        int cost = coeffCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 0];
+        if (eob > 1) InitLevels(qcoeff, width, height, levels);
+        cost += txTypeCost;
+        cost += EobCost(eob, eobCosts, coeffCosts, txClass);
+        // av1_get_nz_map_contexts
+        for (int i = 0; i < eob; i++)
+        {
+            int pos = scan[i];
+            coeffContexts[pos] = (sbyte)(i == eob - 1 ? LowerLevelsCtxEob(bhl, width, i) : LowerLevelsCtx(levels, pos, bhl, txSize, txClass));
+        }
+        const int lpsStride = AomLvMapCoeffCost.LpsStride;
+        int c = eob - 1;
+        {
+            int pos = scan[c];
+            int v = qcoeff[pos];
+            if (v != 0)
+            {
+                int sign = v >> 31, level = (v ^ sign) - sign;
+                int coeffCtx = coeffContexts[pos];
+                cost += coeffCosts.BaseEob[coeffCtx * 3 + Math.Min(level, 3) - 1];
+                if (level > NumBaseLevels)
+                    cost += BrCost(level, coeffCosts.Lps.AsSpan(BrCtxEob(pos, bhl, txClass) * lpsStride));
+                if (c != 0) cost += AomCost.CostLiteral(1);
+                else
+                {
+                    int sign01 = (sign ^ sign) - sign;
+                    cost += coeffCosts.DcSign[txbCtx.DcSignCtx * 2 + sign01];
+                    return cost;
+                }
+            }
+        }
+        for (c = eob - 2; c >= 1; --c)
+        {
+            int pos = scan[c];
+            int coeffCtx = coeffContexts[pos];
+            int v = qcoeff[pos];
+            if (v == 0) { cost += coeffCosts.Base[coeffCtx * 8]; continue; }
+            int level = Math.Abs(v);
+            cost += coeffCosts.Base[coeffCtx * 8 + Math.Min(level, 3)];
+            cost += AomCost.CostLiteral(1);
+            if (level > NumBaseLevels)
+                cost += BrCost(level, coeffCosts.Lps.AsSpan(BrCtx(levels, pos, bhl, txClass) * lpsStride));
+        }
+        {
+            int pos = scan[c];
+            int v = qcoeff[pos];
+            int coeffCtx = coeffContexts[pos];
+            if (v == 0) cost += coeffCosts.Base[coeffCtx * 8];
+            else
+            {
+                int sign = v >> 31, level = (v ^ sign) - sign;
+                cost += coeffCosts.Base[coeffCtx * 8 + Math.Min(level, 3)];
+                int sign01 = (sign ^ sign) - sign;
+                cost += coeffCosts.DcSign[txbCtx.DcSignCtx * 2 + sign01];
+                if (level > NumBaseLevels)
+                    cost += BrCost(level, coeffCosts.Lps.AsSpan(BrCtx(levels, pos, bhl, txClass) * lpsStride));
+            }
+        }
+        return cost;
+    }
+
+    /// <summary>update_coeff_eob_fast (txb_rdopt_utils.h): trailing levels whose coefficient is inside the enlarged zbin
+    /// dropped. Returns the new eob.</summary>
+    internal static int UpdateCoeffEobFast(int eob, int shift, short dequant0, short dequant1, ReadOnlySpan<ushort> scan,
+        ReadOnlySpan<int> coeff, Span<int> qcoeff, Span<int> dqcoeff)
+    {
+        int eobOut = eob;
+        int zbin0 = dequant0 + ((dequant0 * 70 + 64) >> 7), zbin1 = dequant1 + ((dequant1 * 70 + 64) >> 7);
+        for (int i = eob - 1; i >= 0; i--)
+        {
+            int rc = scan[i];
+            int qc = qcoeff[rc], c = coeff[rc];
+            int sign = c >> 31;
+            long abs = (c ^ sign) - sign;
+            if ((abs << (1 + shift)) < (rc != 0 ? zbin1 : zbin0) || qc == 0)
+            {
+                eobOut--;
+                qcoeff[rc] = 0;
+                dqcoeff[rc] = 0;
+            }
+            else break;
+        }
+        return eobOut;
+    }
+
+    /// <summary>av1_cost_coeffs_txb_laplacian: the tx-type and eob costs plus av1_cost_coeffs_txb_estimate (luma only);
+    /// with adjustEob the trailing near-zero levels are dropped first (update_coeff_eob_fast). Returns the cost and the
+    /// (possibly reduced) eob.</summary>
+    internal static int CostCoeffsTxbLaplacian(AomCoeffCosts costs, int txSize, int txType, int planeType, AomTxbCtx txbCtx,
+        ReadOnlySpan<int> coeff, Span<int> qcoeff, Span<int> dqcoeff, ref int eob, int txTypeCost, ReadOnlySpan<ushort> scan,
+        bool adjustEob, short dequant0, short dequant1)
+    {
+        if (adjustEob) eob = UpdateCoeffEobFast(eob, AomQuantize.TxScale(txSize), dequant0, dequant1, scan, coeff, qcoeff, dqcoeff);
+        var coeffCosts = costs.Get(TxsizeEntropyCtx(txSize), planeType);
+        if (eob == 0) return coeffCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 1];
+        int txClass = TxTypeToClass[txType];
+        int cost = coeffCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 0];
+        cost += txTypeCost;
+        cost += EobCost(eob, costs.GetEob(TxsizeLog2Minus4[txSize], planeType), coeffCosts, txClass);
+        // av1_cost_coeffs_txb_estimate
+        int est = 0;
+        int c = eob - 1;
+        est += (Math.Abs(qcoeff[scan[c]]) - 1) << (AomCost.ProbCostShift + 2);
+        for (c = eob - 2; c >= 0; c--) est += CostLut[Math.Min(Math.Abs(qcoeff[scan[c]]), 14)];
+        est += (ConstTerm + LogePar) * (eob - 1);
+        return cost + est;
+    }
+
+    /// <summary>av1_optimize_txb: libaom's trellis on one tx block's levels (qcoeff / dqcoeff updated in place, tcoeff
+    /// the transform coefficients). rdmult: x->rdmult; txTypeCost: get_tx_type_cost. Returns the new eob; rate: the
+    /// block's coded bits (1/512).</summary>
+    internal static int OptimizeTxb(AomCoeffCosts costs, int txSize, int txType, int planeType, bool isInter, AomTxbCtx txbCtx,
+        ReadOnlySpan<int> tcoeff, Span<int> qcoeff, Span<int> dqcoeff, int eob, short dequant0, short dequant1,
+        int rdmultIn, int bitDepth, int sharpness, bool useChromaTrellisRdMult, bool tuneIq, int txTypeCost,
+        ReadOnlySpan<ushort> scan, out int rateCost)
+    {
+        int shift = AomQuantize.TxScale(txSize);
+        int txsCtx = TxsizeEntropyCtx(txSize);
+        int txClass = TxTypeToClass[txType];
+        int bhl = TxbBhl(txSize), width = TxbWide(txSize), height = TxbHigh(txSize);
+        var txbCosts = costs.Get(txsCtx, planeType);
+        var txbEobCosts = costs.GetEob(TxsizeLog2Minus4[txSize], planeType);
+        int rshift = tuneIq ? 7 : 5;
+        var trellisRdMult = useChromaTrellisRdMult ? PlaneRdMultChroma : PlaneRdMult;
+        long rdmult = (((long)rdmultIn * (8 - sharpness) * (trellisRdMult[(isInter ? 2 : 0) + planeType] << (2 * (bitDepth - 8)))) + (1L << (rshift - 1))) >> rshift;
+
+        Span<byte> levels = stackalloc byte[TxPad2d];
+        if (eob > 1) InitLevels(qcoeff, width, height, levels);
+        int nonSkipCost = txbCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 0];
+        int skipCost = txbCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 1];
+        int accuRate = EobCost(eob, txbEobCosts, txbCosts, txClass);
+        long accuDist = 0;
+        int si = eob - 1;
+        int ci = scan[si];
+        int qc = qcoeff[ci];
+        int absQc = Math.Abs(qc);
+        int sign = qc < 0 ? 1 : 0;
+        const int maxNzNum = 2;
+        int nzNum = 1;
+        Span<int> nzCi = stackalloc int[3];
+        nzCi[0] = ci; nzCi[1] = 0; nzCi[2] = 0;
+        if (absQc >= 2)
+        {
+            UpdateCoeffGeneral(ref accuRate, ref accuDist, si, eob, txSize, txClass, bhl, width, rdmult, shift, txbCtx.DcSignCtx,
+                dequant0, dequant1, scan, txbCosts, tcoeff, qcoeff, dqcoeff, levels);
+            --si;
+        }
+        else
+        {
+            int coeffCtx = LowerLevelsCtxEob(bhl, width, si);
+            accuRate += CoeffCostEob(ci, absQc, sign, coeffCtx, txbCtx.DcSignCtx, txbCosts, bhl, txClass);
+            int tqc = tcoeff[ci], dqc = dqcoeff[ci];
+            long dist = CoeffDist(tqc, dqc, shift), dist0 = CoeffDist(tqc, 0, shift);
+            accuDist += dist - dist0;
+            --si;
+        }
+        // update_coeff_eob_facade
+        for (; si >= 0 && nzNum <= maxNzNum; --si)
+            UpdateCoeffEob(ref accuRate, ref accuDist, ref eob, ref nzNum, nzCi, si, txSize, txClass, bhl, width, txbCtx.DcSignCtx,
+                rdmult, shift, dequant0, dequant1, scan, txbEobCosts, txbCosts, tcoeff, qcoeff, dqcoeff, levels, sharpness);
+        if (si == -1 && nzNum <= maxNzNum && sharpness == 0)
+        {
+            // update_skip
+            long rd = AomRd.RdCost64(rdmult, accuRate + nonSkipCost, accuDist);
+            long rdNewEob = AomRd.RdCost64(rdmult, skipCost, 0);
+            if (rdNewEob < rd)
+            {
+                for (int i = 0; i < nzNum; i++) { int c2 = nzCi[i]; qcoeff[c2] = 0; dqcoeff[c2] = 0; }
+                accuRate = 0;
+                eob = 0;
+            }
+        }
+        // update_coeff_simple_facade
+        for (; si >= 1; --si)
+            UpdateCoeffSimple(ref accuRate, si, txSize, txClass, bhl, rdmult, shift, dequant0, dequant1, scan, txbCosts, tcoeff, qcoeff,
+                dqcoeff, levels, sharpness);
+        if (si == 0)
+        {
+            long dummyDist = 0;
+            UpdateCoeffGeneral(ref accuRate, ref dummyDist, si, eob, txSize, txClass, bhl, width, rdmult, shift, txbCtx.DcSignCtx,
+                dequant0, dequant1, scan, txbCosts, tcoeff, qcoeff, dqcoeff, levels);
+        }
+        accuRate += eob == 0 ? skipCost : nonSkipCost + txTypeCost;
+        rateCost = accuRate;
+        return eob;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long CoeffDist(int tcoeff, int dqcoeff, int shift)
+    {
+        long diff = (long)(tcoeff - dqcoeff) * (1 << shift);
+        return diff * diff;
+    }
+
+    private static void UpdateCoeffGeneral(ref int accuRate, ref long accuDist, int si, int eob, int txSize, int txClass, int bhl, int width,
+        long rdmult, int shift, int dcSignCtx, short dequant0, short dequant1, ReadOnlySpan<ushort> scan, AomLvMapCoeffCost txbCosts,
+        ReadOnlySpan<int> tcoeff, Span<int> qcoeff, Span<int> dqcoeff, Span<byte> levels)
+    {
+        int ci = scan[si];
+        int qc = qcoeff[ci];
+        bool isLast = si == eob - 1;
+        int coeffCtx = LowerLevelsCtxGeneral(isLast, si, bhl, width, levels, ci, txSize, txClass);
+        if (qc == 0) { accuRate += txbCosts.Base[coeffCtx * 8]; return; }
+        int sign = qc < 0 ? 1 : 0;
+        int absQc = Math.Abs(qc);
+        int tqc = tcoeff[ci], dqc = dqcoeff[ci];
+        int rate = CoeffCostGeneral(isLast, ci, absQc, sign, coeffCtx, dcSignCtx, txbCosts, bhl, txClass, levels);
+        int qcLow = 0, dqcLow = 0, absQcLow = 0, rateLow;
+        if (absQc == 1) rateLow = txbCosts.Base[coeffCtx * 8];
+        else
+        {
+            int dqv = scan[si] != 0 ? dequant1 : dequant0;
+            QcDqcLow(absQc, sign, dqv, shift, out qcLow, out dqcLow);
+            absQcLow = absQc - 1;
+            rateLow = CoeffCostGeneral(isLast, ci, absQcLow, sign, coeffCtx, dcSignCtx, txbCosts, bhl, txClass, levels);
+        }
+        long tqc2 = (long)tqc * 2;
+        long distDiff0 = ((long)dqc * (dqc - tqc2)) * (1L << (2 * shift));
+        long distDiffLow0 = absQc == 1 ? 0 : ((long)dqcLow * (dqcLow - tqc2)) * (1L << (2 * shift));
+        long rd = AomRd.RdCost64(rdmult, rate, distDiff0);
+        long rdLow = AomRd.RdCost64(rdmult, rateLow, distDiffLow0);
+        if (rdLow < rd)
+        {
+            qcoeff[ci] = qcLow;
+            dqcoeff[ci] = dqcLow;
+            levels[PaddedIdx(ci, bhl)] = (byte)Math.Min(absQcLow, 127);
+            accuRate += rateLow;
+            accuDist += distDiffLow0;
+        }
+        else
+        {
+            accuRate += rate;
+            accuDist += distDiff0;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void QcDqcLow(int absQc, int sign, int dqv, int shift, out int qcLow, out int dqcLow)
+    {
+        int absQcLow = absQc - 1;
+        qcLow = (-sign ^ absQcLow) + sign;
+        int absDqcLow = (absQcLow * dqv) >> shift;
+        dqcLow = (-sign ^ absDqcLow) + sign;
+    }
+
+    private static void UpdateCoeffSimple(ref int accuRate, int si, int txSize, int txClass, int bhl, long rdmult, int shift,
+        short dequant0, short dequant1, ReadOnlySpan<ushort> scan, AomLvMapCoeffCost txbCosts, ReadOnlySpan<int> tcoeff,
+        Span<int> qcoeff, Span<int> dqcoeff, Span<byte> levels, int sharpness)
+    {
+        int ci = scan[si];
+        int qc = qcoeff[ci];
+        int coeffCtx = LowerLevelsCtx(levels, ci, bhl, txSize, txClass);
+        if (qc == 0) { accuRate += txbCosts.Base[coeffCtx * 8]; return; }
+        int absQc = Math.Abs(qc), absTqc = Math.Abs(tcoeff[ci]), absDqc = Math.Abs(dqcoeff[ci]);
+        if (absQc == 1)
+        {
+            int rate = txbCosts.Base[coeffCtx * 8 + 1] + AomCost.CostLiteral(1);
+            if (absDqc < absTqc) { accuRate += rate; return; }
+            if (sharpness == 0)
+            {
+                long distDiff0 = ((long)absDqc * (absDqc - (long)absTqc * 2)) * (1L << (2 * shift));
+                int rateLow = rate - txbCosts.Base[coeffCtx * 8 + 5];
+                long rd = AomRd.RdCost64(rdmult, rate, distDiff0);
+                long rdLow = AomRd.RdCost64(rdmult, rateLow, 0);
+                if (rdLow < rd)
+                {
+                    qcoeff[ci] = 0;
+                    dqcoeff[ci] = 0;
+                    levels[PaddedIdx(ci, bhl)] = 0;
+                    accuRate += rateLow;
+                    return;
+                }
+            }
+            accuRate += rate;
+        }
+        else
+        {
+            int rate = TwoCoeffCostSimple(ci, absQc, coeffCtx, txbCosts, bhl, txClass, levels, out int rateLow);
+            if (absDqc < absTqc) { accuRate += rate; return; }
+            bool allowLowerQc = sharpness == 0 || absQc > 1;
+            if (allowLowerQc)
+            {
+                int dqv = scan[si] != 0 ? dequant1 : dequant0;
+                int absQcLow = absQc - 1;
+                int absDqcLow = (absQcLow * dqv) >> shift;
+                long absTqc2 = (long)absTqc << 1;
+                long distDiff0 = ((long)absDqc * (absDqc - absTqc2)) * (1L << (2 * shift));
+                long distDiffLow0 = ((long)absDqcLow * (absDqcLow - absTqc2)) * (1L << (2 * shift));
+                long rd = AomRd.RdCost64(rdmult, rate, distDiff0);
+                long rdLow = AomRd.RdCost64(rdmult, rateLow, distDiffLow0);
+                if (rdLow < rd)
+                {
+                    int sign = qc < 0 ? 1 : 0;
+                    qcoeff[ci] = (-sign ^ absQcLow) + sign;
+                    dqcoeff[ci] = (-sign ^ absDqcLow) + sign;
+                    levels[PaddedIdx(ci, bhl)] = (byte)Math.Min(absQcLow, 127);
+                    accuRate += rateLow;
+                    return;
+                }
+            }
+            accuRate += rate;
+        }
+    }
+
+    private static void UpdateCoeffEob(ref int accuRate, ref long accuDist, ref int eob, ref int nzNum, Span<int> nzCi, int si, int txSize,
+        int txClass, int bhl, int width, int dcSignCtx, long rdmult, int shift, short dequant0, short dequant1, ReadOnlySpan<ushort> scan,
+        int[] txbEobCosts, AomLvMapCoeffCost txbCosts, ReadOnlySpan<int> tcoeff, Span<int> qcoeff, Span<int> dqcoeff, Span<byte> levels,
+        int sharpness)
+    {
+        int ci = scan[si];
+        int qc = qcoeff[ci];
+        int coeffCtx = LowerLevelsCtx(levels, ci, bhl, txSize, txClass);
+        if (qc == 0) { accuRate += txbCosts.Base[coeffCtx * 8]; return; }
+        int dqv = scan[si] != 0 ? dequant1 : dequant0;
+        bool lowerLevel = false;
+        int absQc = Math.Abs(qc);
+        int tqc = tcoeff[ci], dqc = dqcoeff[ci];
+        int sign = qc < 0 ? 1 : 0;
+        int qcLow = 0, dqcLow = 0, absQcLow = 0, rateLow;
+        if (absQc == 1) rateLow = txbCosts.Base[coeffCtx * 8];
+        else
+        {
+            QcDqcLow(absQc, sign, dqv, shift, out qcLow, out dqcLow);
+            absQcLow = absQc - 1;
+            rateLow = CoeffCostGeneral(false, ci, absQcLow, sign, coeffCtx, dcSignCtx, txbCosts, bhl, txClass, levels);
+        }
+        long tqc2 = (long)tqc * 2;
+        long dist = ((long)dqc * (dqc - tqc2)) * (1L << (2 * shift));
+        long distLow = absQc == 1 ? 0 : ((long)dqcLow * (dqcLow - tqc2)) * (1L << (2 * shift));
+        int rate = CoeffCostGeneral(false, ci, absQc, sign, coeffCtx, dcSignCtx, txbCosts, bhl, txClass, levels);
+        long rd = AomRd.RdCost64(rdmult, accuRate + rate, accuDist + dist);
+        long rdLow = AomRd.RdCost64(rdmult, accuRate + rateLow, accuDist + distLow);
+
+        bool lowerLevelNewEob = false;
+        int newEob = si + 1;
+        int coeffCtxNewEob = LowerLevelsCtxEob(bhl, width, si);
+        int newEobCost = EobCost(newEob, txbEobCosts, txbCosts, txClass);
+        int rateCoeffEob = newEobCost + CoeffCostEob(ci, absQc, sign, coeffCtxNewEob, dcSignCtx, txbCosts, bhl, txClass);
+        long distNewEob = dist;
+        long rdNewEob = AomRd.RdCost64(rdmult, rateCoeffEob, distNewEob);
+        if (absQcLow > 0)
+        {
+            int rateCoeffEobLow = newEobCost + CoeffCostEob(ci, absQcLow, sign, coeffCtxNewEob, dcSignCtx, txbCosts, bhl, txClass);
+            long distNewEobLow = distLow;
+            long rdNewEobLow = AomRd.RdCost64(rdmult, rateCoeffEobLow, distNewEobLow);
+            if (rdNewEobLow < rdNewEob)
+            {
+                lowerLevelNewEob = true;
+                rdNewEob = rdNewEobLow;
+                rateCoeffEob = rateCoeffEobLow;
+                distNewEob = distNewEobLow;
+            }
+        }
+        int qcThreshold = si <= 5 ? 2 : 1;
+        bool allowLowerQc = sharpness == 0 || absQc > qcThreshold;
+        if (allowLowerQc && rdLow < rd)
+        {
+            lowerLevel = true;
+            rd = rdLow;
+            rate = rateLow;
+            dist = distLow;
+        }
+        if ((sharpness == 0 || newEob >= 5) && rdNewEob < rd)
+        {
+            for (int ni = 0; ni < nzNum; ni++)
+            {
+                int lastCi = nzCi[ni];
+                levels[PaddedIdx(lastCi, bhl)] = 0;
+                qcoeff[lastCi] = 0;
+                dqcoeff[lastCi] = 0;
+            }
+            eob = newEob;
+            nzNum = 0;
+            accuRate = rateCoeffEob;
+            accuDist = distNewEob;
+            lowerLevel = lowerLevelNewEob;
+        }
+        else
+        {
+            accuRate += rate;
+            accuDist += dist;
+        }
+        if (lowerLevel)
+        {
+            qcoeff[ci] = qcLow;
+            dqcoeff[ci] = dqcLow;
+            levels[PaddedIdx(ci, bhl)] = (byte)Math.Min(absQcLow, 127);
+        }
+        if (qcoeff[ci] != 0) nzCi[nzNum++] = ci;
+    }
+
+    /// <summary>av1_get_txb_entropy_context: min(sum |level|, 7) with the DC sign in bits 3-4.</summary>
+    internal static byte TxbEntropyContext(ReadOnlySpan<int> qcoeff, ReadOnlySpan<ushort> scan, int eob)
+    {
+        if (eob == 0) return 0;
+        int culLevel = 0;
+        for (int c = 0; c < eob; c++)
+        {
+            int v = qcoeff[scan[c]];
+            if (v == 0) continue;
+            culLevel += Math.Abs(v);
+            if (culLevel > CoeffContextMask) break;
+        }
+        culLevel = Math.Min(CoeffContextMask, culLevel);
+        // set_dc_sign
+        if (qcoeff[0] < 0) culLevel |= 1 << CoeffContextBits;
+        else if (qcoeff[0] > 0) culLevel += 2 << CoeffContextBits;
+        return (byte)culLevel;
+    }
+
+    private static readonly sbyte[] TxbCtxSigns = { 0, -1, 1 };
+    private static readonly sbyte[] TxbCtxDcSignContexts =
+    {
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    };
+    private static readonly byte[] TxbCtxSkipContexts = { 1, 2, 2, 2, 3, 2, 4, 4, 4, 5, 2, 4, 4, 4, 5, 2, 4, 4, 4, 5, 3, 5, 5, 5, 6 };
+
+    /// <summary>get_entropy_context (av1/common/entropy.h): whether any above / left entropy byte of the tx is nonzero,
+    /// summed (combine_entropy_contexts).</summary>
+    internal static int EntropyContext(int txSize, ReadOnlySpan<byte> a, ReadOnlySpan<byte> l)
+    {
+        int above = 0, left = 0;
+        int w = TxSizeWideUnit[txSize], h = TxSizeHighUnit[txSize];
+        for (int k = 0; k < w; k++) above |= a[k];
+        for (int k = 0; k < h; k++) left |= l[k];
+        return (above != 0 ? 1 : 0) + (left != 0 ? 1 : 0);
+    }
+
+    /// <summary>get_txb_ctx (all specialisations): the skip and DC-sign contexts of a tx block from its above / left
+    /// entropy contexts (one byte per 4 samples of the tx's width / height).</summary>
+    internal static AomTxbCtx TxbCtx(int planeBsize, int txSize, int plane, ReadOnlySpan<byte> a, ReadOnlySpan<byte> l)
+    {
+        int txbWUnit = TxSizeWideUnit[txSize], txbHUnit = TxSizeHighUnit[txSize];
+        int dcSign = 0;
+        for (int k = 0; k < txbWUnit; k++) dcSign += TxbCtxSigns[a[k] >> CoeffContextBits];
+        for (int k = 0; k < txbHUnit; k++) dcSign += TxbCtxSigns[l[k] >> CoeffContextBits];
+        var ctx = new AomTxbCtx { DcSignCtx = TxbCtxDcSignContexts[dcSign + 2 * 16] };
+        if (plane == 0)
+        {
+            if (planeBsize == TxsizeToBsize[txSize]) ctx.TxbSkipCtx = 0;
+            else
+            {
+                int top = 0, left = 0;
+                for (int k = 0; k < txbWUnit; k++) top |= a[k];
+                top &= CoeffContextMask; top = Math.Min(top, 4);
+                for (int k = 0; k < txbHUnit; k++) left |= l[k];
+                left &= CoeffContextMask; left = Math.Min(left, 4);
+                ctx.TxbSkipCtx = TxbCtxSkipContexts[top * 5 + left];
+            }
+        }
+        else
+        {
+            int ctxBase = EntropyContext(txSize, a, l);
+            int ctxOffset = NumPelsLog2Lookup[planeBsize] > NumPelsLog2Lookup[TxsizeToBsize[txSize]] ? 10 : 7;
+            ctx.TxbSkipCtx = ctxBase + ctxOffset;
+        }
+        return ctx;
+    }
+}
