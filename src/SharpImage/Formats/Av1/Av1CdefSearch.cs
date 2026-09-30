@@ -71,14 +71,14 @@ internal static class Av1CdefSearch
 
                         // luma
                         BlockSse(yP, ys, planeRowsY, srcY, width, width, height, px, py, 8, 8, edges, scratch, left, dir, variance,
-                            damping, bitDepth, bdMin8, luma: true, accY, codes);
+                            damping + bdMin8, bitDepth, bdMin8, luma: true, accY, codes);
                         // chroma (the co-located block of each plane, luma direction, damping - 1); none for monochrome
                         if (uP == null || vP == null) continue;
                         int cdir = i422 ? UvDir422[dir] : dir;
                         BlockSse(uP, cs, planeRowsC, srcU, cw, cw, ch, px >> ssX, py >> ssY, cnw, cnh, edges, scratch, left, cdir, variance,
-                            damping - 1, bitDepth, bdMin8, luma: false, accC, codes);
+                            damping - 1 + bdMin8, bitDepth, bdMin8, luma: false, accC, codes);
                         BlockSse(vP, cs, planeRowsC, srcV, cw, cw, ch, px >> ssX, py >> ssY, cnw, cnh, edges, scratch, left, cdir, variance,
-                            damping - 1, bitDepth, bdMin8, luma: false, accC, codes);
+                            damping - 1 + bdMin8, bitDepth, bdMin8, luma: false, accC, codes);
                     }
                 has[sb] = any;
                 for (int k = 0; k < 64; k++) { sseY[sb * 64 + k] = accY[k]; sseC[sb * 64 + k] = accC[k]; }
@@ -91,6 +91,10 @@ internal static class Av1CdefSearch
 
         var sbs = Enumerable.Range(0, nSb).Where(i => has[i]).ToArray();
         if (sbs.Length == 0) return null;
+        int ns = sbs.Length;
+        var tY = new long[64 * ns]; var tC = new long[64 * ns];
+        for (int i = 0; i < ns; i++)
+            for (int k = 0; k < 64; k++) { tY[k * ns + i] = sseY[sbs[i] * 64 + k]; tC[k * ns + i] = sseC[sbs[i] * 64 + k]; }
 
         // Strength-set selection per cdef_bits (1, 2, 4, 8 pairs): greedy additions then refinement passes.
         double bestCost = double.MaxValue;
@@ -103,7 +107,7 @@ internal static class Av1CdefSearch
             Array.Fill(cur, long.MaxValue);
             for (int k = 0; k < nb; k++)
             {
-                var (py, pc, _) = BestPair(sbs, sseY, sseC, cur, codes);
+                var (py, pc, _) = BestPair(tY, tC, ns, cur, codes);
                 set.Add((py, pc));
                 for (int i = 0; i < sbs.Length; i++) cur[i] = Math.Min(cur[i], sseY[sbs[i] * 64 + py] + sseC[sbs[i] * 64 + pc]);
             }
@@ -118,7 +122,7 @@ internal static class Av1CdefSearch
                         for (int j = 0; j < nb; j++) if (j != k) m = Math.Min(m, sseY[sbs[i] * 64 + set[j].Y] + sseC[sbs[i] * 64 + set[j].C]);
                         others[i] = m;
                     }
-                    var (py, pc, _) = BestPair(sbs, sseY, sseC, others, codes);
+                    var (py, pc, _) = BestPair(tY, tC, ns, others, codes);
                     set[k] = (py, pc);
                 }
             long total = 0;
@@ -160,7 +164,8 @@ internal static class Av1CdefSearch
         int cnw = 8 >> ssX, cnh = 8 >> ssY;
         bool i422 = ssX == 1 && ssY == 0;
         var outY = (ushort[])yP.Clone(); var outU = (ushort[]?)uP?.Clone(); var outV = (ushort[]?)vP?.Clone();
-        int damping = r.Params.Damping, bdMin8 = bitDepth - 8, w4 = w8 * 2, h4 = h8 * 2;
+        // the filter's damping is the coded one + bitdepth_min_8 (dav1d cdef_apply), as the decoder applies it
+        int bdMin8 = bitDepth - 8, damping = r.Params.Damping + bdMin8, w4 = w8 * 2, h4 = h8 * 2;
         void SbRow(int sby)
         {
             Span<ushort> scratch = stackalloc ushort[8 * 10];
@@ -226,21 +231,35 @@ internal static class Av1CdefSearch
             for (int x = 0; x < w; x++) dst[off + y * stride + x] = scratch[y * sw + x];
     }
 
-    // The (luma, chroma) pair minimising sum_i min(cur[i], sse(pair)) (luma and chroma are independent given cur).
-    private static (int Y, int C, long Total) BestPair(int[] sbs, long[] sseY, long[] sseC, long[] cur, int[] codes)
+    // The (luma, chroma) pair minimising sum_i min(cur[i], sse(pair)); tY / tC = the superblocks' SSEs by code
+    // ([code * ns + i]), summed 4 superblocks per vector with the running best as an early exit every 16.
+    private static (int Y, int C, long Total) BestPair(long[] tY, long[] tC, int ns, long[] cur, int[] codes)
     {
         long best = long.MaxValue; int by = 0, bc = 0;
+        int nv = System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated ? ns & ~3 : 0;
         foreach (int y in codes)
+        {
+            var ry = tY.AsSpan(y * ns, ns);
             foreach (int c in codes)
             {
+                var rc = tC.AsSpan(c * ns, ns);
                 long t = 0;
-                for (int i = 0; i < sbs.Length && t < best; i++)
+                int i = 0;
+                while (i < nv && t < best)
                 {
-                    long v = sseY[sbs[i] * 64 + y] + sseC[sbs[i] * 64 + c];
+                    var acc = Vector256<long>.Zero;
+                    for (int e = Math.Min(nv, i + 16); i < e; i += 4)
+                        acc += Vector256.Min(Vector256.Create(ry.Slice(i, 4)) + Vector256.Create(rc.Slice(i, 4)), Vector256.Create(cur.AsSpan(i, 4)));
+                    t += Vector256.Sum(acc);
+                }
+                for (; i < ns && t < best; i++)
+                {
+                    long v = ry[i] + rc[i];
                     t += v < cur[i] ? v : cur[i];
                 }
                 if (t < best) { best = t; by = y; bc = c; }
             }
+        }
         return (by, bc, best);
     }
 

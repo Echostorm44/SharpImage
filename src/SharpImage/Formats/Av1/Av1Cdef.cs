@@ -5,6 +5,7 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics.X86;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 
 namespace SharpImage.Formats.Av1;
@@ -172,8 +173,99 @@ public static class Av1Cdef
         int priStrength, int secStrength, int dir, int damping, int w, int h, int bitDepth)
     {
         if (!Avx2.IsSupported) return false;
-        FilterRowsV(dst, dstOffset, dstStride, tmp144, 2 * 12 + 2, priStrength, secStrength, dir, damping, w, h, bitDepth - 8);
+        if (dstStride == w && (w == 8 && (h & 1) == 0 || w == 4 && (h & 3) == 0) && !Cdef32)
+        {
+            FilterRows16(dst, dstOffset, tmp144, priStrength, secStrength, dir, damping, w, h, bitDepth - 8);
+            if (CdefCheck)
+            {
+                var d2 = new ushort[w * h];
+                FilterRowsV(d2, 0, w, tmp144, 2 * 12 + 2, priStrength, secStrength, dir, damping, w, h, bitDepth - 8);
+                for (int i = 0; i < w * h; i++)
+                    if (d2[i] != dst[dstOffset + i])
+                        throw new InvalidOperationException($"cdef16 {w}x{h} pri {priStrength} sec {secStrength} dir {dir} damp {damping} bd {bitDepth} at {i}: {dst[dstOffset + i]} vs {d2[i]}; tmp [{string.Join(",", tmp144.ToArray())}]");
+            }
+        }
+        else
+            FilterRowsV(dst, dstOffset, dstStride, tmp144, 2 * 12 + 2, priStrength, secStrength, dir, damping, w, h, bitDepth - 8);
         return true;
+    }
+
+    private static readonly bool Cdef32 = Environment.GetEnvironmentVariable("AV1_CDEF32") == "1";
+    private static readonly bool CdefCheck = Environment.GetEnvironmentVariable("AV1_CDEFCHECK") == "1";
+
+    // FilterRowsV in 16-bit lanes (dav1d's cdef_filter_*_16bpc layout): 16 pixels per vector — two rows of an 8-wide block
+    // or four of a 4-wide one — into a contiguous w-stride dst. Tap differences wrap in 16 bits; with |diff| read unsigned
+    // the INT16_MIN padding sentinel still constrains to 0, the min clamp excludes it (unsigned min) and the max clamp
+    // too (signed max). Every value in range fits 16 bits (|sum| <= 3648), so the results equal the 32-bit kernel's.
+    private static void FilterRows16(Span<ushort> dst, int dstOffset, ReadOnlySpan<short> tmp,
+        int priStrength, int secStrength, int dir, int damping, int w, int h, int bdMin8)
+    {
+        const int ts = 12, center = 2 * 12 + 2;
+        bool pri = priStrength != 0, sec = secStrength != 0;
+        short priTap0 = (short)(4 - ((priStrength >> bdMin8) & 1)), priTap1 = (short)((priTap0 & 3) | 2);
+        int priShift = pri ? Math.Max(0, damping - Log2(priStrength)) : 0;
+        int secShift = sec ? damping - Log2(secStrength) : 0;
+        var priThr = Vector256.Create((short)priStrength); var secThr = Vector256.Create((short)secStrength);
+        var priSh = Vector128.CreateScalar((ushort)priShift); var secSh = Vector128.CreateScalar((ushort)secShift);
+        int po0 = Directions[dir + 2, 0], po1 = Directions[dir + 2, 1];
+        int sa0 = Directions[dir + 4, 0], sa1 = Directions[dir + 4, 1];
+        int sb0 = Directions[dir + 0, 0], sb1 = Directions[dir + 0, 1];
+        int rowsPer = w == 8 ? 2 : 4;
+        for (int r = 0; r < h; r += rowsPer)
+        {
+            int o = center + r * ts;
+            var px = L(tmp, o, w);
+            var sum = Vector256<short>.Zero;
+            var mn = px.AsUInt16(); var mx = px;
+            if (pri)
+            {
+                var p0 = L(tmp, o + po0, w); var p1 = L(tmp, o - po0, w);
+                var q0 = L(tmp, o + po1, w); var q1 = L(tmp, o - po1, w);
+                sum += (C(p0 - px, priThr, priSh) + C(p1 - px, priThr, priSh)) * Vector256.Create(priTap0);
+                sum += (C(q0 - px, priThr, priSh) + C(q1 - px, priThr, priSh)) * Vector256.Create(priTap1);
+                if (sec)
+                {
+                    mn = Vector256.Min(Vector256.Min(mn, p0.AsUInt16()), Vector256.Min(p1.AsUInt16(), Vector256.Min(q0.AsUInt16(), q1.AsUInt16())));
+                    mx = Vector256.Max(Vector256.Max(mx, p0), Vector256.Max(p1, Vector256.Max(q0, q1)));
+                }
+            }
+            if (sec)
+            {
+                for (int k = 0; k < 2; k++)
+                {
+                    int oa = k == 0 ? sa0 : sa1, ob = k == 0 ? sb0 : sb1;
+                    var s0 = L(tmp, o + oa, w); var s1 = L(tmp, o - oa, w);
+                    var s2 = L(tmp, o + ob, w); var s3 = L(tmp, o - ob, w);
+                    var t = C(s0 - px, secThr, secSh) + C(s1 - px, secThr, secSh) + C(s2 - px, secThr, secSh) + C(s3 - px, secThr, secSh);
+                    sum += k == 0 ? t + t : t;
+                    if (pri)
+                    {
+                        mn = Vector256.Min(Vector256.Min(mn, s0.AsUInt16()), Vector256.Min(s1.AsUInt16(), Vector256.Min(s2.AsUInt16(), s3.AsUInt16())));
+                        mx = Vector256.Max(Vector256.Max(mx, s0), Vector256.Max(s1, Vector256.Max(s2, s3)));
+                    }
+                }
+            }
+            var res = px + Vector256.ShiftRightArithmetic(sum + Vector256.ShiftRightArithmetic(sum, 15) + Vector256.Create((short)8), 4);
+            if (pri && sec) res = Vector256.Min(Vector256.Max(res, mn.AsInt16()), mx);
+            res.AsUInt16().CopyTo(dst.Slice(dstOffset + r * w, 16));
+        }
+
+        // 16 lanes: rows at o, o + 12, ... (8 samples each for w 8, 4 each for w 4)
+        static Vector256<short> L(ReadOnlySpan<short> t, int o, int w)
+        {
+            if (w == 8) return Vector256.Create(Vector128.Create(t.Slice(o, 8)), Vector128.Create(t.Slice(o + ts, 8)));
+            var b = MemoryMarshal.AsBytes(t);
+            return Vector256.Create(MemoryMarshal.Read<long>(b.Slice(o * 2)), MemoryMarshal.Read<long>(b.Slice((o + ts) * 2)),
+                MemoryMarshal.Read<long>(b.Slice((o + 2 * ts) * 2)), MemoryMarshal.Read<long>(b.Slice((o + 3 * ts) * 2))).AsInt16();
+        }
+        // constrain(diff, threshold, shift) with |diff| unsigned
+        static Vector256<short> C(Vector256<short> diff, Vector256<short> thr, Vector128<ushort> sh)
+        {
+            var ad = Vector256.Abs(diff).AsUInt16();
+            var lim = Vector256.Max(thr - Avx2.ShiftRightLogical(ad, sh).AsInt16(), Vector256<short>.Zero).AsUInt16();
+            var val = Vector256.Min(ad, lim).AsInt16();
+            return Vector256.ConditionalSelect(Vector256.LessThan(diff, Vector256<short>.Zero), -val, val);
+        }
     }
 
     private static void Padding(Span<short> tmp, int tmpOffset, int tmpStride,
