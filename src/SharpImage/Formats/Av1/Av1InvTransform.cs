@@ -210,14 +210,15 @@ public static class Av1InvTransform
     }
 
     /// <summary>
-    /// Apply inverse transform and add residuals to 16-bit destination (10/12-bit).
+    /// Apply inverse transform and add residuals to the destination, generic over the sample type (byte planes for
+    /// 8-bit content, ushort for 10/12-bit; see Px).
     /// </summary>
     [System.Runtime.CompilerServices.SkipLocalsInit]
-    public static void InvTxfmAdd16(
-        Span<ushort> dst, int dstStride,
+    public static void InvTxfmAdd16<TP>(
+        Span<TP> dst, int dstStride,
         Span<int> coeffs, int eob,
         int txSizeIdx, int shift,
-        Av1TxType txType, int bitDepth)
+        Av1TxType txType, int bitDepth) where TP : unmanaged
     {
         // Lossless (coded-lossless inter blocks reach here too): the 4x4 Walsh-Hadamard inverse.
         if (txType == Av1TxType.WhtWht) { InvWhtAdd16(dst, dstStride, coeffs, bitDepth); return; }
@@ -248,7 +249,7 @@ public static class Av1InvTransform
             {
                 var row = dst.Slice(y * dstStride, w);
                 for (int x = 0; x < w; x++)
-                    row[x] = (ushort)Math.Clamp(row[x] + dc, 0, pixelMax);
+                    row[x] = Px.T<TP>(Math.Clamp(Px.I(row[x]) + dc, 0, pixelMax));
             }
             return;
         }
@@ -315,7 +316,7 @@ public static class Av1InvTransform
             var row = dst.Slice(y * dstStride, w);
             var tmpRow = tmp.Slice(y * w, w);
             for (int x = 0; x < w; x++)
-                row[x] = (ushort)Math.Clamp(row[x] + ((tmpRow[x] + 8) >> 4), 0, pixelMax);
+                row[x] = Px.T<TP>(Math.Clamp(Px.I(row[x]) + ((tmpRow[x] + 8) >> 4), 0, pixelMax));
         }
     }
 
@@ -323,9 +324,9 @@ public static class Av1InvTransform
     /// coefficients) or 8 columns (column pass) at a time via Av1InvTransformV; 4-wide / 4-tall blocks use the low half.
     /// Every lane does the scalar integer math, so the output is identical.</summary>
     [System.Runtime.CompilerServices.SkipLocalsInit]
-    private static void InvTxfmAdd16V(Span<ushort> dst, int dstStride, Span<int> coeffs, uint rowMask, int w, int h,
+    private static void InvTxfmAdd16V<TP>(Span<TP> dst, int dstStride, Span<int> coeffs, uint rowMask, int w, int h,
         int sw, int sh, bool isRect2, int rnd, int shift, int pixelMax, int rowClipMin, int rowClipMax,
-        int colClipMin, int colClipMax, int lw, int lh, int txtp0, int txtp1)
+        int colClipMin, int colClipMax, int lw, int lh, int txtp0, int txtp1) where TP : unmanaged
     {
         int wv = (w + 7) >> 3;                                    // 8-column groups
         Span<Vector256<int>> tmpS = stackalloc Vector256<int>[h * wv];   // row-major intermediate: row y, group gi
@@ -377,7 +378,7 @@ public static class Av1InvTransform
         // Column pass, 8 columns at a time (lanes = columns), added onto the destination.
         var eight = Vector256.Create(8);
         var pmax = Vector256.Create(pixelMax);
-        ref ushort d0 = ref MemoryMarshal.GetReference(dst);
+        ref TP d0 = ref MemoryMarshal.GetReference(dst);
         for (int gi = 0; gi < wv; gi++)
         {
             for (int i = 0; i < h; i++) v[i] = Unsafe.Add(ref t0, i * wv + gi);
@@ -387,18 +388,17 @@ public static class Av1InvTransform
                 for (int y = 0; y < h; y++)
                 {
                     var add = Vector256.ShiftRightArithmetic(v[y] + eight, 4);
-                    ref ushort row = ref Unsafe.Add(ref d0, y * dstStride + x0);
-                    var d = Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref row));
-                    var sum = Vector256.Min(Vector256.Max(d + add, zero), pmax);
-                    Vector256.Narrow(sum.AsUInt32(), Vector256<uint>.Zero).GetLower().StoreUnsafe(ref row);
+                    ref TP row = ref Unsafe.Add(ref d0, y * dstStride + x0);
+                    var sum = Vector256.Min(Vector256.Max(Px.Load8x32(ref row) + add, zero), pmax);
+                    Px.Store8x32(ref row, sum);
                 }
             else
                 for (int y = 0; y < h; y++)
                 {
                     var add = Vector256.ShiftRightArithmetic(v[y] + eight, 4);
-                    ref ushort row = ref Unsafe.Add(ref d0, y * dstStride);
+                    ref TP row = ref Unsafe.Add(ref d0, y * dstStride);
                     for (int x = 0; x < 4; x++)
-                        Unsafe.Add(ref row, x) = (ushort)Math.Clamp(Unsafe.Add(ref row, x) + add.GetElement(x), 0, pixelMax);
+                        Unsafe.Add(ref row, x) = Px.T<TP>(Math.Clamp(Px.I(Unsafe.Add(ref row, x)) + add.GetElement(x), 0, pixelMax));
                 }
         }
     }
@@ -454,10 +454,10 @@ public static class Av1InvTransform
         }
     }
 
-    /// <summary>High bit depth 4x4 Walsh-Hadamard inverse add. See <see cref="InvWhtAdd"/>.</summary>
-    public static void InvWhtAdd16(
-        Span<ushort> dst, int dstStride,
-        Span<int> coeffs, int bitDepth)
+    /// <summary>4x4 Walsh-Hadamard inverse add, generic over the sample type. See <see cref="InvWhtAdd"/>.</summary>
+    public static void InvWhtAdd16<TP>(
+        Span<TP> dst, int dstStride,
+        Span<int> coeffs, int bitDepth) where TP : unmanaged
     {
         int pixelMax = (1 << bitDepth) - 1;
         Span<int> tmp = stackalloc int[16];
@@ -478,7 +478,7 @@ public static class Av1InvTransform
             var row = dst.Slice(y * dstStride, 4);
             var tmpRow = tmp.Slice(y * 4, 4);
             for (int x = 0; x < 4; x++)
-                row[x] = (ushort)Math.Clamp(row[x] + tmpRow[x], 0, pixelMax);
+                row[x] = Px.T<TP>(Math.Clamp(Px.I(row[x]) + tmpRow[x], 0, pixelMax));
         }
     }
 

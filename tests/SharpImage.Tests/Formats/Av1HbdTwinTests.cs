@@ -79,16 +79,25 @@ public sealed class Av1HbdTwinTests
                 var cf8 = new int[Math.Max(w * h, 32 * 32)];
                 for (int i = 0; i <= eob; i++) cf8[Av1Tables.Scans[tx][i]] = rnd.Next(-300, 301);
                 var cf16 = (int[])cf8.Clone();
+                var cfB = (int[])cf8.Clone();
+                var cfS = (int[])cf8.Clone();
                 var p8 = new byte[w * h];
                 var p16 = new ushort[w * h];
                 for (int i = 0; i < p8.Length; i++) { p8[i] = (byte)rnd.Next(256); p16[i] = p8[i]; }
+                var pB = (byte[])p8.Clone();
+                var pS = (byte[])p8.Clone();
                 try
                 {
                     Av1InvTransform.InvTxfmAdd(p8, w, cf8, eob, tx, Av1InvTransform.TxShift[tx], txType, 8);
                     Av1InvTransform.InvTxfmAdd16(p16, w, cf16, eob, tx, Av1InvTransform.TxShift[tx], txType, 8);
+                    // the generic lowbd (byte) instantiation, vector and scalar
+                    Av1InvTransform.InvTxfmAdd16<byte>(pB, w, cfB, eob, tx, Av1InvTransform.TxShift[tx], txType, 8);
+                    Av1InvTransform.ForceScalar = true;
+                    try { Av1InvTransform.InvTxfmAdd16<byte>(pS, w, cfS, eob, tx, Av1InvTransform.TxShift[tx], txType, 8); }
+                    finally { Av1InvTransform.ForceScalar = false; }
                 }
                 catch (Exception) { continue; } // tx type not valid for this size
-                for (int i = 0; i < p8.Length; i++) if (p8[i] != p16[i]) { mismatches++; break; }
+                for (int i = 0; i < p8.Length; i++) if (p8[i] != p16[i] || p8[i] != pB[i] || p8[i] != pS[i]) { mismatches++; break; }
             }
         }
         await Assert.That(mismatches).IsEqualTo(0);

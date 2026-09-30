@@ -100,4 +100,26 @@ internal static class Px
         }
         Unsafe.WriteUnaligned(ref Unsafe.As<TP, byte>(ref r), v.AsUInt64().ToScalar());
     }
+
+    /// <summary>8 samples at r as 32-bit lanes.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector256<int> Load8x32<TP>(ref TP r) where TP : unmanaged
+    {
+        if (typeof(TP) == typeof(byte))
+            return Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.As<TP, byte>(ref r))).AsByte());
+        return Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref Unsafe.As<TP, ushort>(ref r)));
+    }
+
+    /// <summary>Stores 8 int lanes (each within the sample range) at r.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Store8x32<TP>(ref TP r, Vector256<int> v) where TP : unmanaged
+    {
+        var n = Vector128.Narrow(v.GetLower().AsUInt32(), v.GetUpper().AsUInt32());
+        if (typeof(TP) == typeof(byte))
+        {
+            Unsafe.WriteUnaligned(ref Unsafe.As<TP, byte>(ref r), Sse2.PackUnsignedSaturate(n.AsInt16(), n.AsInt16()).AsUInt64().ToScalar());
+            return;
+        }
+        n.StoreUnsafe(ref Unsafe.As<TP, ushort>(ref r));
+    }
 }
