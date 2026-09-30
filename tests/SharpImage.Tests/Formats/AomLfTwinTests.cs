@@ -59,6 +59,9 @@ public sealed partial class AomLfTwinTests
         [DllImport(D)] public static extern int twin_count_sgrproj_bits(int ep, int x0, int x1, int rx0, int rx1);
         [DllImport(D, CharSet = CharSet.Ansi)] public static extern int twin_capture(byte* y, byte* u, byte* v, int w, int h,
             int ss444, int speed, int quantizer, int skipPostproc, string outPath);
+        [DllImport(D, CharSet = CharSet.Ansi)] public static extern int twin_capture2(byte* y, byte* u, byte* v, int w, int h,
+            int ss444, int speed, int quantizer, int skipPostproc, int tileColsLog2, int tileRowsLog2, int sharpness,
+            string outPath);
     }
 
     // ---- helpers ------------------------------------------------------------------------------------------------------
@@ -181,6 +184,7 @@ public sealed partial class AomLfTwinTests
     {
         if (!Available) return;
         var rng = new Random(5);
+        long area = 0;
         for (int iter = 0; iter < 60; iter++)
         {
             int win = rng.Next(2) == 0 ? 7 : 5;
@@ -191,9 +195,26 @@ public sealed partial class AomLfTwinTests
             FillPlane(rng, src, rng.Next(1, 60));
             if (iter % 7 == 0) { rng.NextBytes(dgd.Buf); rng.NextBytes(src.Buf); }   // adversarial: full-range noise
             int hs = rng.Next(0, w / 2), vs = rng.Next(0, h / 2), he = rng.Next(hs + 1, w + 1), ve = rng.Next(vs + 1, h + 1);
+            if (iter < 6)
+            {
+                // the largest unit (1.5 x 256 square), full-range noise and a sparse-peak image (avg near 0, |Y| near 255)
+                w = h = 384;
+                dgd = new AomYv12Plane(w, h, w, h, 8);
+                src = new AomYv12Plane(w, h, w, h, 8);
+                if (iter < 3) { rng.NextBytes(dgd.Buf); rng.NextBytes(src.Buf); }
+                else
+                    for (int i = 0; i < dgd.Buf.Length; i++)
+                    {
+                        dgd.Buf[i] = (byte)(rng.Next(9) == 0 ? 255 : 0);
+                        src.Buf[i] = (byte)(rng.Next(9) == 0 ? 255 : 0);
+                    }
+                hs = vs = 0;
+                he = ve = 384;
+            }
             var M = new long[49];
             var H = new long[49 * 49];
-            AomPickRst.ComputeStats(win, dgd, src, hs, he, vs, ve, M, H, 0);
+            int ds = iter >= 6 && iter % 2 == 1 ? 1 : 0;   // use_downsampled_wiener_stats (not set by the all-intra speeds)
+            AomPickRst.ComputeStats(win, dgd, src, hs, he, vs, ve, M, H, ds);
             var tM = new long[49];
             var tH = new long[49 * 49];
             unsafe
@@ -202,9 +223,10 @@ public sealed partial class AomLfTwinTests
                 fixed (byte* s = src.Buf)
                 fixed (long* pm = tM)
                 fixed (long* ph = tH)
-                    Native.twin_compute_stats(win, d + dgd.Origin, s + src.Origin, hs, he, vs, ve, dgd.Stride, src.Stride, pm, ph, 0);
+                    Native.twin_compute_stats(win, d + dgd.Origin, s + src.Origin, hs, he, vs, ve, dgd.Stride, src.Stride, pm, ph, ds);
             }
             int n2 = win * win;
+            area += (long)(he - hs) * (ve - vs);
             await Assert.That(M.AsSpan(0, n2).SequenceEqual(tM.AsSpan(0, n2))).IsTrue();
             await Assert.That(H.AsSpan(0, n2 * n2).SequenceEqual(tH.AsSpan(0, n2 * n2))).IsTrue();
 
@@ -258,6 +280,8 @@ public sealed partial class AomLfTwinTests
             }
             await Assert.That(score).IsEqualTo(tscore);
         }
+        Console.WriteLine($"compute_stats area {area}");
+        await Assert.That(area).IsGreaterThan(100000);
     }
 
     [Test]
