@@ -3640,7 +3640,12 @@ internal static partial class Av1StillImageEncoder
     {
         int stride = bw4 * 4;
         double bits = Math.Log2(palSize);   // top-left uniform
-        Span<byte> order = stackalloc byte[8];
+        // the cost of each (context, colour index) under the current CDFs, and the static (context, index) of every
+        // (left, top, top-left, target) neighbourhood (BuildColorOrder's order, looked up)
+        Span<double> cost = stackalloc double[5 * 8];
+        for (int ctx = 0; ctx < 5; ctx++)
+            for (int ci = 0; ci < palSize; ci++) cost[ctx * 8 + ci] = Av1CoeffEncode.SymBits(modeCdf.ColorMap[(palSize - 2) * 5 + ctx], ci);
+        var tbl = PalOrderTable(palSize);
         int maxDiag = 4 * (bw4 + bh4) - 1;
         for (int diag = 1; diag < maxDiag; diag++)
         {
@@ -3648,15 +3653,32 @@ internal static partial class Av1StillImageEncoder
             for (int x = first; x >= last; x--)
             {
                 int y = diag - x;
-                int l = x > 0 ? idxMap[y * stride + x - 1] : 0xFF;
-                int tt = y > 0 ? idxMap[(y - 1) * stride + x] : 0xFF;
-                int tl = (x > 0 && y > 0) ? idxMap[(y - 1) * stride + x - 1] : 0xFF;
-                int ctx = Av1CoeffDecode.BuildColorOrder(order, palSize, l, tt, tl);
-                int target = idxMap[y * stride + x], colorIdx = 0; while (order[colorIdx] != target) colorIdx++;
-                bits += Av1CoeffEncode.SymBits(modeCdf.ColorMap[(palSize - 2) * 5 + ctx], colorIdx);
+                int l = x > 0 ? idxMap[y * stride + x - 1] : 8;
+                int tt = y > 0 ? idxMap[(y - 1) * stride + x] : 8;
+                int tl = (x > 0 && y > 0) ? idxMap[(y - 1) * stride + x - 1] : 8;
+                bits += cost[tbl[((l * 9 + tt) * 9 + tl) * 8 + idxMap[y * stride + x]]];
             }
         }
         return bits;
+    }
+
+    // Per palette size: for neighbourhood (left, top, top-left) in 0..7 or 8 = absent and target colour, the index
+    // context * 8 + position of the target in BuildColorOrder's order (0 where the target cannot occur).
+    private static readonly byte[]?[] PalOrderTables = new byte[]?[9];
+    private static byte[] PalOrderTable(int palSize)
+    {
+        var t = PalOrderTables[palSize];
+        if (t != null) return t;
+        t = new byte[9 * 9 * 9 * 8];
+        Span<byte> order = stackalloc byte[8];
+        for (int l = 0; l < 9; l++)
+            for (int tt = 0; tt < 9; tt++)
+                for (int tl = 0; tl < 9; tl++)
+                {
+                    int ctx = Av1CoeffDecode.BuildColorOrder(order, palSize, l == 8 ? 0xFF : l, tt == 8 ? 0xFF : tt, tl == 8 ? 0xFF : tl);
+                    for (int i = 0; i < palSize; i++) t[((l * 9 + tt) * 9 + tl) * 8 + order[i]] = (byte)(ctx * 8 + i);
+                }
+        return PalOrderTables[palSize] = t;
     }
 
     // Rate-DISTORTION cost J = SSE + λ·bits of a colour leaf's luma coded at a given (uniform) tx size. Each tx

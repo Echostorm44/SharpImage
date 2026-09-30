@@ -332,25 +332,32 @@ internal static partial class Av1StillImageEncoder
     /// sizes min(colours, 8) down to 2, pairs ordered by U (the U palette must ascend).</summary>
     private static List<UvPal<TP>> UvPaletteCandidates<TP>(ColorPartCtx<TP> c, int cbx, int cby, int cw, int ch) where TP : unmanaged
     {
-        var list = new List<UvPal<TP>>();
-        var pairs = new Dictionary<int, int>();
+        var list = new List<UvPal<TP>>(7);
+        // the distinct (u, v) pairs in first-occurrence order with their counts (an open-addressed table of 128 slots),
+        // giving up past 64
+        Span<int> slot = stackalloc int[128];   // 1 + index into pts, 0 = empty
+        Span<int> keys = stackalloc int[65];
+        Span<(int U, int V, int N)> ptsBuf = stackalloc (int, int, int)[65];
+        int np = 0;
         for (int y = 0; y < ch; y++)
             for (int x = 0; x < cw; x++)
             {
                 int o = (cby + y) * c.Cw + cbx + x, key = (Px.I(c.U[o]) << 16) | Px.I(c.V[o]);
-                pairs[key] = pairs.TryGetValue(key, out int n) ? n + 1 : 1;
-                if (pairs.Count > 64) return list;
+                int h = (int)(((uint)key * 2654435761u) >> 25);
+                while (slot[h] != 0 && keys[slot[h] - 1] != key) h = (h + 1) & 127;
+                if (slot[h] != 0) { ptsBuf[slot[h] - 1].N++; continue; }
+                if (np == 64) return list;
+                keys[np] = key; ptsBuf[np] = (key >> 16, key & 0xFFFF, 1); slot[h] = ++np;
             }
-        if (pairs.Count < 2) return list;
-        var pts = new List<(int U, int V, int N)>();
-        foreach (var kv in pairs) pts.Add((kv.Key >> 16, kv.Key & 0xFFFF, kv.Value));
+        if (np < 2) return list;
+        var pts = ptsBuf.Slice(0, np);
         pts.Sort((a, b) => b.N.CompareTo(a.N));
         int maxVal = (1 << Bd) - 1;
-        for (int k = Math.Min(pts.Count, 8); k >= 2; k--)
+        for (int k = Math.Min(np, 8); k >= 2; k--)
         {
             Span<double> cu = stackalloc double[8], cv = stackalloc double[8];
             for (int i = 0; i < k; i++) { cu[i] = pts[i].U; cv[i] = pts[i].V; }
-            if (k < pts.Count)
+            if (k < np)
             {
                 Span<double> su = stackalloc double[8], sv = stackalloc double[8];
                 Span<long> sn = stackalloc long[8];
@@ -374,16 +381,18 @@ internal static partial class Av1StillImageEncoder
                     if (!moved) break;
                 }
             }
-            var cols = new List<(ushort U, ushort V)>();
+            // the distinct rounded centroids, ordered by (U, V) (distinct keys: any sort gives the same order)
+            Span<int> cols = stackalloc int[8];
+            int nc = 0;
             for (int q = 0; q < k; q++)
             {
-                var pr = ((ushort)Math.Clamp((int)Math.Round(cu[q]), 0, maxVal), (ushort)Math.Clamp((int)Math.Round(cv[q]), 0, maxVal));
-                if (!cols.Contains(pr)) cols.Add(pr);
+                int pr = (Math.Clamp((int)Math.Round(cu[q]), 0, maxVal) << 16) | Math.Clamp((int)Math.Round(cv[q]), 0, maxVal);
+                if (!cols.Slice(0, nc).Contains(pr)) cols[nc++] = pr;
             }
-            if (cols.Count < 2) continue;
-            cols.Sort((a, b) => a.U != b.U ? a.U.CompareTo(b.U) : a.V.CompareTo(b.V));
-            var cand = new UvPal<TP> { Size = cols.Count, Map = new byte[cw * ch], PredU = new TP[cw * ch], PredV = new TP[cw * ch] };
-            for (int i = 0; i < cols.Count; i++) { cand.U[i] = cols[i].U; cand.V[i] = cols[i].V; }
+            if (nc < 2) continue;
+            cols.Slice(0, nc).Sort();
+            var cand = new UvPal<TP> { Size = nc, Map = new byte[cw * ch], PredU = new TP[cw * ch], PredV = new TP[cw * ch] };
+            for (int i = 0; i < nc; i++) { cand.U[i] = (ushort)(cols[i] >> 16); cand.V[i] = (ushort)(cols[i] & 0xFFFF); }
             for (int y = 0; y < ch; y++)
                 for (int x = 0; x < cw; x++)
                 {
