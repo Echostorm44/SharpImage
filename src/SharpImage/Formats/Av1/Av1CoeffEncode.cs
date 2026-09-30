@@ -461,7 +461,22 @@ internal static class Av1CoeffEncode
         for (int stage = 0; stage < 4; stage++) { int s = Math.Min(rem, 3); b += SymBits(brCdf, s); if (s < 3) break; rem -= 3; }
         return b;
     }
-    private static double GolombBits(uint g) { uint x = g + 1; int len = 31 - BitOperations.LeadingZeroCount(x); return 2 * len + 1; }
+    private static double GolombBits(uint g) => GolombLen(g);
+    private static int GolombLen(uint g) { uint x = g + 1; int len = 31 - BitOperations.LeadingZeroCount(x); return 2 * len + 1; }
+    // Symbol costs in 1/512 bit (BitCost512): SymBits / HiTokBits * 512, exactly.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int SymCost(ReadOnlySpan<ushort> icdf, int s)
+    {
+        int prob = (s == 0 ? 32768 : icdf[s - 1]) - icdf[s];
+        return BitCost512[Math.Max(prob, 0)];
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int HiTokCost(ReadOnlySpan<ushort> brCdf, int mag)
+    {
+        int b = 0, rem = Math.Min(mag, 15) - 3;
+        for (int stage = 0; stage < 4; stage++) { int s = Math.Min(rem, 3); b += SymCost(brCdf, s); if (s < 3) break; rem -= 3; }
+        return b;
+    }
 
     /// <summary>Estimated bit cost of coding one 2D transform block's coefficients with the given contexts, from
     /// the current CDF probabilities (no side effects). Mirrors EncodeCoefs symbol-for-symbol.</summary>
@@ -521,47 +536,57 @@ internal static class Av1CoeffEncode
             if (eobTok == 2) bits += CBr(coef, brTokIdx + (((xE | yE) > 1) ? 14 : 7), magEob);
             levels[rcEob] = LevelByte(magEob);
 
-            // the middle coefficients through the trellis's context machinery (per-position offsets, unchecked neighbour
-            // reads, cost-table rows): the same contexts and symbol costs, summed in the same order
+            // the middle coefficients' costs summed in integers (1/512 bit: every cost is a multiple of it, so the double
+            // total is the same whatever the grouping)
+            ref int sl0 = ref MemoryMarshal.GetReference(signedLevels);
+            int midR = 0;
             var tc = new TrCtx { Coef = coef, Levels = levels, Stride = stride, Pos = TrPosTables[tx], BaseTokIdx = baseTokIdx, BrTokIdx = brTokIdx };
             if (coef.Tab is { } tab)
             {
-                tc.HasTab = true;
-                tc.BaseC = ref MemoryMarshal.GetArrayDataReference(tab.Base);
-                tc.BrC = ref MemoryMarshal.GetArrayDataReference(tab.Br);
+                ref int ib = ref MemoryMarshal.GetArrayDataReference(tab.IBase);
+                ref int ibr = ref MemoryMarshal.GetArrayDataReference(tab.IBr);
+                for (int i = eob - 1; i > 0; i--)
+                {
+                    int rcI = scan[i], mag = Math.Abs(Unsafe.Add(ref sl0, rcI));
+                    TrMidCtx(ref tc, rcI, out int baseCdf, out int brCdf);
+                    int tok = Math.Min(mag, 3);
+                    midR += Unsafe.Add(ref ib, baseCdf * 4 + tok);
+                    if (tok == 3) midR += Unsafe.Add(ref ibr, brCdf * 16 + Math.Min(mag, 15));
+                    levels[rcI] = LevelByte(mag);
+                }
             }
-            ref int sl0 = ref MemoryMarshal.GetReference(signedLevels);
-            for (int i = eob - 1; i > 0; i--)
-            {
-                int rcI = scan[i], mag = Math.Abs(Unsafe.Add(ref sl0, rcI));
-                TrMidCtx(ref tc, rcI, out int baseCdf, out int brCdf);
-                int tok = Math.Min(mag, 3);
-                bits += TBase(ref tc, baseCdf, tok);
-                if (tok == 3) bits += tc.HasTab ? Unsafe.Add(ref tc.BrC, brCdf * 16 + Math.Min(mag, 15)) : HiTokBits(coef.BrTok[brCdf], mag);
-                levels[rcI] = LevelByte(mag);
-            }
+            else
+                for (int i = eob - 1; i > 0; i--)
+                {
+                    int rcI = scan[i], mag = Math.Abs(Unsafe.Add(ref sl0, rcI));
+                    TrMidCtx(ref tc, rcI, out int baseCdf, out int brCdf);
+                    int tok = Math.Min(mag, 3);
+                    midR += SymCost(coef.BaseTok[baseCdf], tok);
+                    if (tok == 3) midR += HiTokCost(coef.BrTok[brCdf], mag);
+                    levels[rcI] = LevelByte(mag);
+                }
+            uint dcNb = (uint)(levels[0 * stride + 1] + levels[1 * stride + 0] + levels[1 * stride + 1]) & 63;   // the DC's br context
+            bits += midR * (1.0 / (1 << CostShift));
 
             int dcMag = Math.Abs(signedLevels[0]);
             int dcTokBase = Math.Min(dcMag, 3);
             bits += CBase(coef, baseTokIdx + 0, dcTokBase);
-            if (dcTokBase == 3)
-            {
-                uint mg = (uint)(levels[0 * stride + 1] + levels[1 * stride + 0] + levels[1 * stride + 1]) & 63;
-                bits += CBr(coef, brTokIdx + (int)(mg > 12 ? 6u : (mg + 1) >> 1), dcMag);
-            }
+            if (dcTokBase == 3) bits += CBr(coef, brTokIdx + (int)(dcNb > 12 ? 6u : (dcNb + 1) >> 1), dcMag);
 
             if (dcMag != 0)
             {
                 bits += CDcSign(coef, chroma * 3 + dcSignCtx, signedLevels[0] < 0 ? 1u : 0u);
                 if (dcMag >= 15) bits += GolombBits((uint)(dcMag - 15));
             }
+            int signBits = 0;
             for (int i = 1; i <= eob; i++)
             {
                 int rcI = scan[i];
                 levels[rcI] = 0; // leave the shared scratch all-zero
-                int mag = Math.Abs(signedLevels[rcI]);
-                if (mag != 0) { bits += 1; if (mag >= 15) bits += GolombBits((uint)(mag - 15)); } // AC sign equiprobable
+                int mag = Math.Abs(Unsafe.Add(ref sl0, rcI));
+                if (mag != 0) { signBits++; if (mag >= 15) signBits += GolombLen((uint)(mag - 15)); } // AC sign equiprobable
             }
+            bits += signBits;
         }
         else
         {
@@ -824,6 +849,47 @@ internal static class Av1CoeffEncode
         }
 
         // --- update_coeff_simple: one level down for the rounded-up AC coefficients, their context final ---
+        if (coef.Tab is { } itab && si >= 1)
+        {
+            // with the cost table: locals, unchecked reads and integer rates (1/512 bit, exact: every cost is a multiple of
+            // 2^-9, and lambda * (R / 512) rounds as (lambda / 512) * R) — the same decisions as the loop below
+            int accR = (int)(accuRate * (1 << CostShift));
+            double lam = lambda * (1.0 / (1 << CostShift));
+            int st = tc.Stride, bt = tc.BaseTokIdx, brt = tc.BrTokIdx;
+            ref byte lv0 = ref MemoryMarshal.GetArrayDataReference(levels);
+            ref short pos0 = ref MemoryMarshal.GetArrayDataReference(tc.Pos);
+            ref int ib = ref MemoryMarshal.GetArrayDataReference(itab.IBase);
+            ref int ibr = ref MemoryMarshal.GetArrayDataReference(itab.IBr);
+            ref ushort sc0 = ref MemoryMarshal.GetArrayDataReference(scan);
+            ref int sl0 = ref MemoryMarshal.GetArrayDataReference(signedLevels);
+            ref double q0 = ref MemoryMarshal.GetArrayDataReference(qf);
+            const int One = 1 << CostShift;
+            for (; si >= 1; si--)
+            {
+                int rc = Unsafe.Add(ref sc0, si), L = Unsafe.Add(ref sl0, rc), mag = Math.Abs(L);
+                ref byte p = ref Unsafe.Add(ref lv0, rc);
+                uint m = (uint)Unsafe.Add(ref p, 1) + Unsafe.Add(ref p, st) + Unsafe.Add(ref p, st + 1);
+                uint hm = m & 63;
+                m += (uint)Unsafe.Add(ref p, 2) + Unsafe.Add(ref p, 2 * st);
+                int pos = Unsafe.Add(ref pos0, rc);
+                ref int bRow = ref Unsafe.Add(ref ib, (bt + (pos & 0xFF) + (m > 512 ? 4 : (int)((m + 64) >> 7))) * 4);
+                if (mag == 0) { accR += bRow; continue; }
+                ref int brRow = ref Unsafe.Add(ref ibr, (brt + (pos >> 8) + (int)(hm > 12 ? 6u : (hm + 1) >> 1)) * 16);
+                int r = Unsafe.Add(ref bRow, Math.Min(mag, 3)) + (mag > 2 ? Unsafe.Add(ref brRow, Math.Min(mag, 15)) : 0)
+                    + One + (mag >= 15 ? GolombLen((uint)(mag - 15)) * One : 0);
+                double aq = Math.Abs(Unsafe.Add(ref q0, rc));
+                // rounded down: lowering only adds distortion
+                if (mag < aq) { accR += r; Unsafe.Add(ref lv0, rc) = LevelByte(mag); continue; }
+                int ml = mag - 1;
+                int rl = ml == 0 ? bRow : Unsafe.Add(ref bRow, Math.Min(ml, 3)) + (ml > 2 ? Unsafe.Add(ref brRow, Math.Min(ml, 15)) : 0)
+                    + One + (ml >= 15 ? GolombLen((uint)(ml - 15)) * One : 0);
+                double e = (aq - mag) * dqA, el = (aq - mag + 1) * dqA;
+                if (el * el + lam * rl < e * e + lam * r) { mag = ml; Unsafe.Add(ref sl0, rc) = L < 0 ? -mag : mag; accR += rl; }
+                else accR += r;
+                Unsafe.Add(ref lv0, rc) = LevelByte(mag);
+            }
+            accuRate = accR * (1.0 / (1 << CostShift));
+        }
         for (; si >= 1; si--)
         {
             int rc = scan[si], L = signedLevels[rc], mag = Math.Abs(L);

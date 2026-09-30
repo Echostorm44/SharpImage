@@ -16,6 +16,8 @@ internal sealed class Av1CoefCostTab
     public readonly double[] DcSign = new double[2 * 3 * 2];
     public readonly double[] EobHi = new double[5 * 2 * 9 * 2];
     public readonly double[] EobPt = new double[7 * 4 * 16];         // [size ctx][slot][eob_pt]
+    // The same costs in 1/512 bit (Av1CoeffEncode.CostShift): exact, since every symbol cost is a multiple of 2^-9.
+    public readonly int[] IBase = new int[5 * 2 * 41 * 4], IBr = new int[4 * 2 * 21 * 16], IEobBase = new int[5 * 2 * 4 * 3];
 
     public void Build(Av1CdfCoefContext c)
     {
@@ -31,5 +33,8 @@ internal sealed class Av1CoefCostTab
                 var cdf = Av1CoeffEncode.EobCdf(c, sz, slot);
                 for (int k = 0; k < cdf.Length && k < 16; k++) EobPt[(sz * 4 + slot) * 16 + k] = Av1CoeffEncode.SymBits(cdf, k);
             }
+        for (int i = 0; i < IBase.Length; i++) IBase[i] = (int)(Base[i] * (1 << Av1CoeffEncode.CostShift));
+        for (int i = 0; i < IBr.Length; i++) IBr[i] = (int)(Br[i] * (1 << Av1CoeffEncode.CostShift));
+        for (int i = 0; i < IEobBase.Length; i++) IEobBase[i] = (int)(EobBase[i] * (1 << Av1CoeffEncode.CostShift));
     }
 }
