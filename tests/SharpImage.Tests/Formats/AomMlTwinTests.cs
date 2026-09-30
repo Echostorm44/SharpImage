@@ -7,7 +7,8 @@ namespace SharpImage.Tests.Formats;
 // functions through aomtwin_ml.dll (built against libaom.a, run-time dispatch initialised, so the AVX2 / SSE3 kernels
 // the encoder uses are the ones compared; see scratchpad aomtwin_ml/). Every float is compared bit for bit.
 // Opt-in: point SHARPIMAGE_AOMTWIN_ML at aomtwin_ml.dll; without it the tests pass without checking.
-// SHARPIMAGE_AOMTWIN_ML_EXHAUSTIVE=1 also runs expf over every float in the softmax's [-10, 0] domain.
+// SHARPIMAGE_AOMTWIN_ML_EXHAUSTIVE=1 also runs expf over every float in [-10, 0], log1pf over every non-negative float
+// and the breakout threshold score over every float in (0, 1).
 [NotInParallel]
 public sealed class AomMlTwinTests
 {
@@ -77,6 +78,14 @@ public sealed class AomMlTwinTests
             int ssX, int ssY, int isChroma, int hbd, float th, [In, Out] byte[] mask);
         [DllImport(L, EntryPoint = "twin_prune_hog")] public static extern void twin_prune_hog16(ushort[] src, int stride, int bsize,
             int mbToRightEdge, int mbToBottomEdge, int ssX, int ssY, int isChroma, int hbd, float th, [In, Out] byte[] mask);
+        [DllImport(L)] public static extern int twin_cnn_predict(byte[] src, int stride, int hbd, int bd, [Out] float[] output);
+        [DllImport(L, EntryPoint = "twin_cnn_predict")] public static extern int twin_cnn_predict16(ushort[] src, int stride, int hbd, int bd,
+            [Out] float[] output);
+        [DllImport(L)] public static extern unsafe void twin_intra_cnn_partition(void* blk, int stride, int hbd, int bd, int qindex, int bsize,
+            int quadTreeIdx, int frameW, int frameH, int pruneLevel, int reset, [In, Out] int[] state, [Out] float[] output);
+        [DllImport(L)] public static extern void twin_ml_breakout(int bsize, int rate, long dist, uint pbSourceVariance, int rdmult, int qindex,
+            int bd, float[] thresh, int modelIndex, int level, [In, Out] int[] state);
+        [DllImport(L)] public static extern void twin_log_ratio_bits(uint start, uint count, [Out] float[] output);
         [DllImport(L)] public static extern int twin_early_term_after_split(int bsize, int frameW, int frameH, int level, int qindex,
             int bd, long bestRd, long partNoneRd, long partSplitRd, long[] splitBlockRd, int[] children, uint[] sms);
     }
@@ -848,6 +857,201 @@ public sealed class AomMlTwinTests
                 Native.twin_collect_hog_cached16(src, stride, sb, miRow, miCol, bs, 0, 0, ssX, ssY, plane, 1, hogT);
             }
             bad = DiffFloats($"hog cached sb {sb} bsize {bs} at {miRow},{miCol} ss {ssX}{ssY}", hogO, hogT, 32);
+        }
+        await Assert.That(bad ?? "").IsEqualTo("");
+    }
+
+    [Test]
+    public async Task CnnPartitionPredict_Random()
+    {
+        if (!Available) return;
+        var rng = new Random(29);
+        string? bad = null;
+        for (int it = 0; it < 400 && bad == null; it++)
+        {
+            int stride = 65 + rng.Next(3) * 8;
+            int bd = rng.Next(3) switch { 0 => 8, 1 => 10, _ => 12 };
+            var vals = RandomPlane(rng, stride, 65, (1 << bd) - 1);
+            var ours = new float[AomMl.CnnOutBufSize];
+            var theirs = new float[AomMl.CnnOutBufSize];
+            if (bd == 8 && rng.Next(4) != 0)
+            {
+                var src = vals.Select(v => (byte)v).ToArray();
+                AomMl.CnnPartitionPredict(src, stride, ours);
+                Native.twin_cnn_predict(src, stride, 0, 8, theirs);
+            }
+            else
+            {
+                var src = vals.Select(v => (ushort)v).ToArray();
+                AomMl.CnnPartitionPredict(src, stride, bd, ours);
+                Native.twin_cnn_predict16(src, stride, 1, bd, theirs);
+            }
+            bad = DiffFloats($"cnn bd {bd}", ours, theirs, AomMl.CnnOutBufSize);
+        }
+        await Assert.That(bad ?? "").IsEqualTo("");
+    }
+
+    // 8-bit luma of a test photo (BT.601 studio range from its 16-bit RGB)
+    private static (byte[] y, int w, int h) PhotoLuma(string name)
+    {
+        var img = SharpImage.Formats.JpegCoder.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", name));
+        int w = (int)img.Columns, h = (int)img.Rows, nc = img.NumberOfChannels;
+        var y = new byte[w * h];
+        for (int r = 0; r < h; r++)
+        {
+            var row = img.GetPixelRow(r);
+            for (int c = 0; c < w; c++)
+            {
+                int R = row[c * nc] >> 8, G = row[c * nc + 1] >> 8, B = row[c * nc + 2] >> 8;
+                y[r * w + c] = (byte)(((66 * R + 129 * G + 25 * B + 128) >> 8) + 16);
+            }
+        }
+        return (y, w, h);
+    }
+
+    private static int cnnChanged;
+
+    // one superblock's CNN partition decisions through the whole 64x64 quad tree (8x8 and up), both ways
+    private static unsafe string? CnnSuperblock<T>(T[] plane, int stride, int sbX, int sbY, int bd, int qindex, int frameW, int frameH,
+        int pruneLevel, Random rng) where T : unmanaged
+    {
+        var cache = new AomCnnPartitionCache();
+        var tout = new float[AomMl.CnnOutBufSize + 2];
+        string? bad = null;
+        void Visit(int bsize, int quad, int x, int y, bool reset)
+        {
+            if (bad != null) return;
+            var st = new[] { rng.Next(2), rng.Next(2), rng.Next(2), rng.Next(2), rng.Next(2) };
+            var so = (int[])st.Clone();
+            var so0 = (int[])st.Clone();
+            int o = (sbY + y) * stride + sbX + x;
+            if (reset) cache.Valid = false;
+            cache.QuadTreeIdx = quad;
+            int none = so[0], sq = so[1], rect = so[2];
+            Span<int> ra = so.AsSpan(3, 2);
+            if (typeof(T) == typeof(byte))
+                AomMl.IntraModeCnnPartition(cache, MemoryMarshal.Cast<T, byte>(plane.AsSpan(o - stride - 1)), stride, qindex, bsize,
+                    frameW, frameH, pruneLevel, ref none, ref sq, ref rect, ra);
+            else
+                AomMl.IntraModeCnnPartition(cache, MemoryMarshal.Cast<T, ushort>(plane.AsSpan(o - stride - 1)), stride, bd, qindex, bsize,
+                    frameW, frameH, pruneLevel, ref none, ref sq, ref rect, ra);
+            so[0] = none; so[1] = sq; so[2] = rect;
+            fixed (T* p = &plane[o])
+                Native.twin_intra_cnn_partition(p, stride, typeof(T) == typeof(byte) ? 0 : 1, bd, qindex, bsize, quad, frameW, frameH,
+                    pruneLevel, reset ? 1 : 0, st, tout);
+            if (!st.SequenceEqual(so0)) cnnChanged++;
+            if (!so.SequenceEqual(st)) { bad = $"cnn partition bsize {bsize} quad {quad} q {qindex}: [{string.Join(",", so)}] vs [{string.Join(",", st)}]"; return; }
+            if (bsize == AomTables.BLOCK_64X64)
+            {
+                bad = DiffFloats($"cnn buffer q {qindex}", cache.Buffer, tout, AomMl.CnnOutBufSize)
+                    ?? DiffFloats($"cnn log_q q {qindex}", [cache.LogQ], [tout[AomMl.CnnOutBufSize]], 1);
+                if (bad != null) return;
+            }
+            if (bsize == AomTables.BLOCK_8X8) return;
+            int sub = AomMl.GetPartitionSubsize(bsize, AomTables.PARTITION_SPLIT), half = AomTables.BlockSizeWide[bsize] / 2;
+            for (int idx = 0; idx < 4; idx++) Visit(sub, 4 * quad + idx + 1, x + (idx & 1) * half, y + (idx >> 1) * half, false);
+        }
+        Visit(AomTables.BLOCK_64X64, 0, 0, 0, true);
+        return bad;
+    }
+
+    [Test]
+    public async Task CnnPartition_RealImageSuperblocks()
+    {
+        if (!Available) return;
+        var (luma, w, h) = PhotoLuma("landscape.jpg");
+        var rng = new Random(30);
+        cnnChanged = 0;
+        string? bad = null;
+        int[] qs = [0, 20, 60, 100, 140, 180, 220, 255];
+        (int fw, int fh)[] frames = [(w, h), (640, 480), (320, 240)];
+        foreach (int q in qs)
+            foreach (var (fw, fh) in frames)
+                for (int k = 0; k < 6 && bad == null; k++)
+                {
+                    int sbX = 1 + rng.Next((w - 66) / 64) * 64, sbY = 1 + rng.Next((h - 66) / 64) * 64;
+                    bad = CnnSuperblock(luma, w, sbX, sbY, 8, q, fw, fh, 1 + rng.Next(2), rng);
+                }
+        await Assert.That(bad ?? "").IsEqualTo("");
+        await Assert.That(cnnChanged).IsGreaterThan(1000);
+    }
+
+    [Test]
+    public async Task CnnPartition_HighBitdepthRandom()
+    {
+        if (!Available) return;
+        var rng = new Random(31);
+        string? bad = null;
+        for (int it = 0; it < 40 && bad == null; it++)
+        {
+            int bd = rng.Next(2) == 0 ? 10 : 12;
+            int stride = 80;
+            var plane = RandomPlane(rng, stride, 80, (1 << bd) - 1).Select(v => (ushort)v).ToArray();
+            bad = CnnSuperblock(plane, stride, 1 + rng.Next(8), 1 + rng.Next(8), bd, rng.Next(256), rng.Next(100, 4000), rng.Next(100, 3000),
+                1 + rng.Next(2), rng);
+        }
+        await Assert.That(bad ?? "").IsEqualTo("");
+    }
+
+    private static readonly float[][] BreakoutThreshSets =
+    [
+        [-1.0f, 0.993307f, 0.952574f, 0.924142f, 0.880797f],
+        [0.5f, 0.5042595622791082f, 0.5f, 0.8378425823517456f, 0.8047585616503903f],
+        [-1.0f, 0.952574f, 0.952574f, 0.924142f, 0.880797f],
+    ];
+
+    [Test]
+    public async Task MlPredictBreakout_Random()
+    {
+        if (!Available) return;
+        var rng = new Random(32);
+        string? bad = null;
+        int broke = 0;
+        for (int it = 0; it < 40000 && bad == null; it++)
+        {
+            int bs = SquareBsizes[rng.Next(SquareBsizes.Length)];
+            float[] th = rng.Next(4) != 0 ? BreakoutThreshSets[rng.Next(BreakoutThreshSets.Length)]
+                : Enumerable.Range(0, 5).Select(_ => rng.Next(8) == 0 ? -1f : (float)rng.NextDouble()).ToArray();
+            int model = rng.Next(2), level = rng.Next(1, 4);
+            int bd = rng.Next(4) == 0 ? 10 : 8;
+            int rate = rng.Next(5) == 0 ? int.MaxValue : rng.Next(0, 200000);
+            long dist = rng.Next(6) == 0 ? rng.NextInt64(0, long.MaxValue / 2) : rng.NextInt64(0, 50000000);
+            uint pbv = (uint)rng.Next(0, 100000);
+            int rdmult = rng.Next(1, 3000000), q = rng.Next(256);
+            var st = new[] { rng.Next(2), rng.Next(2) };
+            int sq = st[0], rect = st[1];
+            AomMl.MlPredictBreakout(bs, rate, dist, pbv, rdmult, q, bd, th, model, level, ref sq, ref rect);
+            Native.twin_ml_breakout(bs, rate, dist, pbv, rdmult, q, bd, th, model, level, st);
+            if (sq != st[0] || rect != st[1]) bad = $"breakout bsize {bs} model {model}: [{sq},{rect}] vs [{st[0]},{st[1]}]";
+            if (st[0] == 0 && st[1] == 0) broke++;
+        }
+        await Assert.That(bad ?? "").IsEqualTo("");
+        await Assert.That(broke).IsGreaterThan(2000);
+    }
+
+    // (float)log(t / (1 - t)) (the breakout threshold score) for floats t in (0, 1): sampled, or every one with
+    // SHARPIMAGE_AOMTWIN_ML_EXHAUSTIVE=1
+    [Test]
+    public async Task BreakoutThreshScore_Log()
+    {
+        if (!Available) return;
+        bool all = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_ML_EXHAUSTIVE") == "1";
+        const int chunk = 1 << 20;
+        var theirs = new float[chunk];
+        uint hi = BitConverter.SingleToUInt32Bits(1f);
+        string? bad = null;
+        ulong step = all ? (ulong)chunk : 1UL << 22;
+        uint count = all ? (uint)chunk : 1u << 14;
+        for (ulong start = 1; start < hi && bad == null; start += step)
+        {
+            uint cnt = (uint)Math.Min(count, hi - start);
+            Native.twin_log_ratio_bits((uint)start, cnt, theirs);
+            for (uint i = 0; i < cnt; i++)
+            {
+                float t = BitConverter.UInt32BitsToSingle((uint)start + i);
+                float ours = (float)Math.Log(t / (1 - t));
+                if (Bits(ours) != Bits(theirs[i])) { bad = $"log ratio t {t:R} ({Bits(t):X8}): {Bits(ours):X8} vs {Bits(theirs[i]):X8}"; break; }
+            }
         }
         await Assert.That(bad ?? "").IsEqualTo("");
     }
