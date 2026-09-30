@@ -6523,6 +6523,44 @@ internal static partial class Av1StillImageEncoder
         return (byte)(Math.Min(cul, 63) | (levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80)));
     }
 
+    // Dequantises levels[0 .. n) into cf decoder-exactly (dq * |level| >> shift, capped at cfMax + sign, signed), in raster
+    // order 8 lanes a vector up to the last nonzero position; returns the sum of |level|. cf past that stays as it was (zero).
+    private static int DequantRc(int[] levels, int n, int dcDq, int acDq, int shift, int cfMax, int[] cf)
+    {
+        int last = levels.AsSpan(0, n).LastIndexOfAnyExcept(0);
+        if (last < 0) return 0;
+        int i = 0, cul = 0;
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var dqV = Vector256.Create(dcDq, acDq, acDq, acDq, acDq, acDq, acDq, acDq);
+            var cmax = Vector256.Create(cfMax);
+            var sum = Vector256<int>.Zero;
+            ref int l0 = ref MemoryMarshal.GetArrayDataReference(levels);
+            ref int c0 = ref MemoryMarshal.GetArrayDataReference(cf);
+            for (; i + 8 <= last + 1; i += 8)
+            {
+                var l = Vector256.LoadUnsafe(ref l0, (nuint)i);
+                var neg = Vector256.ShiftRightArithmetic(l, 31);            // -1 where negative
+                var a = Vector256.Abs(l);
+                var d = Vector256.Min(Vector256.ShiftRightArithmetic(a * dqV, shift), cmax - neg);
+                ((d ^ neg) - neg).StoreUnsafe(ref c0, (nuint)i);
+                sum += a;
+                dqV = Vector256.Create(acDq);
+            }
+            cul = Vector256.Sum(sum);
+        }
+        for (; i <= last; i++)
+        {
+            int lvl = levels[i];
+            if (lvl == 0) { cf[i] = 0; continue; }
+            int mag = Math.Abs(lvl), sign = lvl < 0 ? 1 : 0;
+            int dq = Math.Min(((i == 0 ? dcDq : acDq) * mag) >> shift, cfMax + sign);
+            cf[i] = sign != 0 ? -dq : dq;
+            cul += mag;
+        }
+        return cul;
+    }
+
     private static byte DequantAndReconstructPredRect<TP>(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
         TP[] predBlock, TP[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct, int eobHint = -2) where TP : unmanaged
     {
@@ -6540,19 +6578,7 @@ internal static partial class Av1StillImageEncoder
         }
 
         var cf = t_reconCf ??= new int[64 * 64];   // left all-zero by InvTxfmAdd16
-        int culLevel = 0;
-        for (int i = 0; i <= eob; i++)
-        {
-            int rc = scan[i];
-            int lvl = levels[rc];
-            if (lvl == 0) continue;
-            int mag = Math.Abs(lvl);
-            int sign = lvl < 0 ? 1 : 0;
-            int dq = ((rc == 0 ? dcDq : acDq) * mag) >> dqShift;
-            dq = Math.Min(dq, cfMax + sign);
-            cf[rc] = sign != 0 ? -dq : dq;
-            culLevel += mag;
-        }
+        int culLevel = DequantRc(levels, scan.Length, dcDq, acDq, dqShift, cfMax, cf);
 
         int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
@@ -6571,18 +6597,12 @@ internal static partial class Av1StillImageEncoder
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[txIdx].Ctx - 2);
         int cfMax = CfMax;
-        var scan = Av1Tables.Scans[txIdx];
-        int eob = -1;
-        for (int i = scan.Length - 1; i >= 0; i--) if (levels[scan[i]] != 0) { eob = i; break; }
+        int n = Av1Tables.Scans[txIdx].Length;
         var cf = t_reconCf ??= new int[64 * 64];
-        for (int i = 0; i <= eob; i++)
-        {
-            int rc = scan[i], lvl = levels[rc];
-            if (lvl == 0) continue;
-            int mag = Math.Abs(lvl), sign = lvl < 0 ? 1 : 0;
-            int dq = Math.Min(((rc == 0 ? dcDq : acDq) * mag) >> dqShift, cfMax + sign);
-            cf[rc] = sign != 0 ? -dq : dq;
-        }
+        DequantRc(levels, n, dcDq, acDq, dqShift, cfMax, cf);
+        // the inverse transform reads the eob only to tell a DC-only block (eob 0) from the rest
+        int last = levels.AsSpan(1, n - 1).IndexOfAnyExcept(0);
+        int eob = last >= 0 ? n - 1 : levels[0] != 0 ? 0 : -1;
         var blockBuf = PxScratch<TP>.ReconBlock ??= new TP[64 * 64];
         var block = blockBuf.AsSpan(0, w * h);
         predBlock.AsSpan(0, w * h).CopyTo(block);
