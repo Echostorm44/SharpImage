@@ -10,7 +10,7 @@ using V = System.Runtime.Intrinsics.Vector256<int>;
 namespace SharpImage.Formats.Av1;
 
 [SkipLocalsInit]
-internal static class Av1FwdTxfmAom
+internal static partial class Av1FwdTxfmAom
 {
     private static readonly int[] CosPiData = { 1024, 1024, 1023, 1021, 1019, 1016, 1013, 1009, 1004, 999, 993, 987, 980, 972, 964, 955, 946, 936, 926, 915, 903, 891, 878, 865, 851, 837, 822, 807, 792, 775, 759, 742, 724, 706, 688, 669, 650, 630, 610, 590, 569, 548, 526, 505, 483, 460, 438, 415, 392, 369, 345, 321, 297, 273, 249, 224, 200, 175, 150, 125, 100, 75, 50, 25, 2048, 2047, 2046, 2042, 2038, 2033, 2026, 2018, 2009, 1998, 1987, 1974, 1960, 1945, 1928, 1911, 1892, 1872, 1851, 1829, 1806, 1782, 1757, 1730, 1703, 1674, 1645, 1615, 1583, 1551, 1517, 1483, 1448, 1412, 1375, 1338, 1299, 1260, 1220, 1179, 1138, 1096, 1053, 1009, 965, 921, 876, 830, 784, 737, 690, 642, 595, 546, 498, 449, 400, 350, 301, 251, 201, 151, 100, 50, 4096, 4095, 4091, 4085, 4076, 4065, 4052, 4036, 4017, 3996, 3973, 3948, 3920, 3889, 3857, 3822, 3784, 3745, 3703, 3659, 3612, 3564, 3513, 3461, 3406, 3349, 3290, 3229, 3166, 3102, 3035, 2967, 2896, 2824, 2751, 2675, 2598, 2520, 2440, 2359, 2276, 2191, 2106, 2019, 1931, 1842, 1751, 1660, 1567, 1474, 1380, 1285, 1189, 1092, 995, 897, 799, 700, 601, 501, 401, 301, 201, 101, 8192, 8190, 8182, 8170, 8153, 8130, 8103, 8071, 8035, 7993, 7946, 7895, 7839, 7779, 7713, 7643, 7568, 7489, 7405, 7317, 7225, 7128, 7027, 6921, 6811, 6698, 6580, 6458, 6333, 6203, 6070, 5933, 5793, 5649, 5501, 5351, 5197, 5040, 4880, 4717, 4551, 4383, 4212, 4038, 3862, 3683, 3503, 3320, 3135, 2948, 2760, 2570, 2378, 2185, 1990, 1795, 1598, 1401, 1202, 1003, 803, 603, 402, 201 };
     private static readonly int[] SinPiData = { 0, 330, 621, 836, 951, 0, 660, 1241, 1672, 1901, 0, 1321, 2482, 3344, 3803, 0, 2642, 4964, 6689, 7606 };
@@ -1384,6 +1384,7 @@ internal static class Av1FwdTxfmAom
     internal static int ForwardQuant(ReadOnlySpan<int> residual, int w, int h, int txSize, int hKind, int vKind,
         double dcDq, double acDq, double bias, int[] levels, double[]? qfOut)
     {
+        if (Lowbd && LowbdOn && w is 16 or 32 && h is 16 or 32) return ForwardQuantLbd(residual, w, h, txSize, hKind, vKind, dcDq, acDq, bias, levels, qfOut);
         ref int inv0 = ref MemoryMarshal.GetArrayDataReference(InvScan(txSize));
         var eobV = Vector128.Create(-1);   // per lane: the largest scan index of a nonzero level seen
         int lw = System.Numerics.BitOperations.Log2((uint)w) - 2, lh = System.Numerics.BitOperations.Log2((uint)h) - 2;
@@ -1422,7 +1423,7 @@ internal static class Av1FwdTxfmAom
         ref V rin = ref MemoryMarshal.GetReference(rinS);
         var rnd2 = Vector256.Create(sh2 > 0 ? 1 << (sh2 - 1) : 0);
         var vdc = Vector256.Create(scale / dcDq, scale / acDq, scale / acDq, scale / acDq); var vac = Vector256.Create(scale / acDq);
-        var half = Vector256.Create(0.5); var vbias = Vector256.Create(bias); var one = Vector256.Create(1.0);
+        var half = Vector256.Create(0.5); var vbias = Vector256.Create(bias);
         var m1 = Vector128.Create(-1);
         ref int lv0 = ref MemoryArrayRef(levels);
         for (int r0 = 0; r0 < sh; r0 += 8)
@@ -1443,11 +1444,11 @@ internal static class Av1FwdTxfmAom
                 if (sh2 > 0) v = Vector256.ShiftRightArithmetic(v + rnd2, sh2);
                 if (rect2) v = MulRound(v, 5793, 12);
                 int rc = c * sh + r0;
-                var q = Quant4(Avx.ConvertToVector256Double(v.GetLower()), rc == 0 ? vdc : vac, half, vbias, one, ref Unsafe.Add(ref lv0, rc), qfOut, rc);
+                var q = Quant4(v.GetLower(), rc == 0 ? vdc : vac, half, vbias, ref Unsafe.Add(ref lv0, rc), qfOut, rc);
                 eobV = Vector128.Max(eobV, Vector128.ConditionalSelect(Vector128.Equals(q, Vector128<int>.Zero), m1, Vector128.LoadUnsafe(ref inv0, (nuint)rc)));
                 if (nr == 8)
                 {
-                    q = Quant4(Avx.ConvertToVector256Double(v.GetUpper()), vac, half, vbias, one, ref Unsafe.Add(ref lv0, rc + 4), qfOut, rc + 4);
+                    q = Quant4(v.GetUpper(), vac, half, vbias, ref Unsafe.Add(ref lv0, rc + 4), qfOut, rc + 4);
                     eobV = Vector128.Max(eobV, Vector128.ConditionalSelect(Vector128.Equals(q, Vector128<int>.Zero), m1, Vector128.LoadUnsafe(ref inv0, (nuint)(rc + 4))));
                 }
             }
@@ -1458,16 +1459,14 @@ internal static class Av1FwdTxfmAom
     private static ref int MemoryArrayRef(int[] a) => ref MemoryMarshal.GetArrayDataReference(a);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector128<int> Quant4(Vector256<double> c, Vector256<double> mul, Vector256<double> half,
-        Vector256<double> bias, Vector256<double> one, ref int dst, double[]? qfOut, int at)
+    // level = sign(c) * floor(|qf| + 0.5 - bias), 0 when that is below 1: the magnitude is truncated (the floor for it >= 0,
+    // and 0 for it in (-1, 1), so any bias below 1.5) and the coefficient's sign applied in integers
+    private static Vector128<int> Quant4(Vector128<int> c, Vector256<double> mul, Vector256<double> half,
+        Vector256<double> bias, ref int dst, double[]? qfOut, int at)
     {
-        var qf = c * mul;   // c * 2^tx_scale / dq
+        var qf = Avx.ConvertToVector256Double(c) * mul;   // c * 2^tx_scale / dq
         if (qfOut != null) qf.StoreUnsafe(ref MemoryMarshal.GetArrayDataReference(qfOut), (nuint)at);
-        var mag = Vector256.Abs(qf) + half - bias;
-        var fl = Vector256.Floor(mag);
-        var sgn = Vector256.ConditionalSelect(Vector256.LessThan(qf, Vector256<double>.Zero), -fl, fl);
-        var lv = Vector256.ConditionalSelect(Vector256.LessThan(mag, one), Vector256<double>.Zero, sgn);
-        var li = Avx.ConvertToVector128Int32WithTruncation(lv);
+        var li = Ssse3.Sign(Avx.ConvertToVector128Int32WithTruncation(Vector256.Abs(qf) + half - bias), c);
         li.StoreUnsafe(ref dst);
         return li;
     }

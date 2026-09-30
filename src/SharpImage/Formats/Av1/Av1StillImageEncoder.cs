@@ -447,13 +447,14 @@ internal static partial class Av1StillImageEncoder
     private readonly struct BitDepthScope : IDisposable
     {
         private readonly int prev;
+        private readonly bool prevLowbd;
         public BitDepthScope(int bd)
         {
             if (bd is not (8 or 10 or 12)) throw new ArgumentOutOfRangeException(nameof(bd), "AV1 bit depth must be 8, 10 or 12.");
-            prev = t_bd;
-            t_bd = bd;
+            prev = t_bd; prevLowbd = Av1FwdTxfmAom.Lowbd;
+            t_bd = bd; Av1FwdTxfmAom.Lowbd = bd == 8;   // libaom's lowbd forward transform for 8-bit content
         }
-        public void Dispose() => t_bd = prev;
+        public void Dispose() { t_bd = prev; Av1FwdTxfmAom.Lowbd = prevLowbd; }
     }
 
     // LambdaLibaom (dev): the RD lambda follows libaom's key-frame rdmult for this qindex (av1_compute_rd_mult:
