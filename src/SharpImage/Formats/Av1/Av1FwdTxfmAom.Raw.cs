@@ -1,0 +1,77 @@
+using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using V = System.Runtime.Intrinsics.Vector256<int>;
+
+namespace SharpImage.Formats.Av1;
+
+internal static partial class Av1FwdTxfmAom
+{
+    /// <summary>libaom's forward 2D transform (av1_fwd_txfm2d / fwd_txfm2d_c) of a w x h int16 residual (stride diffStride)
+    /// into tran_low_t coefficients in libaom's layout: coeff[col * min(h, 32) + row] over the retained min(w,32) x
+    /// min(h,32) region. hKind / vKind: the row / column 1D kinds (Av1InvTransform.Type1dDct / Adst / Identity; the
+    /// flipped ADSTs arrive as ADST with flipUd / flipLr, as fwd_txfm2d_c flips its input).</summary>
+    [SkipLocalsInit]
+    internal static void ForwardRaw(ReadOnlySpan<short> diff, int diffStride, int w, int h, int txSize, int hKind, int vKind,
+        bool flipUd, bool flipLr, Span<int> coeff)
+    {
+        int lw = System.Numerics.BitOperations.Log2((uint)w) - 2, lh = System.Numerics.BitOperations.Log2((uint)h) - 2;
+        int sh0 = Shift[txSize * 3], sh1 = -Shift[txSize * 3 + 1], sh2 = -Shift[txSize * 3 + 2];
+        int cosCol = CosBitCol[lw * 5 + lh], cosRow = CosBitRow[lw * 5 + lh];
+        bool rect2 = w == 2 * h || h == 2 * w;
+        int sw = Math.Min(w, 32), sh = Math.Min(h, 32), ng = (w + 7) >> 3;
+        int hp = Math.Max(h, 8);
+        Span<V> colS = stackalloc V[ng * hp + 64];
+        ref V col = ref MemoryMarshal.GetReference(colS);
+        ref V tmp = ref Unsafe.Add(ref col, ng * hp);
+        Span<int> rowBuf = stackalloc int[8];
+        var rnd1 = Vector256.Create(sh1 > 0 ? 1 << (sh1 - 1) : 0);
+        for (int g = 0; g < ng; g++)
+        {
+            ref V cg = ref Unsafe.Add(ref col, g * hp);
+            for (int r = 0; r < h; r++)
+            {
+                int sr = flipUd ? h - 1 - r : r;
+                for (int j = 0; j < 8; j++)
+                {
+                    int c = g * 8 + j;
+                    rowBuf[j] = c < w ? diff[sr * diffStride + (flipLr ? w - 1 - c : c)] : 0;
+                }
+                Unsafe.Add(ref tmp, r) = Vector256.ShiftLeft(Vector256.Create<int>(rowBuf), sh0);
+            }
+            Txfm1d(vKind, h, ref tmp, ref cg, cosCol);
+            for (int r = 0; r < h; r++)
+            {
+                ref V o = ref Unsafe.Add(ref cg, r);
+                if (sh1 > 0) o = Vector256.ShiftRightArithmetic(o + rnd1, sh1);
+            }
+            for (int r = h; r < hp; r++) Unsafe.Add(ref cg, r) = V.Zero;
+        }
+        Span<V> rinS = stackalloc V[64];
+        ref V rin = ref MemoryMarshal.GetReference(rinS);
+        var rnd2 = Vector256.Create(sh2 > 0 ? 1 << (sh2 - 1) : 0);
+        Span<int> lanes = stackalloc int[8];
+        for (int r0 = 0; r0 < sh; r0 += 8)
+        {
+            for (int g = 0; g < ng; g++)
+            {
+                ref V src = ref Unsafe.Add(ref col, g * hp + r0);
+                ref V dst = ref Unsafe.Add(ref rin, g * 8);
+                for (int j = 0; j < 8; j++) Unsafe.Add(ref dst, j) = Unsafe.Add(ref src, j);
+                Transpose8(ref dst);
+            }
+            Txfm1d(hKind, w, ref rin, ref tmp, cosRow);
+            int nr = Math.Min(8, h - r0);
+            for (int c = 0; c < sw; c++)
+            {
+                V v = Unsafe.Add(ref tmp, c);
+                if (sh2 > 0) v = Vector256.ShiftRightArithmetic(v + rnd2, sh2);
+                if (rect2) v = MulRound(v, 5793, 12);
+                v.CopyTo(lanes);
+                int rc = c * sh + r0;
+                for (int k = 0; k < nr; k++) coeff[rc + k] = lanes[k];
+            }
+        }
+    }
+}

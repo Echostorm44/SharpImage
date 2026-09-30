@@ -7,7 +7,7 @@ namespace SharpImage.Tests.Formats;
 // through aomtwin.dll (a thin export layer built against libaom.a; see scratchpad aomtwin/aomtwin.c). Opt-in: point
 // SHARPIMAGE_AOMTWIN at aomtwin.dll; without it the tests pass without checking.
 [NotInParallel]
-public sealed class AomTwinTests
+public sealed partial class AomTwinTests
 {
     private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN");
     private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
@@ -21,7 +21,7 @@ public sealed class AomTwinTests
         return true;
     }
 
-    private static unsafe class Native
+    private static unsafe partial class Native
     {
         [DllImport("aomtwin")] public static extern void twin_init();
         [DllImport("aomtwin")] public static extern int twin_cost_symbol(int p15);
