@@ -13,8 +13,17 @@ internal static partial class Av1FwdTxfmAom
     /// into tran_low_t coefficients in libaom's layout: coeff[col * min(h, 32) + row] over the retained min(w,32) x
     /// min(h,32) region. hKind / vKind: the row / column 1D kinds (Av1InvTransform.Type1dDct / Adst / Identity; the
     /// flipped ADSTs arrive as ADST with flipUd / flipLr, as fwd_txfm2d_c flips its input).</summary>
-    [SkipLocalsInit]
     internal static void ForwardRaw(ReadOnlySpan<short> diff, int diffStride, int w, int h, int txSize, int hKind, int vKind,
+        bool flipUd, bool flipLr, Span<int> coeff)
+    {
+        // 8-bit residuals: libaom's av1_lowbd_fwd_txfm (16-bit lanes) below 64-point axes, as the 8-bit encoder runs it
+        if (w <= 32 && h <= 32 && Avx2.IsSupported) ForwardRawLbd(diff, diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
+        else ForwardRawRef(diff, diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
+    }
+
+    /// <summary>ForwardRaw in 32-bit lanes (fwd_txfm2d_c's arithmetic), every size.</summary>
+    [SkipLocalsInit]
+    internal static void ForwardRawRef(ReadOnlySpan<short> diff, int diffStride, int w, int h, int txSize, int hKind, int vKind,
         bool flipUd, bool flipLr, Span<int> coeff)
     {
         int lw = System.Numerics.BitOperations.Log2((uint)w) - 2, lh = System.Numerics.BitOperations.Log2((uint)h) - 2;
