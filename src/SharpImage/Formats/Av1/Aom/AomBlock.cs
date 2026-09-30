@@ -91,6 +91,8 @@ internal sealed partial class AomMbModeInfo
         SegmentId = s.SegmentId; UseIntrabc = s.UseIntrabc; SkipMode = s.SkipMode; CdefStrength = s.CdefStrength;
     }
 
+    public static readonly AomMbModeInfo Zero = new();
+
     public AomMbModeInfo Clone() { var m = new AomMbModeInfo(); m.CopyFrom(this); return m; }
 }
 
@@ -133,7 +135,7 @@ internal sealed partial class AomMbdPlane
 }
 
 /// <summary>TxfmSearchParams (av1/encoder/block.h).</summary>
-internal sealed class AomTxfmSearchParams
+internal sealed partial class AomTxfmSearchParams
 {
     public int TxModeSearchType;          // TX_MODE
     public int TxSizeSearchMethod;        // TX_SIZE_SEARCH_METHOD
@@ -149,4 +151,5 @@ internal sealed class AomTxfmSearchParams
     public bool EnableNnPruneIntraTxDepths;
     public int NnPruneDepthsForIntraTx;   // TX_PRUNE_NONE / LARGEST / SPLIT
     public int UseQmDistMetric;
+    public int ModeEvalType = -1;           // MODE_EVAL_TYPE of the last set_mode_eval_params
 }
