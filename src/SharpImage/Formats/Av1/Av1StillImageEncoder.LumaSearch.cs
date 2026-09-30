@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -189,10 +190,12 @@ internal static partial class Av1StillImageEncoder
                     }
                     double preBits = -1;
                     // libaom's order (search_tx_type): quantise, trellis, then one rate + one distortion
+                    int candEob = cfEob;   // this candidate's eob when known (-2 not)
                     if (!olv && Sp.AomTrellisFirst && trellis && !oneD && (cfEob == -2 ? HasNonZero(cf) : cfEob >= 0))
                     {
                         if (TimingOn) Tick(7, ref tq);
                         preBits = Quantise(cf, qf, idx, cfEob);
+                        candEob = Sp.AomTrellis ? Av1CoeffEncode.LastTrellisEob : -2;
                         if (TimingOn) Tick(3, ref tq);
                         if (StatsOn) System.Threading.Interlocked.Increment(ref StatRdoq);
                         pre = true;
@@ -218,6 +221,7 @@ internal static partial class Av1StillImageEncoder
                     if (!pre && trellis && !oneD && (cfEob == -2 ? HasNonZero(cf) : cfEob >= 0) && j < bestJ * Sp.RdoqSearchMargin)
                     {
                         double qb = Quantise(cf, qf, idx, cfEob);
+                        candEob = Sp.AomTrellis ? Av1CoeffEncode.LastTrellisEob : -2;
                         if (StatsOn) System.Threading.Interlocked.Increment(ref StatRdoq);
                         bits = qb >= 0 ? qb : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, cf, skc, snc, idx, fullSet: UseFullIntraTxSet);
                         j = (txDom ? TxDist(cf, qf) : ReconSseCandRect(cf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, inv)) + lambda * bits;
@@ -226,7 +230,7 @@ internal static partial class Av1StillImageEncoder
                     if (j < bestJ)
                     {
                         Av1FwdTransform.ReturnLevels(bestCf);
-                        bestJ = j; bestBits = bits; bestCf = cf; bestInv = inv; bestIdx = idx; bestRdoq = rdoqd; bestEob = rdoqd || olv ? -2 : cfEob;
+                        bestJ = j; bestBits = bits; bestCf = cf; bestInv = inv; bestIdx = idx; bestRdoq = rdoqd; bestEob = olv ? -2 : candEob;
                         if (!rdoqd) (qf, qfBest) = (qfBest, qf);   // keep this type's unquantised coefficients (no copy)
                     }
                     else Av1FwdTransform.ReturnLevels(cf);
@@ -235,19 +239,18 @@ internal static partial class Av1StillImageEncoder
                 if (UseRdoq && (Sp.AomTrellisAll || trellis) && !bestRdoq && (OracleLevels == null || OracleLevels1DOnly) && bestInv != Av1TxType.VDct && bestInv != Av1TxType.HDct && HasNonZero(bestCf))
                 {
                     double qb = Quantise(bestCf, qfBest, bestIdx, bestEob);
+                    bestEob = Sp.AomTrellis ? Av1CoeffEncode.LastTrellisEob : -2;
                     double bits = qb >= 0 ? qb : Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, stx, 0, yModeNoFilt, bestCf, skc, snc, bestIdx, fullSet: UseFullIntraTxSet);
                     bestBits = bits;
                     if (!txDom) bestJ = ReconSseCandRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.Luma, c.W, px, py, bestInv) + lambda * bits;
                 }
                 if (TimingOn) tq0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                byte cfc = DequantAndReconstructPredRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.ReconY, c.W, px, py, bestInv);
+                byte cfc = DequantAndReconstructPredRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.ReconY, c.W, px, py, bestInv, bestEob);
                 if (TimingOn) Tick(6, ref tq0);
                 if (txDom)
                 {
                     // the winner's pixel distortion from its reconstruction (calc_pixel_domain_distortion_final)
-                    long psse = 0;
-                    for (int yy = 0; yy < th; yy++)
-                        for (int xx = 0; xx < tw; xx++) { int d = c.ReconY[(py + yy) * c.W + px + xx] - c.Luma[(py + yy) * c.W + px + xx]; psse += (long)d * d; }
+                    long psse = SseU16(c.ReconY, py * c.W + px, c.W, c.Luma, py * c.W + px, c.W, tw, th);
                     bestJ = psse + lambda * bestBits;
                 }
                 list.Add((bestCf, bestInv, bestIdx, skc, snc, px, py));
@@ -293,6 +296,45 @@ internal static partial class Av1StillImageEncoder
                 int d = src[(py + yy) * stride + px + xx] - pred[yy * tw + xx];
                 res[yy * tw + xx] = d; sse += (long)d * d;
             }
+        return sse;
+    }
+
+    // SSE of a w x h block of two sample planes (differences within 16 bits at <= 12-bit depth): 16 / 8 lanes through
+    // pmaddwd, widened to 64 bits every 8 rows (each 32-bit lane then holds <= 8 * 4 * 2 * 4095^2 < 2^31).
+    internal static long SseU16(ushort[] a, int aOff, int aStride, ushort[] b, int bOff, int bStride, int w, int h)
+    {
+        long sse = 0;
+        if (!Avx2.IsSupported || w < 8)
+        {
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++) { int d = a[aOff + y * aStride + x] - b[bOff + y * bStride + x]; sse += (long)d * d; }
+            return sse;
+        }
+        if ((long)aOff + (long)(h - 1) * aStride + w > a.Length || (long)bOff + (long)(h - 1) * bStride + w > b.Length || aOff < 0 || bOff < 0)
+            throw new ArgumentOutOfRangeException(nameof(w));
+        ref ushort pa = ref MemoryMarshal.GetArrayDataReference(a), pb = ref MemoryMarshal.GetArrayDataReference(b);
+        for (int y = 0; y < h;)
+        {
+            var acc = Vector256<int>.Zero;
+            for (int yEnd = Math.Min(h, y + 8); y < yEnd; y++)
+            {
+                ref ushort ra = ref Unsafe.Add(ref pa, aOff + y * aStride), rb = ref Unsafe.Add(ref pb, bOff + y * bStride);
+                int x = 0;
+                for (; x + 16 <= w; x += 16)
+                {
+                    var d = Vector256.LoadUnsafe(ref ra, (nuint)x).AsInt16() - Vector256.LoadUnsafe(ref rb, (nuint)x).AsInt16();
+                    acc += Avx2.MultiplyAddAdjacent(d, d);
+                }
+                if (x + 8 <= w)
+                {
+                    var d = Vector128.LoadUnsafe(ref ra, (nuint)x).AsInt16() - Vector128.LoadUnsafe(ref rb, (nuint)x).AsInt16();
+                    acc += Vector256.Create(Sse2.MultiplyAddAdjacent(d, d), Vector128<int>.Zero);
+                    x += 8;
+                }
+                for (; x < w; x++) { int d = Unsafe.Add(ref ra, x) - Unsafe.Add(ref rb, x); sse += (long)d * d; }
+            }
+            sse += SumInt(acc);
+        }
         return sse;
     }
 

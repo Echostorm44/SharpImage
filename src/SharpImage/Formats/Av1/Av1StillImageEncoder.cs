@@ -2477,21 +2477,12 @@ internal static partial class Av1StillImageEncoder
     {
         int lpx = x4 * 4, lpy = y4 * 4;
         int lw = Math.Min(w4 * 4, c.Bw4 * 4 - lpx), lh = Math.Min(h4 * 4, c.Bh4 * 4 - lpy);
-        long sse = 0;
-        for (int y = 0; y < lh; y++)
-            for (int x = 0; x < lw; x++)
-            { int d = c.ReconY[(lpy + y) * c.W + lpx + x] - c.Luma[(lpy + y) * c.W + lpx + x]; sse += (long)d * d; }
+        long sse = SseU16(c.ReconY, lpy * c.W + lpx, c.W, c.Luma, lpy * c.W + lpx, c.W, lw, lh);
         if (c.Mono) return sse;
         int cpx = lpx >> c.SsX, cpy = lpy >> c.SsY;
         int cnw = Math.Min(Math.Max(lw >> c.SsX, 1), ((c.Bw4 * 4) >> c.SsX) - cpx), cnh = Math.Min(Math.Max(lh >> c.SsY, 1), ((c.Bh4 * 4) >> c.SsY) - cpy);
-        for (int y = 0; y < cnh; y++)
-            for (int x = 0; x < cnw; x++)
-            {
-                int du = c.ReconU[(cpy + y) * c.Cw + cpx + x] - c.U[(cpy + y) * c.Cw + cpx + x];
-                int dv = c.ReconV[(cpy + y) * c.Cw + cpx + x] - c.V[(cpy + y) * c.Cw + cpx + x];
-                sse += (long)du * du + (long)dv * dv;
-            }
-        return sse;
+        int co = cpy * c.Cw + cpx;
+        return sse + SseU16(c.ReconU, co, c.Cw, c.U, co, c.Cw, cnw, cnh) + SseU16(c.ReconV, co, c.Cw, c.V, co, c.Cw, cnw, cnh);
     }
 
     // Per-pixel variance of the source luma block (libaom pb_source_variance, 8-bit scale).
@@ -2512,20 +2503,12 @@ internal static partial class Av1StillImageEncoder
         // frame edge, so including it would make every edge SPLIT look hopeless (and force a 64x64 NONE there).
         int lpx = bx4 * 4, lpy = by4 * 4, ln = blk4 * 4;
         int lw = Math.Min(ln, c.Bw4 * 4 - lpx), lh = Math.Min(ln, c.Bh4 * 4 - lpy);
-        long sse = 0;
-        for (int y = 0; y < lh; y++)
-            for (int x = 0; x < lw; x++)
-            { int d = c.ReconY[(lpy + y) * c.W + lpx + x] - c.Luma[(lpy + y) * c.W + lpx + x]; sse += (long)d * d; }
+        long sse = SseU16(c.ReconY, lpy * c.W + lpx, c.W, c.Luma, lpy * c.W + lpx, c.W, lw, lh);
         if (c.Mono) return sse;
         int cpx = (bx4 * 4) >> c.SsX, cpy = (by4 * 4) >> c.SsY;
         int cnw = Math.Min((blk4 * 4) >> c.SsX, ((c.Bw4 * 4) >> c.SsX) - cpx), cnh = Math.Min((blk4 * 4) >> c.SsY, ((c.Bh4 * 4) >> c.SsY) - cpy);
-        for (int y = 0; y < cnh; y++)
-            for (int x = 0; x < cnw; x++)
-            {
-                int du = c.ReconU[(cpy + y) * c.Cw + cpx + x] - c.U[(cpy + y) * c.Cw + cpx + x];
-                int dv = c.ReconV[(cpy + y) * c.Cw + cpx + x] - c.V[(cpy + y) * c.Cw + cpx + x];
-                sse += (long)du * du + (long)dv * dv;
-            }
+        int co = cpy * c.Cw + cpx;
+        sse += SseU16(c.ReconU, co, c.Cw, c.U, co, c.Cw, cnw, cnh) + SseU16(c.ReconV, co, c.Cw, c.V, co, c.Cw, cnw, cnh);
 
         return sse;
     }
@@ -3782,11 +3765,8 @@ internal static partial class Av1StillImageEncoder
     // Luma block SSE (reconstruction vs source) over an n x n region at pixel (bx,by).
     private static long LumaBlockSse(ColorPartCtx c, int bx, int by, int n)
     {
-        long sse = 0;
         int nw = Math.Min(n, c.Bw4 * 4 - bx), nh = Math.Min(n, c.Bh4 * 4 - by);   // in-frame samples only
-        for (int yy = 0; yy < nh; yy++)
-            for (int xx = 0; xx < nw; xx++) { int d = c.ReconY[(by + yy) * c.W + bx + xx] - c.Luma[(by + yy) * c.W + bx + xx]; sse += (long)d * d; }
-        return sse;
+        return SseU16(c.ReconY, by * c.W + bx, c.W, c.Luma, by * c.W + bx, c.W, nw, nh);
     }
 
     // Estimates the luma coding cost J = SSE + λ·bits of a single rectangular leaf, predicting from the SOURCE
@@ -6412,14 +6392,20 @@ internal static partial class Av1StillImageEncoder
     }
 
     private static byte DequantAndReconstructPredRect(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
-        ushort[] predBlock, ushort[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct)
+        ushort[] predBlock, ushort[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct, int eobHint = -2)
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[txIdx].Ctx - 2);
         int cfMax = CfMax;
         var scan = Av1Tables.Scans[txIdx];
-        int eob = -1;
-        for (int i = scan.Length - 1; i >= 0; i--)
-            if (levels[scan[i]] != 0) { eob = i; break; }
+        int eob = eobHint;   // the caller's when known (quantiser / trellis)
+        if (eob == -2 || Av1CoeffEncode.EobCheck)
+        {
+            int e = -1;
+            for (int i = scan.Length - 1; i >= 0; i--)
+                if (levels[scan[i]] != 0) { e = i; break; }
+            if (eob != -2 && eob != e) throw new InvalidOperationException($"reconstruction eob hint {eob} != {e} (tx {txIdx})");
+            eob = e;
+        }
 
         var cf = t_reconCf ??= new int[64 * 64];   // left all-zero by InvTxfmAdd16
         int culLevel = 0;
@@ -6469,14 +6455,7 @@ internal static partial class Av1StillImageEncoder
         var block = blockBuf.AsSpan(0, w * h);
         predBlock.AsSpan(0, w * h).CopyTo(block);
         Av1InvTransform.InvTxfmAdd16(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, Bd);
-        long sse = 0;
-        for (int y = 0; y < h; y++)
-        {
-            var b = block.Slice(y * w, w);
-            var sr = src.AsSpan((srcBy + y) * srcW + srcBx, w);
-            for (int x = 0; x < w; x++) { int d = b[x] - sr[x]; sse += d * d; }
-        }
-        return sse;
+        return SseU16(blockBuf, 0, w, src, srcBy * srcW + srcBx, srcW, w, h);
     }
 
     // Residual (src - prediction) for an n x n block.

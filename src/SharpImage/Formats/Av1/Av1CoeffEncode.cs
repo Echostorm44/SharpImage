@@ -676,9 +676,27 @@ internal static class Av1CoeffEncode
     /// signedLevels / qf share the tx's rc indexing.</summary>
     /// Returns the coefficient bits of the result as EstimateCoefBits prices them (txTypeBits is the tx-type symbol's
     /// cost, added when the block is not all-zero): each rate term is taken once every later coefficient is final.
+    /// <summary>The eob (last nonzero scan index, -1 all zero) TrellisOptimize left on this thread.</summary>
+    [ThreadStatic] internal static int LastTrellisEob;
+
     internal static double TrellisOptimize(Av1CdfCoefContext coef, int tx, int chroma, int[] signedLevels, double[] qf,
         int dcDq, int acDq, int skipCtx, int dcSignCtx, double lambda, double txTypeBits = 0, int eobHint = -2)
     {
+        double bits = TrellisOptimizeCore(coef, tx, chroma, signedLevels, qf, dcDq, acDq, skipCtx, dcSignCtx, lambda, txTypeBits, eobHint, out int eobOut);
+        LastTrellisEob = eobOut;
+        if (EobCheck)
+        {
+            var sc = Av1Tables.Scans[tx]; int e2 = -1;
+            for (int i = sc.Length - 1; i >= 0; i--) if (signedLevels[sc[i]] != 0) { e2 = i; break; }
+            if (e2 != eobOut) throw new InvalidOperationException($"TrellisOptimize final eob {eobOut} != {e2} (tx {tx})");
+        }
+        return bits;
+    }
+
+    private static double TrellisOptimizeCore(Av1CdfCoefContext coef, int tx, int chroma, int[] signedLevels, double[] qf,
+        int dcDq, int acDq, int skipCtx, int dcSignCtx, double lambda, double txTypeBits, int eobHint, out int eobOut)
+    {
+        eobOut = -1;
         long tt = Av1StillImageEncoder.TimingOn ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         ushort[] scan = Av1Tables.Scans[tx];
         ref readonly Av1TxfmInfo tDim = ref Av1Tables.TxfmDimensions[tx];
@@ -821,6 +839,7 @@ internal static class Av1CoeffEncode
         if (Av1StillImageEncoder.TimingOn) Av1StillImageEncoder.Tick(10, ref tt);
         for (int i = 0; i <= eob0; i++) levels[scan[i]] = 0;   // keep the shared scratch all-zero
         if (Av1StillImageEncoder.TimingOn) Av1StillImageEncoder.Tick(11, ref tt);
+        eobOut = eob;
         return accuRate + nonSkip + txTypeBits;
     }
 
