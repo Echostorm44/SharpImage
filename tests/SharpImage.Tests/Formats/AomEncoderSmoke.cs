@@ -34,6 +34,7 @@ public sealed class AomEncoderSmoke
         AomTrace.Out = traceWriter;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var (cpi, x) = AomEncoder.EncodeFrame(input);
+        AomEncoder.RunPostFilter(cpi, x);
         sw.Stop();
         AomTrace.Out = null;
         var cm = cpi.Cm; var rec = cm.CurFrame;
@@ -63,6 +64,28 @@ public sealed class AomEncoderSmoke
             sb.Append($"txt {r}");
             for (int c = 0; c < cm.MiCols; c++) sb.Append(' ').Append(cm.TxTypeMap[r * cm.MiStride + c]);
             sb.Append('\n');
+        }
+        var pf = cpi.PostFilter;
+        if (pf != null)
+        {
+            sb.Append($"lfl {pf.LoopFilter.FilterLevel[0]} {pf.LoopFilter.FilterLevel[1]} {pf.LoopFilter.FilterLevelU} {pf.LoopFilter.FilterLevelV}\n");
+            for (int p = 0; p < cm.NumPlanes && pf.Restoration == null; p++) sb.Append($"lr {p} type 0 size 0 units 0" + (char)10);
+            for (int p = 0; p < cm.NumPlanes && pf.Restoration != null; p++)
+            {
+                var rsi = pf.Restoration[p];
+                bool none = rsi.FrameRestorationType == AomRestoration.RestoreNone;
+                sb.Append($"lr {p} type {rsi.FrameRestorationType} size {rsi.RestorationUnitSize} units {(none ? 0 : rsi.NumRestUnits)}\n");
+                if (none) continue;
+                for (int u = 0; u < rsi.NumRestUnits; u++)
+                {
+                    var ui = rsi.UnitInfo[u];
+                    sb.Append($"lru {p} {u} t {ui.Type}");
+                    if (ui.Type == AomRestoration.RestoreWiener)
+                        for (int i = 0; i < 8; i++) sb.Append($" {ui.Wiener.V[i]} {ui.Wiener.H[i]}");
+                    if (ui.Type == AomRestoration.RestoreSgrproj) sb.Append($" ep {ui.Sgrproj.Ep} xqd {ui.Sgrproj.Xqd0} {ui.Sgrproj.Xqd1}");
+                    sb.Append('\n');
+                }
+            }
         }
         int sbMi = cm.MibSize, sbRows = (cm.MiRows + sbMi - 1) / sbMi, sbCols = (cm.MiCols + sbMi - 1) / sbMi;
         int npix = 1 << AomTables.NumPelsLog2Lookup[cm.SbSize];

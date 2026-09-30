@@ -22,7 +22,7 @@ internal sealed class AomEncodeInput
 // Port of libaom 3.14.1 av1_encode_frame / encode_frame_internal / encode_tiles / av1_encode_tile / encode_sb_row /
 // encode_rd_sb for one all-intra key frame (one tile, no segmentation, no delta q): the search and the final encode
 // that leave the mode info, the coefficients and the reconstruction for the bitstream writer and the loop filters.
-internal static class AomEncoder
+internal static partial class AomEncoder
 {
     internal static (AomComp cpi, AomMacroblock x) EncodeFrame(AomEncodeInput input)
     {
@@ -63,7 +63,9 @@ internal static class AomEncoder
             Width = input.Width, Height = input.Height, AllowScreenContentTools = input.AllowScreenContentTools,
             UseScreenContentTools = input.UseScreenContentTools, IsScreenContentType = input.IsScreenContentType, BaseQindex = input.BaseQindex,
         };
-        cpi.Sf.SetForFrame(sfIn, new AomSpeedFeatureSeqFlags(), cpi.WinnerModeParams, input.Speed);
+        var seqFlags = new AomSpeedFeatureSeqFlags();
+        cpi.Sf.SetForFrame(sfIn, seqFlags, cpi.WinnerModeParams, input.Speed);
+        cpi.EnableRestoration = seqFlags.enable_restoration != 0;
         input.SfOverride?.Invoke(cpi.Sf);
 
         // lossless / qindex / trellis per segment
