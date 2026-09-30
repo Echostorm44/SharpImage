@@ -1877,6 +1877,7 @@ internal static partial class Av1StillImageEncoder
 
         // Progress waits: a short spin, then the shared monitor (Publish pulses it) — never Thread.Sleep(1), whose
         // timer-tick granularity would stall the wavefront.
+        int workers = 1;
         long waitTicks = 0;   // dev (PhaseHook "rowwait"): total time workers waited on the row above
         void WaitFor(TileMt st, int row, int count)
         {
@@ -1949,8 +1950,9 @@ internal static partial class Av1StillImageEncoder
             Av1CdfIndex.Return(rcdf, index);   // the log holds symbolic ops only: the row context is free again
         }
 
-        void Worker(int _)
+        void Worker(int wi)
         {
+            nint prevAffinity = workers > 1 ? Av1CorePin.Pin(wi) : 0;   // one worker per physical core (Av1CorePin)
             using var bdScope = new BitDepthScope(bd);
             var prevSpeed = t_speed;
             t_speed = speed;
@@ -1965,6 +1967,7 @@ internal static partial class Av1StillImageEncoder
             finally
             {
                 ClearTileWindow();
+                Av1CorePin.Unpin(prevAffinity);
                 t_speed = prevSpeed;
                 Av1ObuWriter.ExchangeThreadState(prevWriter);
             }
@@ -1983,7 +1986,7 @@ internal static partial class Av1StillImageEncoder
         if (t_verifyRecon) t_lastRecon = ([reconY, reconU, reconV], w, cw);
         if (Sp.RowMt)
         {
-            int workers = Math.Max(1, Math.Min(ThreadCount, work.Count));
+            workers = Math.Max(1, Math.Min(ThreadCount, work.Count));
             long tRows = System.Diagnostics.Stopwatch.GetTimestamp();
             if (workers == 1) Worker(0);
             else System.Threading.Tasks.Parallel.For(0, workers, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = workers }, Worker);
