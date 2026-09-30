@@ -369,18 +369,14 @@ internal static class AomEncodeMb
         l.Slice(0, TxSizeHighUnit[txSize]).Fill(ctx);
     }
 
-    [ThreadStatic] private static int[]? t_invScratch;
 
     /// <summary>av1_inverse_transform_block (8-bit): the dequantised coefficients' inverse added into dst (the coefficients
     /// are left untouched, as libaom's). eob: libaom's count (0 = none).</summary>
     internal static void InverseTransformBlock(int[] dqcoeff, int dqOff, int txType, int txSize, byte[] dst, int dstOff, int dstStride, int eob)
     {
         if (eob == 0) return;
-        int n = MaxEob(txSize);
-        var tmp = t_invScratch ??= new int[64 * 64];
-        Array.Copy(dqcoeff, dqOff, tmp, 0, n);
-        Av1InvTransform.InvTxfmAdd16(dst.AsSpan(dstOff), dstStride, tmp.AsSpan(0, n), eob - 1, txSize, Av1InvTransform.TxShift[txSize],
-            (Av1TxType)txType, 8);
+        Av1InvTransform.InvTxfmAdd16(dst.AsSpan(dstOff), dstStride, dqcoeff.AsSpan(dqOff, MaxEob(txSize)), eob - 1, txSize,
+            Av1InvTransform.TxShift[txSize], (Av1TxType)txType, 8, preserveCoeffs: true);
     }
 
     /// <summary>aom_sum_squares_2d_i16.</summary>

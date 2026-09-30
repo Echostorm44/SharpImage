@@ -218,10 +218,11 @@ public static class Av1InvTransform
         Span<TP> dst, int dstStride,
         Span<int> coeffs, int eob,
         int txSizeIdx, int shift,
-        Av1TxType txType, int bitDepth) where TP : unmanaged
+        Av1TxType txType, int bitDepth, bool preserveCoeffs = false) where TP : unmanaged
     {
+        // preserveCoeffs: leave coeffs as they are (the encoder's dqcoeff); otherwise the read coefficients are cleared
         // Lossless (coded-lossless inter blocks reach here too): the 4x4 Walsh-Hadamard inverse.
-        if (txType == Av1TxType.WhtWht) { InvWhtAdd16(dst, dstStride, coeffs, bitDepth); return; }
+        if (txType == Av1TxType.WhtWht) { InvWhtAdd16(dst, dstStride, coeffs, bitDepth, preserveCoeffs); return; }
         ref readonly var tDim = ref Av1Tables.TxfmDimensions[txSizeIdx];
         int w = 4 * tDim.W;
         int h = 4 * tDim.H;
@@ -239,7 +240,7 @@ public static class Av1InvTransform
         if (eob < (hasDcOnly ? 1 : 0))
         {
             int dc = coeffs[0];
-            coeffs[0] = 0;
+            if (!preserveCoeffs) coeffs[0] = 0;
             if (isRect2)
                 dc = (dc * 181 + 128) >> 8;
             dc = (dc * 181 + 128) >> 8;
@@ -265,7 +266,7 @@ public static class Av1InvTransform
         if (Avx2.IsSupported && !ForceScalar)
         {
             InvTxfmAdd16V(dst, dstStride, coeffs, rowMask, w, h, sw, sh, isRect2, rnd, shift, pixelMax,
-                rowClipMin, rowClipMax, colClipMin, colClipMax, tDim.Lw, tDim.Lh, txtp0, txtp1);
+                rowClipMin, rowClipMax, colClipMin, colClipMax, tDim.Lw, tDim.Lh, txtp0, txtp1, preserveCoeffs);
             return;
         }
 
@@ -284,13 +285,13 @@ public static class Av1InvTransform
                 for (int x = 0; x < sw; x++)
                 {
                     row[x] = (coeffs[y + x * sh] * 181 + 128) >> 8;
-                    coeffs[y + x * sh] = 0;
+                    if (!preserveCoeffs) coeffs[y + x * sh] = 0;
                 }
             else
                 for (int x = 0; x < sw; x++)
                 {
                     row[x] = coeffs[y + x * sh];
-                    coeffs[y + x * sh] = 0;
+                    if (!preserveCoeffs) coeffs[y + x * sh] = 0;
                 }
             Apply1d(row, 1, rowClipMin, rowClipMax, tDim.Lw, txtp0);
         }
@@ -341,7 +342,7 @@ public static class Av1InvTransform
     [System.Runtime.CompilerServices.SkipLocalsInit]
     private static void InvTxfmAdd16V<TP>(Span<TP> dst, int dstStride, Span<int> coeffs, uint rowMask, int w, int h,
         int sw, int sh, bool isRect2, int rnd, int shift, int pixelMax, int rowClipMin, int rowClipMax,
-        int colClipMin, int colClipMax, int lw, int lh, int txtp0, int txtp1) where TP : unmanaged
+        int colClipMin, int colClipMax, int lw, int lh, int txtp0, int txtp1, bool preserveCoeffs) where TP : unmanaged
     {
         int wv = (w + 7) >> 3;                                    // 8-column groups
         Span<Vector256<int>> tmpS = stackalloc Vector256<int>[h * wv];   // row-major intermediate: row y, group gi
@@ -370,8 +371,8 @@ public static class Av1InvTransform
             {
                 ref int p = ref Unsafe.Add(ref c0, x * sh + y0);
                 Vector256<int> c;
-                if (g == 8) { c = Vector256.LoadUnsafe(ref p); zero.StoreUnsafe(ref p); }
-                else { c = Vector256.Create(Vector128.LoadUnsafe(ref p), Vector128<int>.Zero); Vector128<int>.Zero.StoreUnsafe(ref p); }
+                if (g == 8) { c = Vector256.LoadUnsafe(ref p); if (!preserveCoeffs) zero.StoreUnsafe(ref p); }
+                else { c = Vector256.Create(Vector128.LoadUnsafe(ref p), Vector128<int>.Zero); if (!preserveCoeffs) Vector128<int>.Zero.StoreUnsafe(ref p); }
                 if (isRect2) c = Vector256.ShiftRightArithmetic(c * 181 + Vector256.Create(128), 8);
                 v[x] = c;
             }
@@ -472,7 +473,7 @@ public static class Av1InvTransform
     /// <summary>4x4 Walsh-Hadamard inverse add, generic over the sample type. See <see cref="InvWhtAdd"/>.</summary>
     public static void InvWhtAdd16<TP>(
         Span<TP> dst, int dstStride,
-        Span<int> coeffs, int bitDepth) where TP : unmanaged
+        Span<int> coeffs, int bitDepth, bool preserveCoeffs = false) where TP : unmanaged
     {
         int pixelMax = (1 << bitDepth) - 1;
         Span<int> tmp = stackalloc int[16];
@@ -483,7 +484,7 @@ public static class Av1InvTransform
                 row[x] = coeffs[y + x * 4] >> 2;
             InvWht4_1d(row, 1);
         }
-        coeffs.Slice(0, 16).Clear();
+        if (!preserveCoeffs) coeffs.Slice(0, 16).Clear();
 
         for (int x = 0; x < 4; x++)
             InvWht4_1dStrided(tmp, x, 4);
