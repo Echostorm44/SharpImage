@@ -225,6 +225,8 @@ internal static class Av1ObuWriter
     /// header carries lr_params (its plan, or none).</summary>
     internal static bool RestorationHeaderShared => t_layered != null || t_sharedHeader;
     private static bool RestorationEnabled => t_lr != null || RestorationHeaderShared;
+    // enable_cdef: the encode's preset (off in libaom's all-intra mode); layered streams and sequences keep it
+    private static bool CdefEnabled => Av1StillImageEncoder.UseCdefSearch || t_layered != null;
 
     internal readonly struct LayeredScope : IDisposable
     {
@@ -519,7 +521,7 @@ internal static class Av1ObuWriter
         // reduced still → inter tools block skipped; screen_content_tools/force_integer_mv default Adaptive.
     afterTools:
         w.PutBool(false);         // enable_superres = 0
-        w.PutBool(true);          // enable_cdef = 1 (frame header carries cdef_params; strengths may be 0 = no-op)
+        w.PutBool(CdefEnabled);   // enable_cdef (libaom all-intra: 0)
         w.PutBool(RestorationEnabled);   // enable_restoration (a standalone still only when its search chose it)
 
         // color_config (AV1 spec 5.5.2)
@@ -714,15 +716,18 @@ internal static class Av1ObuWriter
         w.PutBits((uint)t_sharpness, 3);   // loop_filter_sharpness (AvifEncodeOptions.Sharpness, avifenc -a sharpness=S)
         w.PutBool(false);         // loop_filter_delta_enabled = 0
 
-        // cdef_params (enable_cdef=1, not lossless, not intrabc). Strengths may all be 0 = no-op filter.
-        w.PutBits((uint)(cdef.Damping - 3), 2);   // cdef_damping_minus_3
-        w.PutBits((uint)cdef.Bits, 2);            // cdef_bits
-        for (int i = 0; i < (1 << cdef.Bits); i++)
+        // cdef_params (when the sequence enables CDEF; not lossless, not intrabc). Strengths may all be 0 = no-op filter.
+        if (CdefEnabled)
         {
-            w.PutBits(cdef.YStrengths[i], 6);     // cdef_y_strength (pri<<2 | sec)
-            if (!monochrome)
+            w.PutBits((uint)(cdef.Damping - 3), 2);   // cdef_damping_minus_3
+            w.PutBits((uint)cdef.Bits, 2);            // cdef_bits
+            for (int i = 0; i < (1 << cdef.Bits); i++)
             {
-                w.PutBits(cdef.UvStrengths[i], 6); // cdef_uv_strength
+                w.PutBits(cdef.YStrengths[i], 6);     // cdef_y_strength (pri<<2 | sec)
+                if (!monochrome)
+                {
+                    w.PutBits(cdef.UvStrengths[i], 6); // cdef_uv_strength
+                }
             }
         }
         // lr_params (only present when the sequence enables restoration)

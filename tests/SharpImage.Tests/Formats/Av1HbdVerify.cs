@@ -2563,6 +2563,8 @@ public sealed class Av1HbdVerify
                         },
                         // PROBE_THREADS=n: this many encoder threads (default all)
                         MaxThreads = int.TryParse(Environment.GetEnvironmentVariable("PROBE_THREADS"), out int pth) ? pth : 0,
+                        // the scoreboard compares with avifenc -a tune=psnr (PROBE_TUNE=iq: libavif's default)
+                        Tune = Environment.GetEnvironmentVariable("PROBE_TUNE") == "iq" ? AvifTune.Iq : AvifTune.Psnr,
                     };
                     // Field=Value: an Av1EncodeSpeed field, else an internal static of the encoder / forward transform
                     // (RdLambdaK, DeadzoneBias, ...), restored after this encode.

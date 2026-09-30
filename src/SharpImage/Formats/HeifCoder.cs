@@ -76,8 +76,25 @@ public sealed class AvifLayer
 /// <summary>
 /// Options that control AVIF encoding.
 /// </summary>
+/// <summary>libavif's -a tune for the colour image: the metric libaom tunes for, which also picks libavif's quality to
+/// quantizer mapping.</summary>
+public enum AvifTune
+{
+    /// <summary>libavif's default for still and layered colour images (libaom tune=iq): its tuneIqQualityToQuantizer table.</summary>
+    Iq,
+    /// <summary>tune=psnr: the linear quality mapping quantizer = ((100 - quality) * 63 + 50) / 100.</summary>
+    Psnr,
+}
+
 public sealed class AvifEncodeOptions
 {
+    /// <summary>libavif's -a tune (default <see cref="AvifTune.Iq"/>, as libavif chooses for still colour images).</summary>
+    public AvifTune Tune { get; set; } = AvifTune.Iq;
+
+    /// <summary>avifenc -a enable-cdef: the CDEF filter search. Null = libaom's default for the coding mode: off for a single
+    /// still image (all-intra mode, where libaom disables CDEF), on for layered images and sequences.</summary>
+    public bool? EnableCdef { get; set; }
+
     /// <summary>Quantization parameter 0..51 (0 = highest quality / largest file). Default 20.</summary>
     public int Qp { get; set; } = 20;
 
@@ -1092,7 +1109,8 @@ public static partial class HeifCoder
     public static byte[] EncodeAvif(ImageFrame image, AvifEncodeOptions? options = null)
     {
         options ??= new AvifEncodeOptions();
-        using var scope = new EncoderScope(options);
+        // libavif codes a single still image in libaom's all-intra mode (layered images: good quality with libaom 3.14)
+        using var scope = new EncoderScope(options, allIntra: !options.Progressive && options.Layers == null);
         return EncodeAvifEntry(image, options);
     }
 
@@ -1103,14 +1121,17 @@ public static partial class HeifCoder
         private readonly bool prevAvoid;
         private readonly Av1.Av1EncodeSpeed? prevSpeed;
         private readonly int prevThreads, prevSharpness;
-        public EncoderScope(AvifEncodeOptions options)
+        public EncoderScope(AvifEncodeOptions options, bool allIntra = false)
         {
             if (options.Sharpness is < 0 or > 7) throw new ArgumentOutOfRangeException(nameof(options), "Sharpness must be 0..7.");
             prevSharpness = Av1.Av1ObuWriter.t_sharpness;
             Av1.Av1ObuWriter.t_sharpness = options.Sharpness;
             prevAvoid = t_avoidLibyuv; prevSpeed = Av1.Av1StillImageEncoder.t_speed; prevThreads = Av1.Av1StillImageEncoder.t_threads;
             t_avoidLibyuv = options.AvoidLibyuv;
-            Av1.Av1StillImageEncoder.t_speed = Av1.Av1EncodeSpeed.ForSpeed(options.Speed);
+            var sp = Av1.Av1EncodeSpeed.ForSpeed(options.Speed);
+            // libaom all-intra (av1_cx_iface.c encoder_init): enable_cdef = 0 unless set, so no CDEF search and none signalled
+            sp.UseCdefSearch = options.EnableCdef ?? !allIntra;
+            Av1.Av1StillImageEncoder.t_speed = sp;
             Av1.Av1StillImageEncoder.t_threads = Math.Max(0, options.MaxThreads);
         }
         public void Dispose()
@@ -1213,7 +1234,7 @@ public static partial class HeifCoder
             int? lq = l.Quality ?? options.Quality;
             int? lqa = l.QualityAlpha ?? l.Quality ?? options.QualityAlpha ?? options.Quality;
             if (lq >= 100 || lqa >= 100) throw new NotSupportedException("Lossless layers are not supported.");
-            int qIdx = lq is { } q ? QualityToQIndex(q, color.Matrix == 0) : defQ;
+            int qIdx = lq is { } q ? QualityToQIndex(q, color.Matrix == 0 || options.Tune == AvifTune.Psnr) : defQ;
             int aQIdx = lqa is { } qa ? QualityToQIndex(qa, identityMatrix: true) : Math.Clamp(qIdx / 2, 4, 255);
             inputs.Add(new Av1.Av1StillImageEncoder.LayerInput(y, u, v, alpha, lw, lh, qIdx, aQIdx));
         }
@@ -1230,7 +1251,7 @@ public static partial class HeifCoder
     private static (int? QIdx, int? AlphaQIdx, bool Lossless) QualityQIndices(AvifEncodeOptions o, Av1.Av1ObuWriter.Av1ColorDesc color,
         bool sequence = false)
     {
-        bool linear = color.Matrix == 0 || sequence;
+        bool linear = color.Matrix == 0 || sequence || o.Tune == AvifTune.Psnr;
         int? q = o.Quality is { } c && c < 100 ? QualityToQIndex(c, linear) : null;
         int? qa = (o.QualityAlpha ?? o.Quality) is { } a ? QualityToQIndex(a, identityMatrix: true) : null;
         return (q, qa, o.Quality >= 100);

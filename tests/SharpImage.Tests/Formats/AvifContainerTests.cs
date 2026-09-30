@@ -104,8 +104,9 @@ public sealed class AvifContainerTests
     [Arguments(true, 10)]
     public async Task ProgressiveEncode_FinalLayerEqualsSingleLayerEncode(bool alpha, int bd)
     {
-        // The top layer is coded exactly like a single-layer encode (only its frame header differs), so it decodes to the
-        // same pixels; the base layer is a half-size preview and a1lx indexes both.
+        // The top layer is coded exactly like a single-layer encode in the same coding mode (layered images use libaom's
+        // good-quality mode, so CDEF on; a single still is all-intra, CDEF off unless enabled) — only its frame header
+        // differs, so it decodes to the same pixels; the base layer is a half-size preview and a1lx indexes both.
         var img = new ImageFrame();
         img.Initialize(150, 90, ColorspaceType.SRGB, alpha);
         int ch = img.NumberOfChannels;
@@ -120,7 +121,7 @@ public sealed class AvifContainerTests
         }
         // BT.709 keeps both encodes on the general path (8-bit BT.601 4:2:0 has its own legacy RGB->YUV conversion).
         byte[] prog = HeifCoder.EncodeAvif(img, new AvifEncodeOptions { BitDepth = bd, MatrixCoefficients = 1, Progressive = true });
-        byte[] single = HeifCoder.EncodeAvif(img, new AvifEncodeOptions { BitDepth = bd, MatrixCoefficients = 1 });
+        byte[] single = HeifCoder.EncodeAvif(img, new AvifEncodeOptions { BitDepth = bd, MatrixCoefficients = 1, EnableCdef = true });
         var layers = HeifCoder.DecodeProgressive(prog);
         await Assert.That(layers.Count).IsEqualTo(2);
         var reference = HeifCoder.Decode(single);
