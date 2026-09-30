@@ -66,8 +66,8 @@ internal static partial class Av1StillImageEncoder
 
     /// <summary>Bit mask (by mode value, Vertical..VerticalLeft) of the directional modes libaom's HOG model prunes for
     /// a w x h source block (visible part), at pruning level 1..4 (0 = none). scale = (1+ssX)(1+ssY) for chroma.</summary>
-    internal static uint HogSkipMask(ReadOnlySpan<ushort> plane, int stride, int x0, int y0, int w, int h, int visW, int visH,
-        int level, int scale = 1)
+    internal static uint HogSkipMask<TP>(ReadOnlySpan<TP> plane, int stride, int x0, int y0, int w, int h, int visW, int visH,
+        int level, int scale = 1) where TP : unmanaged
     {
         if (level <= 0) return 0;
         int rows = Math.Min(h, visH - y0), cols = Math.Min(w, visW - x0);
@@ -79,10 +79,10 @@ internal static partial class Av1StillImageEncoder
             for (int c = 1; c < cols - 1; c++)
             {
                 int p = o + c;
-                int dx = (plane[p - stride + 1] + 2 * plane[p + 1] + plane[p + stride + 1])
-                       - (plane[p - stride - 1] + 2 * plane[p - 1] + plane[p + stride - 1]);
-                int dy = (plane[p + stride - 1] + 2 * plane[p + stride] + plane[p + stride + 1])
-                       - (plane[p - stride - 1] + 2 * plane[p - stride] + plane[p - stride + 1]);
+                int dx = (Px.I(plane[p - stride + 1]) + 2 * Px.I(plane[p + 1]) + Px.I(plane[p + stride + 1]))
+                       - (Px.I(plane[p - stride - 1]) + 2 * Px.I(plane[p - 1]) + Px.I(plane[p + stride - 1]));
+                int dy = (Px.I(plane[p + stride - 1]) + 2 * Px.I(plane[p + stride]) + Px.I(plane[p + stride + 1]))
+                       - (Px.I(plane[p - stride - 1]) + 2 * Px.I(plane[p - stride]) + Px.I(plane[p - stride + 1]));
                 if (dx == 0 && dy == 0) continue;
                 int temp = Math.Abs(dx) + Math.Abs(dy);
                 total += temp;
@@ -105,11 +105,11 @@ internal static partial class Av1StillImageEncoder
 
     /// <summary>libaom av1_calc_normalized_variance on a 4x4 luma block: the variance at 8-bit scale (high bit depth
     /// sums rounded down like aom_highbd_10/12_variance4x4).</summary>
-    private static int Var4x4Norm(ushort[] luma, int stride, int x0, int y0)
+    private static int Var4x4Norm<TP>(TP[] luma, int stride, int x0, int y0) where TP : unmanaged
     {
         long sum = 0, sse = 0;
         for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++) { int v = luma[(y0 + y) * stride + x0 + x]; sum += v; sse += v * v; }
+            for (int x = 0; x < 4; x++) { int v = Px.I(luma[(y0 + y) * stride + x0 + x]); sum += v; sse += v * v; }
         int sh = Bd - 8;
         if (sh > 0) { sse = (sse + (1L << (2 * sh - 1))) >> (2 * sh); sum = (sum + (1L << (sh - 1))) >> sh; }
         long var = sse - sum * sum / 16;

@@ -31,8 +31,12 @@ internal static class Px
     /// <summary>16 samples at s[i..] as 16-bit lanes.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector256<ushort> Load16<TP>(ReadOnlySpan<TP> s, int i) where TP : unmanaged
+        => Load16(ref MemoryMarshal.GetReference(s.Slice(i, 16)));
+
+    /// <summary>16 samples at r as 16-bit lanes (unchecked).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector256<ushort> Load16<TP>(ref TP r) where TP : unmanaged
     {
-        ref TP r = ref MemoryMarshal.GetReference(s.Slice(i, 16));
         if (typeof(TP) == typeof(byte))
         {
             var b = Vector128.LoadUnsafe(ref Unsafe.As<TP, byte>(ref r));
@@ -58,8 +62,12 @@ internal static class Px
     /// <summary>8 samples at s[i..] as 16-bit lanes.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector128<ushort> Load8<TP>(ReadOnlySpan<TP> s, int i) where TP : unmanaged
+        => Load8(ref MemoryMarshal.GetReference(s.Slice(i, 8)));
+
+    /// <summary>8 samples at r as 16-bit lanes (unchecked).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector128<ushort> Load8<TP>(ref TP r) where TP : unmanaged
     {
-        ref TP r = ref MemoryMarshal.GetReference(s.Slice(i, 8));
         if (typeof(TP) == typeof(byte))
         {
             var b = Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.As<TP, byte>(ref r))).AsByte();
@@ -99,6 +107,24 @@ internal static class Px
             return;
         }
         Unsafe.WriteUnaligned(ref Unsafe.As<TP, byte>(ref r), v.AsUInt64().ToScalar());
+    }
+
+    /// <summary>dst[y * w + x] = src[srcOff + y * srcStride + x] - pred[predOff + y * predStride + x] for a w x h block.</summary>
+    public static void Residual<TP>(ReadOnlySpan<TP> src, int srcOff, int srcStride, ReadOnlySpan<TP> pred, int predOff, int predStride,
+        Span<int> dst, int w, int h) where TP : unmanaged
+    {
+        for (int y = 0; y < h; y++)
+        {
+            var s = src.Slice(srcOff + y * srcStride, w);
+            var p = pred.Slice(predOff + y * predStride, w);
+            var d = dst.Slice(y * w, w);
+            int x = 0;
+            if (Avx2.IsSupported)
+                for (; x + 8 <= w; x += 8)
+                    (Load8x32(ref Unsafe.Add(ref MemoryMarshal.GetReference(s), x)) - Load8x32(ref Unsafe.Add(ref MemoryMarshal.GetReference(p), x)))
+                        .StoreUnsafe(ref MemoryMarshal.GetReference(d), (nuint)x);
+            for (; x < w; x++) d[x] = I(s[x]) - I(p[x]);
+        }
     }
 
     /// <summary>8 samples at r as 32-bit lanes.</summary>

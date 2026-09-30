@@ -1415,10 +1415,10 @@ public static class Av1Reconstruction
     /// Computes AC component from reconstructed luma for CFL prediction.
     /// Port of dav1d cfl_ac_c (ipred_tmpl.c).
     /// </summary>
-    internal static void ComputeCflAc(
-        Span<short> ac, ReadOnlySpan<ushort> ySrc, int yStride,
+    internal static void ComputeCflAc<TP>(
+        Span<short> ac, ReadOnlySpan<TP> ySrc, int yStride,
         int cw, int ch, int ssHor, int ssVer,
-        int wPad, int hPad)
+        int wPad, int hPad) where TP : unmanaged
     {
         int idx = 0;
         int shift = 1 + (ssVer == 0 ? 1 : 0) + (ssHor == 0 ? 1 : 0);
@@ -1430,12 +1430,12 @@ public static class Av1Reconstruction
         {
             for (int x = 0; x < activeW; x++)
             {
-                int acSum = ySrc[yOff + (x << ssHor)];
-                if (ssHor != 0) acSum += ySrc[yOff + x * 2 + 1];
+                int acSum = Px.I(ySrc[yOff + (x << ssHor)]);
+                if (ssHor != 0) acSum += Px.I(ySrc[yOff + x * 2 + 1]);
                 if (ssVer != 0)
                 {
-                    acSum += ySrc[yOff + (x << ssHor) + yStride];
-                    if (ssHor != 0) acSum += ySrc[yOff + x * 2 + 1 + yStride];
+                    acSum += Px.I(ySrc[yOff + (x << ssHor) + yStride]);
+                    if (ssHor != 0) acSum += Px.I(ySrc[yOff + x * 2 + 1 + yStride]);
                 }
                 ac[idx + x] = (short)(acSum << shift);
             }

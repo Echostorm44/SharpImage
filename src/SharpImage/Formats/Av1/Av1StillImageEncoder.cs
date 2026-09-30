@@ -7,6 +7,7 @@
 using System;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using System.Runtime.InteropServices;
 using System.Collections.Generic;
 
 namespace SharpImage.Formats.Av1;
@@ -872,7 +873,7 @@ internal static partial class Av1StillImageEncoder
     // (fill_variance_4x4avg), a node's variance = 256 * (sse - sum^2 / n) / n over its leaves (get_variance); a 16x16
     // over thresholds[3] forces the split of itself and its parents, a 32x32 over thresholds[2] likewise, 64x64 always
     // splits, and a block below its threshold is kept whole (set_vt_partitioning).
-    private static int VarPartitionChoice(ColorPartCtx c, int bl, int bx4, int by4)
+    private static int VarPartitionChoice<TP>(ColorPartCtx<TP> c, int bl, int bx4, int by4) where TP : unmanaged
     {
         if (bl <= 1) return 3;
         int sbKey = ((by4 >> 4) << 16) | (bx4 >> 4);
@@ -885,7 +886,7 @@ internal static partial class Av1StillImageEncoder
                     int x0 = (sx4 + i) * 4, y0 = (sy4 + j) * 4, s = 0;
                     if (sx4 + i < c.Bw4 && sy4 + j < c.Bh4)
                         for (int y = 0; y < 4; y++)
-                            for (int x = 0; x < 4; x++) s += c.Luma[(y0 + y) * c.W + x0 + x] >> sh;
+                            for (int x = 0; x < 4; x++) s += Px.I(c.Luma[(y0 + y) * c.W + x0 + x]) >> sh;
                     c.VbpAvg[j * 16 + i] = sx4 + i < c.Bw4 && sy4 + j < c.Bh4 ? ((s + 8) >> 4) - 128 : 0;
                 }
             c.VbpSb = sbKey;
@@ -1145,10 +1146,7 @@ internal static partial class Av1StillImageEncoder
         bool mono = layout == Av1PixelLayout.I400;
         int ssX = layout == Av1PixelLayout.I444 ? 0 : 1, ssY = layout is Av1PixelLayout.I420 or Av1PixelLayout.I400 ? 1 : 0;
         int cwIn = mono ? 0 : (width + ssX) >> ssX, chIn = mono ? 0 : (height + ssY) >> ssY;   // ceil — odd dims keep a partial edge sample
-        ushort[] padY = PadPlane(luma, width, height, pw, ph);
-        SourceHook?.Invoke(padY, pw, ph);
-        ushort[] padU = mono ? new ushort[(pw >> 1) * (ph >> 1)] : PadPlane(u, cwIn, chIn, pw >> ssX, ph >> ssY);
-        ushort[] padV = mono ? new ushort[(pw >> 1) * (ph >> 1)] : PadPlane(v, cwIn, chIn, pw >> ssX, ph >> ssY);
+        if (SourceHook != null) SourceHook(PadPlane(luma, width, height, pw, ph), pw, ph);
         // Loop restoration (a standalone still enables it in its sequence header only when used; shared-header streams
         // and grids always enable it — Av1ObuWriter.RestorationHeaderShared). Tiny frames gain nothing.
         bool lrOn = UseLoopRestoration && !(Sp.LrSkip420 && layout is Av1PixelLayout.I420 or Av1PixelLayout.I400)
@@ -1157,10 +1155,11 @@ internal static partial class Av1StillImageEncoder
             && (long)width * height <= FilterSearchMaxPixels && !FilterPickFromQ;
         var (_, _, lrCols, lrRows) = Av1ObuWriter.TileLayout(sbCols, sbRows);
         var logs = lrOn || cdefSb ? new List<Av1MsacWriter.LogOp>[(lrCols.Length - 1) * (lrRows.Length - 1)] : null;
-        // Screen content (libaom's per-frame detection): palette mode on, signalled in the frame header.
-        bool sct = UsePalette || (Sp.UseScreenContentDetection && DetectScreenContent(padY, pw, width, height, bitDepth, fast: Sp.FastScreenDetection));
-        Phase("setup");
-        byte[] tile = EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx, layout, logs, sct);
+        // 8-bit content runs the lowbd pipeline (byte planes and buffers, libaom's lowbd path); 10/12-bit the ushort one.
+        bool sct;
+        byte[] tile = bitDepth == 8 && !HbdPipe8
+            ? EncodeColorTiles<byte>(luma, u, v, width, height, pw, ph, cwIn, chIn, ssX, ssY, mono, sbCols, sbRows, bw4, bh4, baseQIdx, layout, logs, Phase, out sct)
+            : EncodeColorTiles<ushort>(luma, u, v, width, height, pw, ph, cwIn, chIn, ssX, ssY, mono, sbCols, sbRows, bw4, bh4, baseQIdx, layout, logs, Phase, out sct);
         Phase("tiles");
         var seqCfg = new Av1ObuWriter.SeqConfig(width, height, monochrome: mono, enableFilterIntra: UseFilterIntra, bitDepth: bitDepth, layout: layout, color: color);
         byte[] seqObu = Av1ObuWriter.WrapObu(Av1ObuType.SequenceHeader, Av1ObuWriter.WriteSequenceHeaderPayload(seqCfg));
@@ -1173,9 +1172,9 @@ internal static partial class Av1StillImageEncoder
                 int pw2 = pl == 0 ? width : cwIn, ph2 = pl == 0 ? height : chIn, rs = pl == 0 ? lr.W : lr.Cw, ds = dp!.Strides![pl];
                 for (int yy = 0; yy < ph2; yy++)
                     for (int xx = 0; xx < pw2; xx++)
-                        if (lr.Planes[pl][yy * rs + xx] != dp.Planes![pl][yy * ds + xx])
+                        if (SampleAt(lr.Planes[pl], yy * rs + xx) != dp.Planes![pl][yy * ds + xx])
                             throw new InvalidOperationException($"encoder reconstruction differs from the decoder: plane {pl} ({xx},{yy}) " +
-                                $"encoder {lr.Planes[pl][yy * rs + xx]} decoder {dp.Planes[pl][yy * ds + xx]} ({width}x{height} {layout} q{baseQIdx})");
+                                $"encoder {SampleAt(lr.Planes[pl], yy * rs + xx)} decoder {dp.Planes[pl][yy * ds + xx]} ({width}x{height} {layout} q{baseQIdx})");
             }
         }
 
@@ -1223,6 +1222,23 @@ internal static partial class Av1StillImageEncoder
             srcY, srcU, srcV, cwIn, chIn, baseQIdx, best, lfLevel, pic, cdefIdx, sct) : null;
         Phase("lr");
         return lrRes ?? (seqObu, frameObu);
+    }
+
+    /// <summary>Dev: AV1_HBDPIPE8=1 runs 8-bit content through the ushort pipeline (the lowbd one's byte-exact reference).</summary>
+    private static readonly bool HbdPipe8 = Environment.GetEnvironmentVariable("AV1_HBDPIPE8") == "1";
+
+    // The padded source planes as TP, screen-content detection, then the tiles.
+    private static byte[] EncodeColorTiles<TP>(ReadOnlySpan<ushort> luma, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v, int width, int height,
+        int pw, int ph, int cwIn, int chIn, int ssX, int ssY, bool mono, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx,
+        Av1PixelLayout layout, List<Av1MsacWriter.LogOp>[]? logs, Action<string> phase, out bool sct) where TP : unmanaged
+    {
+        TP[] padY = PadPlaneAs<TP>(luma, width, height, pw, ph);
+        TP[] padU = mono ? new TP[(pw >> 1) * (ph >> 1)] : PadPlaneAs<TP>(u, cwIn, chIn, pw >> ssX, ph >> ssY);
+        TP[] padV = mono ? new TP[(pw >> 1) * (ph >> 1)] : PadPlaneAs<TP>(v, cwIn, chIn, pw >> ssX, ph >> ssY);
+        // Screen content (libaom's per-frame detection): palette mode on, signalled in the frame header.
+        sct = UsePalette || (Sp.UseScreenContentDetection && DetectScreenContent<TP>(padY, pw, width, height, Bd, fast: Sp.FastScreenDetection));
+        phase("setup");
+        return EncodeMultiSbColorTile(padY, padU, padV, pw, ph, sbCols, sbRows, bw4, bh4, baseQIdx, layout, logs, sct);
     }
 
     /// <summary>A decoded (grain-free) frame: its SSE vs the source and, when kept, the native-depth planes.</summary>
@@ -1670,12 +1686,12 @@ internal static partial class Av1StillImageEncoder
     // Per-superblock recursive-partition state for I420 colour. Extends the grayscale scheme with two chroma
     // planes (half resolution): chroma follows the luma partition tree, each leaf coding U/V at half the luma
     // block size (down to 4x4 chroma for an 8x8 luma leaf).
-    private sealed class ColorPartCtx
+    private sealed class ColorPartCtx<TP> where TP : unmanaged
     {
         public Av1MsacWriter Msac = null!;
         public Av1CdfContext Cdf = null!;
-        public ushort[] Luma = null!, U = null!, V = null!;
-        public ushort[] ReconY = null!, ReconU = null!, ReconV = null!;
+        public TP[] Luma = null!, U = null!, V = null!;
+        public TP[] ReconY = null!, ReconU = null!, ReconV = null!;
         public int W, Cw, Chh;         // luma stride, chroma stride, chroma height
         // Chroma layout: I420 (SsX=SsY=1, the tuned path), I422 (1,0) or I444 (0,0). Non-4:2:0 leaves go through
         // the layout-generic rect leaf (EncodeRectLeafColor), which sizes chroma as (w>>SsX) x (h>>SsY).
@@ -1699,8 +1715,8 @@ internal static partial class Av1StillImageEncoder
         public byte[] APalSzUv = null!, LPalSzUv = null!;     // chroma palette size / U colours (dav1d pal_sz_uv, pal[1])
         public ushort[] APalColU = null!, LPalColU = null!;
         public bool ScreenContent;     // allow_screen_content_tools: palette flags coded, palette searched
-        public ushort[] Pred = new ushort[64 * 64];
-        public ushort[] EstScratch = new ushort[64 * 64];
+        public TP[] Pred = new TP[64 * 64];
+        public TP[] EstScratch = new TP[64 * 64];
         // libaom reuse_best_prediction_for_part_ab: the last luma winner per (block size, 4x4 position in the 64x64
         // superblock) with the superblock it belongs to; AB-partition leaves search only that mode while set.
         public readonly int[] AomModeCache = new int[22 * 256], AomModeCacheSb = new int[22 * 256];
@@ -1721,7 +1737,7 @@ internal static partial class Av1StillImageEncoder
         // partition decision evaluates each block twice (as a parent's SPLIT child, then as its own NONE): cached per
         // SB128 position (1 + 4 + 16 + 64 + 256 slots for levels 0..4), reset when the superblock changes.
         public readonly long[] EstCache = new long[341];
-        public readonly RdSnapshot?[] SnapPool = new RdSnapshot?[18];
+        public readonly RdSnapshot<TP>?[] SnapPool = new RdSnapshot<TP>?[18];
         public readonly Av1MsacWriter.LogOp[][] LogTailPool = new Av1MsacWriter.LogOp[6][];   // per partition level
         public readonly List<Av1MsacWriter.LogOp>?[] NoneLogPool = new List<Av1MsacWriter.LogOp>?[6];
         public readonly double[] LogVar4 = new double[256];   // log1p(var / 16) of each 4x4 of the superblock LogVarSb
@@ -1757,16 +1773,16 @@ internal static partial class Av1StillImageEncoder
         public List<Av1MsacWriter.LogOp>[] RowLogs = null!;
     }
 
-    private static byte[] EncodeMultiSbColorTile(ushort[] luma, ushort[] uPlane, ushort[] vPlane,
-        int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx, Av1PixelLayout layout = Av1PixelLayout.I420)
+    private static byte[] EncodeMultiSbColorTile<TP>(TP[] luma, TP[] uPlane, TP[] vPlane,
+        int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx, Av1PixelLayout layout = Av1PixelLayout.I420) where TP : unmanaged
         => EncodeMultiSbColorTile(luma, uPlane, vPlane, w, h, sbCols, sbRows, bw4, bh4, baseQIdx, layout, null);
 
     /// <summary>As above; with <paramref name="tileLogs"/> (one slot per tile) each tile's coded operations are also
     /// recorded, with a marker (sby &lt;&lt; 16 | sbx) before every superblock, for a later Replay that inserts syntax
     /// decided after the tile (loop restoration).</summary>
-    private static byte[] EncodeMultiSbColorTile(ushort[] luma, ushort[] uPlane, ushort[] vPlane,
+    private static byte[] EncodeMultiSbColorTile<TP>(TP[] luma, TP[] uPlane, TP[] vPlane,
         int w, int h, int sbCols, int sbRows, int bw4, int bh4, int baseQIdx, Av1PixelLayout layout,
-        List<Av1MsacWriter.LogOp>[]? tileLogs, bool screenContent = false)
+        List<Av1MsacWriter.LogOp>[]? tileLogs, bool screenContent = false) where TP : unmanaged
     {
         screenContent |= UsePalette;
         int qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0);
@@ -1779,10 +1795,10 @@ internal static partial class Av1StillImageEncoder
 
         int sb128Cols = (sbCols + 1) >> 1;
         // the padded source planes are only read: used as they are (no per-encode copies of whole planes)
-        ushort[] lumaArr = luma.Length == w * h ? luma : luma.AsSpan(0, w * h).ToArray();
-        ushort[] uArr = uPlane.Length == cw * chh ? uPlane : uPlane.AsSpan(0, cw * chh).ToArray();
-        ushort[] vArr = vPlane.Length == cw * chh ? vPlane : vPlane.AsSpan(0, cw * chh).ToArray();
-        ushort[] reconY = new ushort[w * h], reconU = new ushort[cw * chh], reconV = new ushort[cw * chh];
+        TP[] lumaArr = luma.Length == w * h ? luma : luma.AsSpan(0, w * h).ToArray();
+        TP[] uArr = uPlane.Length == cw * chh ? uPlane : uPlane.AsSpan(0, cw * chh).ToArray();
+        TP[] vArr = vPlane.Length == cw * chh ? vPlane : vPlane.AsSpan(0, cw * chh).ToArray();
+        TP[] reconY = new TP[w * h], reconU = new TP[cw * chh], reconV = new TP[cw * chh];
         int dcDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 0], acDq = Av1Tables.DequantTable[BdIdx, baseQIdx, 1];
         int bd = Bd;
         var speed = t_speed;
@@ -1804,7 +1820,7 @@ internal static partial class Av1StillImageEncoder
             var prevWriter = Av1ObuWriter.ExchangeThreadState(writerState);
             var tcdf = new Av1CdfContext();
             Av1CdfDefaults.InitializeDefault(tcdf, qcat);
-            var c = new ColorPartCtx
+            var c = new ColorPartCtx<TP>
             {
                 Msac = new Av1MsacWriter { Log = tileLogs != null ? new() : null }, Cdf = tcdf, Luma = lumaArr, U = uArr, V = vArr,
                 ReconY = reconY, ReconU = reconU, ReconV = reconV,
@@ -1918,7 +1934,7 @@ internal static partial class Av1StillImageEncoder
             if (r > 0) WaitFor(st, r - 1, st.SyncAfter);
             var (rcdf, index) = Av1CdfIndex.RentPinned(st.RowInit[r]!);
             st.RowInit[r] = null;
-            var c = new ColorPartCtx
+            var c = new ColorPartCtx<TP>
             {
                 Msac = new Av1MsacWriter { Log = new(st.NCols * 1024), SymIndex = index, DiscardOutput = true }, Cdf = rcdf, Luma = lumaArr, U = uArr, V = vArr,
                 ReconY = reconY, ReconU = reconU, ReconV = reconV,
@@ -2056,7 +2072,8 @@ internal static partial class Av1StillImageEncoder
         }
         return 3;
     }
-    [ThreadStatic] private static (ushort[][] Planes, int W, int Cw)? t_lastRecon;
+    [ThreadStatic] private static (Array[] Planes, int W, int Cw)? t_lastRecon;
+    private static int SampleAt(Array a, int i) => a is byte[] b ? b[i] : ((ushort[])a)[i];
     // The CDF arrays (Av1CdfIndex order) of a fresh default tile context, to replay symbolic tile logs against.
     private static ushort[][] FreshCdfArrays(int baseQIdx)
     {
@@ -2086,7 +2103,7 @@ internal static partial class Av1StillImageEncoder
         return o.ToArray();
     }
 
-    private static void EncodePartitionColor(ColorPartCtx c, int bl, int bx4, int by4, int edgeIdx = 0)
+    private static void EncodePartitionColor<TP>(ColorPartCtx<TP> c, int bl, int bx4, int by4, int edgeIdx = 0) where TP : unmanaged
     {
         int hsz = 16 >> bl, blk4 = 32 >> bl;
         bool haveH = c.Bw4 > bx4 + hsz;
@@ -2190,8 +2207,8 @@ internal static partial class Av1StillImageEncoder
     // Encodes one specific partition choice (0=NONE,1=HORZ,2=VERT,3=SPLIT): the partition symbol, the leaf(s) or
     // recursive children, and the partition-context fill. SPLIT recurses into EncodePartitionColor (which itself
     // applies whatever decision mode is active).
-    private static void EncodeChoiceColor(ColorPartCtx c, int choice, int bl, int bx4, int by4, int hsz, int blk4,
-        Span<ushort> partCdf, int nPart, int bx8, int by8, int edgeIdx)
+    private static void EncodeChoiceColor<TP>(ColorPartCtx<TP> c, int choice, int bl, int bx4, int by4, int hsz, int blk4,
+        Span<ushort> partCdf, int nPart, int bx8, int by8, int edgeIdx) where TP : unmanaged
     {
         ref readonly var node = ref Av1IntraEdgeTree.Tree64[edgeIdx];
         if (choice == 3 && bl == 4) { EncodeSub8Quad(c, bx4, by4, partCdf, nPart, bx8, by8, node); return; }
@@ -2359,11 +2376,11 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Snapshot of all mutable encoder state a partition subtree touches, so trial encodes can be rolled back.
-    private sealed class RdSnapshot
+    private sealed class RdSnapshot<TP> where TP : unmanaged
     {
         public Av1MsacWriter.State Msac;
         public Av1CdfContext Cdf = new();
-        public ushort[] ReconY = null!, ReconU = null!, ReconV = null!;   // block regions
+        public TP[] ReconY = null!, ReconU = null!, ReconV = null!;   // block regions
         public byte[] AbovePart = null!, ALY = null!, ACU = null!, ACV = null!, AModeY = null!, ASkip = null!;
         public byte[] LeftPart = null!, LLY = null!, LCU = null!, LCV = null!, LModeY = null!, LSkip = null!;
         public sbyte[] ATxY = null!, LTxY = null!;
@@ -2374,11 +2391,11 @@ internal static partial class Av1StillImageEncoder
 
     // Snapshots reused per partition level (slot = level * 3 + k: the candidate loop's base and best, the leaf's
     // tx-depth trial), so the RD search does not allocate a CDF context and block copies at every node.
-    private static RdSnapshot Pooled(ColorPartCtx c, int slot) => c.SnapPool[slot] ??= new RdSnapshot();
+    private static RdSnapshot<TP> Pooled<TP>(ColorPartCtx<TP> c, int slot) where TP : unmanaged => c.SnapPool[slot] ??= new RdSnapshot<TP>();
 
-    private static ushort[] CopyRegion(ushort[]? into, ushort[] plane, int stride, int px, int py, int w, int h)
+    private static TP[] CopyRegion<TP>(TP[]? into, TP[] plane, int stride, int px, int py, int w, int h) where TP : unmanaged
     {
-        var r = into != null && into.Length == w * h ? into : new ushort[w * h];
+        var r = into != null && into.Length == w * h ? into : new TP[w * h];
         for (int y = 0; y < h; y++) Array.Copy(plane, (py + y) * stride + px, r, y * w, w);
         return r;
     }
@@ -2390,16 +2407,16 @@ internal static partial class Av1StillImageEncoder
         return r;
     }
 
-    private static void PasteRegion(ushort[] region, ushort[] plane, int stride, int px, int py, int w, int h)
+    private static void PasteRegion<TP>(TP[] region, TP[] plane, int stride, int px, int py, int w, int h) where TP : unmanaged
     {
         for (int y = 0; y < h; y++) Array.Copy(region, y * w, plane, (py + y) * stride + px, w);
     }
 
-    private static RdSnapshot SnapshotRd(ColorPartCtx c, int bx4, int by4, int blk4, RdSnapshot? into = null)
+    private static RdSnapshot<TP> SnapshotRd<TP>(ColorPartCtx<TP> c, int bx4, int by4, int blk4, RdSnapshot<TP>? into = null) where TP : unmanaged
     {
         int lpx = bx4 * 4, lpy = by4 * 4, ln = blk4 * 4;
         int cpx = (bx4 * 4) >> c.SsX, cpy = (by4 * 4) >> c.SsY, cnw = (blk4 * 4) >> c.SsX, cnh = (blk4 * 4) >> c.SsY;
-        var s = into ?? new RdSnapshot();
+        var s = into ?? new RdSnapshot<TP>();
         s.Msac = c.Msac.Save();
         s.Cdf.CopyIntraFrom(c.Cdf);
         s.ReconY = CopyRegion(s.ReconY, c.ReconY, c.W, lpx, lpy, ln, ln);
@@ -2420,7 +2437,7 @@ internal static partial class Av1StillImageEncoder
         return s;
     }
 
-    private static void RestoreRd(ColorPartCtx c, RdSnapshot s, int bx4, int by4, int blk4)
+    private static void RestoreRd<TP>(ColorPartCtx<TP> c, RdSnapshot<TP> s, int bx4, int by4, int blk4) where TP : unmanaged
     {
         int lpx = bx4 * 4, lpy = by4 * 4, ln = blk4 * 4;
         int cpx = (bx4 * 4) >> c.SsX, cpy = (by4 * 4) >> c.SsY, cnw = (blk4 * 4) >> c.SsX, cnh = (blk4 * 4) >> c.SsY;
@@ -2446,7 +2463,7 @@ internal static partial class Av1StillImageEncoder
     // SSE of the reconstructed block (luma + chroma) vs the source planes — the distortion term for true-RD.
     // rd_try_subblock's check after one coded sub-block of the running candidate: adds its region's SSE and aborts
     // the candidate once SSE + lambda * bits so far reaches the budget.
-    private static bool PartOver(ColorPartCtx c, int x4, int y4, int w4, int h4)
+    private static bool PartOver<TP>(ColorPartCtx<TP> c, int x4, int y4, int w4, int h4) where TP : unmanaged
     {
         if (c.PartAborted) return true;
         if (double.IsPositiveInfinity(c.PartBudget)) return false;
@@ -2457,7 +2474,7 @@ internal static partial class Av1StillImageEncoder
 
     // A SPLIT / HORZ / VERT sub-block is coded: record its J (region SSE + lambda * its bits) for the AB prune, then
     // the budget check. kind 0 SPLIT, 1 HORZ, 2 VERT; bits0 = the measured bits before it (updated).
-    private static bool SubDone(ColorPartCtx c, int bl, int kind, int k, int x4, int y4, int w4, int h4, ref double bits0)
+    private static bool SubDone<TP>(ColorPartCtx<TP> c, int bl, int kind, int k, int x4, int y4, int w4, int h4, ref double bits0) where TP : unmanaged
     {
         if (c.PartAborted) return true;
         long sse = RegionSseColor(c, x4, y4, w4, h4);
@@ -2476,10 +2493,10 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Remaining budget for the next sub-block's luma search (+inf when none applies).
-    private static double PartRemaining(ColorPartCtx c) => double.IsPositiveInfinity(c.PartBudget) ? double.MaxValue
+    private static double PartRemaining<TP>(ColorPartCtx<TP> c) where TP : unmanaged => double.IsPositiveInfinity(c.PartBudget) ? double.MaxValue
         : c.PartBudget - (c.PartSse + c.PartLambda * (c.Msac.MeasuredBits - c.PartBits0));
 
-    private static long RegionSseColor(ColorPartCtx c, int x4, int y4, int w4, int h4)
+    private static long RegionSseColor<TP>(ColorPartCtx<TP> c, int x4, int y4, int w4, int h4) where TP : unmanaged
     {
         int lpx = x4 * 4, lpy = y4 * 4;
         int lw = Math.Min(w4 * 4, c.Bw4 * 4 - lpx), lh = Math.Min(h4 * 4, c.Bh4 * 4 - lpy);
@@ -2492,18 +2509,18 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Per-pixel variance of the source luma block (libaom pb_source_variance, 8-bit scale).
-    private static double BlockSrcVar(ColorPartCtx c, int bx4, int by4, int blk4)
+    private static double BlockSrcVar<TP>(ColorPartCtx<TP> c, int bx4, int by4, int blk4) where TP : unmanaged
     {
         int x0 = bx4 * 4, y0 = by4 * 4, n = blk4 * 4;
         int w = Math.Min(n, c.Bw4 * 4 - x0), h = Math.Min(n, c.Bh4 * 4 - y0);
         long sum = 0, sq = 0;
         for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++) { int v = c.Luma[(y0 + y) * c.W + x0 + x]; sum += v; sq += (long)v * v; }
+            for (int x = 0; x < w; x++) { int v = Px.I(c.Luma[(y0 + y) * c.W + x0 + x]); sum += v; sq += (long)v * v; }
         double np = Math.Max(1, w * h);
         return (sq - sum * (double)sum / np) / np / (1 << (2 * (Bd - 8)));
     }
 
-    private static long BlockSseColor(ColorPartCtx c, int bx4, int by4, int blk4)
+    private static long BlockSseColor<TP>(ColorPartCtx<TP> c, int bx4, int by4, int blk4) where TP : unmanaged
     {
         // Only in-frame samples count: a partial block's forced-split children never reconstruct the part past the
         // frame edge, so including it would make every edge SPLIT look hopeless (and force a 64x64 NONE there).
@@ -2519,8 +2536,8 @@ internal static partial class Av1StillImageEncoder
         return sse;
     }
 
-    private static void EncodePartitionColorTrueRd(ColorPartCtx c, int bl, int bx4, int by4, int hsz, int blk4,
-        Span<ushort> partCdf, int nPart, int bx8, int by8, int edgeIdx, bool fullyInside)
+    private static void EncodePartitionColorTrueRd<TP>(ColorPartCtx<TP> c, int bl, int bx4, int by4, int hsz, int blk4,
+        Span<ushort> partCdf, int nPart, int bx8, int by8, int edgeIdx, bool fullyInside) where TP : unmanaged
     {
         if (StatsOn) System.Threading.Interlocked.Increment(ref StatPart[bl]);
         // Candidates: NONE and SPLIT always; HORZ/VERT at 32x32/16x16 when rect is enabled AND the block is fully
@@ -2672,7 +2689,7 @@ internal static partial class Av1StillImageEncoder
         // byte tail), and commit the lowest-J one by restoring that post-state — no re-encode, so a SPLIT winner's
         // subtree is not redone (that is where the exponential blow-up would otherwise come from).
         double bestJ = double.MaxValue;
-        RdSnapshot? bestSnap = null;
+        RdSnapshot<TP>? bestSnap = null;
         int[] bestTail = System.Array.Empty<int>();
         var logBuf = c.LogTailPool[bl] ??= new Av1MsacWriter.LogOp[256];
         int bestLogCount = 0;
@@ -2804,7 +2821,7 @@ internal static partial class Av1StillImageEncoder
         _ => (TxIdx16x8, TxIdx8x16, TxIdx8x4, TxIdx4x8, (int)Av1BlockSize.Bs16x8, (int)Av1BlockSize.Bs8x16),
     };
 
-    private static void FillPartCtx(ColorPartCtx c, int bl, int bx8, int by8, int hsz, Av1BlockPartition part)
+    private static void FillPartCtx<TP>(ColorPartCtx<TP> c, int bl, int bx8, int by8, int hsz, Av1BlockPartition part) where TP : unmanaged
     {
         byte aboveVal = Av1Tables.AboveLeftPartCtx[0, bl, (int)part];
         byte leftVal = Av1Tables.AboveLeftPartCtx[1, bl, (int)part];
@@ -2813,14 +2830,14 @@ internal static partial class Av1StillImageEncoder
     }
 
     // === Chroma-from-luma (CfL) — mirrors Av1Reconstruction.ComputeCflAc / ApplyCflAlpha exactly (I420). ===
-    private static void ComputeCflAcEnc(ushort[] reconY, int yStride, int bx, int by, int cn, short[] ac)
+    private static void ComputeCflAcEnc<TP>(TP[] reconY, int yStride, int bx, int by, int cn, short[] ac) where TP : unmanaged
     {
         int idx = 0;
         for (int y = 0; y < cn; y++)
         {
             int yOff = (by + 2 * y) * yStride + bx;
             for (int x = 0; x < cn; x++)
-            { int p = yOff + 2 * x; ac[idx + x] = (short)((reconY[p] + reconY[p + 1] + reconY[p + yStride] + reconY[p + 1 + yStride]) << 1); }
+            { int p = yOff + 2 * x; ac[idx + x] = (short)((Px.I(reconY[p]) + Px.I(reconY[p + 1]) + Px.I(reconY[p + yStride]) + Px.I(reconY[p + 1 + yStride])) << 1); }
             idx += cn;
         }
 
@@ -2831,19 +2848,19 @@ internal static partial class Av1StillImageEncoder
         for (int i = 0; i < cn * cn; i++) ac[i] = (short)(ac[i] - dc);
     }
 
-    private static ushort[] BuildCflPred(int dcPred, short[] ac, int cn, int alpha)
+    private static TP[] BuildCflPred<TP>(int dcPred, short[] ac, int cn, int alpha) where TP : unmanaged
     {
-        var pred = new ushort[cn * cn];
+        var pred = new TP[cn * cn];
         for (int i = 0; i < cn * cn; i++)
         {
             int diff = ac[i] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6;
-            pred[i] = (ushort)Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax);
+            pred[i] = Px.T<TP>(Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax));
         }
 
         return pred;
     }
 
-    private static int BestCflAlpha(ushort[] plane, int planeW, int cbx, int cby, int cn, int dcPred, short[] ac)
+    private static int BestCflAlpha<TP>(TP[] plane, int planeW, int cbx, int cby, int cn, int dcPred, short[] ac) where TP : unmanaged
     {
         int lo = -16, hi = 16;
         if (Sp.CflSearchRange > 0)
@@ -2853,7 +2870,7 @@ internal static partial class Av1StillImageEncoder
             for (int y = 0; y < cn; y++)
             {
                 int row = (cby + y) * planeW + cbx;
-                for (int x = 0; x < cn; x++) { int a = ac[y * cn + x]; num += (long)a * (plane[row + x] - dcPred); den += (long)a * a; }
+                for (int x = 0; x < cn; x++) { int a = ac[y * cn + x]; num += (long)a * (Px.I(plane[row + x]) - dcPred); den += (long)a * a; }
             }
             int est = den == 0 ? 0 : (int)Math.Clamp(Math.Round(64.0 * num / den), -16, 16);
             lo = Math.Max(-16, est - Sp.CflSearchRange); hi = Math.Min(16, est + Sp.CflSearchRange);
@@ -2863,12 +2880,12 @@ internal static partial class Av1StillImageEncoder
 
     // The alpha in [lo, hi] (first on ties) whose CfL prediction dc + round(ac * alpha / 64) (clamped) has the least
     // SSE against the plane block; cw x ch = 16 .. 4096 pixels, 8 lanes at a time.
-    private static int CflAlphaSearch(ushort[] plane, int planeW, int cbx, int cby, int cw, int ch, int dcPred, short[] ac, int lo, int hi)
+    private static int CflAlphaSearch<TP>(TP[] plane, int planeW, int cbx, int cby, int cw, int ch, int dcPred, short[] ac, int lo, int hi) where TP : unmanaged
     {
         int n = cw * ch;
         Span<int> src = stackalloc int[n], a = stackalloc int[n];
         for (int y = 0; y < ch; y++)
-            for (int x = 0; x < cw; x++) { src[y * cw + x] = plane[(cby + y) * planeW + cbx + x]; a[y * cw + x] = ac[y * cw + x]; }
+            for (int x = 0; x < cw; x++) { src[y * cw + x] = Px.I(plane[(cby + y) * planeW + cbx + x]); a[y * cw + x] = ac[y * cw + x]; }
         var dc = Vector256.Create(dcPred); var max = Vector256.Create(PixMax); var r32 = Vector256.Create(32);
         int bestAlpha = 0; long bestSse = long.MaxValue;
         for (int alpha = lo; alpha <= hi; alpha++)
@@ -2905,14 +2922,14 @@ internal static partial class Av1StillImageEncoder
     // Rect (cw x ch) versions of the CfL helpers — mirror the decoder's ComputeCflAc (I420: sum the 2x2 luma,
     // <<1, subtract DC with log2Sz = log2(cw)+log2(ch)). Used to add CfL chroma to the rect and sub-8x8 leaves,
     // which previously coded DC-only chroma (the profiled +722B chroma-coef gap vs libaom on piechart).
-    private static void ComputeCflAcEncRect(ushort[] reconY, int yStride, int bx, int by, int cw, int ch, short[] ac)
+    private static void ComputeCflAcEncRect<TP>(TP[] reconY, int yStride, int bx, int by, int cw, int ch, short[] ac) where TP : unmanaged
     {
         int idx = 0;
         for (int y = 0; y < ch; y++)
         {
             int yOff = (by + 2 * y) * yStride + bx;
             for (int x = 0; x < cw; x++)
-            { int p = yOff + 2 * x; ac[idx + x] = (short)((reconY[p] + reconY[p + 1] + reconY[p + yStride] + reconY[p + 1 + yStride]) << 1); }
+            { int p = yOff + 2 * x; ac[idx + x] = (short)((Px.I(reconY[p]) + Px.I(reconY[p + 1]) + Px.I(reconY[p + yStride]) + Px.I(reconY[p + 1 + yStride])) << 1); }
             idx += cw;
         }
         int log2Sz = System.Numerics.BitOperations.TrailingZeroCount(cw) + System.Numerics.BitOperations.TrailingZeroCount(ch);
@@ -2922,15 +2939,15 @@ internal static partial class Av1StillImageEncoder
         for (int i = 0; i < cw * ch; i++) ac[i] = (short)(ac[i] - dc);
     }
 
-    private static ushort[] BuildCflPredRect(int dcPred, short[] ac, int cw, int ch, int alpha)
+    private static TP[] BuildCflPredRect<TP>(int dcPred, short[] ac, int cw, int ch, int alpha) where TP : unmanaged
     {
-        var pred = new ushort[cw * ch];
+        var pred = new TP[cw * ch];
         for (int i = 0; i < cw * ch; i++)
-        { int diff = ac[i] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6; pred[i] = (ushort)Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax); }
+        { int diff = ac[i] * alpha, sign = diff >> 31, rounded = (Math.Abs(diff) + 32) >> 6; pred[i] = Px.T<TP>(Math.Clamp(dcPred + ((rounded ^ sign) - sign), 0, PixMax)); }
         return pred;
     }
 
-    private static int BestCflAlphaRect(ushort[] plane, int planeW, int cbx, int cby, int cw, int ch, int dcPred, short[] ac)
+    private static int BestCflAlphaRect<TP>(TP[] plane, int planeW, int cbx, int cby, int cw, int ch, int dcPred, short[] ac) where TP : unmanaged
     {
         int lo = -16, hi = 16;
         if (Sp.CflSearchRange > 0)
@@ -2939,7 +2956,7 @@ internal static partial class Av1StillImageEncoder
             for (int y = 0; y < ch; y++)
             {
                 int row = (cby + y) * planeW + cbx;
-                for (int x = 0; x < cw; x++) { int a = ac[y * cw + x]; num += (long)a * (plane[row + x] - dcPred); den += (long)a * a; }
+                for (int x = 0; x < cw; x++) { int a = ac[y * cw + x]; num += (long)a * (Px.I(plane[row + x]) - dcPred); den += (long)a * a; }
             }
             int est = den == 0 ? 0 : (int)Math.Clamp(Math.Round(64.0 * num / den), -16, 16);
             lo = Math.Max(-16, est - Sp.CflSearchRange); hi = Math.Min(16, est + Sp.CflSearchRange);
@@ -2985,29 +3002,29 @@ internal static partial class Av1StillImageEncoder
         if (signV != 0) w.EncodeSymbolAdapt(cdf.GetCflAlphaCdf((signV == 2 ? 3 : 0) + signU), Math.Abs(alphaV) - 1, 15);
     }
 
-    private static void CopyPlaneBlock(ushort[] src, int cn, ushort[] recon, int reconW, int cbx, int cby)
+    private static void CopyPlaneBlock<TP>(TP[] src, int cn, TP[] recon, int reconW, int cbx, int cby) where TP : unmanaged
     {
         for (int y = 0; y < cn; y++) Array.Copy(src, y * cn, recon, (cby + y) * reconW + cbx, cn);
     }
 
-    private static ushort[] FlatPlane(int value, int cn)
+    private static TP[] FlatPlane<TP>(int value, int cn) where TP : unmanaged
     {
-        var p = new ushort[cn * cn]; Array.Fill(p, (ushort)Math.Clamp(value, 0, PixMax)); return p;
+        var p = new TP[cn * cn]; Array.Fill(p, Px.T<TP>(Math.Clamp(value, 0, PixMax))); return p;
     }
 
     // Reconstruction SSE of a chroma block coded with `coeffs` on prediction `predPlane` (cn x cn), vs the source.
-    private static long ChromaReconSse(int[] coeffs, int tx, int cn, int dcDq, int acDq, ushort[] predPlane,
-        ushort[] src, int srcW, int cbx, int cby)
+    private static long ChromaReconSse<TP>(int[] coeffs, int tx, int cn, int dcDq, int acDq, TP[] predPlane,
+        TP[] src, int srcW, int cbx, int cby) where TP : unmanaged
     {
-        var tmp = new ushort[cn * cn];
+        var tmp = new TP[cn * cn];
         DequantAndReconstructPredRect(coeffs, tx, cn, cn, dcDq, acDq, predPlane, tmp, cn, 0, 0);
         long sse = 0;
         for (int y = 0; y < cn; y++)
-            for (int x = 0; x < cn; x++) { int d = tmp[y * cn + x] - src[(cby + y) * srcW + cbx + x]; sse += (long)d * d; }
+            for (int x = 0; x < cn; x++) { int d = Px.I(tmp[y * cn + x]) - Px.I(src[(cby + y) * srcW + cbx + x]); sse += (long)d * d; }
         return sse;
     }
 
-    private static void EncodeLeafBlockColor(ColorPartCtx c, int bl, int bx4, int by4, int blk4, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
+    private static void EncodeLeafBlockColor<TP>(ColorPartCtx<TP> c, int bl, int bx4, int by4, int blk4, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None) where TP : unmanaged
     {
         if (c.Layout != Av1PixelLayout.I420)
         {
@@ -3073,7 +3090,7 @@ internal static partial class Av1StillImageEncoder
 
         // Luma palette (screen content): the colour map as predictor, residual coded as for DC; kept when its RD beats
         // the regular choice (which then also pays has_palette_y = 0 when it is a DC block).
-        LumaPal? yPal = null;
+        LumaPal<TP>? yPal = null;
         bool palOk = c.ScreenContent && blk4 <= 16 && fullyInside;
         if (palOk)
         {
@@ -3222,7 +3239,7 @@ internal static partial class Av1StillImageEncoder
         int[] vC = ForwardResidual(c.V, c.Cw, cbx, cby, cn, dcV, c.DcDq, c.AcDq, scanLenC, qfV);
         double clam0 = LamK * c.AcDq * c.AcDq;
         var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, yModeSym);
-        var dcuP = FlatPlane(dcU, cn); var dcvP = FlatPlane(dcV, cn);
+        var dcuP = FlatPlane<TP>(dcU, cn); var dcvP = FlatPlane<TP>(dcV, cn);
 
         // Chroma rate for the UV decision: the CDF-based estimate with the contexts the coefficients are coded with
         // (ChromaRateExact), or the flat per-coefficient proxy.
@@ -3258,7 +3275,7 @@ internal static partial class Av1StillImageEncoder
 
         // Winner state across DC / directional-UV / CfL. predU/predV are the reconstruction prediction planes.
         int uvMode = 0, uvDelta = 0; bool useCfl = false;
-        ushort[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
+        TP[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
         double bestJ = ChromaReconSse(uC, ctx0, cn, c.DcDq, c.AcDq, dcuP, c.U, c.Cw, cbx, cby)
                      + ChromaReconSse(vC, ctx0, cn, c.DcDq, c.AcDq, dcvP, c.V, c.Cw, cbx, cby)
                      + clam0 * (CRate(uC, vC) + Av1CoeffEncode.SymBits(uvModeCdf, 0));
@@ -3277,7 +3294,7 @@ internal static partial class Av1StillImageEncoder
             int cbw4 = c.Bw4 >> 1, cbh4 = c.Bh4 >> 1, cbx4 = bx4 >> 1, cby4 = by4 >> 1;
             int bDimW = Av1Tables.BlockDimensions[bs, 2], bDimH = Av1Tables.BlockDimensions[bs, 3];
             bool uvAngleOk = bDimW + bDimH >= 2;
-            var pu = new ushort[cn * cn]; var pv = new ushort[cn * cn];
+            var pu = new TP[cn * cn]; var pv = new TP[cn * cn];
 
             // SAD prescreen on U (SATD's 8x8 tiling overflows the 4x4 chroma case), then full RD on the best few.
             Span<int> topIdx = stackalloc int[RdUvCandidates + 1];
@@ -3321,8 +3338,8 @@ internal static partial class Av1StillImageEncoder
                     bestJ = j; uvMode = (int)mode; uvDelta = delta; useCfl = false;
                     uC = uu; vC = vv; qfU = qfu2; qfV = qfv2;
                     // the candidate buffers become the winner's; the previous winner's (unless DC) take the next candidates
-                    (predU, pu) = (pu, predU != dcuP ? predU : new ushort[pu.Length]);
-                    (predV, pv) = (pv, predV != dcvP ? predV : new ushort[pv.Length]);
+                    (predU, pu) = (pu, predU != dcuP ? predU : new TP[pu.Length]);
+                    (predV, pv) = (pv, predV != dcvP ? predV : new TP[pv.Length]);
                 }
             }
         }
@@ -3339,7 +3356,7 @@ internal static partial class Av1StillImageEncoder
             {
                 // cfl_rd_pick_alpha: each plane priced (trellised) at the alphas around its estimate; best pair, not both 0
                 int R = Math.Max(0, Sp.AomCflRange);
-                double PJ(ushort[] src, ushort[] pr, int skc, int sgc, out int[] lv, out double[] q)
+                double PJ(TP[] src, TP[] pr, int skc, int sgc, out int[] lv, out double[] q)
                 {
                     q = new double[scanLenC];
                     lv = ForwardResidualPredRect(src, c.Cw, cbx, cby, pr, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, q);
@@ -3349,12 +3366,12 @@ internal static partial class Av1StillImageEncoder
                 }
                 var ju = new double[33]; var jv = new double[33];
                 var lu = new int[33][]; var lvv = new int[33][]; var qu = new double[33][]; var qv = new double[33][];
-                var pu2 = new ushort[33][]; var pv2 = new ushort[33][];
+                var pu2 = new TP[33][]; var pv2 = new TP[33][];
                 for (int k = 0; k < 33; k++) { ju[k] = jv[k] = double.MaxValue; }
                 for (int a = Math.Max(-16, aU - R); a <= Math.Min(16, aU + R); a++)
-                { pu2[a + 16] = BuildCflPred(dcU, ac, cn, a); ju[a + 16] = PJ(c.U, pu2[a + 16], eUSkip, eUSign, out lu[a + 16], out qu[a + 16]); }
+                { pu2[a + 16] = BuildCflPred<TP>(dcU, ac, cn, a); ju[a + 16] = PJ(c.U, pu2[a + 16], eUSkip, eUSign, out lu[a + 16], out qu[a + 16]); }
                 for (int a = Math.Max(-16, aV - R); a <= Math.Min(16, aV + R); a++)
-                { pv2[a + 16] = BuildCflPred(dcV, ac, cn, a); jv[a + 16] = PJ(c.V, pv2[a + 16], eVSkip, eVSign, out lvv[a + 16], out qv[a + 16]); }
+                { pv2[a + 16] = BuildCflPred<TP>(dcV, ac, cn, a); jv[a + 16] = PJ(c.V, pv2[a + 16], eVSkip, eVSign, out lvv[a + 16], out qv[a + 16]); }
                 double cflBest = double.MaxValue; int bu = 16, bv = 16;
                 double cflMode = Av1CoeffEncode.SymBits(uvModeCdf, (int)Av1IntraPredMode.ChromaFromLuma);
                 for (int x1 = 0; x1 < 33; x1++)
@@ -3376,8 +3393,8 @@ internal static partial class Av1StillImageEncoder
             }
             else if (aU != 0 || aV != 0)
             {
-                var pcflU = BuildCflPred(dcU, ac, cn, aU);
-                var pcflV = BuildCflPred(dcV, ac, cn, aV);
+                var pcflU = BuildCflPred<TP>(dcU, ac, cn, aU);
+                var pcflV = BuildCflPred<TP>(dcV, ac, cn, aV);
                 var qfUcfl = new double[scanLenC]; var qfVcfl = new double[scanLenC];
                 int[] uCcfl = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, pcflU, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qfUcfl);
                 int[] vCcfl = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, pcflV, cn, cn, ctx0, c.DcDq, c.AcDq, scanLenC, qfVcfl);
@@ -3395,7 +3412,7 @@ internal static partial class Av1StillImageEncoder
         }
 
         // Chroma palette (screen content; uv_mode DC): one map over (u, v) pairs, coded residual on top.
-        UvPal? uvPal = null;
+        UvPal<TP>? uvPal = null;
         if (palOk)
         {
             foreach (var cp in UvPaletteCandidates(c, cbx, cby, cn, cn))
@@ -3542,8 +3559,8 @@ internal static partial class Av1StillImageEncoder
     // Emits a fully-inside DC luma block as a palette block, in the decoder's exact order: skip=1, y_mode=DC,
     // uv_mode=DC, has_palette_y=1 + size + colours, has_palette_uv=0, palette indices, tx_size(depth 0), no
     // coeffs. Then reconstructs luma from the palette (chroma = DC pred) and updates neighbour state.
-    private static void EmitPaletteBlock(ColorPartCtx c, int bx4, int by4, int blk4, int bs, int tx, int n,
-        ushort[] palColors, int palSz, byte[] palIdx, int szCtx, int palCtx, in Av1TxfmInfo maxTDim, bool cflAllowed, int uvNsym)
+    private static void EmitPaletteBlock<TP>(ColorPartCtx<TP> c, int bx4, int by4, int blk4, int bs, int tx, int n,
+        ushort[] palColors, int palSz, byte[] palIdx, int szCtx, int palCtx, in Av1TxfmInfo maxTDim, bool cflAllowed, int uvNsym) where TP : unmanaged
     {
         int bxR = bx4 & 31, byR = by4 & 31, cxR = bxR >> 1, cyR = byR >> 1;
         int bx = bx4 * 4, by = by4 * 4, cbx = bx4 * 2, cby = by4 * 2;
@@ -3577,7 +3594,7 @@ internal static partial class Av1StillImageEncoder
         // Reconstruct luma from palette; chroma from DC prediction (skip ⇒ no residual on either).
         for (int yy = 0; yy < n; yy++)
             for (int xx = 0; xx < n; xx++)
-                c.ReconY[(by + yy) * c.W + bx + xx] = (ushort)palColors[palIdx[yy * stride + xx]];
+                c.ReconY[(by + yy) * c.W + bx + xx] = Px.T<TP>(palColors[palIdx[yy * stride + xx]]);
         if (!c.Mono)
         {
             int dcU = ChromaDc(c, c.ReconU, cbx, cby, cn, cn);
@@ -3640,9 +3657,9 @@ internal static partial class Av1StillImageEncoder
     // coefficient-bit estimate. Used both to TRIAL each depth (under SnapshotRd/RestoreRd) and to commit the winner,
     // so the tx_depth decision is true-RD: it compares the real reconstruction + real coded cost of each depth.
     private static (byte CfY, List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? LumaTxb, double CoefBits)
-        ReconstructLumaAtDepth(ColorPartCtx c, int bx4, int by4, int blk4, int n, int tx, int lumaTx, int depth,
+        ReconstructLumaAtDepth<TP>(ColorPartCtx<TP> c, int bx4, int by4, int blk4, int n, int tx, int lumaTx, int depth,
             Av1IntraPredMode yMode, int yDelta, int yModeNoFilt, int[] yC, Av1TxType yInv, int yTxIdx,
-            Av1EdgeFlags edgeFlags, int bs)
+            Av1EdgeFlags edgeFlags, int bs) where TP : unmanaged
     {
         int bxR = bx4 & 31, byR = by4 & 31, bx = bx4 * 4, by = by4 * 4;
         ref readonly var lTDim = ref Av1Tables.TxfmDimensions[lumaTx];
@@ -3658,7 +3675,7 @@ internal static partial class Av1StillImageEncoder
         var lumaTxb = new List<(int[], Av1TxType, int, int, int, int, int)>();
         double coefBits = 0;
         int txN = lTDim.W * 4, txW4 = lTDim.W;
-        var predBuf = new ushort[txN * txN];
+        var predBuf = new TP[txN * txN];
         int sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0 ? 1 : 0;
         int sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0 ? 1 : 0;
         for (int iy = 0; iy < blk4; iy += txW4)
@@ -3696,8 +3713,8 @@ internal static partial class Av1StillImageEncoder
     // by RD over the intra set for that size, RDOQ'd. Writes ReconY and the per-tx ALY/LLY coefficient contexts.
     // Returns J = SSE + lambda * coefficient bits (tx_size symbol excluded) and the per-tx records.
     private static (double J, List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)> Txb)
-        RectLumaSplitTrial(ColorPartCtx c, int lumaBs, int lumaTx, int bx4, int by4, int w4, int h4,
-            Av1IntraPredMode yMode, int yDelta, int yModeNoFilt, Av1EdgeFlags edgeFlags, int intraFlags)
+        RectLumaSplitTrial<TP>(ColorPartCtx<TP> c, int lumaBs, int lumaTx, int bx4, int by4, int w4, int h4,
+            Av1IntraPredMode yMode, int yDelta, int yModeNoFilt, Av1EdgeFlags edgeFlags, int intraFlags) where TP : unmanaged
     {
         int stx = Av1Tables.TxfmDimensions[lumaTx].Sub;
         ref readonly var sTD = ref Av1Tables.TxfmDimensions[stx];
@@ -3706,7 +3723,7 @@ internal static partial class Av1StillImageEncoder
         bool full = UseFullIntraTxSet && sTD.Min < (byte)Av1TxSize.Tx16x16;
         var txSet = (full && symbolCoded) ? IntraTxTypesFull : (symbolCoded ? IntraTxTypes : DctOnly);
         double lambda = LamK * c.AcDq * c.AcDq;
-        var scr = t_scSplit ??= new LeafScratch();
+        var scr = PxScratch<TP>.Split ??= new LeafScratch<TP>();
         var pred = scr.P1; var res = scr.R; var qf = scr.Q1; var qfBest = scr.Q2;
         bool sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0, sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0;
         var list = new List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>();
@@ -3719,8 +3736,7 @@ internal static partial class Av1StillImageEncoder
                 var localEdge = (((iy > 0 || !sbHasTr) && ix + tw4 >= w4) ? 0 : Av1EdgeFlags.I444TopHasRight) |
                                 ((ix > 0 || (!sbHasBl && iy + th4 >= h4)) ? 0 : Av1EdgeFlags.I444LeftHasBottom);
                 PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, tx4, ty4, tw, th, yMode, yDelta, pred, localEdge, intraFlags);
-                for (int yy = 0; yy < th; yy++)
-                    for (int xx = 0; xx < tw; xx++) res[yy * tw + xx] = c.Luma[(py + yy) * c.W + px + xx] - pred[yy * tw + xx];
+                Px.Residual<TP>(c.Luma, py * c.W + px, c.W, pred, 0, tw, res, tw, th);
                 int skc = Av1CoeffDecode.GetSkipCtx(in sTD, lumaBs, c.ALY.AsSpan(txR), c.LLY.AsSpan(tyR), 0, 0);
                 int snc = Av1CoeffDecode.GetDcSignCtx(stx, c.ALY.AsSpan(txR), c.LLY.AsSpan(tyR));
                 int[] bestCf = null!; Av1TxType bestInv = Av1TxType.DctDct; int bestIdx = 1; double bestJ = double.MaxValue, bestBits = 0;
@@ -3745,7 +3761,7 @@ internal static partial class Av1StillImageEncoder
                 }
                 byte cfc = DequantAndReconstructPredRect(bestCf, stx, tw, th, c.DcDq, c.AcDq, pred, c.ReconY, c.W, px, py, bestInv);
                 for (int yy = 0; yy < th; yy++)
-                    for (int xx = 0; xx < tw; xx++) { int d = c.ReconY[(py + yy) * c.W + px + xx] - c.Luma[(py + yy) * c.W + px + xx]; sseSum += (long)d * d; }
+                    for (int xx = 0; xx < tw; xx++) { int d = Px.I(c.ReconY[(py + yy) * c.W + px + xx]) - Px.I(c.Luma[(py + yy) * c.W + px + xx]); sseSum += (long)d * d; }
                 bitsSum += bestBits;
                 list.Add((bestCf, bestInv, bestIdx, skc, snc, px, py));
                 for (int i = 0; i < tw4 && txR + i < 32; i++) c.ALY[txR + i] = cfc;
@@ -3755,8 +3771,8 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Emits the luma coefficients of a split-depth leaf (RectLumaSplitTrial records) in tx-block order.
-    private static void EmitSplitLuma(ColorPartCtx c, int stx, int yModeNoFilt,
-        List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)> txb)
+    private static void EmitSplitLuma<TP>(ColorPartCtx<TP> c, int stx, int yModeNoFilt,
+        List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)> txb) where TP : unmanaged
     {
         foreach (var t in txb)
         {
@@ -3769,7 +3785,7 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Luma block SSE (reconstruction vs source) over an n x n region at pixel (bx,by).
-    private static long LumaBlockSse(ColorPartCtx c, int bx, int by, int n)
+    private static long LumaBlockSse<TP>(ColorPartCtx<TP> c, int bx, int by, int n) where TP : unmanaged
     {
         int nw = Math.Min(n, c.Bw4 * 4 - bx), nh = Math.Min(n, c.Bh4 * 4 - by);   // in-frame samples only
         return SseU16(c.ReconY, by * c.W + bx, c.W, c.Luma, by * c.W + bx, c.W, nw, nh);
@@ -3778,12 +3794,12 @@ internal static partial class Av1StillImageEncoder
     // Estimates the luma coding cost J = SSE + λ·bits of a single rectangular leaf, predicting from the SOURCE
     // plane and reconstructing through the decoder's inverse — the same methodology as EstimateBlockCost, so the
     // PARTITION_HORZ / PARTITION_VERT costs compare fairly against NONE / SPLIT.
-    private static long EstimateRectCostColor(ColorPartCtx c, int lumaTx, int bx4, int by4, int w4, int h4)
+    private static long EstimateRectCostColor<TP>(ColorPartCtx<TP> c, int lumaTx, int bx4, int by4, int w4, int h4) where TP : unmanaged
     {
         int w = w4 * 4, h = h4 * 4;
         int lScan = Av1Tables.Scans[lumaTx].Length;
-        var pred = new ushort[h * w];
-        var bestPred = new ushort[h * w];
+        var pred = new TP[h * w];
+        var bestPred = new TP[h * w];
         int[] bestCf = null!;
         long bestBits = long.MaxValue;
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
@@ -3794,13 +3810,13 @@ internal static partial class Av1StillImageEncoder
             if (bits < bestBits) { bestBits = bits; bestCf = cf; Array.Copy(pred, bestPred, h * w); }
         }
 
-        var reconTmp = new ushort[h * w];
+        var reconTmp = new TP[h * w];
         DequantAndReconstructPredRect(bestCf, lumaTx, w, h, c.DcDq, c.AcDq, bestPred, reconTmp, w, 0, 0);
         long sse = 0;
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
             {
-                int d = reconTmp[y * w + x] - c.Luma[(by4 * 4 + y) * c.W + (bx4 * 4 + x)];
+                int d = Px.I(reconTmp[y * w + x]) - Px.I(c.Luma[(by4 * 4 + y) * c.W + (bx4 * 4 + x)]);
                 sse += (long)d * d;
             }
 
@@ -3837,23 +3853,22 @@ internal static partial class Av1StillImageEncoder
 
     // Chroma DC prediction exactly as the decoder forms it: the intra edges clipped to the plane's 4-unit extent (tile
     // end >> ss) and padded by replication — the encoder's reconstruction past the frame edge never feeds it.
-    [ThreadStatic] private static ushort[]? t_dcScratch;
-    private static int ChromaDc(ColorPartCtx c, ushort[] plane, int cbx, int cby, int w, int h)
+    private static int ChromaDc<TP>(ColorPartCtx<TP> c, TP[] plane, int cbx, int cby, int w, int h) where TP : unmanaged
     {
-        var buf = t_dcScratch ??= new ushort[64 * 64];
+        var buf = PxScratch<TP>.DcScratch ??= new TP[64 * 64];
         PredictIntraRect(plane, c.Cw, c.Bw4 >> c.SsX, c.Bh4 >> c.SsY, cbx >> 2, cby >> 2, w, h, Av1IntraPredMode.Dc, 0, buf);
-        return buf[0];
+        return Px.I(buf[0]);
     }
 
-    private static int DcPredictRect(ushort[] recon, int reconW, int bx, int by, int w, int h)
+    private static int DcPredictRect<TP>(TP[] recon, int reconW, int bx, int by, int w, int h) where TP : unmanaged
     {
         var tb = TileBounds4(reconW, int.MaxValue, int.MaxValue);
         bool haveTop = by > tb.Y0 * 4, haveLeft = bx > tb.X0 * 4;
         if (haveTop && haveLeft)
         {
             int dc = (w + h) >> 1;
-            for (int x = 0; x < w; x++) dc += recon[(by - 1) * reconW + bx + x];
-            for (int y = 0; y < h; y++) dc += recon[(by + y) * reconW + bx - 1];
+            for (int x = 0; x < w; x++) dc += Px.I(recon[(by - 1) * reconW + bx + x]);
+            for (int y = 0; y < h; y++) dc += Px.I(recon[(by + y) * reconW + bx - 1]);
             dc >>= System.Numerics.BitOperations.TrailingZeroCount((uint)(w + h));
             if (w != h)
             {
@@ -3867,66 +3882,66 @@ internal static partial class Av1StillImageEncoder
         if (haveTop)
         {
             int dc = w >> 1;
-            for (int x = 0; x < w; x++) dc += recon[(by - 1) * reconW + bx + x];
+            for (int x = 0; x < w; x++) dc += Px.I(recon[(by - 1) * reconW + bx + x]);
             return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)w);
         }
 
         if (haveLeft)
         {
             int dc = h >> 1;
-            for (int y = 0; y < h; y++) dc += recon[(by + y) * reconW + bx - 1];
+            for (int y = 0; y < h; y++) dc += Px.I(recon[(by + y) * reconW + bx - 1]);
             return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)h);
         }
 
         return PixMid;
     }
 
-    private static void FillFlatRect(ushort[] recon, int reconW, int bx, int by, int w, int h, int value)
+    private static void FillFlatRect<TP>(TP[] recon, int reconW, int bx, int by, int w, int h, int value) where TP : unmanaged
     {
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
-                recon[(by + y) * reconW + (bx + x)] = (ushort)value;
+                recon[(by + y) * reconW + (bx + x)] = Px.T<TP>(value);
     }
 
     // Estimated chroma coding cost (both planes, DC-predicted from the block mean) of an I420 chroma block of
     // cw x ch pixels at chroma pixel position (cbx,cby), coded with transform chromaTx. Used to make the 16x16
     // partition decision chroma-aware (a HORZ/VERT split codes two chroma blocks vs NONE's one).
-    private static long ChromaCostDc(ColorPartCtx c, int cbx, int cby, int cw, int ch, int chromaTx)
+    private static long ChromaCostDc<TP>(ColorPartCtx<TP> c, int cbx, int cby, int cw, int ch, int chromaTx) where TP : unmanaged
     {
         int scan = Av1Tables.Scans[chromaTx].Length;
         long sU = 0, sV = 0;
         for (int y = 0; y < ch; y++)
-            for (int x = 0; x < cw; x++) { sU += c.U[(cby + y) * c.Cw + cbx + x]; sV += c.V[(cby + y) * c.Cw + cbx + x]; }
+            for (int x = 0; x < cw; x++) { sU += Px.I(c.U[(cby + y) * c.Cw + cbx + x]); sV += Px.I(c.V[(cby + y) * c.Cw + cbx + x]); }
         int n = cw * ch, dcU = (int)((sU + n / 2) / n), dcV = (int)((sV + n / 2) / n);
         return CoeffCost(ForwardResidualRectDc(c.U, c.Cw, cbx, cby, cw, ch, dcU, chromaTx, c.DcDq, c.AcDq, scan))
              + CoeffCost(ForwardResidualRectDc(c.V, c.Cw, cbx, cby, cw, ch, dcV, chromaTx, c.DcDq, c.AcDq, scan));
     }
 
-    private static int[] ForwardResidualRectDc(ReadOnlySpan<ushort> plane, int planeW, int bx, int by, int w, int h,
-        int dc, int txIdx, int dcDq, int acDq, int rcCount)
+    private static int[] ForwardResidualRectDc<TP>(ReadOnlySpan<TP> plane, int planeW, int bx, int by, int w, int h,
+        int dc, int txIdx, int dcDq, int acDq, int rcCount) where TP : unmanaged
     {
         var residual = Av1FwdTransform.RentLevels(h * w);   // fully written below
         for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++) residual[y * w + x] = plane[(by + y) * planeW + (bx + x)] - dc;
+            for (int x = 0; x < w; x++) residual[y * w + x] = Px.I(plane[(by + y) * planeW + (bx + x)]) - dc;
         var lv = Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, Av1FwdTransform.FwdTxType.DctDct);
         Av1FwdTransform.ReturnLevels(residual);
         return lv;
     }
 
     // Reconstructs a rect w x h block on top of a flat DC prediction, via the decoder's InvTxfmAdd.
-    private static byte DequantAndReconstructRectDc(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
-        int dc, ushort[] recon, int reconW, int bx, int by)
+    private static byte DequantAndReconstructRectDc<TP>(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
+        int dc, TP[] recon, int reconW, int bx, int by) where TP : unmanaged
     {
-        var pred = new ushort[h * w];
-        Array.Fill(pred, (ushort)Math.Clamp(dc, 0, PixMax));
+        var pred = new TP[h * w];
+        Array.Fill(pred, Px.T<TP>(Math.Clamp(dc, 0, PixMax)));
         return DequantAndReconstructPredRect(levels, txIdx, w, h, dcDq, acDq, pred, recon, reconW, bx, by);
     }
 
     // Codes one rectangular luma leaf (PARTITION_HORZ/VERT half) plus its I420 chroma: skip, Y mode (+angle),
     // UV mode (DC), then Y/U/V coefficients (rect transforms), and reconstructs all three planes. Chroma is DC-
     // predicted (no CfL for rect yet). Mirrors EncodeLeafBlockColor for a w4 x h4 (in 4-units) rectangle.
-    private static void EncodeRectLeafColor(ColorPartCtx c, int lumaBs, int lumaTx, int chromaTx,
-        int bx4, int by4, int w4, int h4, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int chromaRef = 0)
+    private static void EncodeRectLeafColor<TP>(ColorPartCtx<TP> c, int lumaBs, int lumaTx, int chromaTx,
+        int bx4, int by4, int w4, int h4, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int chromaRef = 0) where TP : unmanaged
     {
         // Layout-generic chroma geometry: (w >> SsX) x (h >> SsY); for 4:2:0 these are exactly the old w/2, h/2.
         // chromaRef (4:2:0 16x4 / 4x16 strips, one 4-unit thin): -1 = no chroma (coded like a mono leaf), +1 = the
@@ -3956,7 +3971,7 @@ internal static partial class Av1StillImageEncoder
         var ymCdf = c.Cdf.GetKfYModeCdf(aboveCtx, leftCtx);
         int ySign = Av1CoeffDecode.GetDcSignCtx(lumaTx, c.ALY.AsSpan(bxR), c.LLY.AsSpan(byR));
         // per-thread scratch (the leaf is not re-entrant; only the first h * w / lScan entries are used)
-        var scr = t_scRect ??= new LeafScratch();
+        var scr = PxScratch<TP>.Rect ??= new LeafScratch<TP>();
         var pred = scr.P1; var bestPred = scr.P2; var resBuf = scr.R;
         var qfCand = scr.Q1; var qfWin = scr.Q2;
         int[] yC = null!;
@@ -4012,7 +4027,7 @@ internal static partial class Av1StillImageEncoder
                 long satd = 0;
                 if (w >= 8 && h >= 8) satd = Satd8x8Rect(c.Luma, c.W, bx, by, pred, w, h);
                 else   // sub-8x8 (4:4:4 sub-block leaves): SAD
-                    for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) satd += Math.Abs(c.Luma[(by + yy) * c.W + bx + xx] - pred[yy * w + xx]);
+                    for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) satd += Math.Abs(Px.I(c.Luma[(by + yy) * c.W + bx + xx]) - Px.I(pred[yy * w + xx]));
                 long mb = (long)(satdLambda * (Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                     + (IsDirectional(mode) ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)));
                 long cost = satd + mb;
@@ -4030,8 +4045,7 @@ internal static partial class Av1StillImageEncoder
             (Av1IntraPredMode mode, int delta) = CandidateModes[topIdx[t]];
             if (pass == 1 && (mode != yMode || delta != yDelta || yC == null)) continue;
             PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, delta, pred, edgeFlags, intraFlags);
-            for (int yy = 0; yy < h; yy++)
-                for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
+            Px.Residual<TP>(c.Luma, by * c.W + bx, c.W, pred, 0, w, resBuf, w, h);
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode)
                 + (IsDirectional(mode) && angleOk ? Av1CoeffEncode.SymBits(c.Cdf.GetAngleDeltaCdf((int)mode - (int)Av1IntraPredMode.Vertical), delta + 3) : 0)
                 + (fiOk && mode == Av1IntraPredMode.Dc ? Av1CoeffEncode.SymBits(fiCdf, 0) : 0);
@@ -4069,8 +4083,7 @@ internal static partial class Av1StillImageEncoder
             {
                 if ((fiMask >> fm & 1) == 0) continue;
                 PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, Av1IntraPredMode.Filter, fm, pred, edgeFlags, intraFlags);
-                for (int yy = 0; yy < h; yy++)
-                    for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
+                Px.Residual<TP>(c.Luma, by * c.W + bx, c.W, pred, 0, w, resBuf, w, h);
                 int ymnf = Av1Tables.FilterModeToYMode[fm];
                 double modeBits = flagBits + Av1CoeffEncode.SymBits(c.Cdf.GetFilterIntraModeCdf(), fm);
                 foreach (var (fwd, inv, idx) in txSet)
@@ -4097,7 +4110,7 @@ internal static partial class Av1StillImageEncoder
         }
 
         // Luma palette (screen content), as in the square leaf.
-        LumaPal? yPal = null;
+        LumaPal<TP>? yPal = null;
         bool palOk = c.ScreenContent && chromaRef == 0 && Math.Max(w4, h4) <= 16 && w4 + h4 >= 4 && bx4 + w4 <= c.Bw4 && by4 + h4 <= c.Bh4;
         if (palOk)
         {
@@ -4264,8 +4277,8 @@ internal static partial class Av1StillImageEncoder
         int[] vC = ForwardResidualRectDc(c.V, c.Cw, cbx, cby, cw, ch, dcV, chromaTx, c.DcDq, c.AcDq, cScan);
         double clam0 = LamK * c.AcDq * c.AcDq;
         var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, yModeSym);
-        var dcuP = new ushort[cw * ch]; Array.Fill(dcuP, (ushort)Math.Clamp(dcU, 0, PixMax));
-        var dcvP = new ushort[cw * ch]; Array.Fill(dcvP, (ushort)Math.Clamp(dcV, 0, PixMax));
+        var dcuP = new TP[cw * ch]; Array.Fill(dcuP, Px.T<TP>(Math.Clamp(dcU, 0, PixMax)));
+        var dcvP = new TP[cw * ch]; Array.Fill(dcvP, Px.T<TP>(Math.Clamp(dcV, 0, PixMax)));
 
         int eUSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)c.Layout);
         int eVSkip = Av1CoeffDecode.GetSkipCtx(in cTDim, lumaBs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)c.Layout);
@@ -4281,7 +4294,7 @@ internal static partial class Av1StillImageEncoder
         // lambda) with their exact rate and the reconstruction SSE, per plane.
         bool aomC = Sp.AomChroma && UseRdoq;
         double clamT = ChromaLamScale * LamK * c.AcDq * c.AcDq;
-        double PlaneJ(ushort[] src, ushort[] pred, Av1TxType t, int skc, int sgc, out int[] lv)
+        double PlaneJ(TP[] src, TP[] pred, Av1TxType t, int skc, int sgc, out int[] lv)
         {
             var qf = t_planeJQf ??= new double[1024];
             lv = ForwardResidualPredRect(src, c.Cw, cbx, cby, pred, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, qf, FwdTypeForTxType(t));
@@ -4290,7 +4303,7 @@ internal static partial class Av1StillImageEncoder
         }
 
         int uvMode = 0, uvDelta = 0; bool useCfl = false;
-        ushort[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
+        TP[] predU = dcuP, predV = dcvP; int alphaU = 0, alphaV = 0;
         double bestJ;
         if (aomC)
         {
@@ -4315,7 +4328,7 @@ internal static partial class Av1StillImageEncoder
             int cbw4 = c.Bw4 >> ssX, cbh4 = c.Bh4 >> ssY, cbx4 = bx4 >> ssX, cby4 = by4 >> ssY;
             int bDimW = Av1Tables.BlockDimensions[lumaBs, 2], bDimH = Av1Tables.BlockDimensions[lumaBs, 3];
             bool uvAngleOk = bDimW + bDimH >= 2;
-            var pu = new ushort[cw * ch]; var pv = new ushort[cw * ch];
+            var pu = new TP[cw * ch]; var pv = new TP[cw * ch];
             Span<int> uvTopIdx = stackalloc int[RdUvCandidates + 1];
             Span<long> uvTopCost = stackalloc long[RdUvCandidates + 1];
             uvTopCost.Fill(long.MaxValue);
@@ -4358,8 +4371,8 @@ internal static partial class Av1StillImageEncoder
                     bestJ = j; uvMode = (int)mode; uvDelta = delta; useCfl = false;
                     Av1FwdTransform.ReturnLevels(uC); Av1FwdTransform.ReturnLevels(vC);
                     uC = uu; vC = vv;
-                    (predU, pu) = (pu, predU != dcuP ? predU : new ushort[pu.Length]);
-                    (predV, pv) = (pv, predV != dcvP ? predV : new ushort[pv.Length]);
+                    (predU, pu) = (pu, predU != dcuP ? predU : new TP[pu.Length]);
+                    (predV, pv) = (pv, predV != dcvP ? predV : new TP[pv.Length]);
                 }
                 else { Av1FwdTransform.ReturnLevels(uu); Av1FwdTransform.ReturnLevels(vv); }
             }
@@ -4380,12 +4393,12 @@ internal static partial class Av1StillImageEncoder
                 int R = Math.Max(0, Sp.AomCflRange);
                 double[] ju = new double[33], jv = new double[33];
                 int[][] lu = new int[33][], lvv = new int[33][];
-                ushort[][] pu2 = new ushort[33][], pv2 = new ushort[33][];
+                TP[][] pu2 = new TP[33][], pv2 = new TP[33][];
                 for (int k = 0; k < 33; k++) { ju[k] = jv[k] = double.MaxValue; }
                 for (int a = Math.Max(-16, aU - R); a <= Math.Min(16, aU + R); a++)
-                { pu2[a + 16] = BuildCflPredRect(dcU, acc, cw, ch, a); ju[a + 16] = PlaneJ(c.U, pu2[a + 16], Av1TxType.DctDct, eUSkip, eUSign, out lu[a + 16]); }
+                { pu2[a + 16] = BuildCflPredRect<TP>(dcU, acc, cw, ch, a); ju[a + 16] = PlaneJ(c.U, pu2[a + 16], Av1TxType.DctDct, eUSkip, eUSign, out lu[a + 16]); }
                 for (int a = Math.Max(-16, aV - R); a <= Math.Min(16, aV + R); a++)
-                { pv2[a + 16] = BuildCflPredRect(dcV, acc, cw, ch, a); jv[a + 16] = PlaneJ(c.V, pv2[a + 16], Av1TxType.DctDct, eVSkip, eVSign, out lvv[a + 16]); }
+                { pv2[a + 16] = BuildCflPredRect<TP>(dcV, acc, cw, ch, a); jv[a + 16] = PlaneJ(c.V, pv2[a + 16], Av1TxType.DctDct, eVSkip, eVSign, out lvv[a + 16]); }
                 double cflBest = double.MaxValue; int bu = 0, bv = 0;
                 double cflMode = Av1CoeffEncode.SymBits(uvModeCdf, (int)Av1IntraPredMode.ChromaFromLuma);
                 for (int x1 = 0; x1 < 33; x1++)
@@ -4413,8 +4426,8 @@ internal static partial class Av1StillImageEncoder
             }
             else if (aU != 0 || aV != 0)
             {
-                var pcflU = BuildCflPredRect(dcU, acc, cw, ch, aU);
-                var pcflV = BuildCflPredRect(dcV, acc, cw, ch, aV);
+                var pcflU = BuildCflPredRect<TP>(dcU, acc, cw, ch, aU);
+                var pcflV = BuildCflPredRect<TP>(dcV, acc, cw, ch, aV);
                 int[] uCc = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, pcflU, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
                 int[] vCc = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, pcflV, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan);
                 double cflJ = ReconSseCandRect(uCc, chromaTx, cw, ch, c.DcDq, c.AcDq, pcflU, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
@@ -4429,7 +4442,7 @@ internal static partial class Av1StillImageEncoder
         }
 
         // Chroma palette (screen content; uv_mode DC).
-        UvPal? uvPal = null;
+        UvPal<TP>? uvPal = null;
         if (palOk)
             foreach (var cp in UvPaletteCandidates(c, cbx, cby, cw, ch))
             {
@@ -4546,8 +4559,8 @@ internal static partial class Av1StillImageEncoder
 
     // The has_palette flags the decoder reads (screen content, 8x8..64x64 extent; Y when y_mode is DC, UV when uv_mode
     // is DC), with the palettes' sizes and colours when chosen.
-    private static void EmitPaletteFlags(ColorPartCtx c, int bs, int bx4, int by4, int w4, int h4, bool yDc, bool uvDc,
-        LumaPal? yp = null, UvPal? uvp = null)
+    private static void EmitPaletteFlags<TP>(ColorPartCtx<TP> c, int bs, int bx4, int by4, int w4, int h4, bool yDc, bool uvDc,
+        LumaPal<TP>? yp = null, UvPal<TP>? uvp = null) where TP : unmanaged
     {
         if (!c.ScreenContent || Math.Max(w4, h4) > 16 || w4 + h4 < 4) return;
         int szCtx = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
@@ -4590,10 +4603,10 @@ internal static partial class Av1StillImageEncoder
     // its own edges — earlier tx blocks of this leaf included — with the per-tx top-right/bottom-left rules, tx
     // blocks past the visible frame edge not coded, and per-tx coefficient contexts. Luma is already decided and
     // reconstructed by the caller; this picks the UV mode by exact per-tx RD, then emits the whole block.
-    private static void RectLeafChromaMultiTx(ColorPartCtx c, int lumaBs, int lumaTx, int chromaTx, int bx4, int by4,
+    private static void RectLeafChromaMultiTx<TP>(ColorPartCtx<TP> c, int lumaBs, int lumaTx, int chromaTx, int bx4, int by4,
         int w4, int h4, Av1EdgeFlags edgeFlags, Span<ushort> ymCdf, int[] yC, Av1IntraPredMode yMode, int yDelta,
         Av1TxType yInv, int yTxIdx, int ySign, byte cfY,
-        List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? txb = null, int emitTx = -1, int depth = 0)
+        List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? txb = null, int emitTx = -1, int depth = 0) where TP : unmanaged
     {
         int ssX = c.SsX, ssY = c.SsY;
         ref readonly var ct = ref Av1Tables.TxfmDimensions[chromaTx];
@@ -4618,16 +4631,16 @@ internal static partial class Av1StillImageEncoder
         int cIntraFlags = IntraEdgeFlags(c.AModeUv[cxR], c.LModeUv[cyR]);
         int cpx = cbx4 * 4, cpy = cby4 * 4;
         int rw = Math.Min((w4 * 4) >> ssX, c.Cw - cpx), rh = Math.Min((h4 * 4) >> ssY, c.Chh - cpy);
-        ushort[] saveU = CopyRegion(null, c.ReconU, c.Cw, cpx, cpy, rw, rh), saveV = CopyRegion(null, c.ReconV, c.Cw, cpx, cpy, rw, rh);
+        TP[] saveU = CopyRegion(null, c.ReconU, c.Cw, cpx, cpy, rw, rh), saveV = CopyRegion(null, c.ReconV, c.Cw, cpx, cpy, rw, rh);
         bool cflAllowed = ((Av1Tables.CflAllowedMask >> lumaBs) & 1) != 0;   // never at 64 — CfL is <=32x32
         var uvModeCdf = c.Cdf.GetUvModeCdf(cflAllowed, (int)yMode);
         int bDimW = Av1Tables.BlockDimensions[lumaBs, 2], bDimH = Av1Tables.BlockDimensions[lumaBs, 3];
         bool uvAngleOk = bDimW + bDimH >= 2;
         double lambda = LamK * c.AcDq * c.AcDq;
-        var pred = new ushort[tw * th];
+        var pred = new TP[tw * th];
 
         // Codes one plane with (mode, delta) through every tx block, reconstructing in place; returns SSE + λ·bits.
-        double RunPlane(ushort[] src, ushort[] recon, Av1IntraPredMode mode, int delta, List<(int[] Lv, byte Cf)> outLv)
+        double RunPlane(TP[] src, TP[] recon, Av1IntraPredMode mode, int delta, List<(int[] Lv, byte Cf)> outLv)
         {
             var uvTx = UvIntraTxType(chromaTx, (int)mode);
             var fwd = FwdTypeForTxType(uvTx);
@@ -4641,7 +4654,7 @@ internal static partial class Av1StillImageEncoder
                 long sse = 0;
                 for (int yy = 0; yy < th; yy++)
                     for (int xx = 0; xx < tw; xx++)
-                    { int d = recon[(py + yy) * c.Cw + px + xx] - src[(py + yy) * c.Cw + px + xx]; sse += (long)d * d; }
+                    { int d = Px.I(recon[(py + yy) * c.Cw + px + xx]) - Px.I(src[(py + yy) * c.Cw + px + xx]); sse += (long)d * d; }
                 j += sse + lambda * CoeffCost(lv);
                 outLv.Add((lv, cf));
             }
@@ -4675,7 +4688,7 @@ internal static partial class Av1StillImageEncoder
         double bestJ = double.MaxValue;
         (Av1IntraPredMode Mode, int Delta) best = cands[0];
         List<(int[] Lv, byte Cf)> bestU = null!, bestV = null!;
-        ushort[] bestRU = null!, bestRV = null!;
+        TP[] bestRU = null!, bestRV = null!;
         foreach (var (mode, delta) in cands)
         {
             PasteRegion(saveU, c.ReconU, c.Cw, cpx, cpy, rw, rh);
@@ -4759,7 +4772,7 @@ internal static partial class Av1StillImageEncoder
 
     // CfL luma AC for 4:2:2 / 4:4:4 via the decoder's own Av1Reconstruction.ComputeCflAc, with the decoder's exact
     // edge padding (recon_tmpl cfl: furthest_r/b from the visible luma extent rounded to the luma tx size).
-    private static void CflAcAnyLayout(ColorPartCtx c, int lumaBs, int lumaTx, int bx4, int by4, short[] ac)
+    private static void CflAcAnyLayout<TP>(ColorPartCtx<TP> c, int lumaBs, int lumaTx, int bx4, int by4, short[] ac) where TP : unmanaged
     {
         int ssX = c.SsX, ssY = c.SsY;
         int bw4 = Av1Tables.BlockDimensions[lumaBs, 0], bh4 = Av1Tables.BlockDimensions[lumaBs, 1];
@@ -4777,7 +4790,7 @@ internal static partial class Av1StillImageEncoder
     // Codes PARTITION_HORZ/VERT at the 8x8 level -> two 8x4 (horz) or 4x8 (vert) luma sub-blocks. AV1 shared-chroma:
     // the chroma (4x4, covering the 8x8) is coded once on the SECOND (odd-position) sub-block. partCdf/nPart are the
     // 8x8 partition CDF (PartitionTypeCount[4]=3). Mirrors the decoder's HORZ/VERT recursion at Bl8x8.
-    private static void EncodeSub8Pair(ColorPartCtx c, bool horz, int bx4, int by4, Span<ushort> partCdf, int nPart, int bx8, int by8, Av1EdgeNode node)
+    private static void EncodeSub8Pair<TP>(ColorPartCtx<TP> c, bool horz, int bx4, int by4, Span<ushort> partCdf, int nPart, int bx8, int by8, Av1EdgeNode node) where TP : unmanaged
     {
         c.Msac.EncodeSymbolAdapt(partCdf, (int)(horz ? Av1BlockPartition.Horizontal : Av1BlockPartition.Vertical), nPart);
         if (Sp.AomSub8Rect && (c.Layout == Av1PixelLayout.I420 || c.Mono))
@@ -4826,7 +4839,7 @@ internal static partial class Av1StillImageEncoder
     // Codes PARTITION_SPLIT at the 8x8 level -> four 4x4 luma blocks in the decoder's order (top-left, top-right,
     // bottom-left, bottom-right) with the edge-tree tip's availability flags; the 4x4 chroma covering the 8x8 is coded
     // on the last (odd x, odd y) block.
-    private static void EncodeSub8Quad(ColorPartCtx c, int bx4, int by4, Span<ushort> partCdf, int nPart, int bx8, int by8, Av1EdgeNode node)
+    private static void EncodeSub8Quad<TP>(ColorPartCtx<TP> c, int bx4, int by4, Span<ushort> partCdf, int nPart, int bx8, int by8, Av1EdgeNode node) where TP : unmanaged
     {
         c.Msac.EncodeSymbolAdapt(partCdf, (int)Av1BlockPartition.Split, nPart);
         const int bs = (int)Av1BlockSize.Bs4x4, tx = (int)Av1TxSize.Tx4x4;
@@ -4859,7 +4872,7 @@ internal static partial class Av1StillImageEncoder
     // One sub-8x8 luma leaf (8x4, 4x8 or 4x4): skip, y_mode (NO angle_delta for these sizes), use_filter_intra
     // (eligible, always 0 here), tx_size, luma coeffs. When hasChroma (the last sub-block of the 8x8) it additionally
     // codes uv_mode (RD-searched like the rect leaf; no angle_delta either) + a 4x4 chroma over the 8x8-aligned region.
-    private static void EncodeSub8Leaf(ColorPartCtx c, int lumaBs, int lumaTx, int bx4, int by4, int w4, int h4, bool hasChroma, Av1EdgeFlags edge)
+    private static void EncodeSub8Leaf<TP>(ColorPartCtx<TP> c, int lumaBs, int lumaTx, int bx4, int by4, int w4, int h4, bool hasChroma, Av1EdgeFlags edge) where TP : unmanaged
     {
         if (c.Mono) hasChroma = false;
         int w = w4 * 4, h = h4 * 4, bx = bx4 * 4, by = by4 * 4;
@@ -4874,7 +4887,7 @@ internal static partial class Av1StillImageEncoder
         // Luma mode search (no angle_delta at these sizes, so only the ~13 base modes — all RD-evaluated directly,
         // no SATD prescreen). Full reduced tx-type set (IDTX+DCT/ADST): the symbol is coded for 8x4/4x8 (max tx
         // dim <= 16), and IDTX helps these tiny edge sub-blocks — same win as the square/rect leaves.
-        var scr = t_scSub8 ??= new LeafScratch();
+        var scr = PxScratch<TP>.Sub8 ??= new LeafScratch<TP>();
         var pred = scr.P1; var bestPred = scr.P2; var resBuf = scr.R;
         var qfCand = scr.Q1; var qfWin = scr.Q2;
         double rectLambda = LamK * c.AcDq * c.AcDq;
@@ -4917,7 +4930,7 @@ internal static partial class Av1StillImageEncoder
             if (ci < 64 && (keep >> ci & 1) == 0) continue;
             if (pass == 1 && (mode != yMode || yC == null)) continue;
             PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, mode, 0, pred, edge, intraFlags);
-            for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) resBuf[yy * w + xx] = c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx];
+            Px.Residual<TP>(c.Luma, by * c.W + bx, c.W, pred, 0, w, resBuf, w, h);
             double modeBits = Av1CoeffEncode.SymBits(ymCdf, (int)mode);
             foreach (var (fwd, inv, idx) in (UseFullIntraTxSet ? IntraTxTypesFull : IntraTxTypes))
             {
@@ -4956,15 +4969,15 @@ internal static partial class Av1StillImageEncoder
         bool cflAllowed = ((Av1Tables.CflAllowedMask >> lumaBs) & 1) != 0;
         int uvNsym = Av1Constants.NumUvIntraPredModes - 1 - (cflAllowed ? 0 : 1);
         bool useCfl = false; int alphaU = 0, alphaV = 0, uvMode = 0;
-        ushort[] predU = null!, predV = null!;
+        TP[] predU = null!, predV = null!;
         if (hasChroma)
         {
             int dcU = ChromaDc(c, c.ReconU, cbx, cby, 4, 4);
             int dcV = ChromaDc(c, c.ReconV, cbx, cby, 4, 4);
             uC = ForwardResidualRectDc(c.U, c.Cw, cbx, cby, 4, 4, dcU, chromaTx, c.DcDq, c.AcDq, cScan);
             vC = ForwardResidualRectDc(c.V, c.Cw, cbx, cby, 4, 4, dcV, chromaTx, c.DcDq, c.AcDq, cScan);
-            predU = new ushort[16]; Array.Fill(predU, (ushort)Math.Clamp(dcU, 0, PixMax));
-            predV = new ushort[16]; Array.Fill(predV, (ushort)Math.Clamp(dcV, 0, PixMax));
+            predU = new TP[16]; Array.Fill(predU, Px.T<TP>(Math.Clamp(dcU, 0, PixMax)));
+            predV = new TP[16]; Array.Fill(predV, Px.T<TP>(Math.Clamp(dcV, 0, PixMax)));
             ref readonly var cTD = ref Av1Tables.TxfmDimensions[chromaTx];
             int eUSkip = Av1CoeffDecode.GetSkipCtx(in cTD, lumaBs, c.ACU.AsSpan(cxR), c.LCU.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
             int eVSkip = Av1CoeffDecode.GetSkipCtx(in cTD, lumaBs, c.ACV.AsSpan(cxR), c.LCV.AsSpan(cyR), 1, (int)Av1PixelLayout.I420);
@@ -4988,7 +5001,7 @@ internal static partial class Av1StillImageEncoder
                                  ((edge & Av1EdgeFlags.I420LeftHasBottom) != 0 ? Av1EdgeFlags.I444LeftHasBottom : 0);
                 int cIntraFlags = IntraEdgeFlags(c.AModeUv[cxR], c.LModeUv[cyR]);
                 int cbw4 = c.Bw4 >> 1, cbh4 = c.Bh4 >> 1, cbx4 = c8x4 >> 1, cby4 = c8y4 >> 1;
-                var pu = new ushort[16]; var pv = new ushort[16];
+                var pu = new TP[16]; var pv = new TP[16];
                 Span<int> topIdx = stackalloc int[RdUvCandidates];
                 Span<long> topCost = stackalloc long[RdUvCandidates];
                 topCost.Fill(long.MaxValue);
@@ -4998,7 +5011,7 @@ internal static partial class Av1StillImageEncoder
                     if (mode == Av1IntraPredMode.Dc || delta != 0) continue;
                     PredictIntraRect(c.ReconU, c.Cw, cbw4, cbh4, cbx4, cby4, 4, 4, mode, 0, pu, chromaEdge, cIntraFlags);
                     long sad = 0;
-                    for (int yy = 0; yy < 4; yy++) { int r = (cby + yy) * c.Cw + cbx; for (int xx = 0; xx < 4; xx++) sad += Math.Abs(c.U[r + xx] - pu[yy * 4 + xx]); }
+                    for (int yy = 0; yy < 4; yy++) { int r = (cby + yy) * c.Cw + cbx; for (int xx = 0; xx < 4; xx++) sad += Math.Abs(Px.I(c.U[r + xx]) - Px.I(pu[yy * 4 + xx])); }
                     for (int k = 0; k < RdUvCandidates; k++)
                         if (sad < topCost[k]) { for (int j = RdUvCandidates - 1; j > k; j--) { topCost[j] = topCost[j - 1]; topIdx[j] = topIdx[j - 1]; } topCost[k] = sad; topIdx[k] = ci; break; }
                 }
@@ -5027,8 +5040,8 @@ internal static partial class Av1StillImageEncoder
                 int aV = BestCflAlphaRect(c.V, c.Cw, cbx, cby, 4, 4, dcV, acc);
                 if (aU != 0 || aV != 0)
                 {
-                    var cflU = BuildCflPredRect(dcU, acc, 4, 4, aU);
-                    var cflV = BuildCflPredRect(dcV, acc, 4, 4, aV);
+                    var cflU = BuildCflPredRect<TP>(dcU, acc, 4, 4, aU);
+                    var cflV = BuildCflPredRect<TP>(dcV, acc, 4, 4, aV);
                     int[] uCc = ForwardResidualPredRect(c.U, c.Cw, cbx, cby, cflU, 4, 4, chromaTx, c.DcDq, c.AcDq, cScan);
                     int[] vCc = ForwardResidualPredRect(c.V, c.Cw, cbx, cby, cflV, 4, 4, chromaTx, c.DcDq, c.AcDq, cScan);
                     double cflJ = ReconSseCandRect(uCc, chromaTx, 4, 4, c.DcDq, c.AcDq, cflU, c.U, c.Cw, cbx, cby, Av1TxType.DctDct)
@@ -5118,15 +5131,15 @@ internal static partial class Av1StillImageEncoder
         return a;
     }
 
-    private static int[] ForwardResidual(ReadOnlySpan<ushort> plane, int planeW, int bx, int by, int n, int dcPred,
-        int dcDq, int acDq, int scanLen, double[]? qfOut = null)
+    private static int[] ForwardResidual<TP>(ReadOnlySpan<TP> plane, int planeW, int bx, int by, int n, int dcPred,
+        int dcDq, int acDq, int scanLen, double[]? qfOut = null) where TP : unmanaged
     {
         var residual = Av1FwdTransform.RentLevels(n * n);   // fully written below
         for (int y = 0; y < n; y++)
         {
             for (int x = 0; x < n; x++)
             {
-                residual[y * n + x] = plane[(by + y) * planeW + (bx + x)] - dcPred;
+                residual[y * n + x] = Px.I(plane[(by + y) * planeW + (bx + x)]) - dcPred;
             }
         }
 
@@ -5159,28 +5172,33 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Pads a plane to pw x ph by replicating the right/bottom edge.
-    private static ushort[] PadPlane(ReadOnlySpan<ushort> src, int w, int h, int pw, int ph)
+    private static ushort[] PadPlane(ReadOnlySpan<ushort> src, int w, int h, int pw, int ph) => PadPlaneAs<ushort>(src, w, h, pw, ph);
+
+    // The source plane replicated out to pw x ph, as the pipeline's sample type (byte for 8-bit content).
+    private static TP[] PadPlaneAs<TP>(ReadOnlySpan<ushort> src, int w, int h, int pw, int ph) where TP : unmanaged
     {
-        var padded = new ushort[pw * ph];
+        var padded = new TP[pw * ph];
         for (int y = 0; y < ph; y++)
         {
             int sy = Math.Min(y, h - 1);
-            for (int x = 0; x < pw; x++)
-            {
-                padded[y * pw + x] = src[sy * w + Math.Min(x, w - 1)];
-            }
+            var row = padded.AsSpan(y * pw, pw);
+            var s = src.Slice(sy * w, w);
+            int n = Math.Min(w, pw);
+            if (typeof(TP) == typeof(ushort)) s.Slice(0, n).CopyTo(MemoryMarshal.Cast<TP, ushort>(row));
+            else for (int x = 0; x < n; x++) row[x] = Px.T<TP>(s[x]);
+            if (n < pw) row.Slice(n).Fill(row[n - 1]);
         }
 
         return padded;
     }
 
-    private static void FillFlat(ushort[] recon, int reconW, int bx, int by, int n, int value)
+    private static void FillFlat<TP>(TP[] recon, int reconW, int bx, int by, int n, int value) where TP : unmanaged
     {
         for (int y = 0; y < n; y++)
         {
             for (int x = 0; x < n; x++)
             {
-                recon[(by + y) * reconW + (bx + x)] = (ushort)value;
+                recon[(by + y) * reconW + (bx + x)] = Px.T<TP>(value);
             }
         }
     }
@@ -5565,7 +5583,7 @@ internal static partial class Av1StillImageEncoder
     // Per-superblock coefficient cost tables (CoefCostTab; AV1_COSTTAB=0 / 1 overrides): rebuilt from the row's CDFs at
     // every superblock start, as libaom's av1_fill_coeff_costs.
     private static readonly string? CostTabEnv = Environment.GetEnvironmentVariable("AV1_COSTTAB");
-    private static void SbCosts(ColorPartCtx c)
+    private static void SbCosts<TP>(ColorPartCtx<TP> c) where TP : unmanaged
     {
         var coef = c.Cdf.Coef;
         if (CostTabEnv == "0" || (CostTabEnv != "1" && !Sp.CoefCostTab)) { coef.Tab = null; return; }
@@ -5581,7 +5599,7 @@ internal static partial class Av1StillImageEncoder
 
     // libaom setup_block_rdmult (ALLINTRA): a superblock mixing near-flat (log 4x4 variance < 2) and busy (> 4) areas
     // codes at a lower lambda: 128 - min(48, 6 * (max - min)) over 128.
-    private static double SbLambdaMul(ColorPartCtx c, int sbx, int sby)
+    private static double SbLambdaMul<TP>(ColorPartCtx<TP> c, int sbx, int sby) where TP : unmanaged
     {
         int x0 = sbx * 64, y0 = sby * 64, w = Math.Min(64, c.Bw4 * 4 - x0), h = Math.Min(64, c.Bh4 * 4 - y0);
         int vmin = int.MaxValue, vmax = 0;
@@ -5677,8 +5695,8 @@ internal static partial class Av1StillImageEncoder
     // the decoder's own inverse and returns J = SSE + λ·rate — so a 64x64 (or 32x32) transform that drops the
     // high-frequency detail of a sharp block is penalised by its reconstruction error, not just its (small) rate.
     // Used for the NONE/SPLIT decision in both the grayscale and colour encoders (the tree is luma-driven).
-    private static long EstimateBlockCost(ushort[] luma, int w, int bw4, int bh4, int dcDq, int acDq, ushort[] scratch,
-        int bl, int bx4, int by4)
+    private static long EstimateBlockCost<TP>(TP[] luma, int w, int bw4, int bh4, int dcDq, int acDq, TP[] scratch,
+        int bl, int bx4, int by4) where TP : unmanaged
     {
         int n = (32 >> bl) * 4;
         int tx = BlToTx(bl);
@@ -5689,7 +5707,7 @@ internal static partial class Av1StillImageEncoder
             int scanLen = Av1Tables.Scans[tx].Length;
             var residual = Av1FwdTransform.RentLevels(n * n);
             for (int y = 0; y < n; y++)
-                for (int x = 0; x < n; x++) residual[y * n + x] = luma[(by4 * 4 + y) * w + bx4 * 4 + x] - scratch[y * n + x];
+                for (int x = 0; x < n; x++) residual[y * n + x] = Px.I(luma[(by4 * 4 + y) * w + bx4 * 4 + x]) - Px.I(scratch[y * n + x]);
             var qf = t_estQf ??= new double[1024];
             int[] cq = Av1FwdTransform.ForwardQuantTyped(residual, n, dcDq, acDq, scanLen, Av1FwdTransform.FwdTxType.DctDct, qf);
             Av1FwdTransform.ReturnLevels(residual);
@@ -5711,13 +5729,13 @@ internal static partial class Av1StillImageEncoder
             if (v != 0) { int a = Math.Abs(v); bits += 5 + (a >= 15 ? 8 : a >> 1); } // base+sign ~5b, magnitude tail
 
         // Reconstruct through the decoder's inverse (from the same source-plane prediction) and measure SSE.
-        var reconTmp = new ushort[n * n];
+        var reconTmp = new TP[n * n];
         DequantAndReconstructPred(coeffs, tx, n, dcDq, acDq, scratch, reconTmp, n, 0, 0);
         long sse = 0;
         for (int y = 0; y < n; y++)
             for (int x = 0; x < n; x++)
             {
-                int d = reconTmp[y * n + x] - luma[(by4 * 4 + y) * w + (bx4 * 4 + x)];
+                int d = Px.I(reconTmp[y * n + x]) - Px.I(luma[(by4 * 4 + y) * w + (bx4 * 4 + x)]);
                 sse += (long)d * d;
             }
 
@@ -5815,11 +5833,11 @@ internal static partial class Av1StillImageEncoder
     // preparation + prediction so encoder and decoder agree bit-for-bit. recon is the reconstruction plane
     // (stride reconW), bx4/by4 the block position in 4-unit units, bw4/bh4 the frame size in 4-unit units.
     [System.Runtime.CompilerServices.SkipLocalsInit]   // the edge buffer: only filled entries are read (AV1_EDGEPOISON=1 checks)
-    private static void PredictIntra(ushort[] recon, int reconW, int bw4, int bh4, int bx4, int by4, int n,
-        Av1IntraPredMode mode, int delta, ushort[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
+    private static void PredictIntra<TP>(TP[] recon, int reconW, int bw4, int bh4, int bx4, int by4, int n,
+        Av1IntraPredMode mode, int delta, TP[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0) where TP : unmanaged
     {
-        Span<ushort> edge = stackalloc ushort[257];
-        if (EdgePoison) edge.Fill(0xB33F);   // dev: prove the predictors never read an unfilled edge entry
+        Span<TP> edge = stackalloc TP[257];
+        if (EdgePoison) edge.Fill(Px.T<TP>(0xB33F));   // dev: prove the predictors never read an unfilled edge entry
         const int edgeCenter = 128;
         int dstOff = (by4 * 4) * reconW + (bx4 * 4);
         int tw4 = n >> 2;
@@ -5840,13 +5858,13 @@ internal static partial class Av1StillImageEncoder
     // directional edges are scored the way the transform will actually code them. Returns the winning (mode,
     // angle_delta) and writes its prediction into predOut (n x n). Purely an encoder decision: any candidate is
     // a valid mode, so this can never desync the decoder.
-    private static (Av1IntraPredMode Mode, int Delta, long Cost) ChooseIntraMode(ushort[] recon, int reconW, int bw4, int bh4,
-        int bx4, int by4, int n, ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] predOut,
-        Av1EdgeFlags edgeFlags = Av1EdgeFlags.None)
+    private static (Av1IntraPredMode Mode, int Delta, long Cost) ChooseIntraMode<TP>(TP[] recon, int reconW, int bw4, int bh4,
+        int bx4, int by4, int n, ReadOnlySpan<TP> src, int srcW, int srcBx, int srcBy, TP[] predOut,
+        Av1EdgeFlags edgeFlags = Av1EdgeFlags.None) where TP : unmanaged
     {
         long best = long.MaxValue;
         (Av1IntraPredMode Mode, int Delta) bestCand = (Av1IntraPredMode.Dc, 0);
-        var tmp = new ushort[n * n];
+        var tmp = new TP[n * n];
         foreach ((Av1IntraPredMode mode, int delta) in CandidateModes)
         {
             if (Sp.EstimateNrdModes && !NrdModeAllowed(mode, n)) continue;
@@ -5865,7 +5883,7 @@ internal static partial class Av1StillImageEncoder
 
     // Sum of 8x8 Hadamard-transformed absolute residuals (src - pred) tiled over an n x n block. SATD is the
     // standard cheap frequency-domain proxy for transform coding cost.
-    private static long Satd8x8(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int n)
+    private static long Satd8x8<TP>(ReadOnlySpan<TP> src, int srcW, int srcBx, int srcBy, TP[] pred, int n) where TP : unmanaged
     {
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
         {
@@ -5883,7 +5901,7 @@ internal static partial class Av1StillImageEncoder
             {
                 for (int y = 0; y < 8; y++)
                     for (int x = 0; x < 8; x++)
-                        d[y * 8 + x] = src[(srcBy + by + y) * srcW + (srcBx + bx + x)] - pred[(by + y) * n + (bx + x)];
+                        d[y * 8 + x] = Px.I(src[(srcBy + by + y) * srcW + (srcBx + bx + x)]) - Px.I(pred[(by + y) * n + (bx + x)]);
                 total += Hadamard8x8Abs(d);
             }
         }
@@ -5895,13 +5913,15 @@ internal static partial class Av1StillImageEncoder
     // SATD), so it prescreens chroma UV modes down to 4x4. A coarse proxy — good enough to pick the RD shortlist.
     [ThreadStatic] private static double[]? t_planeJQf;
 
-    private static long SadBlock(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int cn)
+    private static long SadBlock<TP>(ReadOnlySpan<TP> src, int srcW, int srcBx, int srcBy, TP[] pred, int cn) where TP : unmanaged
         => SadRect(src, srcW, srcBx, srcBy, pred, cn, cn);
 
     // Sum of |src - pred| over a w x h block (pred stride w): 16 / 8 lanes (|a - b| as max - min, summed pairwise
     // through pmaddwd with ones; a 64 x 64 block sums below 2^31).
-    private static long SadRect(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int w, int h)
+    private static long SadRect<TP>(ReadOnlySpan<TP> src, int srcW, int srcBx, int srcBy, TP[] pred, int w, int h) where TP : unmanaged
     {
+        if (typeof(TP) == typeof(byte) && Avx2.IsSupported)
+            return SadRectU8(MemoryMarshal.Cast<TP, byte>(src), srcW, srcBx, srcBy, MemoryMarshal.Cast<TP, byte>(pred.AsSpan()), w, h);
         long total = 0;
         int x0 = System.Runtime.Intrinsics.X86.Avx2.IsSupported ? 0 : w;
         var acc = Vector256<int>.Zero; var ones = Vector256.Create((short)1);
@@ -5914,25 +5934,54 @@ internal static partial class Av1StillImageEncoder
             {
                 for (; x + 16 <= w; x += 16)
                 {
-                    var a = Vector256.Create(s.Slice(x, 16)); var b = Vector256.Create(pr.Slice(x, 16));
+                    var a = Px.Load16(s, x); var b = Px.Load16((ReadOnlySpan<TP>)pr, x);
                     acc += System.Runtime.Intrinsics.X86.Avx2.MultiplyAddAdjacent((Vector256.Max(a, b) - Vector256.Min(a, b)).AsInt16(), ones);
                 }
                 if (x + 8 <= w)
                 {
-                    var a = Vector128.Create(s.Slice(x, 8)); var b = Vector128.Create(pr.Slice(x, 8));
+                    var a = Px.Load8(s, x); var b = Px.Load8((ReadOnlySpan<TP>)pr, x);
                     acc += Vector256.Create(System.Runtime.Intrinsics.X86.Sse2.MultiplyAddAdjacent((Vector128.Max(a, b) - Vector128.Min(a, b)).AsInt16(),
                         Vector128.Create((short)1)), Vector128<int>.Zero);
                     x += 8;
                 }
             }
-            for (; x < w; x++) total += Math.Abs(s[x] - pr[x]);
+            for (; x < w; x++) total += Math.Abs(Px.I(s[x]) - Px.I(pr[x]));
         }
         return total + Vector256.Sum(acc);
     }
 
+    // SadRect on byte samples: psadbw, 32 / 16 / 8 pixels at a time (libaom's lowbd aom_sad*_avx2).
+    private static long SadRectU8(ReadOnlySpan<byte> src, int srcW, int srcBx, int srcBy, ReadOnlySpan<byte> pred, int w, int h)
+    {
+        long total = 0;
+        var acc = Vector256<ulong>.Zero;
+        for (int y = 0; y < h; y++)
+        {
+            var s = src.Slice((srcBy + y) * srcW + srcBx, w);
+            var pr = pred.Slice(y * w, w);
+            int x = 0;
+            for (; x + 32 <= w; x += 32)
+                acc += Avx2.SumAbsoluteDifferences(Vector256.Create(s.Slice(x, 32)), Vector256.Create(pr.Slice(x, 32))).AsUInt64();
+            if (x + 16 <= w)
+            {
+                acc += Vector256.Create(Sse2.SumAbsoluteDifferences(Vector128.Create(s.Slice(x, 16)), Vector128.Create(pr.Slice(x, 16))).AsUInt64(), Vector128<ulong>.Zero);
+                x += 16;
+            }
+            if (x + 8 <= w)
+            {
+                var a = Vector128.CreateScalarUnsafe(MemoryMarshal.Read<ulong>(s.Slice(x, 8))).AsByte();
+                var b = Vector128.CreateScalarUnsafe(MemoryMarshal.Read<ulong>(pr.Slice(x, 8))).AsByte();
+                total += (long)Sse2.SumAbsoluteDifferences(a, b).AsUInt64().ToScalar();
+                x += 8;
+            }
+            for (; x < w; x++) total += Math.Abs(s[x] - pr[x]);
+        }
+        return total + (long)Vector256.Sum(acc);
+    }
+
     // SATD over a w x h rectangular block (pred stride = w). Rect leaf sizes are all multiples of 8, so the 8x8
     // Hadamard tiling is exact. Used to prescreen rect intra modes cheaply before the full RD tx-type search.
-    private static long Satd8x8Rect(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int w, int h)
+    private static long Satd8x8Rect<TP>(ReadOnlySpan<TP> src, int srcW, int srcBx, int srcBy, TP[] pred, int w, int h) where TP : unmanaged
     {
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
         {
@@ -5949,7 +5998,7 @@ internal static partial class Av1StillImageEncoder
             {
                 for (int y = 0; y < 8; y++)
                     for (int x = 0; x < 8; x++)
-                        d[y * 8 + x] = src[(srcBy + by + y) * srcW + (srcBx + bx + x)] - pred[(by + y) * w + (bx + x)];
+                        d[y * 8 + x] = Px.I(src[(srcBy + by + y) * srcW + (srcBx + bx + x)]) - Px.I(pred[(by + y) * w + (bx + x)]);
                 total += Hadamard8x8Abs(d);
             }
         return total;
@@ -5959,10 +6008,10 @@ internal static partial class Av1StillImageEncoder
     // Hadamard8x8Abs of (src - pred) with AVX2: the column butterflies combine the 8 row vectors, the row butterflies
     // run inside each vector (lane swaps at distance 4 / 2 / 1). Exact integer arithmetic, and the sum of absolute
     // values does not depend on the output order, so the result equals the scalar version's.
-    private static long Hadamard8x8AbsAvx2(ReadOnlySpan<ushort> src, int srcOff, int srcW, ReadOnlySpan<ushort> pred, int predOff, int predW)
+    private static long Hadamard8x8AbsAvx2<TP>(ReadOnlySpan<TP> src, int srcOff, int srcW, ReadOnlySpan<TP> pred, int predOff, int predW) where TP : unmanaged
     {
-        static Vector256<int> Row(ReadOnlySpan<ushort> s, int o, ReadOnlySpan<ushort> p, int po)
-            => Avx2.Subtract(Avx2.ConvertToVector256Int32(Vector128.Create(s.Slice(o, 8))), Avx2.ConvertToVector256Int32(Vector128.Create(p.Slice(po, 8))));
+        static Vector256<int> Row(ReadOnlySpan<TP> s, int o, ReadOnlySpan<TP> p, int po)
+            => Px.Load8x32(ref MemoryMarshal.GetReference(s.Slice(o, 8))) - Px.Load8x32(ref MemoryMarshal.GetReference(p.Slice(po, 8)));
         var a0 = Row(src, srcOff, pred, predOff);
         var a1 = Row(src, srcOff + srcW, pred, predOff + predW);
         var a2 = Row(src, srcOff + 2 * srcW, pred, predOff + 2 * predW);
@@ -6017,7 +6066,7 @@ internal static partial class Av1StillImageEncoder
     }
 
     // DC prediction for a 64x64 block from reconstructed neighbours, mirroring Av1IntraPred DC modes.
-    private static int DcPredict(ushort[] recon, int w, int h, int bx, int by, int bw, int bh)
+    private static int DcPredict<TP>(TP[] recon, int w, int h, int bx, int by, int bw, int bh) where TP : unmanaged
     {
         var tb = TileBounds4(w, int.MaxValue, int.MaxValue);
         bool haveTop = by > tb.Y0 * 4;
@@ -6025,22 +6074,22 @@ internal static partial class Av1StillImageEncoder
         if (haveTop && haveLeft)
         {
             int dc = (bw + bh) >> 1;
-            for (int x = 0; x < bw; x++) dc += recon[(by - 1) * w + bx + x];
-            for (int y = 0; y < bh; y++) dc += recon[(by + y) * w + bx - 1];
+            for (int x = 0; x < bw; x++) dc += Px.I(recon[(by - 1) * w + bx + x]);
+            for (int y = 0; y < bh; y++) dc += Px.I(recon[(by + y) * w + bx - 1]);
             return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)(bw + bh));
         }
 
         if (haveTop)
         {
             int dc = bw >> 1;
-            for (int x = 0; x < bw; x++) dc += recon[(by - 1) * w + bx + x];
+            for (int x = 0; x < bw; x++) dc += Px.I(recon[(by - 1) * w + bx + x]);
             return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)bw);
         }
 
         if (haveLeft)
         {
             int dc = bh >> 1;
-            for (int y = 0; y < bh; y++) dc += recon[(by + y) * w + bx - 1];
+            for (int y = 0; y < bh; y++) dc += Px.I(recon[(by + y) * w + bx - 1]);
             return dc >> System.Numerics.BitOperations.TrailingZeroCount((uint)bh);
         }
 
@@ -6050,14 +6099,14 @@ internal static partial class Av1StillImageEncoder
     // Dequantizes the quantized levels the way the decoder does, inverse-transforms onto the DC prediction (via
     // the decoder's own InvTxfmAdd) to reconstruct the 64x64 block into `recon`, and returns the coefficient
     // context byte (cul_level | dc-sign) that neighbours read.
-    private static byte DequantAndReconstruct(int[] levels, int dcDq, int acDq, int dcPred, ushort[] recon, int w, int bx, int by)
+    private static byte DequantAndReconstruct<TP>(int[] levels, int dcDq, int acDq, int dcPred, TP[] recon, int w, int bx, int by) where TP : unmanaged
         => DequantAndReconstruct(levels, Tx64x64, 64, dcDq, acDq, dcPred, recon, w, bx, by);
 
     // Dequantizes quantized levels (decoder-exact), inverse-transforms onto the DC prediction (via the decoder's
     // own InvTxfmAdd) to reconstruct an n x n block of transform <paramref name="tx"/> into <paramref
     // name="recon"/> (stride <paramref name="reconW"/>), and returns the block's coefficient context byte.
-    private static byte DequantAndReconstruct(int[] levels, int tx, int n, int dcDq, int acDq, int dcPred,
-        ushort[] recon, int reconW, int bx, int by)
+    private static byte DequantAndReconstruct<TP>(int[] levels, int tx, int n, int dcDq, int acDq, int dcPred,
+        TP[] recon, int reconW, int bx, int by) where TP : unmanaged
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[tx].Ctx - 2);
         int cfMax = CfMax;
@@ -6087,8 +6136,8 @@ internal static partial class Av1StillImageEncoder
         int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
-        var block = new ushort[n * n];
-        Array.Fill(block, (ushort)dcPred);
+        var block = new TP[n * n];
+        Array.Fill(block, Px.T<TP>(dcPred));
         Av1InvTransform.InvTxfmAdd16(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], Av1TxType.DctDct, Bd);
         for (int y = 0; y < n; y++)
         {
@@ -6103,8 +6152,8 @@ internal static partial class Av1StillImageEncoder
 
     // Dequantizes and reconstructs an n x n block on top of an arbitrary intra prediction (predBlock, n x n),
     // via the decoder's InvTxfmAdd, into recon. Returns the coefficient-context byte.
-    private static byte DequantAndReconstructPred(int[] levels, int tx, int n, int dcDq, int acDq,
-        ushort[] predBlock, ushort[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct)
+    private static byte DequantAndReconstructPred<TP>(int[] levels, int tx, int n, int dcDq, int acDq,
+        TP[] predBlock, TP[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct) where TP : unmanaged
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[tx].Ctx - 2);
         int cfMax = CfMax;
@@ -6133,7 +6182,7 @@ internal static partial class Av1StillImageEncoder
         int dcSignLevel = levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80);
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
-        var block = (t_reconBlock ??= new ushort[64 * 64]).AsSpan(0, n * n);
+        var block = (PxScratch<TP>.ReconBlock ??= new TP[64 * 64]).AsSpan(0, n * n);
         predBlock.AsSpan(0, n * n).CopyTo(block);
         Av1InvTransform.InvTxfmAdd16(block, n, cf, eob, tx, Av1InvTransform.TxShift[tx], txType, Bd);
         for (int y = 0; y < n; y++)
@@ -6151,8 +6200,8 @@ internal static partial class Av1StillImageEncoder
     // `predBlock`, and sum squared error vs the source. Used to score tx-type / mode candidates by true RD (D + λR)
     // rather than rate alone — necessary because IDTX changes the reconstruction distortion at a matched quantizer
     // (unlike the DCT/ADST family), so a rate-only comparison over-selects it on smooth content.
-    private static long ReconSseCand(int[] levels, int tx, int n, int dcDq, int acDq, ushort[] predBlock,
-        ushort[] src, int srcW, int srcBx, int srcBy, Av1TxType txType)
+    private static long ReconSseCand<TP>(int[] levels, int tx, int n, int dcDq, int acDq, TP[] predBlock,
+        TP[] src, int srcW, int srcBx, int srcBy, Av1TxType txType) where TP : unmanaged
         => ReconSseCandRect(levels, tx, n, n, dcDq, acDq, predBlock, src, srcW, srcBx, srcBy, txType);
 
     // J (pre-RDOQ) of the last ChooseLeafRdCore winner, for the palette comparison.
@@ -6160,13 +6209,18 @@ internal static partial class Av1StillImageEncoder
 
     // Per-thread working buffers of a leaf search (ChooseLeafRdCore / the rect leaf / the sub-8 leaf, one set each: none
     // of them re-enters itself), sized for the largest block.
-    private sealed class LeafScratch
+    private sealed class LeafScratch<TP> where TP : unmanaged
     {
-        public readonly ushort[] P1 = new ushort[64 * 64], P2 = new ushort[64 * 64];
+        public readonly TP[] P1 = new TP[64 * 64], P2 = new TP[64 * 64];
         public readonly int[] R = new int[64 * 64];
         public readonly double[] Q1 = new double[1024], Q2 = new double[1024];
     }
-    [ThreadStatic] private static LeafScratch? t_scCore, t_scRect, t_scSub8, t_scSplit;
+    // Per-thread pixel scratch, one set per sample type.
+    private static class PxScratch<TP> where TP : unmanaged
+    {
+        [ThreadStatic] public static LeafScratch<TP>? Core, Rect, Sub8, Split, Aom;
+        [ThreadStatic] public static TP[]? ReconBlock, DcScratch;
+    }
     [ThreadStatic] private static double[]? t_estQf;
     // The last ChooseLeafRdCore prescreen's surviving candidates (CandidateModes indices, SATD order).
     [ThreadStatic] private static int[]? t_topModesArr;
@@ -6177,7 +6231,6 @@ internal static partial class Av1StillImageEncoder
     // always all zero between calls — the inverse transform clears the region it consumed, as dav1d's does — so no
     // allocation or clearing is needed per candidate.
     [ThreadStatic] private static int[]? t_reconCf;
-    [ThreadStatic] private static ushort[]? t_reconBlock;
 
     // Forward-transforms and quantizes (src block - prediction) for an n x n block.
     // The reduced intra tx set (Intra2) types searched for luma tx ≤ 16x16 (where the type is signalled), as
@@ -6228,10 +6281,10 @@ internal static partial class Av1StillImageEncoder
     // bits. This replaces the SATD proxy: it directly minimises what the bitstream costs and lets the tx-type
     // (ADST/DCT) choice compound with the mode choice. Writes the winning prediction into predOut.
     private static (Av1IntraPredMode Mode, int Delta, int[] Coeffs, Av1TxType Inv, int Idx)
-        ChooseLeafRdCore(ushort[] recon, int reconW, int bw4, int bh4, ushort[] luma, int lumaW, int bx4, int by4,
+        ChooseLeafRdCore<TP>(TP[] recon, int reconW, int bw4, int bh4, TP[] luma, int lumaW, int bx4, int by4,
             int n, int tx, int dcDq, int acDq, Av1CdfContext cdf, byte aboveMode, byte leftMode,
-            ReadOnlySpan<byte> aboveLCoef, ReadOnlySpan<byte> leftLCoef, ushort[] predOut,
-            Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, bool filterEligible = false, int bs = 0, bool fullSet = false)
+            ReadOnlySpan<byte> aboveLCoef, ReadOnlySpan<byte> leftLCoef, TP[] predOut,
+            Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, bool filterEligible = false, int bs = 0, bool fullSet = false) where TP : unmanaged
     {
         // Full intra set adds V_DCT/H_DCT for sub-16x16 luma (n in {4,8}); 16x16 and up stay on the reduced set.
         var txSet = !Sp.UseTxTypeSearch ? DctOnly : (fullSet && n <= 8) ? IntraTxTypesFull : (n <= 16 ? IntraTxTypes : DctOnly);
@@ -6241,7 +6294,7 @@ internal static partial class Av1StillImageEncoder
         int dcSignCtx = Av1CoeffDecode.GetDcSignCtx(tx, aboveLCoef, leftLCoef);
         int intraFlags = IntraEdgeFlags(aboveMode, leftMode);
         int scanLen = Av1Tables.Scans[tx].Length;
-        var scr = t_scCore ??= new LeafScratch();
+        var scr = PxScratch<TP>.Core ??= new LeafScratch<TP>();
         var predBuf = scr.P1;
         var qfCand = scr.Q1;
         var qfWin = scr.Q2;
@@ -6394,11 +6447,11 @@ internal static partial class Av1StillImageEncoder
 
     // Intra prediction for a w x h block into dst (h rows x w cols, stride w).
     [System.Runtime.CompilerServices.SkipLocalsInit]   // the edge buffer: only filled entries are read (AV1_EDGEPOISON=1 checks)
-    private static void PredictIntraRect(ushort[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
-        int w, int h, Av1IntraPredMode mode, int delta, ushort[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0)
+    private static void PredictIntraRect<TP>(TP[] recon, int reconW, int bw4, int bh4, int bx4, int by4,
+        int w, int h, Av1IntraPredMode mode, int delta, TP[] dst, Av1EdgeFlags edgeFlags = Av1EdgeFlags.None, int intraFlags = 0) where TP : unmanaged
     {
-        Span<ushort> edge = stackalloc ushort[257];
-        if (EdgePoison) edge.Fill(0xB33F);   // dev: prove the predictors never read an unfilled edge entry
+        Span<TP> edge = stackalloc TP[257];
+        if (EdgePoison) edge.Fill(Px.T<TP>(0xB33F));   // dev: prove the predictors never read an unfilled edge entry
         const int edgeCenter = 128;
         int dstOff = (by4 * 4) * reconW + (bx4 * 4);
         int tw4 = w >> 2, th4 = h >> 2;
@@ -6413,14 +6466,12 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Forward+quant of (src - pred) for a w x h block. pred is h x w row-major.
-    private static int[] ForwardResidualPredRect(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy,
-        ushort[] pred, int w, int h, int txIdx, int dcDq, int acDq, int rcCount, double[]? qfOut = null,
-        Av1FwdTransform.FwdTxType fwd = Av1FwdTransform.FwdTxType.DctDct)
+    private static int[] ForwardResidualPredRect<TP>(ReadOnlySpan<TP> src, int srcW, int srcBx, int srcBy,
+        TP[] pred, int w, int h, int txIdx, int dcDq, int acDq, int rcCount, double[]? qfOut = null,
+        Av1FwdTransform.FwdTxType fwd = Av1FwdTransform.FwdTxType.DctDct) where TP : unmanaged
     {
         var residual = Av1FwdTransform.RentLevels(h * w);   // fully written below
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-                residual[y * w + x] = src[(srcBy + y) * srcW + (srcBx + x)] - pred[y * w + x];
+        Px.Residual(src, srcBy * srcW + srcBx, srcW, pred, 0, w, residual, w, h);
         var lv = Av1FwdTransform.ForwardQuantRect(residual, w, h, txIdx, dcDq, acDq, rcCount, fwd, qfOut);
         Av1FwdTransform.ReturnLevels(residual);
         return lv;
@@ -6436,8 +6487,8 @@ internal static partial class Av1StillImageEncoder
         return (byte)(Math.Min(cul, 63) | (levels[0] == 0 ? 0x40 : (levels[0] < 0 ? 0 : 0x80)));
     }
 
-    private static byte DequantAndReconstructPredRect(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
-        ushort[] predBlock, ushort[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct, int eobHint = -2)
+    private static byte DequantAndReconstructPredRect<TP>(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
+        TP[] predBlock, TP[] recon, int reconW, int bx, int by, Av1TxType txType = Av1TxType.DctDct, int eobHint = -2) where TP : unmanaged
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[txIdx].Ctx - 2);
         int cfMax = CfMax;
@@ -6479,8 +6530,8 @@ internal static partial class Av1StillImageEncoder
 
     // Reconstruction SSE of a w x h rectangular candidate (dequant + inverse onto predBlock) vs the source — the
     // distortion term for true-RD rect leaf selection (mirrors ReconSseCand for the square path).
-    private static long ReconSseCandRect(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
-        ushort[] predBlock, ushort[] src, int srcW, int srcBx, int srcBy, Av1TxType txType)
+    private static long ReconSseCandRect<TP>(int[] levels, int txIdx, int w, int h, int dcDq, int acDq,
+        TP[] predBlock, TP[] src, int srcW, int srcBx, int srcBy, Av1TxType txType) where TP : unmanaged
     {
         int dqShift = Math.Max(0, Av1Tables.TxfmDimensions[txIdx].Ctx - 2);
         int cfMax = CfMax;
@@ -6496,7 +6547,7 @@ internal static partial class Av1StillImageEncoder
             int dq = Math.Min(((rc == 0 ? dcDq : acDq) * mag) >> dqShift, cfMax + sign);
             cf[rc] = sign != 0 ? -dq : dq;
         }
-        var blockBuf = t_reconBlock ??= new ushort[64 * 64];
+        var blockBuf = PxScratch<TP>.ReconBlock ??= new TP[64 * 64];
         var block = blockBuf.AsSpan(0, w * h);
         predBlock.AsSpan(0, w * h).CopyTo(block);
         Av1InvTransform.InvTxfmAdd16(block, w, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, Bd);
@@ -6504,12 +6555,10 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Residual (src - prediction) for an n x n block.
-    private static int[] ComputeResidualPred(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int n)
+    private static int[] ComputeResidualPred<TP>(ReadOnlySpan<TP> src, int srcW, int srcBx, int srcBy, TP[] pred, int n) where TP : unmanaged
     {
         var r = Av1FwdTransform.RentLevels(n * n);   // fully written below
-        for (int y = 0; y < n; y++)
-            for (int x = 0; x < n; x++)
-                r[y * n + x] = src[(srcBy + y) * srcW + (srcBx + x)] - pred[y * n + x];
+        Px.Residual(src, srcBy * srcW + srcBx, srcW, pred, 0, n, r, n, n);
         return r;
     }
 
@@ -6524,8 +6573,8 @@ internal static partial class Av1StillImageEncoder
     // Chooses the intra transform type minimizing coefficient cost for a residual. For luma tx ≤ 16x16 the type is
     // signalled (Intra2 set: DctDct + ADST combos); for tx ≥ 32x32 DctDct is forced. Returns the quantized coeffs,
     // the inverse type for reconstruction, and the Intra2 symbol index to code.
-    private static (int[] Coeffs, Av1TxType Inv, int Idx) ChooseTxType(int[] residual, int n, int tx, int dcDq, int acDq,
-        ushort[] predBlock, ushort[] src, int srcW, int srcBx, int srcBy, double rdLambda)
+    private static (int[] Coeffs, Av1TxType Inv, int Idx) ChooseTxType<TP>(int[] residual, int n, int tx, int dcDq, int acDq,
+        TP[] predBlock, TP[] src, int srcW, int srcBx, int srcBy, double rdLambda) where TP : unmanaged
     {
         int scanLen = Av1Tables.Scans[tx].Length;
         if (n > 16)
@@ -6544,17 +6593,11 @@ internal static partial class Av1StillImageEncoder
         return bestCand;
     }
 
-    private static int[] ForwardResidualPred(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy,
-        ushort[] pred, int n, int dcDq, int acDq, int scanLen)
+    private static int[] ForwardResidualPred<TP>(ReadOnlySpan<TP> src, int srcW, int srcBx, int srcBy,
+        TP[] pred, int n, int dcDq, int acDq, int scanLen) where TP : unmanaged
     {
         var residual = Av1FwdTransform.RentLevels(n * n);   // fully written below
-        for (int y = 0; y < n; y++)
-        {
-            for (int x = 0; x < n; x++)
-            {
-                residual[y * n + x] = src[(srcBy + y) * srcW + (srcBx + x)] - pred[y * n + x];
-            }
-        }
+        Px.Residual(src, srcBy * srcW + srcBx, srcW, pred, 0, n, residual, n, n);
 
         var lv = Av1FwdTransform.ForwardQuantSquare(residual, n, dcDq, acDq, scanLen);
         Av1FwdTransform.ReturnLevels(residual);

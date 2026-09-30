@@ -48,11 +48,10 @@ internal static partial class Av1StillImageEncoder
         public List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)> Txb;
     }
 
-    [ThreadStatic] private static LeafScratch? t_scAom;
 
     // The luma trellis lambda (coefficient-domain units): AomTrellisLam x libaom's (4.25 rdmult in RDCOST units = 68 x
     // its pixel-domain lambda rdmult / 2048), else RdoqLambdaScale x the mode lambda.
-    private static double LumaTrellisLambda(ColorPartCtx c)
+    private static double LumaTrellisLambda<TP>(ColorPartCtx<TP> c) where TP : unmanaged
     {
         if (Sp.AomTrellisLam <= 0) return RdoqScale * LamK * c.AcDq * c.AcDq;
         double dc = c.DcDq, rdm = dc * dc * (3.3 + 0.0015 * dc) / (1 << (2 * (Bd - 8)));
@@ -83,9 +82,9 @@ internal static partial class Av1StillImageEncoder
     // (dav1d recon_b_intra). Writes ReconY and the per-tx ALY/LLY coefficient contexts (callers restore them).
     // Returns J = SSE + lambda * coefficient bits, or +inf once the running J exceeds jLimit (args->exit_early).
     private static (double J, List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>? Txb)
-        LumaUniformTx(ColorPartCtx c, int lumaBs, int stx, int bx4, int by4, int w4, int h4,
+        LumaUniformTx<TP>(ColorPartCtx<TP> c, int lumaBs, int stx, int bx4, int by4, int w4, int h4,
             Av1IntraPredMode yMode, int yDelta, int yModeNoFilt, Av1EdgeFlags edgeFlags, int intraFlags,
-            double jLimit, double trellisMseThr)
+            double jLimit, double trellisMseThr) where TP : unmanaged
     {
         ref readonly var sTD = ref Av1Tables.TxfmDimensions[stx];
         int tw4 = sTD.W, th4 = sTD.H, tw = tw4 * 4, th = th4 * 4, sScan = Av1Tables.Scans[stx].Length;
@@ -98,7 +97,7 @@ internal static partial class Av1StillImageEncoder
         rdoqLambda = LumaTrellisLambda(c);
         // perform_block_coeff_opt: block_mse_q8 <= thr * qstep^2 (qstep = AC dequant >> 3 at 8 bits)
         double qstep = c.AcDq / (double)(1 << (Bd - 5));
-        var scr = t_scAom ??= new LeafScratch();
+        var scr = PxScratch<TP>.Aom ??= new LeafScratch<TP>();
         var pred = scr.P1; var res = scr.R; var qf = scr.Q1; var qfBest = scr.Q2;
         bool sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0, sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0;
         var list = RentTxbList((w4 / tw4) * (h4 / th4));
@@ -170,7 +169,7 @@ internal static partial class Av1StillImageEncoder
                     bool olv = false;
                     if (oTp >= 0 && OracleLevels != null && OracleLevels.TryGetValue(tx4 | (ty4 << 16), out var ol) && ol.Tx == stx)
                     {
-                        bool samePred = OraclePred != null && OraclePred.TryGetValue(tx4 | (ty4 << 16), out var opr) && opr.AsSpan(0, tw * th).SequenceEqual(pred.AsSpan(0, tw * th));
+                        bool samePred = OraclePred != null && OraclePred.TryGetValue(tx4 | (ty4 << 16), out var opr) && SameSamples(opr, pred, tw * th);
                         if (!oneD && CalOn && samePred)
                         {
                             // compare our trellis on this residual with the oracle's levels, on our own cost function
@@ -288,22 +287,20 @@ internal static partial class Av1StillImageEncoder
     }
 
     // residual = source - prediction for a tw x th block at (px, py) (res row-major, stride tw); returns its SSE.
-    private static long ResidualSse(ushort[] src, int stride, int px, int py, ushort[] pred, int[] res, int tw, int th)
+    private static long ResidualSse<TP>(TP[] src, int stride, int px, int py, TP[] pred, int[] res, int tw, int th) where TP : unmanaged
     {
         long sse = 0;
         if (tw >= 8)
         {
             for (int yy = 0; yy < th; yy++)
             {
-                ref ushort s0 = ref src[(py + yy) * stride + px];
-                ref ushort p0 = ref pred[yy * tw];
+                ref TP s0 = ref src[(py + yy) * stride + px];
+                ref TP p0 = ref pred[yy * tw];
                 ref int r0 = ref res[yy * tw];
                 var acc = Vector256<int>.Zero;
                 for (int xx = 0; xx < tw; xx += 8)
                 {
-                    var sv = Vector256.WidenLower(Vector256.Create(Vector128.LoadUnsafe(ref s0, (nuint)xx), Vector128<ushort>.Zero)).AsInt32();
-                    var pv = Vector256.WidenLower(Vector256.Create(Vector128.LoadUnsafe(ref p0, (nuint)xx), Vector128<ushort>.Zero)).AsInt32();
-                    var d = sv - pv;
+                    var d = Px.Load8x32(ref Unsafe.Add(ref s0, xx)) - Px.Load8x32(ref Unsafe.Add(ref p0, xx));
                     d.StoreUnsafe(ref r0, (nuint)xx);
                     acc += d * d;
                 }
@@ -314,7 +311,7 @@ internal static partial class Av1StillImageEncoder
         for (int yy = 0; yy < th; yy++)
             for (int xx = 0; xx < tw; xx++)
             {
-                int d = src[(py + yy) * stride + px + xx] - pred[yy * tw + xx];
+                int d = Px.I(src[(py + yy) * stride + px + xx]) - Px.I(pred[yy * tw + xx]);
                 res[yy * tw + xx] = d; sse += (long)d * d;
             }
         return sse;
@@ -322,41 +319,48 @@ internal static partial class Av1StillImageEncoder
 
     // SSE of a w x h block of two sample planes (differences within 16 bits at <= 12-bit depth): 16 / 8 lanes through
     // pmaddwd, widened to 64 bits every 8 rows (each 32-bit lane then holds <= 8 * 4 * 2 * 4095^2 < 2^31).
-    internal static long SseU16(ushort[] a, int aOff, int aStride, ushort[] b, int bOff, int bStride, int w, int h)
+    internal static long SseU16<TP>(TP[] a, int aOff, int aStride, TP[] b, int bOff, int bStride, int w, int h) where TP : unmanaged
     {
         long sse = 0;
         if (!Avx2.IsSupported || w < 8)
         {
             for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++) { int d = a[aOff + y * aStride + x] - b[bOff + y * bStride + x]; sse += (long)d * d; }
+                for (int x = 0; x < w; x++) { int d = Px.I(a[aOff + y * aStride + x]) - Px.I(b[bOff + y * bStride + x]); sse += (long)d * d; }
             return sse;
         }
         if ((long)aOff + (long)(h - 1) * aStride + w > a.Length || (long)bOff + (long)(h - 1) * bStride + w > b.Length || aOff < 0 || bOff < 0)
             throw new ArgumentOutOfRangeException(nameof(w));
-        ref ushort pa = ref MemoryMarshal.GetArrayDataReference(a), pb = ref MemoryMarshal.GetArrayDataReference(b);
+        ref TP pa = ref MemoryMarshal.GetArrayDataReference(a), pb = ref MemoryMarshal.GetArrayDataReference(b);
         for (int y = 0; y < h;)
         {
             var acc = Vector256<int>.Zero;
             for (int yEnd = Math.Min(h, y + 8); y < yEnd; y++)
             {
-                ref ushort ra = ref Unsafe.Add(ref pa, aOff + y * aStride), rb = ref Unsafe.Add(ref pb, bOff + y * bStride);
+                ref TP ra = ref Unsafe.Add(ref pa, aOff + y * aStride), rb = ref Unsafe.Add(ref pb, bOff + y * bStride);
                 int x = 0;
                 for (; x + 16 <= w; x += 16)
                 {
-                    var d = Vector256.LoadUnsafe(ref ra, (nuint)x).AsInt16() - Vector256.LoadUnsafe(ref rb, (nuint)x).AsInt16();
+                    var d = Px.Load16(ref Unsafe.Add(ref ra, x)).AsInt16() - Px.Load16(ref Unsafe.Add(ref rb, x)).AsInt16();
                     acc += Avx2.MultiplyAddAdjacent(d, d);
                 }
                 if (x + 8 <= w)
                 {
-                    var d = Vector128.LoadUnsafe(ref ra, (nuint)x).AsInt16() - Vector128.LoadUnsafe(ref rb, (nuint)x).AsInt16();
+                    var d = Px.Load8(ref Unsafe.Add(ref ra, x)).AsInt16() - Px.Load8(ref Unsafe.Add(ref rb, x)).AsInt16();
                     acc += Vector256.Create(Sse2.MultiplyAddAdjacent(d, d), Vector128<int>.Zero);
                     x += 8;
                 }
-                for (; x < w; x++) { int d = Unsafe.Add(ref ra, x) - Unsafe.Add(ref rb, x); sse += (long)d * d; }
+                for (; x < w; x++) { int d = Px.I(Unsafe.Add(ref ra, x)) - Px.I(Unsafe.Add(ref rb, x)); sse += (long)d * d; }
             }
             sse += SumInt(acc);
         }
         return sse;
+    }
+
+    // dev oracle: the first n samples of a (ushort) and b equal
+    private static bool SameSamples<TP>(ushort[] a, TP[] b, int n) where TP : unmanaged
+    {
+        for (int i = 0; i < n; i++) if (a[i] != Px.I(b[i])) return false;
+        return true;
     }
 
     // sum of the 8 non-negative lanes (each < 2^31) as a long
@@ -386,7 +390,7 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Hadamard model cost of a prediction (intra_model_rd): SATD over 8x8 tiles, 4x4 where a side is 4.
-    private static long AomModelRd(ColorPartCtx c, int bx, int by, ushort[] pred, int w, int h)
+    private static long AomModelRd<TP>(ColorPartCtx<TP> c, int bx, int by, TP[] pred, int w, int h) where TP : unmanaged
     {
         if (w >= 8 && h >= 8) return Satd8x8Rect(c.Luma, c.W, bx, by, pred, w, h);
         long satd = 0;
@@ -396,7 +400,7 @@ internal static partial class Av1StillImageEncoder
             {
                 for (int yy = 0; yy < 4; yy++)
                     for (int xx = 0; xx < 4; xx++)
-                        d[yy * 4 + xx] = c.Luma[(by + y0 + yy) * c.W + bx + x0 + xx] - pred[(y0 + yy) * w + x0 + xx];
+                        d[yy * 4 + xx] = Px.I(c.Luma[(by + y0 + yy) * c.W + bx + x0 + xx]) - Px.I(pred[(y0 + yy) * w + x0 + xx]);
                 for (int r = 0; r < 4; r++)
                 {
                     int a0 = d[r * 4] + d[r * 4 + 1], a1 = d[r * 4] - d[r * 4 + 1], a2 = d[r * 4 + 2] + d[r * 4 + 3], a3 = d[r * 4 + 2] - d[r * 4 + 3];
@@ -413,8 +417,8 @@ internal static partial class Av1StillImageEncoder
 
     // av1_rd_pick_intra_sby_mode for one luma leaf. On return ReconY / ALY / LLY hold the winner's reconstruction and
     // coefficient contexts. ymCdf context and the filter-intra / angle eligibility are the caller's.
-    private static LumaPick AomLumaSearch(ColorPartCtx c, int lumaBs, int lumaTx, int bx4, int by4, int w4, int h4,
-        Av1EdgeFlags edgeFlags, int intraFlags, bool angleOk, bool fiOk)
+    private static LumaPick AomLumaSearch<TP>(ColorPartCtx<TP> c, int lumaBs, int lumaTx, int bx4, int by4, int w4, int h4,
+        Av1EdgeFlags edgeFlags, int intraFlags, bool angleOk, bool fiOk) where TP : unmanaged
     {
         int w = w4 * 4, h = h4 * 4, bx = bx4 * 4, by = by4 * 4, bxR = bx4 & 31, byR = by4 & 31;
         double lambda = LamK * c.AcDq * c.AcDq;
@@ -440,7 +444,7 @@ internal static partial class Av1StillImageEncoder
         // x->source_variance (per-pixel variance of the source block) for the low-contrast depth prune
         long sum = 0, sq = 0;
         for (int yy = 0; yy < h; yy++)
-            for (int xx = 0; xx < w; xx++) { int v = c.Luma[(by + yy) * c.W + bx + xx]; sum += v; sq += (long)v * v; }
+            for (int xx = 0; xx < w; xx++) { int v = Px.I(c.Luma[(by + yy) * c.W + bx + xx]); sum += v; sq += (long)v * v; }
         double srcVar = ((double)sq - (double)sum * sum / (w * h)) / (w * h) / (1 << (2 * (Bd - 8)));
         double thr = Sp.AomTrellisMseThr;
 
@@ -504,7 +508,7 @@ internal static partial class Av1StillImageEncoder
         Span<long> top = stackalloc long[8];
         top.Fill(long.MaxValue);
         long bestModel = long.MaxValue;
-        var pred = (t_scAom ??= new LeafScratch()).P2;
+        var pred = (PxScratch<TP>.Aom ??= new LeafScratch<TP>()).P2;
         int nModes = 13 + (angleOk ? 48 : 0);
         for (int mi = 0; mi < nModes; mi++)
         {

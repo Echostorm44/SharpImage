@@ -1226,7 +1226,7 @@ internal static class Av1PartitionCnn
 
     /// <summary>Runs the CNN on the 65x65 luma window whose top-left is (x0 - 1, y0 - 1) (coordinates clamped to the
     /// plane, like libaom's extended border), values scaled to [0, 1].</summary>
-    internal static SbOutput Predict(ReadOnlySpan<ushort> luma, int stride, int planeW, int planeH, int x0, int y0, int bitDepth, int dcQ)
+    internal static SbOutput Predict<TP>(ReadOnlySpan<TP> luma, int stride, int planeW, int planeH, int x0, int y0, int bitDepth, int dcQ) where TP : unmanaged
     {
         float maxVal = (1 << bitDepth) - 1;
         var input = new float[65 * 65];
@@ -1236,7 +1236,7 @@ internal static class Av1PartitionCnn
             for (int x = 0; x < 65; x++)
             {
                 int xx = Math.Clamp(x0 - 1 + x, 0, planeW - 1);
-                input[y * 65 + x] = luma[yy * stride + xx] / maxVal;
+                input[y * 65 + x] = Px.I(luma[yy * stride + xx]) / maxVal;
             }
         }
         var o = new SbOutput();

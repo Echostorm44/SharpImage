@@ -13,7 +13,7 @@ internal static partial class Av1StillImageEncoder
     /// 6), photo-like (over 40 values) or solid; screen content when (palettizable - photo/16) blocks cover over a tenth of
     /// the frame. Complex blocks count only with per-pixel variance above 5. fast = every other block (checkerboard),
     /// libaom's speed >= 3.</summary>
-    internal static bool DetectScreenContent(ReadOnlySpan<ushort> luma, int stride, int width, int height, int bitDepth, bool fast)
+    internal static bool DetectScreenContent<TP>(ReadOnlySpan<TP> luma, int stride, int width, int height, int bitDepth, bool fast) where TP : unmanaged
     {
         const int blk = 16, simpleThresh = 4, complexInitial = 40, complexFinal = 6, varThresh = 5;
         long countPalette = 0, countPhoto = 0;
@@ -26,7 +26,7 @@ internal static partial class Av1StillImageEncoder
             for (int c = c0; c + blk <= width; c += blk * mult)
             {
                 for (int y = 0; y < blk; y++)
-                    for (int x = 0; x < blk; x++) b8[y * blk + x] = (byte)(luma[(r + y) * stride + c + x] >> shift);
+                    for (int x = 0; x < blk; x++) b8[y * blk + x] = (byte)(Px.I(luma[(r + y) * stride + c + x]) >> shift);
                 bool under = CountColorsWithThreshold(b8, complexInitial, out int nColors);
                 if (nColors > 1 && under)
                 {
@@ -78,12 +78,12 @@ internal static partial class Av1StillImageEncoder
 
     // av1_get_perpixel_variance for a 16x16 luma block against the flat 128 << (bd - 8) reference, with libaom's
     // high-bit-depth sse / sum rounding, then ROUND_POWER_OF_TWO(var, 8).
-    private static uint PerPixelVariance16(ReadOnlySpan<ushort> luma, int stride, int x0, int y0, int bitDepth)
+    private static uint PerPixelVariance16<TP>(ReadOnlySpan<TP> luma, int stride, int x0, int y0, int bitDepth) where TP : unmanaged
     {
         long sum = 0, sse = 0;
         int off = 128 << (bitDepth - 8);
         for (int y = 0; y < 16; y++)
-            for (int x = 0; x < 16; x++) { int d = luma[(y0 + y) * stride + x0 + x] - off; sum += d; sse += (long)d * d; }
+            for (int x = 0; x < 16; x++) { int d = Px.I(luma[(y0 + y) * stride + x0 + x]) - off; sum += d; sse += (long)d * d; }
         if (bitDepth == 10) { sse = (sse + 8) >> 4; sum = (sum + 2) >> 2; }
         else if (bitDepth == 12) { sse = (sse + 128) >> 8; sum = (sum + 8) >> 4; }
         long var = sse - sum * sum / 256;
@@ -91,38 +91,38 @@ internal static partial class Av1StillImageEncoder
         return (uint)((var + 128) >> 8);
     }
 
-    private sealed class LumaPal
+    private sealed class LumaPal<TP> where TP : unmanaged
     {
         public ushort[] Colors = new ushort[8];
         public int Size;
         public byte[] Map = null!;       // stride = block width
-        public ushort[] Pred = null!;
+        public TP[] Pred = null!;
         public int[] Coeffs = null!;
         public Av1TxType Inv;
         public int Idx;
         public double J;
     }
 
-    private sealed class UvPal
+    private sealed class UvPal<TP> where TP : unmanaged
     {
         public ushort[] U = new ushort[8], V = new ushort[8];
         public int Size;
         public byte[] Map = null!;       // stride = chroma block width
-        public ushort[] PredU = null!, PredV = null!;
+        public TP[] PredU = null!, PredV = null!;
     }
 
     [ThreadStatic] private static int[]? t_palHist;
 
     // Distinct values of a w x h region (ascending) with their counts; returns the count, or -1 when above max.
-    private static int CountColors(ReadOnlySpan<ushort> plane, int stride, int x0, int y0, int w, int h, int max,
-        Span<ushort> vals, Span<int> cnts)
+    private static int CountColors<TP>(ReadOnlySpan<TP> plane, int stride, int x0, int y0, int w, int h, int max,
+        Span<ushort> vals, Span<int> cnts) where TP : unmanaged
     {
         var hist = t_palHist ??= new int[1 << 12];
         int n = 0;
         for (int y = 0; y < h; y++)
         {
             int o = (y0 + y) * stride + x0;
-            for (int x = 0; x < w; x++) if (hist[plane[o + x]]++ == 0) n++;
+            for (int x = 0; x < w; x++) if (hist[Px.I(plane[o + x])]++ == 0) n++;
         }
         int k = 0;
         bool over = n > max;
@@ -131,7 +131,7 @@ internal static partial class Av1StillImageEncoder
             int o = (y0 + y) * stride + x0;
             for (int x = 0; x < w; x++)
             {
-                int v = plane[o + x];
+                int v = Px.I(plane[o + x]);
                 if (hist[v] == 0) continue;
                 if (!over) { vals[k] = (ushort)v; cnts[k] = hist[v]; k++; }
                 hist[v] = 0;
@@ -188,20 +188,20 @@ internal static partial class Av1StillImageEncoder
     }
 
     // Nearest palette index (lowest on ties) per pixel, the prediction it gives, and the map (stride w).
-    private static void PaletteMap(ReadOnlySpan<ushort> plane, int stride, int x0, int y0, int w, int h,
-        ushort[] colors, int size, byte[] map, ushort[] pred)
+    private static void PaletteMap<TP>(ReadOnlySpan<TP> plane, int stride, int x0, int y0, int w, int h,
+        ushort[] colors, int size, byte[] map, TP[] pred) where TP : unmanaged
     {
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
             {
-                int v = plane[(y0 + y) * stride + x0 + x], bi = 0, bd = int.MaxValue;
+                int v = Px.I(plane[(y0 + y) * stride + x0 + x]), bi = 0, bd = int.MaxValue;
                 for (int c = 0; c < size; c++) { int d = Math.Abs(v - colors[c]); if (d < bd) { bd = d; bi = c; } }
-                map[y * w + x] = (byte)bi; pred[y * w + x] = colors[bi];
+                map[y * w + x] = (byte)bi; pred[y * w + x] = Px.T<TP>(colors[bi]);
             }
     }
 
     // Luma palette cache of the block's neighbours (the decoder's get_palette_cache inputs).
-    private static (int LeftSz, int AboveSz) PaletteNeighbours(ColorPartCtx c, int bx4, int by4, Span<ushort> lCol, Span<ushort> aCol, bool uv)
+    private static (int LeftSz, int AboveSz) PaletteNeighbours<TP>(ColorPartCtx<TP> c, int bx4, int by4, Span<ushort> lCol, Span<ushort> aCol, bool uv) where TP : unmanaged
     {
         int bxR = bx4 & 31, byR = by4 & 31;
         byte[] lSzA = uv ? c.LPalSzUv : c.LPalSz, aSzA = uv ? c.APalSzUv : c.APalSz;
@@ -226,8 +226,8 @@ internal static partial class Av1StillImageEncoder
     /// bits), directly comparable with the regular leaf's J.</summary>
     /// <summary>... bound: the J the palette must beat (the regular winner's); a candidate whose side information alone
     /// costs that much is not evaluated.</summary>
-    private static LumaPal? SearchLumaPalette(ColorPartCtx c, int bs, int lumaTx, int bx4, int by4, int w, int h, Span<ushort> ymCdf,
-        double bound = double.MaxValue)
+    private static LumaPal<TP>? SearchLumaPalette<TP>(ColorPartCtx<TP> c, int bs, int lumaTx, int bx4, int by4, int w, int h, Span<ushort> ymCdf,
+        double bound = double.MaxValue) where TP : unmanaged
     {
         int bx = bx4 * 4, by = by4 * 4, bxR = bx4 & 31, byR = by4 & 31;
         var vals = new ushort[64]; var cnts = new int[64];   // arrays: captured by Eval below
@@ -246,7 +246,7 @@ internal static partial class Av1StillImageEncoder
         double baseBits = Av1CoeffEncode.SymBits(ymCdf, (int)Av1IntraPredMode.Dc)
             + Av1CoeffEncode.BoolBits(c.Cdf.GetPalYCdf(szCtx, palCtx)[0], 1);
         int maxVal = (1 << Bd) - 1;
-        LumaPal? best = null;
+        LumaPal<TP>? best = null;
         var colors = new ushort[8];
         var qf = new double[scanLen];
         var res = new int[w * h];
@@ -260,7 +260,7 @@ internal static partial class Av1StillImageEncoder
             if (nv <= 8 && k == nv) { for (int i = 0; i < nv; i++) colors[i] = vals[i]; size = nv; }
             else size = KMeans1D(vals, cnts, nv, k, maxVal, colors);
             if (size < 2) return 0;
-            var cand = new LumaPal { Size = size, Map = new byte[w * h], Pred = new ushort[w * h] };
+            var cand = new LumaPal<TP> { Size = size, Map = new byte[w * h], Pred = new TP[w * h] };
             Array.Copy(colors, cand.Colors, size);
             PaletteMap(c.Luma, c.W, bx, by, w, h, cand.Colors, size, cand.Map, cand.Pred);
             double palBits = baseBits + Av1CoeffEncode.SymBits(c.Cdf.GetPalSzCdf(0, szCtx), size - 2)
@@ -270,7 +270,7 @@ internal static partial class Av1StillImageEncoder
             if (lambda * palBits >= limit) return -1;   // the side information alone already loses (exact)
             if (StatsOn) System.Threading.Interlocked.Increment(ref StatPalCand);
             for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++) res[y * w + x] = c.Luma[(by + y) * c.W + bx + x] - cand.Pred[y * w + x];
+                for (int x = 0; x < w; x++) res[y * w + x] = Px.I(c.Luma[(by + y) * c.W + bx + x]) - Px.I(cand.Pred[y * w + x]);
             double bestJ = double.MaxValue;
             foreach (var (fwd, inv, idx) in txSet)
             {
@@ -320,7 +320,7 @@ internal static partial class Av1StillImageEncoder
         {
             // RDOQ the winner (as the regular leaf does after its choice)
             for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++) res[y * w + x] = c.Luma[(by + y) * c.W + bx + x] - best.Pred[y * w + x];
+                for (int x = 0; x < w; x++) res[y * w + x] = Px.I(c.Luma[(by + y) * c.W + bx + x]) - Px.I(best.Pred[y * w + x]);
             Av1FwdTransform.ForwardQuantRect(res, w, h, lumaTx, c.DcDq, c.AcDq, scanLen, FwdTypeForTxType(best.Inv), qf);
             Av1CoeffEncode.RdoqOptimize(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)Av1IntraPredMode.Dc, best.Coeffs, qf,
                 c.DcDq, c.AcDq, 0, ySign, best.Idx, RdoqScale * LamK * c.AcDq * c.AcDq);
@@ -330,14 +330,14 @@ internal static partial class Av1StillImageEncoder
 
     /// <summary>Chroma palette candidates for a fully-inside cw x ch chroma block: 2-D k-means over (u, v) pairs,
     /// sizes min(colours, 8) down to 2, pairs ordered by U (the U palette must ascend).</summary>
-    private static List<UvPal> UvPaletteCandidates(ColorPartCtx c, int cbx, int cby, int cw, int ch)
+    private static List<UvPal<TP>> UvPaletteCandidates<TP>(ColorPartCtx<TP> c, int cbx, int cby, int cw, int ch) where TP : unmanaged
     {
-        var list = new List<UvPal>();
+        var list = new List<UvPal<TP>>();
         var pairs = new Dictionary<int, int>();
         for (int y = 0; y < ch; y++)
             for (int x = 0; x < cw; x++)
             {
-                int o = (cby + y) * c.Cw + cbx + x, key = (c.U[o] << 16) | c.V[o];
+                int o = (cby + y) * c.Cw + cbx + x, key = (Px.I(c.U[o]) << 16) | Px.I(c.V[o]);
                 pairs[key] = pairs.TryGetValue(key, out int n) ? n + 1 : 1;
                 if (pairs.Count > 64) return list;
             }
@@ -382,7 +382,7 @@ internal static partial class Av1StillImageEncoder
             }
             if (cols.Count < 2) continue;
             cols.Sort((a, b) => a.U != b.U ? a.U.CompareTo(b.U) : a.V.CompareTo(b.V));
-            var cand = new UvPal { Size = cols.Count, Map = new byte[cw * ch], PredU = new ushort[cw * ch], PredV = new ushort[cw * ch] };
+            var cand = new UvPal<TP> { Size = cols.Count, Map = new byte[cw * ch], PredU = new TP[cw * ch], PredV = new TP[cw * ch] };
             for (int i = 0; i < cols.Count; i++) { cand.U[i] = cols[i].U; cand.V[i] = cols[i].V; }
             for (int y = 0; y < ch; y++)
                 for (int x = 0; x < cw; x++)
@@ -390,10 +390,10 @@ internal static partial class Av1StillImageEncoder
                     int o = (cby + y) * c.Cw + cbx + x, bi = 0; long bd = long.MaxValue;
                     for (int q = 0; q < cand.Size; q++)
                     {
-                        long du = c.U[o] - cand.U[q], dv = c.V[o] - cand.V[q], d = du * du + dv * dv;
+                        long du = Px.I(c.U[o]) - cand.U[q], dv = Px.I(c.V[o]) - cand.V[q], d = du * du + dv * dv;
                         if (d < bd) { bd = d; bi = q; }
                     }
-                    cand.Map[y * cw + x] = (byte)bi; cand.PredU[y * cw + x] = cand.U[bi]; cand.PredV[y * cw + x] = cand.V[bi];
+                    cand.Map[y * cw + x] = (byte)bi; cand.PredU[y * cw + x] = Px.T<TP>(cand.U[bi]); cand.PredV[y * cw + x] = Px.T<TP>(cand.V[bi]);
                 }
             list.Add(cand);
         }
@@ -401,7 +401,7 @@ internal static partial class Av1StillImageEncoder
     }
 
     /// <summary>Bits of a chroma palette beyond the DC uv_mode symbol: has_palette_uv=1, size, colours, index map.</summary>
-    private static double UvPaletteBits(ColorPartCtx c, UvPal p, int bx4, int by4, int bs, bool lumaPal, int cw, int ch)
+    private static double UvPaletteBits<TP>(ColorPartCtx<TP> c, UvPal<TP> p, int bx4, int by4, int bs, bool lumaPal, int cw, int ch) where TP : unmanaged
     {
         int szCtx = Av1Tables.BlockDimensions[bs, 2] + Av1Tables.BlockDimensions[bs, 3] - 2;
         Span<ushort> lCol = stackalloc ushort[8], aCol = stackalloc ushort[8];
@@ -413,7 +413,7 @@ internal static partial class Av1StillImageEncoder
     }
 
     /// <summary>Palette syntax of a block (flags in decode_b order are the caller's): the luma palette size + colours.</summary>
-    private static void EmitLumaPaletteColors(ColorPartCtx c, LumaPal p, int bx4, int by4, int szCtx)
+    private static void EmitLumaPaletteColors<TP>(ColorPartCtx<TP> c, LumaPal<TP> p, int bx4, int by4, int szCtx) where TP : unmanaged
     {
         c.Msac.EncodeSymbolAdapt(c.Cdf.GetPalSzCdf(0, szCtx), p.Size - 2, 6);
         Span<ushort> lCol = stackalloc ushort[8], aCol = stackalloc ushort[8];
@@ -421,7 +421,7 @@ internal static partial class Av1StillImageEncoder
         Av1CoeffEncode.EncodeLumaPaletteColorsCore(c.Msac, p.Colors, p.Size, lCol, lSz, aCol, aSz, Bd);
     }
 
-    private static void EmitUvPaletteColors(ColorPartCtx c, UvPal p, int bx4, int by4, int szCtx)
+    private static void EmitUvPaletteColors<TP>(ColorPartCtx<TP> c, UvPal<TP> p, int bx4, int by4, int szCtx) where TP : unmanaged
     {
         c.Msac.EncodeSymbolAdapt(c.Cdf.GetPalSzCdf(1, szCtx), p.Size - 2, 6);
         Span<ushort> lCol = stackalloc ushort[8], aCol = stackalloc ushort[8];
@@ -431,7 +431,7 @@ internal static partial class Av1StillImageEncoder
 
     /// <summary>Neighbour palette state after a block (the decoder's pal_sz / pal cache updates over the block's
     /// 4-unit extent): luma size + colours, chroma size + U colours.</summary>
-    private static void FillPaletteCtx(ColorPartCtx c, int bx4, int by4, int w4, int h4, LumaPal? yp, UvPal? uvp)
+    private static void FillPaletteCtx<TP>(ColorPartCtx<TP> c, int bx4, int by4, int w4, int h4, LumaPal<TP>? yp, UvPal<TP>? uvp) where TP : unmanaged
     {
         int bxR = bx4 & 31, byR = by4 & 31;
         byte ys = (byte)(yp?.Size ?? 0), us = (byte)(uvp?.Size ?? 0);
