@@ -511,18 +511,23 @@ internal static class Av1CoeffEncode
             if (eobTok == 2) bits += CBr(coef, brTokIdx + (((xE | yE) > 1) ? 14 : 7), magEob);
             levels[rcEob] = LevelByte(magEob);
 
+            // the middle coefficients through the trellis's context machinery (per-position offsets, unchecked neighbour
+            // reads, cost-table rows): the same contexts and symbol costs, summed in the same order
+            var tc = new TrCtx { Coef = coef, Levels = levels, Stride = stride, Pos = TrPosTables[tx], BaseTokIdx = baseTokIdx, BrTokIdx = brTokIdx };
+            if (coef.Tab is { } tab)
+            {
+                tc.HasTab = true;
+                tc.BaseC = ref MemoryMarshal.GetArrayDataReference(tab.Base);
+                tc.BrC = ref MemoryMarshal.GetArrayDataReference(tab.Br);
+            }
+            ref int sl0 = ref MemoryMarshal.GetReference(signedLevels);
             for (int i = eob - 1; i > 0; i--)
             {
-                int rcI = scan[i], x = rcI >> shift, y = rcI & mask, mag = Math.Abs(signedLevels[rcI]);
-                int loCtx = Av1CoeffDecode.GetLoCtx(levels.AsSpan(rcI), Av1TxClass.TwoD, out uint hiMag, LoCtxOffsetsIdx(tx), x, y, stride);
+                int rcI = scan[i], mag = Math.Abs(Unsafe.Add(ref sl0, rcI));
+                TrMidCtx(ref tc, rcI, out int baseCdf, out int brCdf);
                 int tok = Math.Min(mag, 3);
-                bits += CBase(coef, baseTokIdx + loCtx, tok);
-                if (tok == 3)
-                {
-                    hiMag &= 63;
-                    int hiCtx = (int)(((y | x) > 1 ? 14u : 7u) + (hiMag > 12 ? 6u : (uint)(hiMag + 1) >> 1));
-                    bits += CBr(coef, brTokIdx + hiCtx, mag);
-                }
+                bits += TBase(ref tc, baseCdf, tok);
+                if (tok == 3) bits += tc.HasTab ? Unsafe.Add(ref tc.BrC, brCdf * 16 + Math.Min(mag, 15)) : HiTokBits(coef.BrTok[brCdf], mag);
                 levels[rcI] = LevelByte(mag);
             }
 
