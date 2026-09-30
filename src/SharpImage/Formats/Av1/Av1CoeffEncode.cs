@@ -400,12 +400,22 @@ internal static class Av1CoeffEncode
 
     private const double Log2_32768 = 15.0;
     [ThreadStatic] private static byte[]? t_estLevels; // EstimateCoefBits level map (all zero between calls)
-    // BitCost[p] = 15 - log2(max(p, 1)) for a Q15 probability p: the same doubles Math.Log2 gives, looked up.
+    // BitCost[p] = 15 - log2(max(p, 1)) for a Q15 probability p, rounded to 1/512 bit: libaom's integer rate unit
+    // (AV1_PROB_COST_SHIFT 9). Every symbol cost is then a multiple of 2^-9, so any sum of them is exact in a double and
+    // independent of its order (hot accumulations can run in integers, CostShift units); BD-neutral vs exact log2.
+    internal const int CostShift = 9;
     internal static readonly double[] BitCost = MakeBitCost();
+    internal static readonly int[] BitCost512 = MakeBitCost512();
+    private static int[] MakeBitCost512()
+    {
+        var t = new int[32769];
+        for (int p = 0; p <= 32768; p++) t[p] = (int)Math.Round((Log2_32768 - Math.Log2(Math.Max(p, 1))) * (1 << CostShift));
+        return t;
+    }
     private static double[] MakeBitCost()
     {
         var t = new double[32769];
-        for (int p = 0; p <= 32768; p++) t[p] = Log2_32768 - Math.Log2(Math.Max(p, 1));
+        for (int p = 0; p <= 32768; p++) t[p] = (double)Math.Round((Log2_32768 - Math.Log2(Math.Max(p, 1))) * (1 << CostShift)) / (1 << CostShift);
         return t;
     }
     /// <summary>Bit cost of coding symbol <paramref name="s"/> from an inverse-CDF's current probabilities.</summary>
