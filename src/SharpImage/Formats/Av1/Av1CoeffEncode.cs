@@ -11,6 +11,7 @@ using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace SharpImage.Formats.Av1;
 
@@ -540,6 +541,23 @@ internal static class Av1CoeffEncode
             // total is the same whatever the grouping)
             ref int sl0 = ref MemoryMarshal.GetReference(signedLevels);
             int midR = 0;
+            if (coef.Tab is { } stab && Vector256.IsHardwareAccelerated)
+            {
+                // libaom's encodetxb order: the level map and every context in vector passes, then a lookup per coefficient
+                midR = EstimateMidV(signedLevels, scan, tx, eob, shift, stride, baseTokIdx, brTokIdx, stab, out int sgn, out uint dcNbV);
+                levels[rcEob] = 0;
+                bits += midR * (1.0 / (1 << CostShift));
+                int dcMagV = Math.Abs(signedLevels[0]);
+                int dcTokV = Math.Min(dcMagV, 3);
+                bits += CBase(coef, baseTokIdx + 0, dcTokV);
+                if (dcTokV == 3) bits += CBr(coef, brTokIdx + (int)(dcNbV > 12 ? 6u : (dcNbV + 1) >> 1), dcMagV);
+                if (dcMagV != 0)
+                {
+                    bits += CDcSign(coef, chroma * 3 + dcSignCtx, signedLevels[0] < 0 ? 1u : 0u);
+                    if (dcMagV >= 15) bits += GolombBits((uint)(dcMagV - 15));
+                }
+                return bits + sgn;
+            }
             var tc = new TrCtx { Coef = coef, Levels = levels, Stride = stride, Pos = TrPosTables[tx], BaseTokIdx = baseTokIdx, BrTokIdx = brTokIdx };
             if (coef.Tab is { } tab)
             {
@@ -598,6 +616,107 @@ internal static class Av1CoeffEncode
         }
 
         return bits;
+    }
+
+    // Per tx size: each coefficient's index in the column-padded map (column stride height + 4), the base-context offset
+    // and br-context base of every padded position, and the widest column / row any scan index up to i reaches.
+    private sealed class EstTx
+    {
+        public ushort[] Pad = null!; public byte[] OffB = null!, OffBr = null!, MaxX = null!, MaxY = null!;
+    }
+    private static readonly EstTx?[] EstTxs = new EstTx?[19];
+    private static EstTx GetEstTx(int tx)
+    {
+        var e = EstTxs[tx];
+        if (e != null) return e;
+        ref readonly Av1TxfmInfo d = ref Av1Tables.TxfmDimensions[tx];
+        int slh = Math.Min((int)d.Lh, (int)Av1TxSize.Tx32x32), shift = slh + 2, sh = 4 << slh, mask = sh - 1, sp = sh + 4;
+        var scan = Av1Tables.Scans[tx];
+        int n = scan.Length, cols = n / sh;
+        var pos = TrPosTables[tx];
+        e = new EstTx { Pad = new ushort[n], OffB = new byte[(cols + 3) * sp + 64], OffBr = new byte[(cols + 3) * sp + 64], MaxX = new byte[n], MaxY = new byte[n] };
+        for (int rc = 0; rc < n; rc++)
+        {
+            int p = (rc >> shift) * sp + (rc & mask);
+            e.Pad[rc] = (ushort)p; e.OffB[p] = (byte)(pos[rc] & 0xFF); e.OffBr[p] = (byte)(pos[rc] >> 8);
+        }
+        int mx = 0, my = 0;
+        for (int i = 0; i < n; i++) { mx = Math.Max(mx, scan[i] >> shift); my = Math.Max(my, scan[i] & mask); e.MaxX[i] = (byte)mx; e.MaxY[i] = (byte)my; }
+        return EstTxs[tx] = e;
+    }
+    [ThreadStatic] private static byte[]? t_evLv, t_evCb, t_evCr;
+
+    // EstimateCoefBits' middle coefficients (scan 1 .. eob - 1) with the cost table, in 1/512 bit, plus the sign / Golomb
+    // bits of scan 1 .. eob and the DC's br neighbour sum. The level map (dav1d LevelByte form, column-padded so a read
+    // past a column's end sees zero) is written for the box the eob reaches, then every base / br context of that box is
+    // computed 16 at a time (the same sums and clamps as TrMidCtx), and each coefficient is one table lookup.
+    private static int EstimateMidV(ReadOnlySpan<int> sl, ushort[] scan, int tx, int eob, int shift, int sh, int baseTokIdx, int brTokIdx,
+        Av1CoefCostTab tab, out int signBits, out uint dcNb)
+    {
+        var et = GetEstTx(tx);
+        int sp = sh + 4, mask = sh - 1;
+        int maxX = et.MaxX[eob], rows = et.MaxY[eob] + 1;
+        var lv = t_evLv ??= new byte[36 * 35 + 64];
+        var cb = t_evCb ??= new byte[36 * 35 + 64];
+        var cr = t_evCr ??= new byte[36 * 35 + 64];
+        int span = (maxX + 3) * sp;   // the box's columns and the two read past it
+        lv.AsSpan(0, span + 32).Clear();
+        ref int sl0 = ref MemoryMarshal.GetReference(sl);
+        ref byte lv0 = ref MemoryMarshal.GetArrayDataReference(lv);
+        // level bytes: 0; 1..2 -> 65 * mag; >= 3 -> 192 + min(mag, 15)
+        var c65 = Vector256.Create(65); var c192 = Vector256.Create(192); var c15 = Vector256.Create(15); var c2 = Vector256.Create(2);
+        for (int x = 0; x <= maxX; x++)
+        {
+            ref int col = ref Unsafe.Add(ref sl0, x * sh);
+            ref byte dst = ref Unsafe.Add(ref lv0, x * sp);
+            int y = 0;
+            for (; y + 8 <= rows; y += 8)
+            {
+                var m = Vector256.Abs(Vector256.LoadUnsafe(ref col, (nuint)y));
+                var b = Vector256.ConditionalSelect(Vector256.GreaterThan(m, c2), Vector256.Min(m, c15) + c192, m * c65);
+                var s = Vector128.Narrow(b.GetLower(), b.GetUpper());
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, y), Vector128.Narrow(s, s).AsUInt64().ToScalar());
+            }
+            for (; y < rows; y++) Unsafe.Add(ref dst, y) = LevelByte(Math.Abs(Unsafe.Add(ref col, y)));
+        }
+        // contexts over the box: base = offset + min((S + 64) >> 7, 4) of the five neighbours' sum S, br = base + f(sum of three & 63)
+        ref byte cb0 = ref MemoryMarshal.GetArrayDataReference(cb);
+        ref byte cr0 = ref MemoryMarshal.GetArrayDataReference(cr);
+        ref byte ob0 = ref MemoryMarshal.GetArrayDataReference(et.OffB);
+        ref byte obr0 = ref MemoryMarshal.GetArrayDataReference(et.OffBr);
+        int end = maxX * sp + rows;
+        var c64 = Vector256.Create((ushort)64); var c4 = Vector256.Create((ushort)4); var c63 = Vector256.Create((ushort)63);
+        var c12 = Vector256.Create((ushort)12); var c6 = Vector256.Create((ushort)6); var c1 = Vector256.Create((ushort)1);
+        for (int p = 0; p < end; p += 16)
+        {
+            ref byte q = ref Unsafe.Add(ref lv0, p);
+            var hm3 = Px.Load16(ref Unsafe.Add(ref q, 1)) + Px.Load16(ref Unsafe.Add(ref q, sp)) + Px.Load16(ref Unsafe.Add(ref q, sp + 1));
+            var s5 = hm3 + Px.Load16(ref Unsafe.Add(ref q, 2)) + Px.Load16(ref Unsafe.Add(ref q, 2 * sp));
+            var bctx = Vector256.Min(Vector256.ShiftRightLogical(s5 + c64, 7), c4) + Px.Load16(ref Unsafe.Add(ref ob0, p));
+            var hm = hm3 & c63;
+            var brc = Vector256.ConditionalSelect(Vector256.GreaterThan(hm, c12), c6, Vector256.ShiftRightLogical(hm + c1, 1)) + Px.Load16(ref Unsafe.Add(ref obr0, p));
+            Px.Store16(ref Unsafe.Add(ref cb0, p), bctx);
+            Px.Store16(ref Unsafe.Add(ref cr0, p), brc);
+        }
+        // per coefficient: its two contexts' costs (and the sign / Golomb bits)
+        ref int ib = ref MemoryMarshal.GetArrayDataReference(tab.IBase);
+        ref int ibr = ref MemoryMarshal.GetArrayDataReference(tab.IBr);
+        ref ushort pad0 = ref MemoryMarshal.GetArrayDataReference(et.Pad);
+        ref ushort sc0 = ref MemoryMarshal.GetArrayDataReference(scan);
+        int r = 0, sg = 0;
+        for (int i = eob - 1; i > 0; i--)
+        {
+            int rc = Unsafe.Add(ref sc0, i), mag = Math.Abs(Unsafe.Add(ref sl0, rc)), p = Unsafe.Add(ref pad0, rc);
+            int tok = Math.Min(mag, 3);
+            r += Unsafe.Add(ref ib, (baseTokIdx + Unsafe.Add(ref cb0, p)) * 4 + tok);
+            if (tok == 3) r += Unsafe.Add(ref ibr, (brTokIdx + Unsafe.Add(ref cr0, p)) * 16 + Math.Min(mag, 15));
+            if (mag != 0) { sg++; if (mag >= 15) sg += GolombLen((uint)(mag - 15)); }
+        }
+        int magE = Math.Abs(Unsafe.Add(ref sl0, Unsafe.Add(ref sc0, eob)));
+        sg++; if (magE >= 15) sg += GolombLen((uint)(magE - 15));
+        signBits = sg;
+        dcNb = (uint)(lv[1] + lv[sp] + lv[sp + 1]) & 63;
+        return r;
     }
 
     /// <summary>Rate-distortion optimized quantization (encoder-only; the decoder is unaffected). Refines the
