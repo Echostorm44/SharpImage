@@ -101,7 +101,7 @@ internal static partial class Av1StillImageEncoder
         var scr = t_scAom ??= new LeafScratch();
         var pred = scr.P1; var res = scr.R; var qf = scr.Q1; var qfBest = scr.Q2;
         bool sbHasTr = (edgeFlags & Av1EdgeFlags.I444TopHasRight) != 0, sbHasBl = (edgeFlags & Av1EdgeFlags.I444LeftHasBottom) != 0;
-        var list = new List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>((w4 / tw4) * (h4 / th4));
+        var list = RentTxbList((w4 / tw4) * (h4 / th4));
         double jSum = 0;
         if (StatsOn) System.Threading.Interlocked.Increment(ref StatTrials);
         for (int iy = 0; iy < h4; iy += th4)
@@ -260,10 +260,31 @@ internal static partial class Av1StillImageEncoder
                 if (jSum > jLimit)
                 {
                     foreach (var t in list) Av1FwdTransform.ReturnLevels(t.Cf);
+                    ReturnTxbList(list);
                     return (double.PositiveInfinity, null);
                 }
             }
         return (jSum, list);
+    }
+
+    // Per-thread pool of the tx-block lists LumaUniformTx hands out (a losing candidate's list comes back cleared).
+    [ThreadStatic] private static List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>[]? t_txbPool;
+    [ThreadStatic] private static int t_txbPoolN;
+    private static List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)> RentTxbList(int capacity)
+    {
+        if (t_txbPool != null && t_txbPoolN > 0)
+        {
+            var l = t_txbPool[--t_txbPoolN];
+            if (l.Capacity < capacity) l.Capacity = capacity;
+            return l;
+        }
+        return new List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>(capacity);
+    }
+    private static void ReturnTxbList(List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)> l)
+    {
+        l.Clear();
+        t_txbPool ??= new List<(int[] Cf, Av1TxType Inv, int Idx, int SkipCtx, int SignCtx, int Px, int Py)>[32];
+        if (t_txbPoolN < t_txbPool.Length) t_txbPool[t_txbPoolN++] = l;
     }
 
     // residual = source - prediction for a tw x th block at (px, py) (res row-major, stride tw); returns its SSE.
@@ -456,11 +477,11 @@ internal static partial class Av1StillImageEncoder
                     rd[Math.Min(k, 2)] = jt;
                     if (jt < best.J)
                     {
-                        if (best.Txb != null) foreach (var t in best.Txb) Av1FwdTransform.ReturnLevels(t.Cf);
+                        if (best.Txb != null) { foreach (var t in best.Txb) Av1FwdTransform.ReturnLevels(t.Cf); ReturnTxbList(best.Txb); }
                         best = new LumaPick { Mode = m, Delta = dl, ModeNoFilt = nf, Depth = codedDepth, Tx = sizes[k], J = jt, Txb = txb };
                         bestModeBits = modeBits;
                     }
-                    else foreach (var t in txb) Av1FwdTransform.ReturnLevels(t.Cf);
+                    else { foreach (var t in txb) Av1FwdTransform.ReturnLevels(t.Cf); ReturnTxbList(txb); }
                 }
                 // prune the smallest size on low-contrast blocks when splitting once already lost
                 if (k > 0 && initDepth + k != 2 && srcVar < 256 && rd[k - 1] != double.MaxValue && rd[k] > rd[k - 1]) break;
@@ -540,6 +561,7 @@ internal static partial class Av1StillImageEncoder
             c.AomModeCache[ck] = (1 << 20) | ((fw ? 1 : 0) << 16) | ((fw ? 0 : (int)best.Mode) << 8) | (best.Delta + 8);
             c.AomModeCacheSb[ck] = sbId;
             foreach (var t in best.Txb) Av1FwdTransform.ReturnLevels(t.Cf);
+            ReturnTxbList(best.Txb);
             best.Txb = LumaUniformTx(c, lumaBs, best.Tx, bx4, by4, w4, h4, best.Mode, best.Delta, best.ModeNoFilt,
                 edgeFlags, intraFlags, double.MaxValue, thr).Txb;
         }

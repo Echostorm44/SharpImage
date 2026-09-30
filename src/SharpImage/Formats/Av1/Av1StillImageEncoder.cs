@@ -4283,7 +4283,7 @@ internal static partial class Av1StillImageEncoder
         double clamT = ChromaLamScale * LamK * c.AcDq * c.AcDq;
         double PlaneJ(ushort[] src, ushort[] pred, Av1TxType t, int skc, int sgc, out int[] lv)
         {
-            var qf = new double[cScan];
+            var qf = t_planeJQf ??= new double[1024];
             lv = ForwardResidualPredRect(src, c.Cw, cbx, cby, pred, cw, ch, chromaTx, c.DcDq, c.AcDq, cScan, qf, FwdTypeForTxType(t));
             double bits = Av1CoeffEncode.TrellisOptimize(eCoef, chromaTx, 1, lv, qf, c.DcDq, c.AcDq, skc, sgc, clamT);
             return ReconSseCandRect(lv, chromaTx, cw, ch, c.DcDq, c.AcDq, pred, src, c.Cw, cbx, cby, t) + clam0 * bits;
@@ -4356,10 +4356,12 @@ internal static partial class Av1StillImageEncoder
                 if (j < bestJ)
                 {
                     bestJ = j; uvMode = (int)mode; uvDelta = delta; useCfl = false;
+                    Av1FwdTransform.ReturnLevels(uC); Av1FwdTransform.ReturnLevels(vC);
                     uC = uu; vC = vv;
                     (predU, pu) = (pu, predU != dcuP ? predU : new ushort[pu.Length]);
                     (predV, pv) = (pv, predV != dcvP ? predV : new ushort[pv.Length]);
                 }
+                else { Av1FwdTransform.ReturnLevels(uu); Av1FwdTransform.ReturnLevels(vv); }
             }
         }
 
@@ -4396,10 +4398,17 @@ internal static partial class Av1StillImageEncoder
                         if (jj < cflBest) { cflBest = jj; bu = x1; bv = x2; }
                     }
                 }
-                if (cflBest < bestJ)
+                bool takeCfl = cflBest < bestJ;
+                if (takeCfl)
                 {
                     bestJ = cflBest; useCfl = true; uvMode = (int)Av1IntraPredMode.ChromaFromLuma;
+                    Av1FwdTransform.ReturnLevels(uC); Av1FwdTransform.ReturnLevels(vC);
                     alphaU = bu - 16; alphaV = bv - 16; uC = lu[bu]; vC = lvv[bv]; predU = pu2[bu]; predV = pv2[bv];
+                }
+                for (int k = 0; k < 33; k++)
+                {
+                    if (!(takeCfl && k == bu)) Av1FwdTransform.ReturnLevels(lu[k]);
+                    if (!(takeCfl && k == bv)) Av1FwdTransform.ReturnLevels(lvv[k]);
                 }
             }
             else if (aU != 0 || aV != 0)
@@ -5882,6 +5891,8 @@ internal static partial class Av1StillImageEncoder
 
     // Sum of absolute differences over a cn x cn block (pred stride = cn). Works at any size (unlike the 8x8-tiled
     // SATD), so it prescreens chroma UV modes down to 4x4. A coarse proxy — good enough to pick the RD shortlist.
+    [ThreadStatic] private static double[]? t_planeJQf;
+
     private static long SadBlock(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int cn)
         => SadRect(src, srcW, srcBx, srcBy, pred, cn, cn);
 
