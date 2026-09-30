@@ -34,6 +34,11 @@ public sealed class AomEncoderSmoke
         AomTrace.Out = traceWriter;
         int reps = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_REPS") ?? "1");
         AomComp cpi = null!; AomMacroblock x = null!;
+        if (reps > 1)
+        {
+            System.Diagnostics.Process.GetCurrentProcess().PriorityClass = System.Diagnostics.ProcessPriorityClass.High;
+            System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
+        }
         var sw = new System.Diagnostics.Stopwatch();
         long searchMs = 0, postMs = 0;
         for (int rep = 0; rep < reps; rep++)

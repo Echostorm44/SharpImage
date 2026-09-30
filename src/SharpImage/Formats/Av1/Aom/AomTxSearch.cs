@@ -224,7 +224,7 @@ internal static class AomTxSearch
         int dstIdx = pd.Dst.Offset + ((blkRow * dstStride + blkCol) << 2);
         const int MaxTxSize = 64;
         var recon = t_recon ??= new byte[MaxTxSize * MaxTxSize];
-        for (int r = 0; r < bsh; r++) Array.Copy(pd.Dst.Buf, dstIdx + r * dstStride, recon, r * MaxTxSize, bsw);
+        AomEncodeMb.CopyBlock(pd.Dst.Buf, dstIdx, dstStride, recon, 0, MaxTxSize, bsw, bsh);
         int txType = AomEncodeMb.GetTxType(xd, plane == 0 ? 0 : 1, blkRow, blkCol, txSize, cpi.ReducedTxSetUsed != 0);
         AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, recon, 0, MaxTxSize, eob);
         return 16 * (long)PixelDist(x, plane, p.Src.Buf, srcIdx, srcStride, recon, 0, MaxTxSize, blkRow, blkCol, planeBsize, txBsize);

@@ -232,22 +232,25 @@ internal static class AomTxb
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int NzMag(ReadOnlySpan<byte> levels, int p, int bhl, int txClass)
     {
-        int mag = ClipMax3(levels[p + (1 << bhl) + TxPadHor]) + ClipMax3(levels[p + 1]);
+        // levels is the padded TxPad2d map: every neighbour of an in-block position lies inside it
+        ref byte l = ref Unsafe.Add(ref MemoryMarshal.GetReference(levels), p);
+        int stride = (1 << bhl) + TxPadHor;
+        int mag = ClipMax3(Unsafe.Add(ref l, stride)) + ClipMax3(Unsafe.Add(ref l, 1));
         if (txClass == TX_CLASS_2D)
         {
-            mag += ClipMax3(levels[p + (1 << bhl) + TxPadHor + 1]);
-            mag += ClipMax3(levels[p + (2 << bhl) + (2 << TxPadHorLog2)]);
-            mag += ClipMax3(levels[p + 2]);
+            mag += ClipMax3(Unsafe.Add(ref l, stride + 1));
+            mag += ClipMax3(Unsafe.Add(ref l, 2 * stride));
+            mag += ClipMax3(Unsafe.Add(ref l, 2));
         }
         else if (txClass == TX_CLASS_VERT)
         {
-            mag += ClipMax3(levels[p + 2]) + ClipMax3(levels[p + 3]) + ClipMax3(levels[p + 4]);
+            mag += ClipMax3(Unsafe.Add(ref l, 2)) + ClipMax3(Unsafe.Add(ref l, 3)) + ClipMax3(Unsafe.Add(ref l, 4));
         }
         else
         {
-            mag += ClipMax3(levels[p + (2 << bhl) + (2 << TxPadHorLog2)]);
-            mag += ClipMax3(levels[p + (3 << bhl) + (3 << TxPadHorLog2)]);
-            mag += ClipMax3(levels[p + (4 << bhl) + (4 << TxPadHorLog2)]);
+            mag += ClipMax3(Unsafe.Add(ref l, 2 * stride));
+            mag += ClipMax3(Unsafe.Add(ref l, 3 * stride));
+            mag += ClipMax3(Unsafe.Add(ref l, 4 * stride));
         }
         return mag;
     }
@@ -314,24 +317,25 @@ internal static class AomTxb
     internal static int BrCtx(ReadOnlySpan<byte> levels, int c, int bhl, int txClass)
     {
         int col = c >> bhl, row = c - (col << bhl);
-        int stride = (1 << bhl) + TxPadHor, pos = col * stride + row;
-        int mag = levels[pos + 1] + levels[pos + stride];
+        int stride = (1 << bhl) + TxPadHor;
+        ref byte l = ref Unsafe.Add(ref MemoryMarshal.GetReference(levels), col * stride + row);
+        int mag = Unsafe.Add(ref l, 1) + Unsafe.Add(ref l, stride);
         switch (txClass)
         {
             case TX_CLASS_2D:
-                mag += levels[pos + stride + 1];
+                mag += Unsafe.Add(ref l, stride + 1);
                 mag = Math.Min((mag + 1) >> 1, 6);
                 if (c == 0) return mag;
                 if (row < 2 && col < 2) return mag + 7;
                 break;
             case TX_CLASS_HORIZ:
-                mag += levels[pos + (stride << 1)];
+                mag += Unsafe.Add(ref l, stride << 1);
                 mag = Math.Min((mag + 1) >> 1, 6);
                 if (c == 0) return mag;
                 if (col == 0) return mag + 7;
                 break;
             default:
-                mag += levels[pos + 2];
+                mag += Unsafe.Add(ref l, 2);
                 mag = Math.Min((mag + 1) >> 1, 6);
                 if (c == 0) return mag;
                 if (row == 0) return mag + 7;
