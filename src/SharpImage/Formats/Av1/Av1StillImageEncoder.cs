@@ -1186,6 +1186,11 @@ internal static partial class Av1StillImageEncoder
             srcY, srcU, srcV, cwIn, chIn, keepPicture: logs != null, deblockOnly: cdefSb, mono: mono, sct: sct);
         Phase("filters");
         sbyte[]? cdefIdx = null;
+        // With loop restoration to follow, the per-superblock CDEF replay is deferred: the restoration replay writes the
+        // cdef_idx literals too, and its no-restoration comparison uses the CDEF frame's size (the deblocked tiles plus one
+        // bit per equiprobable literal); the CDEF-only tiles are replayed only if restoration is not kept.
+        Func<byte[]>? cdefTileLazy = null;
+        long cdefLiteralBits = 0;
         if (cdefSb)
         {
             // Per-superblock CDEF on the deblocked picture; replay the tiles with each superblock's cdef_idx.
@@ -1198,11 +1203,17 @@ internal static partial class Av1StillImageEncoder
                     dpic.RowsY, dpic.RowsC, dpic.Noskip!, dpic.W8, dpic.H8, srcY, srcU, srcV, width, height, cwIn, chIn,
                     sbCols, sbRows, baseQIdx, Bd, LamK * acDq * acDq, ThreadCount, Sp.CdefSearchLevel, ssX, ssY) is { } r)
             {
-                var tiles = new byte[logs!.Length][];
-                var cw2 = CdefIndexWriter(r.SbIdx, sbCols, r.Params.Bits);
-                for (int ti = 0; ti < logs.Length; ti++)
-                    tiles[ti] = Av1MsacWriter.Replay(logs[ti], (id, w) => { if (id < 0) cw2(id, w); }, FreshCdfArrays(baseQIdx));
-                tile = AssembleTileGroup(tiles);
+                var rr = r; var logsC = logs!;
+                byte[] CdefTile()
+                {
+                    var tiles = new byte[logsC.Length][];
+                    var cw2 = CdefIndexWriter(rr.SbIdx, sbCols, rr.Params.Bits);
+                    for (int ti = 0; ti < logsC.Length; ti++)
+                        tiles[ti] = Av1MsacWriter.Replay(logsC[ti], (id, w) => { if (id < 0) cw2(id, w); }, FreshCdfArrays(baseQIdx));
+                    return AssembleTileGroup(tiles);
+                }
+                if (lrOn) { cdefTileLazy = CdefTile; cdefLiteralBits = (long)CdefLiteralCount(logsC, rr.SbIdx.Length, sbCols) * rr.Params.Bits; }
+                else tile = CdefTile();
                 best = r.Params;
                 cdefIdx = r.SbIdx;
                 // The loop-restoration input is the CDEF output: filter the deblocked planes here instead of decoding.
@@ -1218,10 +1229,13 @@ internal static partial class Av1StillImageEncoder
         }
         Phase("cdef");
         byte[] frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: mono, tile, best, lfLevel, screenContent: sct);
-        var lrRes = lrOn && logs != null ? TryLoopRestoration(seqCfg, seqObu, frameObu, logs, sbCols, sbRows, width, height, layout, monochrome: mono,
+        long noLrBytes = frameObu.Length + (cdefLiteralBits + 7) / 8;   // with a deferred CDEF replay: its size
+        var lrRes = lrOn && logs != null ? TryLoopRestoration(seqCfg, seqObu, frameObu, noLrBytes, logs, sbCols, sbRows, width, height, layout, monochrome: mono,
             srcY, srcU, srcV, cwIn, chIn, baseQIdx, best, lfLevel, pic, cdefIdx, sct) : null;
         Phase("lr");
-        return lrRes ?? (seqObu, frameObu);
+        if (lrRes != null) return lrRes.Value;
+        if (cdefTileLazy != null) frameObu = BuildFrameObu(baseQIdx, sbCols, sbRows, monochrome: mono, cdefTileLazy(), best, lfLevel, screenContent: sct);
+        return (seqObu, frameObu);
     }
 
     /// <summary>Dev: AV1_HBDPIPE8=1 runs 8-bit content through the ushort pipeline (the lowbd one's byte-exact reference).</summary>
@@ -1495,7 +1509,7 @@ internal static partial class Av1StillImageEncoder
     /// headers with restoration enabled. Returns null (keep the frame as is) unless the decoded result is better in
     /// SSE + λ·bits.</summary>
     private static (byte[] SeqObu, byte[] FrameObu)? TryLoopRestoration(in Av1ObuWriter.SeqConfig seqCfg, byte[] seqObu, byte[] frameObu,
-        List<Av1MsacWriter.LogOp>[] logs, int sbCols, int sbRows, int width, int height, Av1PixelLayout layout, bool monochrome,
+        long noLrFrameBytes, List<Av1MsacWriter.LogOp>[] logs, int sbCols, int sbRows, int width, int height, Av1PixelLayout layout, bool monochrome,
         ushort[] srcY, ushort[]? srcU, ushort[]? srcV, int cw, int ch, int baseQIdx, Av1ObuWriter.CdefParams cdef, Av1ObuWriter.LfLevels lfLevel,
         DecodedPicture? pic = null, sbyte[]? cdefIdx = null, bool sct = false)
     {
@@ -1541,7 +1555,7 @@ internal static partial class Av1StillImageEncoder
         using var yuv2 = new Av1Decoder { ApplyFilmGrain = false, MaxThreads = ThreadCount }.Decode([.. seq2, .. frame2], 0, isKeyframe: true);
         if (yuv2 == null) return null;
         long sseLr = DecodedSse(yuv2, srcY, srcU, srcV, width, height, cw, ch, monochrome);
-        double jNo = sseNoLr + lambda * 8 * (seqObu.Length + frameObu.Length);
+        double jNo = sseNoLr + lambda * 8 * (seqObu.Length + noLrFrameBytes);
         double jLr = sseLr + lambda * 8 * (seq2.Length + frame2.Length);
         return jLr < jNo ? (seq2, frame2) : null;
     }
@@ -2977,6 +2991,21 @@ internal static partial class Av1StillImageEncoder
     // Op-log marker ids for cdef_idx (read after the skip flag of a 64x64's first non-skip block): negative, so the
     // loop-restoration superblock markers ((sby << 16) | sbx) stay distinct.
     private static int CdefMarker(int bx4, int by4) => int.MinValue | ((by4 >> 4) << 15) | (bx4 >> 4);
+
+    /// <summary>The number of cdef_idx literals CdefIndexWriter writes over these tile logs (superblocks with a marker).</summary>
+    private static int CdefLiteralCount(List<Av1MsacWriter.LogOp>[] logs, int nSb, int sbCols)
+    {
+        var seen = new bool[nSb];
+        int n = 0;
+        foreach (var log in logs)
+            foreach (var op in log)
+            {
+                if (op.Kind != Av1MsacWriter.LogOp.Marker || op.A >= 0) continue;
+                int k = ((op.A >> 15) & 0xFFFF) * sbCols + (op.A & 0x7FFF);
+                if (k < nSb && !seen[k]) { seen[k] = true; n++; }
+            }
+        return n;
+    }
 
     /// <summary>Writes cdef_idx at the first CDEF marker of each superblock (later markers of the same superblock are
     /// blocks after the first non-skip one). One instance per replay.</summary>
