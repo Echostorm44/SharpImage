@@ -57,6 +57,8 @@ public sealed class AomEncoderSmoke
         {
             string? bsTracePath = Environment.GetEnvironmentVariable("AOM_SMOKE_BSTRACE");
             using var bsTrace = bsTracePath != null ? new StreamWriter(bsTracePath) : null;
+            // AOM_SMOKE_NEG=1 (negative control): pack with disable_cdf_update, which must no longer match libaom
+            if (Environment.GetEnvironmentVariable("AOM_SMOKE_NEG") == "1") cpi.DisableCdfUpdate = true;
             File.WriteAllBytes(obuPath, AomBitstream.PackFrame(cpi, trace: bsTrace));
         }
         // AOM_SMOKE_RECON=<path>: the reconstruction as 8-bit 4:2:0 planes (compare with a decoder's output)
