@@ -1774,6 +1774,15 @@ public static class Av1IntraPred
                     Px.Store8(row, x, Vector128.ShiftRightLogical(a * w0 + c * w1 + r32, 6));
                 }
             }
+            // 4 more (the 8-wide loads stay inside src; only 4 lanes are stored)
+            if (Vector128.IsHardwareAccelerated && x + 4 <= n && b + x + 9 <= src.Length)
+            {
+                var a = Px.Load8(src, b + x);
+                var c = Px.Load8(src, b + x + 1);
+                Px.Store4(row, x, Vector128.ShiftRightLogical(a * Vector128.Create((ushort)(64 - frac)) + c * Vector128.Create((ushort)frac)
+                    + Vector128.Create((ushort)32), 6));
+                x += 4;
+            }
         }
         for (; x < n; x++)
             row[x] = Px.T<TP>((Px.I(src[b + x]) * (64 - frac) + Px.I(src[b + x + 1]) * frac + 32) >> 6);
@@ -2217,6 +2226,14 @@ public static class Av1IntraPred
                 Px.Store16(output, i, Vector256.ShiftRightLogical(s, 4));
             }
         }
+        if (Vector128.IsHardwareAccelerated && i + 8 <= end)
+        {
+            var s = (Px.Load8(p, i) + Px.Load8(p, i + 4)) * Vector128.Create((ushort)k0)
+                  + (Px.Load8(p, i + 1) + Px.Load8(p, i + 3)) * Vector128.Create((ushort)k1)
+                  + Px.Load8(p, i + 2) * Vector128.Create((ushort)k2) + Vector128.Create((ushort)8);
+            Px.Store8(output, i, Vector128.ShiftRightLogical(s, 4));
+            i += 8;
+        }
         for (; i < end; i++)
             output[i] = Px.T<TP>(((Px.I(pad[i]) + Px.I(pad[i + 4])) * k0 + (Px.I(pad[i + 1]) + Px.I(pad[i + 3])) * k1 + Px.I(pad[i + 2]) * k2 + 8) >> 4);
         for (; i < sz; i++) output[i] = pad[i + 2];
@@ -2227,18 +2244,31 @@ public static class Av1IntraPred
         ReadOnlySpan<TP> input, int inputOffset,
         int from, int to, int bitDepth) where TP : unmanaged
     {
-        ReadOnlySpan<sbyte> kernel = stackalloc sbyte[] { -1, 9, 9, -1 };
         int max = (1 << bitDepth) - 1;
-        int i;
-        for (i = 0; i < hsz - 1; i++)
+        // p[k] = input[clamp(k - 1, from, to - 1)] for k <= hsz + 2 (+8 slack for the vector loads)
+        int np = hsz + 2 + 9;
+        Span<TP> p = stackalloc TP[np];
+        for (int k = 0; k < np; k++) p[k] = input[inputOffset + Math.Clamp(k - 1, from, to - 1)];
+        ReadOnlySpan<TP> pr = p;
+        int n = hsz - 1, i = 0;
+        // output[2i] = p[i + 1], output[2i + 1] = clip((-p[i] + 9 p[i + 1] + 9 p[i + 2] - p[i + 3] + 8) >> 4) (16-bit exact to 10 bits)
+        if (bitDepth <= 10 && Sse2.IsSupported)
+            for (; i + 8 <= n; i += 8)
+            {
+                var a = Px.Load8(pr, i).AsInt16(); var b1 = Px.Load8(pr, i + 1).AsInt16();
+                var c = Px.Load8(pr, i + 2).AsInt16(); var d = Px.Load8(pr, i + 3).AsInt16();
+                var s = Vector128.ShiftRightArithmetic((b1 + c) * Vector128.Create((short)9) - a - d + Vector128.Create((short)8), 4);
+                var f = Vector128.Min(Vector128.Max(s, Vector128<short>.Zero), Vector128.Create((short)max)).AsUInt16();
+                Px.Store8(output, 2 * i, Sse2.UnpackLow(b1.AsUInt16(), f));
+                Px.Store8(output, 2 * i + 8, Sse2.UnpackHigh(b1.AsUInt16(), f));
+            }
+        for (; i < n; i++)
         {
-            output[i * 2] = input[inputOffset + Math.Clamp(i, from, to - 1)];
-            int s = 0;
-            for (int j = 0; j < 4; j++)
-                s += Px.I(input[inputOffset + Math.Clamp(i + j - 1, from, to - 1)]) * kernel[j];
+            output[i * 2] = p[i + 1];
+            int s = -Px.I(p[i]) + 9 * (Px.I(p[i + 1]) + Px.I(p[i + 2])) - Px.I(p[i + 3]);
             output[i * 2 + 1] = Px.T<TP>(Math.Clamp((s + 8) >> 4, 0, max));
         }
-        output[i * 2] = input[inputOffset + Math.Clamp(i, from, to - 1)];
+        output[i * 2] = p[i + 1];
     }
 
     public static void PredFilter16<TP>(
