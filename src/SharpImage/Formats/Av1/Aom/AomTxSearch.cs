@@ -226,7 +226,7 @@ internal static class AomTxSearch
         var recon = t_recon ??= new byte[MaxTxSize * MaxTxSize];
         AomEncodeMb.CopyBlock(pd.Dst.Buf, dstIdx, dstStride, recon, 0, MaxTxSize, bsw, bsh);
         int txType = AomEncodeMb.GetTxType(xd, plane == 0 ? 0 : 1, blkRow, blkCol, txSize, cpi.ReducedTxSetUsed != 0);
-        AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, recon, 0, MaxTxSize, eob);
+        AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, recon, 0, MaxTxSize, eob, xd.Lossless[xd.Mi0.SegmentId] != 0);
         return 16 * (long)PixelDist(x, plane, p.Src.Buf, srcIdx, srcStride, recon, 0, MaxTxSize, blkRow, blkCol, planeBsize, txBsize);
     }
 
@@ -587,7 +587,7 @@ internal static class AomTxSearch
         var pd = xd.Plane[plane];
         int dstStride = pd.Dst.Stride;
         AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst.Buf,
-            pd.Dst.Offset + ((blkRow * dstStride + blkCol) << 2), dstStride, eob);
+            pd.Dst.Offset + ((blkRow * dstStride + blkCol) << 2), dstStride, eob, xd.Lossless[xd.Mi0.SegmentId] != 0);
     }
 
     /// <summary>recon_intra.</summary>

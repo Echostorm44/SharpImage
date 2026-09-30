@@ -67,6 +67,9 @@ internal static partial class AomEncoder
             Width = input.Width, Height = input.Height, AllowScreenContentTools = input.AllowScreenContentTools,
             UseScreenContentTools = input.UseScreenContentTools, IsScreenContentType = input.IsScreenContentType, BaseQindex = input.BaseQindex,
         };
+        // avifenc --lossless / quality 100 (quantizer 0): libavif sets rc_min_quantizer = rc_max_quantizer = 0 and
+        // AV1E_SET_LOSSLESS, so oxcf.rc_cfg.best_allowed_q = worst_allowed_q = 0 (is_lossless_requested)
+        if (input.BaseQindex == 0) { sfIn.BestAllowedQ = 0; sfIn.WorstAllowedQ = 0; }
         var seqFlags = new AomSpeedFeatureSeqFlags();
         cpi.Sf.SetForFrame(sfIn, seqFlags, cpi.WinnerModeParams, input.Speed);
         cpi.EnableRestoration = seqFlags.enable_restoration != 0;

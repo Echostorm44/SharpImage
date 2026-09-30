@@ -1022,7 +1022,7 @@ internal static class AomIntraModeSearch
 
         int eob = p.Eobs[block];
         if (eob != 0)
-            AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst.Buf, dstOff, dstStride, eob);
+            AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst.Buf, dstOff, dstStride, eob, xd.Lossless[xd.Mi0.SegmentId] != 0);
 
         if (eob == 0 && plane == 0) AomEncodeMb.UpdateTxkArray(xd, blkRow, blkCol, txSize, DCT_DCT);
 

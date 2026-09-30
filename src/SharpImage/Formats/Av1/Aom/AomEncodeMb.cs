@@ -247,9 +247,114 @@ internal static class AomEncodeMb
     {
         var p = x.Plane[plane];
         int diffStride = BlockSizeWide[planeBsize];
+        // av1_lowbd_fwd_txfm: lossless 4x4 goes through av1_highbd_fwd_txfm -> highbd_fwd_txfm_4x4 -> av1_fwht4x4
+        if (x.E.Lossless[x.E.Mi0.SegmentId] != 0 && txSize == TX_4X4)
+        {
+            Fwht4x4(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, p.Coeff.AsSpan(BlockOffset(block), 16));
+            return;
+        }
         TxTypeKinds(txType, out int hKind, out int vKind, out bool flipUd, out bool flipLr);
         Av1FwdTxfmAom.ForwardRaw(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
             txSize, hKind, vKind, flipUd, flipLr, p.Coeff.AsSpan(BlockOffset(block), MaxEob(txSize)));
+    }
+
+    private const int UnitQuantShift = 2, UnitQuantFactor = 1 << UnitQuantShift;
+
+    /// <summary>av1_fwht4x4_c: the 4-point reversible Walsh-Hadamard forward transform (lossless), scaled by UNIT_QUANT_FACTOR.</summary>
+    internal static void Fwht4x4(ReadOnlySpan<short> input, int stride, Span<int> output)
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            long a1 = input[i], b1 = input[stride + i], c1 = input[2 * stride + i], d1 = input[3 * stride + i];
+            a1 += b1;
+            d1 = d1 - c1;
+            long e1 = (a1 - d1) >> 1;
+            b1 = e1 - b1;
+            c1 = e1 - c1;
+            a1 -= c1;
+            d1 += b1;
+            output[i * 4 + 0] = (int)a1;
+            output[i * 4 + 1] = (int)c1;
+            output[i * 4 + 2] = (int)d1;
+            output[i * 4 + 3] = (int)b1;
+        }
+        for (int i = 0; i < 4; i++)
+        {
+            long a1 = output[i], b1 = output[4 + i], c1 = output[8 + i], d1 = output[12 + i];
+            a1 += b1;
+            d1 -= c1;
+            long e1 = (a1 - d1) >> 1;
+            b1 = e1 - b1;
+            c1 = e1 - c1;
+            a1 -= c1;
+            d1 += b1;
+            output[i] = (int)(a1 * UnitQuantFactor);
+            output[4 + i] = (int)(c1 * UnitQuantFactor);
+            output[8 + i] = (int)(d1 * UnitQuantFactor);
+            output[12 + i] = (int)(b1 * UnitQuantFactor);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte ClipPixelAdd(byte dest, int trans) => (byte)Math.Clamp(dest + trans, 0, 255);
+
+    /// <summary>av1_highbd_iwht4x4_add (8-bit samples): eob &gt; 1 runs av1_highbd_iwht4x4_16_add, else av1_highbd_iwht4x4_1_add.</summary>
+    internal static void IwhtAdd4x4(int[] input, int inOff, byte[] dest, int destOff, int stride, int eob)
+    {
+        if (eob > 1)
+        {
+            Span<int> output = stackalloc int[16];
+            for (int i = 0; i < 4; i++)
+            {
+                int a1 = input[inOff + i] >> UnitQuantShift;
+                int c1 = input[inOff + 4 + i] >> UnitQuantShift;
+                int d1 = input[inOff + 8 + i] >> UnitQuantShift;
+                int b1 = input[inOff + 12 + i] >> UnitQuantShift;
+                a1 += c1;
+                d1 -= b1;
+                int e1 = (a1 - d1) >> 1;
+                b1 = e1 - b1;
+                c1 = e1 - c1;
+                a1 -= b1;
+                d1 += c1;
+                output[i] = a1; output[4 + i] = b1; output[8 + i] = c1; output[12 + i] = d1;
+            }
+            for (int i = 0; i < 4; i++)
+            {
+                int a1 = output[i * 4], c1 = output[i * 4 + 1], d1 = output[i * 4 + 2], b1 = output[i * 4 + 3];
+                a1 += c1;
+                d1 -= b1;
+                int e1 = (a1 - d1) >> 1;
+                b1 = e1 - b1;
+                c1 = e1 - c1;
+                a1 -= b1;
+                d1 += c1;
+                int o = destOff + i;
+                dest[o] = ClipPixelAdd(dest[o], a1);
+                dest[o + stride] = ClipPixelAdd(dest[o + stride], b1);
+                dest[o + 2 * stride] = ClipPixelAdd(dest[o + 2 * stride], c1);
+                dest[o + 3 * stride] = ClipPixelAdd(dest[o + 3 * stride], d1);
+            }
+        }
+        else
+        {
+            Span<int> tmp = stackalloc int[4];
+            int a1 = input[inOff] >> UnitQuantShift;
+            int e1 = a1 >> 1;
+            a1 -= e1;
+            tmp[0] = a1;
+            tmp[1] = tmp[2] = tmp[3] = e1;
+            for (int i = 0; i < 4; i++)
+            {
+                e1 = tmp[i] >> 1;
+                a1 = tmp[i] - e1;
+                int o = destOff + i;
+                dest[o] = ClipPixelAdd(dest[o], a1);
+                dest[o + stride] = ClipPixelAdd(dest[o + stride], e1);
+                dest[o + 2 * stride] = ClipPixelAdd(dest[o + 2 * stride], e1);
+                dest[o + 3 * stride] = ClipPixelAdd(dest[o + 3 * stride], e1);
+            }
+        }
     }
 
     /// <summary>av1_xform_dc_only.</summary>
@@ -372,9 +477,12 @@ internal static class AomEncodeMb
 
     /// <summary>av1_inverse_transform_block (8-bit): the dequantised coefficients' inverse added into dst (the coefficients
     /// are left untouched, as libaom's). eob: libaom's count (0 = none).</summary>
-    internal static void InverseTransformBlock(int[] dqcoeff, int dqOff, int txType, int txSize, byte[] dst, int dstOff, int dstStride, int eob)
+    internal static void InverseTransformBlock(int[] dqcoeff, int dqOff, int txType, int txSize, byte[] dst, int dstOff, int dstStride, int eob,
+        bool lossless = false)
     {
         if (eob == 0) return;
+        // av1_inv_txfm_add (lossless -> av1_inv_txfm_add_c -> highbd_inv_txfm_add_4x4_c -> av1_highbd_iwht4x4_add)
+        if (lossless && txSize == TX_4X4) { IwhtAdd4x4(dqcoeff, dqOff, dst, dstOff, dstStride, eob); return; }
         Av1InvTransform.InvTxfmAdd16(dst.AsSpan(dstOff), dstStride, dqcoeff.AsSpan(dqOff, MaxEob(txSize)), eob - 1, txSize,
             Av1InvTransform.TxShift[txSize], (Av1TxType)txType, 8, preserveCoeffs: true);
     }
