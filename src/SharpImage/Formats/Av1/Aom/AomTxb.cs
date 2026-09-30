@@ -288,7 +288,7 @@ internal static class AomTxb
 
     /// <summary>get_br_ctx.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int BrCtx(ReadOnlySpan<byte> levels, int c, int bhl, int txClass)
+    internal static int BrCtx(ReadOnlySpan<byte> levels, int c, int bhl, int txClass)
     {
         int col = c >> bhl, row = c - (col << bhl);
         int stride = (1 << bhl) + TxPadHor, pos = col * stride + row;

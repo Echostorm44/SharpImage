@@ -31,6 +31,12 @@ internal sealed class AomRdcostBlockArgs
 // uniform_txfm_yrd, choose_tx_size_type_from_rd / choose_largest_tx_size / choose_smallest_tx_size,
 // av1_pick_uniform_tx_size_type_yrd and av1_txfm_uvrd. (The inter-only paths - var-tx, the residual hash, skip
 // prediction, prune_tx_2D - are not used by the all-intra encoder.)
+/// <summary>Optional per-call RD trace (same lines as the scratchpad aomoracle's libaom wrappers).</summary>
+internal static class AomTrace
+{
+    [ThreadStatic] public static System.IO.TextWriter? Out;
+}
+
 internal static class AomTxSearch
 {
     public const int FTXS_NONE = 0, FTXS_DCT_AND_1D_DCT_ONLY = 1 << 0, FTXS_DISABLE_TRELLIS_OPT = 1 << 1, FTXS_USE_TRANSFORM_DOMAIN = 1 << 2;
@@ -55,8 +61,8 @@ internal static class AomTxSearch
         return true;
     }
 
-    /// <summary>RIGHT_SIGNED_SHIFT.</summary>
-    private static long RightSignedShift(long value, int shift) => value >= 0 ? value >> shift : -((-value) >> shift);
+    /// <summary>RIGHT_SIGNED_SHIFT (aom_ports/mem.h): a negative count shifts left (64-point transforms: 2 * (1 - 2)).</summary>
+    private static long RightSignedShift(long value, int n) => n < 0 ? value << -n : value >> n;
 
     /// <summary>av1_get_entropy_contexts: copies the plane block's above / left entropy contexts.</summary>
     internal static void GetEntropyContexts(int planeBsize, AomMbdPlane pd, Span<byte> tAbove, Span<byte> tLeft)
@@ -659,6 +665,7 @@ internal static class AomTxSearch
             ? (ushort)(1 << DCT_DCT)
             : GetTxMask(cpi, x, plane, block, blkRow, blkCol, planeBsize, txSize, txbCtx, ftxsMode, refBestRd, out txkAllowed, txkMap);
         ushort allowedTxMask = txMask;
+        if (AomTrace.Out != null) AomTrace.Out.Write($" st p{plane} blk {blkRow} {blkCol} tx {txSize} mask {allowedTxMask:x4} allowed {txkAllowed} dconly {(dcOnlyBlk ? 1 : 0)} bsse {blockSse} mse {blockMseQ8} skip_trellis {(skipTrellis ? 1 : 0)}\n");
 
         if (xd.Bd > 8)
         {
@@ -754,6 +761,7 @@ internal static class AomTxSearch
 
             thisRdStats.Rate = rateCost;
             long rd = AomRd.RdCost(x.Rdmult, thisRdStats.Rate, thisRdStats.Dist);
+            if (AomTrace.Out != null) AomTrace.Out.Write($"  stt p{plane} blk {blkRow} {blkCol} tx {txSize} type {txType} eob {p.Eobs[block]} rate {thisRdStats.Rate} dist {thisRdStats.Dist} sse {thisRdStats.Sse} rd {rd} trellis {(qp.UseOptimizeB ? 1 : 0)}\n");
 
             if (rd < bestRd)
             {
@@ -936,6 +944,7 @@ internal static class AomTxSearch
 
         mbmi.TxSize = txSize;
         TxfmRdInPlane(x, cpi, ref rdStats, refBestRd, Math.Min(noThisRd, skipTxfmRd), 0, bs, txSize, ftxsMode);
+        if (AomTrace.Out != null) AomTrace.Out.Write($" uyrd tx {txSize} ref {refBestRd} -> rate {rdStats.Rate} dist {rdStats.Dist} txrate {txSizeRate}\n");
         if (rdStats.Rate == int.MaxValue) return long.MaxValue;
 
         long rd;
@@ -1069,6 +1078,8 @@ internal static class AomTxSearch
         if (xd.Lossless[mbmi.SegmentId] != 0) ChooseSmallestTxSize(cpi, x, ref rdStats, refBestRd, bs);
         else if (x.TxfmSearchParams.TxSizeSearchMethod == USE_LARGESTALL) ChooseLargestTxSize(cpi, x, ref rdStats, refBestRd, bs);
         else ChooseTxSizeTypeFromRd(cpi, x, ref rdStats, refBestRd, bs);
+        if (AomTrace.Out != null)
+            AomTrace.Out.Write($"yrd {xd.MiRow} {xd.MiCol} bs {bs} y {mbmi.Mode} ad {mbmi.AngleDelta[0]} fi {mbmi.UseFilterIntra} {mbmi.FilterIntraMode} ref {refBestRd} -> rate {rdStats.Rate} dist {rdStats.Dist} sse {rdStats.Sse} skip {rdStats.SkipTxfm} tx {mbmi.TxSize}\n");
     }
 
     /// <summary>av1_txfm_uvrd (intra blocks). Returns whether the cost is valid.</summary>

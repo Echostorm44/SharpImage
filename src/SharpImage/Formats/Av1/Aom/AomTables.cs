@@ -360,6 +360,14 @@ internal static partial class AomTables
         0, 4, 4,
     };
 
+    // [BLOCK_SIZES_ALL] (44 values)
+    internal static readonly byte[] PartitionContextLookup =
+    {
+        31, 31, 31, 30, 30, 31, 30, 30, 30, 28, 28, 30, 28, 28, 28, 24,
+        24, 28, 24, 24, 24, 16, 16, 24, 16, 16, 16, 0, 0, 16, 0, 0,
+        31, 28, 28, 31, 30, 24, 24, 30, 28, 16, 16, 28,
+    };
+
     // [FRAME_UPDATE_TYPES][TX_SIZES_ALL][TX_TYPES] (2128 values)
     internal static readonly int[] DefaultTxTypeProbs =
     {
@@ -990,6 +998,17 @@ internal static partial class AomTables
         9, 0, 10, 11, 3, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         9, 10, 11, 0, 1, 2, 4, 5, 3, 6, 7, 8, 0, 0, 0, 0,
         9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 4, 5, 3, 6, 7, 8,
+    };
+
+    // [EXT_TX_SET_TYPES][TX_TYPES] (96 values)
+    internal static readonly int[] ExtTxInd =
+    {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 3, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 5, 6, 4, 0, 0, 0, 0, 0, 0, 2, 3, 0, 0, 0, 0,
+        3, 4, 5, 8, 6, 7, 9, 10, 11, 0, 1, 2, 0, 0, 0, 0,
+        7, 8, 9, 12, 10, 11, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6,
     };
 
     // [EXT_TX_SETS_INTRA][EXT_TX_SIZES] (12 values)

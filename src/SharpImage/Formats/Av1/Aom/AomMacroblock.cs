@@ -99,7 +99,7 @@ internal sealed class AomWinnerModeStats
     public AomRdStats RdCost;
     public long Rd;
     public int RateY, RateUv;
-    public readonly byte[] ColorIndexMap = new byte[64 * 64];
+    public readonly byte[] ColorIndexMap = new byte[128 * 128];   // [MAX_SB_SQUARE]
     public int ModeIndex;
 }
 
@@ -107,13 +107,83 @@ internal sealed class AomWinnerModeStats
 internal sealed class AomPickModeContext
 {
     public readonly AomMbModeInfo Mic = new();
-    public readonly byte[][] ColorIndexMap = { new byte[128 * 128], new byte[128 * 128] };
-    public readonly byte[] TxTypeMap = new byte[32 * 32];
+    public readonly byte[]?[] ColorIndexMap = new byte[]?[2];
+    public byte[] TxTypeMap;
     public int NumFourByFourBlk;
+    public readonly ushort[][] Eobs = new ushort[3][];
+    public readonly byte[][] TxbEntropyCtx = new byte[3][];
+    public int Skippable;
     public AomRdStats RdStats;
     public int RdModeIsReady;
-    public bool[] Blk_skip = Array.Empty<bool>();
-    // coefficient buffers of the chosen mode (for the final encode reuse): not used on the all-intra path
+
+    /// <summary>av1_alloc_pmc (the coefficient buffers are the shared per-plane ones in the MACROBLOCK).</summary>
+    public AomPickModeContext(int bsize, bool allowScreenContentTools)
+    {
+        int numPix = BlockSizeWide[bsize] * BlockSizeHigh[bsize];
+        int numBlk = numPix / 16;
+        TxTypeMap = new byte[numBlk];
+        NumFourByFourBlk = numBlk;
+        for (int i = 0; i < 3; i++) { Eobs[i] = new ushort[numBlk]; TxbEntropyCtx[i] = new byte[numBlk]; }
+        if (numPix <= 64 * 64 && allowScreenContentTools)
+            for (int i = 0; i < 2; i++) ColorIndexMap[i] = new byte[numPix];
+        RdStats.Invalidate();
+    }
+
+    /// <summary>av1_copy_tree_context.</summary>
+    public void CopyFrom(AomPickModeContext src)
+    {
+        Mic.CopyFrom(src.Mic);
+        NumFourByFourBlk = src.NumFourByFourBlk;
+        Skippable = src.Skippable;
+        Array.Copy(src.TxTypeMap, TxTypeMap, src.NumFourByFourBlk);
+        RdStats = src.RdStats;
+        RdModeIsReady = src.RdModeIsReady;
+    }
+}
+
+/// <summary>PC_TREE (av1/encoder/context_tree.h).</summary>
+internal sealed class AomPcTree
+{
+    public int Partitioning = PARTITION_NONE;
+    public int BlockSize;
+    public AomPickModeContext? None;
+    public readonly AomPickModeContext?[] Horizontal = new AomPickModeContext?[2], Vertical = new AomPickModeContext?[2];
+    public readonly AomPickModeContext?[] HorizontalA = new AomPickModeContext?[3], HorizontalB = new AomPickModeContext?[3],
+        VerticalA = new AomPickModeContext?[3], VerticalB = new AomPickModeContext?[3];
+    public readonly AomPickModeContext?[] Horizontal4 = new AomPickModeContext?[4], Vertical4 = new AomPickModeContext?[4];
+    public readonly AomPcTree?[] Split = new AomPcTree?[4];
+    public int Index;
+
+    /// <summary>av1_alloc_pc_tree_node.</summary>
+    public AomPcTree(int bsize) { BlockSize = bsize; }
+
+    /// <summary>av1_free_pc_tree_recursive (search types other than VAR_BASED_PARTITION).</summary>
+    public static void FreeRecursive(AomPcTree? t, bool keepBest, bool keepNone)
+    {
+        if (t == null) return;
+        int partition = t.Partitioning;
+        if (!keepNone && (!keepBest || partition != PARTITION_NONE)) t.None = null;
+        for (int i = 0; i < 2; ++i)
+        {
+            if (!keepBest || partition != PARTITION_HORZ) t.Horizontal[i] = null;
+            if (!keepBest || partition != PARTITION_VERT) t.Vertical[i] = null;
+        }
+        for (int i = 0; i < 3; ++i)
+        {
+            if (!keepBest || partition != PARTITION_HORZ_A) t.HorizontalA[i] = null;
+            if (!keepBest || partition != PARTITION_HORZ_B) t.HorizontalB[i] = null;
+            if (!keepBest || partition != PARTITION_VERT_A) t.VerticalA[i] = null;
+            if (!keepBest || partition != PARTITION_VERT_B) t.VerticalB[i] = null;
+        }
+        for (int i = 0; i < 4; ++i)
+        {
+            if (!keepBest || partition != PARTITION_HORZ_4) t.Horizontal4[i] = null;
+            if (!keepBest || partition != PARTITION_VERT_4) t.Vertical4[i] = null;
+        }
+        if (!keepBest || partition != PARTITION_SPLIT)
+            for (int i = 0; i < 4; ++i)
+                if (t.Split[i] != null) { FreeRecursive(t.Split[i], false, false); t.Split[i] = null; }
+    }
 }
 
 /// <summary>MACROBLOCK (av1/encoder/block.h): the encoder-side state of the current block (partial: the port's files

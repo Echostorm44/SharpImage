@@ -284,7 +284,7 @@ public sealed partial class AomPaletteTwinTests
             Array.Copy(sc.Costs, o, a, 0, a.Length);
             o += a.Length;
         }
-        var ctx = new AomPickModeContext { NumFourByFourBlk = MiSizeWide[bsize] * MiSizeHigh[bsize] };
+        var ctx = new AomPickModeContext(bsize, true);
 
         int rate = sc.Io32[0], rateTokenonly = sc.Io32[1];
         byte skippable = (byte)sc.Io32[2];

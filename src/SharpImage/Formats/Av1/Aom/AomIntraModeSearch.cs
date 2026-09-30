@@ -271,10 +271,15 @@ internal static class AomIntraModeSearch
         mbmi.Mode = DC_PRED;
         mbmi.Palette.PaletteSize0 = 0;
 
+        // skip filter intra when the cached MB_MODE_INFO's winner is not filter intra
+        if (x.UseMbModeCache && x.MbModeCache!.UseFilterIntra == 0) return false;
+
         for (int mode = 0; mode < FILTER_INTRA_MODES; ++mode)
         {
             mbmi.FilterIntraMode = (byte)mode;
             if (sf.intra_sf.prune_filter_intra_level == 1 && (DerivedFilterIntraModeUsedFlag[bestModeSoFar] & (1 << mode)) == 0) continue;
+            // only the cached winner's filter intra mode
+            if (x.UseMbModeCache && mode != x.MbModeCache!.FilterIntraMode) continue;
             if (ModelIntraYrdAndPrune(cpi, x, bsize, ref bestModelRd)) continue;
             AomRdStats tokenonlyRdStats = default;
             AomTxSearch.PickUniformTxSizeTypeYrd(cpi, x, ref tokenonlyRdStats, bsize, bestRd);
@@ -403,6 +408,18 @@ internal static class AomIntraModeSearch
     internal static long RdPickIntraSbyMode(AomComp cpi, AomMacroblock x, ref int rate, ref int rateTokenonly, ref long distortion,
         ref byte skippable, int bsize, long bestRd, AomPickModeContext ctx)
     {
+        long r = RdPickIntraSbyModeImpl(cpi, x, ref rate, ref rateTokenonly, ref distortion, ref skippable, bsize, bestRd, ctx);
+        if (AomTrace.Out != null)
+        {
+            var m = x.E.Mi0;
+            AomTrace.Out.Write($"sby {x.E.MiRow} {x.E.MiCol} bs {bsize} in {bestRd} -> {r} rate {rate} tok {rateTokenonly} dist {distortion} y {m.Mode} ad {m.AngleDelta[0]} fi {m.UseFilterIntra} {m.FilterIntraMode} tx {m.TxSize} rdmult {x.Rdmult}\n");
+        }
+        return r;
+    }
+
+    private static long RdPickIntraSbyModeImpl(AomComp cpi, AomMacroblock x, ref int rate, ref int rateTokenonly, ref long distortion,
+        ref byte skippable, int bsize, long bestRd, AomPickModeContext ctx)
+    {
         var xd = x.E;
         var mbmi = xd.Mi0;
         var sf = cpi.Sf;
@@ -454,6 +471,9 @@ internal static class AomIntraModeSearch
             // filter intra overlaps smooth: smooth pruned only when all filter intra modes are enabled
             if (sf.intra_sf.disable_smooth_intra != 0 && sf.intra_sf.prune_filter_intra_level == 0 && mbmi.Mode == SMOOTH_PRED) continue;
             if (!cpi.EnablePaethIntra && mbmi.Mode == PAETH_PRED) continue;
+
+            // only the winner mode of x->mb_mode_cache
+            if (x.UseMbModeCache && mbmi.Mode != x.MbModeCache!.Mode) continue;
 
             bool isDirectionalMode = IsDirectionalMode(mbmi.Mode);
             if (isDirectionalMode && directionalModeSkipMask[mbmi.Mode] != 0) continue;
@@ -832,7 +852,7 @@ internal static class AomIntraModeSearch
         }
 
         // the reconstructed luma is stored only with chroma RDO (else in encode_superblock)
-        xd.Cfl.StoreY = cpi.Monochrome || !xd.IsChromaRef ? 0 : 1;   // store_cfl_required_rdo
+        xd.Cfl.StoreY = StoreCflRequiredRdo(cpi, xd) ? 1 : 0;
         if (xd.Cfl.StoreY != 0)
         {
             EncodeIntraBlockPlane(cpi, x, mbmi.Bsize, 0, DRY_RUN_NORMAL, cpi.OptimizeSegArr[mbmi.SegmentId]);
@@ -915,6 +935,14 @@ internal static class AomIntraModeSearch
 
         mbmi.CopyFrom(bestMbmi);
         return bestRd;
+    }
+
+    /// <summary>store_cfl_required_rdo.</summary>
+    internal static bool StoreCflRequiredRdo(AomComp cpi, AomMacroblockD xd)
+    {
+        if (cpi.Monochrome || !xd.IsChromaRef) return false;
+        // chroma reference blocks store the luma iff CfL may be tried
+        return AomCfl.IsCflAllowed(xd) != 0;
     }
 
     // ---- encodemb.c: av1_encode_intra_block_plane ----

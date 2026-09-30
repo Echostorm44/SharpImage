@@ -111,8 +111,8 @@ internal sealed partial class AomMbPlane
     public int[] Coeff = new int[MaxSbSquare];
     public int[] Qcoeff = new int[MaxSbSquare];
     public int[] Dqcoeff = new int[MaxSbSquare];
-    public readonly ushort[] Eobs = new ushort[MaxSbSquare / 16];
-    public readonly byte[] TxbEntropyCtx = new byte[MaxSbSquare / 16];
+    public ushort[] Eobs = new ushort[MaxSbSquare / 16];
+    public byte[] TxbEntropyCtx = new byte[MaxSbSquare / 16];
     public AomBuf2d Src;
     // quantizer / dequantizer [dc, ac] for the block's qindex (x->plane[p].*_QTX)
     public short QuantFp0, QuantFp1, RoundFp0, RoundFp1, Quant0, Quant1, QuantShift0, QuantShift1,

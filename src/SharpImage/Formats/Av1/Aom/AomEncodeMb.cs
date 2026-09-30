@@ -69,8 +69,8 @@ internal static class AomEncodeMb
     internal static int MaxUvTxsize(int bsize, int ssX, int ssY)
         => AomTxb.AdjustedTxSize(MaxTxsizeRectLookup[PlaneBlockSize(bsize, ssX, ssY)]);
 
-    /// <summary>get_uv_mode (UV_PREDICTION_MODE -> PREDICTION_MODE; UV_CFL_PRED -> UV_INTRA_MODES as libaom's table).</summary>
-    internal static int UvModeToIntra(int uvMode) => uvMode == UV_CFL_PRED ? 13 : uvMode;
+    /// <summary>get_uv_mode (UV_PREDICTION_MODE -> PREDICTION_MODE; UV_CFL_PRED -> DC_PRED).</summary>
+    internal static int UvModeToIntra(int uvMode) => uvMode == UV_CFL_PRED ? DC_PRED : uvMode;
 
     /// <summary>intra_mode_to_tx_type.</summary>
     internal static int IntraModeToTxTypeOf(AomMbModeInfo mbmi, int planeType)
