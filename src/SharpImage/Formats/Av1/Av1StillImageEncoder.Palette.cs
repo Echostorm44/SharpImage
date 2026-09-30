@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.Intrinsics;
 
 namespace SharpImage.Formats.Av1;
 
@@ -191,6 +192,31 @@ internal static partial class Av1StillImageEncoder
     private static void PaletteMap<TP>(ReadOnlySpan<TP> plane, int stride, int x0, int y0, int w, int h,
         ushort[] colors, int size, byte[] map, TP[] pred) where TP : unmanaged
     {
+        if (Vector256.IsHardwareAccelerated && w >= 16)
+        {
+            // 16 pixels a vector: per colour |v - c| (unsigned 16-bit), strictly smaller wins (lowest index on ties)
+            Span<Vector256<ushort>> cv = stackalloc Vector256<ushort>[8];
+            for (int q = 0; q < size; q++) cv[q] = Vector256.Create(colors[q]);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x += 16)
+                {
+                    var v = Px.Load16(plane, (y0 + y) * stride + x0 + x);
+                    var bd = Vector256.Max(v, cv[0]) - Vector256.Min(v, cv[0]);
+                    var bi = Vector256<ushort>.Zero; var pv = cv[0];
+                    for (int q = 1; q < size; q++)
+                    {
+                        var d = Vector256.Max(v, cv[q]) - Vector256.Min(v, cv[q]);
+                        var lt = Vector256.LessThan(d, bd);
+                        bd = Vector256.Min(d, bd);
+                        bi = Vector256.ConditionalSelect(lt, Vector256.Create((ushort)q), bi);
+                        pv = Vector256.ConditionalSelect(lt, cv[q], pv);
+                    }
+                    int o = y * w + x;
+                    Vector128.Narrow(bi.GetLower(), bi.GetUpper()).CopyTo(map.AsSpan(o, 16));
+                    Px.Store16<TP>(pred, o, pv);
+                }
+            return;
+        }
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
             {
@@ -269,8 +295,7 @@ internal static partial class Av1StillImageEncoder
             double limit = Math.Min(bound, best?.J ?? double.MaxValue);
             if (lambda * palBits >= limit) return -1;   // the side information alone already loses (exact)
             if (StatsOn) System.Threading.Interlocked.Increment(ref StatPalCand);
-            for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++) res[y * w + x] = Px.I(c.Luma[(by + y) * c.W + bx + x]) - Px.I(cand.Pred[y * w + x]);
+            Px.Residual<TP>(c.Luma, by * c.W + bx, c.W, cand.Pred, 0, w, res, w, h);
             double bestJ = double.MaxValue;
             foreach (var (fwd, inv, idx) in txSet)
             {
@@ -282,10 +307,11 @@ internal static partial class Av1StillImageEncoder
                     rate = Av1CoeffEncode.TrellisOptimize(c.Cdf.Coef, lumaTx, 0, cf, qf, c.DcDq, c.AcDq, 0, ySign, LumaTrellisLambda(c),
                         Av1CoeffEncode.IntraTxTypeBits(c.Cdf.Mode, lumaTx, (int)Av1IntraPredMode.Dc, idx, UseFullIntraTxSet));
                 long sse = ReconSseCandRect(cf, lumaTx, w, h, c.DcDq, c.AcDq, cand.Pred, c.Luma, c.W, bx, by, inv);
-                if (sse + lambda * palBits >= Math.Min(bestJ, limit)) continue;   // distortion alone loses (exact)
+                if (sse + lambda * palBits >= Math.Min(bestJ, limit)) { Av1FwdTransform.ReturnLevels(cf); continue; }   // distortion alone loses (exact)
                 if (rate < 0) rate = Av1CoeffEncode.EstimateCoefBits(c.Cdf.Coef, c.Cdf.Mode, lumaTx, 0, (int)Av1IntraPredMode.Dc, cf, 0, ySign, idx, fullSet: UseFullIntraTxSet);
                 double j = sse + lambda * (rate + palBits);
-                if (j < bestJ) { bestJ = j; cand.Coeffs = cf; cand.Inv = inv; cand.Idx = idx; }
+                if (j < bestJ) { Av1FwdTransform.ReturnLevels(cand.Coeffs); bestJ = j; cand.Coeffs = cf; cand.Inv = inv; cand.Idx = idx; }
+                else Av1FwdTransform.ReturnLevels(cf);
             }
             if (cand.Coeffs == null) return 0;
             cand.J = bestJ;
