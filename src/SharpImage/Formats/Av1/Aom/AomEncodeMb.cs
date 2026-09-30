@@ -23,16 +23,6 @@ internal struct AomQuantParam
     public int XformQuantIdx;
 }
 
-internal sealed partial class AomMacroblock
-{
-    // encoder configuration the coefficient path reads (cpi->oxcf / cpi->sf / cpi->optimize_seg_arr)
-    public int Sharpness;                 // oxcf.algo_cfg.sharpness
-    public bool UseChromaTrellisRdMult;   // sf.tx_sf.use_chroma_trellis_rd_mult
-    public bool TuneIq;                   // oxcf.tune_cfg.tuning == AOM_TUNE_IQ / SSIMULACRA2
-    public int OptimizeSeg = 1;           // cpi->optimize_seg_arr[segment] (TRELLIS_OPT_TYPE)
-    public int ReducedTxSetUsed;          // cm->features.reduced_tx_set_used
-}
-
 // Port of libaom 3.14.1 av1/encoder/encodemb.{c,h} (subtract, xform, quant, optimize_b, set_txb_context), the
 // transform-block iterator, av1_inverse_transform_block's use, and the 8-bit distortion kernels the search uses
 // (aom_sum_squares_2d_i16, aom_sum_sse_2d_i16, aom_sse, av1_block_error as AVX2 runs it, aom_satd).
@@ -290,13 +280,13 @@ internal static class AomEncodeMb
     }
 
     /// <summary>get_tx_type_cost (txb_rdopt.c): the tx type's symbol cost for luma (0 for chroma).</summary>
-    internal static int TxTypeCost(AomMacroblock x, int plane, int txSize, int txType)
+    internal static int TxTypeCost(AomMacroblock x, int plane, int txSize, int txType, int reducedTxSetUsed)
     {
         if (plane > 0) return 0;
         var xd = x.E;
         var mbmi = xd.Mi0;
         int sqr = TxsizeSqrMap[txSize];
-        int setType = ExtTxSetType(txSize, false, x.ReducedTxSetUsed != 0);
+        int setType = ExtTxSetType(txSize, false, reducedTxSetUsed != 0);
         if (NumExtTxSet[setType] > 1 && xd.Lossless[mbmi.SegmentId] == 0)
         {
             int extTxSet = ExtTxSetIndex[0 * 16 + setType];
@@ -314,13 +304,13 @@ internal static class AomEncodeMb
         => costs.Get(AomTxb.TxsizeEntropyCtx(txSize), plane == 0 ? 0 : 1).TxbSkip[ctx.TxbSkipCtx * 2 + 1];
 
     /// <summary>av1_optimize_b: the trellis (or the skip cost when there is nothing to optimise). Returns the eob.</summary>
-    internal static int OptimizeB(AomMacroblock x, int plane, int block, int txSize, int txType, AomTxbCtx txbCtx, out int rateCost)
+    internal static int OptimizeB(AomComp cpi, AomMacroblock x, int plane, int block, int txSize, int txType, AomTxbCtx txbCtx, out int rateCost)
     {
         var xd = x.E;
         var p = x.Plane[plane];
         int eob = p.Eobs[block];
         int segmentId = xd.Mi0.SegmentId;
-        if (eob == 0 || x.OptimizeSeg == 0 || xd.Lossless[segmentId] != 0)
+        if (eob == 0 || cpi.OptimizeSegArr[segmentId] == 0 || xd.Lossless[segmentId] != 0)
         {
             rateCost = CostSkipTxb(x.CoeffCosts, txbCtx, plane, txSize);
             return eob;
@@ -329,20 +319,20 @@ internal static class AomEncodeMb
         var scan = ScanOf(txSize, txType);
         var q = p.Qcoeff.AsSpan(off, n);
         eob = AomTxb.OptimizeTxb(x.CoeffCosts, txSize, txType, plane == 0 ? 0 : 1, false, txbCtx, p.Coeff.AsSpan(off, n), q,
-            p.Dqcoeff.AsSpan(off, n), eob, p.Dequant0, p.Dequant1, x.Rdmult, xd.Bd, x.Sharpness, x.UseChromaTrellisRdMult, x.TuneIq,
-            TxTypeCost(x, plane, txSize, txType), scan, out rateCost);
+            p.Dqcoeff.AsSpan(off, n), eob, p.Dequant0, p.Dequant1, x.Rdmult, xd.Bd, cpi.Sharpness, cpi.Sf.tx_sf.use_chroma_trellis_rd_mult != 0,
+            cpi.TuneIq, TxTypeCost(x, plane, txSize, txType, cpi.ReducedTxSetUsed), scan, out rateCost);
         p.Eobs[block] = (ushort)eob;
         p.TxbEntropyCtx[block] = AomTxb.TxbEntropyContext(q, scan, eob);
         return eob;
     }
 
     /// <summary>cost_coeffs / av1_cost_coeffs_txb.</summary>
-    internal static int CostCoeffs(AomMacroblock x, int plane, int block, int txSize, int txType, AomTxbCtx txbCtx)
+    internal static int CostCoeffs(AomMacroblock x, int plane, int block, int txSize, int txType, AomTxbCtx txbCtx, int reducedTxSetUsed)
     {
         var p = x.Plane[plane];
         int off = BlockOffset(block);
         return AomTxb.CostCoeffsTxb(x.CoeffCosts, txSize, txType, plane == 0 ? 0 : 1, txbCtx, p.Qcoeff.AsSpan(off, MaxEob(txSize)),
-            p.Eobs[block], TxTypeCost(x, plane, txSize, txType), ScanOf(txSize, txType));
+            p.Eobs[block], TxTypeCost(x, plane, txSize, txType, reducedTxSetUsed), ScanOf(txSize, txType));
     }
 
     /// <summary>av1_set_txb_context.</summary>

@@ -14,6 +14,8 @@ public sealed partial class AomTwinTests
         [DllImport("aomtwin")] public static extern ulong twin_sum_sse_2d_i16(short* src, int stride, int w, int h, int* sum);
         [DllImport("aomtwin")] public static extern long twin_sse(byte* a, int aStride, byte* b, int bStride, int w, int h);
         [DllImport("aomtwin")] public static extern int twin_satd(int* coeff, int n);
+        [DllImport("aomtwin")] public static extern void twin_hadamard(int txSize, short* src, int stride, int* coeff);
+        [DllImport("aomtwin")] public static extern void twin_inv_txfm_add(int* dqcoeff, byte* dst, int stride, int txSize, int txType, int eob);
     }
 
     // residual generators: uniform, the extremes, smooth ramps, sparse spikes (the transforms' overflow corners)
@@ -127,6 +129,83 @@ public sealed partial class AomTwinTests
             long sL; unsafe { fixed (byte* a = p0) fixed (byte* b = p1) sL = Native.twin_sse(a, 72, b, 80, w, h); }
             long sO = AomEncodeMb.Sse(p0, 0, 72, p1, 0, 80, w, h);
             if (sO != sL) await Assert.That(sO).IsEqualTo(sL);
+        }
+    }
+
+    [Test]
+    public async Task InverseTransform_AllSizesTypes()
+    {
+        if (!Available) return;
+        var rng = new Random(13);
+        const int stride = 64;
+        var diff = new short[64 * stride];
+        var coeff = new int[64 * 64];
+        var dq = new int[64 * 64];
+        var dstA = new byte[64 * stride];
+        var dstB = new byte[64 * stride];
+        string first = "";
+        for (int tx = 0; tx < 19 && first == ""; tx++)
+        {
+            int w = AomTables.TxSizeWide[tx], h = AomTables.TxSizeHigh[tx];
+            int n = Math.Min(w, 32) * Math.Min(h, 32);
+            for (int txType = 0; txType < 16 && first == ""; txType++)
+            {
+                if (Math.Max(w, h) == 32 && txType != AomTables.DCT_DCT && txType != AomTables.IDTX) continue;
+                if (Math.Max(w, h) == 64 && txType != AomTables.DCT_DCT) continue;
+                var scan = AomEncodeMb.ScanOf(tx, txType);
+                for (int iter = 0; iter < 400 && first == ""; iter++)
+                {
+                    Array.Clear(coeff);
+                    // the coefficients the encoder can produce: its own transform of 8-bit residuals, quantised. (libaom's
+                    // 16-bit SIMD inverse saturates where the spec clamps, so arbitrary out-of-range input is not compared.)
+                    FillResidual(rng, diff, stride, w, h, iter % 7);
+                    AomEncodeMb.TxTypeKinds(txType, out int hk, out int vk, out bool fu, out bool fl);
+                    Av1FwdTxfmAom.ForwardRaw(diff, stride, w, h, tx, hk, vk, fu, fl, coeff.AsSpan(0, n));
+                    int step = 4 + rng.Next(1500);
+                    for (int i = 0; i < n; i++) dq[i] = (int)Math.Round(coeff[i] / (double)step) * step;
+                    int eob = 0;
+                    for (int i = 0; i < n; i++) if (dq[scan[i]] != 0) eob = i + 1;
+                    if (eob == 0) continue;
+                    // the kernels read only the scan's first eob positions
+                    for (int i = eob; i < n; i++) dq[scan[i]] = 0;
+                    rng.NextBytes(dstA);
+                    Array.Copy(dstA, dstB, dstA.Length);
+                    unsafe { fixed (int* pq = dq) fixed (byte* pd = dstA) Native.twin_inv_txfm_add(pq, pd, stride, tx, txType, eob); }
+                    AomEncodeMb.InverseTransformBlock(dq, 0, txType, tx, dstB, 0, stride, eob);
+                    for (int r = 0; r < h && first == ""; r++)
+                        for (int c = 0; c < w; c++)
+                            if (dstA[r * stride + c] != dstB[r * stride + c])
+                            {
+                                first = $"tx {tx} type {txType} iter {iter} eob {eob} ({r},{c}): libaom {dstA[r * stride + c]} ours {dstB[r * stride + c]}";
+                                break;
+                            }
+                }
+            }
+        }
+        await Assert.That(first).IsEqualTo("");
+    }
+
+    [Test]
+    public async Task Hadamard_AllSizes()
+    {
+        if (!Available) return;
+        var rng = new Random(17);
+        const int stride = 64;
+        var diff = new short[64 * stride];
+        var a = new int[1024];
+        var b = new int[1024];
+        int[] sizes = { AomTables.TX_4X4, AomTables.TX_8X8, AomTables.TX_16X16, AomTables.TX_32X32 };
+        foreach (int tx in sizes)
+        {
+            int n = AomTables.TxSize2d[tx], w = AomTables.TxSizeWide[tx];
+            for (int iter = 0; iter < 2000; iter++)
+            {
+                FillResidual(rng, diff, stride, w, w, iter % 7);
+                unsafe { fixed (short* pd = diff) fixed (int* pa = a) Native.twin_hadamard(tx, pd, stride, pa); }
+                AomHadamard.WhtFwdTxfm(tx, diff, stride, b);
+                if (!a.AsSpan(0, n).SequenceEqual(b.AsSpan(0, n)))
+                    await Assert.That(string.Join(",", b.AsSpan(0, n).ToArray())).IsEqualTo(string.Join(",", a.AsSpan(0, n).ToArray()));
+            }
         }
     }
 }
