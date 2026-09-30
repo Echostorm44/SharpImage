@@ -4327,8 +4327,7 @@ internal static partial class Av1StillImageEncoder
                 if (delta != 0 && !uvAngleOk) continue;
                 if ((hogUv >> (int)mode & 1) != 0) continue;
                 PredictIntraRect(c.ReconU, c.Cw, cbw4, cbh4, cbx4, cby4, cw, ch, mode, delta, pu, chromaEdge, cIntraFlags);
-                long sad = 0;
-                for (int yy = 0; yy < ch; yy++) { int r = (cby + yy) * c.Cw + cbx; for (int xx = 0; xx < cw; xx++) sad += Math.Abs(c.U[r + xx] - pu[yy * cw + xx]); }
+                long sad = SadRect(c.U, c.Cw, cbx, cby, pu, cw, ch);
                 for (int k = 0; k < RdUvCandidates; k++)
                     if (sad < uvTopCost[k]) { for (int j = RdUvCandidates - 1; j > k; j--) { uvTopCost[j] = uvTopCost[j - 1]; uvTopIdx[j] = uvTopIdx[j - 1]; } uvTopCost[k] = sad; uvTopIdx[k] = ci; break; }
             }
@@ -4656,8 +4655,7 @@ internal static partial class Av1StillImageEncoder
                 {
                     PredictIntraRect(c.ReconU, c.Cw, pbw4, pbh4, cbx4 + x, cby4 + y, tw, th, mode, delta, pred, e, cIntraFlags);
                     int px = cpx + x * 4, py = cpy + y * 4;
-                    for (int yy = 0; yy < th; yy++)
-                        for (int xx = 0; xx < tw; xx++) sad += Math.Abs(c.U[(py + yy) * c.Cw + px + xx] - pred[yy * tw + xx]);
+                    sad += SadRect(c.U, c.Cw, px, py, pred, tw, th);
                 }
                 for (int k = 0; k < RdUvCandidates; k++)
                     if (sad < topCost[k]) { for (int q = RdUvCandidates - 1; q > k; q--) { topCost[q] = topCost[q - 1]; topIdx[q] = topIdx[q - 1]; } topCost[k] = sad; topIdx[k] = ci; break; }
@@ -4887,7 +4885,7 @@ internal static partial class Av1StillImageEncoder
                 if (CandidateModes[ci].Delta != 0 || (keep >> ci & 1) == 0) continue;
                 PredictIntraRect(c.ReconY, c.W, c.Bw4, c.Bh4, bx4, by4, w, h, CandidateModes[ci].Mode, 0, pred, edge, intraFlags);
                 long sad = 0;
-                for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) sad += Math.Abs(c.Luma[(by + yy) * c.W + (bx + xx)] - pred[yy * w + xx]);
+                sad += SadRect(c.Luma, c.W, bx, by, pred, w, h);
                 sads[ci] = sad;
             }
             ulong allowed = keep;
@@ -5885,14 +5883,38 @@ internal static partial class Av1StillImageEncoder
     // Sum of absolute differences over a cn x cn block (pred stride = cn). Works at any size (unlike the 8x8-tiled
     // SATD), so it prescreens chroma UV modes down to 4x4. A coarse proxy — good enough to pick the RD shortlist.
     private static long SadBlock(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int cn)
+        => SadRect(src, srcW, srcBx, srcBy, pred, cn, cn);
+
+    // Sum of |src - pred| over a w x h block (pred stride w): 16 / 8 lanes (|a - b| as max - min, summed pairwise
+    // through pmaddwd with ones; a 64 x 64 block sums below 2^31).
+    private static long SadRect(ReadOnlySpan<ushort> src, int srcW, int srcBx, int srcBy, ushort[] pred, int w, int h)
     {
         long total = 0;
-        for (int y = 0; y < cn; y++)
+        int x0 = System.Runtime.Intrinsics.X86.Avx2.IsSupported ? 0 : w;
+        var acc = Vector256<int>.Zero; var ones = Vector256.Create((short)1);
+        for (int y = 0; y < h; y++)
         {
-            int row = (srcBy + y) * srcW + srcBx;
-            for (int x = 0; x < cn; x++) total += Math.Abs(src[row + x] - pred[y * cn + x]);
+            var s = src.Slice((srcBy + y) * srcW + srcBx, w);
+            var pr = pred.AsSpan(y * w, w);
+            int x = 0;
+            if (x0 == 0)
+            {
+                for (; x + 16 <= w; x += 16)
+                {
+                    var a = Vector256.Create(s.Slice(x, 16)); var b = Vector256.Create(pr.Slice(x, 16));
+                    acc += System.Runtime.Intrinsics.X86.Avx2.MultiplyAddAdjacent((Vector256.Max(a, b) - Vector256.Min(a, b)).AsInt16(), ones);
+                }
+                if (x + 8 <= w)
+                {
+                    var a = Vector128.Create(s.Slice(x, 8)); var b = Vector128.Create(pr.Slice(x, 8));
+                    acc += Vector256.Create(System.Runtime.Intrinsics.X86.Sse2.MultiplyAddAdjacent((Vector128.Max(a, b) - Vector128.Min(a, b)).AsInt16(),
+                        Vector128.Create((short)1)), Vector128<int>.Zero);
+                    x += 8;
+                }
+            }
+            for (; x < w; x++) total += Math.Abs(s[x] - pr[x]);
         }
-        return total;
+        return total + Vector256.Sum(acc);
     }
 
     // SATD over a w x h rectangular block (pred stride = w). Rect leaf sizes are all multiples of 8, so the 8x8
