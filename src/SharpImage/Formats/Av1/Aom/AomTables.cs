@@ -777,4 +777,100 @@ internal static partial class AomTables
         6, 7, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10,
         11,
     };
+
+    // [FILTER_INTRA_MODES] (5 values)
+    internal static readonly byte[] FimodeToIntradir =
+    {
+        0, 1, 2, 6, 0,
+    };
+
+    // [EXT_TX_SET_TYPES] (6 values)
+    internal static readonly int[] NumExtTxSet =
+    {
+        1, 2, 5, 7, 12, 16,
+    };
+
+    // [EXT_TX_SET_TYPES][TX_TYPES] (96 values)
+    internal static readonly int[] ExtTxUsed =
+    {
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    };
+
+    // [INTRA_MODES] (13 values)
+    internal static readonly ushort[] DerivedIntraTxUsedFlag =
+    {
+        521, 1027, 2053, 527, 9, 9, 9, 2053, 1027, 517, 1027, 2053, 521,
+    };
+
+    // [INTRA_MODES] (13 values)
+    internal static readonly ushort[] ReducedIntraTxUsedFlag =
+    {
+        2063, 1039, 2063, 527, 2063, 1039, 2063, 2063, 1039, 2063, 1039, 2063, 3086,
+    };
+
+    // [EXT_TX_SET_TYPES] (6 values)
+    internal static readonly ushort[] ExtTxUsedFlag =
+    {
+        1, 513, 527, 3599, 4095, 65535,
+    };
+
+    // [2][2] (4 values)
+    internal static readonly byte[] ExtTxSetLookup =
+    {
+        3, 2, 5, 4,
+    };
+
+    // [2][EXT_TX_SET_TYPES] (12 values)
+    internal static readonly int[] ExtTxSetIndex =
+    {
+        0, -1, 2, 1, -1, -1, 0, 3, -1, -1, 2, 1,
+    };
+
+    // [INTRA_MODES] (13 values)
+    internal static readonly byte[] IntraModeToTxType =
+    {
+        0, 1, 2, 0, 3, 1, 2, 2, 1, 3, 1, 2, 3,
+    };
+
+    // [EXT_TX_SET_TYPES][TX_TYPES] (96 values)
+    internal static readonly int[] ExtTxInv =
+    {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        9, 0, 3, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        9, 0, 10, 11, 3, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        9, 10, 11, 0, 1, 2, 4, 5, 3, 6, 7, 8, 0, 0, 0, 0,
+        9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 4, 5, 3, 6, 7, 8,
+    };
+
+    // [EXT_TX_SETS_INTRA][EXT_TX_SIZES] (12 values)
+    internal static readonly int[] UseIntraExtTxForTxsize =
+    {
+        1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0,
+    };
+
+    // [2][AOMMAX(EXT_TX_SETS_INTRA, EXT_TX_SETS_INTER)] (7 values)
+    internal static readonly int[] ExtTxSetIdxToType =
+    {
+        0, 3, 2, 0, 5, 4, 1,
+    };
+
+    // [TX_SIZES_ALL] (19 values)
+    internal static readonly ushort[] DcCoeffScale =
+    {
+        1024, 2048, 4096, 4096, 0, 1448, 1448, 2896, 2896, 2896, 2896, 0, 0, 2048, 2048, 4096,
+        4096, 0, 0,
+    };
+
+    // [TX_SIZES_ALL] (19 values)
+    internal static readonly int[] SqrtTxPixels2d =
+    {
+        4, 8, 16, 32, 32, 6, 6, 12, 12, 23, 23, 32, 32, 8, 8, 16,
+        16, 23, 23,
+    };
 }

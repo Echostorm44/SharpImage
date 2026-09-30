@@ -34,6 +34,7 @@ public sealed class AomTwinTests
             short* quant2, short* shift2, short* dequant2, int logScale, int* qcoeff, int* dqcoeff);
         [DllImport("aomtwin")] public static extern void twin_scan(int txSize, int txType, short* outp, int n);
         [DllImport("aomtwin")] public static extern int twin_default_coeff_costs(int baseQindex, int* outp, int outLen);
+        [DllImport("aomtwin")] public static extern int twin_default_mode_costs(int enableFilterIntra, int* outp, int outLen, int* offs);
         [DllImport("aomtwin")] public static extern int twin_cost_coeffs_txb(int* costs, int plane, int txSize, int txType, int txbSkipCtx,
             int dcSignCtx, int* qcoeff, int eob);
         [DllImport("aomtwin")] public static extern int twin_optimize_txb(int* costs, int plane, int txSize, int txType, int txbSkipCtx,
@@ -317,5 +318,48 @@ public sealed class AomTwinTests
         await Assert.That(firstDump ?? "").IsEqualTo("");
         await Assert.That(string.Join("; ", fails.OrderBy(k => k.Key).Select(k => $"{k.Key}: {k.Value}"))).IsEqualTo("");
         await Assert.That(checkedN).IsGreaterThan(10000);
+    }
+
+    [Test]
+    public async Task DefaultModeCosts()
+    {
+        if (!Available) return;
+        foreach (bool fi in new[] { true, false })
+        {
+            var buf = new int[20000]; var offs = new int[17];
+            unsafe { fixed (int* p = buf) fixed (int* o = offs) Native.twin_default_mode_costs(fi ? 1 : 0, p, buf.Length, o); }
+            var fc = new Av1CdfContext();
+            Av1CdfDefaults.InitializeMode(fc.Mode);
+            Av1CdfDefaults.InitializeKfym(fc.Kfym);
+            var mc = new AomModeCosts();
+            AomModeCostFill.Fill(mc, fc, fi);
+            var errors = new List<string>();
+            void Cmp(string name, int field, int[] ours, int count, Func<int, bool>? used = null)
+            {
+                for (int k = 0; k < count; k++)
+                {
+                    if (used != null && !used(k)) continue;
+                    if (ours[k] != buf[offs[field] + k]) { errors.Add($"{name}[{k}] ours {ours[k]} libaom {buf[offs[field] + k]}"); return; }
+                }
+            }
+            Cmp("partition", 0, mc.PartitionCost, 200, k => (k % 10) < ((k / 10) >> 2 == 0 ? 4 : (k / 10) >> 2 == 4 ? 8 : 10));
+            Cmp("skip_txfm", 1, mc.SkipTxfmCost, 6);
+            Cmp("y_mode", 2, mc.YModeCosts, 13 * 13 * 13, k => k / 169 < 5 && (k / 13) % 13 < 5);
+            Cmp("intra_uv_mode", 3, mc.IntraUvModeCost, 2 * 13 * 14, k => k / (13 * 14) == 1 || k % 14 < 13);
+            Cmp("filter_intra_mode", 4, mc.FilterIntraModeCost, 5);
+            Cmp("filter_intra", 5, mc.FilterIntraCost, 44, k => AomModeCostFill.FilterIntraAllowedBsize(fi, k / 2));
+            Cmp("palette_y_size", 6, mc.PaletteYSizeCost, 49);
+            Cmp("palette_uv_size", 7, mc.PaletteUvSizeCost, 49);
+            Cmp("palette_y_mode", 8, mc.PaletteYModeCost, 42);
+            Cmp("palette_uv_mode", 9, mc.PaletteUvModeCost, 4);
+            Cmp("palette_y_color", 10, mc.PaletteYColorCost, 280, k => k % 8 < k / 40 + 2);
+            Cmp("palette_uv_color", 11, mc.PaletteUvColorCost, 280, k => k % 8 < k / 40 + 2);
+            Cmp("cfl", 12, mc.CflCost, 256);
+            Cmp("tx_size", 13, mc.TxSizeCost, 60, k => k % 5 < (k / 15 == 0 ? 2 : 3));
+            Cmp("intra_tx_type", 14, mc.IntraTxTypeCosts, 3 * 4 * 13 * 16, k => AomTables.UseIntraExtTxForTxsize[(k / (13 * 16 * 4)) * 4 + (k / (13 * 16)) % 4] != 0);
+            Cmp("angle_delta", 15, mc.AngleDeltaCost, 56);
+            Cmp("intrabc", 16, mc.IntrabcCost, 2);
+            await Assert.That(string.Join("; ", errors)).IsEqualTo("");
+        }
     }
 }
