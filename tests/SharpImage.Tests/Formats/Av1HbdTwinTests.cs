@@ -42,15 +42,18 @@ public sealed class Av1HbdTwinTests
             for (int i = 0; i < e8.Length; i++) { e8[i] = (byte)rnd.Next(256); e16[i] = e8[i]; }
             var d8 = new byte[w * h];
             var d16 = new ushort[w * h];
+            var dB = new byte[w * h];
             if (mode == 13 && (w > 32 || h > 32)) continue;   // filter-intra is defined only up to 32x32
             int maxW = rnd.Next(1, 2 * w + 1), maxH = rnd.Next(1, 2 * h + 1);
-            bool t8 = false, t16 = false;
+            bool t8 = false, t16 = false, tB = false;
             try { Av1IntraPred.Predict(mode, d8, w, e8, center, w, h, angle, maxW, maxH, 8); } catch (IndexOutOfRangeException) { t8 = true; }
             // (the vector paths slice their edge spans, so an out-of-range read can surface as ArgumentOutOfRangeException)
             try { Av1IntraPred.Predict16(mode, d16, w, e16, center, w, h, angle, maxW, maxH, 8); } catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException) { t16 = true; }
-            if (t8 || t16) { if (t8 != t16) mismatches++; continue; }   // invalid combo: both must reject alike
+            // the generic predictor's lowbd (byte) instantiation
+            try { Av1IntraPred.Predict16<byte>(mode, dB, w, e8, center, w, h, angle, maxW, maxH, 8); } catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException) { tB = true; }
+            if (t8 || t16 || tB) { if (t8 != t16 || t8 != tB) mismatches++; continue; }   // invalid combo: all must reject alike
             compared++;
-            for (int i = 0; i < d8.Length; i++) if (d8[i] != d16[i]) { mismatches++; break; }
+            for (int i = 0; i < d8.Length; i++) if (d8[i] != d16[i] || d8[i] != dB[i]) { mismatches++; break; }
         }
         await Assert.That(mismatches).IsEqualTo(0);
         await Assert.That(compared).IsGreaterThan(2000);
@@ -115,13 +118,58 @@ public sealed class Av1HbdTwinTests
             int a16 = a8;
             var o8 = new byte[513];
             var o16 = new ushort[513];
+            var oB = new byte[513];
+            int aB = a8;
             int off = (y * 4) * stride + x * 4;
             int m8 = Av1Reconstruction.PrepareIntraEdges(x, x > 0, y, y > 0, bw4, bh4, flags, p8, off, stride, default,
                 mode, ref a8, tw, th, filter, o8, edgeCenter, 8);
             int m16 = Av1Reconstruction.PrepareIntraEdges(x, x > 0, y, y > 0, bw4, bh4, flags, p16, off, stride, default,
                 mode, ref a16, tw, th, filter, o16, edgeCenter, 8);
-            bool bad = m8 != m16 || a8 != a16;
-            for (int i = 0; i < o8.Length && !bad; i++) if (o8[i] != o16[i]) bad = true;
+            int mB = Av1Reconstruction.PrepareIntraEdges<byte>(x, x > 0, y, y > 0, bw4, bh4, flags, p8, off, stride, default,
+                mode, ref aB, tw, th, filter, oB, edgeCenter, 8);
+            bool bad = m8 != m16 || a8 != a16 || m8 != mB || a8 != aB;
+            for (int i = 0; i < o8.Length && !bad; i++) if (o8[i] != o16[i] || o8[i] != oB[i]) bad = true;
+            if (bad) mismatches++;
+        }
+        await Assert.That(mismatches).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task CflAndPalette16AtBd8MatchByte()
+    {
+        var rnd = new Random(31);
+        int[] sizes = { 4, 8, 16, 32 };
+        int mismatches = 0;
+        const int center = 128;
+        for (int trial = 0; trial < 2000; trial++)
+        {
+            int w = sizes[rnd.Next(sizes.Length)], h = sizes[rnd.Next(sizes.Length)];
+            if (w > 4 * h || h > 4 * w) continue;
+            int ssH = rnd.Next(2), ssV = rnd.Next(2), lw = w << ssH, lh = h << ssV;
+            var l8 = new byte[lw * lh];
+            var l16 = new ushort[lw * lh];
+            for (int i = 0; i < l8.Length; i++) { l8[i] = (byte)rnd.Next(256); l16[i] = l8[i]; }
+            int wPad = rnd.Next(w / 4), hPad = rnd.Next(h / 4);
+            var ac8 = new short[w * h]; var ac16 = new short[w * h]; var acB = new short[w * h];
+            Av1IntraPred.CflAc(ac8, l8, lw, wPad, hPad, w, h, ssH, ssV);
+            Av1IntraPred.CflAc16<ushort>(ac16, l16, lw, wPad, hPad, w, h, ssH, ssV);
+            Av1IntraPred.CflAc16<byte>(acB, l8, lw, wPad, hPad, w, h, ssH, ssV);
+            bool bad = !ac8.AsSpan().SequenceEqual(ac16) || !ac8.AsSpan().SequenceEqual(acB);
+            var e8 = new byte[257]; var e16 = new ushort[257];
+            for (int i = 0; i < e8.Length; i++) { e8[i] = (byte)rnd.Next(256); e16[i] = e8[i]; }
+            int alpha = rnd.Next(-16, 17);
+            var d8 = new byte[w * h]; var d16 = new ushort[w * h]; var dB = new byte[w * h];
+            Av1IntraPred.PredCfl(d8, w, e8, center, w, h, ac8, alpha);
+            Av1IntraPred.PredCfl16<ushort>(d16, w, e16, center, w, h, ac8, alpha, 8);
+            Av1IntraPred.PredCfl16<byte>(dB, w, e8, center, w, h, ac8, alpha, 8);
+            for (int i = 0; i < d8.Length && !bad; i++) if (d8[i] != d16[i] || d8[i] != dB[i]) bad = true;
+            var pal = new ushort[8];
+            for (int i = 0; i < 8; i++) pal[i] = (ushort)rnd.Next(256);
+            var idx = new byte[w * h / 2];
+            for (int i = 0; i < idx.Length; i++) idx[i] = (byte)(rnd.Next(8) | rnd.Next(8) << 4);
+            Av1IntraPred.PredPalette16<ushort>(d16, w, pal, idx, w, h);
+            Av1IntraPred.PredPalette16<byte>(dB, w, pal, idx, w, h);
+            for (int i = 0; i < d16.Length && !bad; i++) if (d16[i] != dB[i]) bad = true;
             if (bad) mismatches++;
         }
         await Assert.That(mismatches).IsEqualTo(0);

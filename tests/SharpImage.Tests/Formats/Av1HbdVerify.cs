@@ -2212,7 +2212,14 @@ public sealed class Av1HbdVerify
                             int iters = Math.Max(20000, 2_000_000 / (n * n));
                             var sw = System.Diagnostics.Stopwatch.StartNew();
                             for (int i = 0; i < iters; i++) Av1IntraPred.Predict16(impl, dst, n, edge, 256, n, n, a, n, n, 8);
-                            sb.Append($" {name} {sw.Elapsed.TotalMilliseconds * 1e6 / iters:F0}");
+                            double t16 = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+                            // the lowbd (byte) instantiation on the same edge
+                            var e8 = new byte[513]; for (int i = 0; i < e8.Length; i++) e8[i] = (byte)edge[i];
+                            var d8 = new byte[64 * 64];
+                            for (int i = 0; i < 2000; i++) Av1IntraPred.Predict16<byte>(impl, d8, n, e8, 256, n, n, a, n, n, 8);
+                            sw.Restart();
+                            for (int i = 0; i < iters; i++) Av1IntraPred.Predict16<byte>(impl, d8, n, e8, 256, n, n, a, n, n, 8);
+                            sb.Append($" {name} {t16:F0}/{sw.Elapsed.TotalMilliseconds * 1e6 / iters:F0}");
                         }
                         log.AppendLine(sb.ToString());
                     }

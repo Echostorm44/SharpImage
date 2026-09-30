@@ -87,17 +87,17 @@ public static class Av1Reconstruction
     /// <param name="filterEdge">Whether intra edge filtering is enabled.</param>
     /// <param name="topleftOut">Output edge buffer: [-th*4..0..tw*4+tw*4].</param>
     /// <param name="bitdepth">Bit depth (8 or 10).</param>
-    public static int PrepareIntraEdges(
+    public static int PrepareIntraEdges<TP>(
         int x, bool haveLeft,
         int y, bool haveTop,
         int w, int h,
         Av1EdgeFlags edgeFlags,
-        ReadOnlySpan<ushort> dst, int dstOff, int dstStride,
-        ReadOnlySpan<ushort> topSbEdge,
+        ReadOnlySpan<TP> dst, int dstOff, int dstStride,
+        ReadOnlySpan<TP> topSbEdge,
         Av1IntraPredMode mode, ref int angle,
         int tw, int th, bool filterEdge,
-        Span<ushort> topleftOut, int topleftCenter,
-        int bitdepth)
+        Span<TP> topleftOut, int topleftCenter,
+        int bitdepth) where TP : unmanaged
     {
         // Resolve to implementation mode
         int implMode;
@@ -148,7 +148,7 @@ public static class Av1Reconstruction
         byte needs = EdgeNeeds[implMode];
 
         // Resolve top source pointer
-        ReadOnlySpan<ushort> dstTop = default;
+        ReadOnlySpan<TP> dstTop = default;
         int dstTopOffset = 0;
         if (haveTop && ((needs & (NeedsTop | NeedsTopleft)) != 0 ||
             ((needs & NeedsLeft) != 0 && !haveLeft)))
@@ -181,7 +181,7 @@ public static class Av1Reconstruction
             }
             else
             {
-                ushort fillVal = haveTop ? dstTop[dstTopOffset] : (ushort)(((1 << bitdepth) >> 1) + 1);
+                TP fillVal = haveTop ? dstTop[dstTopOffset] : Px.T<TP>(((1 << bitdepth) >> 1) + 1);
                 topleftOut.Slice(leftStart, sz).Fill(fillVal);
             }
 
@@ -221,7 +221,7 @@ public static class Av1Reconstruction
             }
             else
             {
-                ushort fillVal = haveLeft ? dst[dstOff - 1] : (ushort)(((1 << bitdepth) >> 1) - 1);
+                TP fillVal = haveLeft ? dst[dstOff - 1] : Px.T<TP>(((1 << bitdepth) >> 1) - 1);
                 topleftOut.Slice(topStart, sz).Fill(fillVal);
             }
 
@@ -252,22 +252,22 @@ public static class Av1Reconstruction
             if (haveLeft)
                 topleftOut[topleftCenter] = haveTop ? dstTop[dstTopOffset - 1] : dst[dstOff - 1];
             else
-                topleftOut[topleftCenter] = haveTop ? dstTop[dstTopOffset] : (ushort)((1 << bitdepth) >> 1);
+                topleftOut[topleftCenter] = haveTop ? dstTop[dstTopOffset] : Px.T<TP>((1 << bitdepth) >> 1);
 
             // Z2 corner filtering
             if (implMode == ImplZ2 && tw + th >= 6 && filterEdge)
             {
-                topleftOut[topleftCenter] = (ushort)(
-                    ((topleftOut[topleftCenter - 1] + topleftOut[topleftCenter + 1]) * 5 +
-                     topleftOut[topleftCenter] * 6 + 8) >> 4);
+                topleftOut[topleftCenter] = Px.T<TP>(
+                    ((Px.I(topleftOut[topleftCenter - 1]) + Px.I(topleftOut[topleftCenter + 1])) * 5 +
+                     Px.I(topleftOut[topleftCenter]) * 6 + 8) >> 4);
             }
         }
 
         return implMode;
     }
 
-    /// <summary>8-bit overload of <see cref="PrepareIntraEdges(int,bool,int,bool,int,int,Av1EdgeFlags,ReadOnlySpan{ushort},int,int,ReadOnlySpan{ushort},Av1IntraPredMode,ref int,int,int,bool,Span{ushort},int,int)"/>
-    /// retained for the encoder, whose reconstruction surfaces are 8-bit byte planes.</summary>
+    /// <summary>Scalar 8-bit reference for <see cref="PrepareIntraEdges{TP}"/>
+    /// (Av1HbdTwinTests pins the generic byte / ushort instantiations to it).</summary>
     public static int PrepareIntraEdges(
         int x, bool haveLeft,
         int y, bool haveTop,

@@ -1,4 +1,5 @@
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 // AV1 intra prediction modes for the decoder
 // Ported from dav1d: src/ipred_tmpl.c + src/ipred_prepare_tmpl.c (VideoLAN dav1d, BSD-2-Clause)
 // Implements DC, V, H, Paeth, Smooth, directional (Z1/Z2/Z3), filter intra,
@@ -1261,72 +1262,74 @@ public static class Av1IntraPred
     }
 
     // ========================================================================
-    // High bit depth variants (16-bit)
+    // 16-bit arithmetic variants, generic over the sample type TP (byte for 8-bit content, ushort for 10/12-bit; see Px).
+    // The "16" names the arithmetic width, not the storage: the byte instantiation at bit depth 8 is bit-identical to the
+    // ushort one.
     // ========================================================================
 
     /// <summary>
-    /// DC prediction for high bit depth (10/12-bit).
+    /// DC prediction.
     /// </summary>
-    public static void PredDc16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height, int bitDepth)
+    public static void PredDc16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height, int bitDepth) where TP : unmanaged
     {
         int dc = DcGenBoth16(edgeBuf, center, width, height, bitDepth);
         SplatDc16(dst, dstStride, width, height, dc);
     }
 
-    public static void PredDcTop16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height)
+    public static void PredDcTop16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height) where TP : unmanaged
     {
         int dc = DcGenTop16(edgeBuf, center, width);
         SplatDc16(dst, dstStride, width, height, dc);
     }
 
-    public static void PredDcLeft16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height)
+    public static void PredDcLeft16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height) where TP : unmanaged
     {
         int dc = DcGenLeft16(edgeBuf, center, height);
         SplatDc16(dst, dstStride, width, height, dc);
     }
 
-    public static void PredDc12816(
-        Span<ushort> dst, int dstStride,
-        int width, int height, int bitDepth)
+    public static void PredDc12816<TP>(
+        Span<TP> dst, int dstStride,
+        int width, int height, int bitDepth) where TP : unmanaged
     {
         int dc = ((1 << bitDepth) + 1) >> 1;
         SplatDc16(dst, dstStride, width, height, dc);
     }
 
-    public static void PredV16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height)
+    public static void PredV16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height) where TP : unmanaged
     {
         var top = edgeBuf.Slice(center + 1, width);
         for (int y = 0; y < height; y++)
             top.CopyTo(dst.Slice(y * dstStride, width));
     }
 
-    public static void PredH16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height)
+    public static void PredH16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height) where TP : unmanaged
     {
         for (int y = 0; y < height; y++)
             dst.Slice(y * dstStride, width).Fill(edgeBuf[center - 1 - y]);
     }
 
-    public static void PredPaeth16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height)
+    public static void PredPaeth16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height) where TP : unmanaged
     {
-        int tl = edgeBuf[center];
+        int tl = Px.I(edgeBuf[center]);
         if (Vector256.IsHardwareAccelerated && width >= 16)
         {
             // 16 lanes: |left - base| = |top - tl|, |top - base| = |left - tl|, |tl - base| = |left + top - 2tl|
@@ -1334,19 +1337,19 @@ public static class Av1IntraPred
             var vtl = Vector256.Create((short)tl);
             for (int y = 0; y < height; y++)
             {
-                int left = edgeBuf[center - 1 - y];
+                int left = Px.I(edgeBuf[center - 1 - y]);
                 var vl = Vector256.Create((short)left);
                 var tdiff = Vector256.Create((short)Math.Abs(left - tl));
                 var row = dst.Slice(y * dstStride, width);
                 for (int x = 0; x < width; x += 16)
                 {
-                    var top = Vector256.Create(edgeBuf.Slice(center + 1 + x, 16)).AsInt16();
+                    var top = Px.Load16(edgeBuf, center + 1 + x).AsInt16();
                     var ldiff = Vector256.Abs(top - vtl);
                     var tldiff = Vector256.Abs(vl + top - vtl - vtl);
                     var useLeft = Vector256.LessThanOrEqual(ldiff, tdiff) & Vector256.LessThanOrEqual(ldiff, tldiff);
                     var useTop = Vector256.LessThanOrEqual(tdiff, tldiff);
                     var v = Vector256.ConditionalSelect(useLeft, vl, Vector256.ConditionalSelect(useTop, top, vtl));
-                    v.AsUInt16().CopyTo(row.Slice(x, 16));
+                    Px.Store16(row, x, v.AsUInt16());
                 }
             }
             return;
@@ -1354,46 +1357,46 @@ public static class Av1IntraPred
         if (Vector128.IsHardwareAccelerated && width == 8)
         {
             var vtl = Vector128.Create((short)tl);
-            var top = Vector128.Create(edgeBuf.Slice(center + 1, 8)).AsInt16();
+            var top = Px.Load8(edgeBuf, center + 1).AsInt16();
             var ldiff = Vector128.Abs(top - vtl);
             for (int y = 0; y < height; y++)
             {
-                int left = edgeBuf[center - 1 - y];
+                int left = Px.I(edgeBuf[center - 1 - y]);
                 var vl = Vector128.Create((short)left);
                 var tdiff = Vector128.Create((short)Math.Abs(left - tl));
                 var tldiff = Vector128.Abs(vl + top - vtl - vtl);
                 var useLeft = Vector128.LessThanOrEqual(ldiff, tdiff) & Vector128.LessThanOrEqual(ldiff, tldiff);
                 var useTop = Vector128.LessThanOrEqual(tdiff, tldiff);
-                Vector128.ConditionalSelect(useLeft, vl, Vector128.ConditionalSelect(useTop, top, vtl)).AsUInt16().CopyTo(dst.Slice(y * dstStride, 8));
+                Px.Store8(dst, y * dstStride, Vector128.ConditionalSelect(useLeft, vl, Vector128.ConditionalSelect(useTop, top, vtl)).AsUInt16());
             }
             return;
         }
         for (int y = 0; y < height; y++)
         {
-            int left = edgeBuf[center - 1 - y];
+            int left = Px.I(edgeBuf[center - 1 - y]);
             var row = dst.Slice(y * dstStride, width);
             for (int x = 0; x < width; x++)
             {
-                int top = edgeBuf[center + 1 + x];
+                int top = Px.I(edgeBuf[center + 1 + x]);
                 int @base = left + top - tl;
                 int ldiff = Math.Abs(left - @base);
                 int tdiff = Math.Abs(top - @base);
                 int tldiff = Math.Abs(tl - @base);
-                row[x] = (ushort)(ldiff <= tdiff && ldiff <= tldiff ? left :
+                row[x] = Px.T<TP>(ldiff <= tdiff && ldiff <= tldiff ? left :
                                   tdiff <= tldiff ? top : tl);
             }
         }
     }
 
-    public static void PredSmooth16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height)
+    public static void PredSmooth16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height) where TP : unmanaged
     {
         var weightsH = Av1Tables.SmoothWeights.AsSpan(width, width);
         var weightsV = Av1Tables.SmoothWeights.AsSpan(height, height);
-        int right = edgeBuf[center + width];
-        int bottom = edgeBuf[center - height];
+        int right = Px.I(edgeBuf[center + width]);
+        int bottom = Px.I(edgeBuf[center - height]);
         if (Vector256.IsHardwareAccelerated && width >= 8)
         {
             // per column: top, wH and (256 - wH) * right + 256 fixed; per row two broadcasts
@@ -1402,7 +1405,7 @@ public static class Av1IntraPred
             Span<int> tmp = stackalloc int[8];
             for (int k = 0; k < nc; k++)
             {
-                for (int i = 0; i < 8; i++) tmp[i] = edgeBuf[center + 1 + k * 8 + i];
+                for (int i = 0; i < 8; i++) tmp[i] = Px.I(edgeBuf[center + 1 + k * 8 + i]);
                 colTop[k] = Vector256.Create<int>(tmp);
                 for (int i = 0; i < 8; i++) tmp[i] = weightsH[k * 8 + i];
                 colW[k] = Vector256.Create<int>(tmp);
@@ -1412,13 +1415,10 @@ public static class Av1IntraPred
             {
                 var wv = Vector256.Create((int)weightsV[y]);
                 var c = Vector256.Create((256 - weightsV[y]) * bottom);
-                var l = Vector256.Create((int)edgeBuf[center - 1 - y]);
+                var l = Vector256.Create(Px.I(edgeBuf[center - 1 - y]));
                 var row = dst.Slice(y * dstStride, width);
                 for (int k = 0; k < nc; k++)
-                {
-                    var pred = Vector256.ShiftRightArithmetic(wv * colTop[k] + c + colW[k] * l + colC[k], 9);
-                    Vector128.Narrow(pred.GetLower().AsUInt32(), pred.GetUpper().AsUInt32()).CopyTo(row.Slice(k * 8, 8));
-                }
+                    Px.Store8(row, k * 8, Vector256.ShiftRightArithmetic(wv * colTop[k] + c + colW[k] * l + colC[k], 9));
             }
             return;
         }
@@ -1428,22 +1428,22 @@ public static class Av1IntraPred
             var row = dst.Slice(y * dstStride, width);
             for (int x = 0; x < width; x++)
             {
-                int pred = weightsV[y] * edgeBuf[center + 1 + x] +
+                int pred = weightsV[y] * Px.I(edgeBuf[center + 1 + x]) +
                            (256 - weightsV[y]) * bottom +
-                           weightsH[x] * edgeBuf[center - 1 - y] +
+                           weightsH[x] * Px.I(edgeBuf[center - 1 - y]) +
                            (256 - weightsH[x]) * right;
-                row[x] = (ushort)((pred + 256) >> 9);
+                row[x] = Px.T<TP>((pred + 256) >> 9);
             }
         }
     }
 
-    public static void PredSmoothV16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height)
+    public static void PredSmoothV16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height) where TP : unmanaged
     {
         var weightsV = Av1Tables.SmoothWeights.AsSpan(height, height);
-        int bottom = edgeBuf[center - height];
+        int bottom = Px.I(edgeBuf[center - height]);
         if (Vector256.IsHardwareAccelerated && width >= 8)
         {
             int nc = width >> 3;
@@ -1451,7 +1451,7 @@ public static class Av1IntraPred
             Span<int> tmp = stackalloc int[8];
             for (int k = 0; k < nc; k++)
             {
-                for (int i = 0; i < 8; i++) tmp[i] = edgeBuf[center + 1 + k * 8 + i];
+                for (int i = 0; i < 8; i++) tmp[i] = Px.I(edgeBuf[center + 1 + k * 8 + i]);
                 colTop[k] = Vector256.Create<int>(tmp);
             }
             for (int y = 0; y < height; y++)
@@ -1460,10 +1460,7 @@ public static class Av1IntraPred
                 var c = Vector256.Create((256 - weightsV[y]) * bottom + 128);
                 var row = dst.Slice(y * dstStride, width);
                 for (int k = 0; k < nc; k++)
-                {
-                    var pred = Vector256.ShiftRightArithmetic(wv * colTop[k] + c, 8);
-                    Vector128.Narrow(pred.GetLower().AsUInt32(), pred.GetUpper().AsUInt32()).CopyTo(row.Slice(k * 8, 8));
-                }
+                    Px.Store8(row, k * 8, Vector256.ShiftRightArithmetic(wv * colTop[k] + c, 8));
             }
             return;
         }
@@ -1473,20 +1470,20 @@ public static class Av1IntraPred
             var row = dst.Slice(y * dstStride, width);
             for (int x = 0; x < width; x++)
             {
-                int pred = weightsV[y] * edgeBuf[center + 1 + x] +
+                int pred = weightsV[y] * Px.I(edgeBuf[center + 1 + x]) +
                            (256 - weightsV[y]) * bottom;
-                row[x] = (ushort)((pred + 128) >> 8);
+                row[x] = Px.T<TP>((pred + 128) >> 8);
             }
         }
     }
 
-    public static void PredSmoothH16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height)
+    public static void PredSmoothH16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height) where TP : unmanaged
     {
         var weightsH = Av1Tables.SmoothWeights.AsSpan(width, width);
-        int right = edgeBuf[center + width];
+        int right = Px.I(edgeBuf[center + width]);
         if (Vector256.IsHardwareAccelerated && width >= 8)
         {
             int nc = width >> 3;
@@ -1500,13 +1497,10 @@ public static class Av1IntraPred
             }
             for (int y = 0; y < height; y++)
             {
-                var l = Vector256.Create((int)edgeBuf[center - 1 - y]);
+                var l = Vector256.Create(Px.I(edgeBuf[center - 1 - y]));
                 var row = dst.Slice(y * dstStride, width);
                 for (int k = 0; k < nc; k++)
-                {
-                    var pred = Vector256.ShiftRightArithmetic(colW[k] * l + colC[k], 8);
-                    Vector128.Narrow(pred.GetLower().AsUInt32(), pred.GetUpper().AsUInt32()).CopyTo(row.Slice(k * 8, 8));
-                }
+                    Px.Store8(row, k * 8, Vector256.ShiftRightArithmetic(colW[k] * l + colC[k], 8));
             }
             return;
         }
@@ -1516,38 +1510,38 @@ public static class Av1IntraPred
             var row = dst.Slice(y * dstStride, width);
             for (int x = 0; x < width; x++)
             {
-                int pred = weightsH[x] * edgeBuf[center - 1 - y] +
+                int pred = weightsH[x] * Px.I(edgeBuf[center - 1 - y]) +
                            (256 - weightsH[x]) * right;
-                row[x] = (ushort)((pred + 128) >> 8);
+                row[x] = Px.T<TP>((pred + 128) >> 8);
             }
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int DcGenTop16(ReadOnlySpan<ushort> edgeBuf, int center, int width)
+    private static int DcGenTop16<TP>(ReadOnlySpan<TP> edgeBuf, int center, int width) where TP : unmanaged
     {
         int dc = width >> 1;
         for (int i = 0; i < width; i++)
-            dc += edgeBuf[center + 1 + i];
+            dc += Px.I(edgeBuf[center + 1 + i]);
         return dc >> BitOperations.TrailingZeroCount((uint)width);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int DcGenLeft16(ReadOnlySpan<ushort> edgeBuf, int center, int height)
+    private static int DcGenLeft16<TP>(ReadOnlySpan<TP> edgeBuf, int center, int height) where TP : unmanaged
     {
         int dc = height >> 1;
         for (int i = 0; i < height; i++)
-            dc += edgeBuf[center - 1 - i];
+            dc += Px.I(edgeBuf[center - 1 - i]);
         return dc >> BitOperations.TrailingZeroCount((uint)height);
     }
 
-    private static int DcGenBoth16(ReadOnlySpan<ushort> edgeBuf, int center, int width, int height, int bitDepth)
+    private static int DcGenBoth16<TP>(ReadOnlySpan<TP> edgeBuf, int center, int width, int height, int bitDepth) where TP : unmanaged
     {
         int dc = (width + height) >> 1;
         for (int i = 0; i < width; i++)
-            dc += edgeBuf[center + 1 + i];
+            dc += Px.I(edgeBuf[center + 1 + i]);
         for (int i = 0; i < height; i++)
-            dc += edgeBuf[center - 1 - i];
+            dc += Px.I(edgeBuf[center - 1 - i]);
         dc >>= BitOperations.TrailingZeroCount((uint)(width + height));
 
         if (width != height)
@@ -1562,34 +1556,34 @@ public static class Av1IntraPred
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void SplatDc16(Span<ushort> dst, int dstStride, int width, int height, int dc)
+    private static void SplatDc16<TP>(Span<TP> dst, int dstStride, int width, int height, int dc) where TP : unmanaged
     {
-        ushort dcVal = (ushort)dc;
+        TP dcVal = Px.T<TP>(dc);
         for (int y = 0; y < height; y++)
             dst.Slice(y * dstStride, width).Fill(dcVal);
     }
 
     // ========================================================================
-    // High bit depth: edge preparation + dispatcher + directional/filter/CFL
-    // Mirrors the 8-bit path exactly; clamps that used 255 now use (1<<bd)-1.
+    // Edge preparation + dispatcher + directional/filter/CFL
+    // Mirrors the byte reference path exactly; clamps that used 255 now use (1<<bd)-1.
     // ========================================================================
 
-    /// <summary>High bit depth edge preparation. See <see cref="PrepareIntraEdges"/>.</summary>
-    public static ImplPredMode PrepareIntraEdges16(
+    /// <summary>Edge preparation. See <see cref="PrepareIntraEdges"/>.</summary>
+    public static ImplPredMode PrepareIntraEdges16<TP>(
         int x, bool haveLeft, int y, bool haveTop,
         int w, int h,
         EdgeFlags edgeFlags,
-        ReadOnlySpan<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> prefilterTopEdge,
+        ReadOnlySpan<TP> dst, int dstStride,
+        ReadOnlySpan<TP> prefilterTopEdge,
         int mode, ref int angle,
         int tw, int th, bool enableEdgeFilter,
-        Span<ushort> edgeBuf, int centerOffset,
-        int bitDepth)
+        Span<TP> edgeBuf, int centerOffset,
+        int bitDepth) where TP : unmanaged
     {
         var implMode = ResolveMode(mode, haveLeft, haveTop, ref angle);
         int needs = EdgeNeeds[(int)implMode];
 
-        ReadOnlySpan<ushort> dstTop = default;
+        ReadOnlySpan<TP> dstTop = default;
         if (haveTop && ((needs & NeedsTop) != 0 || (needs & NeedsTopLeft) != 0 ||
                         ((needs & NeedsLeft) != 0 && !haveLeft)))
         {
@@ -1613,7 +1607,7 @@ public static class Av1IntraPred
             }
             else
             {
-                ushort fill = haveTop ? dstTop[0] : (ushort)(((1 << bitDepth) >> 1) + 1);
+                TP fill = haveTop ? dstTop[0] : Px.T<TP>(((1 << bitDepth) >> 1) + 1);
                 edgeBuf.Slice(leftBase, sz).Fill(fill);
             }
 
@@ -1650,7 +1644,7 @@ public static class Av1IntraPred
             }
             else
             {
-                ushort fill = haveLeft ? dst[-1] : (ushort)(((1 << bitDepth) >> 1) - 1);
+                TP fill = haveLeft ? dst[-1] : Px.T<TP>(((1 << bitDepth) >> 1) - 1);
                 edgeBuf.Slice(topBase, sz).Fill(fill);
             }
 
@@ -1678,24 +1672,24 @@ public static class Av1IntraPred
             if (haveLeft)
                 edgeBuf[centerOffset] = haveTop ? dstTop[-1] : dst[-1];
             else
-                edgeBuf[centerOffset] = haveTop ? dstTop[0] : (ushort)((1 << bitDepth) >> 1);
+                edgeBuf[centerOffset] = haveTop ? dstTop[0] : Px.T<TP>((1 << bitDepth) >> 1);
 
             if (implMode == ImplPredMode.Z2 && tw + th >= 6 && enableEdgeFilter)
             {
-                edgeBuf[centerOffset] = (ushort)(((edgeBuf[centerOffset - 1] +
-                    edgeBuf[centerOffset + 1]) * 5 + edgeBuf[centerOffset] * 6 + 8) >> 4);
+                edgeBuf[centerOffset] = Px.T<TP>(((Px.I(edgeBuf[centerOffset - 1]) +
+                    Px.I(edgeBuf[centerOffset + 1])) * 5 + Px.I(edgeBuf[centerOffset]) * 6 + 8) >> 4);
             }
         }
 
         return implMode;
     }
 
-    /// <summary>High bit depth prediction dispatcher. See <see cref="Predict"/>.</summary>
-    public static void Predict16(int implMode,
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
+    /// <summary>Prediction dispatcher. See <see cref="Predict"/>.</summary>
+    public static void Predict16<TP>(int implMode,
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
         int width, int height, int angle,
-        int maxWidth, int maxHeight, int bitDepth)
+        int maxWidth, int maxHeight, int bitDepth) where TP : unmanaged
     {
         bool enableEdgeFilter = (angle & (1 << 10)) != 0;
         switch (implMode)
@@ -1719,33 +1713,33 @@ public static class Av1IntraPred
 
     /// <summary>dst[y * dstStride + x] = src[x * srcStride + y] for x &lt; w, y &lt; h (a column-major w x h block to rows):
     /// 8 x 8 tiles of 16-bit lanes where both sides allow, scalar at the ragged edges.</summary>
-    private static void TransposeU16(ReadOnlySpan<ushort> src, int srcStride, Span<ushort> dst, int dstStride, int w, int h)
+    private static void TransposeU16<TP>(ReadOnlySpan<TP> src, int srcStride, Span<TP> dst, int dstStride, int w, int h) where TP : unmanaged
     {
-        int w8 = Vector128.IsHardwareAccelerated ? w & ~7 : 0, h8 = Vector128.IsHardwareAccelerated ? h & ~7 : 0;
+        int w8 = Sse2.IsSupported ? w & ~7 : 0, h8 = Sse2.IsSupported ? h & ~7 : 0;
         for (int x0 = 0; x0 < w8; x0 += 8)
             for (int y0 = 0; y0 < h8; y0 += 8)
             {
                 // rows of the tile = src columns x0..x0+7 (8 samples each at y0..)
-                var r0 = Vector128.Create(src.Slice((x0 + 0) * srcStride + y0, 8)).AsInt16(); var r1 = Vector128.Create(src.Slice((x0 + 1) * srcStride + y0, 8)).AsInt16();
-                var r2 = Vector128.Create(src.Slice((x0 + 2) * srcStride + y0, 8)).AsInt16(); var r3 = Vector128.Create(src.Slice((x0 + 3) * srcStride + y0, 8)).AsInt16();
-                var r4 = Vector128.Create(src.Slice((x0 + 4) * srcStride + y0, 8)).AsInt16(); var r5 = Vector128.Create(src.Slice((x0 + 5) * srcStride + y0, 8)).AsInt16();
-                var r6 = Vector128.Create(src.Slice((x0 + 6) * srcStride + y0, 8)).AsInt16(); var r7 = Vector128.Create(src.Slice((x0 + 7) * srcStride + y0, 8)).AsInt16();
-                var a0 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(r0, r1).AsInt32(); var a1 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(r0, r1).AsInt32();
-                var a2 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(r2, r3).AsInt32(); var a3 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(r2, r3).AsInt32();
-                var a4 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(r4, r5).AsInt32(); var a5 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(r4, r5).AsInt32();
-                var a6 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(r6, r7).AsInt32(); var a7 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(r6, r7).AsInt32();
-                var b0 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(a0, a2).AsInt64(); var b1 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(a0, a2).AsInt64();
-                var b2 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(a1, a3).AsInt64(); var b3 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(a1, a3).AsInt64();
-                var b4 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(a4, a6).AsInt64(); var b5 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(a4, a6).AsInt64();
-                var b6 = System.Runtime.Intrinsics.X86.Sse2.UnpackLow(a5, a7).AsInt64(); var b7 = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(a5, a7).AsInt64();
-                System.Runtime.Intrinsics.X86.Sse2.UnpackLow(b0, b4).AsUInt16().CopyTo(dst.Slice((y0 + 0) * dstStride + x0, 8));
-                System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(b0, b4).AsUInt16().CopyTo(dst.Slice((y0 + 1) * dstStride + x0, 8));
-                System.Runtime.Intrinsics.X86.Sse2.UnpackLow(b1, b5).AsUInt16().CopyTo(dst.Slice((y0 + 2) * dstStride + x0, 8));
-                System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(b1, b5).AsUInt16().CopyTo(dst.Slice((y0 + 3) * dstStride + x0, 8));
-                System.Runtime.Intrinsics.X86.Sse2.UnpackLow(b2, b6).AsUInt16().CopyTo(dst.Slice((y0 + 4) * dstStride + x0, 8));
-                System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(b2, b6).AsUInt16().CopyTo(dst.Slice((y0 + 5) * dstStride + x0, 8));
-                System.Runtime.Intrinsics.X86.Sse2.UnpackLow(b3, b7).AsUInt16().CopyTo(dst.Slice((y0 + 6) * dstStride + x0, 8));
-                System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(b3, b7).AsUInt16().CopyTo(dst.Slice((y0 + 7) * dstStride + x0, 8));
+                var r0 = Px.Load8(src, (x0 + 0) * srcStride + y0).AsInt16(); var r1 = Px.Load8(src, (x0 + 1) * srcStride + y0).AsInt16();
+                var r2 = Px.Load8(src, (x0 + 2) * srcStride + y0).AsInt16(); var r3 = Px.Load8(src, (x0 + 3) * srcStride + y0).AsInt16();
+                var r4 = Px.Load8(src, (x0 + 4) * srcStride + y0).AsInt16(); var r5 = Px.Load8(src, (x0 + 5) * srcStride + y0).AsInt16();
+                var r6 = Px.Load8(src, (x0 + 6) * srcStride + y0).AsInt16(); var r7 = Px.Load8(src, (x0 + 7) * srcStride + y0).AsInt16();
+                var a0 = Sse2.UnpackLow(r0, r1).AsInt32(); var a1 = Sse2.UnpackHigh(r0, r1).AsInt32();
+                var a2 = Sse2.UnpackLow(r2, r3).AsInt32(); var a3 = Sse2.UnpackHigh(r2, r3).AsInt32();
+                var a4 = Sse2.UnpackLow(r4, r5).AsInt32(); var a5 = Sse2.UnpackHigh(r4, r5).AsInt32();
+                var a6 = Sse2.UnpackLow(r6, r7).AsInt32(); var a7 = Sse2.UnpackHigh(r6, r7).AsInt32();
+                var b0 = Sse2.UnpackLow(a0, a2).AsInt64(); var b1 = Sse2.UnpackHigh(a0, a2).AsInt64();
+                var b2 = Sse2.UnpackLow(a1, a3).AsInt64(); var b3 = Sse2.UnpackHigh(a1, a3).AsInt64();
+                var b4 = Sse2.UnpackLow(a4, a6).AsInt64(); var b5 = Sse2.UnpackHigh(a4, a6).AsInt64();
+                var b6 = Sse2.UnpackLow(a5, a7).AsInt64(); var b7 = Sse2.UnpackHigh(a5, a7).AsInt64();
+                Px.Store8(dst, (y0 + 0) * dstStride + x0, Sse2.UnpackLow(b0, b4).AsUInt16());
+                Px.Store8(dst, (y0 + 1) * dstStride + x0, Sse2.UnpackHigh(b0, b4).AsUInt16());
+                Px.Store8(dst, (y0 + 2) * dstStride + x0, Sse2.UnpackLow(b1, b5).AsUInt16());
+                Px.Store8(dst, (y0 + 3) * dstStride + x0, Sse2.UnpackHigh(b1, b5).AsUInt16());
+                Px.Store8(dst, (y0 + 4) * dstStride + x0, Sse2.UnpackLow(b2, b6).AsUInt16());
+                Px.Store8(dst, (y0 + 5) * dstStride + x0, Sse2.UnpackHigh(b2, b6).AsUInt16());
+                Px.Store8(dst, (y0 + 6) * dstStride + x0, Sse2.UnpackLow(b3, b7).AsUInt16());
+                Px.Store8(dst, (y0 + 7) * dstStride + x0, Sse2.UnpackHigh(b3, b7).AsUInt16());
             }
         for (int x = 0; x < w; x++)
             for (int y = x < w8 ? h8 : 0; y < h; y++) dst[y * dstStride + x] = src[x * srcStride + y];
@@ -1753,7 +1747,7 @@ public static class Av1IntraPred
 
     /// <summary>row[x] = (src[b + x] * (64 - frac) + src[b + x + 1] * frac + 32) >> 6 for x &lt; n. For bit depths up to
     /// 10 the sum stays below 65536, so 16-bit vector lanes give the identical result.</summary>
-    private static void InterpRun(Span<ushort> row, ReadOnlySpan<ushort> src, int b, int frac, int n, int bitDepth)
+    private static void InterpRun<TP>(Span<TP> row, ReadOnlySpan<TP> src, int b, int frac, int n, int bitDepth) where TP : unmanaged
     {
         int x = 0;
         if (bitDepth <= 10)
@@ -1764,9 +1758,9 @@ public static class Av1IntraPred
                 var r32 = Vector256.Create((ushort)32);
                 for (; x + 16 <= n; x += 16)
                 {
-                    var a = Vector256.Create(src.Slice(b + x, 16));
-                    var c = Vector256.Create(src.Slice(b + x + 1, 16));
-                    Vector256.ShiftRightLogical(a * w0 + c * w1 + r32, 6).CopyTo(row.Slice(x, 16));
+                    var a = Px.Load16(src, b + x);
+                    var c = Px.Load16(src, b + x + 1);
+                    Px.Store16(row, x, Vector256.ShiftRightLogical(a * w0 + c * w1 + r32, 6));
                 }
             }
             if (Vector128.IsHardwareAccelerated && x + 8 <= n)
@@ -1775,27 +1769,27 @@ public static class Av1IntraPred
                 var r32 = Vector128.Create((ushort)32);
                 for (; x + 8 <= n; x += 8)
                 {
-                    var a = Vector128.Create(src.Slice(b + x, 8));
-                    var c = Vector128.Create(src.Slice(b + x + 1, 8));
-                    Vector128.ShiftRightLogical(a * w0 + c * w1 + r32, 6).CopyTo(row.Slice(x, 8));
+                    var a = Px.Load8(src, b + x);
+                    var c = Px.Load8(src, b + x + 1);
+                    Px.Store8(row, x, Vector128.ShiftRightLogical(a * w0 + c * w1 + r32, 6));
                 }
             }
         }
         for (; x < n; x++)
-            row[x] = (ushort)((src[b + x] * (64 - frac) + src[b + x + 1] * frac + 32) >> 6);
+            row[x] = Px.T<TP>((Px.I(src[b + x]) * (64 - frac) + Px.I(src[b + x + 1]) * frac + 32) >> 6);
     }
 
-    public static void PredZ1_16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height, int angle, bool enableEdgeFilter, int bitDepth)
+    public static void PredZ1_16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height, int angle, bool enableEdgeFilter, int bitDepth) where TP : unmanaged
     {
         bool isSm = ((angle >> 9) & 1) != 0;
         angle &= 511;
         int dx = Av1Tables.DrIntraDerivative[angle >> 1];
         int maxBaseX;
 
-        Span<ushort> topBuf = stackalloc ushort[128];
+        Span<TP> topBuf = stackalloc TP[128];
         bool upsample = enableEdgeFilter && GetUpsample(width + height, 90 - angle, isSm);
         bool useTopBuf;
         int topOffset = 0;
@@ -1833,8 +1827,8 @@ public static class Av1IntraPred
         int baseInc = 1 + (upsample ? 1 : 0);
         if (!upsample)
         {
-            ReadOnlySpan<ushort> src = useTopBuf ? (ReadOnlySpan<ushort>)topBuf : edgeBuf.Slice(topOffset);
-            ushort fill = src[maxBaseX];
+            ReadOnlySpan<TP> src = useTopBuf ? (ReadOnlySpan<TP>)topBuf : edgeBuf.Slice(topOffset);
+            TP fill = src[maxBaseX];
             for (int y = 0, xpos = dx; y < height; y++, xpos += dx)
             {
                 var row = dst.Slice(y * dstStride, width);
@@ -1853,14 +1847,14 @@ public static class Av1IntraPred
             {
                 if (@base < maxBaseX)
                 {
-                    int s0 = useTopBuf ? topBuf[@base] : edgeBuf[topOffset + @base];
-                    int s1 = useTopBuf ? topBuf[@base + 1] : edgeBuf[topOffset + @base + 1];
+                    int s0 = Px.I(useTopBuf ? topBuf[@base] : edgeBuf[topOffset + @base]);
+                    int s1 = Px.I(useTopBuf ? topBuf[@base + 1] : edgeBuf[topOffset + @base + 1]);
                     int v = s0 * (64 - frac) + s1 * frac;
-                    row[x] = (ushort)((v + 32) >> 6);
+                    row[x] = Px.T<TP>((v + 32) >> 6);
                 }
                 else
                 {
-                    ushort fill = useTopBuf ? topBuf[maxBaseX] : edgeBuf[topOffset + maxBaseX];
+                    TP fill = useTopBuf ? topBuf[maxBaseX] : edgeBuf[topOffset + maxBaseX];
                     row.Slice(x, width - x).Fill(fill);
                     break;
                 }
@@ -1868,11 +1862,11 @@ public static class Av1IntraPred
         }
     }
 
-    public static void PredZ2_16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
+    public static void PredZ2_16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
         int width, int height, int angle, bool enableEdgeFilter,
-        int maxWidth, int maxHeight, int bitDepth)
+        int maxWidth, int maxHeight, int bitDepth) where TP : unmanaged
     {
         bool isSm = ((angle >> 9) & 1) != 0;
         angle &= 511;
@@ -1882,7 +1876,7 @@ public static class Av1IntraPred
         bool upsampleLeft = enableEdgeFilter && GetUpsample(width + height, 180 - angle, isSm);
         bool upsampleAbove = enableEdgeFilter && GetUpsample(width + height, angle - 90, isSm);
 
-        Span<ushort> edge = stackalloc ushort[129];
+        Span<TP> edge = stackalloc TP[129];
         int edgeCenter = 64;
 
         if (upsampleAbove)
@@ -1924,8 +1918,7 @@ public static class Av1IntraPred
             }
             else
             {
-                for (int i = 0; i < height; i++)
-                    edge[edgeCenter - height + i] = edgeBuf[center - height + i];
+                edgeBuf.Slice(center - height, height).CopyTo(edge.Slice(edgeCenter - height, height));
             }
         }
 
@@ -1936,7 +1929,7 @@ public static class Av1IntraPred
 
         if (!upsampleAbove)
         {
-            ReadOnlySpan<ushort> top = edge.Slice(edgeCenter);
+            ReadOnlySpan<TP> top = edge.Slice(edgeCenter);
             Span<int> xsRow = stackalloc int[height];
             for (int y = 0, xpos = (1 << 6) - dx; y < height; y++, xpos -= dx)
             {
@@ -1949,9 +1942,9 @@ public static class Av1IntraPred
             {
                 // The left-edge pixels by column: down a column the left position steps one sample per row at a fixed
                 // fraction, a run over the left edge read upwards (revL[k] = edge[edgeCenter - k], k = baseY + 1).
-                Span<ushort> revL = stackalloc ushort[height + 1];
+                Span<TP> revL = stackalloc TP[height + 1];
                 for (int k = 0; k <= height; k++) revL[k] = edge[edgeCenter - k];
-                Span<ushort> col = stackalloc ushort[height];
+                Span<TP> col = stackalloc TP[height];
                 for (int x = 0, ys = 0; x < width; x++)
                 {
                     while (ys < height && xsRow[ys] <= x) ys++;   // rows ys.. read the left edge at this column
@@ -1963,7 +1956,7 @@ public static class Av1IntraPred
                         for (int j = 0; j < n; j++, ypos += 64)
                         {
                             int baseY = ypos >> 6, fracY = ypos & 0x3E;
-                            dst[(ys + j) * dstStride + x] = (ushort)((edge[edgeCenter - 1 - baseY] * (64 - fracY) + edge[edgeCenter - 2 - baseY] * fracY + 32) >> 6);
+                            dst[(ys + j) * dstStride + x] = Px.T<TP>((Px.I(edge[edgeCenter - 1 - baseY]) * (64 - fracY) + Px.I(edge[edgeCenter - 2 - baseY]) * fracY + 32) >> 6);
                         }
                         continue;
                     }
@@ -1979,9 +1972,9 @@ public static class Av1IntraPred
                 {
                     int baseY = ypos >> 6;
                     int fracY = ypos & 0x3E;
-                    int v = edge[edgeCenter - leftStep - baseY] * (64 - fracY) +
-                            edge[edgeCenter - leftStep - baseY - 1] * fracY;
-                    row[x] = (ushort)((v + 32) >> 6);
+                    int v = Px.I(edge[edgeCenter - leftStep - baseY]) * (64 - fracY) +
+                            Px.I(edge[edgeCenter - leftStep - baseY - 1]) * fracY;
+                    row[x] = Px.T<TP>((v + 32) >> 6);
                 }
             }
             return;
@@ -2000,31 +1993,31 @@ public static class Av1IntraPred
                 int v;
                 if (baseX >= 0)
                 {
-                    v = edge[edgeCenter + baseX] * (64 - fracX) +
-                        edge[edgeCenter + baseX + 1] * fracX;
+                    v = Px.I(edge[edgeCenter + baseX]) * (64 - fracX) +
+                        Px.I(edge[edgeCenter + baseX + 1]) * fracX;
                 }
                 else
                 {
                     int baseY = ypos >> 6;
                     int fracY = ypos & 0x3E;
-                    v = edge[edgeCenter - leftStep - baseY] * (64 - fracY) +
-                        edge[edgeCenter - leftStep - baseY - 1] * fracY;
+                    v = Px.I(edge[edgeCenter - leftStep - baseY]) * (64 - fracY) +
+                        Px.I(edge[edgeCenter - leftStep - baseY - 1]) * fracY;
                 }
-                row[x] = (ushort)((v + 32) >> 6);
+                row[x] = Px.T<TP>((v + 32) >> 6);
             }
         }
     }
 
-    public static void PredZ3_16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height, int angle, bool enableEdgeFilter, int bitDepth)
+    public static void PredZ3_16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height, int angle, bool enableEdgeFilter, int bitDepth) where TP : unmanaged
     {
         bool isSm = ((angle >> 9) & 1) != 0;
         angle &= 511;
         int dy = Av1Tables.DrIntraDerivative[(270 - angle) >> 1];
 
-        Span<ushort> leftBuf = stackalloc ushort[128];
+        Span<TP> leftBuf = stackalloc TP[128];
         int maxBaseY;
         bool upsample = enableEdgeFilter && GetUpsample(width + height, angle - 180, isSm);
         bool useLeftBuf;
@@ -2066,12 +2059,12 @@ public static class Av1IntraPred
         if (!upsample)
         {
             // rev[i] = left sample i steps down (the original reads src[leftOffset - base] and its successor)
-            ReadOnlySpan<ushort> srcL = useLeftBuf ? (ReadOnlySpan<ushort>)leftBuf : edgeBuf;
-            Span<ushort> rev = stackalloc ushort[maxBaseY + 1];
+            ReadOnlySpan<TP> srcL = useLeftBuf ? (ReadOnlySpan<TP>)leftBuf : edgeBuf;
+            Span<TP> rev = stackalloc TP[maxBaseY + 1];
             for (int i = 0; i <= maxBaseY; i++) rev[i] = srcL[leftOffset - i];
-            ushort fill = rev[maxBaseY];
+            TP fill = rev[maxBaseY];
             // column x is a run down the left edge: computed as row x of a column-major block, then transposed
-            Span<ushort> cols = stackalloc ushort[width * height];
+            Span<TP> cols = stackalloc TP[width * height];
             for (int x = 0, ypos = dy; x < width; x++, ypos += dy)
             {
                 var col = cols.Slice(x * height, height);
@@ -2079,7 +2072,7 @@ public static class Av1IntraPred
                 InterpRun(col, rev, b, ypos & 0x3E, n, bitDepth);
                 if (n < height) col.Slice(n).Fill(fill);
             }
-            TransposeU16(cols, height, dst, dstStride, width, height);
+            TransposeU16<TP>(cols, height, dst, dstStride, width, height);
             return;
         }
         for (int x = 0, ypos = dy; x < width; x++, ypos += dy)
@@ -2089,14 +2082,14 @@ public static class Av1IntraPred
             {
                 if (@base < maxBaseY)
                 {
-                    int s0 = useLeftBuf ? leftBuf[leftOffset - @base] : edgeBuf[leftOffset - @base];
-                    int s1 = useLeftBuf ? leftBuf[leftOffset - @base - 1] : edgeBuf[leftOffset - @base - 1];
+                    int s0 = Px.I(useLeftBuf ? leftBuf[leftOffset - @base] : edgeBuf[leftOffset - @base]);
+                    int s1 = Px.I(useLeftBuf ? leftBuf[leftOffset - @base - 1] : edgeBuf[leftOffset - @base - 1]);
                     int v = s0 * (64 - frac) + s1 * frac;
-                    dst[y * dstStride + x] = (ushort)((v + 32) >> 6);
+                    dst[y * dstStride + x] = Px.T<TP>((v + 32) >> 6);
                 }
                 else
                 {
-                    ushort fill = useLeftBuf ? leftBuf[leftOffset - maxBaseY] : edgeBuf[leftOffset - maxBaseY];
+                    TP fill = useLeftBuf ? leftBuf[leftOffset - maxBaseY] : edgeBuf[leftOffset - maxBaseY];
                     for (; y < height; y++)
                         dst[y * dstStride + x] = fill;
                     break;
@@ -2105,17 +2098,17 @@ public static class Av1IntraPred
         }
     }
 
-    private static void FilterEdge16(
-        Span<ushort> output, int sz,
+    private static void FilterEdge16<TP>(
+        Span<TP> output, int sz,
         int limFrom, int limTo,
-        ReadOnlySpan<ushort> input, int inputOffset,
-        int from, int to, int strength)
+        ReadOnlySpan<TP> input, int inputOffset,
+        int from, int to, int strength) where TP : unmanaged
     {
         // taps {k0, k1, k2, k1, k0}: {0,4,8,4,0}, {0,5,6,5,0}, {2,4,4,4,2}
         int k0 = strength >= 3 ? 2 : 0, k1 = strength == 1 ? 4 : strength == 2 ? 5 : 4, k2 = strength == 1 ? 8 : strength == 2 ? 6 : 4;
         // the input clamped to [from, to) once: pad[k] = input[clamp(k - 2)] (+16 slack for the vector tail)
-        Span<ushort> pad = stackalloc ushort[sz + 4 + 16];
-        ushort lo = input[inputOffset + from], hi = input[inputOffset + to - 1];
+        Span<TP> pad = stackalloc TP[sz + 4 + 16];
+        TP lo = input[inputOffset + from], hi = input[inputOffset + to - 1];
         {
             // pad[k] = input[clamp(k - 2, from, to - 1)]: [0, a) = lo, [a, b) copied, [b, end) = hi
             int n = sz + 4 + 16, a = Math.Clamp(from + 2, 0, n), b = Math.Clamp(to + 2, a, n);
@@ -2123,6 +2116,7 @@ public static class Av1IntraPred
             if (b > a) input.Slice(inputOffset + a - 2, b - a).CopyTo(pad.Slice(a));
             pad.Slice(b).Fill(hi);
         }
+        ReadOnlySpan<TP> p = pad;
         int i = 0, end = Math.Min(limTo, sz);
         for (; i < Math.Min(sz, limFrom); i++) output[i] = pad[i + 2];
         // 16 * 4095 + 8 < 65536: ushort lanes are exact up to 12 bits
@@ -2132,21 +2126,21 @@ public static class Av1IntraPred
             var r8 = Vector256.Create((ushort)8);
             for (; i + 16 <= end; i += 16)
             {
-                var s = (Vector256.Create(pad.Slice(i, 16)) + Vector256.Create(pad.Slice(i + 4, 16))) * v0
-                      + (Vector256.Create(pad.Slice(i + 1, 16)) + Vector256.Create(pad.Slice(i + 3, 16))) * v1
-                      + Vector256.Create(pad.Slice(i + 2, 16)) * v2 + r8;
-                Vector256.ShiftRightLogical(s, 4).CopyTo(output.Slice(i, 16));
+                var s = (Px.Load16(p, i) + Px.Load16(p, i + 4)) * v0
+                      + (Px.Load16(p, i + 1) + Px.Load16(p, i + 3)) * v1
+                      + Px.Load16(p, i + 2) * v2 + r8;
+                Px.Store16(output, i, Vector256.ShiftRightLogical(s, 4));
             }
         }
         for (; i < end; i++)
-            output[i] = (ushort)(((pad[i] + pad[i + 4]) * k0 + (pad[i + 1] + pad[i + 3]) * k1 + pad[i + 2] * k2 + 8) >> 4);
+            output[i] = Px.T<TP>(((Px.I(pad[i]) + Px.I(pad[i + 4])) * k0 + (Px.I(pad[i + 1]) + Px.I(pad[i + 3])) * k1 + Px.I(pad[i + 2]) * k2 + 8) >> 4);
         for (; i < sz; i++) output[i] = pad[i + 2];
     }
 
-    private static void UpsampleEdge16(
-        Span<ushort> output, int hsz,
-        ReadOnlySpan<ushort> input, int inputOffset,
-        int from, int to, int bitDepth)
+    private static void UpsampleEdge16<TP>(
+        Span<TP> output, int hsz,
+        ReadOnlySpan<TP> input, int inputOffset,
+        int from, int to, int bitDepth) where TP : unmanaged
     {
         ReadOnlySpan<sbyte> kernel = stackalloc sbyte[] { -1, 9, 9, -1 };
         int max = (1 << bitDepth) - 1;
@@ -2156,16 +2150,16 @@ public static class Av1IntraPred
             output[i * 2] = input[inputOffset + Math.Clamp(i, from, to - 1)];
             int s = 0;
             for (int j = 0; j < 4; j++)
-                s += input[inputOffset + Math.Clamp(i + j - 1, from, to - 1)] * kernel[j];
-            output[i * 2 + 1] = (ushort)Math.Clamp((s + 8) >> 4, 0, max);
+                s += Px.I(input[inputOffset + Math.Clamp(i + j - 1, from, to - 1)]) * kernel[j];
+            output[i * 2 + 1] = Px.T<TP>(Math.Clamp((s + 8) >> 4, 0, max));
         }
         output[i * 2] = input[inputOffset + Math.Clamp(i, from, to - 1)];
     }
 
-    public static void PredFilter16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height, int filterIndex, int bitDepth)
+    public static void PredFilter16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height, int filterIndex, int bitDepth) where TP : unmanaged
     {
         filterIndex &= 511;
         int max = (1 << bitDepth) - 1;
@@ -2181,36 +2175,36 @@ public static class Av1IntraPred
                 int p0, p1, p2, p3, p4, p5, p6;
 
                 if (y == 0)
-                    p0 = edgeBuf[topleftEdgeIdx];
+                    p0 = Px.I(edgeBuf[topleftEdgeIdx]);
                 else if (x == 0)
-                    p0 = edgeBuf[center - y];
+                    p0 = Px.I(edgeBuf[center - y]);
                 else
-                    p0 = dst[dstOffset - dstStride + x - 1];
+                    p0 = Px.I(dst[dstOffset - dstStride + x - 1]);
 
                 if (y == 0)
                 {
-                    p1 = edgeBuf[topIdx + x];
-                    p2 = edgeBuf[topIdx + x + 1];
-                    p3 = edgeBuf[topIdx + x + 2];
-                    p4 = edgeBuf[topIdx + x + 3];
+                    p1 = Px.I(edgeBuf[topIdx + x]);
+                    p2 = Px.I(edgeBuf[topIdx + x + 1]);
+                    p3 = Px.I(edgeBuf[topIdx + x + 2]);
+                    p4 = Px.I(edgeBuf[topIdx + x + 3]);
                 }
                 else
                 {
-                    p1 = dst[dstOffset - dstStride + x];
-                    p2 = dst[dstOffset - dstStride + x + 1];
-                    p3 = dst[dstOffset - dstStride + x + 2];
-                    p4 = dst[dstOffset - dstStride + x + 3];
+                    p1 = Px.I(dst[dstOffset - dstStride + x]);
+                    p2 = Px.I(dst[dstOffset - dstStride + x + 1]);
+                    p3 = Px.I(dst[dstOffset - dstStride + x + 2]);
+                    p4 = Px.I(dst[dstOffset - dstStride + x + 3]);
                 }
 
                 if (x == 0)
                 {
-                    p5 = edgeBuf[center - y - 1];
-                    p6 = edgeBuf[center - y - 2];
+                    p5 = Px.I(edgeBuf[center - y - 1]);
+                    p6 = Px.I(edgeBuf[center - y - 2]);
                 }
                 else
                 {
-                    p5 = dst[dstOffset + x - 1];
-                    p6 = dst[dstOffset + dstStride + x - 1];
+                    p5 = Px.I(dst[dstOffset + x - 1]);
+                    p6 = Px.I(dst[dstOffset + dstStride + x - 1]);
                 }
 
                 int fltPos = 0;
@@ -2225,7 +2219,7 @@ public static class Av1IntraPred
                                   Av1Tables.FilterIntraTaps[filterIndex, fltPos + 32] * p4 +
                                   Av1Tables.FilterIntraTaps[filterIndex, fltPos + 40] * p5 +
                                   Av1Tables.FilterIntraTaps[filterIndex, fltPos + 48] * p6;
-                        dst[dstOffset + yy * dstStride + x + xx] = (ushort)Math.Clamp((acc + 8) >> 4, 0, max);
+                        dst[dstOffset + yy * dstStride + x + xx] = Px.T<TP>(Math.Clamp((acc + 8) >> 4, 0, max));
                     }
                 }
 
@@ -2251,8 +2245,8 @@ public static class Av1IntraPred
 
     // PredFilter16 with one 4 x 2 block per vector (the blocks stay a serial chain: each reads its left / above neighbours'
     // outputs); identical arithmetic.
-    private static void PredFilter16V(Span<ushort> dst, int dstStride, ReadOnlySpan<ushort> edgeBuf, int center,
-        int width, int height, int filterIndex, int max)
+    private static void PredFilter16V<TP>(Span<TP> dst, int dstStride, ReadOnlySpan<TP> edgeBuf, int center,
+        int width, int height, int filterIndex, int max) where TP : unmanaged
     {
         ref int tp = ref MemoryMarshal.GetArrayDataReference(FilterTapsByNeighbour);
         tp = ref Unsafe.Add(ref tp, filterIndex * 56);
@@ -2266,72 +2260,72 @@ public static class Av1IntraPred
             int topleftEdgeIdx = center - y;
             for (int x = 0; x < width; x += 4)
             {
-                int p0 = y == 0 ? edgeBuf[topleftEdgeIdx] : x == 0 ? edgeBuf[center - y] : dst[dstOffset - dstStride + x - 1];
+                int p0 = Px.I(y == 0 ? edgeBuf[topleftEdgeIdx] : x == 0 ? edgeBuf[center - y] : dst[dstOffset - dstStride + x - 1]);
                 int p1, p2, p3, p4;
-                if (y == 0) { p1 = edgeBuf[topIdx + x]; p2 = edgeBuf[topIdx + x + 1]; p3 = edgeBuf[topIdx + x + 2]; p4 = edgeBuf[topIdx + x + 3]; }
+                if (y == 0) { p1 = Px.I(edgeBuf[topIdx + x]); p2 = Px.I(edgeBuf[topIdx + x + 1]); p3 = Px.I(edgeBuf[topIdx + x + 2]); p4 = Px.I(edgeBuf[topIdx + x + 3]); }
                 else
                 {
                     int a = dstOffset - dstStride + x;
-                    p1 = dst[a]; p2 = dst[a + 1]; p3 = dst[a + 2]; p4 = dst[a + 3];
+                    p1 = Px.I(dst[a]); p2 = Px.I(dst[a + 1]); p3 = Px.I(dst[a + 2]); p4 = Px.I(dst[a + 3]);
                 }
                 int p5, p6;
-                if (x == 0) { p5 = edgeBuf[center - y - 1]; p6 = edgeBuf[center - y - 2]; }
-                else { p5 = dst[dstOffset + x - 1]; p6 = dst[dstOffset + dstStride + x - 1]; }
+                if (x == 0) { p5 = Px.I(edgeBuf[center - y - 1]); p6 = Px.I(edgeBuf[center - y - 2]); }
+                else { p5 = Px.I(dst[dstOffset + x - 1]); p6 = Px.I(dst[dstOffset + dstStride + x - 1]); }
                 var acc = k0 * Vector256.Create(p0) + k1 * Vector256.Create(p1) + k2 * Vector256.Create(p2) + k3 * Vector256.Create(p3)
                         + k4 * Vector256.Create(p4) + k5 * Vector256.Create(p5) + k6 * Vector256.Create(p6);
                 var o = Vector256.Min(Vector256.Max(Vector256.ShiftRightArithmetic(acc + r8, 4), Vector256<int>.Zero), vmax);
-                var n = Vector128.Narrow(o.GetLower().AsUInt32(), o.GetUpper().AsUInt32()).AsUInt64();
-                MemoryMarshal.Write(MemoryMarshal.AsBytes(dst.Slice(dstOffset + x, 4)), n.GetElement(0));
-                MemoryMarshal.Write(MemoryMarshal.AsBytes(dst.Slice(dstOffset + dstStride + x, 4)), n.GetElement(1));
+                var n = Vector128.Narrow(o.GetLower().AsUInt32(), o.GetUpper().AsUInt32());
+                Px.Store4(dst, dstOffset + x, n);
+                Px.Store4(dst, dstOffset + dstStride + x, Vector128.CreateScalarUnsafe(n.AsUInt64().GetElement(1)).AsUInt16());
                 if (y == 0) topleftEdgeIdx = topIdx + x + 3;
             }
             dstOffset += dstStride * 2;
         }
     }
 
-    public static void PredCfl16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
+    public static void PredCfl16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
         int width, int height,
-        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+        ReadOnlySpan<short> ac, int alpha, int bitDepth) where TP : unmanaged
     {
         int dc = DcGenBoth16(edgeBuf, center, width, height, bitDepth);
         CflPred16(dst, dstStride, width, height, dc, ac, alpha, bitDepth);
     }
 
-    public static void PredCflTop16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
+    public static void PredCflTop16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
         int width, int height,
-        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+        ReadOnlySpan<short> ac, int alpha, int bitDepth) where TP : unmanaged
     {
         int dc = DcGenTop16(edgeBuf, center, width);
         CflPred16(dst, dstStride, width, height, dc, ac, alpha, bitDepth);
     }
 
-    public static void PredCflLeft16(
-        Span<ushort> dst, int dstStride,
-        ReadOnlySpan<ushort> edgeBuf, int center,
+    public static void PredCflLeft16<TP>(
+        Span<TP> dst, int dstStride,
+        ReadOnlySpan<TP> edgeBuf, int center,
         int width, int height,
-        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+        ReadOnlySpan<short> ac, int alpha, int bitDepth) where TP : unmanaged
     {
         int dc = DcGenLeft16(edgeBuf, center, height);
         CflPred16(dst, dstStride, width, height, dc, ac, alpha, bitDepth);
     }
 
-    public static void PredCfl12816(
-        Span<ushort> dst, int dstStride,
+    public static void PredCfl12816<TP>(
+        Span<TP> dst, int dstStride,
         int width, int height,
-        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+        ReadOnlySpan<short> ac, int alpha, int bitDepth) where TP : unmanaged
     {
         int dc = (1 << bitDepth) >> 1;
         CflPred16(dst, dstStride, width, height, dc, ac, alpha, bitDepth);
     }
 
-    private static void CflPred16(
-        Span<ushort> dst, int dstStride,
+    private static void CflPred16<TP>(
+        Span<TP> dst, int dstStride,
         int width, int height, int dc,
-        ReadOnlySpan<short> ac, int alpha, int bitDepth)
+        ReadOnlySpan<short> ac, int alpha, int bitDepth) where TP : unmanaged
     {
         int max = (1 << bitDepth) - 1;
         for (int y = 0; y < height; y++)
@@ -2343,18 +2337,18 @@ public static class Av1IntraPred
                 int diff = alpha * acRow[x];
                 int sign = diff >> 31;
                 int absDiff = (Math.Abs(diff) + 32) >> 6;
-                row[x] = (ushort)Math.Clamp(dc + (absDiff ^ sign) - sign, 0, max);
+                row[x] = Px.T<TP>(Math.Clamp(dc + (absDiff ^ sign) - sign, 0, max));
             }
         }
     }
 
-    /// <summary>High bit depth CFL AC generation from ushort luma. See <see cref="CflAc"/>.</summary>
-    public static void CflAc16(
+    /// <summary>CFL AC generation from reconstructed luma. See <see cref="CflAc"/>.</summary>
+    public static void CflAc16<TP>(
         Span<short> ac,
-        ReadOnlySpan<ushort> luma, int lumaStride,
+        ReadOnlySpan<TP> luma, int lumaStride,
         int wPad, int hPad,
         int width, int height,
-        int ssHor, int ssVer)
+        int ssHor, int ssVer) where TP : unmanaged
     {
         int acIdx = 0;
 
@@ -2363,12 +2357,12 @@ public static class Av1IntraPred
             int x;
             for (x = 0; x < width - 4 * wPad; x++)
             {
-                int sum = luma[y * (lumaStride << ssVer) + (x << ssHor)];
-                if (ssHor != 0) sum += luma[y * (lumaStride << ssVer) + x * 2 + 1];
+                int sum = Px.I(luma[y * (lumaStride << ssVer) + (x << ssHor)]);
+                if (ssHor != 0) sum += Px.I(luma[y * (lumaStride << ssVer) + x * 2 + 1]);
                 if (ssVer != 0)
                 {
-                    sum += luma[(y * (lumaStride << ssVer)) + lumaStride + (x << ssHor)];
-                    if (ssHor != 0) sum += luma[(y * (lumaStride << ssVer)) + lumaStride + x * 2 + 1];
+                    sum += Px.I(luma[(y * (lumaStride << ssVer)) + lumaStride + (x << ssHor)]);
+                    if (ssHor != 0) sum += Px.I(luma[(y * (lumaStride << ssVer)) + lumaStride + x * 2 + 1]);
                 }
                 ac[acIdx + x] = (short)(sum << (1 + (ssVer == 0 ? 1 : 0) + (ssHor == 0 ? 1 : 0)));
             }
@@ -2393,11 +2387,11 @@ public static class Av1IntraPred
             ac[i] -= (short)dcSum;
     }
 
-    public static void PredPalette16(
-        Span<ushort> dst, int dstStride,
+    public static void PredPalette16<TP>(
+        Span<TP> dst, int dstStride,
         ReadOnlySpan<ushort> palette,
         ReadOnlySpan<byte> indices,
-        int width, int height)
+        int width, int height) where TP : unmanaged
     {
         int idxPos = 0;
         for (int y = 0; y < height; y++)
@@ -2406,8 +2400,8 @@ public static class Av1IntraPred
             for (int x = 0; x < width; x += 2)
             {
                 byte packed = indices[idxPos++];
-                row[x] = palette[packed & 7];
-                row[x + 1] = palette[packed >> 4];
+                row[x] = Px.T<TP>(palette[packed & 7]);
+                row[x + 1] = Px.T<TP>(palette[packed >> 4]);
             }
         }
     }
