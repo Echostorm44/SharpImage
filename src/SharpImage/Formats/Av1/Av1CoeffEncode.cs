@@ -357,6 +357,18 @@ internal static class Av1CoeffEncode
             if (Math.Min(magEob, 3) - 1 == 2) bits += CBr(coef, brTokIdx + (yE != 0 ? 14 : 7), magEob);
             levels[xE * stride + yE] = LevelByte(magEob);
 
+            if (coef.Tab is { } tab1 && Vector256.IsHardwareAccelerated)
+            {
+                int mid = EstimateMid1DV(signedLevels, cls, shift, shift2, mask, eob, baseTokIdx, brTokIdx, tab1, out int sg1, out int dcCtxV, out uint dcHmV);
+                bits += mid * (1.0 / (1 << CostShift));
+                int dcMagV = Math.Abs(signedLevels[0]);
+                int dcTokV = Math.Min(dcMagV, 3);
+                bits += CBase(coef, baseTokIdx + dcCtxV, dcTokV);
+                if (dcTokV == 3) bits += CBr(coef, brTokIdx + (int)(dcHmV > 12 ? 6u : (dcHmV + 1) >> 1), dcMagV);
+                if (dcMagV != 0) { bits += CDcSign(coef, dcSignCtx, signedLevels[0] < 0 ? 1u : 0u); if (dcMagV >= 15) bits += GolombBits((uint)(dcMagV - 15)); }
+                return bits + sg1;
+            }
+
             for (int i = eob - 1; i > 0; i--)
             {
                 int x = i & mask, y = i >> shift, levelIdx = x * stride + y, mag = Math.Abs(signedLevels[Rc1d(i, cls, shift, shift2, mask)]);
@@ -616,6 +628,61 @@ internal static class Av1CoeffEncode
         }
 
         return bits;
+    }
+
+    [ThreadStatic] private static byte[]? t_e1Lv, t_e1Cb, t_e1Cr;
+
+    // EstimateCoefBits1D's middle coefficients (scan 1 .. eob - 1) with the cost table, in 1/512 bit, plus the sign / Golomb
+    // bits of scan 1 .. eob, the DC's base context and its br neighbour sum. The 1D scan is raster (x = i & mask, y = i >>
+    // shift) and a context reads (x, y + 1), (x + 1, y), (x, y + 2 .. 4), all later scan positions or outside the block: the
+    // level map of the coded positions is written into a row-major map (stride 32, four zero rows below), then every
+    // context of rows 0 .. y(eob) computed 16 at a time (GetLoCtx's 1D sums, offset 26 + (y > 1 ? 10 : 5y), br base 7 / 14).
+    private static int EstimateMid1DV(ReadOnlySpan<int> sl, Av1TxClass cls, int shift, int shift2, int mask, int eob, int baseTokIdx, int brTokIdx,
+        Av1CoefCostTab tab, out int signBits, out int dcBaseCtx, out uint dcHm)
+    {
+        const int SP = 32;
+        var lv = t_e1Lv ??= new byte[SP * 22 + 64];
+        var cb = t_e1Cb ??= new byte[SP * 22 + 64];
+        var cr = t_e1Cr ??= new byte[SP * 22 + 64];
+        ref byte lv0 = ref MemoryMarshal.GetArrayDataReference(lv);
+        ref int sl0 = ref MemoryMarshal.GetReference(sl);
+        for (int i = 0; i <= eob; i++)
+            Unsafe.Add(ref lv0, (i >> shift) * SP + (i & mask)) = LevelByte(Math.Abs(Unsafe.Add(ref sl0, Rc1d(i, cls, shift, shift2, mask))));
+        int yE = eob >> shift;
+        ref byte cb0 = ref MemoryMarshal.GetArrayDataReference(cb);
+        ref byte cr0 = ref MemoryMarshal.GetArrayDataReference(cr);
+        var c64 = Vector256.Create((ushort)64); var c4 = Vector256.Create((ushort)4); var c63 = Vector256.Create((ushort)63);
+        var c12 = Vector256.Create((ushort)12); var c6 = Vector256.Create((ushort)6); var c1 = Vector256.Create((ushort)1);
+        for (int y = 0; y <= yE; y++)
+        {
+            ref byte q = ref Unsafe.Add(ref lv0, y * SP);
+            var hm3 = Px.Load16(ref Unsafe.Add(ref q, SP)) + Px.Load16(ref Unsafe.Add(ref q, 1)) + Px.Load16(ref Unsafe.Add(ref q, 2 * SP));
+            var s5 = hm3 + Px.Load16(ref Unsafe.Add(ref q, 3 * SP)) + Px.Load16(ref Unsafe.Add(ref q, 4 * SP));
+            var bctx = Vector256.Min(Vector256.ShiftRightLogical(s5 + c64, 7), c4) + Vector256.Create((ushort)(26 + (y > 1 ? 10 : y * 5)));
+            var hm = hm3 & c63;
+            var brc = Vector256.ConditionalSelect(Vector256.GreaterThan(hm, c12), c6, Vector256.ShiftRightLogical(hm + c1, 1)) + Vector256.Create((ushort)(y > 0 ? 14 : 7));
+            Px.Store16(ref Unsafe.Add(ref cb0, y * SP), bctx);
+            Px.Store16(ref Unsafe.Add(ref cr0, y * SP), brc);
+        }
+        ref int ib = ref MemoryMarshal.GetArrayDataReference(tab.IBase);
+        ref int ibr = ref MemoryMarshal.GetArrayDataReference(tab.IBr);
+        int r = 0, sg = 0;
+        for (int i = eob - 1; i > 0; i--)
+        {
+            int p = (i >> shift) * SP + (i & mask), mag = Math.Abs(Unsafe.Add(ref sl0, Rc1d(i, cls, shift, shift2, mask)));
+            int tok = Math.Min(mag, 3);
+            r += Unsafe.Add(ref ib, (baseTokIdx + Unsafe.Add(ref cb0, p)) * 4 + tok);
+            if (tok == 3) r += Unsafe.Add(ref ibr, (brTokIdx + Unsafe.Add(ref cr0, p)) * 16 + Math.Min(mag, 15));
+            if (mag != 0) { sg++; if (mag >= 15) sg += GolombLen((uint)(mag - 15)); }
+        }
+        int magE = Math.Abs(Unsafe.Add(ref sl0, Rc1d(eob, cls, shift, shift2, mask)));
+        sg++; if (magE >= 15) sg += GolombLen((uint)(magE - 15));
+        signBits = sg;
+        dcBaseCtx = cb[0];
+        dcHm = (uint)(lv[SP] + lv[1] + lv[2 * SP]) & 63;
+        // leave the map all zero
+        lv.AsSpan(0, (yE + 1) * SP).Clear();
+        return r;
     }
 
     // Per tx size: each coefficient's index in the column-padded map (column stride height + 4), the base-context offset
