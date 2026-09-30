@@ -66,8 +66,9 @@ internal sealed class AomCommon
         MibSize = MiSizeWide[sbSize];
         MibSizeLog2 = MiSizeWideLog2[sbSize];
         Width = width; Height = height; SsX = ssX; SsY = ssY; Monochrome = monochrome;
-        MiCols = (width + 3) >> 2;    // size_in_mi
-        MiRows = (height + 3) >> 2;
+        // enc_set_mb_mi: the mi grid covers the frame aligned to 8 luma pixels (mi_cols / mi_rows are always even)
+        MiCols = ((width + 7) & ~7) >> 2;
+        MiRows = ((height + 7) & ~7) >> 2;
         MiStride = (MiCols + 31) & ~31;   // calc_mi_size: aligned to MAX_MIB_SIZE
         int alignedRows = (MiRows + 31) & ~31;
         MiGridBase = new AomMbModeInfo?[MiStride * alignedRows];

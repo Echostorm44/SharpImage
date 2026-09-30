@@ -9,12 +9,16 @@ public sealed class AomEncoderSmoke
     {
         string? yuvPath = Environment.GetEnvironmentVariable("AOM_SMOKE_YUV");
         int w = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_W") ?? "200"), h = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_H") ?? "150");
-        int cw = (w + 1) / 2, ch = (h + 1) / 2;
+        // AOM_SMOKE_FMT=444 (4:4:4 planes in the file) / mono (luma only is read)
+        string fmt = Environment.GetEnvironmentVariable("AOM_SMOKE_FMT") ?? "420";
+        bool is444 = fmt == "444", mono = fmt == "mono";
+        int cw = is444 ? w : (w + 1) / 2, ch = is444 ? h : (h + 1) / 2;
         byte[] y = new byte[w * h], u = new byte[cw * ch], v = new byte[cw * ch];
         if (yuvPath != null && File.Exists(yuvPath))
         {
             var all = File.ReadAllBytes(yuvPath);
-            Array.Copy(all, 0, y, 0, y.Length); Array.Copy(all, y.Length, u, 0, u.Length); Array.Copy(all, y.Length + u.Length, v, 0, v.Length);
+            Array.Copy(all, 0, y, 0, y.Length);
+            if (!mono) { Array.Copy(all, y.Length, u, 0, u.Length); Array.Copy(all, y.Length + u.Length, v, 0, v.Length); }
         }
         else
         {
@@ -25,6 +29,8 @@ public sealed class AomEncoderSmoke
         }
         bool noMl = Environment.GetEnvironmentVariable("AOM_SMOKE_NOML") == "1";
         var input = new AomEncodeInput { Width = w, Height = h, Planes = new[] { y, u, v }, Strides = new[] { w, cw, cw },
+            SsX = is444 ? 0 : 1, SsY = is444 ? 0 : 1, Monochrome = mono,
+            EnableIntrabc = Environment.GetEnvironmentVariable("AOM_SMOKE_NOIBC") != "1",
             BaseQindex = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_Q") ?? "112"),
             Speed = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_SPEED") ?? "6"),
             SfOverride = noMl ? sf => { sf.intra_sf.intra_pruning_with_hog = 0; sf.intra_sf.chroma_intra_pruning_with_hog = 0;
@@ -47,7 +53,8 @@ public sealed class AomEncoderSmoke
             (cpi, x) = AomEncoder.EncodeFrame(input);
             searchMs = rep == 0 ? sw.ElapsedMilliseconds : Math.Min(searchMs, sw.ElapsedMilliseconds);
             sw.Restart();
-            AomEncoder.RunPostFilter(cpi, x);
+            // AOM_SMOKE_APPLYLR=1: apply the chosen loop restoration to the reconstruction (what a decoder outputs)
+            AomEncoder.RunPostFilter(cpi, x, Environment.GetEnvironmentVariable("AOM_SMOKE_APPLYLR") == "1");
             postMs = rep == 0 ? sw.ElapsedMilliseconds : Math.Min(postMs, sw.ElapsedMilliseconds);
         }
         Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms");
@@ -60,6 +67,37 @@ public sealed class AomEncoderSmoke
         Console.WriteLine($"smoke: luma PSNR {psnr:F2}");
         string? outPath = Environment.GetEnvironmentVariable("AOM_SMOKE_OUT");
         if (outPath != null) File.WriteAllText(outPath, Dump(cpi));
+        // AOM_SMOKE_OBU=<path>: the libaom-exact packet (AomBitstream.PackFrame); AOM_SMOKE_BSTRACE=<path>: its symbol trace
+        string? obuPath = Environment.GetEnvironmentVariable("AOM_SMOKE_OBU");
+        if (obuPath != null)
+        {
+            string? bsTracePath = Environment.GetEnvironmentVariable("AOM_SMOKE_BSTRACE");
+            using var bsTrace = bsTracePath != null ? new StreamWriter(bsTracePath) : null;
+            // AOM_SMOKE_NEG=1 (negative control): pack with disable_cdf_update, which must no longer match libaom
+            if (Environment.GetEnvironmentVariable("AOM_SMOKE_NEG") == "1") cpi.DisableCdfUpdate = true;
+            // AOM_SMOKE_CICP=cp,tc,mc / AOM_SMOKE_RANGE=0 (studio) / AOM_SMOKE_CSP=<chroma sample position>
+            var seqCfg = new AomSequenceConfig();
+            string? cicp = Environment.GetEnvironmentVariable("AOM_SMOKE_CICP");
+            if (cicp != null)
+            {
+                var parts = cicp.Split(',').Select(int.Parse).ToArray();
+                (seqCfg.ColorPrimaries, seqCfg.TransferCharacteristics, seqCfg.MatrixCoefficients) = (parts[0], parts[1], parts[2]);
+            }
+            if (Environment.GetEnvironmentVariable("AOM_SMOKE_RANGE") == "0") seqCfg.ColorRange = 0;
+            if (Environment.GetEnvironmentVariable("AOM_SMOKE_CSP") is string csp) seqCfg.ChromaSamplePosition = int.Parse(csp);
+            File.WriteAllBytes(obuPath, AomBitstream.PackFrame(cpi, seqCfg, bsTrace));
+        }
+        // AOM_SMOKE_RECON=<path>: the reconstruction as 8-bit 4:2:0 planes (compare with a decoder's output)
+        string? reconPath = Environment.GetEnvironmentVariable("AOM_SMOKE_RECON");
+        if (reconPath != null)
+        {
+            using var fs = File.Create(reconPath);
+            for (int p = 0; p < cm.NumPlanes; p++)
+            {
+                int pw = p == 0 ? w : cw, ph = p == 0 ? h : ch;
+                for (int r = 0; r < ph; r++) fs.Write(rec.Buffers[p], rec.Offsets[p] + r * rec.Strides[p], pw);
+            }
+        }
         await Assert.That(psnr).IsGreaterThan(20.0);
     }
 
