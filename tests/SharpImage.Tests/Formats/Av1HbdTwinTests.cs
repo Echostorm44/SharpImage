@@ -51,7 +51,10 @@ public sealed class Av1HbdTwinTests
             try { Av1IntraPred.Predict16(mode, d16, w, e16, center, w, h, angle, maxW, maxH, 8); } catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException) { t16 = true; }
             // the generic predictor's lowbd (byte) instantiation
             try { Av1IntraPred.Predict16<byte>(mode, dB, w, e8, center, w, h, angle, maxW, maxH, 8); } catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException) { tB = true; }
-            if (t8 || t16 || tB) { if (t8 != t16 || t8 != tB) mismatches++; continue; }   // invalid combo: all must reject alike
+            // an invalid combination (off the angle grid / edge sizes): the generic predictors must not reject what the reference
+            // accepts; where the reference itself runs past its edge buffer they may still produce a block (the whole-vector
+            // paths read only in-bounds edge memory), which no conformant stream reaches
+            if (t8 || t16 || tB) { if ((!t8 && (t16 || tB)) || t16 != tB) mismatches++; continue; }
             compared++;
             for (int i = 0; i < d8.Length; i++) if (d8[i] != d16[i] || d8[i] != dB[i]) { mismatches++; break; }
         }

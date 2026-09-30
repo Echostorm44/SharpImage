@@ -1779,6 +1779,28 @@ public static class Av1IntraPred
             row[x] = Px.T<TP>((Px.I(src[b + x]) * (64 - frac) + Px.I(src[b + x + 1]) * frac + 32) >> 6);
     }
 
+    /// <summary>InterpRun for n a multiple of 8 at bit depths up to 10, inlined and unchecked (the caller guarantees
+    /// src[0 .. n] and dst[0 .. n - 1]): the whole-vector paths.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void InterpRun8<TP>(ref TP dst, ref TP src, int frac, int n) where TP : unmanaged
+    {
+        int x = 0;
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var w0 = Vector256.Create((ushort)(64 - frac)); var w1 = Vector256.Create((ushort)frac);
+            for (; x + 16 <= n; x += 16)
+                Px.Store16(ref Unsafe.Add(ref dst, x), Vector256.ShiftRightLogical(Px.Load16(ref Unsafe.Add(ref src, x)) * w0
+                    + Px.Load16(ref Unsafe.Add(ref src, x + 1)) * w1 + Vector256.Create((ushort)32), 6));
+        }
+        if (x < n)
+        {
+            var w0 = Vector128.Create((ushort)(64 - frac)); var w1 = Vector128.Create((ushort)frac);
+            for (; x < n; x += 8)
+                Px.Store8(ref Unsafe.Add(ref dst, x), Vector128.ShiftRightLogical(Px.Load8(ref Unsafe.Add(ref src, x)) * w0
+                    + Px.Load8(ref Unsafe.Add(ref src, x + 1)) * w1 + Vector128.Create((ushort)32), 6));
+        }
+    }
+
     public static void PredZ1_16<TP>(
         Span<TP> dst, int dstStride,
         ReadOnlySpan<TP> edgeBuf, int center,
@@ -1931,38 +1953,101 @@ public static class Av1IntraPred
         {
             ReadOnlySpan<TP> top = edge.Slice(edgeCenter);
             Span<int> xsRow = stackalloc int[height];
+            // Whole vectors (as libaom's dr_prediction_z2_HxW): a row's top run starts 8-aligned at or below xs (the lanes
+            // below xs read the left samples just before the corner, in bounds, and are overwritten by the left part).
+            bool whole = !upsampleLeft && bitDepth <= 10 && width >= 8 && height >= 8 && Vector128.IsHardwareAccelerated;
             for (int y = 0, xpos = (1 << 6) - dx; y < height; y++, xpos -= dx)
             {
                 var row = dst.Slice(y * dstStride, width);
                 int baseX = xpos >> 6;
                 int xs = xsRow[y] = Math.Clamp(-baseX, 0, width);   // pixels x >= xs read the top edge (baseX + x >= 0)
-                if (xs < width) InterpRun(row.Slice(xs), top, baseX + xs, xpos & 0x3E, width - xs, bitDepth);
+                if (xs >= width) continue;
+                if (whole)
+                {
+                    int x0 = xs & ~7;
+                    InterpRun8(ref Unsafe.Add(ref MemoryMarshal.GetReference(row), x0), ref Unsafe.Add(ref MemoryMarshal.GetReference(edge), edgeCenter + baseX + x0),
+                        xpos & 0x3E, width - x0);
+                }
+                else InterpRun(row.Slice(xs), top, baseX + xs, xpos & 0x3E, width - xs, bitDepth);
+            }
+            if (whole)
+            {
+                // The left region by column (see below), each run 8-aligned: it starts at the vector boundary at or above its
+                // first left row (a left edge padded by 8 in front covers the extra rows, whose values are discarded), the
+                // columns are transposed as whole 8 x 8 tiles, and each row's left part blended in.
+                int xsMax = xsRow[height - 1];
+                if (xsMax == 0) return;
+                int xsMax8 = (xsMax + 7) & ~7;
+                Span<TP> revLp = stackalloc TP[height + 9];   // revLp[k + 8] = edge[edgeCenter - k]
+                for (int k = 0; k <= height; k++) revLp[k + 8] = edge[edgeCenter - k];
+                Span<TP> cols = stackalloc TP[xsMax8 * height];
+                for (int x = 0, ys = 0; x < xsMax; x++)
+                {
+                    while (xsRow[ys] <= x) ys++;
+                    int ypos = (ys << 6) - (x + 1) * dy, n = height - ys;
+                    if ((ypos >> 6) + 1 < 0 || (ypos >> 6) + 1 + n > height)
+                    {
+                        // past the left edge's ends (only off the AV1 angle grid): the per-pixel form
+                        var col = cols.Slice(x * height + ys, n);
+                        for (int j = 0; j < n; j++, ypos += 64)
+                        {
+                            int baseY = ypos >> 6, fracY = ypos & 0x3E;
+                            col[j] = Px.T<TP>((Px.I(edge[edgeCenter - 1 - baseY]) * (64 - fracY) + Px.I(edge[edgeCenter - 2 - baseY]) * fracY + 32) >> 6);
+                        }
+                        continue;
+                    }
+                    int ys8 = ys & ~7, ypos8 = ypos - ((ys - ys8) << 6);
+                    InterpRun8(ref Unsafe.Add(ref MemoryMarshal.GetReference(cols), x * height + ys8), ref Unsafe.Add(ref MemoryMarshal.GetReference(revLp), (ypos8 >> 6) + 9),
+                        ypos & 0x3E, height - ys8);
+                }
+                Span<TP> rows = stackalloc TP[height * xsMax8];
+                TransposeU16<TP>(cols, height, rows, xsMax8, xsMax8, height);
+                var lane = Vector128.Create((short)0, 1, 2, 3, 4, 5, 6, 7);
+                ReadOnlySpan<TP> rowsR = rows;
+                for (int y = 0; y < height; y++)
+                {
+                    int xs = xsRow[y], x = 0, o = y * dstStride, ro = y * xsMax8;
+                    for (; x + 8 <= xs; x += 8) Px.Store8(dst, o + x, Px.Load8(rowsR, ro + x));
+                    if (x < xs)
+                    {
+                        var m = Vector128.LessThan(lane, Vector128.Create((short)(xs - x))).AsUInt16();
+                        Px.Store8(dst, o + x, Vector128.ConditionalSelect(m, Px.Load8(rowsR, ro + x), Px.Load8((ReadOnlySpan<TP>)dst, o + x)));
+                    }
+                }
+                return;
             }
             if (!upsampleLeft)
             {
                 // The left-edge pixels by column: down a column the left position steps one sample per row at a fixed
-                // fraction, a run over the left edge read upwards (revL[k] = edge[edgeCenter - k], k = baseY + 1).
+                // fraction, a run over the left edge read upwards (revL[k] = edge[edgeCenter - k], k = baseY + 1). The
+                // columns of the left region (x < xsRow[y], widest on the last row) are built column-major, transposed
+                // with vector tiles, and each row's left part copied in.
+                int xsMax = xsRow[height - 1];
+                if (xsMax == 0) return;
                 Span<TP> revL = stackalloc TP[height + 1];
                 for (int k = 0; k <= height; k++) revL[k] = edge[edgeCenter - k];
-                Span<TP> col = stackalloc TP[height];
-                for (int x = 0, ys = 0; x < width; x++)
+                Span<TP> cols = stackalloc TP[xsMax * height];   // column x at x * height (rows above its run unused)
+                for (int x = 0, ys = 0; x < xsMax; x++)
                 {
-                    while (ys < height && xsRow[ys] <= x) ys++;   // rows ys.. read the left edge at this column
-                    if (ys >= height) break;
+                    while (xsRow[ys] <= x) ys++;   // rows ys.. read the left edge at this column (row height - 1 does)
                     int ypos = (ys << 6) - (x + 1) * dy, n = height - ys;
+                    var col = cols.Slice(x * height + ys, n);
                     if ((ypos >> 6) + 1 < 0 || (ypos >> 6) + 1 + n > height)
                     {
                         // past the left edge's ends (only off the AV1 angle grid): the per-pixel form
                         for (int j = 0; j < n; j++, ypos += 64)
                         {
                             int baseY = ypos >> 6, fracY = ypos & 0x3E;
-                            dst[(ys + j) * dstStride + x] = Px.T<TP>((Px.I(edge[edgeCenter - 1 - baseY]) * (64 - fracY) + Px.I(edge[edgeCenter - 2 - baseY]) * fracY + 32) >> 6);
+                            col[j] = Px.T<TP>((Px.I(edge[edgeCenter - 1 - baseY]) * (64 - fracY) + Px.I(edge[edgeCenter - 2 - baseY]) * fracY + 32) >> 6);
                         }
                         continue;
                     }
                     InterpRun(col, revL, (ypos >> 6) + 1, ypos & 0x3E, n, bitDepth);
-                    for (int j = 0; j < n; j++) dst[(ys + j) * dstStride + x] = col[j];
                 }
+                Span<TP> rows = stackalloc TP[height * xsMax];
+                TransposeU16<TP>(cols, height, rows, xsMax, xsMax, height);
+                for (int y = 0; y < height; y++)
+                    if (xsRow[y] > 0) rows.Slice(y * xsMax, xsRow[y]).CopyTo(dst.Slice(y * dstStride, xsRow[y]));
                 return;
             }
             for (int y = 0; y < height; y++)

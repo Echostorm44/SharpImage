@@ -2304,6 +2304,80 @@ public sealed class Av1HbdVerify
                     }
                     continue;
                 }
+                if (t[0] == "predtwin")
+                {
+                    // predtwin: Av1HbdTwinTests.Predict16AtBd8MatchesPredict's loop, printing the mismatching cases
+                    var rnd = new Random(7);
+                    int[] sizes = { 4, 8, 16, 32, 64 };
+                    const int center = 256;
+                    for (int trial = 0; trial < 4000; trial++)
+                    {
+                        int w = sizes[rnd.Next(sizes.Length)], h = sizes[rnd.Next(sizes.Length)];
+                        if (w > 4 * h || h > 4 * w) continue;
+                        int mode = rnd.Next(14);
+                        int angle = mode switch { 10 => rnd.Next(3, 88), 11 => rnd.Next(93, 178), 12 => rnd.Next(183, 268), 13 => rnd.Next(5), _ => 0 };
+                        if (mode is >= 10 and <= 12) { if (rnd.Next(2) == 0) angle |= 1 << 10; if (rnd.Next(2) == 0) angle |= 1 << 9; }
+                        var e8 = new byte[513]; var e16 = new ushort[513];
+                        for (int i = 0; i < e8.Length; i++) { e8[i] = (byte)rnd.Next(256); e16[i] = e8[i]; }
+                        var d8 = new byte[w * h]; var d16 = new ushort[w * h]; var dB = new byte[w * h];
+                        if (mode == 13 && (w > 32 || h > 32)) continue;
+                        int maxW = rnd.Next(1, 2 * w + 1), maxH = rnd.Next(1, 2 * h + 1);
+                        string r8 = "ok", r16 = "ok", rB = "ok";
+                        try { Av1IntraPred.Predict(mode, d8, w, e8, center, w, h, angle, maxW, maxH, 8); } catch (Exception ex) { r8 = ex.GetType().Name; }
+                        try { Av1IntraPred.Predict16(mode, d16, w, e16, center, w, h, angle, maxW, maxH, 8); } catch (Exception ex) { r16 = ex.GetType().Name; }
+                        try { Av1IntraPred.Predict16<byte>(mode, dB, w, e8, center, w, h, angle, maxW, maxH, 8); } catch (Exception ex) { rB = ex.GetType().Name; }
+                        bool diff = false;
+                        if (r8 == "ok" && r16 == "ok" && rB == "ok") for (int i = 0; i < d8.Length; i++) if (d8[i] != d16[i] || d8[i] != dB[i]) { diff = true; break; }
+                        if (diff || (r8 == "ok") != (r16 == "ok") || (r8 == "ok") != (rB == "ok"))
+                            log.AppendLine($"predtwin trial {trial} mode {mode} {w}x{h} angle {angle & 511} filt {(angle >> 10) & 1} sm {(angle >> 9) & 1} max {maxW}x{maxH}: 8 {r8} 16 {r16} B {rB} diff {diff}");
+                    }
+                    continue;
+                }
+                if (t[0] == "predloop")
+                {
+                    // predloop <impl> <angle> <n> <seconds> [nofilter]: Predict16<byte> on one n x n mode in a loop (line profiler)
+                    int impl = int.Parse(t[1]), ang = int.Parse(t[2]), n = int.Parse(t[3]); double secs = double.Parse(t[4]);
+                    int a = ang | (t.Length > 5 ? 0 : 1 << 10);
+                    var rng = new Random(5);
+                    var e8 = new byte[513]; for (int i = 0; i < e8.Length; i++) e8[i] = (byte)rng.Next(256);
+                    var d8 = new byte[64 * 64];
+                    var sw = System.Diagnostics.Stopwatch.StartNew(); long calls = 0;
+                    while (sw.Elapsed.TotalSeconds < secs)
+                    {
+                        for (int i = 0; i < 1000; i++) Av1IntraPred.Predict16<byte>(impl, d8, n, e8, 256, n, n, a, n, n, 8);
+                        calls += 1000;
+                    }
+                    log.AppendLine($"predloop {impl} {ang} {n}x{n}: {sw.Elapsed.TotalMilliseconds * 1e6 / calls:F1} ns/call");
+                    continue;
+                }
+                if (t[0] == "fwdloop")
+                {
+                    // fwdloop <tx> <seconds> [noqf]: ForwardQuantRect on one tx size (DCT_DCT, residual +-64) in a loop, for the
+                    // line profiler
+                    int tx = int.Parse(t[1]); double secs = double.Parse(t[2]); bool noqf = t.Length > 3;
+                    ref readonly var td = ref SharpImage.Formats.Av1.Av1Tables.TxfmDimensions[tx];
+                    int w = td.W * 4, h = td.H * 4, n = Math.Min(w, 32) * Math.Min(h, 32);
+                    var rng = new Random(3);
+                    var res = new int[w * h]; for (int i = 0; i < res.Length; i++) res[i] = rng.Next(-64, 65);
+                    var qf = noqf ? null : new double[n];
+                    var sw = System.Diagnostics.Stopwatch.StartNew(); long calls = 0;
+                    while (sw.Elapsed.TotalSeconds < secs)
+                    {
+                        for (int i = 0; i < 1000; i++) Av1FwdTransform.ReturnLevels(Av1FwdTransform.ForwardQuantRect(res, w, h, tx, 40, 50, n, Av1FwdTransform.FwdTxType.DctDct, qf));
+                        calls += 1000;
+                    }
+                    log.AppendLine($"fwdloop {w}x{h}{(noqf ? " noqf" : "")}: {sw.Elapsed.TotalMilliseconds * 1e6 / calls:F1} ns/call");
+                    // the kernel alone (no wrapper / level pool)
+                    var lvls = new int[n];
+                    sw.Restart(); calls = 0;
+                    while (sw.Elapsed.TotalSeconds < secs)
+                    {
+                        for (int i = 0; i < 1000; i++) SharpImage.Formats.Av1.Av1FwdTxfmAom.ForwardQuant(res, w, h, tx, 0, 0, 40, 50, 0.04, lvls, qf);
+                        calls += 1000;
+                    }
+                    log.AppendLine($"fwdloop {w}x{h} kernel only: {sw.Elapsed.TotalMilliseconds * 1e6 / calls:F1} ns/call");
+                    continue;
+                }
                 if (t[0] == "fwdbench")
                 {
                     // fwdbench: ns per forward + quant call per tx size (DCT_DCT, residual +-64), matrix vs libaom forward.

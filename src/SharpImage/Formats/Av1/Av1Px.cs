@@ -45,6 +45,32 @@ internal static class Px
         return Vector256.LoadUnsafe(ref Unsafe.As<TP, ushort>(ref r));
     }
 
+    /// <summary>Stores 16 lanes (each within the sample range) at r (unchecked).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Store16<TP>(ref TP r, Vector256<ushort> v) where TP : unmanaged
+    {
+        if (typeof(TP) == typeof(byte))
+        {
+            var n = Sse2.IsSupported ? Sse2.PackUnsignedSaturate(v.GetLower().AsInt16(), v.GetUpper().AsInt16()) : Vector128.Narrow(v.GetLower(), v.GetUpper());
+            n.StoreUnsafe(ref Unsafe.As<TP, byte>(ref r));
+            return;
+        }
+        v.StoreUnsafe(ref Unsafe.As<TP, ushort>(ref r));
+    }
+
+    /// <summary>Stores 8 lanes (each within the sample range) at r (unchecked).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Store8<TP>(ref TP r, Vector128<ushort> v) where TP : unmanaged
+    {
+        if (typeof(TP) == typeof(byte))
+        {
+            var n = Sse2.IsSupported ? Sse2.PackUnsignedSaturate(v.AsInt16(), v.AsInt16()) : Vector128.Narrow(v, v);
+            Unsafe.WriteUnaligned(ref Unsafe.As<TP, byte>(ref r), n.AsUInt64().ToScalar());
+            return;
+        }
+        v.StoreUnsafe(ref Unsafe.As<TP, ushort>(ref r));
+    }
+
     /// <summary>Stores 16 lanes (each within the sample range) to d[i..].</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Store16<TP>(Span<TP> d, int i, Vector256<ushort> v) where TP : unmanaged
