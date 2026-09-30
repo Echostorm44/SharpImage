@@ -177,6 +177,32 @@ internal static class AomEncodeMb
     internal static void SubtractBlock(int rows, int cols, short[] diff, int diffOff, int diffStride,
         byte[] src, int srcOff, int srcStride, byte[] pred, int predOff, int predStride)
     {
+        if (cols >= 8 && Avx2.IsSupported)
+        {
+            ref byte sr = ref MemoryMarshal.GetArrayDataReference(src);
+            ref byte pr = ref MemoryMarshal.GetArrayDataReference(pred);
+            ref short dr = ref MemoryMarshal.GetArrayDataReference(diff);
+            for (int r = 0; r < rows; r++)
+            {
+                int d = diffOff + r * diffStride, s = srcOff + r * srcStride, p = predOff + r * predStride;
+                if (cols >= 16)
+                {
+                    for (int c = 0; c < cols; c += 16)
+                    {
+                        var a = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref sr, (nuint)(s + c)));
+                        var b = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref pr, (nuint)(p + c)));
+                        (a - b).StoreUnsafe(ref dr, (nuint)(d + c));
+                    }
+                }
+                else
+                {
+                    var a = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref sr, s))).AsByte());
+                    var b = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pr, p))).AsByte());
+                    (a - b).StoreUnsafe(ref dr, (nuint)d);
+                }
+            }
+            return;
+        }
         for (int r = 0; r < rows; r++)
         {
             int d = diffOff + r * diffStride, s = srcOff + r * srcStride, p = predOff + r * predStride;
@@ -387,8 +413,15 @@ internal static class AomEncodeMb
     /// <summary>aom_satd.</summary>
     internal static int Satd(ReadOnlySpan<int> coeff, int length)
     {
-        int satd = 0;
-        for (int i = 0; i < length; i++) satd += Math.Abs(coeff[i]);
+        int satd = 0, i = 0;
+        if (length >= 8)
+        {
+            ref int c0 = ref MemoryMarshal.GetReference(coeff);
+            var acc = Vector256<int>.Zero;
+            for (; i + 8 <= length; i += 8) acc += Vector256.Abs(Vector256.LoadUnsafe(ref c0, (nuint)i));
+            satd = Vector256.Sum(acc);
+        }
+        for (; i < length; i++) satd += Math.Abs(coeff[i]);
         return satd;
     }
 

@@ -1,6 +1,8 @@
 using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -190,6 +192,27 @@ internal static class AomTxb
     {
         int stride = height + TxPadHor;
         levels.Slice(stride * width, TxPadBottom * stride + TxPadEnd).Clear();
+        ref int c0 = ref MemoryMarshal.GetReference(coeff);
+        ref byte l0 = ref MemoryMarshal.GetReference(levels);
+        var max = Vector256.Create(127);
+        if (height >= 8)
+        {
+            for (int i = 0; i < width; i++)
+            {
+                ref int ci = ref Unsafe.Add(ref c0, i * height);
+                ref byte li = ref Unsafe.Add(ref l0, i * stride);
+                for (int j = 0; j < height; j += 8)
+                {
+                    // min(|c|, 127) in 8 int lanes, narrowed to 8 bytes (values fit, so truncation is exact)
+                    var a = Vector256.Min(Vector256.Abs(Vector256.LoadUnsafe(ref ci, (nuint)j)), max);
+                    var s16 = Vector256.Narrow(a, Vector256<int>.Zero);
+                    var s8 = Vector256.Narrow(s16, Vector256<short>.Zero);
+                    Unsafe.WriteUnaligned(ref Unsafe.Add(ref li, j), s8.AsUInt64().GetElement(0));
+                }
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref li, height), 0u);   // TX_PAD_HOR
+            }
+            return;
+        }
         int ls = 0;
         for (int i = 0; i < width; i++)
         {
@@ -432,6 +455,7 @@ internal static class AomTxb
 
     /// <summary>av1_cost_coeffs_txb (warehouse_efficients_txb): the coded bits (1/512) of a tx block's levels with the
     /// given contexts; txTypeCost = get_tx_type_cost's value for this block.</summary>
+    [SkipLocalsInit]   // libaom's levels_buf / coeff_contexts are uninitialized stack arrays filled before use
     internal static int CostCoeffsTxb(AomCoeffCosts costs, int txSize, int txType, int planeType, AomTxbCtx txbCtx,
         ReadOnlySpan<int> qcoeff, int eob, int txTypeCost, ReadOnlySpan<ushort> scan)
     {
@@ -554,6 +578,7 @@ internal static class AomTxb
     /// <summary>av1_optimize_txb: libaom's trellis on one tx block's levels (qcoeff / dqcoeff updated in place, tcoeff
     /// the transform coefficients). rdmult: x->rdmult; txTypeCost: get_tx_type_cost. Returns the new eob; rate: the
     /// block's coded bits (1/512).</summary>
+    [SkipLocalsInit]   // libaom's levels_buf / coeff_contexts are uninitialized stack arrays filled before use
     internal static int OptimizeTxb(AomCoeffCosts costs, int txSize, int txType, int planeType, bool isInter, AomTxbCtx txbCtx,
         ReadOnlySpan<int> tcoeff, Span<int> qcoeff, Span<int> dqcoeff, int eob, short dequant0, short dequant1,
         int rdmultIn, int bitDepth, int sharpness, bool useChromaTrellisRdMult, bool tuneIq, int txTypeCost,

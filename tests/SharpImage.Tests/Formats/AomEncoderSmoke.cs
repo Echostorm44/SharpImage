@@ -32,16 +32,27 @@ public sealed class AomEncoderSmoke
         string? tracePath = Environment.GetEnvironmentVariable("AOM_TRACE");
         using var traceWriter = tracePath != null ? new StreamWriter(tracePath) : null;
         AomTrace.Out = traceWriter;
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var (cpi, x) = AomEncoder.EncodeFrame(input);
-        AomEncoder.RunPostFilter(cpi, x);
-        sw.Stop();
+        int reps = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_REPS") ?? "1");
+        AomComp cpi = null!; AomMacroblock x = null!;
+        var sw = new System.Diagnostics.Stopwatch();
+        long searchMs = 0, postMs = 0;
+        for (int rep = 0; rep < reps; rep++)
+        {
+            sw.Restart();
+            (cpi, x) = AomEncoder.EncodeFrame(input);
+            searchMs = rep == 0 ? sw.ElapsedMilliseconds : Math.Min(searchMs, sw.ElapsedMilliseconds);
+            sw.Restart();
+            AomEncoder.RunPostFilter(cpi, x);
+            postMs = rep == 0 ? sw.ElapsedMilliseconds : Math.Min(postMs, sw.ElapsedMilliseconds);
+        }
+        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms");
+        sw.Restart(); sw.Stop();
         AomTrace.Out = null;
         var cm = cpi.Cm; var rec = cm.CurFrame;
         double se = 0;
         for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) { int d = rec.Buffers[0][rec.Offsets[0] + r * rec.Strides[0] + c] - y[r * w + c]; se += d * d; }
         double psnr = 10 * Math.Log10(255.0 * 255 / (se / (w * h)));
-        Console.WriteLine($"smoke: {sw.ElapsedMilliseconds} ms, luma PSNR {psnr:F2}");
+        Console.WriteLine($"smoke: luma PSNR {psnr:F2}");
         string? outPath = Environment.GetEnvironmentVariable("AOM_SMOKE_OUT");
         if (outPath != null) File.WriteAllText(outPath, Dump(cpi));
         await Assert.That(psnr).IsGreaterThan(20.0);
