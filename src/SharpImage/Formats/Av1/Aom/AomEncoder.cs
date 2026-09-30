@@ -15,6 +15,8 @@ internal sealed class AomEncodeInput
     public bool AllowScreenContentTools, UseScreenContentTools, AllowIntrabc, IsScreenContentType;
     /// <summary>Run libaom's screen-content detection (sets the flags above from the source).</summary>
     public bool DetectScreenContent = true;
+    /// <summary>oxcf.kf_cfg.enable_intrabc (AV1E_SET_ENABLE_INTRABC): false keeps intrabc off even for screen content.</summary>
+    public bool EnableIntrabc = true;
     /// <summary>Test hook: adjusts the speed features after libaom's setup (e.g. to isolate a stage).</summary>
     public Action<AomSpeedFeatures>? SfOverride;
 }
@@ -56,6 +58,8 @@ internal static partial class AomEncoder
             cpi.UseScreenContentTools = sct;
             cpi.AllowIntrabc = ibc;
         }
+        // encode_frame_internal: features->allow_intrabc &= oxcf->kf_cfg.enable_intrabc
+        cpi.AllowIntrabc &= input.EnableIntrabc;
 
         // speed features (framesize independent / dependent / qindex dependent) and the winner mode params
         var sfIn = new AomSpeedFeatureInputs

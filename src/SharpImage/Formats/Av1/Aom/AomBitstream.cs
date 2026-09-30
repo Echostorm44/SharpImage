@@ -101,7 +101,8 @@ internal static class AomBitstream
             EnableIntraEdgeFilter = cpi.EnableIntraEdgeFilter;
             EnableRestoration = cpi.EnableRestoration;
             AllowScreenContentTools = cpi.AllowScreenContentTools;
-            AllowIntrabc = cpi.AllowScreenContentTools && cpi.AllowIntrabc;
+            // encode_frame_internal: "If intrabc is allowed but never selected, reset the allow_intrabc flag."
+            AllowIntrabc = cpi.AllowScreenContentTools && cpi.AllowIntrabc && AnyIntrabcBlock(cm);
             CodedLossless = cm.BaseQindex == 0;   // no delta q: every segment is lossless iff base_qindex is 0
             AllLossless = CodedLossless;           // no superres
             ReducedTxSetUsed = cpi.ReducedTxSetUsed;
@@ -139,6 +140,15 @@ internal static class AomBitstream
             int colSb = (sbCols + (1 << Log2Cols) - 1) >> Log2Cols, rowSb = (sbRows + (1 << Log2Rows) - 1) >> Log2Rows;
             if (colSb < sbCols || rowSb < sbRows)
                 throw new NotSupportedException("frames needing more than one tile are not supported by the port");
+        }
+
+        /// <summary>cpi->intrabc_used: any block of the frame coded with intrabc.</summary>
+        private static bool AnyIntrabcBlock(AomCommon cm)
+        {
+            for (int r = 0; r < cm.MiRows; r++)
+                for (int c = 0; c < cm.MiCols; c++)
+                    if ((cm.MiGridBase[r * cm.MiStride + c]?.UseIntrabc ?? 0) != 0) return true;
+            return false;
         }
 
         private static int TileLog2(int blkSize, int target)

@@ -9,12 +9,16 @@ public sealed class AomEncoderSmoke
     {
         string? yuvPath = Environment.GetEnvironmentVariable("AOM_SMOKE_YUV");
         int w = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_W") ?? "200"), h = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_H") ?? "150");
-        int cw = (w + 1) / 2, ch = (h + 1) / 2;
+        // AOM_SMOKE_FMT=444 (4:4:4 planes in the file) / mono (luma only is read)
+        string fmt = Environment.GetEnvironmentVariable("AOM_SMOKE_FMT") ?? "420";
+        bool is444 = fmt == "444", mono = fmt == "mono";
+        int cw = is444 ? w : (w + 1) / 2, ch = is444 ? h : (h + 1) / 2;
         byte[] y = new byte[w * h], u = new byte[cw * ch], v = new byte[cw * ch];
         if (yuvPath != null && File.Exists(yuvPath))
         {
             var all = File.ReadAllBytes(yuvPath);
-            Array.Copy(all, 0, y, 0, y.Length); Array.Copy(all, y.Length, u, 0, u.Length); Array.Copy(all, y.Length + u.Length, v, 0, v.Length);
+            Array.Copy(all, 0, y, 0, y.Length);
+            if (!mono) { Array.Copy(all, y.Length, u, 0, u.Length); Array.Copy(all, y.Length + u.Length, v, 0, v.Length); }
         }
         else
         {
@@ -25,6 +29,8 @@ public sealed class AomEncoderSmoke
         }
         bool noMl = Environment.GetEnvironmentVariable("AOM_SMOKE_NOML") == "1";
         var input = new AomEncodeInput { Width = w, Height = h, Planes = new[] { y, u, v }, Strides = new[] { w, cw, cw },
+            SsX = is444 ? 0 : 1, SsY = is444 ? 0 : 1, Monochrome = mono,
+            EnableIntrabc = Environment.GetEnvironmentVariable("AOM_SMOKE_NOIBC") != "1",
             BaseQindex = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_Q") ?? "112"),
             Speed = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_SPEED") ?? "6"),
             SfOverride = noMl ? sf => { sf.intra_sf.intra_pruning_with_hog = 0; sf.intra_sf.chroma_intra_pruning_with_hog = 0;

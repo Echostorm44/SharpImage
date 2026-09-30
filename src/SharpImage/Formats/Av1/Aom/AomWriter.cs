@@ -112,7 +112,7 @@ internal sealed class AomWriter
     /// <summary>aom_write_cdf (od_ec_encode_cdf_q15): codes s with a non-adaptive dav1d-layout CDF.</summary>
     public void WriteCdf(int s, ReadOnlySpan<ushort> cdf, int nsymbs)
     {
-        if (Trace != null) TraceSym('c', s, cdf, nsymbs);
+        if (Trace != null) TraceSym('s', s, cdf, nsymbs);
         EncodeQ15(s > 0 ? Icdf(cdf, s - 1, nsymbs) : CdfProbTop, Icdf(cdf, s, nsymbs), s, nsymbs);
     }
 
