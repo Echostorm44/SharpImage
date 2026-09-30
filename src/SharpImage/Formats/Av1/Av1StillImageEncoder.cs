@@ -2396,8 +2396,18 @@ internal static partial class Av1StillImageEncoder
     private static TP[] CopyRegion<TP>(TP[]? into, TP[] plane, int stride, int px, int py, int w, int h) where TP : unmanaged
     {
         var r = into != null && into.Length == w * h ? into : new TP[w * h];
-        for (int y = 0; y < h; y++) Array.Copy(plane, (py + y) * stride + px, r, y * w, w);
+        if (w > 0 && h > 0) CopyRows<TP>(plane, py * stride + px, stride, r, 0, w, w, h);
         return r;
+    }
+
+    // A strided block copy: whole-row vector moves for the power-of-two widths of coded blocks, else a copy per row.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void CopyRows<TP>(ReadOnlySpan<TP> src, int srcOff, int srcStride, Span<TP> dst, int dstOff, int dstStride, int w, int h)
+        where TP : unmanaged
+    {
+        int bytes = w * System.Runtime.CompilerServices.Unsafe.SizeOf<TP>();
+        if ((bytes & (bytes - 1)) == 0 && bytes >= 4 && bytes <= 128) { Px.CopyBlock(src, srcOff, srcStride, dst, dstOff, dstStride, w, h); return; }
+        for (int y = 0; y < h; y++) src.Slice(srcOff + y * srcStride, w).CopyTo(dst.Slice(dstOff + y * dstStride, w));
     }
 
     private static T[] CopyInto<T>(T[]? into, T[] src)
@@ -2409,7 +2419,7 @@ internal static partial class Av1StillImageEncoder
 
     private static void PasteRegion<TP>(TP[] region, TP[] plane, int stride, int px, int py, int w, int h) where TP : unmanaged
     {
-        for (int y = 0; y < h; y++) Array.Copy(region, y * w, plane, (py + y) * stride + px, w);
+        if (w > 0 && h > 0) CopyRows<TP>(region, 0, w, plane, py * stride + px, stride, w, h);
     }
 
     private static RdSnapshot<TP> SnapshotRd<TP>(ColorPartCtx<TP> c, int bx4, int by4, int blk4, RdSnapshot<TP>? into = null) where TP : unmanaged
@@ -3004,7 +3014,7 @@ internal static partial class Av1StillImageEncoder
 
     private static void CopyPlaneBlock<TP>(TP[] src, int cn, TP[] recon, int reconW, int cbx, int cby) where TP : unmanaged
     {
-        for (int y = 0; y < cn; y++) Array.Copy(src, y * cn, recon, (cby + y) * reconW + cbx, cn);
+        CopyRows<TP>(src, 0, cn, recon, cby * reconW + cbx, reconW, cn, cn);
     }
 
     private static TP[] FlatPlane<TP>(int value, int cn) where TP : unmanaged
@@ -6522,7 +6532,7 @@ internal static partial class Av1StillImageEncoder
         byte cfCtx = (byte)(Math.Min(culLevel, 63) | dcSignLevel);
 
         // the prediction straight into the reconstruction, the inverse transform added there
-        for (int y = 0; y < h; y++) predBlock.AsSpan(y * w, w).CopyTo(recon.AsSpan((by + y) * reconW + bx, w));
+        Px.CopyBlock<TP>(predBlock, 0, w, recon, by * reconW + bx, reconW, w, h);
         Av1InvTransform.InvTxfmAdd16(recon.AsSpan(by * reconW + bx), reconW, cf, eob, txIdx, Av1InvTransform.TxShift[txIdx], txType, Bd);
 
         return cfCtx;

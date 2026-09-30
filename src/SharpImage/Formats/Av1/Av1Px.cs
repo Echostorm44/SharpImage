@@ -153,6 +153,39 @@ internal static class Px
         }
     }
 
+    /// <summary>Copies an h-row block of w samples (w * sizeof(TP) of 4..128 bytes, a power of two) between strided
+    /// buffers with whole-row vector moves (no memmove call per short row).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CopyBlock<TP>(ReadOnlySpan<TP> src, int srcOff, int srcStride, Span<TP> dst, int dstOff, int dstStride, int w, int h)
+        where TP : unmanaged
+    {
+        int bytes = w * Unsafe.SizeOf<TP>();
+        // bounds: the first and last rows
+        _ = src.Slice(srcOff, (h - 1) * srcStride + w); _ = dst.Slice(dstOff, (h - 1) * dstStride + w);
+        ref byte s = ref Unsafe.As<TP, byte>(ref Unsafe.Add(ref MemoryMarshal.GetReference(src), srcOff));
+        ref byte d = ref Unsafe.As<TP, byte>(ref Unsafe.Add(ref MemoryMarshal.GetReference(dst), dstOff));
+        int ss = srcStride * Unsafe.SizeOf<TP>(), ds = dstStride * Unsafe.SizeOf<TP>();
+        switch (bytes)
+        {
+            case 4:
+                for (int y = 0; y < h; y++) Unsafe.WriteUnaligned(ref Unsafe.Add(ref d, y * ds), Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref s, y * ss)));
+                return;
+            case 8:
+                for (int y = 0; y < h; y++) Unsafe.WriteUnaligned(ref Unsafe.Add(ref d, y * ds), Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref s, y * ss)));
+                return;
+            case 16:
+                for (int y = 0; y < h; y++) Vector128.LoadUnsafe(ref Unsafe.Add(ref s, y * ss)).StoreUnsafe(ref Unsafe.Add(ref d, y * ds));
+                return;
+            default:
+                for (int y = 0; y < h; y++)
+                {
+                    ref byte sr = ref Unsafe.Add(ref s, y * ss); ref byte dr = ref Unsafe.Add(ref d, y * ds);
+                    for (int o = 0; o < bytes; o += 32) Vector256.LoadUnsafe(ref sr, (nuint)o).StoreUnsafe(ref dr, (nuint)o);
+                }
+                return;
+        }
+    }
+
     /// <summary>8 samples at r as 32-bit lanes.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector256<int> Load8x32<TP>(ref TP r) where TP : unmanaged

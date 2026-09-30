@@ -259,19 +259,8 @@ public static class Av1InvTransform
         int sh = Math.Min(h, 32);
         int sw = Math.Min(w, 32);
 
-        // Rows (coefficient index rc = y + x * sh) holding a nonzero coefficient, found with a vectorized skip over zeros.
-        uint rowMask = 0;
-        {
-            var cs = coeffs.Slice(0, sw * sh);
-            for (int p = 0; ;)
-            {
-                int k = cs.Slice(p).IndexOfAnyExcept(0);
-                if (k < 0) break;
-                p += k;
-                rowMask |= 1u << (p & (sh - 1));
-                if (++p >= cs.Length) break;
-            }
-        }
+        // Rows (coefficient index rc = y + x * sh) holding a nonzero coefficient: the columns ORed together, 8 rows a vector.
+        uint rowMask = NonzeroRows(coeffs.Slice(0, sw * sh), sw, sh);
 
         if (Avx2.IsSupported && !ForceScalar)
         {
@@ -318,6 +307,32 @@ public static class Av1InvTransform
             for (int x = 0; x < w; x++)
                 row[x] = Px.T<TP>(Math.Clamp(Px.I(row[x]) + ((tmpRow[x] + 8) >> 4), 0, pixelMax));
         }
+    }
+
+    /// <summary>Bit y set when row y of the column-major sw x sh coefficients (rc = y + x * sh) has a nonzero.</summary>
+    private static uint NonzeroRows(ReadOnlySpan<int> cs, int sw, int sh)
+    {
+        ref int c0 = ref MemoryMarshal.GetReference(cs);
+        if (sh >= 8 && Vector256.IsHardwareAccelerated)
+        {
+            uint m = 0;
+            for (int r = 0; r < sh; r += 8)
+            {
+                var acc = Vector256<int>.Zero;
+                for (int x = 0; x < sw; x++) acc |= Vector256.LoadUnsafe(ref c0, (nuint)(x * sh + r));
+                m |= (~Vector256.Equals(acc, Vector256<int>.Zero).ExtractMostSignificantBits() & 0xFFu) << r;
+            }
+            return m;
+        }
+        if (sh == 4 && Vector128.IsHardwareAccelerated)
+        {
+            var acc = Vector128<int>.Zero;
+            for (int x = 0; x < sw; x++) acc |= Vector128.LoadUnsafe(ref c0, (nuint)(x * 4));
+            return ~Vector128.Equals(acc, Vector128<int>.Zero).ExtractMostSignificantBits() & 0xFu;
+        }
+        uint mask = 0;
+        for (int i = 0; i < cs.Length; i++) if (cs[i] != 0) mask |= 1u << (i & (sh - 1));
+        return mask;
     }
 
     /// <summary>InvTxfmAdd16 with the 1-D kernels run on 8 rows (row pass, loaded straight from the column-major
