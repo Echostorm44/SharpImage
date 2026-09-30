@@ -48,6 +48,9 @@ internal sealed partial class AomComp
     public int RdRdmult;             // cpi->rd.RDMULT
     public bool AllowUpdateCdf = true;   // tile_data->allow_update_cdf
     public bool DisableCdfUpdate;
+    // x->txfm_search_info.txb_split_count of the final encode (OUTPUT_ENABLED): intra blocks whose tx size is not the
+    // block's largest. Zero turns the frame's TX_MODE_SELECT into TX_MODE_LARGEST before the bitstream is written.
+    public int TxbSplitCount;
     // CB_COEFF_BUFFER per superblock (row-major over the frame's SBs)
     public AomCbCoeffBuffer[] CbCoeffBuffers = Array.Empty<AomCbCoeffBuffer>();
     // mbmi_ext_frame cb_offset per mi (y, uv)
@@ -271,7 +274,7 @@ internal static partial class AomEncodeFrame
     }
 
     /// <summary>set_mi_row_col.</summary>
-    private static void SetMiRowCol(AomMacroblockD xd, AomCommon cm, int miRow, int bh, int miCol, int bw)
+    internal static void SetMiRowCol(AomMacroblockD xd, AomCommon cm, int miRow, int bh, int miCol, int bw)
     {
         xd.MbToTopEdge = -((miRow * 4) * 8);
         xd.MbToBottomEdge = ((cm.MiRows - bh - miRow) * 4) * 8;
@@ -518,6 +521,7 @@ internal static partial class AomEncodeFrame
         {
             if (txfmParams.TxModeSearchType == TX_MODE_SELECT && xd.Lossless[mbmi.SegmentId] == 0 && mbmi.Bsize > BLOCK_4X4)
             {
+                if (mbmi.TxSize != MaxTxsizeRectLookup[bsize]) ++cpi.TxbSplitCount;
                 if (AomTxSearch.BlockSignalsTxsize(bsize))
                 {
                     int txSizeCtx = AomTxSearch.TxSizeContext(xd);
@@ -534,6 +538,7 @@ internal static partial class AomEncodeFrame
                 int rows = Math.Min(cm.MiRows - miRow, miHeight);
                 for (int j = 0; j < rows; j++)
                     for (int i = 0; i < cols; i++) xd.MiGrid[xd.MiOffset + mis * j + i]!.TxSize = intraTxSize;
+                if (intraTxSize != MaxTxsizeRectLookup[bsize]) ++cpi.TxbSplitCount;
             }
         }
 

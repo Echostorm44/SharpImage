@@ -34,7 +34,8 @@ public sealed class AomEncoderSmoke
         AomTrace.Out = traceWriter;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var (cpi, x) = AomEncoder.EncodeFrame(input);
-        AomEncoder.RunPostFilter(cpi, x);
+        // AOM_SMOKE_APPLYLR=1: apply the chosen loop restoration to the reconstruction (what a decoder outputs)
+        AomEncoder.RunPostFilter(cpi, x, Environment.GetEnvironmentVariable("AOM_SMOKE_APPLYLR") == "1");
         sw.Stop();
         AomTrace.Out = null;
         var cm = cpi.Cm; var rec = cm.CurFrame;
@@ -44,6 +45,25 @@ public sealed class AomEncoderSmoke
         Console.WriteLine($"smoke: {sw.ElapsedMilliseconds} ms, luma PSNR {psnr:F2}");
         string? outPath = Environment.GetEnvironmentVariable("AOM_SMOKE_OUT");
         if (outPath != null) File.WriteAllText(outPath, Dump(cpi));
+        // AOM_SMOKE_OBU=<path>: the libaom-exact packet (AomBitstream.PackFrame); AOM_SMOKE_BSTRACE=<path>: its symbol trace
+        string? obuPath = Environment.GetEnvironmentVariable("AOM_SMOKE_OBU");
+        if (obuPath != null)
+        {
+            string? bsTracePath = Environment.GetEnvironmentVariable("AOM_SMOKE_BSTRACE");
+            using var bsTrace = bsTracePath != null ? new StreamWriter(bsTracePath) : null;
+            File.WriteAllBytes(obuPath, AomBitstream.PackFrame(cpi, trace: bsTrace));
+        }
+        // AOM_SMOKE_RECON=<path>: the reconstruction as 8-bit 4:2:0 planes (compare with a decoder's output)
+        string? reconPath = Environment.GetEnvironmentVariable("AOM_SMOKE_RECON");
+        if (reconPath != null)
+        {
+            using var fs = File.Create(reconPath);
+            for (int p = 0; p < cm.NumPlanes; p++)
+            {
+                int pw = p == 0 ? w : cw, ph = p == 0 ? h : ch;
+                for (int r = 0; r < ph; r++) fs.Write(rec.Buffers[p], rec.Offsets[p] + r * rec.Strides[p], pw);
+            }
+        }
         await Assert.That(psnr).IsGreaterThan(20.0);
     }
 
