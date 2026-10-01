@@ -14,6 +14,9 @@ internal sealed class AomSequenceConfig
     /// <summary>0 studio, 1 full (AV1E_SET_COLOR_RANGE AOM_CR_FULL_RANGE).</summary>
     public int ColorRange = 1;
     public int ChromaSamplePosition;
+    /// <summary>Film grain parameters to signal (avifenc --film-grain / a grain table: libaom codes the frame unchanged
+    /// and adds film_grain_params); null = none.</summary>
+    public Av1FilmGrainData? FilmGrain;
 }
 
 // Port of libaom 3.14.1 av1/encoder/bitstream.c (av1_pack_bitstream and what it reaches) and encodetxb.c's coefficient
@@ -211,7 +214,7 @@ internal static class AomBitstream
         wb.WriteBit(f.EnableCdef ? 1 : 0);
         wb.WriteBit(f.EnableRestoration ? 1 : 0);
         WriteColorConfig(f, wb);
-        wb.WriteBit(0);                                    // film_grain_params_present
+        wb.WriteBit(f.SeqCfg.FilmGrain != null ? 1 : 0);   // film_grain_params_present
         AddTrailingBits(wb);
         return wb.ToArray();
     }
@@ -320,6 +323,41 @@ internal static class AomBitstream
         }
         if (!f.CodedLossless) wb.WriteBit(f.TxMode == TX_MODE_SELECT ? 1 : 0);
         wb.WriteBit(f.ReducedTxSetUsed);
+        if (f.SeqCfg.FilmGrain is { } fg) WriteFilmGrainParams(fg, cm.Monochrome, !cm.Monochrome && cm.SsX == 1 && cm.SsY == 1, wb);
+    }
+
+    /// <summary>write_film_grain_params for a shown key frame: apply_grain, grain_seed (update_grain implied), the
+    /// parameter set; chroma point counts absent for mono, chroma-from-luma and 4:2:0 without luma points.</summary>
+    private static unsafe void WriteFilmGrainParams(Av1FilmGrainData fg, bool mono, bool is420, AomWriteBitBuffer wb)
+    {
+        wb.WriteBit(1);                                    // apply_grain
+        wb.WriteLiteral((int)(fg.Seed & 0xFFFF), 16);
+        wb.WriteLiteral(fg.NumYPoints, 4);
+        for (int i = 0; i < fg.NumYPoints; i++) { wb.WriteLiteral(fg.YPoints[i * 2], 8); wb.WriteLiteral(fg.YPoints[i * 2 + 1], 8); }
+        if (!mono) wb.WriteBit(fg.ChromaScalingFromLuma != 0 ? 1 : 0);
+        if (!mono && fg.ChromaScalingFromLuma == 0 && !(fg.NumYPoints == 0 && is420))
+        {
+            wb.WriteLiteral(fg.NumUvPoints0, 4);
+            for (int i = 0; i < fg.NumUvPoints0; i++) { wb.WriteLiteral(fg.UvPoints[i * 2], 8); wb.WriteLiteral(fg.UvPoints[i * 2 + 1], 8); }
+            wb.WriteLiteral(fg.NumUvPoints1, 4);
+            for (int i = 0; i < fg.NumUvPoints1; i++) { wb.WriteLiteral(fg.UvPoints[20 + i * 2], 8); wb.WriteLiteral(fg.UvPoints[21 + i * 2], 8); }
+        }
+        wb.WriteLiteral(fg.ScalingShift - 8, 2);
+        wb.WriteLiteral(fg.ArCoeffLag, 2);
+        int numPosLuma = 2 * fg.ArCoeffLag * (fg.ArCoeffLag + 1);
+        int numPosChroma = numPosLuma + (fg.NumYPoints > 0 ? 1 : 0);
+        if (fg.NumYPoints > 0)
+            for (int i = 0; i < numPosLuma; i++) wb.WriteLiteral(fg.ArCoeffsY[i] + 128, 8);
+        if (fg.NumUvPoints0 > 0 || fg.ChromaScalingFromLuma != 0)
+            for (int i = 0; i < numPosChroma; i++) wb.WriteLiteral(fg.ArCoeffsUv[i] + 128, 8);
+        if (fg.NumUvPoints1 > 0 || fg.ChromaScalingFromLuma != 0)
+            for (int i = 0; i < numPosChroma; i++) wb.WriteLiteral(fg.ArCoeffsUv[28 + i] + 128, 8);
+        wb.WriteLiteral((int)(fg.ArCoeffShift - 6), 2);
+        wb.WriteLiteral(fg.GrainScaleShift, 2);
+        if (fg.NumUvPoints0 > 0) { wb.WriteLiteral(fg.UvMult0 + 128, 8); wb.WriteLiteral(fg.UvLumaMult0 + 128, 8); wb.WriteLiteral(fg.UvOffset0 + 256, 9); }
+        if (fg.NumUvPoints1 > 0) { wb.WriteLiteral(fg.UvMult1 + 128, 8); wb.WriteLiteral(fg.UvLumaMult1 + 128, 8); wb.WriteLiteral(fg.UvOffset1 + 256, 9); }
+        wb.WriteBit(fg.OverlapFlag != 0 ? 1 : 0);
+        wb.WriteBit(fg.ClipToRestrictedRange != 0 ? 1 : 0);
     }
 
     /// <summary>write_delta_q (frame header).</summary>

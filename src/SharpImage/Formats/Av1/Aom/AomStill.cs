@@ -70,7 +70,7 @@ internal static class AomStill
         var seqCfg = new AomSequenceConfig
         {
             ColorPrimaries = c.Primaries, TransferCharacteristics = c.Transfer, MatrixCoefficients = c.Matrix,
-            ColorRange = c.FullRange ? 1 : 0, ChromaSamplePosition = layout == Av1PixelLayout.I420 ? Av1ObuWriter.ChromaSamplePosition : 0,
+            ColorRange = c.FullRange ? 1 : 0, FilmGrain = Av1ObuWriter.ActiveFilmGrain, ChromaSamplePosition = layout == Av1PixelLayout.I420 ? Av1ObuWriter.ChromaSamplePosition : 0,
         };
         return SplitPacket(AomBitstream.PackFrame(cpi, seqCfg));
     }
