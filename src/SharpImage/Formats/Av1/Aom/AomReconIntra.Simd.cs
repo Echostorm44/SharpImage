@@ -12,6 +12,7 @@ namespace SharpImage.Formats.Av1;
 // max_base - 1, plus 16).
 internal static unsafe partial class AomReconIntra
 {
+    private static readonly Vector256<int> Lane8 = Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7);
     private static readonly Vector128<byte> Iota16 = Vector128.Create((byte)0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 
     /// <summary>count samples dst[c] = interpolate(src[c], src[c + 1], shift) for c &lt; n, fill after.</summary>
@@ -22,7 +23,6 @@ internal static unsafe partial class AomReconIntra
         var w1 = Vector256.Create((short)shift);
         var r16 = Vector256.Create((short)16);
         var fillV = Vector128.Create(fill);
-        byte* tail = stackalloc byte[16];
         for (int c = 0; c < count; c += 16)
         {
             Vector128<byte> res;
@@ -39,11 +39,7 @@ internal static unsafe partial class AomReconIntra
             if (rem >= 16) Sse2.Store(dst + c, res);
             else if (rem == 8) *(ulong*)(dst + c) = res.AsUInt64().ToScalar();
             else if (rem == 4) *(uint*)(dst + c) = res.AsUInt32().ToScalar();
-            else
-            {
-                Sse2.Store(tail, res);
-                Buffer.MemoryCopy(tail, dst + c, rem, rem);
-            }
+            else Unsafe.CopyBlockUnaligned(dst + c, &res, (uint)rem);
         }
     }
 
@@ -102,12 +98,23 @@ internal static unsafe partial class AomReconIntra
             int baseOff = t >> 6;
             // base_x = c + baseOff >= min_base_x (-1) from column c0 on
             int c0 = Math.Max(0, -1 - baseOff);
-            for (int c = 0; c < Math.Min(c0, bw); ++c)
+            int nl = Math.Min(c0, bw);
+            for (int c = 0; c < nl; c += 8)
             {
-                int yy = (r << 6) - (c + 1) * dy;
-                int baseY = yy >> 6;
-                int shift = (yy & 0x3F) >> 1;
-                dst[c] = (byte)((left[baseY] * (32 - shift) + left[baseY + 1] * shift + 16) >> 5);
+                // columns c .. c + 7: y = (r << 6) - (c + 1) * dy, two left samples gathered per lane (lanes past the
+                // prefix, whose base would run below the edge, clamped to it and not stored)
+                var yy = Vector256.Create(r << 6) - (Vector256.Create(c + 1) + Lane8) * Vector256.Create(dy);
+                var baseY = Vector256.Max(Vector256.ShiftRightArithmetic(yy, 6), Vector256.Create(-1));
+                var shift = Vector256.ShiftRightLogical(yy & Vector256.Create(0x3F), 1);
+                var g = Avx2.GatherVector256((int*)left, baseY, 1);
+                var l0 = g & Vector256.Create(0xFF);
+                var l1 = Vector256.ShiftRightLogical(g, 8) & Vector256.Create(0xFF);
+                var v = Vector256.ShiftRightLogical(l0 * (Vector256.Create(32) - shift) + l1 * shift + Vector256.Create(16), 5);
+                var w16 = Sse2.PackSignedSaturate(v.GetLower(), v.GetUpper());
+                var b8 = Sse2.PackUnsignedSaturate(w16, w16);
+                int cnt = Math.Min(8, nl - c);
+                if (cnt == 8) *(ulong*)(dst + c) = b8.AsUInt64().ToScalar();
+                else Unsafe.CopyBlockUnaligned(dst + c, &b8, (uint)cnt);
             }
             if (c0 < bw) DrRun(dst + c0, above + baseOff + c0, bw - c0, bw - c0, (t & 0x3F) >> 1, 0);
         }
