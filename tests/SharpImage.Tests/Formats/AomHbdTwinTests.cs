@@ -42,6 +42,7 @@ public sealed partial class AomHbdTwinTests
             int upAbove, int upLeft, int dx, int dy, int bd);
         [DllImport(D)] public static extern void twin_filter_edge(ushort* p, int sz, int strength);
         [DllImport(D)] public static extern void twin_upsample_edge(ushort* p, int sz, int bd);
+        [DllImport(D)] public static extern void twin_lbd_txfm(int kind, short* diff, int stride, int* coeff);
     }
 
     private static int RandomTxType(Random rng, int tx)
@@ -307,6 +308,27 @@ public sealed partial class AomHbdTwinTests
                 eo = (ushort[])ea.Clone();
                 fixed (ushort* pa = ea) fixed (ushort* po = eo) { Native.twin_upsample_edge(pa + 64, usz, bd); AomReconIntra.HighbdUpsampleIntraEdge(po + 64, usz, bd); }
                 if (!ea.AsSpan().SequenceEqual(eo)) throw new Exception($"upsample sz {usz} bd {bd}");
+            }
+        return Task.CompletedTask;
+    }
+
+    [Test]
+    public unsafe Task NonrdLbdTxfmOnHbdResiduals_MatchLibaom()
+    {
+        if (!Available) return Task.CompletedTask;
+        var rng = new Random(16);
+        foreach (int bd in new[] { 10, 12 })
+            for (int it = 0; it < 3000; it++)
+            {
+                int kind = it % 3, n = kind == 0 ? 4 : kind == 1 ? 8 : 16;
+                var diff = Residual(rng, 16, 16, bd, (it / 3) % 4);
+                var a = new int[256];
+                var o = new int[256];
+                fixed (short* pd = diff) fixed (int* pa = a) Native.twin_lbd_txfm(kind, pd, 16, pa);
+                if (kind == 0) AomHbd.Fdct4x4Sse2(diff, 16, o);
+                else if (kind == 1) AomHadamard.H8x8(diff, 16, o);
+                else AomHbd.Hadamard16x16Lbd(diff, 16, o);
+                if (!a.AsSpan(0, n * n).SequenceEqual(o.AsSpan(0, n * n))) throw new Exception($"kind {kind} bd {bd} it {it}");
             }
         return Task.CompletedTask;
     }

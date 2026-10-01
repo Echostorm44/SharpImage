@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace SharpImage.Formats.Av1;
 
@@ -168,6 +170,88 @@ internal static class AomHbd
             case AomTables.TX_32X32: Hadamard32x32(srcDiff, srcStride, coeff); break;
             default: throw new ArgumentOutOfRangeException(nameof(txSize));
         }
+    }
+
+    /// <summary>aom_fdct4x4_sse2 (the lowbd kernel libaom's nonrd block_yrd runs on high bit depth residuals): 16-bit lanes
+    /// that wrap (the &lt;&lt; 4 pre-scale, the butterfly adds) and saturate (packs), as the SSE2 code does.</summary>
+    internal static void Fdct4x4Sse2(ReadOnlySpan<short> input, int stride, Span<int> output)
+    {
+        const short c16 = 11585, c8 = 15137, c24 = 6270;
+        var kA = Vector128.Create(c16, c16, c16, c16, c16, (short)-c16, c16, (short)-c16);
+        var kB = Vector128.Create(c16, (short)-c16, c16, (short)-c16, c16, c16, c16, c16);
+        var kC = Vector128.Create(c8, c24, c8, c24, c24, (short)-c8, c24, (short)-c8);
+        var kD = Vector128.Create(c24, (short)-c8, c24, (short)-c8, c8, c24, c8, c24);
+        var kE = Vector128.Create(c16);
+        var kF = Vector128.Create(c16, (short)-c16, c16, (short)-c16, c16, (short)-c16, c16, (short)-c16);
+        var kG = Vector128.Create(c8, c24, c8, c24, (short)-c8, (short)-c24, (short)-c8, (short)-c24);
+        var kH = Vector128.Create(c24, (short)-c8, c24, (short)-c8, (short)-c24, c8, (short)-c24, c8);
+        var rnd = Vector128.Create(1 << 13);
+        var rnd2 = Vector128.Create((1 << 13) + ((1 << 13) << 1));
+        var biasA = Vector128.Create((short)0, 1, 1, 1, 1, 1, 1, 1);
+        var biasB = Vector128.Create((short)1, 0, 0, 0, 0, 0, 0, 0);
+        var in0 = Vector128.Create(input[0], input[1], input[2], input[3], input[3 * stride], input[3 * stride + 1], input[3 * stride + 2], input[3 * stride + 3]);
+        var in1 = Vector128.Create(input[stride], input[stride + 1], input[stride + 2], input[stride + 3], input[2 * stride], input[2 * stride + 1], input[2 * stride + 2], input[2 * stride + 3]);
+        in0 = Sse2.ShiftLeftLogical(in0, 4);
+        in1 = Sse2.ShiftLeftLogical(in1, 4);
+        var mask = Sse2.CompareEqual(in0, biasA);
+        in0 = Sse2.Add(in0, mask);
+        in0 = Sse2.Add(in0, biasB);
+        {
+            var r0 = Sse2.UnpackLow(in0, in1);
+            var r1 = Sse2.UnpackHigh(in0, in1);
+            var r2 = Sse2.Shuffle(r0.AsInt32(), 0xB4).AsInt16();
+            var r3 = Sse2.Shuffle(r1.AsInt32(), 0xB4).AsInt16();
+            var t0 = Sse2.Add(r2, r3);
+            var t1 = Sse2.Subtract(r2, r3);
+            var w0 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(t0, kA), rnd), 14);
+            var w1 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(t1, kC), rnd), 14);
+            var w2 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(t0, kB), rnd), 14);
+            var w3 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(t1, kD), rnd), 14);
+            var x0 = Sse2.PackSignedSaturate(w0, w1);
+            var x1 = Sse2.PackSignedSaturate(w2, w3);
+            in0 = Sse2.Shuffle(x0.AsInt32(), 0xD8).AsInt16();
+            in1 = Sse2.Shuffle(x1.AsInt32(), 0x8D).AsInt16();
+        }
+        {
+            var t0 = Sse2.Add(in0, in1);
+            var t1 = Sse2.Subtract(in0, in1);
+            var w0 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(t0, kE), rnd2), 16);
+            var w1 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(t0, kF), rnd2), 16);
+            var w2 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(t1, kG), rnd2), 16);
+            var w3 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(t1, kH), rnd2), 16);
+            in0 = Sse2.PackSignedSaturate(w0, w2);
+            in1 = Sse2.PackSignedSaturate(w1, w3);
+        }
+        for (int i = 0; i < 8; i++) { output[i] = in0.GetElement(i); output[8 + i] = in1.GetElement(i); }
+    }
+
+    /// <summary>aom_hadamard_16x16_avx2 with its int16 lanes wrapping in the last stage (the 8-bit port's H16x16 sums in
+    /// 32 bits, identical for 8-bit residuals): what libaom's nonrd block_yrd gets from high bit depth residuals.</summary>
+    internal static void Hadamard16x16Lbd(ReadOnlySpan<short> srcDiff, int srcStride, Span<int> coeff)
+    {
+        for (int idx = 0; idx < 4; ++idx)
+            AomHadamard.H8x8(srcDiff.Slice((idx >> 1) * 8 * srcStride + (idx & 1) * 8), srcStride, coeff.Slice(idx * 64));
+        for (int idx = 0; idx < 64; ++idx)
+        {
+            short a0 = (short)coeff[idx], a1 = (short)coeff[idx + 64], a2 = (short)coeff[idx + 128], a3 = (short)coeff[idx + 192];
+            short b0 = (short)((short)(a0 + a1) >> 1), b1 = (short)((short)(a0 - a1) >> 1);
+            short b2 = (short)((short)(a2 + a3) >> 1), b3 = (short)((short)(a2 - a3) >> 1);
+            coeff[idx] = (short)(b0 + b2);
+            coeff[idx + 64] = (short)(b1 + b3);
+            coeff[idx + 128] = (short)(b0 - b2);
+            coeff[idx + 192] = (short)(b1 - b3);
+        }
+        for (int i = 0; i < 16; i++)
+            for (int j = 0; j < 4; j++) (coeff[i * 16 + 4 + j], coeff[i * 16 + 8 + j]) = (coeff[i * 16 + 8 + j], coeff[i * 16 + 4 + j]);
+    }
+
+    /// <summary>aom_highbd_sad (any size): the exact sum of absolute differences.</summary>
+    internal static uint Sad(ushort[] a, int aOff, int aStride, ushort[] b, int bOff, int bStride, int w, int h)
+    {
+        uint sad = 0;
+        for (int r = 0; r < h; r++)
+            for (int c = 0; c < w; c++) sad += (uint)Math.Abs(a[aOff + r * aStride + c] - b[bOff + r * bStride + c]);
+        return sad;
     }
 
     /// <summary>clip_pixel_highbd.</summary>

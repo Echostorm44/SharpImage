@@ -12,6 +12,8 @@ internal sealed class AomYv12Plane
     /// <summary>High bit depth samples (Buf is null then).</summary>
     public readonly ushort[] Buf16 = null!;
     public readonly int Stride, Origin, Border;
+    /// <summary>The frame's bit depth (8 for byte planes).</summary>
+    public int BitDepth = 8;
     public readonly int Width, Height, CropWidth, CropHeight;
 
     public AomYv12Plane(int width, int height, int cropWidth, int cropHeight, int border, bool hbd = false)
@@ -81,9 +83,9 @@ internal sealed class AomYv12
         // aom_realloc_frame_buffer: aligned_width = (width + 7) & ~7, uv_width = aligned_width >> ss_x
         int aw = (width + 7) & ~7, ah = (height + 7) & ~7;
         Planes = new AomYv12Plane[numPlanes];
-        Planes[0] = new AomYv12Plane(aw, ah, width, height, border, bitDepth > 8);
+        Planes[0] = new AomYv12Plane(aw, ah, width, height, border, bitDepth > 8) { BitDepth = bitDepth };
         for (int p = 1; p < numPlanes; p++)
-            Planes[p] = new AomYv12Plane(aw >> ssX, ah >> ssY, (width + ssX) >> ssX, (height + ssY) >> ssY, border, bitDepth > 8);
+            Planes[p] = new AomYv12Plane(aw >> ssX, ah >> ssY, (width + ssX) >> ssX, (height + ssY) >> ssY, border, bitDepth > 8) { BitDepth = bitDepth };
     }
 
     public AomYv12 CloneGeometry() => new(Width, Height, SsX, SsY, NumPlanes, Planes[0].Border, BitDepth);
