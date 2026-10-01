@@ -419,7 +419,7 @@ internal static partial class Av1StillImageEncoder
     private static int Bd => t_bd == 0 ? 8 : t_bd;
     // Worker threads for the encode running on this thread (AvifEncodeOptions.MaxThreads; 0 = every core).
     [ThreadStatic] internal static int t_threads;
-    private static int ThreadCount => t_threads > 0 ? t_threads : Environment.ProcessorCount;
+    internal static int ThreadCount => t_threads > 0 ? t_threads : Environment.ProcessorCount;
 
     // Evaluates independent candidates (trial decodes) on worker threads that inherit this encode's bit depth and
     // speed settings; results come back in candidate order, so the choice never depends on the thread count.
