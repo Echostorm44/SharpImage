@@ -199,4 +199,52 @@ public sealed class AomSearchPerfTwinTests
         Console.WriteLine($"cnn partition predict: ours {best:F1} us aom {bestA:F1} us");
         await Assert.That(buf.SequenceEqual(theirs)).IsTrue();
     }
+
+    /// <summary>The vector QM quantizers against the scalar ports of quantize_fp_helper_c / aom_quantize_b_helper_c: every
+    /// tx size, QM level, plane and 2D type, random and boundary coefficients, both log scales.</summary>
+    [Test]
+    public async Task QmQuantizers_Vector_MatchScalar()
+    {
+        var rng = new Random(31);
+        var quants = new AomQuants(8, 0, 0, 0, 0, 0, 0);
+        int cases = 0, bad = 0;
+        for (int txSize = 0; txSize < 19; txSize++)
+        {
+            int n = AomEncodeMb.MaxEob(txSize);
+            for (int level = 0; level < 15; level += 2)
+                for (int plane = 0; plane < 3; plane++)
+                    foreach (int txType in new[] { 0, 1, 2, 3 })
+                    {
+                        if (Math.Max(TxSizeWide[txSize], TxSizeHigh[txSize]) > 16 && txType != 0) continue;
+                        var qm = AomQm.Qmatrix(level, plane, txSize, txType); var iqm = AomQm.Iqmatrix(level, plane, txSize, txType);
+                        if (qm == null || iqm == null) continue;
+                        var scan = AomEncodeMb.ScanOf(txSize, txType); var iscan = AomEncodeMb.IScanOf(txSize, txType);
+                        int logScale = AomQuantize.TxScale(txSize);
+                        for (int trial = 0; trial < 6; trial++)
+                        {
+                            int q = rng.Next(1, 256);
+                            int amp = trial % 3 == 0 ? 40 : trial % 3 == 1 ? 2000 : 1 << 18;
+                            var c = new int[n];
+                            for (int i = 0; i < n; i++) c[i] = rng.Next(4) == 0 ? 0 : rng.Next(-amp, amp + 1);
+                            var a1 = new int[n]; var a2 = new int[n]; var b1 = new int[n]; var b2 = new int[n];
+                            int e1 = AomQm.QuantizeFpHelper(c, n, scan, quants.RoundFp[0, q, 0], quants.RoundFp[0, q, 1], quants.QuantFp[0, q, 0], quants.QuantFp[0, q, 1],
+                                quants.Dequant[0, q, 0], quants.Dequant[0, q, 1], qm, iqm, logScale, a1, b1);
+                            int e2 = AomQm.QuantizeFpHelperAvx2(c, n, iscan, quants.RoundFp[0, q, 0], quants.RoundFp[0, q, 1], quants.QuantFp[0, q, 0], quants.QuantFp[0, q, 1],
+                                quants.Dequant[0, q, 0], quants.Dequant[0, q, 1], qm, iqm, logScale, a2, b2);
+                            cases++;
+                            if (e1 != e2 || !a1.AsSpan().SequenceEqual(a2) || !b1.AsSpan().SequenceEqual(b2)) bad++;
+                            int f1 = AomQm.QuantizeBHelper(c, n, scan, quants.Zbin[0, q, 0], quants.Zbin[0, q, 1], quants.Round[0, q, 0], quants.Round[0, q, 1],
+                                quants.Quant[0, q, 0], quants.Quant[0, q, 1], quants.QuantShift[0, q, 0], quants.QuantShift[0, q, 1], quants.Dequant[0, q, 0], quants.Dequant[0, q, 1],
+                                qm, iqm, logScale, a1, b1);
+                            int f2 = AomQm.QuantizeBHelperAvx2(c, n, iscan, quants.Zbin[0, q, 0], quants.Zbin[0, q, 1], quants.Round[0, q, 0], quants.Round[0, q, 1],
+                                quants.Quant[0, q, 0], quants.Quant[0, q, 1], quants.QuantShift[0, q, 0], quants.QuantShift[0, q, 1], quants.Dequant[0, q, 0], quants.Dequant[0, q, 1],
+                                qm, iqm, logScale, a2, b2);
+                            cases++;
+                            if (f1 != f2 || !a1.AsSpan().SequenceEqual(a2) || !b1.AsSpan().SequenceEqual(b2)) bad++;
+                        }
+                    }
+        }
+        Console.WriteLine($"qm quantizers: {cases} cases, {bad} mismatches");
+        await Assert.That(bad).IsEqualTo(0);
+    }
 }

@@ -440,7 +440,14 @@ internal static partial class AomEncodeMb
         else if (qp.XformQuantIdx != AomXformQuant.SkipQuant)
         {
             short[] iscan = IScanOf(txSize, txType);
-            int eob = qp.Qmatrix != null && qp.Iqmatrix != null ? qp.XformQuantIdx switch
+            int eob = qp.Qmatrix != null && qp.Iqmatrix != null ? AomQm.QmSimdSupported ? qp.XformQuantIdx switch
+            {
+                AomXformQuant.Fp => AomQm.QuantizeFpHelperAvx2(coeff, n, iscan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
+                    p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                AomXformQuant.B => AomQm.QuantizeBHelperAvx2(coeff, n, iscan, p.Zbin0, p.Zbin1, p.Round0, p.Round1, p.Quant0, p.Quant1,
+                    p.QuantShift0, p.QuantShift1, p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                _ => throw new NotSupportedException("AV1_XFORM_QUANT_DC is not used on the all-intra path"),
+            } : qp.XformQuantIdx switch
             {
                 AomXformQuant.Fp => AomQm.QuantizeFpHelper(coeff, n, scan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
                     p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
