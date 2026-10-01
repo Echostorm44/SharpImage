@@ -310,12 +310,22 @@ internal static unsafe partial class AomReconIntra
         int bw = TxSizeWide[txSize];
         int bh = TxSizeHigh[txSize];
 
+        bool simd = System.Runtime.Intrinsics.X86.Avx2.IsSupported;
         if (angle > 0 && angle < 90)
-            DrPredictionZ1(dst, stride, bw, bh, above, left, upsampleAbove, dx, dy);
+        {
+            if (simd && upsampleAbove == 0) DrPredictionZ1Simd(dst, stride, bw, bh, above, dx);
+            else DrPredictionZ1(dst, stride, bw, bh, above, left, upsampleAbove, dx, dy);
+        }
         else if (angle > 90 && angle < 180)
-            DrPredictionZ2(dst, stride, bw, bh, above, left, upsampleAbove, upsampleLeft, dx, dy);
+        {
+            if (simd && upsampleAbove == 0 && upsampleLeft == 0) DrPredictionZ2Simd(dst, stride, bw, bh, above, left, dx, dy);
+            else DrPredictionZ2(dst, stride, bw, bh, above, left, upsampleAbove, upsampleLeft, dx, dy);
+        }
         else if (angle > 180 && angle < 270)
-            DrPredictionZ3(dst, stride, bw, bh, above, left, upsampleLeft, dx, dy);
+        {
+            if (simd && upsampleLeft == 0) DrPredictionZ3Simd(dst, stride, bw, bh, left, dy);
+            else DrPredictionZ3(dst, stride, bw, bh, above, left, upsampleLeft, dx, dy);
+        }
         else if (angle == 90)
             AomIntraPred.Pred(V_PRED, txSize, dst, stride, above, left);
         else if (angle == 180)
