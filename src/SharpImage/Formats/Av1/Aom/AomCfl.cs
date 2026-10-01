@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -219,6 +220,24 @@ internal static unsafe class AomCfl
     public static void CflPredictLbd(short* acBufQ3, byte* dst, int dstStride, int alphaQ3, int width, int height)
     {
         int dc = dst[0];
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && width >= 8)
+        {
+            // libaom's kernel: mulhrs(|ac|, |alpha| << 9) = (|alpha * ac| + 32) >> 6, the sign of alpha * ac put back,
+            // dc added, packed with unsigned saturation (the clip)
+            var aq12 = System.Runtime.Intrinsics.Vector128.Create((short)(Math.Abs(alphaQ3) << 9));
+            var dcV = System.Runtime.Intrinsics.Vector128.Create((short)dc);
+            var negAlpha = System.Runtime.Intrinsics.Vector128.Create((short)(alphaQ3 < 0 ? -1 : 1));
+            for (int j = 0; j < height; j++, dst += dstStride, acBufQ3 += CFL_BUF_LINE)
+                for (int i = 0; i < width; i += 8)
+                {
+                    var ac = System.Runtime.Intrinsics.X86.Sse2.LoadVector128(acBufQ3 + i);
+                    var s = System.Runtime.Intrinsics.X86.Ssse3.MultiplyHighRoundScale(System.Runtime.Intrinsics.X86.Ssse3.Abs(ac).AsInt16(), aq12);
+                    s = System.Runtime.Intrinsics.X86.Ssse3.Sign(System.Runtime.Intrinsics.X86.Ssse3.Sign(s, ac), negAlpha);
+                    var b = System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(System.Runtime.Intrinsics.X86.Sse2.Add(s, dcV), dcV);
+                    *(ulong*)(dst + i) = System.Runtime.Intrinsics.Vector128.AsUInt64(b).ToScalar();
+                }
+            return;
+        }
         for (int j = 0; j < height; j++)
         {
             for (int i = 0; i < width; i++)

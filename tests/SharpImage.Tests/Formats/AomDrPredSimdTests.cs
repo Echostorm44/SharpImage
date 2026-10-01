@@ -40,6 +40,37 @@ public sealed class AomDrPredSimdTests
         return mismatches;
     }
 
+    [Test]
+    public async Task VectorCflPredictMatchesReference() => await Assert.That(RunCfl()).IsEqualTo(0);
+
+    // cfl_predict_lbd_c's clip(dc + ROUND_POWER_OF_TWO_SIGNED(alpha_q3 * ac, 6)) over all alphas and widths
+    private static unsafe int RunCfl()
+    {
+        var rng = new Random(13);
+        int mismatches = 0;
+        short* ac = stackalloc short[32 * 32];
+        byte* a = stackalloc byte[32 * 40], b = stackalloc byte[32 * 40];
+        foreach (int w in new[] { 4, 8, 16, 32 })
+            foreach (int h in new[] { 4, 8, 16, 32 })
+                for (int alpha = -16; alpha <= 16; alpha++)
+                {
+                    for (int i = 0; i < 32 * 32; i++) ac[i] = (short)rng.Next(-2040, 2041);
+                    byte dc = (byte)rng.Next(256);
+                    for (int i = 0; i < 32 * 40; i++) a[i] = b[i] = dc;
+                    for (int j = 0; j < h; j++)
+                        for (int i = 0; i < w; i++)
+                        {
+                            int sl = alpha * ac[j * 32 + i];
+                            sl = sl < 0 ? -((-sl + 32) >> 6) : (sl + 32) >> 6;
+                            a[j * 40 + i] = (byte)Math.Clamp(sl + dc, 0, 255);
+                        }
+                    AomCfl.CflPredictLbd(ac, b, 40, alpha, w, h);
+                    if (!new Span<byte>(a, 32 * 40).SequenceEqual(new Span<byte>(b, 32 * 40)) && mismatches++ < 10)
+                        Console.WriteLine($"cfl {w}x{h} alpha {alpha} differs");
+                }
+        return mismatches;
+    }
+
     private static unsafe int Run()
     {
         var rng = new Random(5);

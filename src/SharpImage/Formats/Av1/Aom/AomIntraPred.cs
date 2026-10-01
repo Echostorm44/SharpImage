@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -104,6 +106,26 @@ internal static unsafe class AomIntraPred
     public static void PaethPredictor(byte* dst, nint stride, int bw, int bh, byte* above, byte* left)
     {
         int ytopLeft = above[-1];
+        if (Avx2.IsSupported && bw >= 8)
+        {
+            // per lane: base = top + left - topleft; |base - left| = |top - topleft|, |base - top| = |left - topleft|
+            var tl = Vector128.Create((short)ytopLeft);
+            for (int r = 0; r < bh; r++, dst += stride)
+            {
+                var l = Vector128.Create((short)left[r]);
+                for (int c = 0; c < bw; c += 8)
+                {
+                    var top = Sse41.ConvertToVector128Int16(Vector128.CreateScalar(*(ulong*)(above + c)).AsByte());
+                    var pLeft = Vector128.Abs(top - tl);
+                    var pTop = Vector128.Abs(l - tl);
+                    var pTopLeft = Vector128.Abs(top + l - tl - tl);
+                    var useLeft = Vector128.LessThanOrEqual(pLeft, pTop) & Vector128.LessThanOrEqual(pLeft, pTopLeft);
+                    var v = Vector128.ConditionalSelect(useLeft, l, Vector128.ConditionalSelect(Vector128.LessThanOrEqual(pTop, pTopLeft), top, tl));
+                    *(ulong*)(dst + c) = Sse2.PackUnsignedSaturate(v, v).AsUInt64().ToScalar();
+                }
+            }
+            return;
+        }
         for (int r = 0; r < bh; r++, dst += stride)
         {
             int l = left[r];
@@ -120,6 +142,31 @@ internal static unsafe class AomIntraPred
         // scale = 2 * 2^SMOOTH_WEIGHT_LOG2_SCALE
         const int log2Scale = 1 + SMOOTH_WEIGHT_LOG2_SCALE;
         const int scale = 1 << SMOOTH_WEIGHT_LOG2_SCALE;
+        if (Avx2.IsSupported && bw >= 8)
+        {
+            fixed (byte* ws = SmoothWeights)
+            {
+                byte* wW = ws + bw - 4;
+                var rnd = Vector256.Create(1 << (log2Scale - 1));
+                var sc = Vector256.Create(scale);
+                var right = Vector256.Create(rightPred);
+                for (int r = 0; r < bh; ++r, dst += stride)
+                {
+                    int wh = smWeightsH[r];
+                    var whV = Vector256.Create(wh);
+                    var rowPart = Vector256.Create((scale - wh) * belowPred + 0);
+                    var l = Vector256.Create((int)left[r]);
+                    for (int c = 0; c < bw; c += 8)
+                    {
+                        var a = Avx2.ConvertToVector256Int32(above + c);
+                        var ww = Avx2.ConvertToVector256Int32(wW + c);
+                        var v = Vector256.ShiftRightLogical(whV * a + rowPart + ww * l + (sc - ww) * right + rnd, log2Scale);
+                        StoreInt8(dst + c, v);
+                    }
+                }
+            }
+            return;
+        }
         for (int r = 0; r < bh; ++r, dst += stride)
         {
             int wh = smWeightsH[r], l = left[r];
@@ -139,6 +186,19 @@ internal static unsafe class AomIntraPred
         ReadOnlySpan<byte> smWeights = SmoothWeights.Slice(bh - 4, bh);
         const int log2Scale = SMOOTH_WEIGHT_LOG2_SCALE;
         const int scale = 1 << SMOOTH_WEIGHT_LOG2_SCALE;
+        if (Avx2.IsSupported && bw >= 8)
+        {
+            var rnd = Vector256.Create(1 << (log2Scale - 1));
+            for (int r = 0; r < bh; r++, dst += stride)
+            {
+                int w = smWeights[r];
+                var wV = Vector256.Create(w);
+                var b = Vector256.Create((scale - w) * belowPred) + rnd;
+                for (int c = 0; c < bw; c += 8)
+                    StoreInt8(dst + c, Vector256.ShiftRightLogical(wV * Avx2.ConvertToVector256Int32(above + c) + b, log2Scale));
+            }
+            return;
+        }
         for (int r = 0; r < bh; r++, dst += stride)
         {
             int w = smWeights[r];
@@ -157,6 +217,26 @@ internal static unsafe class AomIntraPred
         ReadOnlySpan<byte> smWeights = SmoothWeights.Slice(bw - 4, bw);
         const int log2Scale = SMOOTH_WEIGHT_LOG2_SCALE;
         const int scale = 1 << SMOOTH_WEIGHT_LOG2_SCALE;
+        if (Avx2.IsSupported && bw >= 8)
+        {
+            fixed (byte* ws = SmoothWeights)
+            {
+                byte* wW = ws + bw - 4;
+                var rnd = Vector256.Create(1 << (log2Scale - 1));
+                var sc = Vector256.Create(scale);
+                var right = Vector256.Create(rightPred);
+                for (int r = 0; r < bh; r++, dst += stride)
+                {
+                    var l = Vector256.Create((int)left[r]);
+                    for (int c = 0; c < bw; c += 8)
+                    {
+                        var ww = Avx2.ConvertToVector256Int32(wW + c);
+                        StoreInt8(dst + c, Vector256.ShiftRightLogical(ww * l + (sc - ww) * right + rnd, log2Scale));
+                    }
+                }
+            }
+            return;
+        }
         for (int r = 0; r < bh; r++, dst += stride)
         {
             int l = left[r];
@@ -167,6 +247,14 @@ internal static unsafe class AomIntraPred
                 dst[c] = (byte)((thisPred + (1u << (log2Scale - 1))) >> log2Scale);
             }
         }
+    }
+
+    // 8 int lanes holding 0 .. 255 stored as 8 bytes
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StoreInt8(byte* dst, Vector256<int> v)
+    {
+        var w = Sse2.PackSignedSaturate(v.GetLower(), v.GetUpper());
+        *(ulong*)dst = Sse2.PackUnsignedSaturate(w, w).AsUInt64().ToScalar();
     }
 
     public static void Dc128Predictor(byte* dst, nint stride, int bw, int bh) => Fill(dst, stride, bw, bh, 128);
