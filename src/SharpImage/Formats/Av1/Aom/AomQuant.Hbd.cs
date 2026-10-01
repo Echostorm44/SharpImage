@@ -13,6 +13,12 @@ internal static class AomQuantizeHbd
     /// ((|c| + round) * quant) &gt;&gt; (16 - log_scale), zeroed where dequant &gt; |c| &lt;&lt; (1 + log_scale), dequantised
     /// (level * dequant) &gt;&gt; log_scale; the DC parameters for coefficient 0 only. Returns the eob.</summary>
     internal static int QuantizeFp(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short round0, short round1,
+        short quant0, short quant1, short dequant0, short dequant1, int logScale, Span<int> qcoeff, Span<int> dqcoeff) =>
+        AomQuantizeHbdSimd.Supported && (nCoeffs & 7) == 0
+            ? AomQuantizeHbdSimd.QuantizeFp(coeff, nCoeffs, iscan, round0, round1, quant0, quant1, dequant0, dequant1, logScale, qcoeff, dqcoeff)
+            : QuantizeFpScalar(coeff, nCoeffs, iscan, round0, round1, quant0, quant1, dequant0, dequant1, logScale, qcoeff, dqcoeff);
+
+    internal static int QuantizeFpScalar(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short round0, short round1,
         short quant0, short quant1, short dequant0, short dequant1, int logScale, Span<int> qcoeff, Span<int> dqcoeff)
     {
         int r0 = round0, r1 = round1;
@@ -44,6 +50,13 @@ internal static class AomQuantizeHbd
     /// quantised when |c| &gt;= zbin: tmp = |c| + round, tmp2 = ((tmp * quant) &gt;&gt; 16) + tmp, level = (tmp2 * quant_shift)
     /// &gt;&gt; (16 - log_scale), dequantised (level * dequant) &gt;&gt; log_scale. Returns the eob.</summary>
     internal static int QuantizeB(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short zbin0, short zbin1, short round0, short round1,
+        short quant0, short quant1, short quantShift0, short quantShift1, short dequant0, short dequant1, int logScale,
+        Span<int> qcoeff, Span<int> dqcoeff) =>
+        AomQuantizeHbdSimd.Supported && (nCoeffs & 7) == 0
+            ? AomQuantizeHbdSimd.QuantizeB(coeff, nCoeffs, iscan, zbin0, zbin1, round0, round1, quant0, quant1, quantShift0, quantShift1, dequant0, dequant1, logScale, qcoeff, dqcoeff)
+            : QuantizeBScalar(coeff, nCoeffs, iscan, zbin0, zbin1, round0, round1, quant0, quant1, quantShift0, quantShift1, dequant0, dequant1, logScale, qcoeff, dqcoeff);
+
+    internal static int QuantizeBScalar(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short zbin0, short zbin1, short round0, short round1,
         short quant0, short quant1, short quantShift0, short quantShift1, short dequant0, short dequant1, int logScale,
         Span<int> qcoeff, Span<int> dqcoeff)
     {

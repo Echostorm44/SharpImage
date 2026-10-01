@@ -247,4 +247,44 @@ public sealed class AomSearchPerfTwinTests
         Console.WriteLine($"qm quantizers: {cases} cases, {bad} mismatches");
         await Assert.That(bad).IsEqualTo(0);
     }
+    [Test]
+    public async Task HbdQuantizers_Vector_MatchScalar()
+    {
+        var rng = new Random(37);
+        int cases = 0, bad = 0;
+        foreach (int bd in new[] { 10, 12 })
+        {
+            var quants = new AomQuants(bd, 0, 0, 0, 0, 0, 0);
+            for (int txSize = 0; txSize < 19; txSize++)
+            {
+                int n = AomEncodeMb.MaxEob(txSize);
+                var iscan = AomEncodeMb.IScanOf(txSize, 0);
+                int logScale = AomQuantize.TxScale(txSize);
+                for (int trial = 0; trial < 40; trial++)
+                {
+                    int q = rng.Next(0, 256);
+                    int amp = trial % 4 == 0 ? 40 : trial % 4 == 1 ? 2000 : trial % 4 == 2 ? 1 << 16 : 1 << (bd + 8);
+                    var c = new int[n];
+                    for (int i = 0; i < n; i++) c[i] = rng.Next(4) == 0 ? 0 : rng.Next(-amp, amp + 1);
+                    var a1 = new int[n]; var a2 = new int[n]; var b1 = new int[n]; var b2 = new int[n];
+                    int e1 = AomQuantizeHbd.QuantizeFpScalar(c, n, iscan, quants.RoundFp[0, q, 0], quants.RoundFp[0, q, 1], quants.QuantFp[0, q, 0], quants.QuantFp[0, q, 1],
+                        quants.Dequant[0, q, 0], quants.Dequant[0, q, 1], logScale, a1, b1);
+                    int e2 = AomQuantizeHbdSimd.QuantizeFp(c, n, iscan, quants.RoundFp[0, q, 0], quants.RoundFp[0, q, 1], quants.QuantFp[0, q, 0], quants.QuantFp[0, q, 1],
+                        quants.Dequant[0, q, 0], quants.Dequant[0, q, 1], logScale, a2, b2);
+                    cases++;
+                    if (e1 != e2 || !a1.AsSpan().SequenceEqual(a2) || !b1.AsSpan().SequenceEqual(b2)) bad++;
+                    int f1 = AomQuantizeHbd.QuantizeBScalar(c, n, iscan, quants.Zbin[0, q, 0], quants.Zbin[0, q, 1], quants.Round[0, q, 0], quants.Round[0, q, 1],
+                        quants.Quant[0, q, 0], quants.Quant[0, q, 1], quants.QuantShift[0, q, 0], quants.QuantShift[0, q, 1], quants.Dequant[0, q, 0], quants.Dequant[0, q, 1],
+                        logScale, a1, b1);
+                    int f2 = AomQuantizeHbdSimd.QuantizeB(c, n, iscan, quants.Zbin[0, q, 0], quants.Zbin[0, q, 1], quants.Round[0, q, 0], quants.Round[0, q, 1],
+                        quants.Quant[0, q, 0], quants.Quant[0, q, 1], quants.QuantShift[0, q, 0], quants.QuantShift[0, q, 1], quants.Dequant[0, q, 0], quants.Dequant[0, q, 1],
+                        logScale, a2, b2);
+                    cases++;
+                    if (f1 != f2 || !a1.AsSpan().SequenceEqual(a2) || !b1.AsSpan().SequenceEqual(b2)) bad++;
+                }
+            }
+        }
+        Console.WriteLine($"hbd quantizers: {cases} cases, {bad} mismatches");
+        await Assert.That(bad).IsEqualTo(0);
+    }
 }
