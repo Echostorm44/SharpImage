@@ -190,6 +190,26 @@ internal static class AomVarBasedPart
         return (sum + 8) >> 4;
     }
 
+    /// <summary>fill_variance_4x4avg on a high bit depth source (aom_highbd_avg_4x4; dst_avg stays 128).</summary>
+    private static void FillVariance4x4AvgHbd(ushort[] src, int srcOff, int srcStride, int x8Idx, int y8Idx, AomVarTree vt, int i8,
+        int pixelsWide, int pixelsHigh)
+    {
+        for (int idx = 0; idx < 4; idx++)
+        {
+            int x4Idx = x8Idx + BlkIdxX(idx, 2), y4Idx = y8Idx + BlkIdxY(idx, 2);
+            uint sse = 0;
+            int sum = 0;
+            if (x4Idx < pixelsWide && y4Idx < pixelsHigh)
+            {
+                int off = srcOff + y4Idx * srcStride + x4Idx, s = 0;
+                for (int i = 0; i < 4; i++, off += srcStride) s += src[off] + src[off + 1] + src[off + 2] + src[off + 3];
+                sum = ((s + 8) >> 4) - 128;
+                sse = (uint)(sum * sum);
+            }
+            FillVariance(sse, sum, 0, ref vt.Leaf4[i8 * 4 + idx]);
+        }
+    }
+
     /// <summary>fill_variance_4x4avg (key frames: the 4x4 source means against 128).</summary>
     private static void FillVariance4x4Avg(byte[] src, int srcOff, int srcStride, int x8Idx, int y8Idx, AomVarTree vt, int i8,
         int pixelsWide, int pixelsHigh)
@@ -213,7 +233,8 @@ internal static class AomVarBasedPart
     private static void SetVbpThresholdsKeyFrame(AomComp cpi, Span<long> thresholds, int qindex)
     {
         var cm = cpi.Cm;
-        int acQ = Av1Tables.DequantTable[0, Math.Clamp(qindex, 0, 255), 1];   // av1_ac_quant_QTX (8-bit)
+        int bdIdx = cm.BitDepth == 8 ? 0 : cm.BitDepth == 10 ? 1 : 2;
+        int acQ = Av1Tables.DequantTable[bdIdx, Math.Clamp(qindex, 0, 255), 1];   // av1_ac_quant_QTX
         long thresholdBase = 120L * acQ;
         int thresholdLeftShift = cpi.Sf.rt_sf.var_part_split_threshold_shift;
         int numPixels = cm.Width * cm.Height;
@@ -301,7 +322,10 @@ internal static class AomVarBasedPart
                     for (int lvl3Idx = 0; lvl3Idx < 4; lvl3Idx++)
                     {
                         int x8Idx = x16Idx + BlkIdxX(lvl3Idx, 3), y8Idx = y16Idx + BlkIdxY(lvl3Idx, 3);
-                        FillVariance4x4Avg(srcBuf, srcOff, srcStride, x8Idx, y8Idx, vt, i16 * 4 + lvl3Idx, pixelsWide, pixelsHigh);
+                        if (src.Buf16 != null)
+                            FillVariance4x4AvgHbd(src.Buf16, srcOff, srcStride, x8Idx, y8Idx, vt, i16 * 4 + lvl3Idx, pixelsWide, pixelsHigh);
+                        else
+                            FillVariance4x4Avg(srcBuf, srcOff, srcStride, x8Idx, y8Idx, vt, i16 * 4 + lvl3Idx, pixelsWide, pixelsHigh);
                     }
                 }
             }

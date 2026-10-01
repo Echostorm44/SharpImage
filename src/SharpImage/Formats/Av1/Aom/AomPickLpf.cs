@@ -210,7 +210,7 @@ internal static class AomPickLpf
                     zeroFilterSse[plane] = AomSse.SsePlane(sd.Planes[plane], cur.Planes[plane]);
 
             var p0 = cur.Planes[0];
-            var backupY = new AomYv12Plane(p0.Width, p0.Height, p0.CropWidth, p0.CropHeight, p0.Border);
+            var backupY = new AomYv12Plane(p0.Width, p0.Height, p0.CropWidth, p0.CropHeight, p0.Border, p0.Buf16 != null);
             lf.FilterLevel[0] = lf.FilterLevel[1] = SearchFilterLevel(sd, cur, backupY, mi, lf, filter, cfg, partial,
                 lastFrameFilterLevel, 0, 2, out bestFilterSse[0]);
             if (method != LPF_PICK_FROM_FULL_IMAGE_NON_DUAL)
@@ -223,7 +223,7 @@ internal static class AomPickLpf
             if (numPlanes > 1)
             {
                 var p1 = cur.Planes[1];
-                var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border);
+                var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border, p1.Buf16 != null);
                 lf.FilterLevelU = SearchFilterLevel(sd, cur, backupUv, mi, lf, filter, cfg, partial,
                     lastFrameFilterLevel, 1, 0, out bestFilterSse[1]);
                 lf.FilterLevelV = SearchFilterLevel(sd, cur, backupUv, mi, lf, filter, cfg, partial,
