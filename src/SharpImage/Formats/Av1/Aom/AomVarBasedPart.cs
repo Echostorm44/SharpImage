@@ -266,7 +266,9 @@ internal static class AomVarBasedPart
         bool isSmallSb = cm.SbSize == BLOCK_64X64;
         int num64x64Blocks = isSmallSb ? 1 : 4;
 
-        SetVbpThresholdsKeyFrame(cpi, thresholds, cm.BaseQindex);
+        // the superblock qindex (delta q: base + x->delta_qindex)
+        int sbQindex = Math.Clamp(cpi.DeltaQPresentFlag ? cm.BaseQindex + x.DeltaQindex : cm.BaseQindex, 0, 255);
+        SetVbpThresholdsKeyFrame(cpi, thresholds, sbQindex);
 
         var src = x.Plane[0].Src;
         byte[] srcBuf = src.Buf;

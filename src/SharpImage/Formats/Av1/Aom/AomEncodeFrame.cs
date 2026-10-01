@@ -321,7 +321,7 @@ internal static partial class AomEncodeFrame
     internal static void SetupBlockRdmult(AomComp cpi, AomMacroblock x, int miRow, int miCol, int bsize)
     {
         x.Rdmult = cpi.RdRdmult;
-        if (cpi.DeltaQPresentFlag) x.Rdmult = cpi.SetRdmultDeltaQ(x);
+        if (cpi.DeltaQPresentFlag && cpi.Sf.rt_sf.use_nonrd_pick_mode == 0) x.Rdmult = cpi.SetRdmultDeltaQ(x);
         if (cpi.TuneIq) SetSsimRdmult(cpi, x, bsize, miRow, miCol);
         if (cpi.AllIntra) x.Rdmult = (int)(((long)x.Rdmult * x.IntraSbRdmultModifier) >> 7);
         x.Rdmult = x.Rdmult > 0 ? x.Rdmult : 1;
@@ -660,7 +660,7 @@ internal static partial class AomEncodeFrame
             }
             // delta quant: the superblock's first coded block moves the running base qindex
             bool superBlockUpperLeft = (miRow & (cm.MibSize - 1)) == 0 && (miCol & (cm.MibSize - 1)) == 0;
-            if (cpi.DeltaQPresentFlag && (bsize != cm.SbSize || mbmi.SkipTxfm == 0) && superBlockUpperLeft)
+            if (!nonrd && cpi.DeltaQPresentFlag && (bsize != cm.SbSize || mbmi.SkipTxfm == 0) && superBlockUpperLeft)   // (encode_b only; encode_b_nonrd does not)
                 xd.CurrentBaseQindex = mbmi.CurrentQindex;
             if (cpi.AllowUpdateCdf) UpdateStats(cpi, x);
         }
