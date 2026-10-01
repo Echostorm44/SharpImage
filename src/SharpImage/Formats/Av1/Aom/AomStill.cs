@@ -17,24 +17,28 @@ internal static class AomStill
     /// <summary>The avifenc speed (cpu-used) of the current AVIF all-intra encode, + 1 (0: no such encode is active, so
     /// the port is not used).</summary>
     [ThreadStatic] private static int t_speedPlus1;
+    /// <summary>The colour image is coded with libaom's tune=iq (libavif's default for non-identity colour); alpha items
+    /// (no colour description) keep tune=psnr, as libavif sets for alpha.</summary>
+    [ThreadStatic] private static bool t_tuneIq;
 
     internal static int Speed => t_speedPlus1 - 1;
 
     /// <summary>Activates the port for an all-intra encode at this avifenc speed (clamped to libaom's 0-9 as libavif does);
     /// a negative speed deactivates it. Returns the previous state for <see cref="Exit"/>.</summary>
-    internal static int Enter(int speed)
+    internal static (int, bool) Enter(int speed, bool tuneIq = false)
     {
-        int prev = t_speedPlus1;
+        var prev = (t_speedPlus1, t_tuneIq);
         t_speedPlus1 = speed < 0 ? 0 : Math.Clamp(speed, 0, 9) + 1;
+        t_tuneIq = tuneIq;
         return prev;
     }
 
-    internal static void Exit(int prev) => t_speedPlus1 = prev;
+    internal static void Exit((int SpeedPlus1, bool TuneIq) prev) => (t_speedPlus1, t_tuneIq) = prev;
 
     /// <summary>Whether a frame with these parameters goes through the port.</summary>
     internal static bool Handles(int bitDepth, Av1PixelLayout layout, int width, int height)
         => Enabled && bitDepth == 8 && layout is Av1PixelLayout.I420 or Av1PixelLayout.I444 or Av1PixelLayout.I400
-           && t_speedPlus1 >= 1 && Av1ObuWriter.PlainStill && width <= 4096 && width * height <= 4096 * 2304;
+           && t_speedPlus1 >= 1 && (!t_tuneIq || t_speedPlus1 <= 7) && Av1ObuWriter.PlainStill && width <= 4096 && width * height <= 4096 * 2304;
 
     /// <summary>Encodes one frame. Planes hold samples 0..255 (ushort, the earlier encoder's plane type); chroma planes
     /// are ((w + ssX) &gt;&gt; ssX) x ((h + ssY) &gt;&gt; ssY); u / v are ignored for 4:0:0. qIdx 0 codes losslessly.</summary>
@@ -49,6 +53,7 @@ internal static class AomStill
         {
             Width = width, Height = height, SsX = ssX, SsY = ssY, Monochrome = mono, Planes = planes,
             Strides = mono ? new[] { width } : new[] { width, cw, cw }, BaseQindex = qIdx, Speed = Speed,
+            TuneIq = t_tuneIq && color != null,
         };
         var (cpi, x) = AomEncoder.EncodeFrame(input);
         AomEncoder.RunPostFilter(cpi, x, applyRestoration: false);
