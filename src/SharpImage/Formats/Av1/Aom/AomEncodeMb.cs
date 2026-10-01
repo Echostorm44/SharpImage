@@ -216,6 +216,21 @@ internal static partial class AomEncodeMb
             }
             return;
         }
+        if (cols == 4 && Sse41.IsSupported && rows > 0 && diffOff >= 0 && srcOff >= 0 && predOff >= 0
+            && diffOff + (long)(rows - 1) * diffStride + 4 <= diff.Length && srcOff + (long)(rows - 1) * srcStride + 4 <= src.Length
+            && predOff + (long)(rows - 1) * predStride + 4 <= pred.Length)
+        {
+            ref byte sr = ref MemoryMarshal.GetArrayDataReference(src);
+            ref byte pr = ref MemoryMarshal.GetArrayDataReference(pred);
+            ref short dr = ref MemoryMarshal.GetArrayDataReference(diff);
+            for (int r = 0; r < rows; r++)
+            {
+                var a = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref sr, srcOff + r * srcStride))).AsByte());
+                var b = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pr, predOff + r * predStride))).AsByte());
+                Unsafe.WriteUnaligned(ref Unsafe.As<short, byte>(ref Unsafe.Add(ref dr, diffOff + r * diffStride)), (a - b).AsUInt64().ToScalar());
+            }
+            return;
+        }
         for (int r = 0; r < rows; r++)
         {
             int d = diffOff + r * diffStride, s = srcOff + r * srcStride, p = predOff + r * predStride;

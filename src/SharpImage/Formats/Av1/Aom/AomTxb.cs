@@ -1013,12 +1013,18 @@ internal static class AomTxb
     internal static byte TxbEntropyContext(ReadOnlySpan<int> qcoeff, ReadOnlySpan<ushort> scan, int eob)
     {
         if (eob == 0) return 0;
+        if ((uint)eob > (uint)scan.Length) throw new ArgumentOutOfRangeException(nameof(eob));
+        // min(sum |level|, 7) without the per-coefficient zero test (data-random): each term clamped to 8 keeps the
+        // minimum and the sum small; the early exit as soon as it passes 7
         int culLevel = 0;
+        ref int q0 = ref MemoryMarshal.GetReference(qcoeff);
+        ref ushort s0 = ref MemoryMarshal.GetReference(scan);
+        int n = qcoeff.Length;
         for (int c = 0; c < eob; c++)
         {
-            int v = qcoeff[scan[c]];
-            if (v == 0) continue;
-            culLevel += AbsI(v);
+            int pos = Unsafe.Add(ref s0, c);
+            if ((uint)pos >= (uint)n) throw new ArgumentOutOfRangeException(nameof(scan));
+            culLevel += Math.Min(AbsI(Unsafe.Add(ref q0, pos)), 8);
             if (culLevel > CoeffContextMask) break;
         }
         culLevel = Math.Min(CoeffContextMask, culLevel);
