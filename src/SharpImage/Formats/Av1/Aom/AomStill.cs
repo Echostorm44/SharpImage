@@ -53,6 +53,8 @@ internal static class AomStill
         {
             Width = width, Height = height, SsX = ssX, SsY = ssY, Monochrome = mono, Planes = planes,
             Strides = mono ? new[] { width } : new[] { width, cw, cw }, BaseQindex = qIdx, Speed = Speed,
+            // libavif: maxThreads > 1 -> cfg.g_threads = min(maxThreads, 64) (row-MT, libaom's default)
+            Threads = Math.Min(Av1StillImageEncoder.ThreadCount, 64),
             Tune = color != null ? t_tune : AomTune.Psnr,
         };
         var (cpi, x) = AomEncoder.EncodeFrame(input);

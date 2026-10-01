@@ -45,7 +45,18 @@ internal static class AomPostFilter
         var filter = new AomLoopFilter();
         AomPickLpf.PickFilterLevel(src, cur, mi, lf, lpfCfg, filter);
         if (lf.FilterLevel[0] != 0 || lf.FilterLevel[1] != 0)
-            filter.FilterFrame(cur, mi, lf, 0, cur.NumPlanes, false, lpfCfg.FrameLpfOptLevel);
+        {
+            if (lpfCfg.Parallel && cur.NumPlanes > 1)
+            {
+                // the planes filter independently (luma beside chroma, as the MT loop filter's planes; U and V stay
+                // together for the joint-chroma opt level)
+                var chroma = System.Threading.Tasks.Task.Run(() =>
+                    new AomLoopFilter().FilterFrame(cur, mi, lf, 1, cur.NumPlanes, false, lpfCfg.FrameLpfOptLevel));
+                filter.FilterFrame(cur, mi, lf, 0, 1, false, lpfCfg.FrameLpfOptLevel);
+                chroma.Wait();
+            }
+            else filter.FilterFrame(cur, mi, lf, 0, cur.NumPlanes, false, lpfCfg.FrameLpfOptLevel);
+        }
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         LastLpfTicks = t1 - t0;
         LastRstTicks = LastCdefTicks = 0;

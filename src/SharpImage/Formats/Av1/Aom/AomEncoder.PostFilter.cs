@@ -59,6 +59,7 @@ internal static partial class AomEncoder
             SkipLoopFilterUsingFiltError = sf.lpf_sf.skip_loop_filter_using_filt_error, Sharpness = cpi.Sharpness,
             SharpnessFromConfig = cpi.AllIntra || cpi.TuneIq, EnableAdaptiveSharpness = cpi.EnableAdaptiveSharpness, BaseQindex = cm.BaseQindex, KeyFrame = true, IntraOnly = true,
             TxModeOnly4x4 = x.E.Lossless[0] != 0,
+            Parallel = cpi.NumWorkers > 1,
         };
         // is_inter_tx_size_search_level_one / get_lpf_opt_level
         bool txLevelOne = sf.tx_sf.inter_tx_size_search_init_depth_rect >= 1 && sf.tx_sf.inter_tx_size_search_init_depth_sqr >= 1;

@@ -24,7 +24,7 @@ internal static partial class AomPalette
         byte[] colorMap = xd.Plane[plane].ColorIndexMap;
         int n = plane != 0 ? mbmi.Palette.PaletteSize1 : mbmi.Palette.PaletteSize0;
         AomRdoptUtils.GetBlockDimensions(bsize, plane, xd, out int planeBlockWidth, out _, out int rows, out int cols);
-        var tokens = cpi.PaletteTokens;
+        var tokens = x.PaletteTokens;
         // The first color index.
         tokens.Add(new AomPaletteToken(colorMap[0], -1));
         int paletteSizeIdx = n - PALETTE_MIN_SIZE;

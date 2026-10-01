@@ -57,6 +57,9 @@ internal sealed class AomLpfPickConfig
     public int SearchLpfOptLevel;
     /// <summary>The final deblocking's get_lpf_opt_level(&amp;sf): 0, 1 (dual/quad), 2 (LPF_PICK_FROM_Q: joint chroma).</summary>
     public int FrameLpfOptLevel;
+    /// <summary>Multi-threaded encode (mt_info num_workers &gt; 1): the chroma level searches run beside the luma ones
+    /// (the planes filter independently, so the levels are the single-threaded ones, as libaom's MT loop filter's are).</summary>
+    public bool Parallel;
 }
 
 /// <summary>Port of libaom av1/encoder/picklpf.c (single-threaded semantics; the row-MT loop filter gives the same
@@ -207,6 +210,27 @@ internal static class AomPickLpf
                 for (int plane = 0; plane < numPlanes; plane++)
                     zeroFilterSse[plane] = AomSse.SsePlane(sd.Planes[plane], cur.Planes[plane]);
 
+            // chroma: U then V, independent of the luma levels (each search filters its own plane only)
+            System.Threading.Tasks.Task? chromaTask = null;
+            AomLoopFilterParams? lfChroma = null;
+            long[]? chromaSse = null;
+            if (numPlanes > 1 && cfg.Parallel)
+            {
+                lfChroma = lf.Clone();
+                chromaSse = new long[3];
+                int[] lastLevels = lastFrameFilterLevel.ToArray();
+                chromaTask = System.Threading.Tasks.Task.Run(() =>
+                {
+                    Span<int> last = lastLevels;
+                    var lfc = lfChroma;
+                    var p1 = cur.Planes[1];
+                    var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border);
+                    var filterC = new AomLoopFilter();
+                    lfc.FilterLevelU = SearchFilterLevel(sd, cur, backupUv, mi, lfc, filterC, cfg, partial, last, 1, 0, out chromaSse[1]);
+                    lfc.FilterLevelV = SearchFilterLevel(sd, cur, backupUv, mi, lfc, filterC, cfg, partial, last, 2, 0, out chromaSse[2]);
+                });
+            }
+
             var p0 = cur.Planes[0];
             var backupY = new AomYv12Plane(p0.Width, p0.Height, p0.CropWidth, p0.CropHeight, p0.Border);
             lf.FilterLevel[0] = lf.FilterLevel[1] = SearchFilterLevel(sd, cur, backupY, mi, lf, filter, cfg, partial,
@@ -218,7 +242,15 @@ internal static class AomPickLpf
                 lf.FilterLevel[1] = SearchFilterLevel(sd, cur, backupY, mi, lf, filter, cfg, partial,
                     lastFrameFilterLevel, 0, 1, out bestFilterSse[0]);
             }
-            if (numPlanes > 1)
+            if (chromaTask != null)
+            {
+                chromaTask.Wait();
+                lf.FilterLevelU = lfChroma!.FilterLevelU;
+                lf.FilterLevelV = lfChroma.FilterLevelV;
+                bestFilterSse[1] = chromaSse![1];
+                bestFilterSse[2] = chromaSse[2];
+            }
+            else if (numPlanes > 1)
             {
                 var p1 = cur.Planes[1];
                 var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border);

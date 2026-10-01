@@ -34,12 +34,6 @@ internal sealed class AomVarTree
     }
 }
 
-internal sealed partial class AomComp
-{
-    // td->vt64x64 (the variance tree storage, reused by every superblock)
-    public readonly AomVarTree VarTree = new();
-}
-
 // Port of libaom 3.14.1 av1/encoder/var_based_part.c for intra-only frames (the all-intra speeds 7-9 run
 // VAR_BASED_PARTITION): av1_choose_var_based_partitioning with its key-frame paths (4x4 source averages against 128,
 // the key-frame thresholds, the forced splits, set_vt_partitioning's intra rules, the 16x16 sub-block variance prune),
@@ -259,7 +253,7 @@ internal static class AomVarBasedPart
     {
         var cm = cpi.Cm;
         var xd = x.E;
-        var vt = cpi.VarTree;
+        var vt = x.VarTree;
         Span<int> forceSplit = stackalloc int[85];
         Span<int> maxVar32x32 = stackalloc int[4], minVar32x32 = stackalloc int[4];
         Span<long> thresholds = stackalloc long[5];

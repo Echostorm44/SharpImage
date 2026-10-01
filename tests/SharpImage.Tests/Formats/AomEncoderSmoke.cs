@@ -33,6 +33,8 @@ public sealed class AomEncoderSmoke
             EnableIntrabc = Environment.GetEnvironmentVariable("AOM_SMOKE_NOIBC") != "1",
             BaseQindex = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_Q") ?? "112"),
             Speed = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_SPEED") ?? "6"),
+            // AOM_SMOKE_THREADS=N: cfg.g_threads (row-MT from 2)
+            Threads = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_THREADS") ?? "1"),
             // AOM_SMOKE_TUNE=iq / ssim (AOM_TUNE_IQ / AOM_TUNE_SSIM), AOM_SMOKE_IQOFF=<letters> (tune-iq sub-features switched back off, as AOMORACLE_IQOFF)
             Tune = Environment.GetEnvironmentVariable("AOM_SMOKE_TUNE") switch { "iq" => AomTune.Iq, "ssim" => AomTune.Ssim, _ => AomTune.Psnr },
             IqOff = Environment.GetEnvironmentVariable("AOM_SMOKE_IQOFF"),
@@ -51,6 +53,7 @@ public sealed class AomEncoderSmoke
         var sw = new System.Diagnostics.Stopwatch();
         long searchMs = 0, postMs = 0;
         double lpfMs = 0, rstMs = 0, cdefMs = 0;
+        double totalMs = 0;
         for (int rep = 0; rep < reps; rep++)
         {
             sw.Restart();
@@ -66,8 +69,18 @@ public sealed class AomEncoderSmoke
             cdefMs = rep == 0 ? cc : Math.Min(cdefMs, cc);
             lpfMs = rep == 0 ? l : Math.Min(lpfMs, l);
             rstMs = rep == 0 ? rr : Math.Min(rstMs, rr);
+            if (reps > 1)
+            {
+                // the whole aom_codec_encode equivalent: encode + post filter + pack
+                var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                var (c2, x2) = AomEncoder.EncodeFrame(input);
+                AomEncoder.RunPostFilter(c2, x2);
+                AomBitstream.PackFrame(c2, new AomSequenceConfig());
+                double ms = System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                totalMs = rep == 0 ? ms : Math.Min(totalMs, ms);
+            }
         }
-        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, cdef {cdefMs:F1} ms, restoration {rstMs:F1} ms)");
+        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, cdef {cdefMs:F1} ms, restoration {rstMs:F1} ms), total {totalMs:F1} ms");
         // AOM_SMOKE_PFREPS=n: n more post-filter runs (profiling)
         int pfReps = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_PFREPS") ?? "0");
         for (int rep = 0; rep < pfReps; rep++) AomEncoder.RunPostFilter(cpi, x);

@@ -146,7 +146,7 @@ internal static class AomQuantSetup
         AomEncodeFrame.SetOffsets(cpi, x, miRow, miCol, sbSize);
         xd.Mi0.CurrentQindex = currentQindex;
         InitPlaneQuantizers(cpi, x, false);
-        cpi.DeltaqUsed |= x.DeltaQindex != 0;
+        if (x.DeltaQindex != 0) cpi.DeltaqUsed = true;   // (td->deltaq_used, OR-ed over the threads)
     }
 
     /// <summary>setup_delta_q_nonrd (DELTA_Q_VARIANCE_BOOST).</summary>
