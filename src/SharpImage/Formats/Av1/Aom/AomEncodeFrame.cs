@@ -920,8 +920,6 @@ internal static partial class AomEncodeFrame
         }
     }
 
-    [ThreadStatic] private static byte[]? t_levels;
-    [ThreadStatic] private static sbyte[]? t_coeffContexts;
 
     /// <summary>av1_update_and_record_txb_context (and av1_record_txb_context without CDF updates).</summary>
     private static void UpdateAndRecordTxbContext(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize,
@@ -965,14 +963,14 @@ internal static partial class AomEncodeFrame
             tcoeffOff = cbOffset + blockOffset;
             Array.Copy(p.Qcoeff, blockOffset, tcoeffArr, tcoeffOff, segEob);
 
-            var levels = t_levels ??= new byte[AomTxb.TxPad2d];
+            var levels = x.ScratchLevels;
             AomTxb.InitLevels(tcoeffArr.AsSpan(tcoeffOff, segEob), width, height, levels);
             UpdateTxTypeCount(cpi, x, blkRow, blkCol, plane, txSize, allowUpdateCdf);
 
             int txClass = AomTxb.TxTypeToClass[txType];
             UpdateEobContext(eob, txSize, txClass, planeType, ec, allowUpdateCdf);
 
-            var coeffContexts = t_coeffContexts ??= new sbyte[64 * 64];
+            var coeffContexts = x.ScratchCoeffContexts;
             // av1_get_nz_map_contexts
             for (int i = 0; i < eob; ++i)
             {

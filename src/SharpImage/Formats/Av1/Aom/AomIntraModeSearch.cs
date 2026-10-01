@@ -132,7 +132,6 @@ internal static class AomIntraModeSearch
         return totalRate;
     }
 
-    [ThreadStatic] private static int[]? t_coeffScratch;
 
     /// <summary>intra_model_rd: a quick prediction and SATD estimate of the plane without the tx pipeline.</summary>
     internal static long IntraModelRd(AomComp cpi, AomMacroblock x, int plane, int planeBsize, int txSize, bool useHadamard)
@@ -146,7 +145,7 @@ internal static class AomIntraModeSearch
         var p = x.Plane[plane];
         var pd = xd.Plane[plane];
         int diffStride = BlockSizeWide[planeBsize];
-        var coeff = t_coeffScratch ??= new int[64 * 64];
+        var coeff = x.ScratchCoeff;
         for (int row = 0; row < maxBlocksHigh; row += stepr)
             for (int col = 0; col < maxBlocksWide; col += stepc)
             {
@@ -445,7 +444,6 @@ internal static class AomIntraModeSearch
         return false;
     }
 
-    [ThreadStatic] private static AomMbModeInfo? t_bestMbmi;
 
     /// <summary>av1_rd_pick_intra_sby_mode: the best non-intrabc luma mode of an intra-frame block.</summary>
     internal static long RdPickIntraSbyMode(AomComp cpi, AomMacroblock x, ref int rate, ref int rateTokenonly, ref long distortion,
@@ -488,7 +486,7 @@ internal static class AomIntraModeSearch
 
         AomRdoptUtils.SetModeEvalParams(cpi, x, MODE_EVAL);
 
-        var bestMbmi = t_bestMbmi ??= new AomMbModeInfo();
+        var bestMbmi = x.ScratchBestMbmi ??= new AomMbModeInfo();
         bestMbmi.CopyFrom(mbmi);
         int maxWinnerModeCount = AomRdoptUtils.WinnerModeCountAllowed[sf.winner_mode_sf.multi_winner_mode_type];
         AomRdoptUtils.ZeroWinnerModeStats(bsize, maxWinnerModeCount, x.WinnerModeStats);
@@ -818,15 +816,14 @@ internal static class AomIntraModeSearch
         }
     }
 
-    [ThreadStatic] private static AomRdStats[]? t_cflU, t_cflV;
 
     /// <summary>cfl_rd_pick_alpha.</summary>
     private static bool CflRdPickAlpha(AomMacroblock x, AomComp cpi, int txSize, long refBestRd, int cflSearchRange, ref AomRdStats bestRdStats,
         ref byte bestCflAlphaIdx, ref sbyte bestCflAlphaSigns)
     {
         var mc = x.ModeCosts;
-        var cflRdArrU = t_cflU ??= new AomRdStats[CFL_MAGS_SIZE];
-        var cflRdArrV = t_cflV ??= new AomRdStats[CFL_MAGS_SIZE];
+        var cflRdArrU = x.ScratchCflU ??= new AomRdStats[CFL_MAGS_SIZE];
+        var cflRdArrV = x.ScratchCflV ??= new AomRdStats[CFL_MAGS_SIZE];
         var xd = x.E;
         bestRdStats.Invalidate();
 
@@ -918,7 +915,6 @@ internal static class AomIntraModeSearch
         return true;
     }
 
-    [ThreadStatic] private static AomMbModeInfo? t_bestUvMbmi;
 
     /// <summary>av1_rd_pick_intra_sbuv_mode.</summary>
     internal static long RdPickIntraSbuvMode(AomComp cpi, AomMacroblock x, ref int rate, ref int rateTokenonly, ref long distortion,
@@ -926,7 +922,7 @@ internal static class AomIntraModeSearch
     {
         var xd = x.E;
         var mbmi = xd.Mi0;
-        var bestMbmi = t_bestUvMbmi ??= new AomMbModeInfo();
+        var bestMbmi = x.ScratchBestUvMbmi ??= new AomMbModeInfo();
         bestMbmi.CopyFrom(mbmi);
         long bestRd = long.MaxValue;
         var mc = x.ModeCosts;
@@ -1038,7 +1034,6 @@ internal static class AomIntraModeSearch
 
     // ---- encodemb.c: av1_encode_intra_block_plane ----
 
-    [ThreadStatic] private static byte[]? t_ta, t_tl;
 
     /// <summary>av1_encode_intra_block_plane: predict, transform, quantise (and trellis), reconstruct every tx block.</summary>
     internal static void EncodeIntraBlockPlane(AomComp cpi, AomMacroblock x, int bsize, int plane, int dryRun, int enableOptimizeB)
@@ -1046,8 +1041,8 @@ internal static class AomIntraModeSearch
         var xd = x.E;
         if (plane != 0 && !xd.IsChromaRef) return;
         var pd = xd.Plane[plane];
-        var ta = t_ta ??= new byte[32];
-        var tl = t_tl ??= new byte[32];
+        var ta = x.ScratchTa;
+        var tl = x.ScratchTl;
         Array.Clear(ta); Array.Clear(tl);
         int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, pd.SubsamplingX, pd.SubsamplingY);
         if (enableOptimizeB != 0) AomTxSearch.GetEntropyContexts(planeBsize, pd, ta, tl);

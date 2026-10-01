@@ -735,6 +735,44 @@ internal static partial class AomEncodeMb
     internal static long Sse(byte[] a, int aOff, int aStride, byte[] b, int bOff, int bStride, int width, int height)
     {
         long sse = 0;
+        if (Avx2.IsSupported && width > 0 && height > 0 && height <= 64 && (width == 4 || width == 8 || width == 16) && aOff >= 0 && bOff >= 0
+            && aOff + (long)(height - 1) * aStride + width <= a.Length && bOff + (long)(height - 1) * bStride + width <= b.Length)
+        {
+            // the tx widths up to 16 (at most 64 rows: 64 x 16 x 255^2 fits the int32 lanes): one accumulator, one reduction
+            ref byte pa = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(a), aOff);
+            ref byte pb = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(b), bOff);
+            var acc = Vector256<int>.Zero;
+            if (width == 16)
+                for (int y = 0; y < height; y++)
+                {
+                    var d = Avx2.Subtract(Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref pa, (nuint)(y * aStride))),
+                        Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref pb, (nuint)(y * bStride))));
+                    acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(d, d));
+                }
+            else if (width == 8)
+                for (int y = 0; y < height; y += 2)
+                {
+                    // two rows of 8 per 256-bit register (height is even for the 8-wide tx sizes; an odd last row alone)
+                    ulong r0a = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pa, y * aStride)), r0b = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pb, y * bStride));
+                    ulong r1a = y + 1 < height ? Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pa, (y + 1) * aStride)) : 0;
+                    ulong r1b = y + 1 < height ? Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pb, (y + 1) * bStride)) : 0;
+                    var d = Avx2.Subtract(Avx2.ConvertToVector256Int16(Vector128.Create(r0a, r1a).AsByte()), Avx2.ConvertToVector256Int16(Vector128.Create(r0b, r1b).AsByte()));
+                    acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(d, d));
+                }
+            else
+                for (int y = 0; y < height; y += 4)
+                {
+                    // four rows of 4
+                    int n = Math.Min(4, height - y);
+                    uint a0 = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pa, y * aStride)), b0 = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pb, y * bStride));
+                    uint a1 = n > 1 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pa, (y + 1) * aStride)) : 0, b1 = n > 1 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pb, (y + 1) * bStride)) : 0;
+                    uint a2 = n > 2 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pa, (y + 2) * aStride)) : 0, b2 = n > 2 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pb, (y + 2) * bStride)) : 0;
+                    uint a3 = n > 3 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pa, (y + 3) * aStride)) : 0, b3 = n > 3 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pb, (y + 3) * bStride)) : 0;
+                    var d = Avx2.Subtract(Avx2.ConvertToVector256Int16(Vector128.Create(a0, a1, a2, a3).AsByte()), Avx2.ConvertToVector256Int16(Vector128.Create(b0, b1, b2, b3).AsByte()));
+                    acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(d, d));
+                }
+            return (long)(uint)Vector256.Sum(acc.AsUInt32());
+        }
         if (Avx2.IsSupported && width > 0 && height > 0 && aOff >= 0 && bOff >= 0
             && aOff + (long)(height - 1) * aStride + width <= a.Length && bOff + (long)(height - 1) * bStride + width <= b.Length)
         {

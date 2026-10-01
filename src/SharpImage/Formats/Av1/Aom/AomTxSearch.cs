@@ -212,8 +212,6 @@ internal static partial class AomTxSearch
         return (long)sse;
     }
 
-    [ThreadStatic] private static byte[]? t_recon;
-    [ThreadStatic] private static ushort[]? t_recon16;
 
     /// <summary>pixel_dist / pixel_dist_visible_only (high bit depth): the variance kernel's SSE or aom_highbd_sse_odd_size,
     /// both rounded by 2 (bd - 8) bits.</summary>
@@ -242,14 +240,14 @@ internal static partial class AomTxSearch
         if (pd.Dst.Buf16 != null)
         {
             // high bit depth: recon16 (aom_highbd_convolve_copy), av1_highbd_inv_txfm_add, the rounded highbd SSE
-            var recon16 = t_recon16 ??= new ushort[MaxTxSize * MaxTxSize];
+            var recon16 = x.ScratchRecon16 ??= new ushort[MaxTxSize * MaxTxSize];
             AomHbd.CopyBlock(pd.Dst.Buf16, dstIdx, dstStride, recon16, 0, MaxTxSize, bsw, bsh);
             int txType16 = AomEncodeMb.GetTxType(xd, plane == 0 ? 0 : 1, blkRow, blkCol, txSize, cpi.ReducedTxSetUsed != 0);
             AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType16, txSize, recon16, 0, MaxTxSize, eob, xd.Bd,
                 xd.Lossless[xd.Mi0.SegmentId] != 0);
             return 16 * (long)PixelDist(x, plane, p.Src.Buf16, srcIdx, srcStride, recon16, 0, MaxTxSize, blkRow, blkCol, planeBsize, txBsize);
         }
-        var recon = t_recon ??= new byte[MaxTxSize * MaxTxSize];
+        var recon = x.ScratchRecon;
         AomEncodeMb.CopyBlock(pd.Dst.Buf, dstIdx, dstStride, recon, 0, MaxTxSize, bsw, bsh);
         int txType = AomEncodeMb.GetTxType(xd, plane == 0 ? 0 : 1, blkRow, blkCol, txSize, cpi.ReducedTxSetUsed != 0);
         AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, recon, 0, MaxTxSize, eob, xd.Lossless[xd.Mi0.SegmentId] != 0);
@@ -951,7 +949,6 @@ internal static partial class AomTxSearch
         if (args.CurrentRd > args.BestRd) args.ExitEarly = true;
     }
 
-    [ThreadStatic] private static AomRdcostBlockArgs? t_args;
 
     /// <summary>av1_txfm_rd_in_plane.</summary>
     internal static void TxfmRdInPlane(AomMacroblock x, AomComp cpi, ref AomRdStats rdStats, long refBestRd, long currentRd, int plane,
@@ -962,7 +959,7 @@ internal static partial class AomTxSearch
 
         var xd = x.E;
         var pd = xd.Plane[plane];
-        var args = t_args ??= new AomRdcostBlockArgs();
+        var args = x.ScratchRdArgs ??= new AomRdcostBlockArgs();
         // (re-entrancy: the chroma CfL search can nest a luma search; take a fresh args object when one is live)
         if (args.X != null) args = new AomRdcostBlockArgs();
         args.Reset();
