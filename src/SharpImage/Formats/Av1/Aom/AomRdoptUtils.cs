@@ -102,7 +102,7 @@ internal static class AomRdoptUtils
         var sf = cpi.Sf;
         var w = cpi.WinnerModeParams;
         var p = x.TxfmSearchParams;
-        p.UseQmDistMetric = 0;
+        p.UseQmDistMetric = cpi.QmPsnrDistMetric ? 1 : 0;   // dist_metric == AOM_DIST_METRIC_QM_PSNR
         switch (modeEvalType)
         {
             case DEFAULT_EVAL:
