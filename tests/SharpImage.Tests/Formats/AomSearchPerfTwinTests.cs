@@ -311,4 +311,45 @@ public sealed class AomSearchPerfTwinTests
         Console.WriteLine($"hbd compute stats: {cases} cases, {bad} mismatches");
         await Assert.That(bad).IsEqualTo(0);
     }
+    [Test]
+    public async Task HbdDsp_Vector_MatchScalar()
+    {
+        var rng = new Random(43);
+        int bad = 0, cases = 0;
+        for (int trial = 0; trial < 400; trial++)
+        {
+            int bd = trial % 2 == 0 ? 10 : 12, max = (1 << bd) - 1;
+            int w = 4 * rng.Next(1, 33), h = rng.Next(1, 65), stride = 136;
+            var a = new ushort[stride * 66]; var b = new ushort[stride * 66];
+            for (int k = 0; k < a.Length; k++) { a[k] = (ushort)(trial % 3 == 0 ? (rng.Next(2) * max) : rng.Next(max + 1)); b[k] = (ushort)(trial % 3 == 0 ? max - a[k] : rng.Next(max + 1)); }
+            int off = rng.Next(0, 4);
+            cases++;
+            if (AomHbd.Sse(a, off, stride, b, off + 1, stride, w, h) != AomHbd.SseScalar(a, off, stride, b, off + 1, stride, w, h)) bad++;
+            // subtract
+            var d1 = new short[64 * 64];
+            AomHbd.SubtractBlock(Math.Min(h, 64), Math.Min(w, 64), d1, 0, 64, a, off, stride, b, off, stride);
+            for (int r = 0; r < Math.Min(h, 64); r++)
+                for (int c = 0; c < Math.Min(w, 64); c++)
+                    if (d1[r * 64 + c] != (short)(a[off + r * stride + c] - b[off + r * stride + c])) { bad++; r = 99; break; }
+            // block error
+            int n = 16 << rng.Next(0, 7);
+            var co = new int[n]; var dq = new int[n];
+            for (int k = 0; k < n; k++) { co[k] = rng.Next(-(1 << 22), 1 << 22); dq[k] = co[k] + rng.Next(-(1 << 20), 1 << 20); }
+            long e = AomHbd.BlockError(co, dq, n, out long ssz, bd);
+            long re = 0, rs = 0;
+            for (int k = 0; k < n; k++) { long df = co[k] - dq[k]; re += df * df; rs += (long)co[k] * co[k]; }
+            int sh = 2 * (bd - 8), rnd = (1 << sh) >> 1;
+            cases++;
+            if (e != (re + rnd) >> sh || ssz != (rs + rnd) >> sh) bad++;
+            // hadamard 8x8: the same coefficients up to the order
+            var diff = new short[8 * 72];
+            for (int k = 0; k < diff.Length; k++) diff[k] = (short)(trial % 3 == 0 ? (rng.Next(2) == 0 ? -max : max) : rng.Next(-max, max + 1));
+            var h1 = new int[64]; var h2 = new int[64];
+            AomHbd.Hadamard8x8(diff, 72, h1); AomHbd.Hadamard8x8Scalar(diff, 72, h2);
+            for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++) if (h1[c * 8 + r] != h2[r * 8 + c]) { bad++; r = 9; break; }
+            cases++;
+        }
+        Console.WriteLine($"hbd dsp: {cases} cases, {bad} mismatches");
+        await Assert.That(bad).IsEqualTo(0);
+    }
 }

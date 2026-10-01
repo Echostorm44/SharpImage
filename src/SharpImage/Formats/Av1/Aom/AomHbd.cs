@@ -73,6 +73,49 @@ internal static class AomHbd
     /// <summary>aom_highbd_sse: the exact SSE of two w x h blocks.</summary>
     internal static long Sse(ushort[] a, int aOff, int aStride, ushort[] b, int bOff, int bStride, int width, int height)
     {
+        if (Avx2.IsSupported && (width & 3) == 0 && width > 0 && width <= 128 && aOff >= 0 && bOff >= 0 && height > 0
+            && aOff + (height - 1) * aStride + width <= a.Length && bOff + (height - 1) * bStride + width <= b.Length)
+            return SseAvx2(a, aOff, aStride, b, bOff, bStride, width, height);
+        return SseScalar(a, aOff, aStride, b, bOff, bStride, width, height);
+    }
+
+    // exact: the 16-bit differences (|d| < 4096), pair-summed squares in 32 bits per row (w / 16 * 2 * 4095^2 < 2^31
+    // for w <= 128), widened to 64 bits per row
+    private static long SseAvx2(ushort[] a, int aOff, int aStride, ushort[] b, int bOff, int bStride, int width, int height)
+    {
+        ref ushort ra = ref MemoryMarshal.GetArrayDataReference(a), rb = ref MemoryMarshal.GetArrayDataReference(b);
+        var acc = Vector256<long>.Zero;
+        for (int y = 0; y < height; y++)
+        {
+            nuint ar = (nuint)(aOff + y * aStride), br = (nuint)(bOff + y * bStride);
+            var row = Vector256<int>.Zero;
+            int x = 0;
+            for (; x + 16 <= width; x += 16)
+            {
+                var d = (Vector256.LoadUnsafe(ref ra, ar + (nuint)x) - Vector256.LoadUnsafe(ref rb, br + (nuint)x)).AsInt16();
+                row += Avx2.MultiplyAddAdjacent(d, d);
+            }
+            if (x + 8 <= width)
+            {
+                var d = (Vector128.LoadUnsafe(ref ra, ar + (nuint)x) - Vector128.LoadUnsafe(ref rb, br + (nuint)x)).AsInt16();
+                row += Vector256.Create(Sse2.MultiplyAddAdjacent(d, d), Vector128<int>.Zero);
+                x += 8;
+            }
+            if (x < width)
+            {
+                var va = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(ref Unsafe.As<ushort, byte>(ref Unsafe.Add(ref ra, ar + (nuint)x)))).AsInt16();
+                var vb = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(ref Unsafe.As<ushort, byte>(ref Unsafe.Add(ref rb, br + (nuint)x)))).AsInt16();
+                var d = va - vb;
+                row += Vector256.Create(Sse2.MultiplyAddAdjacent(d, d), Vector128<int>.Zero);
+            }
+            var (lo, hi) = Vector256.Widen(row);
+            acc += lo + hi;
+        }
+        return Vector256.Sum(acc);
+    }
+
+    internal static long SseScalar(ushort[] a, int aOff, int aStride, ushort[] b, int bOff, int bStride, int width, int height)
+    {
         long sse = 0;
         for (int y = 0; y < height; y++)
         {
@@ -95,6 +138,28 @@ internal static class AomHbd
     internal static void SubtractBlock(int rows, int cols, short[] diff, int diffOff, int diffStride,
         ushort[] src, int srcOff, int srcStride, ushort[] pred, int predOff, int predStride)
     {
+        if (Vector128.IsHardwareAccelerated && (cols & 3) == 0 && cols > 0 && rows > 0 && diffOff >= 0 && srcOff >= 0 && predOff >= 0
+            && diffOff + (rows - 1) * diffStride + cols <= diff.Length && srcOff + (rows - 1) * srcStride + cols <= src.Length
+            && predOff + (rows - 1) * predStride + cols <= pred.Length)
+        {
+            ref ushort rs = ref MemoryMarshal.GetArrayDataReference(src), rp = ref MemoryMarshal.GetArrayDataReference(pred);
+            ref short rd = ref MemoryMarshal.GetArrayDataReference(diff);
+            for (int r = 0; r < rows; r++)
+            {
+                nuint d = (nuint)(diffOff + r * diffStride), s = (nuint)(srcOff + r * srcStride), p = (nuint)(predOff + r * predStride);
+                if (cols == 4)
+                {
+                    long v = Unsafe.ReadUnaligned<long>(ref Unsafe.As<ushort, byte>(ref Unsafe.Add(ref rs, s)));
+                    long w = Unsafe.ReadUnaligned<long>(ref Unsafe.As<ushort, byte>(ref Unsafe.Add(ref rp, p)));
+                    Unsafe.WriteUnaligned(ref Unsafe.As<short, byte>(ref Unsafe.Add(ref rd, d)),
+                        (Vector128.CreateScalar(v).AsInt16() - Vector128.CreateScalar(w).AsInt16()).AsInt64().ToScalar());
+                    continue;
+                }
+                for (int c = 0; c < cols; c += 8)
+                    (Vector128.LoadUnsafe(ref rs, s + (nuint)c) - Vector128.LoadUnsafe(ref rp, p + (nuint)c)).AsInt16().StoreUnsafe(ref rd, d + (nuint)c);
+            }
+            return;
+        }
         for (int r = 0; r < rows; r++)
         {
             int d = diffOff + r * diffStride, s = srcOff + r * srcStride, p = predOff + r * predStride;
@@ -115,7 +180,24 @@ internal static class AomHbd
         long error = 0, sqcoeff = 0;
         int shift = 2 * (bd - 8);
         int rounding = (1 << shift) >> 1;
-        for (int i = 0; i < blockSize; i++)
+        int i = 0;
+        if (Avx2.IsSupported && coeff.Length >= blockSize && dqcoeff.Length >= blockSize)
+        {
+            // exact 64-bit products of the even and the odd 32-bit lanes (vpmuldq)
+            ref int rc = ref MemoryMarshal.GetReference(coeff), rq = ref MemoryMarshal.GetReference(dqcoeff);
+            var err = Vector256<long>.Zero; var sq = Vector256<long>.Zero;
+            for (; i + 8 <= blockSize; i += 8)
+            {
+                var c = Vector256.LoadUnsafe(ref rc, (nuint)i);
+                var d = c - Vector256.LoadUnsafe(ref rq, (nuint)i);
+                var co = Vector256.ShiftRightLogical(c.AsInt64(), 32).AsInt32();
+                var dd = Vector256.ShiftRightLogical(d.AsInt64(), 32).AsInt32();
+                err += Avx2.Multiply(d, d) + Avx2.Multiply(dd, dd);
+                sq += Avx2.Multiply(c, c) + Avx2.Multiply(co, co);
+            }
+            error = Vector256.Sum(err); sqcoeff = Vector256.Sum(sq);
+        }
+        for (; i < blockSize; i++)
         {
             long diff = coeff[i] - dqcoeff[i];
             error += diff * diff;
@@ -152,6 +234,56 @@ internal static class AomHbd
     /// <summary>aom_highbd_hadamard_8x8_c.</summary>
     internal static void Hadamard8x8(ReadOnlySpan<short> srcDiff, int srcStride, Span<int> coeff)
     {
+        if (Avx2.IsSupported && srcDiff.Length >= 7 * srcStride + 8 && coeff.Length >= 64)
+        {
+            Hadamard8x8Avx2(ref MemoryMarshal.GetReference(srcDiff), srcStride, ref MemoryMarshal.GetReference(coeff));
+            return;
+        }
+        Hadamard8x8Scalar(srcDiff, srcStride, coeff);
+    }
+
+    /// <summary>aom_highbd_hadamard_8x8 in vector lanes: the first pass in wrapping 16-bit lanes down the columns, a
+    /// transpose, the second pass in 32-bit lanes; the coefficients come out transposed (coeff[k * 8 + idx] instead of
+    /// coeff[idx * 8 + k]), a fixed permutation that the absolute sum (the only use) and the 16x16 / 32x32 combines
+    /// (position-wise across the 8x8s) do not see.</summary>
+    private static void Hadamard8x8Avx2(ref short s, int stride, ref int coeff)
+    {
+        var r0 = Vector128.LoadUnsafe(ref s); var r1 = Vector128.LoadUnsafe(ref s, (nuint)stride);
+        var r2 = Vector128.LoadUnsafe(ref s, (nuint)(2 * stride)); var r3 = Vector128.LoadUnsafe(ref s, (nuint)(3 * stride));
+        var r4 = Vector128.LoadUnsafe(ref s, (nuint)(4 * stride)); var r5 = Vector128.LoadUnsafe(ref s, (nuint)(5 * stride));
+        var r6 = Vector128.LoadUnsafe(ref s, (nuint)(6 * stride)); var r7 = Vector128.LoadUnsafe(ref s, (nuint)(7 * stride));
+        var b0 = r0 + r1; var b1 = r0 - r1; var b2 = r2 + r3; var b3 = r2 - r3;
+        var b4 = r4 + r5; var b5 = r4 - r5; var b6 = r6 + r7; var b7 = r6 - r7;
+        var c0 = b0 + b2; var c1 = b1 + b3; var c2 = b0 - b2; var c3 = b1 - b3;
+        var c4 = b4 + b6; var c5 = b5 + b7; var c6 = b4 - b6; var c7 = b5 - b7;
+        // o_k (lane = column idx) = buffer[idx * 8 + k]
+        var o0 = c0 + c4; var o7 = c1 + c5; var o3 = c2 + c6; var o4 = c3 + c7;
+        var o2 = c0 - c4; var o6 = c1 - c5; var o1 = c2 - c6; var o5 = c3 - c7;
+        // t_m (lane idx) = o_idx[m]: the second pass's 8 inputs of column idx, down the lanes
+        var a0 = Sse2.UnpackLow(o0, o1); var a1 = Sse2.UnpackHigh(o0, o1); var a2 = Sse2.UnpackLow(o2, o3); var a3 = Sse2.UnpackHigh(o2, o3);
+        var a4 = Sse2.UnpackLow(o4, o5); var a5 = Sse2.UnpackHigh(o4, o5); var a6 = Sse2.UnpackLow(o6, o7); var a7 = Sse2.UnpackHigh(o6, o7);
+        var e0 = Sse2.UnpackLow(a0.AsInt32(), a2.AsInt32()); var e1 = Sse2.UnpackHigh(a0.AsInt32(), a2.AsInt32());
+        var e2 = Sse2.UnpackLow(a1.AsInt32(), a3.AsInt32()); var e3 = Sse2.UnpackHigh(a1.AsInt32(), a3.AsInt32());
+        var e4 = Sse2.UnpackLow(a4.AsInt32(), a6.AsInt32()); var e5 = Sse2.UnpackHigh(a4.AsInt32(), a6.AsInt32());
+        var e6 = Sse2.UnpackLow(a5.AsInt32(), a7.AsInt32()); var e7 = Sse2.UnpackHigh(a5.AsInt32(), a7.AsInt32());
+        var t0 = Avx2.ConvertToVector256Int32(Sse2.UnpackLow(e0.AsInt64(), e4.AsInt64()).AsInt16());
+        var t1 = Avx2.ConvertToVector256Int32(Sse2.UnpackHigh(e0.AsInt64(), e4.AsInt64()).AsInt16());
+        var t2 = Avx2.ConvertToVector256Int32(Sse2.UnpackLow(e1.AsInt64(), e5.AsInt64()).AsInt16());
+        var t3 = Avx2.ConvertToVector256Int32(Sse2.UnpackHigh(e1.AsInt64(), e5.AsInt64()).AsInt16());
+        var t4 = Avx2.ConvertToVector256Int32(Sse2.UnpackLow(e2.AsInt64(), e6.AsInt64()).AsInt16());
+        var t5 = Avx2.ConvertToVector256Int32(Sse2.UnpackHigh(e2.AsInt64(), e6.AsInt64()).AsInt16());
+        var t6 = Avx2.ConvertToVector256Int32(Sse2.UnpackLow(e3.AsInt64(), e7.AsInt64()).AsInt16());
+        var t7 = Avx2.ConvertToVector256Int32(Sse2.UnpackHigh(e3.AsInt64(), e7.AsInt64()).AsInt16());
+        var d0 = t0 + t1; var d1 = t0 - t1; var d2 = t2 + t3; var d3 = t2 - t3;
+        var d4 = t4 + t5; var d5 = t4 - t5; var d6 = t6 + t7; var d7 = t6 - t7;
+        var f0 = d0 + d2; var f1 = d1 + d3; var f2 = d0 - d2; var f3 = d1 - d3;
+        var f4 = d4 + d6; var f5 = d5 + d7; var f6 = d4 - d6; var f7 = d5 - d7;
+        (f0 + f4).StoreUnsafe(ref coeff, 0); (f1 + f5).StoreUnsafe(ref coeff, 56); (f2 + f6).StoreUnsafe(ref coeff, 24); (f3 + f7).StoreUnsafe(ref coeff, 32);
+        (f0 - f4).StoreUnsafe(ref coeff, 16); (f1 - f5).StoreUnsafe(ref coeff, 48); (f2 - f6).StoreUnsafe(ref coeff, 8); (f3 - f7).StoreUnsafe(ref coeff, 40);
+    }
+
+    internal static void Hadamard8x8Scalar(ReadOnlySpan<short> srcDiff, int srcStride, Span<int> coeff)
+    {
         Span<short> buffer = stackalloc short[64];
         for (int idx = 0; idx < 8; ++idx) HadamardHighbdCol8FirstPass(srcDiff.Slice(idx), srcStride, buffer.Slice(idx * 8, 8));
         for (int idx = 0; idx < 8; ++idx) HadamardHighbdCol8SecondPass(buffer.Slice(idx), 8, coeff.Slice(8 * idx, 8));
@@ -160,9 +292,23 @@ internal static class AomHbd
     /// <summary>aom_highbd_hadamard_16x16_c.</summary>
     internal static void Hadamard16x16(ReadOnlySpan<short> srcDiff, int srcStride, Span<int> coeff)
     {
-        for (int idx = 0; idx < 4; ++idx)
-            Hadamard8x8(srcDiff.Slice((idx >> 1) * 8 * srcStride + (idx & 1) * 8), srcStride, coeff.Slice(idx * 64, 64));
-        for (int idx = 0; idx < 64; ++idx)
+        for (int q = 0; q < 4; ++q)
+            Hadamard8x8(srcDiff.Slice((q >> 1) * 8 * srcStride + (q & 1) * 8), srcStride, coeff.Slice(q * 64, 64));
+        int idx = 0;
+        if (Vector256.IsHardwareAccelerated && coeff.Length >= 256)
+        {
+            ref int c = ref MemoryMarshal.GetReference(coeff);
+            for (; idx < 64; idx += 8)
+            {
+                var a0 = Vector256.LoadUnsafe(ref c, (nuint)idx); var a1 = Vector256.LoadUnsafe(ref c, (nuint)idx + 64);
+                var a2 = Vector256.LoadUnsafe(ref c, (nuint)idx + 128); var a3 = Vector256.LoadUnsafe(ref c, (nuint)idx + 192);
+                var b0 = Vector256.ShiftRightArithmetic(a0 + a1, 1); var b1 = Vector256.ShiftRightArithmetic(a0 - a1, 1);
+                var b2 = Vector256.ShiftRightArithmetic(a2 + a3, 1); var b3 = Vector256.ShiftRightArithmetic(a2 - a3, 1);
+                (b0 + b2).StoreUnsafe(ref c, (nuint)idx); (b1 + b3).StoreUnsafe(ref c, (nuint)idx + 64);
+                (b0 - b2).StoreUnsafe(ref c, (nuint)idx + 128); (b1 - b3).StoreUnsafe(ref c, (nuint)idx + 192);
+            }
+        }
+        for (; idx < 64; ++idx)
         {
             int a0 = coeff[idx], a1 = coeff[idx + 64], a2 = coeff[idx + 128], a3 = coeff[idx + 192];
             int b0 = (a0 + a1) >> 1, b1 = (a0 - a1) >> 1, b2 = (a2 + a3) >> 1, b3 = (a2 - a3) >> 1;
@@ -173,9 +319,23 @@ internal static class AomHbd
     /// <summary>aom_highbd_hadamard_32x32_c.</summary>
     internal static void Hadamard32x32(ReadOnlySpan<short> srcDiff, int srcStride, Span<int> coeff)
     {
-        for (int idx = 0; idx < 4; ++idx)
-            Hadamard16x16(srcDiff.Slice((idx >> 1) * 16 * srcStride + (idx & 1) * 16), srcStride, coeff.Slice(idx * 256, 256));
-        for (int idx = 0; idx < 256; ++idx)
+        for (int q = 0; q < 4; ++q)
+            Hadamard16x16(srcDiff.Slice((q >> 1) * 16 * srcStride + (q & 1) * 16), srcStride, coeff.Slice(q * 256, 256));
+        int idx = 0;
+        if (Vector256.IsHardwareAccelerated && coeff.Length >= 1024)
+        {
+            ref int c = ref MemoryMarshal.GetReference(coeff);
+            for (; idx < 256; idx += 8)
+            {
+                var a0 = Vector256.LoadUnsafe(ref c, (nuint)idx); var a1 = Vector256.LoadUnsafe(ref c, (nuint)idx + 256);
+                var a2 = Vector256.LoadUnsafe(ref c, (nuint)idx + 512); var a3 = Vector256.LoadUnsafe(ref c, (nuint)idx + 768);
+                var b0 = Vector256.ShiftRightArithmetic(a0 + a1, 2); var b1 = Vector256.ShiftRightArithmetic(a0 - a1, 2);
+                var b2 = Vector256.ShiftRightArithmetic(a2 + a3, 2); var b3 = Vector256.ShiftRightArithmetic(a2 - a3, 2);
+                (b0 + b2).StoreUnsafe(ref c, (nuint)idx); (b1 + b3).StoreUnsafe(ref c, (nuint)idx + 256);
+                (b0 - b2).StoreUnsafe(ref c, (nuint)idx + 512); (b1 - b3).StoreUnsafe(ref c, (nuint)idx + 768);
+            }
+        }
+        for (; idx < 256; ++idx)
         {
             int a0 = coeff[idx], a1 = coeff[idx + 256], a2 = coeff[idx + 512], a3 = coeff[idx + 768];
             int b0 = (a0 + a1) >> 2, b1 = (a0 - a1) >> 2, b2 = (a2 + a3) >> 2, b3 = (a2 - a3) >> 2;
