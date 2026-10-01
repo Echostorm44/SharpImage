@@ -115,6 +115,7 @@ internal struct AomTxbCtx
 // Port of libaom av1/common/txb_common.{h,c}, av1/encoder/encodetxb.c (the level map, contexts, eob tokens, entropy
 // context) and av1/encoder/txb_rdopt.{c,h} (av1_cost_coeffs_txb, av1_cost_coeffs_txb_laplacian, av1_optimize_txb).
 // Coefficient arrays in libaom's layout: index = col * height + row (column-major, height = the adjusted tx's).
+[System.Runtime.CompilerServices.SkipLocalsInit]
 internal static class AomTxb
 {
     internal const int NumBaseLevels = 2, CoeffBaseRange = 12, MaxBaseBrRange = CoeffBaseRange + NumBaseLevels + 1;

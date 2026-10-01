@@ -25,6 +25,7 @@ internal sealed partial class AomMacroblock
 // av1_rd_pick_intra_sby_mode (mode / angle loop, model-rd pruning, the ALLINTRA variance factor, filter intra, winner
 // mode processing) and av1_rd_pick_intra_sbuv_mode (chroma modes, angle search, CfL alpha search), plus
 // av1_encode_intra_block_plane (encodemb.c) that the CfL search re-runs for the luma reconstruction.
+[System.Runtime.CompilerServices.SkipLocalsInit]
 internal static class AomIntraModeSearch
 {
     private const int MAX_ANGLE_DELTA = 3, INTRA_MODE_END = 13, INTRA_MODE_START = 0;

@@ -57,6 +57,10 @@ public sealed class AomEncoderSmoke
         using var traceWriter = tracePath != null ? new StreamWriter(tracePath) : null;
         AomTrace.Out = traceWriter;
         int reps = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_REPS") ?? "1");
+        // AOM_SMOKE_JITMAP / AOM_SMOKE_TIDFILE: the jitted code map and this thread's id for an external native sampler
+        string? jitMapPath = Environment.GetEnvironmentVariable("AOM_SMOKE_JITMAP");
+        using var jitMap = jitMapPath != null ? new AomJitMap() : null;
+        if (Environment.GetEnvironmentVariable("AOM_SMOKE_TIDFILE") is string tidFile) AomJitMap.WriteThreadId(tidFile);
         AomComp cpi = null!; AomMacroblock x = null!;
         if (reps > 1)
         {
@@ -66,7 +70,7 @@ public sealed class AomEncoderSmoke
         var sw = new System.Diagnostics.Stopwatch();
         long searchMs = 0, postMs = 0;
         double lpfMs = 0, rstMs = 0, cdefMs = 0;
-        double totalMs = 0, allocMb = 0; int gcs = 0;
+        double totalMs = 0, allocMb = 0, gcMs = 0; int gcs = 0;
         for (int rep = 0; rep < reps; rep++)
         {
             sw.Restart();
@@ -87,17 +91,18 @@ public sealed class AomEncoderSmoke
             if (reps > 1)
             {
                 // the whole aom_codec_encode equivalent: encode + post filter + pack
-                long a0 = GC.GetAllocatedBytesForCurrentThread(); int g0 = GC.CollectionCount(0);
+                long a0 = GC.GetAllocatedBytesForCurrentThread(); int g0 = GC.CollectionCount(0); var p0 = GC.GetTotalPauseDuration();
                 var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 var (c2, x2) = AomEncoder.EncodeFrame(input);
                 AomEncoder.RunPostFilter(c2, x2);
                 AomBitstream.PackFrame(c2, new AomSequenceConfig());
                 double ms = System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
                 totalMs = rep == 0 ? ms : Math.Min(totalMs, ms);
-                allocMb = (GC.GetAllocatedBytesForCurrentThread() - a0) / 1048576.0; gcs = GC.CollectionCount(0) - g0;
+                allocMb = (GC.GetAllocatedBytesForCurrentThread() - a0) / 1048576.0; gcs = GC.CollectionCount(0) - g0; gcMs = (GC.GetTotalPauseDuration() - p0).TotalMilliseconds;
             }
         }
-        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, cdef {cdefMs:F1} ms, restoration {rstMs:F1} ms), total {totalMs:F1} ms, alloc {allocMb:F1} MB gen0 {gcs}");
+        if (jitMapPath != null) jitMap!.Save(jitMapPath);
+        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, cdef {cdefMs:F1} ms, restoration {rstMs:F1} ms), total {totalMs:F1} ms, alloc {allocMb:F1} MB gen0 {gcs} gc pause {gcMs:F1} ms");
         // AOM_SMOKE_PFREPS=n: n more post-filter runs (profiling)
         int pfReps = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_PFREPS") ?? "0");
         for (int rep = 0; rep < pfReps; rep++) AomEncoder.RunPostFilter(cpi, x);

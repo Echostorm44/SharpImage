@@ -76,6 +76,7 @@ internal static partial class AomTxSearch
         int maxTxSize = MaxPredictSfTxSize[bsize];
         int txH = TxSizeHigh[maxTxSize], txW = TxSizeWide[maxTxSize];
         Span<int> coefs = stackalloc int[32 * 32];
+        coefs.Clear();
         uint maxQcoefThresh = (xd.Bd == 8 ? SkipPredThreshold8 : xd.Bd == 10 ? SkipPredThreshold10 : SkipPredThreshold12)[bsize];
         var srcDiff = x.Plane[0].SrcDiff;
         int nCoeff = txW * txH;

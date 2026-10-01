@@ -42,6 +42,7 @@ internal static class AomTrace
     public static System.IO.TextWriter? Out { get => On ? t_out : null; set => t_out = value; }
 }
 
+[System.Runtime.CompilerServices.SkipLocalsInit]
 internal static partial class AomTxSearch
 {
     public const int FTXS_NONE = 0, FTXS_DCT_AND_1D_DCT_ONLY = 1 << 0, FTXS_DISABLE_TRELLIS_OPT = 1 << 1, FTXS_USE_TRANSFORM_DOMAIN = 1 << 2;

@@ -27,6 +27,7 @@ internal struct AomQuantParam
 // Port of libaom 3.14.1 av1/encoder/encodemb.{c,h} (subtract, xform, quant, optimize_b, set_txb_context), the
 // transform-block iterator, av1_inverse_transform_block's use, and the 8-bit distortion kernels the search uses
 // (aom_sum_squares_2d_i16, aom_sum_sse_2d_i16, aom_sse, av1_block_error as AVX2 runs it, aom_satd).
+[System.Runtime.CompilerServices.SkipLocalsInit]
 internal static partial class AomEncodeMb
 {
     /// <summary>BLOCK_OFFSET: a tx block's coefficient offset (block counts 4x4 units).</summary>
