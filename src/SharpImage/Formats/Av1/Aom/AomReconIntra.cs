@@ -627,9 +627,8 @@ internal static unsafe partial class AomReconIntra
             i = 0;
             if (nLeftPx > 0)
             {
-                for (; i < nLeftPx; i++) leftCol[i] = leftRef[i * refStride];
-                if (nBottomLeftPx > 0)
-                    for (; i < txhpx + nBottomLeftPx; i++) leftCol[i] = leftRef[i * refStride];
+                GatherColumn(leftCol, leftRef, refStride, nBottomLeftPx > 0 ? txhpx + nBottomLeftPx : nLeftPx);
+                i = nBottomLeftPx > 0 ? txhpx + nBottomLeftPx : nLeftPx;
                 if (i < numLeftPixelsNeeded)
                     Unsafe.InitBlockUnaligned(leftCol + i, leftCol[i - 1], (uint)(numLeftPixelsNeeded - i));
             }
@@ -716,6 +715,16 @@ internal static unsafe partial class AomReconIntra
         DrPredictor(dst, dstStride, txSize, aboveRow, leftCol, upsampleAbove, upsampleLeft, pAngle);
     }
 
+    /// <summary>dst[i] = src[i * stride] for i &lt; n (the left edge column), four at a time.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void GatherColumn(byte* dst, byte* src, nint stride, int n)
+    {
+        int i = 0;
+        for (; i + 4 <= n; i += 4, src += 4 * stride)
+            *(uint*)(dst + i) = (uint)(src[0] | src[stride] << 8 | src[2 * stride] << 16 | src[3 * stride] << 24);
+        for (; i < n; i++, src += stride) dst[i] = *src;
+    }
+
     /// <summary>build_non_directional_intra_predictors (reconintra.c, static): DC, SMOOTH*, PAETH.</summary>
     public static void BuildNonDirectionalIntraPredictors(byte* refp, nint refStride, byte* dst, nint dstStride,
         int mode, int txSize, int nTopPx, int nLeftPx)
@@ -752,7 +761,8 @@ internal static unsafe partial class AomReconIntra
             Unsafe.InitBlockUnaligned(leftData, 129, NUM_INTRA_NEIGHBOUR_PIXELS);
             if (nLeftPx > 0)
             {
-                for (i = 0; i < nLeftPx; i++) leftCol[i] = leftRef[i * refStride];
+                GatherColumn(leftCol, leftRef, refStride, nLeftPx);
+                i = nLeftPx;
                 if (i < txhpx) Unsafe.InitBlockUnaligned(leftCol + i, leftCol[i - 1], (uint)(txhpx - i));
             }
             else if (nTopPx > 0)
