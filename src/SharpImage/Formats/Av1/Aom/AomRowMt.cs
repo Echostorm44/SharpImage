@@ -307,6 +307,19 @@ internal sealed class AomRowMt
         {
             var t = tr._arrays;
             int sum = wtLeft + wtTr, half = sum / 2;
+            if (sum == 4)
+            {
+                // the weights libaom uses (3, 1): a shift instead of the division, and no compare (equal entries give
+                // (4 l + 2) >> 2 = l)
+                for (int i = 0; i < _arrays.Length; i++)
+                {
+                    var l = _arrays[i];
+                    var r = t[i];
+                    if (r.Length != l.Length) throw new InvalidOperationException("CDF layouts differ");
+                    for (int j = 0; j < l.Length; j++) l[j] = (ushort)((l[j] * wtLeft + r[j] * wtTr + 2) >> 2);
+                }
+                return;
+            }
             for (int i = 0; i < _arrays.Length; i++)
             {
                 var l = _arrays[i];
