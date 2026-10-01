@@ -665,93 +665,245 @@ internal sealed class AomPickRst
             for (int l = k + 1; l < wienerWin2; ++l) H[l * wienerWin2 + k] = H[k * wienerWin2 + l];
     }
 
-    /// <summary>ComputeStats' upper triangle of H and M as av1_compute_stats_avx2 arranges it: the (dgd - avg) samples
-    /// as int16, 16 columns per vector, every (k, l) product pair summed with madd, the downsample weight (zero past the
-    /// unit's width) folded into one operand. Integer sums, so the totals equal the scalar order's exactly: int32
-    /// accumulators (at most 32 sampled rows x 64 chunks x 2 x 255 x 1020 &lt; 2^31) are flushed into the int64 totals.</summary>
+    /// <summary>av1_compute_stats_avx2 (8-bit; compute_stats_win7_avx2 / compute_stats_win5_avx2): the (dgd - avg) and
+    /// (src - avg) blocks as int16 (sub_avg_block_avx2), then for every window sample i the upper-triangle row H[i][l]
+    /// (and with i = 0 all of M) as whole-unit int32 madd sums, one window column (7 or 5 accumulators) per pass, the
+    /// downsample factor folded into the current operand and the last chunk masked to the unit's width. Each sum is
+    /// reduced to int64 the way libaom reduces it: hadd_four_32_to_64 (two int32 4-lane sums, each wrapping, added in
+    /// int64) or the exact int64 sum of all 8 lanes (convert_32_to_64_add / add_64bit_lvl).</summary>
     [SkipLocalsInit]
-    private static void ComputeStatsAvx2(int wienerWin, AomYv12Plane dgd, AomYv12Plane src, int hStart, int hEnd,
+    private static unsafe void ComputeStatsAvx2(int wienerWin, AomYv12Plane dgd, AomYv12Plane src, int hStart, int hEnd,
         int vStart, int vEnd, long[] M, long[] H, int useDownsampledWienerStats, byte avg)
     {
-        int wienerWin2 = wienerWin * wienerWin, half = wienerWin >> 1;
+        int win = wienerWin, win2 = win * win, half = win >> 1;
         int width = hEnd - hStart, height = vEnd - vStart;
-        int chunks = (width + 15) >> 4;
-        // D: rows vStart - half .. vEnd + half, columns hStart - half .. + chunks * 16 + 2 * half (zeros past the unit's
-        // right neighbours)
-        int dw = chunks * 16 + 2 * half + 16, dh = height + 2 * half;
-        var dbuf = new short[dw * dh];
+        int dStride = (width + 2 * half + 15) & ~15, sStride = (width + 15) & ~15;
+        // window rows past the last one are read (and multiplied by nothing) when a block starts below row 0
+        int dRows = height + 2 * half + win;
+        int dSize = dStride * dRows + 32, sSize = sStride * height + 32;
+        if (_statsD == null || _statsD.Length < dSize) _statsD = new short[dSize];
+        if (_statsS == null || _statsS.Length < sSize) _statsS = new short[sSize];
+        short[] dArr = _statsD, sArr = _statsS;
         byte[] db = dgd.Buf, sb = src.Buf;
-        for (int r = 0; r < dh; r++)
+        // sub_avg_block_avx2
+        var avgV = Vector256.Create((short)avg);
+        for (int r = 0; r < dRows; r++)
         {
             int o = dgd.At(hStart - half, vStart - half + r);
             int n = width + 2 * half;
-            for (int c = 0; c < n; c++) dbuf[r * dw + c] = (short)(db[o + c] - avg);
-        }
-        int pairs = wienerWin2 * (wienerWin2 + 1) / 2;
-        Span<Vector256<int>> acc = stackalloc Vector256<int>[pairs];
-        Span<Vector256<int>> accM = stackalloc Vector256<int>[wienerWin2];
-        Span<Vector256<short>> win = stackalloc Vector256<short>[wienerWin2];
-        acc.Clear();
-        accM.Clear();
-        ref short d0 = ref MemoryMarshal.GetArrayDataReference(dbuf);
-        var avgV = Vector256.Create((short)avg);
-        Span<short> maskBuf = stackalloc short[32];
-        int pending = 0;
-        void Flush(Span<Vector256<int>> acc, Span<Vector256<int>> accM)
-        {
-            static long Sum(Vector256<int> v) => Vector256.Sum(Avx2.ConvertToVector256Int64(v.GetLower()) + Avx2.ConvertToVector256Int64(v.GetUpper()));
-            int p = 0;
-            for (int k = 0; k < wienerWin2; k++)
+            int row = r * dStride;
+            if (r < height + 2 * half)
             {
-                M[k] += Sum(accM[k]);
-                for (int l = k; l < wienerWin2; l++) H[k * wienerWin2 + l] += Sum(acc[p++]);
+                int c = 0;
+                for (; c + 16 <= n; c += 16)
+                    (Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref db[o + c])) - avgV).StoreUnsafe(ref dArr[row + c]);
+                for (; c < n; c++) dArr[row + c] = (short)(db[o + c] - avg);
+                Array.Clear(dArr, row + n, dStride - n);
             }
-            acc.Clear();
-            accM.Clear();
-            pending = 0;
+            else Array.Clear(dArr, row, dStride);
         }
-        int downsampleFactor = useDownsampledWienerStats != 0 ? 4 : 1;
-        for (int i = vStart; i < vEnd; i += downsampleFactor)
+        for (int r = 0; r < height; r++)
         {
-            if (useDownsampledWienerStats != 0 && vEnd - i < 4) downsampleFactor = vEnd - i;
-            if (pending == 32) Flush(acc, accM);
-            pending++;
-            int rr = i - vStart;   // D row of the window's top-left is rr (+ dy + half)
-            int so = src.At(hStart, i);
-            for (int c = 0; c < chunks; c++)
+            int o = src.At(hStart, vStart + r), row = r * sStride, c = 0;
+            for (; c + 16 <= width; c += 16)
+                (Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref sb[o + c])) - avgV).StoreUnsafe(ref sArr[row + c]);
+            for (; c < width; c++) sArr[row + c] = (short)(sb[o + c] - avg);
+            Array.Clear(sArr, row + width, sStride - width);
+        }
+        int wdMul16 = width & ~15, beyond = width - wdMul16;
+        var mask = Avx2.CompareGreaterThan(Vector256.Create((short)beyond),
+            Vector256.Create((short)0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+        bool ds = useDownsampledWienerStats != 0;
+        Span<Vector256<int>> accH = stackalloc Vector256<int>[7];
+        Span<Vector256<int>> accM = stackalloc Vector256<int>[7];
+        fixed (short* d = dArr)
+        fixed (short* s = sArr)
+        {
+            // Step 1: all of M and row 0 of H
+            for (int j = 0; j < win; j++)
             {
-                int c0 = c * 16;
-                int valid = Math.Min(16, width - c0);
-                Vector256<short> wv;
-                if (valid == 16) wv = Vector256.Create((short)downsampleFactor);
-                else
+                StatsPass(win, d, d + j, s, dStride, sStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH, accM);
+                for (int g = 0; g < win; g++)
                 {
-                    for (int q = 0; q < 16; q++) maskBuf[q] = (short)(q < valid ? downsampleFactor : 0);
-                    wv = Vector256.Create<short>(maskBuf);
+                    bool exact = win == 5 && g == 4;
+                    M[win * j + g] = exact ? SumExact(accM[g]) : SumHadd4(accM[g]);
+                    H[win * j + g] = exact ? SumExact(accH[g]) : SumHadd4(accH[g]);
                 }
-                // window vectors: index (dx + half) * win + (dy + half), the scalar code's order
-                for (int dx = 0; dx < wienerWin; dx++)
-                    for (int dy = 0; dy < wienerWin; dy++)
-                        win[dx * wienerWin + dy] = Vector256.LoadUnsafe(ref d0, (nuint)((rr + dy) * dw + c0 + dx));
-                Vector256<short> x;
-                if (valid == 16) x = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref sb[so + c0])) - avgV;
-                else
+            }
+            // The remaining rows of H: the current sample (column i / win, row i % win of the window) against every
+            // window column j from its own on (the upper triangle).
+            for (int i = 1; i < win2; i++)
+            {
+                int ci = i / win, ri = i % win;
+                short* cur = d + ci + ri * dStride;
+                for (int j = ci; j < win; j++)
                 {
-                    for (int q = 0; q < 16; q++) maskBuf[16 + q] = (short)(q < valid ? sb[so + c0 + q] - avg : 0);
-                    x = Vector256.Create<short>(maskBuf.Slice(16));
-                }
-                var xw = Avx2.MultiplyLow(x, wv);
-                int p = 0;
-                for (int k = 0; k < wienerWin2; k++)
-                {
-                    var wk = win[k];
-                    accM[k] += Avx2.MultiplyAddAdjacent(xw, wk);
-                    var a = Avx2.MultiplyLow(wk, wv);
-                    for (int l = k; l < wienerWin2; l++) acc[p++] += Avx2.MultiplyAddAdjacent(a, win[l]);
+                    StatsPass(win, cur, d + j, null, dStride, sStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH, accM);
+                    bool first = j == ci && ri != 0;
+                    for (int g = first ? ri : 0; g < win; g++)
+                    {
+                        bool exact = win == 7
+                            ? first && ((ri == 1 && g >= 5) || (ri == 2 && g == 6))
+                            : first ? ri >= 3 : g == 4;
+                        H[i * win2 + win * j + g] = exact ? SumExact(accH[g]) : SumHadd4(accH[g]);
+                    }
                 }
             }
         }
-        if (pending > 0) Flush(acc, accM);
+    }
+
+    [ThreadStatic] private static short[]? _statsD, _statsS;
+
+    /// <summary>hadd_four_32_to_64_avx2's value for one accumulator: the two 4-lane int32 sums (wrapping), added in int64.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long SumHadd4(Vector256<int> v)
+    {
+        unchecked
+        {
+            int lo = v.GetElement(0) + v.GetElement(1) + v.GetElement(2) + v.GetElement(3);
+            int hi = v.GetElement(4) + v.GetElement(5) + v.GetElement(6) + v.GetElement(7);
+            return (long)lo + hi;
+        }
+    }
+
+    /// <summary>convert_and_add + add_64bit_lvl: the int64 sum of the 8 lanes.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long SumExact(Vector256<int> v)
+        => Vector256.Sum(Avx2.ConvertToVector256Int64(v.GetLower()) + Avx2.ConvertToVector256Int64(v.GetUpper()));
+
+    /// <summary>One INIT_H_VALUES / INIT_MH_VALUES sweep over the unit: accH[g] += madd(cur * df, window row g) for the
+    /// win window rows at w (and, with s, accM[g] += madd(src * df, window row g)).</summary>
+    private static unsafe void StatsPass(int win, short* cur, short* w, short* s, int dStride, int sStride, int wdMul16,
+        int beyond, Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH,
+        Span<Vector256<int>> accM)
+    {
+        if (win == 7)
+        {
+            if (s == null) StatsPassH7(cur, w, dStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH);
+            else StatsPassHM(7, cur, w, s, dStride, sStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH, accM);
+        }
+        else
+        {
+            if (s == null) StatsPassH5(cur, w, dStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH);
+            else StatsPassHM(5, cur, w, s, dStride, sStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH, accM);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe Vector256<int> Madd(Vector256<int> acc, Vector256<short> a, short* p)
+        => Avx2.Add(acc, Avx2.MultiplyAddAdjacent(a, Avx.LoadVector256(p)));
+
+    private static unsafe void StatsPassH7(short* cur, short* w, int dStride, int wdMul16, int beyond,
+        Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH)
+    {
+        Vector256<int> a0 = default, a1 = default, a2 = default, a3 = default, a4 = default, a5 = default, a6 = default;
+        int procHt = vStart, df = ds ? 4 : 1;
+        do
+        {
+            if (ds && vEnd - procHt < 4) df = vEnd - procHt;
+            var dfv = Vector256.Create((short)df);
+            int x = 0;
+            for (; x < wdMul16; x += 16)
+            {
+                var c = Avx2.MultiplyLow(Avx.LoadVector256(cur + x), dfv);
+                short* p = w + x;
+                a0 = Madd(a0, c, p);
+                a1 = Madd(a1, c, p + dStride);
+                a2 = Madd(a2, c, p + 2 * dStride);
+                a3 = Madd(a3, c, p + 3 * dStride);
+                a4 = Madd(a4, c, p + 4 * dStride);
+                a5 = Madd(a5, c, p + 5 * dStride);
+                a6 = Madd(a6, c, p + 6 * dStride);
+            }
+            if (beyond != 0)
+            {
+                var c = Avx2.MultiplyLow(Avx2.And(Avx.LoadVector256(cur + x), mask), dfv);
+                short* p = w + x;
+                a0 = Madd(a0, c, p);
+                a1 = Madd(a1, c, p + dStride);
+                a2 = Madd(a2, c, p + 2 * dStride);
+                a3 = Madd(a3, c, p + 3 * dStride);
+                a4 = Madd(a4, c, p + 4 * dStride);
+                a5 = Madd(a5, c, p + 5 * dStride);
+                a6 = Madd(a6, c, p + 6 * dStride);
+            }
+            procHt += df;
+            cur += df * dStride;
+            w += df * dStride;
+        } while (procHt < vEnd);
+        accH[0] = a0; accH[1] = a1; accH[2] = a2; accH[3] = a3; accH[4] = a4; accH[5] = a5; accH[6] = a6;
+    }
+
+    private static unsafe void StatsPassH5(short* cur, short* w, int dStride, int wdMul16, int beyond,
+        Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH)
+    {
+        Vector256<int> a0 = default, a1 = default, a2 = default, a3 = default, a4 = default;
+        int procHt = vStart, df = ds ? 4 : 1;
+        do
+        {
+            if (ds && vEnd - procHt < 4) df = vEnd - procHt;
+            var dfv = Vector256.Create((short)df);
+            int x = 0;
+            for (; x < wdMul16; x += 16)
+            {
+                var c = Avx2.MultiplyLow(Avx.LoadVector256(cur + x), dfv);
+                short* p = w + x;
+                a0 = Madd(a0, c, p);
+                a1 = Madd(a1, c, p + dStride);
+                a2 = Madd(a2, c, p + 2 * dStride);
+                a3 = Madd(a3, c, p + 3 * dStride);
+                a4 = Madd(a4, c, p + 4 * dStride);
+            }
+            if (beyond != 0)
+            {
+                var c = Avx2.MultiplyLow(Avx2.And(Avx.LoadVector256(cur + x), mask), dfv);
+                short* p = w + x;
+                a0 = Madd(a0, c, p);
+                a1 = Madd(a1, c, p + dStride);
+                a2 = Madd(a2, c, p + 2 * dStride);
+                a3 = Madd(a3, c, p + 3 * dStride);
+                a4 = Madd(a4, c, p + 4 * dStride);
+            }
+            procHt += df;
+            cur += df * dStride;
+            w += df * dStride;
+        } while (procHt < vEnd);
+        accH[0] = a0; accH[1] = a1; accH[2] = a2; accH[3] = a3; accH[4] = a4;
+    }
+
+    private static unsafe void StatsPassHM(int win, short* cur, short* w, short* s, int dStride, int sStride,
+        int wdMul16, int beyond, Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH,
+        Span<Vector256<int>> accM)
+    {
+        for (int g = 0; g < win; g++) accH[g] = accM[g] = default;
+        int procHt = vStart, df = ds ? 4 : 1;
+        do
+        {
+            if (ds && vEnd - procHt < 4) df = vEnd - procHt;
+            var dfv = Vector256.Create((short)df);
+            for (int x = 0; x < wdMul16 + (beyond != 0 ? 16 : 0); x += 16)
+            {
+                var cv = Avx.LoadVector256(cur + x);
+                var sv = Avx.LoadVector256(s + x);
+                if (x >= wdMul16)
+                {
+                    cv = Avx2.And(cv, mask);
+                    sv = Avx2.And(sv, mask);
+                }
+                var c = Avx2.MultiplyLow(cv, dfv);
+                var sm = Avx2.MultiplyLow(sv, dfv);
+                for (int g = 0; g < win; g++)
+                {
+                    var wv = Avx.LoadVector256(w + x + g * dStride);
+                    accM[g] = Avx2.Add(accM[g], Avx2.MultiplyAddAdjacent(sm, wv));
+                    accH[g] = Avx2.Add(accH[g], Avx2.MultiplyAddAdjacent(c, wv));
+                }
+            }
+            procHt += df;
+            cur += df * dStride;
+            w += df * dStride;
+            s += df * sStride;
+        } while (procHt < vEnd);
     }
 
     private static int WrapIndex(int i, int wienerWin)

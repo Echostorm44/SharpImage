@@ -63,6 +63,9 @@ public sealed class AomEncoderSmoke
             rstMs = rep == 0 ? rr : Math.Min(rstMs, rr);
         }
         Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, restoration {rstMs:F1} ms)");
+        // AOM_SMOKE_PFREPS=n: n more post-filter runs (profiling)
+        int pfReps = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_PFREPS") ?? "0");
+        for (int rep = 0; rep < pfReps; rep++) AomEncoder.RunPostFilter(cpi, x);
         sw.Restart(); sw.Stop();
         AomTrace.Out = null;
         var cm = cpi.Cm; var rec = cm.CurFrame;

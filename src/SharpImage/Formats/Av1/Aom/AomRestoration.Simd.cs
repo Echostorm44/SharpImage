@@ -60,6 +60,7 @@ internal static partial class AomRestoration
     }
 
     /// <summary>av1_wiener_convolve_add_src_avx2 (8-bit, round_0 = 3, round_1 = 11).</summary>
+    [SkipLocalsInit]
     public static unsafe void WienerConvolveAddSrcAvx2(byte[] src, int s0, int srcStride, byte[] dst, int d0, int dstStride,
         in AomTaps8 filterX, in AomTaps8 filterY, int w, int h)
     {
