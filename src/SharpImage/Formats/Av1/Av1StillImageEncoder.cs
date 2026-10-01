@@ -832,7 +832,7 @@ internal static partial class Av1StillImageEncoder
         Av1ObuWriter.Av1ColorDesc? color = null)
     {
         if (AomStill.Handles(bitDepth, Av1PixelLayout.I400, width, height))
-            return AomStill.Encode(luma, default, default, width, height, Av1PixelLayout.I400, baseQIdx, color);
+            return AomStill.Encode(luma, default, default, width, height, Av1PixelLayout.I400, baseQIdx, color, bitDepth);
         if (Sp.MonoColorPath) return BuildColorObus(luma, default, default, width, height, baseQIdx, bitDepth, Av1PixelLayout.I400, color);
         using var bdScope = new BitDepthScope(bitDepth);
         ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
@@ -1134,7 +1134,7 @@ internal static partial class Av1StillImageEncoder
         if (layout is not (Av1PixelLayout.I420 or Av1PixelLayout.I422 or Av1PixelLayout.I444 or Av1PixelLayout.I400))
             throw new ArgumentOutOfRangeException(nameof(layout));
         if (AomStill.Handles(bitDepth, layout, width, height))
-            return AomStill.Encode(luma, u, v, width, height, layout, baseQIdx, color);
+            return AomStill.Encode(luma, u, v, width, height, layout, baseQIdx, color, bitDepth);
         using var bdScope = new BitDepthScope(bitDepth);
         using var spScope = new LayoutSpeedScope(layout);
         using var lamScope = new LambdaScope(baseQIdx);
@@ -1574,7 +1574,7 @@ internal static partial class Av1StillImageEncoder
     {
         var codedLayout = monochrome ? Av1PixelLayout.I400 : layout;
         if (AomStill.Handles(bitDepth, codedLayout, width, height))
-            return AomStill.Encode(luma, u, v, width, height, codedLayout, 0, color);
+            return AomStill.Encode(luma, u, v, width, height, codedLayout, 0, color, bitDepth);
         using var bdScope = new BitDepthScope(bitDepth);
         ValidateMultiSb(width, height, out int sbCols, out int sbRows, out int bw4, out int bh4, out int pw, out int ph);
         ushort[] padY = PadPlane(luma, width, height, pw, ph);

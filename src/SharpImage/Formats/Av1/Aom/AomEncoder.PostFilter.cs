@@ -58,7 +58,7 @@ internal static partial class AomEncoder
             Method = sf.lpf_sf.lpf_pick, UseCoarseFilterLevelSearch = sf.lpf_sf.use_coarse_filter_level_search,
             SkipLoopFilterUsingFiltError = sf.lpf_sf.skip_loop_filter_using_filt_error, Sharpness = cpi.Sharpness,
             SharpnessFromConfig = cpi.AllIntra || cpi.TuneIq, EnableAdaptiveSharpness = cpi.EnableAdaptiveSharpness, BaseQindex = cm.BaseQindex, KeyFrame = true, IntraOnly = true,
-            TxModeOnly4x4 = x.E.Lossless[0] != 0,
+            TxModeOnly4x4 = x.E.Lossless[0] != 0, BitDepth = cm.BitDepth,
             Parallel = cpi.NumWorkers > 1,
         };
         // is_inter_tx_size_search_level_one / get_lpf_opt_level
@@ -69,7 +69,7 @@ internal static partial class AomEncoder
         AomRstPickConfig? rstCfg = null;
         if (cpi.EnableRestoration && x.E.Lossless[0] == 0)
         {
-            rstCfg = new AomRstPickConfig { Rdmult = cpi.RdRdmult, BaseQindex = cm.BaseQindex, SbSize = cm.SbSize };
+            rstCfg = new AomRstPickConfig { Rdmult = cpi.RdRdmult, BaseQindex = cm.BaseQindex, SbSize = cm.SbSize, BitDepth = cm.BitDepth };
             rstCfg.SetSpeedFeatures(sf.lpf_sf);
             // av1_fill_lr_rates from the tile's CDFs
             AomModeCostFill.FillLr(x.ModeCosts, x.TileCtx);
@@ -88,6 +88,12 @@ internal static partial class AomEncoder
             int isUv = p > 0 ? 1 : 0;
             int w = (((cm.Width + 7) & ~7) >> (isUv != 0 ? cm.SsX : 0)), h = (((cm.Height + 7) & ~7) >> (isUv != 0 ? cm.SsY : 0));
             var pl = cur.Planes[p];
+            if (pl.Buf16 != null)
+            {
+                for (int r = 0; r < h; r++)
+                    Array.Copy(pl.Buf16, pl.At(0, r), cm.CurFrame.Buffers16[p], cm.CurFrame.Offsets[p] + r * cm.CurFrame.Strides[p], w);
+                continue;
+            }
             for (int r = 0; r < h; r++)
                 Array.Copy(pl.Buf, pl.At(0, r), cm.CurFrame.Buffers[p], cm.CurFrame.Offsets[p] + r * cm.CurFrame.Strides[p], w);
         }
@@ -97,10 +103,16 @@ internal static partial class AomEncoder
     /// <summary>The frame's 8-aligned area as an AomYv12 (the post filters' frame type).</summary>
     private static AomYv12 ToYv12(AomFrameBuffer fb, AomCommon cm)
     {
-        var y = new AomYv12(cm.Width, cm.Height, cm.SsX, cm.SsY, cm.NumPlanes);
+        var y = new AomYv12(cm.Width, cm.Height, cm.SsX, cm.SsY, cm.NumPlanes, bitDepth: fb.BitDepth);
         for (int p = 0; p < cm.NumPlanes; p++)
         {
             var pl = y.Planes[p];
+            if (fb.Hbd)
+            {
+                for (int r = 0; r < pl.Height; r++)
+                    Array.Copy(fb.Buffers16[p], fb.Offsets[p] + r * fb.Strides[p], pl.Buf16, pl.At(0, r), pl.Width);
+                continue;
+            }
             for (int r = 0; r < pl.Height; r++)
                 Array.Copy(fb.Buffers[p], fb.Offsets[p] + r * fb.Strides[p], pl.Buf, pl.At(0, r), pl.Width);
         }

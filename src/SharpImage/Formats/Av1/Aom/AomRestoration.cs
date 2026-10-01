@@ -47,6 +47,8 @@ internal struct AomRestorationTileLimits
 internal sealed class AomStripeBoundaries
 {
     public byte[] Above = Array.Empty<byte>(), Below = Array.Empty<byte>();
+    /// <summary>The high bit depth boundary lines.</summary>
+    public ushort[] Above16 = Array.Empty<ushort>(), Below16 = Array.Empty<ushort>();
     public int Stride;
 }
 
@@ -163,6 +165,7 @@ internal static partial class AomRestoration
     /// <summary>av1_extend_frame (8-bit): replicate the edge samples of the width x height area border samples out.</summary>
     public static void ExtendFrame(AomYv12Plane p, int width, int height, int borderHorz, int borderVert)
     {
+        if (p.Buf16 != null) { ExtendFrameHbd(p, width, height, borderHorz, borderVert); return; }
         byte[] b = p.Buf;
         for (int i = 0; i < height; ++i)
         {
@@ -189,6 +192,15 @@ internal static partial class AomRestoration
         var b = rsi.Boundaries;
         b.Stride = planeW + 2 * RestorationExtraHorz + 32;
         int size = numStripes * RestorationCtxVert * b.Stride;
+        if (frame.BitDepth > 8)
+        {
+            if (b.Above16.Length < size)
+            {
+                b.Above16 = new ushort[size];
+                b.Below16 = new ushort[size];
+            }
+            return;
+        }
         if (b.Above.Length < size)
         {
             b.Above = new byte[size];
@@ -248,6 +260,20 @@ internal static partial class AomRestoration
                 int y1 = Math.Min((stripeIdx + 1) * stripeHeight - stripeOff, planeH);
                 bool useDeblockAbove = stripeIdx > 0;
                 bool useDeblockBelow = y1 < planeHeight;
+                if (p.Buf16 != null)
+                {
+                    if (!afterCdef)
+                    {
+                        if (useDeblockAbove) SaveDeblockBoundaryLines16(p, bnd, y0 - RestorationCtxVert, stripeIdx, true);
+                        if (useDeblockBelow) SaveDeblockBoundaryLines16(p, bnd, y1, stripeIdx, false);
+                    }
+                    else
+                    {
+                        if (!useDeblockAbove) SaveCdefBoundaryLines16(p, bnd, y0, stripeIdx, true);
+                        if (!useDeblockBelow) SaveCdefBoundaryLines16(p, bnd, y1 - 1, stripeIdx, false);
+                    }
+                    continue;
+                }
                 if (!afterCdef)
                 {
                     if (useDeblockAbove) SaveDeblockBoundaryLines(p, bnd, y0 - RestorationCtxVert, stripeIdx, true);
@@ -578,6 +604,8 @@ internal static partial class AomRestoration
         public const int LineBufferWidth = RestorationUnitSizeMax * 3 / 2 + 2 * RestorationExtraHorz;
         public readonly byte[][] SaveAbove = { new byte[LineBufferWidth], new byte[LineBufferWidth], new byte[LineBufferWidth] };
         public readonly byte[][] SaveBelow = { new byte[LineBufferWidth], new byte[LineBufferWidth], new byte[LineBufferWidth] };
+        public readonly ushort[][] SaveAbove16 = { new ushort[LineBufferWidth], new ushort[LineBufferWidth], new ushort[LineBufferWidth] };
+        public readonly ushort[][] SaveBelow16 = { new ushort[LineBufferWidth], new ushort[LineBufferWidth], new ushort[LineBufferWidth] };
         public readonly ushort[] WienerTemp = new ushort[(128 + 7) * 128];
         public readonly int[] Flt0 = new int[RestorationUnitPelsMax], Flt1 = new int[RestorationUnitPelsMax];
         public readonly SgrScratch Sgr = new();
@@ -651,6 +679,11 @@ internal static partial class AomRestoration
         UnitScratch sc)
     {
         _ = planeW;
+        if (data.Buf16 != null)
+        {
+            FilterUnitHbd(limits, rui, rsb, planeH, ssX, ssY, data, dst, sc, BitDepthOf(data));
+            return;
+        }
         int unitH = limits.VEnd - limits.VStart, unitW = limits.HEnd - limits.HStart;
         int dataTl = data.At(limits.HStart, limits.VStart), dstTl = dst.At(limits.HStart, limits.VStart);
         if (rui.Type == RestoreNone)
@@ -740,7 +773,10 @@ internal static partial class AomRestoration
                 ++row;
             }
             // loop_restoration_copy_planes
-            for (int r = 0; r < planeH; r++) Buffer.BlockCopy(dst.Buf, dst.At(0, r), data.Buf, data.At(0, r), planeW);
+            if (dst.Buf16 != null)
+                for (int r = 0; r < planeH; r++) Array.Copy(dst.Buf16, dst.At(0, r), data.Buf16, data.At(0, r), planeW);
+            else
+                for (int r = 0; r < planeH; r++) Buffer.BlockCopy(dst.Buf, dst.At(0, r), data.Buf, data.At(0, r), planeW);
         }
     }
 

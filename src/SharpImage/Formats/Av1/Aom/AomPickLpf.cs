@@ -11,6 +11,8 @@ internal static class AomSse
     public static long SsePart(AomYv12Plane a, AomYv12Plane b, int hstart, int width, int vstart, int height)
     {
         if (width <= 0 || height <= 0) return 0;
+        // aom_highbd_get_{y,u,v}_sse: the exact SSE (aom_highbd_8_mse16x16 blocks + highbd_encoder_sse edges)
+        if (a.Buf16 != null) return AomHbd.Sse(a.Buf16, a.At(hstart, vstart), a.Stride, b.Buf16, b.At(hstart, vstart), b.Stride, width, height);
         return AomEncodeMb.Sse(a.Buf, a.At(hstart, vstart), a.Stride, b.Buf, b.At(hstart, vstart), b.Stride, width, height);
     }
 
@@ -21,6 +23,17 @@ internal static class AomSse
     public static ulong VarPart(AomYv12Plane a, int hstart, int width, int vstart, int height)
     {
         ulong ss = 0, s = 0;
+        if (a.Buf16 != null)
+        {
+            // aom_highbd_get_{y,u,v}_var: aom_var_2d_u16 / area
+            for (int r = 0; r < height; r++)
+            {
+                int ia = a.At(hstart, vstart + r);
+                for (int c = 0; c < width; c++) { ulong v = a.Buf16[ia + c]; ss += v * v; s += v; }
+            }
+            ulong n16 = (ulong)(width * height);
+            return (ss - s * s / n16) / n16;
+        }
         for (int r = 0; r < height; r++)
         {
             int ia = a.At(hstart, vstart + r);
@@ -224,7 +237,7 @@ internal static class AomPickLpf
                     Span<int> last = lastLevels;
                     var lfc = lfChroma;
                     var p1 = cur.Planes[1];
-                    var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border);
+                    var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border, p1.Buf16 != null) { BitDepth = p1.BitDepth };
                     var filterC = new AomLoopFilter();
                     lfc.FilterLevelU = SearchFilterLevel(sd, cur, backupUv, mi, lfc, filterC, cfg, partial, last, 1, 0, out chromaSse[1]);
                     lfc.FilterLevelV = SearchFilterLevel(sd, cur, backupUv, mi, lfc, filterC, cfg, partial, last, 2, 0, out chromaSse[2]);
@@ -232,7 +245,7 @@ internal static class AomPickLpf
             }
 
             var p0 = cur.Planes[0];
-            var backupY = new AomYv12Plane(p0.Width, p0.Height, p0.CropWidth, p0.CropHeight, p0.Border);
+            var backupY = new AomYv12Plane(p0.Width, p0.Height, p0.CropWidth, p0.CropHeight, p0.Border, p0.Buf16 != null) { BitDepth = p0.BitDepth };
             lf.FilterLevel[0] = lf.FilterLevel[1] = SearchFilterLevel(sd, cur, backupY, mi, lf, filter, cfg, partial,
                 lastFrameFilterLevel, 0, 2, out bestFilterSse[0]);
             if (method != LPF_PICK_FROM_FULL_IMAGE_NON_DUAL)
@@ -253,7 +266,7 @@ internal static class AomPickLpf
             else if (numPlanes > 1)
             {
                 var p1 = cur.Planes[1];
-                var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border);
+                var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border, p1.Buf16 != null) { BitDepth = p1.BitDepth };
                 lf.FilterLevelU = SearchFilterLevel(sd, cur, backupUv, mi, lf, filter, cfg, partial,
                     lastFrameFilterLevel, 1, 0, out bestFilterSse[1]);
                 lf.FilterLevelV = SearchFilterLevel(sd, cur, backupUv, mi, lf, filter, cfg, partial,

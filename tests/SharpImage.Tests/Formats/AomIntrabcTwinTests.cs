@@ -104,7 +104,7 @@ public sealed class AomIntrabcTwinTests
             int off = rng.Next(0, 160 - size) * 160 + rng.Next(0, 160 - size);
             uint a1, a2;
             fixed (byte* p = img) f(p + off, 160, size, &a1, &a2);
-            AomHashMotion.GetBlockHashValue(info, img, off, 160, size, out uint b1, out uint b2);
+            AomHashMotion.GetBlockHashValue(info, img, null, off, 160, size, out uint b1, out uint b2);
             if (!Equals(b1, a1)) return $"b1: {b1} != {a1}";
             if (!Equals(b2, a2)) return $"b2: {b2} != {a2}";
         }

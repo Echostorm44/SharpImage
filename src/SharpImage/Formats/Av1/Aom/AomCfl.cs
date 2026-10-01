@@ -12,7 +12,7 @@ namespace SharpImage.Formats.Av1;
 /// libaom dispatches SSSE3/AVX2 versions of subsample / subtract_average / predict; they equal the C (twin-verified).
 /// </summary>
 [SkipLocalsInit]
-internal static unsafe class AomCfl
+internal static unsafe partial class AomCfl
 {
     public const int CFL_BUF_LINE = AomCflCtx.CflBufLine, CFL_BUF_SQUARE = AomCflCtx.CflBufSquare;
     private const int MI_SIZE_LOG2 = 2;
@@ -384,6 +384,11 @@ internal static unsafe class AomCfl
             // Only dimensions of size 4 can have an odd offset.
             Sub8x8AdjustOffset(cfl, xd.MiRow, xd.MiCol, ref row, ref col);
         }
+        if (pd.Dst.Buf16 != null)
+        {
+            fixed (ushort* buf16 = pd.Dst.Buf16) CflStoreHbd(cfl, buf16 + offset, stride, row, col, txSize);
+            return;
+        }
         fixed (byte* buf = pd.Dst.Buf) CflStore(cfl, buf + offset, stride, row, col, txSize);
     }
 
@@ -487,6 +492,11 @@ internal static unsafe class AomCfl
         int width = MaxIntraBlockWidth(xd, bsize, 0, txSize);
         int height = MaxIntraBlockHeight(xd, bsize, 0, txSize);
         txSize = GetTxSize(width, height);
+        if (pd.Dst.Buf16 != null)
+        {
+            fixed (ushort* buf16 = pd.Dst.Buf16) CflStoreHbd(cfl, buf16 + pd.Dst.Offset, pd.Dst.Stride, row, col, txSize);
+            return;
+        }
         fixed (byte* buf = pd.Dst.Buf) CflStore(cfl, buf + pd.Dst.Offset, pd.Dst.Stride, row, col, txSize);
     }
 }

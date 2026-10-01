@@ -32,7 +32,7 @@ internal sealed partial class AomComp
 
     /// <summary>set_rdmult(cpi, x, -1) (av1_get_cb_rdmult without TPL stats): the rdmult of the superblock's delta qindex.</summary>
     public int SetRdmultDeltaQ(AomMacroblock x)
-        => AomRd.RdMultKeyFrame(Cm.BaseQindex + x.RdmultDeltaQindex + Cm.YDcDeltaQ, 8, TuneIq);
+        => AomRd.RdMultKeyFrame(Cm.BaseQindex + x.RdmultDeltaQindex + Cm.YDcDeltaQ, Cm.BitDepth, TuneIq);
 
     /// <summary>av1_set_mb_ssim_rdmult_scaling: per 16x16 luma block the mean of its 8x8 per-pixel variances through
     /// the exponential SSIM model, normalised by the geometric mean over the frame.</summary>
@@ -55,8 +55,13 @@ internal sealed partial class AomComp
                     for (int miCol = col * numMiW; miCol < cm.MiCols && miCol < (col + 1) * numMiW; miCol += 2)
                     {
                         // av1_get_perpixel_variance_facade(BLOCK_8X8, AOM_PLANE_Y): variance vs. AV1_VAR_OFFS, rounded per pixel
-                        uint v = AomIntraModeSearch.VarianceVsZero(buf, yOff + (miRow << 2) * yStride + (miCol << 2), yStride, 8, 8, out _);
-                        var += (v + 32) >> 6;
+                        if (src.Hbd)
+                            var += AomHbd.PerpixelVariance(src.Buffers16[0], yOff + (miRow << 2) * yStride + (miCol << 2), yStride, 8, 8, src.BitDepth);
+                        else
+                        {
+                            uint v = AomIntraModeSearch.VarianceVsZero(buf, yOff + (miRow << 2) * yStride + (miCol << 2), yStride, 8, 8, out _);
+                            var += (v + 32) >> 6;
+                        }
                         numOfVar += 1.0;
                     }
                 var = var / numOfVar;

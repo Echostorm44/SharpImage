@@ -142,8 +142,17 @@ internal static partial class AomQm
 
     /// <summary>av1_block_error_qm (8-bit): the matrix-weighted coefficient error and energy (weights by scan[i], as
     /// libaom indexes them).</summary>
-    internal static long BlockErrorQm(ReadOnlySpan<int> coeff, ReadOnlySpan<int> dqcoeff, int blockSize, byte[] qm, ReadOnlySpan<ushort> scan, out long ssz)
+    internal static long BlockErrorQm(ReadOnlySpan<int> coeff, ReadOnlySpan<int> dqcoeff, int blockSize, byte[] qm, ReadOnlySpan<ushort> scan, out long ssz,
+        int bd = 8)
     {
+        if (bd > 8)
+        {
+            // high bit depth: the sums rounded down by 2 (bd - 8) bits
+            long e = BlockErrorQm(coeff, dqcoeff, blockSize, qm, scan, out long s8);
+            int shift = 2 * (bd - 8), rounding = (1 << shift) >> 1;
+            ssz = (s8 + rounding) >> shift;
+            return (e + rounding) >> shift;
+        }
         long error = 0, sqcoeff = 0;
         for (int i = 0; i < blockSize; i++)
         {

@@ -27,7 +27,7 @@ internal struct AomQuantParam
 // Port of libaom 3.14.1 av1/encoder/encodemb.{c,h} (subtract, xform, quant, optimize_b, set_txb_context), the
 // transform-block iterator, av1_inverse_transform_block's use, and the 8-bit distortion kernels the search uses
 // (aom_sum_squares_2d_i16, aom_sum_sse_2d_i16, aom_sse, av1_block_error as AVX2 runs it, aom_satd).
-internal static class AomEncodeMb
+internal static partial class AomEncodeMb
 {
     /// <summary>BLOCK_OFFSET: a tx block's coefficient offset (block counts 4x4 units).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -229,6 +229,13 @@ internal static class AomEncodeMb
         var p = x.Plane[plane];
         var pd = x.E.Plane[plane];
         int diffStride = BlockSizeWide[planeBsize];
+        if (p.Src.Buf16 != null)
+        {
+            AomHbd.SubtractBlock(TxSizeHigh[txSize], TxSizeWide[txSize], p.SrcDiff, (blkRow * diffStride + blkCol) << 2, diffStride,
+                p.Src.Buf16, p.Src.Offset + ((blkRow * p.Src.Stride + blkCol) << 2), p.Src.Stride,
+                pd.Dst.Buf16, pd.Dst.Offset + ((blkRow * pd.Dst.Stride + blkCol) << 2), pd.Dst.Stride);
+            return;
+        }
         SubtractBlock(TxSizeHigh[txSize], TxSizeWide[txSize], p.SrcDiff, (blkRow * diffStride + blkCol) << 2, diffStride,
             p.Src.Buf, p.Src.Offset + ((blkRow * p.Src.Stride + blkCol) << 2), p.Src.Stride,
             pd.Dst.Buf, pd.Dst.Offset + ((blkRow * pd.Dst.Stride + blkCol) << 2), pd.Dst.Stride);
@@ -240,6 +247,11 @@ internal static class AomEncodeMb
         var p = x.Plane[plane];
         var pd = x.E.Plane[plane];
         int bw = BlockSizeWide[planeBsize], bh = BlockSizeHigh[planeBsize];
+        if (p.Src.Buf16 != null)
+        {
+            AomHbd.SubtractBlock(bh, bw, p.SrcDiff, 0, bw, p.Src.Buf16, p.Src.Offset, p.Src.Stride, pd.Dst.Buf16, pd.Dst.Offset, pd.Dst.Stride);
+            return;
+        }
         SubtractBlock(bh, bw, p.SrcDiff, 0, bw, p.Src.Buf, p.Src.Offset, p.Src.Stride, pd.Dst.Buf, pd.Dst.Offset, pd.Dst.Stride);
     }
 
@@ -267,8 +279,13 @@ internal static class AomEncodeMb
             return;
         }
         TxTypeKinds(txType, out int hKind, out int vKind, out bool flipUd, out bool flipLr);
-        Av1FwdTxfmAom.ForwardRaw(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
-            txSize, hKind, vKind, flipUd, flipLr, p.Coeff.AsSpan(BlockOffset(block), MaxEob(txSize)));
+        // high bit depth: av1_highbd_fwd_txfm (av1_fwd_txfm2d_* in 32-bit lanes, every size)
+        if (x.E.Bd > 8)
+            Av1FwdTxfmAom.ForwardRawRef(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
+                txSize, hKind, vKind, flipUd, flipLr, p.Coeff.AsSpan(BlockOffset(block), MaxEob(txSize)));
+        else
+            Av1FwdTxfmAom.ForwardRaw(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
+                txSize, hKind, vKind, flipUd, flipLr, p.Coeff.AsSpan(BlockOffset(block), MaxEob(txSize)));
     }
 
     private const int UnitQuantShift = 2, UnitQuantFactor = 1 << UnitQuantShift;
@@ -400,7 +417,27 @@ internal static class AomEncodeMb
         var coeff = p.Coeff.AsSpan(off, n);
         var q = p.Qcoeff.AsSpan(off, n);
         var dq = p.Dqcoeff.AsSpan(off, n);
-        if (qp.XformQuantIdx != AomXformQuant.SkipQuant)
+        if (qp.XformQuantIdx != AomXformQuant.SkipQuant && x.E.Bd > 8)
+        {
+            // quant_func_list[...][is_hbd]: av1_highbd_quantize_fp_facade / av1_highbd_quantize_b_facade
+            short[] iscanH = IScanOf(txSize, txType);
+            p.Eobs[block] = (ushort)(qp.Qmatrix != null && qp.Iqmatrix != null ? qp.XformQuantIdx switch
+            {
+                AomXformQuant.Fp => AomQuantizeHbd.QuantizeFpHelperQm(coeff, n, scan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
+                    p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                AomXformQuant.B => AomQuantizeHbd.QuantizeBHelperQm(coeff, n, scan, p.Zbin0, p.Zbin1, p.Round0, p.Round1, p.Quant0, p.Quant1,
+                    p.QuantShift0, p.QuantShift1, p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                _ => throw new NotSupportedException("AV1_XFORM_QUANT_DC is not used on the all-intra path"),
+            } : qp.XformQuantIdx switch
+            {
+                AomXformQuant.Fp => AomQuantizeHbd.QuantizeFp(coeff, n, iscanH, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
+                    p.Dequant0, p.Dequant1, qp.LogScale, q, dq),
+                AomXformQuant.B => AomQuantizeHbd.QuantizeB(coeff, n, iscanH, p.Zbin0, p.Zbin1, p.Round0, p.Round1, p.Quant0, p.Quant1,
+                    p.QuantShift0, p.QuantShift1, p.Dequant0, p.Dequant1, qp.LogScale, q, dq),
+                _ => throw new NotSupportedException("AV1_XFORM_QUANT_DC is not used on the all-intra path"),
+            });
+        }
+        else if (qp.XformQuantIdx != AomXformQuant.SkipQuant)
         {
             short[] iscan = IScanOf(txSize, txType);
             int eob = qp.Qmatrix != null && qp.Iqmatrix != null ? qp.XformQuantIdx switch

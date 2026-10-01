@@ -40,8 +40,8 @@ internal static partial class AomPalette
             return;
         }
         ref AomPaletteModeInfo pmi = ref mbmi.Palette;
-        if (cpi.UseHighbitdepth) throw new NotImplementedException("high-bitdepth palette: palette_rd_y");
-        for (int i = 0; i < numUniqueColors; ++i) pmi.PaletteColors[i] = (ushort)Math.Clamp((int)centroids[i], 0, 255);   // clip_pixel
+        int maxPix = (1 << cpi.BitDepth) - 1;   // clip_pixel_highbd / clip_pixel
+        for (int i = 0; i < numUniqueColors; ++i) pmi.PaletteColors[i] = (ushort)Math.Clamp((int)centroids[i], 0, maxPix);
         pmi.PaletteSize0 = (byte)numUniqueColors;
         var xd = x.E;
         byte[] colorMap = xd.Plane[0].ColorIndexMap;
@@ -192,9 +192,17 @@ internal static partial class AomPalette
 
         int[] countBuf = t_countBuf ??= new int[1 << 12];   // Maximum (1 << 12) color levels.
         int colors, colorsThreshold;
-        if (isHbd) throw new NotImplementedException("high-bitdepth palette: av1_count_colors_highbd");
-        colors = CountColors(src, srcOff, srcStride, rows, cols, countBuf);
-        colorsThreshold = colors;
+        ushort[]? src16 = x.Plane[0].Src.Buf16;
+        if (isHbd)
+        {
+            Span<int> countBuf8 = stackalloc int[1 << 8];   // Maximum (1 << 8) bins for hbd path.
+            colors = CountColorsHighbd(src16!, srcOff, srcStride, rows, cols, bitDepth, countBuf, countBuf8, out colorsThreshold);
+        }
+        else
+        {
+            colors = CountColors(src, srcOff, srcStride, rows, cols, countBuf);
+            colorsThreshold = colors;
+        }
 
         byte[] colorMap = xd.Plane[0].ColorIndexMap;
         int colorThreshPalette = x.ColorPaletteThresh;
@@ -215,7 +223,9 @@ internal static partial class AomPalette
         {
             short[] data = x.KmeansDataBuf;
             Span<short> centroids = stackalloc short[PALETTE_MAX_SIZE];
-            FillDataAndGetBounds(src, srcOff, srcStride, rows, cols, isHbd, data, out int lowerBound, out int upperBound);
+            int lowerBound, upperBound;
+            if (isHbd) FillDataAndGetBounds(src16!, srcOff, srcStride, rows, cols, data, out lowerBound, out upperBound);
+            else FillDataAndGetBounds(src, srcOff, srcStride, rows, cols, isHbd, data, out lowerBound, out upperBound);
 
             mbmi.Mode = DC_PRED;
             mbmi.UseFilterIntra = 0;
@@ -331,12 +341,23 @@ internal static partial class AomPalette
         AomRdoptUtils.GetBlockDimensions(bsize, 1, xd, out int planeBlockWidth, out int planeBlockHeight, out int rows, out int cols);
 
         mbmi.UvMode = UV_DC_PRED;
-        if (cpi.UseHighbitdepth) throw new NotImplementedException("high-bitdepth palette: av1_count_colors_highbd");
-        Span<int> countBuf = stackalloc int[1 << 8];
-        colorsU = CountColors(srcU, srcUOff, srcStride, rows, cols, countBuf);
-        colorsV = CountColors(srcV, srcVOff, srcStride, rows, cols, countBuf);
-        colorsThresholdU = colorsU;
-        colorsThresholdV = colorsV;
+        ushort[]? srcU16 = x.Plane[1].Src.Buf16, srcV16 = x.Plane[2].Src.Buf16;
+        bool hbd = cpi.UseHighbitdepth;
+        if (hbd)
+        {
+            int[] countBufHbd = t_countBuf ??= new int[1 << 12];   // Maximum (1 << 12) color levels.
+            Span<int> countBuf8 = stackalloc int[1 << 8];         // Maximum (1 << 8) bins for hbd path.
+            colorsU = CountColorsHighbd(srcU16!, srcUOff, srcStride, rows, cols, cpi.BitDepth, countBufHbd, countBuf8, out colorsThresholdU);
+            colorsV = CountColorsHighbd(srcV16!, srcVOff, srcStride, rows, cols, cpi.BitDepth, countBufHbd, countBuf8, out colorsThresholdV);
+        }
+        else
+        {
+            Span<int> countBuf = stackalloc int[1 << 8];
+            colorsU = CountColors(srcU, srcUOff, srcStride, rows, cols, countBuf);
+            colorsV = CountColors(srcV, srcVOff, srcStride, rows, cols, countBuf);
+            colorsThresholdU = colorsU;
+            colorsThresholdV = colorsV;
+        }
 
         Span<ushort> colorCache = stackalloc ushort[2 * PALETTE_MAX_SIZE];
         int nCache = GetPaletteCache(xd, 1, colorCache);
@@ -348,14 +369,14 @@ internal static partial class AomPalette
             short[] data = x.KmeansDataBuf;
             Span<short> centroids = stackalloc short[2 * PALETTE_MAX_SIZE];
 
-            int lbU = srcU[srcUOff], ubU = srcU[srcUOff];
-            int lbV = srcV[srcVOff], ubV = srcV[srcVOff];
+            int lbU = hbd ? srcU16![srcUOff] : srcU[srcUOff], ubU = lbU;
+            int lbV = hbd ? srcV16![srcVOff] : srcV[srcVOff], ubV = lbV;
             for (int r = 0; r < rows; ++r)
             {
                 for (int c = 0; c < cols; ++c)
                 {
-                    int valU = srcU[srcUOff + r * srcStride + c];
-                    int valV = srcV[srcVOff + r * srcStride + c];
+                    int valU = hbd ? srcU16![srcUOff + r * srcStride + c] : srcU[srcUOff + r * srcStride + c];
+                    int valV = hbd ? srcV16![srcVOff + r * srcStride + c] : srcV[srcVOff + r * srcStride + c];
                     data[(r * cols + c) * 2] = (short)valU;
                     data[(r * cols + c) * 2 + 1] = (short)valV;
                     if (valU < lbU) lbU = valU;
@@ -397,7 +418,7 @@ internal static partial class AomPalette
                 pmi.PaletteSize1 = (byte)n;
                 for (int i = 1; i < 3; ++i)
                     for (int j = 0; j < n; ++j)
-                        pmi.PaletteColors[i * PALETTE_MAX_SIZE + j] = (ushort)Math.Clamp((int)centroids[j * 2 + i - 1], 0, 255);   // clip_pixel
+                        pmi.PaletteColors[i * PALETTE_MAX_SIZE + j] = (ushort)Math.Clamp((int)centroids[j * 2 + i - 1], 0, (1 << cpi.BitDepth) - 1);
 
                 if (cpi.Sf.intra_sf.early_term_chroma_palette_size_search != 0)
                 {

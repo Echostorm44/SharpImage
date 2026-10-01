@@ -122,11 +122,11 @@ internal static class AomQuantSetup
         int currentQindex = Math.Clamp(cpi.DeltaQPresentFlag ? cm.BaseQindex + x.DeltaQindex : cm.BaseQindex, 0, 255);
         int qindex = currentQindex;   // av1_get_qindex (segmentation off)
         int qindexRd = qindex;
-        int rdmult = AomRd.RdMultKeyFrame(qindexRd + cm.YDcDeltaQ, 8, cpi.TuneIq);
+        int rdmult = AomRd.RdMultKeyFrame(qindexRd + cm.YDcDeltaQ, cm.BitDepth, cpi.TuneIq);
         if (x.Qindex != qindex || doUpdate) SetQIndex(cpi, x, qindex);
         else SetQmatrix(cpi, x);   // (segment unchanged; av1_use_qmatrix re-applies set_qmatrix)
         x.Errorperbit = AomRd.ErrorPerBit(rdmult);
-        x.SadPerBit = AomEncodeFrame.SadPerBit(qindexRd);
+        x.SadPerBit = AomEncodeFrame.SadPerBit(qindexRd, cm.BitDepth);
     }
 
     /// <summary>setup_delta_q (DELTA_Q_VARIANCE_BOOST, no delta lf): the superblock's qindex.</summary>
@@ -186,24 +186,30 @@ internal static class AomQuantSetup
     {
         int baseQindex = cpi.Cm.BaseQindex;
         uint variance = GetVarianceBoostBlockVariance(x);
+        int bd = cpi.Cm.BitDepth;
         double strength = (cpi.DeltaqStrength / 100.0) * 3.0;
         strength = Math.Clamp(strength, 0.0, 6.0);   // fclamp
         if (variance == 0) variance = 1;
         double qstepRatio = 0.15 * strength * (-Math.Log2((double)variance) + 10.0) + 1.0;
         qstepRatio = Math.Clamp(qstepRatio, 1.0, VarBoostMaxBoost);
-        double baseQ = Av1Tables.DequantTable[0, baseQindex, 1] / 4.0;   // av1_convert_qindex_to_q
+        double baseQ = QindexToQ(baseQindex, bd);   // av1_convert_qindex_to_q
         double targetQ = baseQ / qstepRatio;
-        int targetQindex = ConvertQToQindex(targetQ);
+        int targetQindex = ConvertQToQindex(targetQ, bd);
         int boost = (int)Math.Round((baseQindex + 544.0) * (baseQindex - targetQindex) / 1279.0, MidpointRounding.AwayFromZero);
         boost = Math.Min(VarBoostMaxDeltaqRange, boost);
         return Math.Max(baseQindex - boost, 1);   // MINQ + 1
     }
 
-    /// <summary>av1_convert_q_to_qindex (8-bit): the first qindex whose q matches or exceeds q.</summary>
-    private static int ConvertQToQindex(double q)
+    /// <summary>av1_convert_qindex_to_q: the AC dequantizer / 4 (/ 16 at 10 bits, / 64 at 12).</summary>
+    private static double QindexToQ(int qindex, int bd)
+        => bd == 8 ? Av1Tables.DequantTable[0, qindex, 1] / 4.0 : bd == 10 ? Av1Tables.DequantTable[1, qindex, 1] / 16.0
+            : Av1Tables.DequantTable[2, qindex, 1] / 64.0;
+
+    /// <summary>av1_convert_q_to_qindex: the first qindex whose q matches or exceeds q.</summary>
+    private static int ConvertQToQindex(double q, int bd)
     {
         int qindex = 0;
-        while (qindex < 255 && Av1Tables.DequantTable[0, qindex, 1] / 4.0 < q) qindex++;
+        while (qindex < 255 && QindexToQ(qindex, bd) < q) qindex++;
         return qindex;
     }
 
@@ -215,7 +221,9 @@ internal static class AomQuantSetup
         var src = x.Plane[0].Src;
         for (int i = 0; i < 8; i++)
             for (int j = 0; j < 8; j++)
-                variances[i * 8 + j] = AomIntraModeSearch.VarianceVsZero(src.Buf, src.Offset + i * 8 * src.Stride + j * 8, src.Stride, 8, 8, out _) / 64;
+                variances[i * 8 + j] = (src.Buf16 != null
+                    ? AomHbd.Variance(src.Buf16, src.Offset + i * 8 * src.Stride + j * 8, src.Stride, null, 0, 0, 0, 8, 8, x.E.Bd, out _)
+                    : AomIntraModeSearch.VarianceVsZero(src.Buf, src.Offset + i * 8 * src.Stride + j * 8, src.Stride, 8, 8, out _)) / 64;
         variances.Sort();
         const int octile = 5, inOctile = 8;
         int middle = octile * inOctile - 1;
