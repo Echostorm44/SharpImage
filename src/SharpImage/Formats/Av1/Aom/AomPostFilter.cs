@@ -15,7 +15,7 @@ internal sealed class AomPostFilterResult
 /// <summary>CdefInfo: the frame's CDEF damping, strength bits and strength presets (luma / chroma, each primary * 4 + secondary).</summary>
 internal sealed class AomCdefInfo
 {
-    public int CdefDamping = 3, CdefBits, NbCdefStrengths = 1;
+    public int CdefDamping, CdefBits, NbCdefStrengths = 1;
     public readonly int[] CdefStrengths = new int[8], CdefUvStrengths = new int[8];
 }
 
@@ -33,21 +33,34 @@ internal static class AomPostFilter
     /// <param name="applyRestoration">apply the chosen restoration to cur</param>
     /// <param name="lf">the frame's struct loopfilter (its levels are overwritten; deltas as the encoder set them)</param>
     public static AomPostFilterResult Run(AomYv12 src, AomYv12 cur, AomLfMiGrid mi, AomLpfPickConfig lpfCfg,
-        AomRstPickConfig? rstCfg, bool applyRestoration, AomLoopFilterParams? lf = null)
+        AomRstPickConfig? rstCfg, bool applyRestoration, AomLoopFilterParams? lf = null,
+        Func<AomYv12, AomCdefInfo>? cdefSearch = null, Action<AomYv12, AomCdefInfo>? cdefApply = null)
     {
         lf ??= new AomLoopFilterParams();
         var filter = new AomLoopFilter();
         AomPickLpf.PickFilterLevel(src, cur, mi, lf, lpfCfg, filter);
         if (lf.FilterLevel[0] != 0 || lf.FilterLevel[1] != 0) filter.FilterFrame(cur, mi, lf, 0, cur.NumPlanes);
-        if (rstCfg == null) return new AomPostFilterResult { LoopFilter = lf };
 
-        var rst = new AomRestorationInfo[cur.NumPlanes];
-        for (int p = 0; p < rst.Length; p++) rst[p] = new AomRestorationInfo();
-        AomRestoration.SaveBoundaryLines(cur, rst, afterCdef: false);
-        AomRestoration.SaveBoundaryLines(cur, rst, afterCdef: true);
+        // cdef_restoration_frame: the deblocked stripe boundaries, the CDEF search and the CDEF filter (avifenc's
+        // skip_postproc_filtering skips it when nothing after CDEF reads the frame)
+        AomRestorationInfo[]? rst = null;
+        if (rstCfg != null)
+        {
+            rst = new AomRestorationInfo[cur.NumPlanes];
+            for (int p = 0; p < rst.Length; p++) rst[p] = new AomRestorationInfo();
+            AomRestoration.SaveBoundaryLines(cur, rst, afterCdef: false);
+        }
+        AomCdefInfo? cdef = null;
+        if (cdefSearch != null)
+        {
+            cdef = cdefSearch(cur);
+            if (rstCfg != null || applyRestoration) cdefApply!(cur, cdef);
+        }
+        if (rstCfg == null) return new AomPostFilterResult { LoopFilter = lf, Cdef = cdef };
+        AomRestoration.SaveBoundaryLines(cur, rst!, afterCdef: true);
         AomPickRst.PickFilterRestoration(src, cur, rst, rstCfg);
         if (applyRestoration && Array.Exists(rst, r => r.FrameRestorationType != AomRestoration.RestoreNone))
             AomRestoration.FilterFrame(cur, rst);
-        return new AomPostFilterResult { LoopFilter = lf, Restoration = rst };
+        return new AomPostFilterResult { LoopFilter = lf, Restoration = rst, Cdef = cdef };
     }
 }

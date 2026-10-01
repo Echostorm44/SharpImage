@@ -72,7 +72,10 @@ internal static partial class AomEncoder
             x.ModeCosts.WienerRestoreCost.CopyTo(rstCfg.WienerRestoreCost, 0);
             x.ModeCosts.SgrprojRestoreCost.CopyTo(rstCfg.SgrprojRestoreCost, 0);
         }
-        var result = AomPostFilter.Run(src, cur, mi, lpfCfg, rstCfg, applyRestoration, lf);
+        // is_cdef_used: seq enable_cdef (cdef_control != CDEF_NONE) and not coded lossless
+        bool useCdef = cpi.CdefControl != 0 && x.E.Lossless[0] == 0;
+        var result = AomPostFilter.Run(src, cur, mi, lpfCfg, rstCfg, applyRestoration, lf,
+            useCdef ? f => AomCdef.Search(cpi, f, src, cpi.RdRdmult) : null, useCdef ? (f, ci) => AomCdef.Frame(cpi, f, ci) : null);
         cpi.PostFilter = result;
         // the filtered reconstruction back into the frame buffer
         for (int p = 0; p < np; p++)
