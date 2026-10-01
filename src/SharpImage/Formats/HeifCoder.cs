@@ -1120,9 +1120,11 @@ public static partial class HeifCoder
     {
         private readonly bool prevAvoid;
         private readonly Av1.Av1EncodeSpeed? prevSpeed;
-        private readonly int prevThreads, prevSharpness;
+        private readonly int prevThreads, prevSharpness, prevAom;
         public EncoderScope(AvifEncodeOptions options, bool allIntra = false)
         {
+            // libavif's all-intra stills go through the libaom-port encoder (Av1.AomStill) where it applies
+            prevAom = Av1.AomStill.Enter(allIntra && options.EnableCdef != true && options.Tune == AvifTune.Psnr ? options.Speed : -1);
             if (options.Sharpness is < 0 or > 7) throw new ArgumentOutOfRangeException(nameof(options), "Sharpness must be 0..7.");
             prevSharpness = Av1.Av1ObuWriter.t_sharpness;
             Av1.Av1ObuWriter.t_sharpness = options.Sharpness;
@@ -1138,6 +1140,7 @@ public static partial class HeifCoder
         {
             t_avoidLibyuv = prevAvoid; Av1.Av1StillImageEncoder.t_speed = prevSpeed; Av1.Av1StillImageEncoder.t_threads = prevThreads;
             Av1.Av1ObuWriter.t_sharpness = prevSharpness;
+            Av1.AomStill.Exit(prevAom);
         }
     }
 
@@ -1350,7 +1353,11 @@ public static partial class HeifCoder
         }
 
         var color = ResolveAvifColor(image, options, bd);
-        if (options.Lossless && options.MatrixCoefficients == null)
+        // A grey (+ alpha) source keeps 4:0:0 with the default matrix when lossless, as avifenc does for a grey PNG
+        // (its reader picks 4:0:0 from the colour type before --lossless picks the identity matrix).
+        bool greyLossless = options.Lossless && options.MatrixCoefficients == null
+            && options.ChromaSubsampling is AvifChromaSubsampling.Auto or AvifChromaSubsampling.Yuv400 && IsGreyImage(image);
+        if (options.Lossless && options.MatrixCoefficients == null && !greyLossless)
             color = color with { Matrix = 0 };   // identity (GBR) at 4:4:4 — exact RGB
         // 4:0:0 cannot use the identity matrix: avifenc resets it to BT.601.
         if (options.ChromaSubsampling == AvifChromaSubsampling.Yuv400 && color.Matrix == 0)
@@ -1363,7 +1370,8 @@ public static partial class HeifCoder
             AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
             AvifChromaSubsampling.Yuv400 => Av1.Av1PixelLayout.I400,
             // Auto: 4:4:4 for identity and for lossless (subsampled chroma cannot be lossless; avifenc --lossless), else 4:2:0.
-            _ => color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
+            _ => greyLossless ? Av1.Av1PixelLayout.I400
+                : color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
         };
         if (color.Matrix == 0 && layout != Av1.Av1PixelLayout.I444)
             throw new ArgumentException("The identity matrix (MatrixCoefficients 0) requires 4:4:4 chroma.", nameof(options));
@@ -1878,6 +1886,20 @@ public static partial class HeifCoder
 
     // The frame's samples as RGB in coded-depth units [0, 2^bd - 1] plus the alpha plane (null without an alpha
     // channel), whether any pixel has colour, and whether any pixel is not fully opaque.
+    // Every pixel has R = G = B (a grey source; readers expand grey to RGB).
+    private static bool IsGreyImage(ImageFrame image)
+    {
+        int channels = image.NumberOfChannels;
+        if (channels < 3) return true;
+        for (int y = 0; y < (int)image.Rows; y++)
+        {
+            ReadOnlySpan<ushort> row = image.GetPixelRow(y);
+            for (int o = 0; o + 2 < row.Length; o += channels)
+                if (row[o] != row[o + 1] || row[o] != row[o + 2]) return false;
+        }
+        return true;
+    }
+
     private static void ReadRgbPlanes(ImageFrame image, int bd, out double[] r, out double[] g, out double[] b, out ushort[]? alpha,
         out bool colour, out bool nonOpaque)
     {

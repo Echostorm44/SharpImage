@@ -157,19 +157,18 @@ internal static class Av1AvifWriter
     // Professional streams (4:2:2, 12-bit) fit no AVIF profile brand, so none is claimed (as libavif does).
     private static byte[] Ftyp(int bitDepth, Av1PixelLayout layout, bool sequence = false, bool toneMapped = false, bool avio = false)
     {
-        int profile = Av1ObuWriter.SeqProfile(bitDepth, layout);
         // An image sequence (libavif): major brand 'avis', compatible avif, [avio: some track made only of sync
         // samples], avis, msf1, iso8, mif1, miaf.
         var brands = sequence
             ? Concat(Fourcc("avis"), U32(0), Fourcc("avif"), avio ? Fourcc("avio") : [], Fourcc("avis"), Fourcc("msf1"), Fourcc("iso8"),
                 Fourcc("mif1"), Fourcc("miaf"))
             : Concat(Fourcc("avif"), U32(0), Fourcc("avif"), Fourcc("mif1"), Fourcc("miaf"));
-        brands = profile switch
+        // libavif: MA1B for 8 / 10-bit 4:2:0, MA1A for 8 / 10-bit 4:4:4 (not 4:0:0, 4:2:2 or 12-bit)
+        if (bitDepth is 8 or 10)
         {
-            0 => Concat(brands, Fourcc("MA1B")),
-            1 => Concat(brands, Fourcc("MA1A")),
-            _ => brands,
-        };
+            if (layout == Av1PixelLayout.I420) brands = Concat(brands, Fourcc("MA1B"));
+            else if (layout == Av1PixelLayout.I444) brands = Concat(brands, Fourcc("MA1A"));
+        }
         // 'tmap' (ISO/IEC 23008-12:2024/AMD 1): readers only consider a tone-mapped derived image with this brand.
         return Box("ftyp", toneMapped ? Concat(brands, Fourcc("tmap")) : brands);
     }
@@ -258,12 +257,14 @@ internal static class Av1AvifWriter
         var assoc2 = new List<(int Index, bool Essential)>();
         if (alphaData != null)
         {
+            // libavif's order and flags (ispe, pixi, av1C essential, auxC), each property shared with an identical one
+            // already written (a monochrome colour item's pixi / av1C)
             assoc2.Add((ispeIdx, false));
-            assoc2.Add((Add(Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth, width, height))), true));
+            assoc2.Add((AddShared(FullBox("pixi", 0, 0, new byte[] { 1, (byte)bitDepth })), false));
+            assoc2.Add((AddShared(Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth, width, height))), true));
             // auxC: aux_type is a null-terminated URN string identifying the alpha plane.
             byte[] auxUrn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
-            assoc2.Add((Add(FullBox("auxC", 0, 0, auxUrn)), true));
-            assoc2.Add((Add(FullBox("pixi", 0, 0, new byte[] { 1, (byte)bitDepth })), false));
+            assoc2.Add((AddShared(FullBox("auxC", 0, 0, auxUrn)), false));
             if (x?.AlphaLayerSizes is { Length: > 1 } als) assoc2.Add((Add(A1lx(als)), false));
             assoc2.AddRange(transforms);   // the alpha plane is transformed exactly like the colour image
         }
@@ -315,32 +316,33 @@ internal static class Av1AvifWriter
             }
         }
 
-        // Items: (id, type, payload, infe name / content type, infe flags; 1 = hidden).
+        // Items: (id, type, payload, infe name / content type, infe flags; 1 = hidden). Names as libavif's getInfeName.
+        byte[] Name(string n) => System.Text.Encoding.ASCII.GetBytes(n + "\0");
         var items = new List<(int Id, string Type, byte[] Payload, byte[] InfeExtra, uint Flags)>
         {
-            (1, "av01", colorData, new byte[] { 0 }, 0),
+            (1, "av01", colorData, Name("Color"), 0),
         };
-        if (alphaData != null) items.Add((2, "av01", alphaData, new byte[] { 0 }, 0));
+        if (alphaData != null) items.Add((2, "av01", alphaData, Name("Alpha"), 0));
         int nextId = items.Count + 1;
         int tmapId = 0, gmId = 0;
         if (gmx != null)
         {
             tmapId = nextId++;
-            items.Add((tmapId, "tmap", gmx.Tmap, new byte[] { 0 }, 0));
+            items.Add((tmapId, "tmap", gmx.Tmap, Name("GMap"), 0));
             gmId = nextId++;
-            items.Add((gmId, "av01", gmx.Data, new byte[] { 0 }, 1));
+            items.Add((gmId, "av01", gmx.Data, Name("GMap"), 1));
         }
         int satoId = 0, hiddenId = 0, hiddenAlphaId = 0;
         if (stx != null)
         {
             satoId = nextId++;
-            items.Add((satoId, "sato", stx.Payload, new byte[] { 0 }, 0));
+            items.Add((satoId, "sato", stx.Payload, Name("SampleTransform"), 0));
             hiddenId = nextId++;
-            items.Add((hiddenId, "av01", stx.HiddenColor, new byte[] { 0 }, 1));
+            items.Add((hiddenId, "av01", stx.HiddenColor, Name("SampleTransform"), 1));
             if (stx.HiddenAlpha != null)
             {
                 hiddenAlphaId = nextId++;
-                items.Add((hiddenAlphaId, "av01", stx.HiddenAlpha, new byte[] { 0 }, 0));
+                items.Add((hiddenAlphaId, "av01", stx.HiddenAlpha, Name("Alpha"), 0));
             }
         }
         int exifId = 0, xmpId = 0;
@@ -415,6 +417,36 @@ internal static class Av1AvifWriter
                 foreach (var smp in sq.AlphaSamples) { chunks.Add(smp); pos += smp.Length; }
             }
         }
+        bool layeredItems = x?.ColorLayerSizes != null || x?.AlphaLayerSizes != null;
+        if (sq == null && !layeredItems)
+        {
+            // libavif's packing (write.c): pass 0 the metadata (Exif / XMP / tmap), pass 1 alpha and the gain map image,
+            // pass 2 everything else (the colour data), each in item order; a payload identical to one already written
+            // reuses that chunk
+            int PassOf(int i)
+            {
+                var it = items[i];
+                if (it.Type is "Exif" or "mime" or "tmap") return 0;
+                bool alphaOrGainMap = (alphaData != null && it.Id == 2) || (hiddenAlphaId != 0 && it.Id == hiddenAlphaId) || (gmId != 0 && it.Id == gmId);
+                return alphaOrGainMap ? 1 : 2;
+            }
+            var written = new List<(byte[] Data, long Offset)>();
+            for (int pass = 0; pass < 3; pass++)
+                for (int i = 0; i < items.Count; i++)
+                {
+                    if (PassOf(i) != pass) continue;
+                    byte[] data = items[i].Payload;
+                    if (data.Length == 0) continue;
+                    long found = -1;
+                    foreach (var (d, o) in written) if (d.AsSpan().SequenceEqual(data)) { found = o; break; }
+                    if (found >= 0) { itemOffset[i] = found; continue; }
+                    itemOffset[i] = pos;
+                    written.Add((data, pos));
+                    chunks.Add(data);
+                    pos += data.Length;
+                }
+        }
+        else
         for (int i = 0; i < items.Count; i++)
         {
             if (sq != null && i == 0) { itemOffset[i] = colorChunk; continue; }

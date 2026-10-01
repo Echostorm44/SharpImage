@@ -204,6 +204,9 @@ internal static class Av1ObuWriter
     // C420mpeg2 / C420paldv planes coded as they are keep their siting (sequence header and av1C).
     [ThreadStatic] private static int t_chromaSamplePosition;
     internal static int ChromaSamplePosition => t_chromaSamplePosition;
+    /// <summary>No film grain, layering, tiling request or sharpness is active: a plain single-tile still key frame (what
+    /// the libaom-port encoder, AomStill, produces).</summary>
+    internal static bool PlainStill => ActiveFilmGrain == null && t_layered == null && t_tileLog2Request == (0, 0) && t_sharpness == 0;
     internal readonly struct ChromaPositionScope : IDisposable
     {
         private readonly int prev;
