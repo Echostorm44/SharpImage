@@ -60,6 +60,10 @@ internal static partial class AomEncoder
             SharpnessFromConfig = cpi.AllIntra, BaseQindex = cm.BaseQindex, KeyFrame = true, IntraOnly = true,
             TxModeOnly4x4 = x.E.Lossless[0] != 0,
         };
+        // is_inter_tx_size_search_level_one / get_lpf_opt_level
+        bool txLevelOne = sf.tx_sf.inter_tx_size_search_init_depth_rect >= 1 && sf.tx_sf.inter_tx_size_search_init_depth_sqr >= 1;
+        lpfCfg.SearchLpfOptLevel = txLevelOne ? 1 : 0;
+        lpfCfg.FrameLpfOptLevel = txLevelOne ? (sf.lpf_sf.lpf_pick == LPF_PICK_FROM_Q ? 2 : 1) : 0;
 
         AomRstPickConfig? rstCfg = null;
         if (cpi.EnableRestoration && x.E.Lossless[0] == 0)

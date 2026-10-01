@@ -103,7 +103,7 @@ public sealed partial class AomLfTwinTests
     {
         if (!Available) return;
         var rng = new Random(11);
-        int mismatches = 0, runs = 0;
+        int mismatches = 0, runs = 0, simdMismatches = 0, simdRuns = 0;
         foreach (int kind in new[] { 4, 6, 8, 14 })
             for (int vert = 0; vert < 2; vert++)
                 for (int variant = 0; variant < 3; variant++)
@@ -113,9 +113,13 @@ public sealed partial class AomLfTwinTests
                     {
                         var ours = new AomYv12Plane(32, 32, 32, 32, 16);
                         FillPlane(rng, ours, rng.Next(4) == 0 ? 20 : rng.Next(4));
+                        if (iter % 16 == 0) rng.NextBytes(ours.Buf);
                         var theirs = new AomYv12Plane(32, 32, 32, 32, 16);
                         theirs.CopyFrom(ours);
+                        var simd = new AomYv12Plane(32, 32, 32, 32, 16);
+                        simd.CopyFrom(ours);
                         byte[] t0 = RandomThresh(rng, out _), t1 = RandomThresh(rng, out _);
+                        if (variant == 1 && iter % 2 == 0) t1 = t0;   // the deblocker's dual calls pass one set twice
                         int s = ours.At(8, 8);
                         int lines = variant == 0 ? 1 : variant == 1 ? 2 : 4;
                         int across = vert == 1 ? 1 : ours.Stride, along = vert == 1 ? ours.Stride : 1;
@@ -123,6 +127,12 @@ public sealed partial class AomLfTwinTests
                         {
                             byte[] t = variant == 1 && k == 1 ? t1 : t0;
                             AomLpf.Apply(kind, ours.Buf, s + 4 * k * along, across, along, t[0], t[16], t[32]);
+                        }
+                        bool simdComparable = AomLpf.SimdSupported && (variant != 1 || ReferenceEquals(t0, t1));
+                        if (simdComparable)
+                        {
+                            if (vert == 1) AomLpf.Vertical(kind, simd.Buf, s, simd.Stride, 4 * lines, t0[0], t0[16], t0[32]);
+                            else AomLpf.Horizontal(kind, simd.Buf, s, simd.Stride, 4 * lines, t0[0], t0[16], t0[32]);
                         }
                         unsafe
                         {
@@ -140,12 +150,19 @@ public sealed partial class AomLfTwinTests
                                 System.Runtime.InteropServices.NativeMemory.AlignedFree(al);
                             }
                         }
+                        if (simdComparable)
+                        {
+                            simdRuns++;
+                            if (!simd.Buf.AsSpan().SequenceEqual(theirs.Buf)) simdMismatches++;
+                        }
                         runs++;
                         if (!ours.Buf.AsSpan().SequenceEqual(theirs.Buf)) mismatches++;
                     }
                 }
         await Assert.That(runs).IsGreaterThan(0);
         await Assert.That(mismatches).IsEqualTo(0);
+        await Assert.That(simdRuns).IsGreaterThan(AomLpf.SimdSupported ? 0 : -1);
+        await Assert.That(simdMismatches).IsEqualTo(0);
     }
 
     [Test]

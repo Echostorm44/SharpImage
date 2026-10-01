@@ -120,7 +120,7 @@ public sealed partial class AomLfTwinTests
             int planeStart = opt != 2 && rng.Next(4) == 0 ? rng.Next(3) : 0;
             int planeEnd = 3;
             var theirs = frame.Clone();
-            new AomLoopFilter().FilterFrame(frame, mi, lf, planeStart, planeEnd);
+            new AomLoopFilter().FilterFrame(frame, mi, lf, planeStart, planeEnd, false, opt);
             int n = g.Blocks.Count;
             var bsz = new byte[n];
             var txs = new byte[n];

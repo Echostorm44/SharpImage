@@ -7,7 +7,7 @@ namespace SharpImage.Formats.Av1;
 /// 4 lines of an edge, like aom_lpf_{horizontal,vertical}_N_c; the dual/quad variants libaom dispatches are 2/4
 /// consecutive calls (the SSE2/AVX2 dual/quad kernels are bit-exact with that, twin-verified). across = the sample step
 /// across the edge (pitch for a horizontal edge, 1 for a vertical one), along = the step to the next line.</summary>
-internal static class AomLpf
+internal static partial class AomLpf
 {
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static sbyte Scc(int t) => (sbyte)(t < -128 ? -128 : t > 127 ? 127 : t);   // signed_char_clamp

@@ -47,6 +47,7 @@ public sealed class AomEncoderSmoke
         }
         var sw = new System.Diagnostics.Stopwatch();
         long searchMs = 0, postMs = 0;
+        double lpfMs = 0, rstMs = 0;
         for (int rep = 0; rep < reps; rep++)
         {
             sw.Restart();
@@ -56,8 +57,12 @@ public sealed class AomEncoderSmoke
             // AOM_SMOKE_APPLYLR=1: apply the chosen loop restoration to the reconstruction (what a decoder outputs)
             AomEncoder.RunPostFilter(cpi, x, Environment.GetEnvironmentVariable("AOM_SMOKE_APPLYLR") == "1");
             postMs = rep == 0 ? sw.ElapsedMilliseconds : Math.Min(postMs, sw.ElapsedMilliseconds);
+            double l = AomPostFilter.LastLpfTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double rr = AomPostFilter.LastRstTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            lpfMs = rep == 0 ? l : Math.Min(lpfMs, l);
+            rstMs = rep == 0 ? rr : Math.Min(rstMs, rr);
         }
-        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms");
+        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, restoration {rstMs:F1} ms)");
         sw.Restart(); sw.Stop();
         AomTrace.Out = null;
         var cm = cpi.Cm; var rec = cm.CurFrame;

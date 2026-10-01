@@ -238,7 +238,7 @@ internal sealed class AomLoopFilter
                     len = 0;
                     txSize = TX_4X4;
                 }
-                if (len != 0) AomLpf.Apply(len, pl.Buf, pl.At(currX, currY), 1, pl.Stride, _mblim[lvl], _lim[lvl], _hevThr[lvl]);
+                if (len != 0) Filter(true, len, pl.Buf, pl.At(currX, currY), pl.Stride, 4, lvl);
                 x += TxSizeWideUnit[txSize];
             }
     }
@@ -262,15 +262,404 @@ internal sealed class AomLoopFilter
                     len = 0;
                     txSize = TX_4X4;
                 }
-                if (len != 0) AomLpf.Apply(len, pl.Buf, pl.At(currX, currY), pl.Stride, 1, _mblim[lvl], _lim[lvl], _hevThr[lvl]);
+                if (len != 0) Filter(false, len, pl.Buf, pl.At(currX, currY), pl.Stride, 4, lvl);
                 y += TxSizeHighUnit[txSize];
             }
     }
 
+    /// <summary>filter_vert / filter_horz: the dispatched aom_lpf_{vertical,horizontal}_{len} kernel over lines = 4
+    /// (single), 8 (_dual) or 16 (_quad) lines with the level's thresholds.</summary>
+    private void Filter(bool vert, int len, byte[] buf, int s, int stride, int lines, int lvl)
+    {
+        int bl = _mblim[lvl], li = _lim[lvl], th = _hevThr[lvl];
+        if (AomLpf.SimdSupported)
+        {
+            if (vert) AomLpf.Vertical(len, buf, s, stride, lines, bl, li, th);
+            else AomLpf.Horizontal(len, buf, s, stride, lines, bl, li, th);
+            return;
+        }
+        for (int k = 0; k < lines; k += 4)
+        {
+            if (vert) AomLpf.Apply(len, buf, s + k * stride, 1, stride, bl, li, th);
+            else AomLpf.Apply(len, buf, s + k, stride, 1, bl, li, th);
+        }
+    }
+
+    // ---- the lpf_opt_level 1 / 2 paths (av1_filter_block_plane_{vert,horz}_opt{,_chroma}) ----------------------------
+
+    // vert_filter_length_luma[TX_SIZES_ALL][TX_SIZES_ALL]
+    private static readonly byte[] VertFilterLengthLuma =
+    {
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8,
+        4, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+        4, 8, 14, 14, 14, 4, 8, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14, 14,
+    };
+
+    // horz_filter_length_luma[TX_SIZES_ALL][TX_SIZES_ALL]
+    private static readonly byte[] HorzFilterLengthLuma =
+    {
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+        4, 8, 14, 14, 14, 8, 4, 14, 8, 14, 14, 14, 14, 14, 4, 14, 8, 14, 14,
+    };
+
+    // vert_filter_length_chroma[TX_SIZES_ALL][TX_SIZES_ALL]
+    private static readonly byte[] VertFilterLengthChroma =
+    {
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6,
+    };
+
+    // horz_filter_length_chroma[TX_SIZES_ALL][TX_SIZES_ALL]
+    private static readonly byte[] HorzFilterLengthChroma =
+    {
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+        4, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6, 6, 6, 6, 4, 6, 6, 6, 6,
+    };
+
+    // AV1_DEBLOCKING_PARAMETERS params_buf[MAX_MIB_SIZE] / TX_SIZE tx_buf[MAX_MIB_SIZE]
+    private readonly byte[] _pLen = new byte[MaxMibSize], _pLvl = new byte[MaxMibSize], _txBuf = new byte[MaxMibSize];
+
+    /// <summary>mi_prev != mbmi for the aligned blocks of a coded frame: the step back crosses the block's leading edge.</summary>
+    private static bool PuEdge(AomLfMiGrid mi, int idx, bool vert, int c, int step)
+    {
+        int dim = vert ? MiSizeWide[mi.Bsize[idx]] : MiSizeHigh[mi.Bsize[idx]];
+        return (c & (dim - 1)) < step;
+    }
+
+    /// <summary>set_one_param_for_line_luma: params[p] and the transform size at (miRow, miCol).</summary>
+    private int SetOneParamLuma(AomLfMiGrid mi, bool vert, int miCol, int miRow, int coord, bool isFirstBlock,
+        int prevTxSize, int modeStep, ref int minDim, int p)
+    {
+        _pLen[p] = 0;
+        int idx = miRow * mi.MiCols + miCol;
+        int ts = GetTransformSize(mi, idx, 0, 0, 0);
+        if (!isFirstBlock || coord != 0)
+        {
+            int prevIdx = idx - modeStep;
+            int pvTs = isFirstBlock ? GetTransformSize(mi, prevIdx, 0, 0, 0) : prevTxSize;
+            if (isFirstBlock) minDim = vert ? BlockSizeHigh[mi.Bsize[prevIdx]] : BlockSizeWide[mi.Bsize[prevIdx]];
+            int dirIdx = vert ? 0 : 1;
+            int level = GetFilterLevel(mi, idx, dirIdx, 0);
+            if (level == 0) level = GetFilterLevel(mi, prevIdx, dirIdx, 0);
+            bool puEdge = PuEdge(mi, idx, vert, vert ? miCol : miRow, 1);
+            bool currSkipped = !puEdge && mi.Skip[idx] && mi.IsInter[idx];
+            if ((puEdge || !currSkipped) && level != 0)
+            {
+                _pLen[p] = vert ? VertFilterLengthLuma[ts * TX_SIZES_ALL + pvTs] : HorzFilterLengthLuma[ts * TX_SIZES_ALL + pvTs];
+                _pLvl[p] = (byte)level;
+            }
+        }
+        int blockDim = vert ? BlockSizeHigh[mi.Bsize[idx]] : BlockSizeWide[mi.Bsize[idx]];
+        minDim = Math.Min(minDim, blockDim);
+        return ts;
+    }
+
+    /// <summary>set_lpf_parameters_for_line_luma.</summary>
+    private void SetLpfParametersForLineLuma(AomLfMiGrid mi, bool vert, int miCol, int miRow, int miRange, int modeStep,
+        ref int minDim)
+    {
+        int prevTxSize = TX_INVALID, p = 0;
+        int counter = vert ? miCol : miRow;
+        bool first = true;
+        do
+        {
+            int ts = SetOneParamLuma(mi, vert, vert ? counter : miCol, vert ? miRow : counter, counter, first, prevTxSize,
+                modeStep, ref minDim, p);
+            _txBuf[p] = (byte)ts;
+            int advance = vert ? TxSizeWideUnit[ts] : TxSizeHighUnit[ts];
+            prevTxSize = ts;
+            counter += advance;
+            p += advance;
+            first = false;
+        } while (counter < miRange);
+    }
+
+    /// <summary>set_one_param_for_line_chroma.</summary>
+    private int SetOneParamChroma(AomLfMiGrid mi, bool vert, int miCol, int miRow, int coord, bool isFirstBlock,
+        int prevTxSize, int modeStep, int ssX, int ssY, ref int minDim, int plane, int p)
+    {
+        _pLen[p] = 0;
+        miRow |= ssY;
+        miCol |= ssX;
+        int idx = miRow * mi.MiCols + miCol;
+        int ts = GetTransformSize(mi, idx, plane, ssX, ssY);
+        if (!isFirstBlock || coord != 0)
+        {
+            int prevIdx = idx - modeStep;
+            int pvTs = isFirstBlock ? GetTransformSize(mi, prevIdx, plane, ssX, ssY) : prevTxSize;
+            if (isFirstBlock) minDim = vert ? TxSizeHigh[pvTs] : TxSizeWide[pvTs];
+            int dirIdx = vert ? 0 : 1;
+            int level = GetFilterLevel(mi, idx, dirIdx, plane);
+            if (level == 0) level = GetFilterLevel(mi, prevIdx, dirIdx, plane);
+            bool puEdge = PuEdge(mi, idx, vert, vert ? miCol : miRow, vert ? 1 << ssX : 1 << ssY);
+            bool currSkipped = !puEdge && mi.Skip[idx] && mi.IsInter[idx];
+            if ((!currSkipped || puEdge) && level != 0)
+            {
+                _pLen[p] = vert ? VertFilterLengthChroma[ts * TX_SIZES_ALL + pvTs] : HorzFilterLengthChroma[ts * TX_SIZES_ALL + pvTs];
+                _pLvl[p] = (byte)level;
+            }
+        }
+        int txDim = vert ? TxSizeHigh[ts] : TxSizeWide[ts];
+        minDim = Math.Min(minDim, txDim);
+        return ts;
+    }
+
+    /// <summary>set_lpf_parameters_for_line_chroma.</summary>
+    private void SetLpfParametersForLineChroma(AomLfMiGrid mi, bool vert, int miCol, int miRow, int miRange, int modeStep,
+        int ssX, int ssY, ref int minDim, int plane)
+    {
+        int prevTxSize = TX_INVALID, p = 0;
+        int counter = vert ? miCol : miRow;
+        int scale = vert ? ssX : ssY;
+        bool first = true;
+        do
+        {
+            int ts = SetOneParamChroma(mi, vert, vert ? counter : miCol, vert ? miRow : counter, counter, first,
+                prevTxSize, modeStep, ssX, ssY, ref minDim, plane, p);
+            _txBuf[p] = (byte)ts;
+            int advance = vert ? TxSizeWideUnit[ts] : TxSizeHighUnit[ts];
+            prevTxSize = ts;
+            counter += advance << scale;
+            p += advance;
+            first = false;
+        } while (counter < miRange);
+    }
+
+    /// <summary>av1_filter_block_plane_vert_opt (luma, num_mis_in_lpf_unit_height_log2 = MAX_MIB_SIZE_LOG2).</summary>
+    private void FilterBlockPlaneVertOpt(AomYv12Plane pl, AomLfMiGrid mi, int miRow, int miCol)
+    {
+        int planeMiCols = (pl.CropWidth + MiSize - 1) >> 2, planeMiRows = (pl.CropHeight + MiSize - 1) >> 2;
+        int yRange = Math.Min(planeMiRows - miRow, MaxMibSize), xRange = Math.Min(planeMiCols - miCol, MaxMibSize);
+        for (int y = 0; y < yRange; y++)
+        {
+            int minBlockHeight = 128;
+            SetLpfParametersForLineLuma(mi, true, miCol, miRow + y, miCol + xRange, 1, ref minBlockHeight);
+            int s = pl.At(miCol * MiSize, (miRow + y) * MiSize);
+            int lines = 4;
+            if ((y & 3) == 0 && y + 3 < yRange && minBlockHeight >= 16)
+            {
+                lines = 16;
+                y += 3;
+            }
+            else if (y + 1 < yRange && minBlockHeight >= 8)
+            {
+                lines = 8;
+                y += 1;
+            }
+            for (int x = 0; x < xRange;)
+            {
+                int ts = _txBuf[x];
+                if (ts == TX_INVALID)
+                {
+                    _pLen[x] = 0;
+                    ts = TX_4X4;
+                }
+                if (_pLen[x] != 0) Filter(true, _pLen[x], pl.Buf, s + x * MiSize, pl.Stride, lines, _pLvl[x]);
+                x += TxSizeWideUnit[ts];
+            }
+        }
+    }
+
+    /// <summary>av1_filter_block_plane_horz_opt (luma).</summary>
+    private void FilterBlockPlaneHorzOpt(AomYv12Plane pl, AomLfMiGrid mi, int miRow, int miCol)
+    {
+        int planeMiCols = (pl.CropWidth + MiSize - 1) >> 2, planeMiRows = (pl.CropHeight + MiSize - 1) >> 2;
+        int yRange = Math.Min(planeMiRows - miRow, MaxMibSize), xRange = Math.Min(planeMiCols - miCol, MaxMibSize);
+        for (int x = 0; x < xRange; x++)
+        {
+            int minBlockWidth = 128;
+            SetLpfParametersForLineLuma(mi, false, miCol + x, miRow, miRow + yRange, mi.MiCols, ref minBlockWidth);
+            int s = pl.At((miCol + x) * MiSize, miRow * MiSize);
+            int lines = 4;
+            if ((x & 3) == 0 && x + 3 < xRange && minBlockWidth >= 16)
+            {
+                lines = 16;
+                x += 3;
+            }
+            else if (x + 1 < xRange && minBlockWidth >= 8)
+            {
+                lines = 8;
+                x += 1;
+            }
+            for (int y = 0; y < yRange;)
+            {
+                int ts = _txBuf[y];
+                if (ts == TX_INVALID)
+                {
+                    _pLen[y] = 0;
+                    ts = TX_4X4;
+                }
+                if (_pLen[y] != 0) Filter(false, _pLen[y], pl.Buf, s + y * MiSize * pl.Stride, pl.Stride, lines, _pLvl[y]);
+                y += TxSizeHighUnit[ts];
+            }
+        }
+    }
+
+    /// <summary>av1_filter_block_plane_vert_opt_chroma; joint (lpf_opt_level 2) also filters plV with plane U's
+    /// parameters.</summary>
+    private void FilterBlockPlaneVertOptChroma(AomYv12Plane pl, AomYv12Plane? plV, AomLfMiGrid mi, int plane, int ssX,
+        int ssY, int miRow, int miCol)
+    {
+        int miCols = ((pl.CropWidth << ssX) + MiSize - 1) >> 2, miRows = ((pl.CropHeight << ssY) + MiSize - 1) >> 2;
+        int planeMiRows = (miRows + ((1 << ssY) >> 1)) >> ssY, planeMiCols = (miCols + ((1 << ssX) >> 1)) >> ssX;
+        int yRange = Math.Min(planeMiRows - (miRow >> ssY), MaxMibSize >> ssY);
+        int xRange = Math.Min(planeMiCols - (miCol >> ssX), MaxMibSize >> ssX);
+        int modeStep = 1 << ssX;
+        int s0 = pl.At((miCol * MiSize) >> ssX, (miRow * MiSize) >> ssY);
+        for (int y = 0; y < yRange; y++)
+        {
+            int minHeight = 64;
+            SetLpfParametersForLineChroma(mi, true, miCol, miRow + (y << ssY), miCol + (xRange << ssX), modeStep, ssX,
+                ssY, ref minHeight, plane);
+            int lines = 4, yInc = 0;
+            if ((y & 3) == 0 && y + 3 < yRange && minHeight >= 16)
+            {
+                lines = 16;
+                yInc = 3;
+            }
+            else if (y % 2 == 0 && y + 1 < yRange && minHeight >= 8)
+            {
+                lines = 8;
+                yInc = 1;
+            }
+            for (int x = 0; x < xRange;)
+            {
+                int ts = _txBuf[x];
+                if (ts == TX_INVALID)
+                {
+                    _pLen[x] = 0;
+                    ts = TX_4X4;
+                }
+                int off = s0 + y * MiSize * pl.Stride + x * MiSize;
+                if (_pLen[x] != 0)
+                {
+                    Filter(true, _pLen[x], pl.Buf, off, pl.Stride, lines, _pLvl[x]);
+                    if (plV != null) Filter(true, _pLen[x], plV.Buf, off, plV.Stride, lines, _pLvl[x]);
+                }
+                x += TxSizeWideUnit[ts];
+            }
+            y += yInc;
+        }
+    }
+
+    /// <summary>av1_filter_block_plane_horz_opt_chroma.</summary>
+    private void FilterBlockPlaneHorzOptChroma(AomYv12Plane pl, AomYv12Plane? plV, AomLfMiGrid mi, int plane, int ssX,
+        int ssY, int miRow, int miCol)
+    {
+        int miCols = ((pl.CropWidth << ssX) + MiSize - 1) >> 2, miRows = ((pl.CropHeight << ssY) + MiSize - 1) >> 2;
+        int planeMiRows = (miRows + ((1 << ssY) >> 1)) >> ssY, planeMiCols = (miCols + ((1 << ssX) >> 1)) >> ssX;
+        int yRange = Math.Min(planeMiRows - (miRow >> ssY), MaxMibSize >> ssY);
+        int xRange = Math.Min(planeMiCols - (miCol >> ssX), MaxMibSize >> ssX);
+        int modeStep = mi.MiCols << ssY;
+        int s0 = pl.At((miCol * MiSize) >> ssX, (miRow * MiSize) >> ssY);
+        for (int x = 0; x < xRange; x++)
+        {
+            int minWidth = 64;
+            SetLpfParametersForLineChroma(mi, false, miCol + (x << ssX), miRow, miRow + (yRange << ssY), modeStep, ssX,
+                ssY, ref minWidth, plane);
+            int lines = 4, xInc = 0;
+            if ((x & 3) == 0 && x + 3 < xRange && minWidth >= 16)
+            {
+                lines = 16;
+                xInc = 3;
+            }
+            else if (x % 2 == 0 && x + 1 < xRange && minWidth >= 8)
+            {
+                lines = 8;
+                xInc = 1;
+            }
+            for (int y = 0; y < yRange;)
+            {
+                int ts = _txBuf[y];
+                if (ts == TX_INVALID)
+                {
+                    _pLen[y] = 0;
+                    ts = TX_4X4;
+                }
+                int off = s0 + y * MiSize * pl.Stride + x * MiSize;
+                if (_pLen[y] != 0)
+                {
+                    Filter(false, _pLen[y], pl.Buf, off, pl.Stride, lines, _pLvl[y]);
+                    if (plV != null) Filter(false, _pLen[y], plV.Buf, off, plV.Stride, lines, _pLvl[y]);
+                }
+                y += TxSizeHighUnit[ts];
+            }
+            x += xInc;
+        }
+    }
+
     /// <summary>av1_loop_filter_frame_mt (one worker) on planes [planeStart, planeEnd): partialFrame filters only the
-    /// middle rows (LPF_PICK_FROM_SUBIMAGE).</summary>
+    /// middle rows (LPF_PICK_FROM_SUBIMAGE). lpfOptLevel: 0 the per-edge walk, 1 the dual/quad line walk, 2 also
+    /// U and V jointly with U's parameters (libaom's lpf_opt_level).</summary>
     public void FilterFrame(AomYv12 frame, AomLfMiGrid mi, AomLoopFilterParams lf, int planeStart, int planeEnd,
-        bool partialFrame = false)
+        bool partialFrame = false, int lpfOptLevel = 0)
     {
         planeEnd = Math.Min(planeEnd, frame.NumPlanes);
         // check_planes_to_loop_filter
@@ -294,13 +683,25 @@ internal sealed class AomLoopFilter
         for (int miRow = startMiRow; miRow < endMiRow; miRow += MaxMibSize)
             for (int plane = 0; plane < 3; ++plane)
             {
-                if (!planesToLf[plane]) continue;
+                // skip_loop_filter_plane
+                bool joint = lpfOptLevel == 2 && plane == 1;
+                if (lpfOptLevel == 2 && plane == 2) continue;
+                if (joint ? !planesToLf[1] && !planesToLf[2] : !planesToLf[plane]) continue;
                 var pl = frame.Planes[plane];
+                var plV = joint && frame.NumPlanes > 2 ? frame.Planes[2] : null;
                 int ssX = plane > 0 ? frame.SsX : 0, ssY = plane > 0 ? frame.SsY : 0;
                 for (int miCol = 0; miCol < mi.MiCols; miCol += MaxMibSize)
-                    FilterBlockPlaneVert(pl, mi, plane, ssX, ssY, miRow, miCol);
+                {
+                    if (lpfOptLevel == 0) FilterBlockPlaneVert(pl, mi, plane, ssX, ssY, miRow, miCol);
+                    else if (plane == 0) FilterBlockPlaneVertOpt(pl, mi, miRow, miCol);
+                    else FilterBlockPlaneVertOptChroma(pl, plV, mi, plane, ssX, ssY, miRow, miCol);
+                }
                 for (int miCol = 0; miCol < mi.MiCols; miCol += MaxMibSize)
-                    FilterBlockPlaneHorz(pl, mi, plane, ssX, ssY, miRow, miCol);
+                {
+                    if (lpfOptLevel == 0) FilterBlockPlaneHorz(pl, mi, plane, ssX, ssY, miRow, miCol);
+                    else if (plane == 0) FilterBlockPlaneHorzOpt(pl, mi, miRow, miCol);
+                    else FilterBlockPlaneHorzOptChroma(pl, plV, mi, plane, ssX, ssY, miRow, miCol);
+                }
             }
     }
 }
