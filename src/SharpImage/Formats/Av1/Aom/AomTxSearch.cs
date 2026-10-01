@@ -335,12 +335,12 @@ internal static partial class AomTxSearch
     private static ushort PruneTxkTypeSepar(AomComp cpi, AomMacroblock x, int plane, int block, int txSize, int blkRow, int blkCol,
         int planeBsize, Span<int> txkMap, int allowedTxMask, int pruneFactor, AomTxbCtx txbCtx, long refBestRd, int numSel)
     {
-        Span<long> rdsV = stackalloc long[4];
-        Span<long> rdsH = stackalloc long[4];
-        Span<int> idxV = stackalloc int[] { 0, 1, 2, 3 };
-        Span<int> idxH = stackalloc int[] { 0, 1, 2, 3 };
-        Span<int> skipV = stackalloc int[4];
-        Span<int> skipH = stackalloc int[4];
+        var rdsVBuf1 = new StackArr4<long>(); Span<long> rdsV = rdsVBuf1;
+        var rdsHBuf2 = new StackArr4<long>(); Span<long> rdsH = rdsHBuf2;
+        var idxVBuf3 = new StackArr4<int>(); Span<int> idxV = idxVBuf3; for (int q = 0; q < 4; q++) idxV[q] = q;
+        var idxHBuf4 = new StackArr4<int>(); Span<int> idxH = idxHBuf4; for (int q = 0; q < 4; q++) idxH[q] = q;
+        var skipVBuf5 = new StackArr4<int>(); Span<int> skipV = skipVBuf5;
+        var skipHBuf6 = new StackArr4<int>(); Span<int> skipH = skipHBuf6;
         skipV.Clear(); skipH.Clear();
         var qp = AomEncodeMb.SetupQuant(txSize, true, AomXformQuant.B, cpi.QuantBAdapt);
         int rateCost;
@@ -380,7 +380,7 @@ internal static partial class AomTxSearch
             if (rdsV[idx] > rdsV[0] * 1.2) skipV[idxV[idx]] = 1;
 
         // combine rd_h and rd_v to prune tx candidates
-        Span<long> rds = stackalloc long[16];
+        var rdsBuf7 = new StackArr16<long>(); Span<long> rds = rdsBuf7;
         int numCand = 0, last = TX_TYPES - 1;
         for (int i = 0; i < 16; i++)
         {
@@ -416,7 +416,7 @@ internal static partial class AomTxSearch
     private static ushort PruneTxkType(AomComp cpi, AomMacroblock x, int plane, int block, int txSize, int blkRow, int blkCol,
         int planeBsize, Span<int> txkMap, int allowedTxMask, int pruneFactor, AomTxbCtx txbCtx)
     {
-        Span<long> rds = stackalloc long[TX_TYPES];
+        var rdsBuf8 = new StackArr16<long>(); Span<long> rds = rdsBuf8;
         int numCand = 0, last = TX_TYPES - 1;
         var qp = AomEncodeMb.SetupQuant(txSize, true, AomXformQuant.B, cpi.QuantBAdapt);
         for (int idx = 0; idx < TX_TYPES; idx++)
@@ -627,8 +627,8 @@ internal static partial class AomTxSearch
             bestRdStats.Sse = bestRdStats.Dist;
 
             // (libaom takes the contexts of the whole plane block's top-left here, not of this tx block)
-            Span<byte> ctxa = stackalloc byte[AomMacroblockD.MaxMibSize];
-            Span<byte> ctxl = stackalloc byte[AomMacroblockD.MaxMibSize];
+            var ctxaBuf9 = new StackArr32<byte>(); Span<byte> ctxa = ctxaBuf9;
+            var ctxlBuf10 = new StackArr32<byte>(); Span<byte> ctxl = ctxlBuf10;
             GetEntropyContexts(planeBsize, xd.Plane[plane], ctxa, ctxl);
             int txsCtx = AomTxb.TxsizeEntropyCtx(txSize);
             var txbCtxTmp = AomTxb.TxbCtx(planeBsize, txSize, plane, ctxa, ctxl);
@@ -713,7 +713,7 @@ internal static partial class AomTxSearch
 
         byte bestTxbCtx = 0;
         int txkAllowed = TX_TYPES;
-        Span<int> txkMap = stackalloc int[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        var txkMapBuf11 = new StackArr16<int>(); Span<int> txkMap = txkMapBuf11; for (int q = 0; q < 16; q++) txkMap[q] = q;
         int dequantShift = xd.Bd > 8 ? xd.Bd - 5 : 3;
         int qstep = p.Dequant1 >> dequantShift;
 
@@ -764,7 +764,7 @@ internal static partial class AomTxSearch
         if (calcPixelDomainDistortionFinal && (txkAllowed < TX_TYPES || allowedTxMask == 0x0001))
             calcPixelDomainDistortionFinal = useTransformDomainDistortion = false;
 
-        Span<bool> skipTrellisBasedOnSatd = stackalloc bool[TX_TYPES];
+        var skipTrellisBasedOnSatdBuf12 = new StackArr16<bool>(); Span<bool> skipTrellisBasedOnSatd = skipTrellisBasedOnSatdBuf12;
         skipTrellisBasedOnSatd.Clear();
         var qp = AomEncodeMb.SetupQuant(txSize, !skipTrellis,
             skipTrellis ? (UseBQuantNoTrellis ? AomXformQuant.B : AomXformQuant.Fp) : AomXformQuant.Fp, cpi.QuantBAdapt);
@@ -1082,12 +1082,12 @@ internal static partial class AomTxSearch
             initDepth = MAX_TX_DEPTH;
         }
 
-        Span<byte> bestTxkTypeMap = stackalloc byte[AomMacroblockD.MaxMibSize * AomMacroblockD.MaxMibSize];
+        var bestTxkTypeMapBuf13 = new StackArr1024<byte>(); Span<byte> bestTxkTypeMap = bestTxkTypeMapBuf13;
         int bestTxSize = maxRectTxSize;
         long bestRd = long.MaxValue;
         int numBlks = BsizeToNumBlk(bs);
         x.RdModel = FULL_TXFM_RD;
-        Span<long> rd = stackalloc long[] { long.MaxValue, long.MaxValue, long.MaxValue };
+        var rdBuf14 = new StackArr3<long>(); Span<long> rd = rdBuf14; rd.Fill(long.MaxValue);
         var map = xd.TxTypeMap.AsSpan(xd.TxTypeMapOffset, numBlks);
         for (int txSize = startTx, depth = initDepth; depth <= MAX_TX_DEPTH; depth++, txSize = SubTxSizeMap[txSize])
         {

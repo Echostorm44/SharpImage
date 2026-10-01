@@ -341,7 +341,7 @@ internal static unsafe partial class AomReconIntra
     public static void FilterIntraPredictor(byte* dst, nint stride, int txSize, byte* above, byte* left, int mode)
     {
         const int B = 33;
-        byte* buffer = stackalloc byte[B * B];
+        Unsafe.SkipInit(out StackArr1089<byte> bufferBuf); byte* buffer = (byte*)Unsafe.AsPointer(ref bufferBuf[0]);
         int bw = TxSizeWide[txSize];
         int bh = TxSizeHigh[txSize];
 
@@ -352,7 +352,7 @@ internal static unsafe partial class AomReconIntra
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
         {
             // the 8 outputs of a 4x2 cell in 8 int lanes: sum over the 7 neighbours p_j of p_j * taps[k][j]
-            Span<Vector256<int>> tc = stackalloc Vector256<int>[7];
+            Unsafe.SkipInit(out StackArr7<Vector256<int>> tcBuf); Span<Vector256<int>> tc = tcBuf;
             for (int j = 0; j < 7; j++)
                 tc[j] = Vector256.Create(taps[j], taps[8 + j], taps[16 + j], taps[24 + j], taps[32 + j], taps[40 + j], taps[48 + j], taps[56 + j]);
             var rnd = Vector256.Create(1 << (FILTER_INTRA_SCALE_BITS - 1));
@@ -489,7 +489,7 @@ internal static unsafe partial class AomReconIntra
         {
             // the edge with its clamped neighbours materialised (e[-2], e[-1] = p[0]; e[sz ..] = p[sz - 1]), then 16 taps
             // sums at a time; the stores past p[sz - 1] are overwritten by the extension below
-            byte* buf = stackalloc byte[2 + 129 + 32];
+            Unsafe.SkipInit(out StackArr163<byte> bufBuf); byte* buf = (byte*)Unsafe.AsPointer(ref bufBuf[0]);
             byte* e = buf + 2;
             Buffer.MemoryCopy(p, e, 129, sz);
             byte first = e[0], last = e[sz - 1];
@@ -514,7 +514,7 @@ internal static unsafe partial class AomReconIntra
             Unsafe.InitBlockUnaligned(p + sz, last, 16);
             return;
         }
-        byte* edge = stackalloc byte[129];
+        Unsafe.SkipInit(out StackArr129<byte> edgeBuf); byte* edge = (byte*)Unsafe.AsPointer(ref edgeBuf[0]);
         Buffer.MemoryCopy(p, edge, 129, sz);
         for (int i = 1; i < sz; i++)
         {
@@ -552,7 +552,7 @@ internal static unsafe partial class AomReconIntra
         // Extend first/last samples (upper-left p[-1], last p[sz-1]) to support 4-tap filter
         p[-2] = p[-1];
         p[sz] = p[sz - 1];
-        byte* inp = stackalloc byte[48];
+        Unsafe.SkipInit(out StackArr48<byte> inpBuf); byte* inp = (byte*)Unsafe.AsPointer(ref inpBuf[0]);
         Buffer.MemoryCopy(p - 2, inp, 32, 32);
         Unsafe.InitBlockUnaligned(inp + 32, 0, 16);
         int chunks = (sz + 1 + 15) >> 4;
@@ -576,8 +576,8 @@ internal static unsafe partial class AomReconIntra
         int i;
         byte* aboveRef = refp - refStride;
         byte* leftRef = refp - 1;
-        byte* leftData = stackalloc byte[NUM_INTRA_NEIGHBOUR_PIXELS];
-        byte* aboveData = stackalloc byte[NUM_INTRA_NEIGHBOUR_PIXELS];
+        Unsafe.SkipInit(out StackArr160<byte> leftBuf); byte* leftData = (byte*)Unsafe.AsPointer(ref leftBuf[0]);
+        Unsafe.SkipInit(out StackArr160<byte> aboveBuf); byte* aboveData = (byte*)Unsafe.AsPointer(ref aboveBuf[0]);
         byte* aboveRow = aboveData + 16;
         byte* leftCol = leftData + 16;
         int txwpx = TxSizeWide[txSize];
@@ -739,8 +739,8 @@ internal static unsafe partial class AomReconIntra
             return;
         }
 
-        byte* leftData = stackalloc byte[NUM_INTRA_NEIGHBOUR_PIXELS];
-        byte* aboveData = stackalloc byte[NUM_INTRA_NEIGHBOUR_PIXELS];
+        Unsafe.SkipInit(out StackArr160<byte> leftBuf); byte* leftData = (byte*)Unsafe.AsPointer(ref leftBuf[0]);
+        Unsafe.SkipInit(out StackArr160<byte> aboveBuf); byte* aboveData = (byte*)Unsafe.AsPointer(ref aboveBuf[0]);
         byte* aboveRow = aboveData + 16;
         byte* leftCol = leftData + 16;
 

@@ -279,7 +279,7 @@ internal static class AomIntraModeSearch
         bool filterIntraSelectedFlag = false;
         int bestTxSize = TX_8X8;
         byte bestUse = 0, bestFiMode = 0;
-        Span<byte> bestTxTypeMap = stackalloc byte[32 * 32];
+        var bestTxTypeMapBuf15 = new StackArr1024<byte>(); Span<byte> bestTxTypeMap = bestTxTypeMapBuf15;
         mbmi.UseFilterIntra = 1;
         mbmi.Mode = DC_PRED;
         mbmi.Palette.PaletteSize0 = 0;
@@ -437,7 +437,7 @@ internal static class AomIntraModeSearch
         var mbmi = xd.Mi0;
         var sf = cpi.Sf;
         long bestModelRd = long.MaxValue;
-        Span<byte> directionalModeSkipMask = stackalloc byte[INTRA_MODE_END];
+        var directionalModeSkipMaskBuf16 = new StackArr13<byte>(); Span<byte> directionalModeSkipMask = directionalModeSkipMaskBuf16;
         directionalModeSkipMask.Clear();
         bool beatBestRd = false;
         bool tryPalette = cpi.EnablePalette && AllowPalette(cpi.AllowScreenContentTools, mbmi.Bsize);
@@ -450,7 +450,7 @@ internal static class AomIntraModeSearch
         if (sf.intra_sf.intra_pruning_with_hog != 0)
         {
             // Less aggressive thresholds than inter frames: key / intra frames want higher quality
-            ReadOnlySpan<float> thresh = stackalloc float[] { -1.2f, -1.2f, -0.6f, 0.4f };
+            ReadOnlySpan<float> thresh = new float[] { -1.2f, -1.2f, -0.6f, 0.4f };
             PruneIntraModeWithHog(cpi, x, bsize, thresh[sf.intra_sf.intra_pruning_with_hog - 1], directionalModeSkipMask, false);
         }
         mbmi.UseFilterIntra = 0;
@@ -464,9 +464,9 @@ internal static class AomIntraModeSearch
         AomRdoptUtils.ZeroWinnerModeStats(bsize, maxWinnerModeCount, x.WinnerModeStats);
         x.WinnerModeCount = 0;
 
-        Span<long> topIntraModelRd = stackalloc long[TOP_INTRA_MODEL_COUNT];
+        var topIntraModelRdBuf17 = new StackArr4<long>(); Span<long> topIntraModelRd = topIntraModelRdBuf17;
         topIntraModelRd.Fill(long.MaxValue);
-        Span<long> intraModesRdCost = stackalloc long[INTRA_MODE_END * SIZE_OF_ANGLE_DELTA_RD_COST_ARRAY];
+        var intraModesRdCostBuf18 = new StackArr117<long>(); Span<long> intraModesRdCost = intraModesRdCostBuf18;
         intraModesRdCost.Fill(long.MaxValue);
 
         const int LumaModeCount = INTRA_MODE_END + 8 * 2 * MAX_ANGLE_DELTA;   // LUMA_MODE_COUNT: 13 + 48
@@ -625,7 +625,7 @@ internal static class AomIntraModeSearch
     {
         var mbmi = x.E.Mi0;
         int bestAngleDelta = 0;
-        Span<long> rdCost = stackalloc long[2 * (MAX_ANGLE_DELTA + 2)];
+        var rdCostBuf19 = new StackArr10<long>(); Span<long> rdCost = rdCostBuf19;
         rdStats.Rate = int.MaxValue;
         rdStats.SkipTxfm = 0;
         rdStats.Dist = long.MaxValue;
@@ -880,7 +880,7 @@ internal static class AomIntraModeSearch
             xd.Cfl.StoreY = 0;
         }
         bool dirModeSkipMaskReady = false;
-        Span<byte> directionalModeSkipMask = stackalloc byte[14];
+        var directionalModeSkipMaskBuf20 = new StackArr14<byte>(); Span<byte> directionalModeSkipMask = directionalModeSkipMaskBuf20;
         directionalModeSkipMask.Clear();
         int cflAllowed = AomCfl.IsCflAllowed(xd);
 
@@ -919,7 +919,7 @@ internal static class AomIntraModeSearch
             {
                 if (sf.intra_sf.chroma_intra_pruning_with_hog != 0 && !dirModeSkipMaskReady)
                 {
-                    ReadOnlySpan<float> thresh = stackalloc float[] { -1.2f, 0.0f, 0.0f, 1.2f, -1.2f, -1.2f, -0.6f, 0.4f };   // [inter, intra][level]
+                    ReadOnlySpan<float> thresh = new float[] { -1.2f, 0.0f, 0.0f, 1.2f, -1.2f, -1.2f, -0.6f, 0.4f };   // [inter, intra][level]
                     PruneIntraModeWithHog(cpi, x, bsize, thresh[(cpi.FrameIsIntraOnly ? 4 : 0) + sf.intra_sf.chroma_intra_pruning_with_hog - 1],
                         directionalModeSkipMask, true);
                     dirModeSkipMaskReady = true;

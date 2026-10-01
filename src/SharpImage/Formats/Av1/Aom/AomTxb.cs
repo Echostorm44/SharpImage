@@ -383,8 +383,10 @@ internal static class AomTxb
         if (eob == 0) return coeffCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 1];
         int txClass = TxTypeToClass[txType];
         int bhl = TxbBhl(txSize), width = TxbWide(txSize), height = TxbHigh(txSize);
-        Span<byte> levels = stackalloc byte[TxPad2d];
-        Span<sbyte> coeffContexts = stackalloc sbyte[32 * 32];
+        Unsafe.SkipInit(out LevelsBuf levelsBuf);
+        Span<byte> levels = levelsBuf;
+        Unsafe.SkipInit(out StackArr1024<sbyte> ctxBuf);
+        Span<sbyte> coeffContexts = ctxBuf;
         var eobCosts = costs.GetEob(TxsizeLog2Minus4[txSize], planeType);
         int cost = coeffCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 0];
         if (eob > 1) InitLevels(qcoeff, width, height, levels);
@@ -517,7 +519,8 @@ internal static class AomTxb
         var trellisRdMult = useChromaTrellisRdMult ? PlaneRdMultChroma : PlaneRdMult;
         long rdmult = (((long)rdmultIn * (8 - sharpness) * (trellisRdMult[(isInter ? 2 : 0) + planeType] << (2 * (bitDepth - 8)))) + (1L << (rshift - 1))) >> rshift;
 
-        Span<byte> levels = stackalloc byte[TxPad2d];
+        Unsafe.SkipInit(out LevelsBuf levelsBuf);   // a struct local, not stackalloc: keeps the method tier-able (OSR / PGO)
+        Span<byte> levels = levelsBuf;
         if (eob > 1) InitLevels(qcoeff, width, height, levels);
         var t = new Trellis
         {
@@ -542,7 +545,8 @@ internal static class AomTxb
         int sign = qc < 0 ? 1 : 0;
         const int maxNzNum = 2;
         int nzNum = 1;
-        Span<int> nzCi = stackalloc int[3];
+        Unsafe.SkipInit(out NzBuf nzBuf);
+        Span<int> nzCi = nzBuf;
         nzCi[0] = ci; nzCi[1] = 0; nzCi[2] = 0;
         if (absQc >= 2)
         {
@@ -584,6 +588,9 @@ internal static class AomTxb
         rateCost = accuRate;
         return eob;
     }
+
+    [InlineArray(TxPad2d)] private struct LevelsBuf { private byte e; }
+    [InlineArray(3)] private struct NzBuf { private int e; }
 
     /// <summary>The trellis's per-block state (av1_optimize_txb's locals and arguments), passed to the per-coefficient
     /// updates by reference: unchecked views of the block's coefficients, levels, scan and cost tables.</summary>
