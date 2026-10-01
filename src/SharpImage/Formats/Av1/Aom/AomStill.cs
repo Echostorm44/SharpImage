@@ -6,7 +6,8 @@ namespace SharpImage.Formats.Av1;
 /// The AVIF still-image path through the libaom-port encoder: one all-intra key frame of 8-bit planes encoded exactly
 /// as libaom 3.14.1 does it for libavif (AOM_USAGE_ALL_INTRA, AOM_Q at the given qindex, cpu-used = the avifenc speed,
 /// tune PSNR / SSIM / IQ, one tile), returned as the sequence-header and frame OBUs the AVIF container stores. Used for what the
-/// port covers (8-bit 4:2:0 / 4:2:2 / 4:4:4 / 4:0:0, speeds 0-9 (10 = 9, as libavif clamps), no film grain / layers / tiling / sharpness); everything else
+/// port covers (8 / 10 / 12-bit 4:2:0 / 4:2:2 / 4:4:4 / 4:0:0 -- high bit depth as libavif drives it: AOM_CODEC_USE_HIGHBITDEPTH,
+/// loop restoration off at 12 bits --, speeds 0-9 (10 = 9, as libavif clamps), no film grain / layers / tiling / sharpness); everything else
 /// stays on the earlier encoder until ported.
 /// </summary>
 internal static class AomStill
@@ -37,21 +38,27 @@ internal static class AomStill
 
     /// <summary>Whether a frame with these parameters goes through the port.</summary>
     internal static bool Handles(int bitDepth, Av1PixelLayout layout, int width, int height)
-        => Enabled && bitDepth == 8 && layout is Av1PixelLayout.I420 or Av1PixelLayout.I422 or Av1PixelLayout.I444 or Av1PixelLayout.I400
+        => Enabled && bitDepth is 8 or 10 or 12 && layout is Av1PixelLayout.I420 or Av1PixelLayout.I422 or Av1PixelLayout.I444 or Av1PixelLayout.I400
            && t_speedPlus1 >= 1 && Av1ObuWriter.PlainStill && width <= 4096 && width * height <= 4096 * 2304;
 
-    /// <summary>Encodes one frame. Planes hold samples 0..255 (ushort, the earlier encoder's plane type); chroma planes
+    /// <summary>Encodes one frame. Planes hold samples 0..(1 &lt;&lt; bitDepth) - 1 (ushort, the earlier encoder's plane type); chroma planes
     /// are ((w + ssX) &gt;&gt; ssX) x ((h + ssY) &gt;&gt; ssY); u / v are ignored for 4:0:0. qIdx 0 codes losslessly.</summary>
     internal static (byte[] SeqObu, byte[] FrameObu) Encode(ReadOnlySpan<ushort> y, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v,
-        int width, int height, Av1PixelLayout layout, int qIdx, Av1ObuWriter.Av1ColorDesc? color)
+        int width, int height, Av1PixelLayout layout, int qIdx, Av1ObuWriter.Av1ColorDesc? color, int bitDepth = 8)
     {
         bool mono = layout == Av1PixelLayout.I400;
         int ssX = layout == Av1PixelLayout.I444 ? 0 : 1, ssY = layout == Av1PixelLayout.I420 || mono ? 1 : 0;
         int cw = (width + ssX) >> ssX, ch = (height + ssY) >> ssY;
-        var planes = mono ? new[] { Narrow(y, width * height) } : new[] { Narrow(y, width * height), Narrow(u, cw * ch), Narrow(v, cw * ch) };
+        bool hbd = bitDepth > 8;
+        var planes = hbd ? null : mono ? new[] { Narrow(y, width * height) } : new[] { Narrow(y, width * height), Narrow(u, cw * ch), Narrow(v, cw * ch) };
+        var planes16 = !hbd ? null : mono ? new[] { y[..(width * height)].ToArray() }
+            : new[] { y[..(width * height)].ToArray(), u[..(cw * ch)].ToArray(), v[..(cw * ch)].ToArray() };
         var input = new AomEncodeInput
         {
-            Width = width, Height = height, SsX = ssX, SsY = ssY, Monochrome = mono, Planes = planes,
+            Width = width, Height = height, SsX = ssX, SsY = ssY, Monochrome = mono, Planes = planes!, Planes16 = planes16,
+            BitDepth = bitDepth,
+            // libavif: AV1E_SET_ENABLE_RESTORATION 0 for 12-bit input (crbug.com/aomedia/42302587)
+            EnableRestoration = bitDepth != 12,
             Strides = mono ? new[] { width } : new[] { width, cw, cw }, BaseQindex = qIdx, Speed = Speed,
             // libavif: maxThreads > 1 -> cfg.g_threads = min(maxThreads, 64) (row-MT, libaom's default)
             Threads = Math.Min(Av1StillImageEncoder.ThreadCount, 64),
