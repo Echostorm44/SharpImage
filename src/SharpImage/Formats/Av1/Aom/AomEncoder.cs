@@ -19,9 +19,9 @@ internal sealed class AomEncodeInput
     public bool EnableIntrabc = true;
     /// <summary>Test hook: adjusts the speed features after libaom's setup (e.g. to isolate a stage).</summary>
     public Action<AomSpeedFeatures>? SfOverride;
-    /// <summary>AOME_SET_TUNING AOM_TUNE_IQ (libavif's default for still colour images; libavif never sets it for
-    /// lossless, so it is ignored at qindex 0).</summary>
-    public bool TuneIq;
+    /// <summary>AOME_SET_TUNING: AOM_TUNE_IQ is libavif's default for still non-identity colour images, AOM_TUNE_SSIM
+    /// for identity-matrix colour (libavif never sets a tuning for lossless, so it is ignored at qindex 0).</summary>
+    public AomTune Tune;
     /// <summary>Test hook (tune=iq staging): letters of the sub-features handle_tuning enables to switch back off:
     /// q enable_qm, d deltaq_mode, c cdef, s sharpness, u chroma deltaq, m qm-psnr dist metric, a adaptive sharpness.</summary>
     public string? IqOff;
@@ -30,6 +30,9 @@ internal sealed class AomEncodeInput
 // Port of libaom 3.14.1 av1_encode_frame / encode_frame_internal / encode_tiles / av1_encode_tile / encode_sb_row /
 // encode_rd_sb for one all-intra key frame (one tile, no segmentation, no delta q): the search and the final encode
 // that leave the mode info, the coefficients and the reconstruction for the bitstream writer and the loop filters.
+/// <summary>The aom_tune_metric values the port implements.</summary>
+internal enum AomTune { Psnr, Ssim, Iq }
+
 internal sealed partial class AomComp
 {
     // td->pc_root of the non-RD path (allocated once per frame and reused by every superblock)
@@ -40,18 +43,18 @@ internal static partial class AomEncoder
 {
     internal static (AomComp cpi, AomMacroblock x) EncodeFrame(AomEncodeInput input)
     {
-        // handle_tuning (av1_cx_iface.c) for AOM_TUNE_IQ
-        bool tuneIq = input.TuneIq && input.BaseQindex != 0;
+        // handle_tuning (av1_cx_iface.c) for AOM_TUNE_IQ (AOM_TUNE_SSIM only adds the SSIM rdmult scaling)
+        var tune = input.BaseQindex != 0 ? input.Tune : AomTune.Psnr;
+        bool tuneIq = tune == AomTune.Iq;
         string off = tuneIq ? input.IqOff ?? "" : "";
         bool deltaqVarianceBoost = tuneIq && !off.Contains('d');
         var cm = new AomCommon(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome,
             deltaqVarianceBoost ? BLOCK_64X64 : SelectSbSize(input.Width, input.Height, input.Speed));   // Variance Boost: 64x64 SBs
         cm.BaseQindex = input.BaseQindex;
         var cpi = new AomComp { Cm = cm, Speed = input.Speed, AllowScreenContentTools = input.AllowScreenContentTools,
-            UseScreenContentTools = input.UseScreenContentTools, AllowIntrabc = input.AllowIntrabc, SbSize = cm.SbSize };
+            UseScreenContentTools = input.UseScreenContentTools, AllowIntrabc = input.AllowIntrabc, SbSize = cm.SbSize, Tune = tune };
         if (tuneIq)
         {
-            cpi.TuneIq = true;
             cpi.UsingQm = !off.Contains('q');
             cpi.QmMinLevel = 2; cpi.QmMaxLevel = 10;   // QM_FIRST_IQ_SSIMULACRA2 / QM_LAST_IQ_SSIMULACRA2
             cpi.Sharpness = off.Contains('s') ? 0 : 7;
@@ -181,7 +184,7 @@ internal static partial class AomEncoder
         }
 
         // encoder.c: av1_set_mb_ssim_rdmult_scaling (tune SSIM / IQ / SSIMULACRA2)
-        if (cpi.TuneIq) cpi.SetMbSsimRdmultScaling();
+        if (cpi.SsimRdmult) cpi.SetMbSsimRdmultScaling();
 
         // encode_frame_internal: delta q resolution and presence (Variance Boost: delta_q_res by the base qindex)
         cpi.DeltaQRes = 0;

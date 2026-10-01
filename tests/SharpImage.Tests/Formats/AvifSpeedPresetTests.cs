@@ -7,7 +7,8 @@ using SharpImage.Image;
 namespace SharpImage.Tests.Formats;
 
 // AvifEncodeOptions.Speed 0..10 (avifenc -s): every preset produces a valid file of sane quality, and the presets
-// above the default really search less (7..10 each change the encode — they once all fell back to speed 6).
+// above the default really search less (7..9 each change the encode — they once all fell back to speed 6; 10 codes as
+// 9, as libavif clamps cpu-used to libaom's 0..9).
 public sealed class AvifSpeedPresetTests
 {
     private static double Psnr(ImageFrame a, ImageFrame b)
@@ -38,7 +39,8 @@ public sealed class AvifSpeedPresetTests
             await Assert.That(back.Columns).IsEqualTo(src.Columns);
             await Assert.That(Psnr(src, back)).IsGreaterThan(30.0);
         }
-        var same = Enumerable.Range(7, 4).Where(sp => outputs[sp].SequenceEqual(outputs[sp - 1])).Select(sp => $"{sp - 1}={sp}").ToList();
+        await Assert.That(outputs[10].SequenceEqual(outputs[9])).IsTrue();
+        var same = Enumerable.Range(7, 3).Where(sp => outputs[sp].SequenceEqual(outputs[sp - 1])).Select(sp => $"{sp - 1}={sp}").ToList();
         await Assert.That(string.Join(",", same)).IsEqualTo("");
     }
 }

@@ -17,7 +17,11 @@ internal sealed partial class AomComp
     // oxcf.q_cfg / algo_cfg / tune_cfg
     public int QuantBAdapt;
     public int Sharpness;
-    public bool TuneIq;
+    // oxcf.tune_cfg.tuning
+    public AomTune Tune;
+    public bool TuneIq => Tune == AomTune.Iq;
+    /// <summary>AOM_TUNE_SSIM / AOM_TUNE_IQ: av1_set_mb_ssim_rdmult_scaling and av1_set_ssim_rdmult.</summary>
+    public bool SsimRdmult => Tune is AomTune.Ssim or AomTune.Iq;
     // cpi->use_screen_content_tools, cm->features.reduced_tx_set_used
     public bool UseScreenContentTools;
     public int ReducedTxSetUsed;
