@@ -76,6 +76,10 @@ internal sealed partial class AomMbModeInfo
     public byte UseIntrabc;
     public byte SkipMode;
     public sbyte CdefStrength;
+    // inter (intrabc) fields: mv[2], motion_mode, interp_filters (av1_broadcast_interp_filter packed: y << 16 | x)
+    public AomMv Mv0, Mv1;
+    public byte MotionMode;
+    public uint InterpFilters;
 
     public void CopyFrom(AomMbModeInfo s)
     {
@@ -89,6 +93,7 @@ internal sealed partial class AomMbModeInfo
         SkipTxfm = s.SkipTxfm; TxSize = s.TxSize;
         Array.Copy(s.InterTxSize, InterTxSize, InterTxSize.Length);
         SegmentId = s.SegmentId; UseIntrabc = s.UseIntrabc; SkipMode = s.SkipMode; CdefStrength = s.CdefStrength;
+        Mv0 = s.Mv0; Mv1 = s.Mv1; MotionMode = s.MotionMode; InterpFilters = s.InterpFilters;
     }
 
     public static readonly AomMbModeInfo Zero = new();

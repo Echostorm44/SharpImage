@@ -65,7 +65,7 @@ internal sealed class AomModeCosts
     public const int PartitionContexts = 20, SkipContexts = 3, KfModeContexts = 5, IntraModes = 13, UvIntraModes = 14,
         BlockSizesAll = 22, PalatteBsizeCtxs = 7, PaletteYModeContexts = 3, PaletteUvModeContexts = 2, PaletteSizes = 7,
         PaletteColorIndexContexts = 5, PaletteColors = 8, CflJointSigns = 8, CflAlphabetSize = 16, MaxTxCats = 4,
-        TxSizeContexts = 3, MaxTxDepth = 2, TxfmPartitionContexts = 21, ExtTxSizes = 4, ExtTxSetsIntra = 3, TxTypes = 16,
+        TxSizeContexts = 3, MaxTxDepth = 2, TxfmPartitionContexts = 21, ExtTxSizes = 4, ExtTxSetsIntra = 3, ExtTxSetsInter = 4, TxTypes = 16,
         DirectionalModes = 8, MaxAngleDelta = 3, FilterIntraModes = 5, DeltaLfProbs = 3, SpatialPredictionProbs = 3,
         SegTemporalPredCtxs = 3, IntrabcSymbols = 2, RestoreSwitchableTypes = 3;
 
@@ -85,6 +85,7 @@ internal sealed class AomModeCosts
     public readonly int[] TxSizeCost = new int[MaxTxCats * TxSizeContexts * 5];                  // [cat][ctx][TX_SIZES]
     public readonly int[] TxfmPartitionCost = new int[TxfmPartitionContexts * 2];
     public readonly int[] IntraTxTypeCosts = new int[ExtTxSetsIntra * ExtTxSizes * IntraModes * TxTypes];   // [set][sqr tx][mode][type]
+    public readonly int[] InterTxTypeCosts = new int[ExtTxSetsInter * ExtTxSizes * TxTypes];                // [set][sqr tx][type]
     public readonly int[] AngleDeltaCost = new int[DirectionalModes * (2 * MaxAngleDelta + 1)];
     public readonly int[] IntrabcCost = new int[2];
     public readonly int[] SwitchableRestoreCost = new int[RestoreSwitchableTypes];
@@ -115,6 +116,7 @@ internal sealed class AomPickModeContext
     public int Skippable;
     public AomRdStats RdStats;
     public int RdModeIsReady;
+    public readonly AomMbmiExtFrame MbmiExtBest = new();
 
     /// <summary>av1_alloc_pmc (the coefficient buffers are the shared per-plane ones in the MACROBLOCK).</summary>
     public AomPickModeContext(int bsize, bool allowScreenContentTools)
@@ -133,6 +135,7 @@ internal sealed class AomPickModeContext
     public void CopyFrom(AomPickModeContext src)
     {
         Mic.CopyFrom(src.Mic);
+        MbmiExtBest.CopyFrom(src.MbmiExtBest);
         NumFourByFourBlk = src.NumFourByFourBlk;
         Skippable = src.Skippable;
         Array.Copy(src.TxTypeMap, TxTypeMap, src.NumFourByFourBlk);

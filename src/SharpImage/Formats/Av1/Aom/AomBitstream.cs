@@ -638,13 +638,30 @@ internal static class AomBitstream
             }
         }
 
-        if (t.F.TxMode == TX_MODE_SELECT && bsize > BLOCK_4X4 && xd.Lossless[mbmi.SegmentId] == 0)
-            WriteSelectedTxSize(t);
-        // set_txfm_ctxs (intra: the block's tx size)
-        xd.AboveTxfmContext.AsSpan(xd.AboveTxfmContextOffset, xd.Width).Fill((byte)TxSizeWide[mbmi.TxSize]);
-        xd.LeftTxfmContextBuffer.AsSpan(xd.LeftTxfmContextOffset, xd.Height).Fill((byte)TxSizeHigh[mbmi.TxSize]);
+        bool isInterTx = AomEncodeMb.IsInterBlock(mbmi);
+        if (t.F.TxMode == TX_MODE_SELECT && AomTxSearch.BlockSignalsTxsize(bsize) && !(isInterTx && mbmi.SkipTxfm != 0) &&
+            xd.Lossless[mbmi.SegmentId] == 0)
+        {
+            if (isInterTx)
+            {
+                int maxTxSize = AomTxSearch.GetVartxMaxTxsize(xd, bsize, 0);
+                int txbh = TxSizeHighUnit[maxTxSize], txbw = TxSizeWideUnit[maxTxSize];
+                for (int idy = 0; idy < MiSizeHigh[bsize]; idy += txbh)
+                    for (int idx = 0; idx < MiSizeWide[bsize]; idx += txbw) WriteTxSizeVartx(t, maxTxSize, 0, idy, idx);
+            }
+            else
+            {
+                WriteSelectedTxSize(t);
+                SetTxfmCtxs(xd, mbmi.TxSize, false);
+            }
+        }
+        else SetTxfmCtxs(xd, mbmi.TxSize, mbmi.SkipTxfm != 0 && isInterTx);
 
-        if (mbmi.SkipTxfm == 0) WriteIntraCoeffsMb(t, bsize);
+        if (mbmi.SkipTxfm == 0)
+        {
+            if (!isInterTx) WriteIntraCoeffsMb(t, bsize);
+            else WriteInterCoeffsMb(t, bsize);
+        }
     }
 
     /// <summary>write_mb_modes_kf (no segmentation, CDEF strength bits 0, no delta q).</summary>
@@ -660,9 +677,41 @@ internal static class AomBitstream
         {
             // write_intrabc_info
             t.W.WriteSymbol(mbmi.UseIntrabc, m.Intrabc, 2);
-            if (mbmi.UseIntrabc != 0) throw new NotSupportedException("intrabc blocks (av1_encode_dv) are not ported yet");
+            if (mbmi.UseIntrabc != 0)
+            {
+                var ext = t.Cpi.MbmiExtFrameAt(xd.MiRow, xd.MiCol)!;   // x->mbmi_ext_frame
+                EncodeDv(t.W, mbmi.Mv0, ext.RefMvStack[0].ThisMv, t.Fc.Mv);
+                return;
+            }
         }
         WriteIntraPredictionModes(t);
+    }
+
+    /// <summary>av1_encode_dv (encodemv.c): the DV difference with MV_SUBPEL_NONE on the ndvc CDFs.</summary>
+    private static void EncodeDv(AomWriter w, AomMv mv, AomMv refMv, Av1CdfMvContext mvctx)
+    {
+        var diff = new AomMv(mv.Row - refMv.Row, mv.Col - refMv.Col);
+        int j = AomMvCost.GetMvJoint(diff);
+        w.WriteSymbol(j, mvctx.Joint, AomMvCost.MvJoints);
+        if (AomMvCost.MvJointVertical(j)) EncodeMvComponent(w, diff.Row, mvctx.Comp0);
+        if (AomMvCost.MvJointHorizontal(j)) EncodeMvComponent(w, diff.Col, mvctx.Comp1);
+    }
+
+    /// <summary>encode_mv_component (MV_SUBPEL_NONE: no fractional / high precision bits).</summary>
+    private static void EncodeMvComponent(AomWriter w, int comp, Av1CdfMvComponent mvcomp)
+    {
+        int sign = comp < 0 ? 1 : 0;
+        int mag = sign != 0 ? -comp : comp;
+        int mvClass = AomMvCost.GetMvClass(mag - 1, out int offset);
+        int d = offset >> 3;
+        w.WriteSymbol(sign, mvcomp.Sign, 2);
+        w.WriteSymbol(mvClass, mvcomp.Classes, AomMvCost.MvClasses);
+        if (mvClass == 0) w.WriteSymbol(d, mvcomp.Class0, AomMvCost.Class0Size);
+        else
+        {
+            int n = mvClass + AomMvCost.Class0Bits - 1;
+            for (int i = 0; i < n; ++i) w.WriteSymbol((d >> i) & 1, mvcomp.ClassN[i], 2);
+        }
     }
 
     /// <summary>write_intra_prediction_modes (key frame).</summary>
@@ -884,6 +933,117 @@ internal static class AomBitstream
         }
     }
 
+    /// <summary>set_txfm_ctxs.</summary>
+    private static void SetTxfmCtxs(AomMacroblockD xd, int txSize, bool skip)
+    {
+        byte bw = (byte)TxSizeWide[txSize], bh = (byte)TxSizeHigh[txSize];
+        if (skip)
+        {
+            bw = (byte)(xd.Width * 4);
+            bh = (byte)(xd.Height * 4);
+        }
+        xd.AboveTxfmContext.AsSpan(xd.AboveTxfmContextOffset, xd.Width).Fill(bw);
+        xd.LeftTxfmContextBuffer.AsSpan(xd.LeftTxfmContextOffset, xd.Height).Fill(bh);
+    }
+
+    /// <summary>write_tx_size_vartx.</summary>
+    private static void WriteTxSizeVartx(TileWriter t, int txSize, int depth, int blkRow, int blkCol)
+    {
+        var xd = t.Xd;
+        var mbmi = xd.Mi0;
+        int maxBlocksHigh = AomEncodeMb.MaxBlockHigh(xd, mbmi.Bsize, 0), maxBlocksWide = AomEncodeMb.MaxBlockWide(xd, mbmi.Bsize, 0);
+        if (blkRow >= maxBlocksHigh || blkCol >= maxBlocksWide) return;
+        var above = xd.AboveTxfmContext;
+        var left = xd.LeftTxfmContextBuffer;
+        int aOff = xd.AboveTxfmContextOffset + blkCol, lOff = xd.LeftTxfmContextOffset + blkRow;
+        if (depth == 2)   // MAX_VARTX_DEPTH
+        {
+            AomTxSearch.TxfmPartitionUpdate(above, aOff, left, lOff, txSize, txSize);
+            return;
+        }
+        int ctx = AomTxSearch.TxfmPartitionContext(above[aOff], left[lOff], mbmi.Bsize, txSize);
+        int txbSizeIndex = AomTxSearch.GetTxbSizeIndex(mbmi.Bsize, blkRow, blkCol);
+        if (txSize == mbmi.InterTxSize[txbSizeIndex])
+        {
+            t.W.WriteSymbol(0, t.Fc.Mode.Txpart[ctx], 2);
+            AomTxSearch.TxfmPartitionUpdate(above, aOff, left, lOff, txSize, txSize);
+        }
+        else
+        {
+            int subTxs = SubTxSizeMap[txSize];
+            int bsw = TxSizeWideUnit[subTxs], bsh = TxSizeHighUnit[subTxs];
+            t.W.WriteSymbol(1, t.Fc.Mode.Txpart[ctx], 2);
+            if (subTxs == TX_4X4)
+            {
+                AomTxSearch.TxfmPartitionUpdate(above, aOff, left, lOff, subTxs, txSize);
+                return;
+            }
+            for (int row = 0; row < TxSizeHighUnit[txSize]; row += bsh)
+                for (int col = 0; col < TxSizeWideUnit[txSize]; col += bsw)
+                    WriteTxSizeVartx(t, subTxs, depth + 1, blkRow + row, blkCol + col);
+        }
+    }
+
+    /// <summary>write_tokens_b's inter branch (write_inter_txb_coeff / pack_txb_tokens).</summary>
+    private static void WriteInterCoeffsMb(TileWriter t, int bsize)
+    {
+        var cm = t.Cm;
+        var xd = t.Xd;
+        Span<int> block = stackalloc int[3];
+        block.Clear();
+        int num4x4W = MiSizeWide[bsize], num4x4H = MiSizeHigh[bsize];
+        int muBlocksWide = Math.Min(num4x4W, MiSizeWide[BLOCK_64X64]), muBlocksHigh = Math.Min(num4x4H, MiSizeHigh[BLOCK_64X64]);
+        for (int row = 0; row < num4x4H; row += muBlocksHigh)
+            for (int col = 0; col < num4x4W; col += muBlocksWide)
+                for (int plane = 0; plane < cm.NumPlanes; ++plane)
+                {
+                    if (plane != 0 && !xd.IsChromaRef) break;
+                    var pd = xd.Plane[plane];
+                    int ssX = pd.SubsamplingX, ssY = pd.SubsamplingY;
+                    int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, ssX, ssY);
+                    int maxTxSize = AomTxSearch.GetVartxMaxTxsize(xd, planeBsize, plane);
+                    int step = TxSizeWideUnit[maxTxSize] * TxSizeHighUnit[maxTxSize];
+                    int bkw = TxSizeWideUnit[maxTxSize], bkh = TxSizeHighUnit[maxTxSize];
+                    int maxUnitBsize = AomEncodeMb.PlaneBlockSize(BLOCK_64X64, ssX, ssY);
+                    int unitHeight = Math.Min(MiSizeHigh[maxUnitBsize] + (row >> ssY), MiSizeHigh[planeBsize]);
+                    int unitWidth = Math.Min(MiSizeWide[maxUnitBsize] + (col >> ssX), MiSizeWide[planeBsize]);
+                    for (int blkRow = row >> ssY; blkRow < unitHeight; blkRow += bkh)
+                        for (int blkCol = col >> ssX; blkCol < unitWidth; blkCol += bkw)
+                        {
+                            PackTxbTokens(t, plane, planeBsize, block[plane], blkRow, blkCol, maxTxSize);
+                            block[plane] += step;
+                        }
+                }
+    }
+
+    /// <summary>pack_txb_tokens.</summary>
+    private static void PackTxbTokens(TileWriter t, int plane, int planeBsize, int block, int blkRow, int blkCol, int txSize)
+    {
+        var xd = t.Xd;
+        var mbmi = xd.Mi0;
+        int maxBlocksHigh = AomEncodeMb.MaxBlockHigh(xd, planeBsize, plane), maxBlocksWide = AomEncodeMb.MaxBlockWide(xd, planeBsize, plane);
+        if (blkRow >= maxBlocksHigh || blkCol >= maxBlocksWide) return;
+        var pd = xd.Plane[plane];
+        int planeTxSize = plane != 0 ? AomEncodeMb.MaxUvTxsize(mbmi.Bsize, pd.SubsamplingX, pd.SubsamplingY)
+            : mbmi.InterTxSize[AomTxSearch.GetTxbSizeIndex(planeBsize, blkRow, blkCol)];
+        if (txSize == planeTxSize || plane != 0)
+        {
+            WriteCoeffsTxb(t, blkRow, blkCol, plane, block, txSize);
+            return;
+        }
+        int subTxs = SubTxSizeMap[txSize];
+        int bsw = TxSizeWideUnit[subTxs], bsh = TxSizeHighUnit[subTxs];
+        int step = bsh * bsw;
+        int rowEnd = Math.Min(TxSizeHighUnit[txSize], maxBlocksHigh - blkRow);
+        int colEnd = Math.Min(TxSizeWideUnit[txSize], maxBlocksWide - blkCol);
+        for (int r = 0; r < rowEnd; r += bsh)
+            for (int c = 0; c < colEnd; c += bsw)
+            {
+                PackTxbTokens(t, plane, planeBsize, block, blkRow + r, blkCol + c, subTxs);
+                block += step;
+            }
+    }
+
     /// <summary>write_selected_tx_size.</summary>
     private static void WriteSelectedTxSize(TileWriter t)
     {
@@ -1060,8 +1220,17 @@ internal static class AomBitstream
     {
         var mbmi = t.Xd.Mi0;
         bool reduced = t.F.ReducedTxSetUsed != 0;
-        int setType = AomEncodeMb.ExtTxSetType(txSize, false, reduced);
-        if (NumExtTxSet[setType] > 1 && t.Cm.BaseQindex > 0 && mbmi.SkipTxfm == 0)
+        bool isInter = AomEncodeMb.IsInterBlock(mbmi);
+        int setType = AomEncodeMb.ExtTxSetType(txSize, isInter, reduced);
+        if (NumExtTxSet[setType] > 1 && t.Cm.BaseQindex > 0 && mbmi.SkipTxfm == 0 && isInter)
+        {
+            int eset = ExtTxSetIndex[6 + setType];
+            int sqr = TxsizeSqrMap[txSize];
+            var mi = t.Fc.Mode;
+            ushort[] cdf = eset == 1 ? mi.TxtpInter1[sqr] : eset == 2 ? mi.TxtpInter2 : mi.TxtpInter3[sqr];
+            t.W.WriteSymbol(ExtTxInd[setType * 16 + txType], cdf, NumExtTxSet[setType]);
+        }
+        else if (NumExtTxSet[setType] > 1 && t.Cm.BaseQindex > 0 && mbmi.SkipTxfm == 0)
         {
             int eset = ExtTxSetIndex[0 * 16 + setType];
             int intraDir = mbmi.UseFilterIntra != 0 ? FimodeToIntradir[mbmi.FilterIntraMode] : mbmi.Mode;

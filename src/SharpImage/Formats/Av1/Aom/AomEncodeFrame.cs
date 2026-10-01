@@ -305,6 +305,8 @@ internal static partial class AomEncodeFrame
         }
         xd.Height = bh;
         xd.Width = bw;
+        xd.IsLastVerticalRect = bw < bh && ((miCol + bw) & (bh - 1)) == 0;
+        xd.IsFirstHorizontalRect = bw > bh && (miRow & (bw - 1)) == 0;
     }
 
     /// <summary>av1_set_offsets (segmentation off: segment 0).</summary>
@@ -399,7 +401,7 @@ internal static partial class AomEncodeFrame
         ctx.RdStats.Rdcost = rdCost.Rdcost;
     }
 
-    /// <summary>av1_rd_pick_intra_mode_sb (intrabc not ported: allow_intrabc is off without screen content).</summary>
+    /// <summary>av1_rd_pick_intra_mode_sb.</summary>
     internal static void RdPickIntraModeSb(AomComp cpi, AomMacroblock x, ref AomRdStats rdCost, int bsize, AomPickModeContext ctx, long bestRd)
     {
         var cm = cpi.Cm;
@@ -414,6 +416,7 @@ internal static partial class AomEncodeFrame
         mbmi.RefFrame0 = 0;       // INTRA_FRAME
         mbmi.RefFrame1 = -1;      // NONE_FRAME
         mbmi.UseIntrabc = 0;
+        mbmi.Mv0 = default;
         mbmi.SkipMode = 0;
 
         long intraYrd = AomIntraModeSearch.RdPickIntraSbyMode(cpi, x, ref rateY, ref rateYTokenonly, ref distY, ref ySkipTxfm, bsize, bestRd, ctx);
@@ -439,11 +442,11 @@ internal static partial class AomEncodeFrame
         else rdCost.Rate = int.MaxValue;
 
         if (rdCost.Rate != int.MaxValue && rdCost.Rdcost < bestRd) bestRd = rdCost.Rdcost;
-        if (cpi.FrameIsIntraOnly && cpi.AllowScreenContentTools && cpi.AllowIntrabc)
-            throw new NotSupportedException("intrabc (rd_pick_intrabc_mode_sb) is not ported yet");
+        if (RdPickIntrabcModeSb(cpi, x, ctx, ref rdCost, bsize, bestRd) < bestRd) ctx.RdStats.SkipTxfm = mbmi.SkipTxfm;
         if (rdCost.Rate == int.MaxValue) return;
 
         ctx.Mic.CopyFrom(mbmi);
+        ctx.MbmiExtBest.CopyFrom(x.MbmiExt);
         xd.TxTypeMap.AsSpan(xd.TxTypeMapOffset, ctx.NumFourByFourBlk).CopyTo(ctx.TxTypeMap);
     }
 
@@ -459,6 +462,7 @@ internal static partial class AomEncodeFrame
         int mis = cm.MiStride;
 
         miAddr.CopyFrom(mi);
+        ctx.MbmiExtBest.CopyTo(x.MbmiExt);   // copy_mbmi_ext_frame_to_mbmi_ext
         x.TxfmSkip = ctx.RdStats.SkipTxfm;
 
         xd.TxTypeMap = ctx.TxTypeMap;
@@ -505,24 +509,40 @@ internal static partial class AomEncodeFrame
         txfmParams.TxModeSearchType = AomRdoptUtils.SelectTxMode(false, txfmParams.TxSizeSearchMethod);
 
         int miRow = xd.MiRow, miCol = xd.MiCol;
-        // store_cfl_required
-        xd.Cfl.StoreY = StoreCflRequired(cm, xd) ? 1 : 0;
-        for (int plane = 0; plane < numPlanes; ++plane)
-            AomIntraModeSearch.EncodeIntraBlockPlane(cpi, x, bsize, plane, dryRun, cpi.OptimizeSegArr[mbmi.SegmentId]);
-        xd.Cfl.StoreY = 0;
-        if (AomIntraModeSearch.AllowPalette(cpi.AllowScreenContentTools, bsize))
-            for (int plane = 0; plane < Math.Min(2, numPlanes); ++plane)
-                if ((plane == 0 ? mbmi.Palette.PaletteSize0 : mbmi.Palette.PaletteSize1) > 0 && dryRun == OUTPUT_ENABLED)
-                    AomPalette.TokenizeColorMap(cpi, x, plane, bsize, mbmi.TxSize, cpi.AllowUpdateCdf);
+        bool isInter = AomEncodeMb.IsInterBlock(mbmi);
+        if (!isInter)
+        {
+            // store_cfl_required
+            xd.Cfl.StoreY = StoreCflRequired(cm, xd) ? 1 : 0;
+            for (int plane = 0; plane < numPlanes; ++plane)
+                AomIntraModeSearch.EncodeIntraBlockPlane(cpi, x, bsize, plane, dryRun, cpi.OptimizeSegArr[mbmi.SegmentId]);
+            xd.Cfl.StoreY = 0;
+            if (AomIntraModeSearch.AllowPalette(cpi.AllowScreenContentTools, bsize))
+                for (int plane = 0; plane < Math.Min(2, numPlanes); ++plane)
+                    if ((plane == 0 ? mbmi.Palette.PaletteSize0 : mbmi.Palette.PaletteSize1) > 0 && dryRun == OUTPUT_ENABLED)
+                        AomPalette.TokenizeColorMap(cpi, x, plane, bsize, mbmi.TxSize, cpi.AllowUpdateCdf);
 
-        UpdateIntraMbTxbContext(cpi, x, dryRun, bsize, cpi.AllowUpdateCdf);
+            UpdateIntraMbTxbContext(cpi, x, dryRun, bsize, cpi.AllowUpdateCdf);
+        }
+        else
+        {
+            // intrabc: the prediction from the current frame, then the residual and tokens (x->reuse_inter_pred is
+            // real-time only: all planes are predicted)
+            for (int i = 0; i < numPlanes; ++i) xd.Plane[i].Pre0 = xd.Plane[i].Dst;
+            AomReconInter.BuildIntrabcPredictor(cm, xd, miRow, miCol, 0, numPlanes - 1);
+            EncodeSbInter(cpi, x, bsize, dryRun);
+            TokenizeSbVartx(cpi, x, dryRun, bsize, cpi.AllowUpdateCdf);
+        }
 
         if (dryRun == OUTPUT_ENABLED)
         {
-            if (txfmParams.TxModeSearchType == TX_MODE_SELECT && xd.Lossless[mbmi.SegmentId] == 0 && mbmi.Bsize > BLOCK_4X4)
+            if (cpi.AllowIntrabcNow && mbmi.UseIntrabc != 0) cpi.IntrabcUsed = true;
+            if (txfmParams.TxModeSearchType == TX_MODE_SELECT && xd.Lossless[mbmi.SegmentId] == 0 && mbmi.Bsize > BLOCK_4X4 &&
+                !(isInter && mbmi.SkipTxfm != 0))
             {
-                if (mbmi.TxSize != MaxTxsizeRectLookup[bsize]) ++cpi.TxbSplitCount;
-                if (AomTxSearch.BlockSignalsTxsize(bsize))
+                if (isInter) TxPartitionCountUpdate(cpi, x, bsize, cpi.AllowUpdateCdf);
+                else if (mbmi.TxSize != MaxTxsizeRectLookup[bsize]) ++cpi.TxbSplitCount;
+                if (!isInter && AomTxSearch.BlockSignalsTxsize(bsize))
                 {
                     int txSizeCtx = AomTxSearch.TxSizeContext(xd);
                     int txSizeCat = AomTxSearch.BsizeToTxSizeCat(bsize);
@@ -533,7 +553,9 @@ internal static partial class AomEncodeFrame
             }
             else
             {
-                int intraTxSize = mbmi.TxSize;
+                int intraTxSize = isInter
+                    ? (xd.Lossless[mbmi.SegmentId] != 0 ? TX_4X4 : AomTxSearch.TxSizeFromTxMode(bsize, txfmParams.TxModeSearchType))
+                    : mbmi.TxSize;
                 int cols = Math.Min(cm.MiCols - miCol, miWidth);
                 int rows = Math.Min(cm.MiRows - miRow, miHeight);
                 for (int j = 0; j < rows; j++)
@@ -542,14 +564,29 @@ internal static partial class AomEncodeFrame
             }
         }
 
+        if (txfmParams.TxModeSearchType == TX_MODE_SELECT && AomTxSearch.BlockSignalsTxsize(mbmi.Bsize) && isInter && mbmi.SkipTxfm == 0 &&
+            xd.Lossless[mbmi.SegmentId] == 0)
         {
-            int txSize = bsize > BLOCK_4X4 ? mbmi.TxSize : TX_4X4;
+            if (dryRun != OUTPUT_ENABLED) TxPartitionSetContexts(cm, xd, bsize);
+        }
+        else
+        {
+            int txSize;
+            if (isInter) txSize = xd.Lossless[mbmi.SegmentId] != 0 ? TX_4X4 : AomTxSearch.TxSizeFromTxMode(bsize, txfmParams.TxModeSearchType);
+            else txSize = bsize > BLOCK_4X4 ? mbmi.TxSize : TX_4X4;
             mbmi.TxSize = txSize;
-            // set_txfm_ctxs (intra: never skip-sized)
+            // set_txfm_ctxs (skip-sized for skipped inter blocks)
             byte bwTx = (byte)TxSizeWide[txSize], bhTx = (byte)TxSizeHigh[txSize];
+            if (mbmi.SkipTxfm != 0 && isInter)
+            {
+                bwTx = (byte)(xd.Width * 4);
+                bhTx = (byte)(xd.Height * 4);
+            }
             xd.AboveTxfmContext.AsSpan(xd.AboveTxfmContextOffset, xd.Width).Fill(bwTx);
             xd.LeftTxfmContextBuffer.AsSpan(xd.LeftTxfmContextOffset, xd.Height).Fill(bhTx);
         }
+
+        if (isInter && !xd.IsChromaRef && AomCfl.IsCflAllowed(xd) != 0) AomCfl.CflStoreBlock(xd, mbmi.Bsize, mbmi.TxSize);
     }
 
     private static readonly byte[] BsizeToMaxDepth = { 0, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 };
@@ -575,10 +612,14 @@ internal static partial class AomEncodeFrame
         mbmi.Partition = partition;
         UpdateState(cpi, x, ctx, miRow, miCol, bsize, dryRun);
 
+        AomMbmiExtFrame? extFrame = null;
+        if (cpi.MbmiExtFrameBase != null)
+            extFrame = cpi.MbmiExtFrameBase[miRow * cm.MiStride + miCol] ??= new AomMbmiExtFrame();   // x->mbmi_ext_frame
         if (dryRun == OUTPUT_ENABLED)
         {
             cpi.ExtCbOffset[(miRow * cm.MiStride + miCol) * 2 + 0] = x.CbOffset[0];
             cpi.ExtCbOffset[(miRow * cm.MiStride + miCol) * 2 + 1] = x.CbOffset[1];
+            if (extFrame != null) { extFrame.CbOffset[0] = (ushort)x.CbOffset[0]; extFrame.CbOffset[1] = (ushort)x.CbOffset[1]; }
         }
 
         EncodeSuperblock(cpi, x, dryRun, bsize);
@@ -594,6 +635,7 @@ internal static partial class AomEncodeFrame
             }
             if (cpi.AllowUpdateCdf) UpdateStats(cpi, x);
         }
+        extFrame?.CopyFrom(x.MbmiExt);   // av1_copy_mbmi_ext_to_mbmi_ext_frame
         x.Rdmult = originMult;
     }
 
@@ -688,9 +730,16 @@ internal static partial class AomEncodeFrame
         var fc = x.TileCtx;
         int skipCtx = AomTxSearch.SkipTxfmContext(xd);
         AomCdf.Update(fc.Mode.Skip[skipCtx], mbmi.SkipTxfm, 2);
-        SumIntraStats(cpi, x, mbmi);
-        if (cpi.FrameIsIntraOnly && cpi.AllowScreenContentTools && cpi.AllowIntrabc)
+        if (!AomEncodeMb.IsInterBlock(mbmi)) SumIntraStats(cpi, x, mbmi);
+        if (cpi.AllowIntrabcNow)
+        {
             AomCdf.Update(fc.Mode.Intrabc, mbmi.UseIntrabc, 2);
+            if (mbmi.UseIntrabc != 0)
+            {
+                var dvRef = x.MbmiExt.RefMvStack[0].ThisMv;
+                AomMvCost.UpdateMvStats(mbmi.Mv0, dvRef, fc.Mv, AomMvCost.MV_SUBPEL_NONE);   // fc->ndvc
+            }
+        }
     }
 
     /// <summary>av1_sum_intra_stats (key frames).</summary>
@@ -970,11 +1019,19 @@ internal static partial class AomEncodeFrame
         var mbmi = xd.Mi0;
         if (plane > 0) return;
         int txType = AomEncodeMb.GetTxType(xd, 0, blkRow, blkCol, txSize, cpi.ReducedTxSetUsed != 0);
-        int setType = AomEncodeMb.ExtTxSetType(txSize, false, cpi.ReducedTxSetUsed != 0);
+        bool isInter = AomEncodeMb.IsInterBlock(mbmi);
+        int setType = AomEncodeMb.ExtTxSetType(txSize, isInter, cpi.ReducedTxSetUsed != 0);
         if (NumExtTxSet[setType] > 1 && cpi.Cm.BaseQindex > 0 && mbmi.SkipTxfm == 0)
         {
-            int eset = ExtTxSetIndex[0 * 16 + setType];
-            if (eset > 0)
+            int eset = ExtTxSetIndex[(isInter ? 6 : 0) + setType];
+            if (eset > 0 && isInter)
+            {
+                int sqr = TxsizeSqrMap[txSize];
+                var m = x.TileCtx.Mode;
+                ushort[] cdf = eset == 1 ? m.TxtpInter1[sqr] : eset == 2 ? m.TxtpInter2 : m.TxtpInter3[sqr];
+                if (allowUpdateCdf) AomCdf.Update(cdf, ExtTxInd[setType * 16 + txType], NumExtTxSet[setType]);
+            }
+            else if (eset > 0)
             {
                 int intraDir = mbmi.UseFilterIntra != 0 ? FimodeToIntradir[mbmi.FilterIntraMode] : mbmi.Mode;
                 int sqr = TxsizeSqrMap[txSize];

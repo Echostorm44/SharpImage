@@ -132,6 +132,26 @@ internal static class AomHadamard
     {
         for (int idx = 0; idx < 4; ++idx)
             H8x8(srcDiff.Slice((idx >> 1) * 8 * srcStride + (idx & 1) * 8), srcStride, coeff.Slice(idx * 64));
+        if (Avx2.IsSupported && coeff.Length >= 256)
+        {
+            ref int c0 = ref MemoryMarshal.GetReference(coeff);
+            for (int idx = 0; idx < 64; idx += 8)
+            {
+                var a0 = Vector256.LoadUnsafe(ref c0, (nuint)idx); var a1 = Vector256.LoadUnsafe(ref c0, (nuint)(idx + 64));
+                var a2 = Vector256.LoadUnsafe(ref c0, (nuint)(idx + 128)); var a3 = Vector256.LoadUnsafe(ref c0, (nuint)(idx + 192));
+                var b0 = Vector256.ShiftRightArithmetic(a0 + a1, 1); var b1 = Vector256.ShiftRightArithmetic(a0 - a1, 1);
+                var b2 = Vector256.ShiftRightArithmetic(a2 + a3, 1); var b3 = Vector256.ShiftRightArithmetic(a2 - a3, 1);
+                (b0 + b2).StoreUnsafe(ref c0, (nuint)idx); (b1 + b3).StoreUnsafe(ref c0, (nuint)(idx + 64));
+                (b0 - b2).StoreUnsafe(ref c0, (nuint)(idx + 128)); (b1 - b3).StoreUnsafe(ref c0, (nuint)(idx + 192));
+            }
+            // extra shift to match AVX2 output: per 16, the middle two quads swapped
+            for (int i = 0; i < 16; i++)
+            {
+                var m = Vector256.LoadUnsafe(ref c0, (nuint)(i * 16 + 4));
+                Avx2.Permute2x128(m, m, 0x01).StoreUnsafe(ref c0, (nuint)(i * 16 + 4));
+            }
+            return;
+        }
         for (int idx = 0; idx < 64; ++idx)
         {
             int a0 = coeff[idx], a1 = coeff[idx + 64], a2 = coeff[idx + 128], a3 = coeff[idx + 192];
@@ -156,6 +176,20 @@ internal static class AomHadamard
     {
         for (int idx = 0; idx < 4; ++idx)
             H16x16(srcDiff.Slice((idx >> 1) * 16 * srcStride + (idx & 1) * 16), srcStride, coeff.Slice(idx * 256));
+        if (Avx2.IsSupported && coeff.Length >= 1024)
+        {
+            ref int c0 = ref MemoryMarshal.GetReference(coeff);
+            for (int idx = 0; idx < 256; idx += 8)
+            {
+                var a0 = Vector256.LoadUnsafe(ref c0, (nuint)idx); var a1 = Vector256.LoadUnsafe(ref c0, (nuint)(idx + 256));
+                var a2 = Vector256.LoadUnsafe(ref c0, (nuint)(idx + 512)); var a3 = Vector256.LoadUnsafe(ref c0, (nuint)(idx + 768));
+                var b0 = Vector256.ShiftRightArithmetic(a0 + a1, 2); var b1 = Vector256.ShiftRightArithmetic(a0 - a1, 2);
+                var b2 = Vector256.ShiftRightArithmetic(a2 + a3, 2); var b3 = Vector256.ShiftRightArithmetic(a2 - a3, 2);
+                (b0 + b2).StoreUnsafe(ref c0, (nuint)idx); (b1 + b3).StoreUnsafe(ref c0, (nuint)(idx + 256));
+                (b0 - b2).StoreUnsafe(ref c0, (nuint)(idx + 512)); (b1 - b3).StoreUnsafe(ref c0, (nuint)(idx + 768));
+            }
+            return;
+        }
         for (int idx = 0; idx < 256; ++idx)
         {
             int a0 = coeff[idx], a1 = coeff[idx + 256], a2 = coeff[idx + 512], a3 = coeff[idx + 768];
