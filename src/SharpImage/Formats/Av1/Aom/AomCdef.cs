@@ -414,6 +414,13 @@ internal static partial class AomCdef
                     int ysize = vfiltSize + (bottom ? 0 : VBorder) + yoff, xsize = hfiltSize + (right ? 0 : HBorder) + xoff;
                     int row = fbr * MiSize64 << miHighL2, col = fbc * MiSize64 << miWideL2;
                     var dp = cur.Planes[pli];
+                    if (dp.Buf16 != null)
+                    {
+                        // av1_cdef_copy_sb8_16_highbd
+                        for (int r = 0; r < ysize; r++)
+                            Array.Copy(dp.Buf16, dp.At(col - xoff, row - yoff + r), inbuf, inOff - yoff * BStride - xoff + r * BStride, xsize);
+                    }
+                    else
                     // av1_cdef_copy_sb8_16_lowbd
                     unsafe
                     {
@@ -430,6 +437,14 @@ internal static partial class AomCdef
                     for (int gi = 0; gi < totalStrengths; gi++)
                     {
                         GetFilterStrengths(pickMethod, out int pri, out int sec, gi);
+                        if (dp.Buf16 != null)
+                        {
+                            ulong hsse = FiltErrorHbd(rp, row, col, sc.TmpDst16, inbuf, inOff, xdec, ydec, dir, ref dirinit, var, pli, dlist, cdefCount,
+                                pri, sec, damping, cm.BitDepth - 8);
+                            if (pli < 2) (pli == 0 ? mse0 : mse1)[k][gi] = hsse;
+                            else mse1[k][gi] += hsse;
+                            continue;
+                        }
                         // get_filt_error (8-bit)
                         ulong currSse = 0;
                         bool zero = pri == 0 && sec == 0;
@@ -658,7 +673,8 @@ internal static partial class AomCdef
     private static void PickCdefFromQp(AomComp cpi, AomCdefInfo ci, bool skipCdef, bool isScreenContent, bool avoidUvCdef)
     {
         var cm = cpi.Cm;
-        int q = Av1Tables.DequantTable[0, cm.BaseQindex, 1];
+        int bdq = cm.BitDepth;
+        int q = Av1Tables.DequantTable[bdq == 8 ? 0 : bdq == 10 ? 1 : 2, cm.BaseQindex, 1] >> (bdq - 8);
         if (skipCdef) { ci.CdefBits = 1; ci.NbCdefStrengths = 2; }
         else { ci.CdefBits = 0; ci.NbCdefStrengths = 1; }
         ci.CdefDamping = 3 + (cm.BaseQindex >> 6);
@@ -744,14 +760,22 @@ internal static partial class AomCdef
                     if (i1 < vsize + VBorder) FillRect(inbuf, inOff + i1 * BStride - HBorder, BStride, vsize + VBorder - i1, hsize + 2 * HBorder, VeryLarge);
                     if (j0 > -HBorder) FillRect(inbuf, inOff + i0 * BStride - HBorder, BStride, i1 - i0, j0 + HBorder, VeryLarge);
                     if (j1 < hsize + HBorder) FillRect(inbuf, inOff + i0 * BStride + j1, BStride, i1 - i0, hsize + HBorder - j1, VeryLarge);
+                    var dp = frame.Planes[plane];
+                    bool dirinit = false;
+                    if (pp.Buf16 != null)
+                    {
+                        for (int r = 0; r < i1 - i0; r++)
+                            Array.Copy(pp.Buf16, pp.At(coffset + j0, roffset + i0 + r), inbuf, inOff + (i0 + r) * BStride + j0, j1 - j0);
+                        FilterFb16(dp.Buf16, dp.At(coffset, roffset), dp.Stride, inbuf, inOff, xdec, ydec, dir, ref dirinit, false, var, plane, dlist,
+                            cdefCount, plane == 0 ? levelY : levelUv, plane == 0 ? secY : secUv, ci.CdefDamping, cm.BitDepth - 8);
+                        continue;
+                    }
                     unsafe
                     {
                         fixed (ushort* ib = inbuf)
                         fixed (byte* sb = pp.Buf)
                             CopyRect8To16(ib + inOff + i0 * BStride + j0, BStride, sb + pp.At(coffset + j0, roffset + i0), pp.Stride, j1 - j0, i1 - i0);
                     }
-                    var dp = frame.Planes[plane];
-                    bool dirinit = false;
                     FilterFb(dp.Buf, dp.At(coffset, roffset), dp.Stride, inbuf, inOff, xdec, ydec, dir, ref dirinit, false, var, plane, dlist,
                         cdefCount, plane == 0 ? levelY : levelUv, plane == 0 ? secY : secUv, ci.CdefDamping, 0);
                 }
@@ -768,4 +792,5 @@ internal sealed class CdefSearchScratch
     public readonly int[] Dir = new int[AomCdef.NBlocksForScratch * AomCdef.NBlocksForScratch];
     public readonly int[] Var = new int[AomCdef.NBlocksForScratch * AomCdef.NBlocksForScratch];
     public readonly byte[] TmpDst8 = new byte[128 * 128];
+    public readonly ushort[] TmpDst16 = new ushort[128 * 128];
 }
