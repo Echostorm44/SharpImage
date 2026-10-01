@@ -97,12 +97,13 @@ internal static class AomRdoptUtils
     }
 
     /// <summary>set_mode_eval_params (the dist metric is PSNR: no QM distortion; the mb rd record is inter-only).</summary>
-    internal static void SetModeEvalParams(AomComp cpi, AomMacroblock x, int modeEvalType, bool codedLossless = false)
+    internal static void SetModeEvalParams(AomComp cpi, AomMacroblock x, int modeEvalType)
     {
+        bool codedLossless = cpi.Cm.BaseQindex == 0;   // cm->features.coded_lossless (no delta q / segmentation)
         var sf = cpi.Sf;
         var w = cpi.WinnerModeParams;
         var p = x.TxfmSearchParams;
-        p.UseQmDistMetric = 0;
+        p.UseQmDistMetric = cpi.QmPsnrDistMetric ? 1 : 0;   // dist_metric == AOM_DIST_METRIC_QM_PSNR
         switch (modeEvalType)
         {
             case DEFAULT_EVAL:

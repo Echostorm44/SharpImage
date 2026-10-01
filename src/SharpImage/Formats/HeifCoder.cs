@@ -1120,11 +1120,14 @@ public static partial class HeifCoder
     {
         private readonly bool prevAvoid;
         private readonly Av1.Av1EncodeSpeed? prevSpeed;
-        private readonly int prevThreads, prevSharpness, prevAom;
+        private readonly int prevThreads, prevSharpness;
+        private readonly (int, bool) prevAom;
         public EncoderScope(AvifEncodeOptions options, bool allIntra = false)
         {
             // libavif's all-intra stills go through the libaom-port encoder (Av1.AomStill) where it applies
-            prevAom = Av1.AomStill.Enter(allIntra && options.EnableCdef != true && options.Tune == AvifTune.Psnr ? options.Speed : -1);
+            // (tune=iq: libaom's own CDEF choice, so only without an explicit enable-cdef)
+            bool aomTune = options.Tune == AvifTune.Psnr ? options.EnableCdef != true : options.Tune == AvifTune.Iq && options.EnableCdef == null;
+            prevAom = Av1.AomStill.Enter(allIntra && aomTune ? options.Speed : -1, options.Tune == AvifTune.Iq);
             if (options.Sharpness is < 0 or > 7) throw new ArgumentOutOfRangeException(nameof(options), "Sharpness must be 0..7.");
             prevSharpness = Av1.Av1ObuWriter.t_sharpness;
             Av1.Av1ObuWriter.t_sharpness = options.Sharpness;
@@ -1395,6 +1398,10 @@ public static partial class HeifCoder
             options.DenoiseBlockSize, options.DenoiseApply);
         // Quality (libavif scale) overrides Qp; quality 100 = lossless AV1 coding (matrix unchanged).
         var (qIdx, aQIdx, qualityLossless) = QualityQIndices(options, color);
+        // libavif tunes identity-matrix colour for SSIM, not IQ: not through the libaom port (yet)
+        var aomScope = options.Tune == AvifTune.Iq && color.Matrix == 0 ? Av1.AomStill.Enter(-1) : ((int, bool)?)null;
+        try
+        {
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
                && options.FilmGrain == null && !denoise && !options.Progressive && !forceColor && !forceAlpha && qIdx == null && aQIdx == null
                && !qualityLossless && !options.SharpYuv && !SourcePlanes.TryGetValue(image, out _)
@@ -1402,6 +1409,11 @@ public static partial class HeifCoder
             : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless || qualityLossless, grain,
                 options.Progressive && image.Columns >= 16 && image.Rows >= 16,   // a sub-8px base layer is pointless
                 forceColor: forceColor, forceAlpha: forceAlpha, qIdxOverride: qIdx, alphaQIdxOverride: aQIdx, sharpYuv: options.SharpYuv);
+        }
+        finally
+        {
+            if (aomScope is { } prev) Av1.AomStill.Exit(prev);
+        }
     }
 
     /// <summary>

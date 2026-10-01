@@ -19,20 +19,48 @@ internal sealed class AomEncodeInput
     public bool EnableIntrabc = true;
     /// <summary>Test hook: adjusts the speed features after libaom's setup (e.g. to isolate a stage).</summary>
     public Action<AomSpeedFeatures>? SfOverride;
+    /// <summary>AOME_SET_TUNING AOM_TUNE_IQ (libavif's default for still colour images; libavif never sets it for
+    /// lossless, so it is ignored at qindex 0).</summary>
+    public bool TuneIq;
+    /// <summary>Test hook (tune=iq staging): letters of the sub-features handle_tuning enables to switch back off:
+    /// q enable_qm, d deltaq_mode, c cdef, s sharpness, u chroma deltaq, m qm-psnr dist metric, a adaptive sharpness.</summary>
+    public string? IqOff;
 }
 
 // Port of libaom 3.14.1 av1_encode_frame / encode_frame_internal / encode_tiles / av1_encode_tile / encode_sb_row /
 // encode_rd_sb for one all-intra key frame (one tile, no segmentation, no delta q): the search and the final encode
 // that leave the mode info, the coefficients and the reconstruction for the bitstream writer and the loop filters.
+internal sealed partial class AomComp
+{
+    // td->pc_root of the non-RD path (allocated once per frame and reused by every superblock)
+    public AomPcTree? NonrdPcRoot;
+}
+
 internal static partial class AomEncoder
 {
     internal static (AomComp cpi, AomMacroblock x) EncodeFrame(AomEncodeInput input)
     {
+        // handle_tuning (av1_cx_iface.c) for AOM_TUNE_IQ
+        bool tuneIq = input.TuneIq && input.BaseQindex != 0;
+        string off = tuneIq ? input.IqOff ?? "" : "";
+        bool deltaqVarianceBoost = tuneIq && !off.Contains('d');
         var cm = new AomCommon(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome,
-            SelectSbSize(input.Width, input.Height, input.Speed));
+            deltaqVarianceBoost ? BLOCK_64X64 : SelectSbSize(input.Width, input.Height, input.Speed));   // Variance Boost: 64x64 SBs
         cm.BaseQindex = input.BaseQindex;
         var cpi = new AomComp { Cm = cm, Speed = input.Speed, AllowScreenContentTools = input.AllowScreenContentTools,
             UseScreenContentTools = input.UseScreenContentTools, AllowIntrabc = input.AllowIntrabc, SbSize = cm.SbSize };
+        if (tuneIq)
+        {
+            cpi.TuneIq = true;
+            cpi.UsingQm = !off.Contains('q');
+            cpi.QmMinLevel = 2; cpi.QmMaxLevel = 10;   // QM_FIRST_IQ_SSIMULACRA2 / QM_LAST_IQ_SSIMULACRA2
+            cpi.Sharpness = off.Contains('s') ? 0 : 7;
+            cpi.QmPsnrDistMetric = !off.Contains('m');
+            cpi.CdefControl = off.Contains('c') ? 0 : 3;   // CDEF_ADAPTIVE
+            cpi.EnableChromaDeltaq = !off.Contains('u');
+            cpi.DeltaqVarianceBoost = deltaqVarianceBoost;
+            cpi.EnableAdaptiveSharpness = !off.Contains('a');
+        }
 
         // the source frame with libaom's replicated borders (the lookahead copy runs aom_extend_frame_borders)
         cpi.Source = new AomFrameBuffer(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome);
@@ -47,7 +75,15 @@ internal static partial class AomEncoder
         }
 
         // av1_set_screen_content_options (anti-aliasing aware detection; the fast variant from speed 3)
-        if (input.DetectScreenContent)
+        // (non-RD pick mode without the hybrid intra search, speed 9: screen content detection is disabled and the
+        // tools stay off)
+        bool nonrdNoHybrid = input.Speed >= 9;
+        if (input.DetectScreenContent && nonrdNoHybrid)
+        {
+            input.AllowScreenContentTools = input.UseScreenContentTools = input.AllowIntrabc = input.IsScreenContentType = false;
+            cpi.AllowScreenContentTools = cpi.UseScreenContentTools = cpi.AllowIntrabc = false;
+        }
+        else if (input.DetectScreenContent)
         {
             var (sct, ibc, isSc) = EstimateScreenContent(cpi.Source, input.Speed >= 3);
             input.AllowScreenContentTools = sct;
@@ -86,21 +122,11 @@ internal static partial class AomEncoder
             cpi.OptimizeSegArr[i] = lossless ? NO_TRELLIS_OPT : cpi.Sf.rd_sf.optimize_coefficients;
         }
 
+        // av1_set_quantizer: chroma delta q and the quantization matrix levels; av1_init_quantizer
+        AomQuantSetup.SetQuantizer(cpi, input.BaseQindex);
+        cpi.Quants = new AomQuants(8, cm.YDcDeltaQ, cm.UDcDeltaQ, cm.UAcDeltaQ, cm.VDcDeltaQ, cm.VAcDeltaQ, cpi.Sharpness);
         // av1_frame_init_quantizer / set_q_index
-        var quants = new AomQuants(8, 0, 0, 0, 0, 0, cpi.Sharpness);
-        x.Qindex = input.BaseQindex;
-        for (int p = 0; p < 3; p++)
-        {
-            var mp = x.Plane[p];
-            int q = input.BaseQindex;
-            mp.QuantFp0 = quants.QuantFp[p, q, 0]; mp.QuantFp1 = quants.QuantFp[p, q, 1];
-            mp.RoundFp0 = quants.RoundFp[p, q, 0]; mp.RoundFp1 = quants.RoundFp[p, q, 1];
-            mp.Quant0 = quants.Quant[p, q, 0]; mp.Quant1 = quants.Quant[p, q, 1];
-            mp.QuantShift0 = quants.QuantShift[p, q, 0]; mp.QuantShift1 = quants.QuantShift[p, q, 1];
-            mp.Zbin0 = quants.Zbin[p, q, 0]; mp.Zbin1 = quants.Zbin[p, q, 1];
-            mp.Round0 = quants.Round[p, q, 0]; mp.Round1 = quants.Round[p, q, 1];
-            mp.Dequant0 = quants.Dequant[p, q, 0]; mp.Dequant1 = quants.Dequant[p, q, 1];
-        }
+        AomQuantSetup.SetQIndex(cpi, x, input.BaseQindex);
 
         // init_encode_frame_mb_context / av1_setup_block_planes
         for (int p = 0; p < 3; p++)
@@ -118,7 +144,7 @@ internal static partial class AomEncoder
         cm.Fc = new Av1CdfContext();
         int qCtxQ = input.BaseQindex;
         Av1CdfDefaults.InitializeDefault(cm.Fc, qCtxQ <= 20 ? 0 : qCtxQ <= 60 ? 1 : qCtxQ <= 120 ? 2 : 3);   // get_q_ctx
-        cpi.RdRdmult = AomRd.RdMultKeyFrame(input.BaseQindex, 8);
+        cpi.RdRdmult = AomRd.RdMultKeyFrame(input.BaseQindex + cm.YDcDeltaQ, 8, cpi.TuneIq);
         x.Errorperbit = AomRd.ErrorPerBit(cpi.RdRdmult);
         AomModeCostFill.Fill(x.ModeCosts, cm.Fc, cpi.EnableFilterIntra);
         x.CoeffCosts.Fill(cm.Fc.Coef, cm.NumPlanes);
@@ -154,6 +180,19 @@ internal static partial class AomEncoder
             cpi.MbmiExtFrameBase = new AomMbmiExtFrame?[cm.MiGridBase.Length];
         }
 
+        // encoder.c: av1_set_mb_ssim_rdmult_scaling (tune SSIM / IQ / SSIMULACRA2)
+        if (cpi.TuneIq) cpi.SetMbSsimRdmultScaling();
+
+        // encode_frame_internal: delta q resolution and presence (Variance Boost: delta_q_res by the base qindex)
+        cpi.DeltaQRes = 0;
+        if (cpi.DeltaqVarianceBoost) cpi.DeltaQRes = input.BaseQindex >= 160 ? 8 : input.BaseQindex >= 120 ? 4 : input.BaseQindex >= 80 ? 2 : 1;
+        cpi.DeltaQPresentFlag = cpi.DeltaqVarianceBoost && input.BaseQindex > 0;
+        cpi.DeltaqUsed = false;
+        xd.CurrentBaseQindex = input.BaseQindex;
+
+        // encode_tiles: the real-time path preallocates one PC_TREE for the frame
+        if (cpi.Sf.rt_sf.use_nonrd_pick_mode != 0) cpi.NonrdPcRoot = new AomPcTree(cm.SbSize);
+
         // av1_encode_tile
         cm.ZeroAboveContext();
         if (cpi.EnableCflIntra) AomCfl.CflInit(xd.Cfl, input.SsX, input.SsY);
@@ -161,6 +200,8 @@ internal static partial class AomEncoder
 
         // intrabc allowed but never selected: reset the flag
         if (cpi.AllowIntrabc && !cpi.IntrabcUsed) cpi.AllowIntrabc = false;
+        // no non-zero delta q used: drop delta_q_present_flag
+        if (cpi.DeltaQPresentFlag && !cpi.DeltaqUsed) cpi.DeltaQPresentFlag = false;
         return (cpi, x);
     }
 
@@ -320,8 +361,10 @@ internal static partial class AomEncoder
             x.SourceVariance = uint.MaxValue;
             x.CbCoefBuff = cpi.CbCoeffBuffers[sbRow * sbCols + sbCol];
             // (produce_gradients_for_sb: the HOG is computed without the gradient cache; identical results)
+            x.ColorPaletteThresh = 64;
             x.InitSrcVarInfo(cm.SbSize);
-            EncodeRdSb(cpi, x, miRow, miCol);
+            if (cpi.Sf.rt_sf.use_nonrd_pick_mode != 0) EncodeNonrdSb(cpi, x, miRow, miCol);
+            else EncodeRdSb(cpi, x, miRow, miCol);
         }
     }
 
@@ -370,12 +413,22 @@ internal static partial class AomEncoder
         var sf = cpi.Sf;
         // init_encode_rd_sb
         x.Cnn.Valid = false;
+        if (cpi.DeltaQPresentFlag) AomQuantSetup.SetupDeltaQ(cpi, x, miRow, miCol);
         x.TxfmSearchParams.ModeEvalType = DEFAULT_EVAL;
         AomRdStats dummyRdc = default;
         dummyRdc.Invalidate();
 
+        if (sf.part_sf.partition_search_type == VAR_BASED_PARTITION)
+        {
+            // partition search starting from a variance-based partition
+            AomEncodeFrame.SetOffsets(cpi, x, miRow, miCol, cm.SbSize);
+            AomVarBasedPart.ChooseVarBasedPartitioning(cpi, x, miRow, miCol);
+            var root = new AomPcTree(cm.SbSize);
+            AomEncodeFrame.RdUsePartition(cpi, x, miRow, miCol, cm.SbSize, out _, out _, true, root);
+            return;
+        }
         if (sf.part_sf.partition_search_type != SEARCH_PARTITION)
-            throw new NotSupportedException("only SEARCH_PARTITION (the all-intra RD speeds) is ported");
+            throw new NotSupportedException("FIXED_PARTITION is not used by the all-intra speeds");
 
         // set_max_min_partition_size (no auto max partition for intra frames)
         x.MaxPartitionSize = Math.Min(sf.part_sf.default_max_partition_size, DimToSize(cpi.MaxPartitionSizeCfg));
@@ -386,6 +439,19 @@ internal static partial class AomEncoder
         var pcRoot = new AomPcTree(cm.SbSize);
         long noneRd = 0;
         AomEncodeFrame.RdPickPartition(cpi, x, miRow, miCol, cm.SbSize, ref dummyRdc, dummyRdc, pcRoot, ref noneRd, false, null);
+    }
+
+    /// <summary>encode_nonrd_sb (VAR_BASED_PARTITION, no segment skip, no delta q).</summary>
+    private static void EncodeNonrdSb(AomComp cpi, AomMacroblock x, int miRow, int miCol)
+    {
+        var cm = cpi.Cm;
+        // set a variance-based partition
+        AomEncodeFrame.SetOffsets(cpi, x, miRow, miCol, cm.SbSize);
+        AomVarBasedPart.ChooseVarBasedPartitioning(cpi, x, miRow, miCol);
+        x.CbOffset[0] = 0;
+        x.CbOffset[1] = 0;
+        // (skip_cdef_sb is off in the all-intra mode)
+        AomEncodeFrame.NonrdUsePartition(cpi, x, miRow, miCol, cm.SbSize, cpi.NonrdPcRoot!);
     }
 
     /// <summary>dim_to_size.</summary>

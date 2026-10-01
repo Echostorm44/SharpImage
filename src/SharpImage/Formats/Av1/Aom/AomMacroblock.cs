@@ -88,6 +88,7 @@ internal sealed class AomModeCosts
     public readonly int[] InterTxTypeCosts = new int[ExtTxSetsInter * ExtTxSizes * TxTypes];                // [set][sqr tx][type]
     public readonly int[] AngleDeltaCost = new int[DirectionalModes * (2 * MaxAngleDelta + 1)];
     public readonly int[] IntrabcCost = new int[2];
+    public readonly int[] MbmodeCost = new int[4 * IntraModes];                                // [BLOCK_SIZE_GROUPS][INTRA_MODES]
     public readonly int[] SwitchableRestoreCost = new int[RestoreSwitchableTypes];
     public readonly int[] WienerRestoreCost = new int[2];
     public readonly int[] SgrprojRestoreCost = new int[2];
@@ -197,6 +198,8 @@ internal sealed partial class AomMacroblock
     public readonly AomMacroblockD E = new();
     public int Qindex;
     public int DeltaQindex;
+    // x->rdmult_delta_qindex / x->rdmult_cur_qindex (the superblock's delta q for its rdmult)
+    public int RdmultDeltaQindex, RdmultCurQindex;
     public int Rdmult;
     public int IntraSbRdmultModifier = 128;
     public readonly AomModeCosts ModeCosts = new();

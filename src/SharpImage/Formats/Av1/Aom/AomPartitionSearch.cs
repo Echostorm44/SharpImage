@@ -304,7 +304,7 @@ internal static partial class AomEncodeFrame
         ref AomRdStats sumRdc, int partition, AomPickModeContext thisCtx)
     {
         int origMult = x.Rdmult;
-        SetupBlockRdmult(cpi, x);
+        SetupBlockRdmult(cpi, x, miRow, miCol, subsize);
         bestRdcost.CostUpdate(x.Rdmult);
         RdStatsSubtraction(x.Rdmult, bestRdcost, sumRdc, out AomRdStats rdcostRemaining);
         AomRdStats thisRdc = default;
@@ -915,7 +915,7 @@ internal static partial class AomEncodeFrame
         }
 
         int origRdmult = x.Rdmult;
-        SetupBlockRdmult(cpi, x);
+        SetupBlockRdmult(cpi, x, miRow, miCol, bsize);
         bestRdc.CostUpdate(x.Rdmult);
 
         xd.AboveTxfmContext = cm.AboveTxfm;

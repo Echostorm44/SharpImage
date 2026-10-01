@@ -501,7 +501,7 @@ internal static class AomTxb
     internal static int OptimizeTxb(AomCoeffCosts costs, int txSize, int txType, int planeType, bool isInter, AomTxbCtx txbCtx,
         ReadOnlySpan<int> tcoeff, Span<int> qcoeff, Span<int> dqcoeff, int eob, short dequant0, short dequant1,
         int rdmultIn, int bitDepth, int sharpness, bool useChromaTrellisRdMult, bool tuneIq, int txTypeCost,
-        ReadOnlySpan<ushort> scan, out int rateCost)
+        ReadOnlySpan<ushort> scan, out int rateCost, byte[]? iqmatrix = null, byte[]? qmatrix = null)
     {
         int shift = AomQuantize.TxScale(txSize);
         int txsCtx = TxsizeEntropyCtx(txSize);
@@ -529,7 +529,7 @@ internal static class AomTxb
             NzOffset = ref MemoryMarshal.GetArrayDataReference(NzMapCtxOffset[txSize]),
             EobCosts = txbEobCosts, Costs = txbCosts, Rdmult = rdmult,
             Shift = shift, Bhl = bhl, Width = width, TxClass = txClass, DcSignCtx = txbCtx.DcSignCtx, Sharpness = sharpness,
-            Dq0 = dequant0, Dq1 = dequant1,
+            Dq0 = dequant0, Dq1 = dequant1, Iqm = iqmatrix, Qm = qmatrix,
         };
         int nonSkipCost = txbCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 0];
         int skipCost = txbCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 1];
@@ -554,8 +554,7 @@ internal static class AomTxb
             int coeffCtx = LowerLevelsCtxEob(bhl, width, si);
             accuRate += CoeffCostEob(ref t, ci, absQc, sign, coeffCtx);
             int tqc = tcoeff[ci], dqc = dqcoeff[ci];
-            long dist = CoeffDist(tqc, dqc, shift), dist0 = CoeffDist(tqc, 0, shift);
-            accuDist += dist - dist0;
+            accuDist += DistDiff(ref t, tqc, dqc, ci);
             --si;
         }
         // update_coeff_eob_facade
@@ -599,13 +598,28 @@ internal static class AomTxb
         public AomLvMapCoeffCost Costs;
         public long Rdmult;
         public int Shift, Bhl, Width, TxClass, DcSignCtx, Sharpness, Dq0, Dq1;
+        // the inverse quantization matrix (get_dqv) and, with the QM-PSNR metric, the weighting matrix (get_coeff_dist)
+        public byte[]? Iqm, Qm;
     }
 
+    /// <summary>get_dqv: the coefficient's dequantizer, matrix-weighted.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static long CoeffDist(int tcoeff, int dqcoeff, int shift)
+    private static int Dqv(ref Trellis t, int ci)
     {
-        long diff = (long)(tcoeff - dqcoeff) * (1 << shift);
-        return diff * diff;
+        int dqv = ci != 0 ? t.Dq1 : t.Dq0;
+        var iqm = t.Iqm;
+        if (iqm != null) dqv = (iqm[ci] * dqv + (1 << 4)) >> 5;
+        return dqv;
+    }
+
+    /// <summary>get_coeff_dist(tqc, dqc) - get_coeff_dist(tqc, 0): without a matrix (tqc - dqc)^2 - tqc^2 = dqc (dqc - 2 tqc),
+    /// scaled by 2^(2 shift); with the QM-PSNR matrix both weighted and rounded as libaom computes them.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long DistDiff(ref Trellis t, int tqc, int dqc, int ci)
+    {
+        var qm = t.Qm;
+        if (qm == null) return ((long)dqc * (dqc - (long)tqc * 2)) * (1L << (2 * t.Shift));
+        return AomQm.CoeffDistQm(tqc, dqc, t.Shift, qm, ci) - AomQm.CoeffDistQm(tqc, 0, t.Shift, qm, ci);
     }
 
     /// <summary>get_lower_levels_ctx over the trellis's levels.</summary>
@@ -720,14 +734,13 @@ internal static class AomTxb
         if (absQc == 1) rateLow = Unsafe.Add(ref t.Base, coeffCtx * 8);
         else
         {
-            int dqv = ci != 0 ? t.Dq1 : t.Dq0;
+            int dqv = Dqv(ref t, ci);
             QcDqcLow(absQc, sign, dqv, t.Shift, out qcLow, out dqcLow);
             absQcLow = absQc - 1;
             rateLow = isLast ? CoeffCostEob(ref t, ci, absQcLow, sign, coeffCtx) : CoeffCostNotLast(ref t, ci, absQcLow, sign, coeffCtx);
         }
-        long tqc2 = (long)tqc * 2;
-        long distDiff0 = ((long)dqc * (dqc - tqc2)) * (1L << (2 * t.Shift));
-        long distDiffLow0 = absQc == 1 ? 0 : ((long)dqcLow * (dqcLow - tqc2)) * (1L << (2 * t.Shift));
+        long distDiff0 = DistDiff(ref t, tqc, dqc, ci);
+        long distDiffLow0 = absQc == 1 ? 0 : DistDiff(ref t, tqc, dqcLow, ci);
         long rd = AomRd.RdCost64(t.Rdmult, rate, distDiff0);
         long rdLow = AomRd.RdCost64(t.Rdmult, rateLow, distDiffLow0);
         if (rdLow < rd)
@@ -760,7 +773,7 @@ internal static class AomTxb
             if (absDqc < absTqc) { accuRate += rate; return; }
             if (t.Sharpness == 0)
             {
-                long distDiff0 = ((long)absDqc * (absDqc - (long)absTqc * 2)) * (1L << (2 * shift));
+                long distDiff0 = DistDiff(ref t, absTqc, absDqc, ci);
                 int rateLow = rate - Unsafe.Add(ref t.Base, coeffCtx * 8 + 5);
                 long rd = AomRd.RdCost64(t.Rdmult, rate, distDiff0);
                 long rdLow = AomRd.RdCost64(t.Rdmult, rateLow, 0);
@@ -780,12 +793,11 @@ internal static class AomTxb
             int rate = TwoCoeffCostSimple(ref t, ci, absQc, coeffCtx, out int rateLow);
             if (absDqc < absTqc) { accuRate += rate; return; }
             // allow_lower_qc = sharpness == 0 || abs_qc > 1: always, abs_qc being at least 2 here
-            int dqv = ci != 0 ? t.Dq1 : t.Dq0;
+            int dqv = Dqv(ref t, ci);
             int absQcLow = absQc - 1;
             int absDqcLow = (absQcLow * dqv) >> shift;
-            long absTqc2 = (long)absTqc << 1;
-            long distDiff0 = ((long)absDqc * (absDqc - absTqc2)) * (1L << (2 * shift));
-            long distDiffLow0 = ((long)absDqcLow * (absDqcLow - absTqc2)) * (1L << (2 * shift));
+            long distDiff0 = DistDiff(ref t, absTqc, absDqc, ci);
+            long distDiffLow0 = DistDiff(ref t, absTqc, absDqcLow, ci);
             long rd = AomRd.RdCost64(t.Rdmult, rate, distDiff0);
             long rdLow = AomRd.RdCost64(t.Rdmult, rateLow, distDiffLow0);
             if (rdLow < rd)
@@ -810,7 +822,7 @@ internal static class AomTxb
         if (qc == 0) { accuRate += Unsafe.Add(ref t.Base, coeffCtx * 8); return; }
         int shift = t.Shift, bhl = t.Bhl, sharpness = t.Sharpness;
         long rdmult = t.Rdmult;
-        int dqv = ci != 0 ? t.Dq1 : t.Dq0;
+        int dqv = Dqv(ref t, ci);
         bool lowerLevel = false;
         int absQc = Math.Abs(qc);
         int tqc = Unsafe.Add(ref t.Tcoeff, ci), dqc = Unsafe.Add(ref t.Dqcoeff, ci);
@@ -823,9 +835,8 @@ internal static class AomTxb
             absQcLow = absQc - 1;
             rateLow = CoeffCostNotLast(ref t, ci, absQcLow, sign, coeffCtx);
         }
-        long tqc2 = (long)tqc * 2;
-        long dist = ((long)dqc * (dqc - tqc2)) * (1L << (2 * shift));
-        long distLow = absQc == 1 ? 0 : ((long)dqcLow * (dqcLow - tqc2)) * (1L << (2 * shift));
+        long dist = DistDiff(ref t, tqc, dqc, ci);
+        long distLow = absQc == 1 ? 0 : DistDiff(ref t, tqc, dqcLow, ci);
         int rate = CoeffCostNotLast(ref t, ci, absQc, sign, coeffCtx);
         long rd = AomRd.RdCost64(rdmult, accuRate + rate, accuDist + dist);
         long rdLow = AomRd.RdCost64(rdmult, accuRate + rateLow, accuDist + distLow);

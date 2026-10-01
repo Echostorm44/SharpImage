@@ -239,14 +239,20 @@ internal static partial class AomTxSearch
         return (uint)AomEncodeMb.Sse(src, srcOff, srcStride, dst, dstOff, dstStride, visibleCols, visibleRows);
     }
 
-    /// <summary>dist_block_tx_domain (no quantization matrices).</summary>
-    private static void DistBlockTxDomain(AomMacroblock x, int plane, int block, int txSize, out long outDist, out long outSse)
+    /// <summary>dist_block_tx_domain: av1_block_error, or the QM-weighted av1_block_error_qm with the QM-PSNR metric.</summary>
+    private static void DistBlockTxDomain(AomMacroblock x, int plane, int block, int txSize, byte[]? qmatrix, int txType,
+        out long outDist, out long outSse)
     {
         var p = x.Plane[plane];
         int bufferLength = AomEncodeMb.MaxEob(txSize);
         int shift = (MAX_TX_SCALE - AomQuantize.TxScale(txSize)) * 2;
         int off = AomEncodeMb.BlockOffset(block);
-        long dist = AomEncodeMb.BlockErrorAvx2(p.Coeff.AsSpan(off, bufferLength), p.Dqcoeff.AsSpan(off, bufferLength), bufferLength, out long thisSse);
+        long dist, thisSse;
+        if (qmatrix == null || x.TxfmSearchParams.UseQmDistMetric == 0)
+            dist = AomEncodeMb.BlockErrorAvx2(p.Coeff.AsSpan(off, bufferLength), p.Dqcoeff.AsSpan(off, bufferLength), bufferLength, out thisSse);
+        else
+            dist = AomQm.BlockErrorQm(p.Coeff.AsSpan(off, bufferLength), p.Dqcoeff.AsSpan(off, bufferLength), bufferLength, qmatrix,
+                AomEncodeMb.ScanOf(txSize, txType), out thisSse);
         outDist = RightSignedShift(dist, shift);
         outSse = RightSignedShift(thisSse, shift);
     }
@@ -313,8 +319,9 @@ internal static partial class AomTxSearch
         for (int idx = 0; idx < 4; ++idx)
         {
             int txType = IdxMap[idx];
+            AomEncodeMb.SetupQmatrix(x, plane, txSize, txType, ref qp);
             XformQuant(x, plane, block, blkRow, blkCol, planeBsize, txSize, txType, qp);
-            DistBlockTxDomain(x, plane, block, txSize, out dist, out sse);
+            DistBlockTxDomain(x, plane, block, txSize, qp.Qmatrix, txType, out dist, out sse);
             rateCost = CostCoeffsLaplacian(cpi, x, plane, block, txSize, txType, txbCtx);
             rdsH[idx] = AomRd.RdCost(x.Rdmult, rateCost, dist);
             if ((rdsH[idx] - (rdsH[idx] >> 2)) > refBestRd) skipH[idx] = 1;
@@ -331,8 +338,9 @@ internal static partial class AomTxSearch
         for (int idx = 1; idx < 4; ++idx)
         {
             int txType = IdxMap[mapV + idxV[idx] * 4];
+            AomEncodeMb.SetupQmatrix(x, plane, txSize, txType, ref qp);
             XformQuant(x, plane, block, blkRow, blkCol, planeBsize, txSize, txType, qp);
-            DistBlockTxDomain(x, plane, block, txSize, out dist, out sse);
+            DistBlockTxDomain(x, plane, block, txSize, qp.Qmatrix, txType, out dist, out sse);
             rateCost = CostCoeffsLaplacian(cpi, x, plane, block, txSize, txType, txbCtx);
             rdsV[idx] = AomRd.RdCost(x.Rdmult, rateCost, dist);
             if ((rdsV[idx] - (rdsV[idx] >> 2)) > refBestRd) skipV[idx] = 1;
@@ -390,9 +398,10 @@ internal static partial class AomTxSearch
                 last--;
                 continue;
             }
+            AomEncodeMb.SetupQmatrix(x, plane, txSize, txType, ref qp);
             XformQuant(x, plane, block, blkRow, blkCol, planeBsize, txSize, txType, qp);
             int rateCost = CostCoeffsLaplacian(cpi, x, plane, block, txSize, txType, txbCtx);
-            DistBlockTxDomain(x, plane, block, txSize, out long dist, out _);
+            DistBlockTxDomain(x, plane, block, txSize, qp.Qmatrix, txType, out long dist, out _);
             txkMap[numCand] = txType;
             rds[numCand] = AomRd.RdCost(x.Rdmult, rateCost, dist);
             if (rds[numCand] == 0) rds[numCand] = 1;
@@ -634,6 +643,7 @@ internal static partial class AomTxSearch
             {
                 var qp = AomEncodeMb.SetupQuant(txSize, !skipTrellis,
                     skipTrellis ? (UseBQuantNoTrellis ? AomXformQuant.B : AomXformQuant.Fp) : AomXformQuant.Fp, cpi.QuantBAdapt);
+                AomEncodeMb.SetupQmatrix(x, plane, txSize, bestTxType, ref qp);
                 XformQuant(x, plane, block, blkRow, blkCol, planeBsize, txSize, bestTxType, qp);
                 if (qp.UseOptimizeB) AomEncodeMb.OptimizeB(cpi, x, plane, block, txSize, bestTxType, txbCtx, out rateCost);
             }
@@ -728,6 +738,9 @@ internal static partial class AomTxSearch
         {
             int txType = txkMap[idx];
             if (txType == TX_TYPE_INVALID || (allowedTxMask & (1 << txType)) == 0) continue;
+            // av1_use_qmatrix: the matrices only with QMs on and a lossy segment (skip_trellis_opt_based_on_satd's
+            // av1_setup_quant may reset them before the quantizer runs, as in libaom)
+            if (cpi.Cm.UsingQmatrix && xd.Lossless[xd.Mi0.SegmentId] == 0) AomEncodeMb.SetupQmatrix(x, plane, txSize, txType, ref qp);
             if (plane == 0) xd.TxTypeMap[xd.TxTypeMapOffset + txTypeMapIdx] = (byte)txType;
             AomRdStats thisRdStats = default;
             thisRdStats.Invalidate();
@@ -759,7 +772,7 @@ internal static partial class AomTxSearch
             }
             else if (useTransformDomainDistortion)
             {
-                DistBlockTxDomain(x, plane, block, txSize, out thisRdStats.Dist, out thisRdStats.Sse);
+                DistBlockTxDomain(x, plane, block, txSize, qp.Qmatrix, txType, out thisRdStats.Dist, out thisRdStats.Sse);
             }
             else
             {
@@ -771,7 +784,7 @@ internal static partial class AomTxSearch
                 {
                     // 3 of 4 quadrants of a 64-pt transform are zero and the inverse tends to overflow; sse_diff is
                     // their energy, deciding whether pixel-domain distortion is safe
-                    DistBlockTxDomain(x, plane, block, txSize, out thisRdStats.Dist, out thisRdStats.Sse);
+                    DistBlockTxDomain(x, plane, block, txSize, qp.Qmatrix, txType, out thisRdStats.Dist, out thisRdStats.Sse);
                     sseDiff = blockSse - thisRdStats.Sse;
                 }
                 if (txSize != TX_64X64 || !isHighEnergy || (sseDiff * 2) < thisRdStats.Sse)

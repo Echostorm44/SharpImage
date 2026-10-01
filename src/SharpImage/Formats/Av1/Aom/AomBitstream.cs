@@ -80,7 +80,7 @@ internal static class AomBitstream
         public readonly AomCommon Cm;
         public readonly AomSequenceConfig SeqCfg;
         public readonly int Profile, SeqLevelIdx, NumBitsWidth, NumBitsHeight;
-        public readonly bool EnableFilterIntra, EnableIntraEdgeFilter, EnableRestoration, EnableCdef = false;
+        public readonly bool EnableFilterIntra, EnableIntraEdgeFilter, EnableRestoration, EnableCdef;
         public readonly bool AllowScreenContentTools, AllowIntrabc, CodedLossless, AllLossless;
         public readonly int TxMode, ReducedTxSetUsed;
         public readonly AomLoopFilterParams Lf;
@@ -100,10 +100,11 @@ internal static class AomBitstream
             EnableFilterIntra = cpi.EnableFilterIntra;
             EnableIntraEdgeFilter = cpi.EnableIntraEdgeFilter;
             EnableRestoration = cpi.EnableRestoration;
+            EnableCdef = cpi.CdefControl != 0;   // seq_params->enable_cdef = cdef_control != CDEF_NONE
             AllowScreenContentTools = cpi.AllowScreenContentTools;
             // encode_frame_internal: "If intrabc is allowed but never selected, reset the allow_intrabc flag."
             AllowIntrabc = cpi.AllowScreenContentTools && cpi.AllowIntrabc && AnyIntrabcBlock(cm);
-            CodedLossless = cm.BaseQindex == 0;   // no delta q: every segment is lossless iff base_qindex is 0
+            CodedLossless = cm.BaseQindex == 0;   // (delta q is never present at base_qindex 0): lossless iff base_qindex is 0
             AllLossless = CodedLossless;           // no superres
             ReducedTxSetUsed = cpi.ReducedTxSetUsed;
             // encode_frame_internal's select_tx_mode, then av1_encode_frame's TX_MODE_SELECT -> TX_MODE_LARGEST
@@ -271,24 +272,72 @@ internal static class AomBitstream
         if (f.Log2Cols < f.MaxLog2Cols) wb.WriteBit(0);
         for (int ones = f.Log2Rows - f.MinLog2Rows; ones-- > 0;) wb.WriteBit(1);
         if (f.Log2Rows < f.MaxLog2Rows) wb.WriteBit(0);
-        // encode_quantization (no delta q, no qm)
+        // encode_quantization (separate_uv_delta_q 0)
         wb.WriteLiteral(cm.BaseQindex, 8);
-        wb.WriteBit(0);                                     // y_dc_delta_q
+        WriteDeltaQ(wb, cm.YDcDeltaQ);
         if (cm.NumPlanes > 1)
         {
-            wb.WriteBit(0);                                 // u_dc_delta_q
-            wb.WriteBit(0);                                 // u_ac_delta_q
+            bool diffUvDelta = cm.UDcDeltaQ != cm.VDcDeltaQ || cm.UAcDeltaQ != cm.VAcDeltaQ;
+            WriteDeltaQ(wb, cm.UDcDeltaQ);
+            WriteDeltaQ(wb, cm.UAcDeltaQ);
+            if (diffUvDelta)
+            {
+                WriteDeltaQ(wb, cm.VDcDeltaQ);
+                WriteDeltaQ(wb, cm.VAcDeltaQ);
+            }
         }
-        wb.WriteBit(0);                                     // using_qmatrix
+        wb.WriteBit(cm.UsingQmatrix ? 1 : 0);
+        if (cm.UsingQmatrix)
+        {
+            wb.WriteLiteral(cm.QmLevelY, 4);
+            wb.WriteLiteral(cm.QmLevelU, 4);
+        }
         wb.WriteBit(0);                                     // encode_segmentation: enabled
-        if (cm.BaseQindex > 0) wb.WriteBit(0);             // delta_q_present_flag
+        if (cm.BaseQindex > 0)
+        {
+            wb.WriteBit(cpi.DeltaQPresentFlag ? 1 : 0);
+            if (cpi.DeltaQPresentFlag)
+            {
+                wb.WriteLiteral(MostSignificantBit(cpi.DeltaQRes), 2);
+                if (!f.AllowIntrabc) wb.WriteBit(0);       // delta_lf_present_flag
+            }
+        }
         if (!f.AllLossless)
         {
-            if (!f.CodedLossless) EncodeLoopfilter(f, wb);   // (encode_cdef: seq enable_cdef is 0)
+            if (!f.CodedLossless)
+            {
+                EncodeLoopfilter(f, wb);
+                EncodeCdef(f, wb);
+            }
             EncodeRestorationMode(f, wb);
         }
         if (!f.CodedLossless) wb.WriteBit(f.TxMode == TX_MODE_SELECT ? 1 : 0);
         wb.WriteBit(f.ReducedTxSetUsed);
+    }
+
+    /// <summary>write_delta_q (frame header).</summary>
+    private static void WriteDeltaQ(AomWriteBitBuffer wb, int deltaQ)
+    {
+        if (deltaQ != 0)
+        {
+            wb.WriteBit(1);
+            wb.WriteInvSignedLiteral(deltaQ, 6);
+        }
+        else wb.WriteBit(0);
+    }
+
+    /// <summary>encode_cdef.</summary>
+    private static void EncodeCdef(FrameState f, AomWriteBitBuffer wb)
+    {
+        if (!f.EnableCdef || f.AllowIntrabc) return;
+        var ci = f.Cpi.PostFilter!.Cdef!;
+        wb.WriteLiteral(ci.CdefDamping - 3, 2);
+        wb.WriteLiteral(ci.CdefBits, 2);
+        for (int i = 0; i < ci.NbCdefStrengths; i++)
+        {
+            wb.WriteLiteral(ci.CdefStrengths[i], 6);
+            if (f.Cm.NumPlanes > 1) wb.WriteLiteral(ci.CdefUvStrengths[i], 6);
+        }
     }
 
     /// <summary>encode_loopfilter.</summary>
@@ -382,6 +431,7 @@ internal static class AomBitstream
         public readonly AomSgrprojInfo[] RefSgrproj = new AomSgrprojInfo[3];
         public readonly byte[] Levels = new byte[AomTxb.TxPad2d];
         public readonly sbyte[] CoeffContexts = new sbyte[64 * 64];
+        public readonly bool[] CdefTransmitted = new bool[4];
     }
 
     /// <summary>av1_pack_tile_info for the frame's single tile: write_modes then aom_stop_encode.</summary>
@@ -409,6 +459,7 @@ internal static class AomBitstream
         xd.TxTypeMap = cm.TxTypeMap;
         xd.TxTypeMapStride = cm.MiStride;
         var t = new TileWriter { F = f, Cpi = cpi, Cm = cm, W = w, Fc = fc, Xd = xd };
+        xd.CurrentBaseQindex = cm.BaseQindex;
 
         // av1_reset_loop_restoration
         for (int p = 0; p < cm.NumPlanes; ++p)
@@ -672,7 +723,8 @@ internal static class AomBitstream
         var m = t.Fc.Mode;
         // write_skip
         t.W.WriteSymbol(mbmi.SkipTxfm, m.Skip[AomTxSearch.SkipTxfmContext(xd)], 2);
-        // write_cdef: enable_cdef is 0 (cdef_bits 0 writes nothing)
+        WriteCdef(t, mbmi.SkipTxfm);
+        WriteDeltaQParams(t, mbmi.SkipTxfm);
         if (t.F.AllowIntrabc)
         {
             // write_intrabc_info
@@ -685,6 +737,55 @@ internal static class AomBitstream
             }
         }
         WriteIntraPredictionModes(t);
+    }
+
+    /// <summary>write_cdef: the CDEF unit's strength with its first non-skip block.</summary>
+    private static void WriteCdef(TileWriter t, int skip)
+    {
+        var f = t.F;
+        if (f.CodedLossless || f.AllowIntrabc || !f.EnableCdef) return;
+        var cm = t.Cm;
+        var xd = t.Xd;
+        int sbMask = cm.MibSize - 1;
+        if ((xd.MiRow & sbMask) == 0 && (xd.MiCol & sbMask) == 0) Array.Clear(t.CdefTransmitted);
+        const int cdefSize = 16;   // 64x64 CDEF units in mi
+        int index = cm.SbSize == BLOCK_128X128 ? ((xd.MiCol & cdefSize) != 0 ? 1 : 0) + 2 * ((xd.MiRow & cdefSize) != 0 ? 1 : 0) : 0;
+        if (!t.CdefTransmitted[index] && skip == 0)
+        {
+            int firstBlockMask = ~(cdefSize - 1);
+            var mbmi = cm.MiGridBase[(xd.MiRow & firstBlockMask) * cm.MiStride + (xd.MiCol & firstBlockMask)]!;
+            t.W.WriteLiteral(mbmi.CdefStrength, t.Cpi.PostFilter!.Cdef!.CdefBits);
+            t.CdefTransmitted[index] = true;
+        }
+    }
+
+    /// <summary>write_delta_q_params (no delta lf).</summary>
+    private static void WriteDeltaQParams(TileWriter t, int skip)
+    {
+        var cpi = t.Cpi;
+        if (!cpi.DeltaQPresentFlag) return;
+        var cm = t.Cm;
+        var xd = t.Xd;
+        var mbmi = xd.Mi0;
+        bool superBlockUpperLeft = (xd.MiRow & (cm.MibSize - 1)) == 0 && (xd.MiCol & (cm.MibSize - 1)) == 0;
+        if ((mbmi.Bsize != cm.SbSize || skip == 0) && superBlockUpperLeft)
+        {
+            int reduced = (mbmi.CurrentQindex - xd.CurrentBaseQindex) / cpi.DeltaQRes;
+            // write_delta_qindex
+            int sign = reduced < 0 ? 1 : 0;
+            int abs = sign != 0 ? -reduced : reduced;
+            const int deltaQSmall = 3;
+            t.W.WriteSymbol(Math.Min(abs, deltaQSmall), t.Fc.Mode.DeltaQ, deltaQSmall + 1);
+            if (abs >= deltaQSmall)
+            {
+                int remBits = MostSignificantBit(abs - 1);
+                int thr = (1 << remBits) + 1;
+                t.W.WriteLiteral(remBits - 1, 3);
+                t.W.WriteLiteral(abs - thr, remBits);
+            }
+            if (abs > 0) t.W.WriteBit(sign);
+            xd.CurrentBaseQindex = mbmi.CurrentQindex;
+        }
     }
 
     /// <summary>av1_encode_dv (encodemv.c): the DV difference with MV_SUBPEL_NONE on the ndvc CDFs.</summary>

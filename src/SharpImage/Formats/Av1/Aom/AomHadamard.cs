@@ -116,6 +116,23 @@ internal static class AomHadamard
         Avx2.ConvertToVector256Int32(u7).StoreUnsafe(ref c, 56);
     }
 
+    /// <summary>aom_hadamard_lp_8x8 (SSE2 kernel / the C reference's transposed output): <see cref="H8x8"/>'s values
+    /// kept in int16.</summary>
+    internal static void H8x8Lp(ReadOnlySpan<short> srcDiff, int srcStride, Span<short> coeff)
+    {
+        ref short s = ref MemoryMarshal.GetReference(srcDiff);
+        var r0 = Vector128.LoadUnsafe(ref s, 0); var r1 = Vector128.LoadUnsafe(ref s, (nuint)srcStride);
+        var r2 = Vector128.LoadUnsafe(ref s, (nuint)(2 * srcStride)); var r3 = Vector128.LoadUnsafe(ref s, (nuint)(3 * srcStride));
+        var r4 = Vector128.LoadUnsafe(ref s, (nuint)(4 * srcStride)); var r5 = Vector128.LoadUnsafe(ref s, (nuint)(5 * srcStride));
+        var r6 = Vector128.LoadUnsafe(ref s, (nuint)(6 * srcStride)); var r7 = Vector128.LoadUnsafe(ref s, (nuint)(7 * srcStride));
+        Col8V(r0, r1, r2, r3, r4, r5, r6, r7, out var t0, out var t1, out var t2, out var t3, out var t4, out var t5, out var t6, out var t7);
+        Transpose8(ref t0, ref t1, ref t2, ref t3, ref t4, ref t5, ref t6, ref t7);
+        Col8V(t0, t1, t2, t3, t4, t5, t6, t7, out var u0, out var u1, out var u2, out var u3, out var u4, out var u5, out var u6, out var u7);
+        ref short c = ref MemoryMarshal.GetReference(coeff);
+        u0.StoreUnsafe(ref c, 0); u1.StoreUnsafe(ref c, 8); u2.StoreUnsafe(ref c, 16); u3.StoreUnsafe(ref c, 24);
+        u4.StoreUnsafe(ref c, 32); u5.StoreUnsafe(ref c, 40); u6.StoreUnsafe(ref c, 48); u7.StoreUnsafe(ref c, 56);
+    }
+
     private static void H8x8Scalar(ReadOnlySpan<short> srcDiff, int srcStride, Span<int> coeff)
     {
         Span<short> buffer = stackalloc short[64];

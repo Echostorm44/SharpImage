@@ -33,6 +33,8 @@ public sealed class AomEncoderSmoke
             EnableIntrabc = Environment.GetEnvironmentVariable("AOM_SMOKE_NOIBC") != "1",
             BaseQindex = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_Q") ?? "112"),
             Speed = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_SPEED") ?? "6"),
+            // AOM_SMOKE_TUNE=iq (AOM_TUNE_IQ), AOM_SMOKE_IQOFF=<letters> (tune-iq sub-features switched back off, as AOMORACLE_IQOFF)
+            TuneIq = Environment.GetEnvironmentVariable("AOM_SMOKE_TUNE") == "iq", IqOff = Environment.GetEnvironmentVariable("AOM_SMOKE_IQOFF"),
             SfOverride = noMl ? sf => { sf.intra_sf.intra_pruning_with_hog = 0; sf.intra_sf.chroma_intra_pruning_with_hog = 0;
                 sf.part_sf.intra_cnn_based_part_prune_level = 0; sf.part_sf.ml_prune_partition = 0; sf.tx_sf.prune_intra_tx_depths_using_nn = false; } : null };
         string? tracePath = Environment.GetEnvironmentVariable("AOM_TRACE");
@@ -47,7 +49,7 @@ public sealed class AomEncoderSmoke
         }
         var sw = new System.Diagnostics.Stopwatch();
         long searchMs = 0, postMs = 0;
-        double lpfMs = 0, rstMs = 0;
+        double lpfMs = 0, rstMs = 0, cdefMs = 0;
         for (int rep = 0; rep < reps; rep++)
         {
             sw.Restart();
@@ -59,10 +61,12 @@ public sealed class AomEncoderSmoke
             postMs = rep == 0 ? sw.ElapsedMilliseconds : Math.Min(postMs, sw.ElapsedMilliseconds);
             double l = AomPostFilter.LastLpfTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             double rr = AomPostFilter.LastRstTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double cc = AomPostFilter.LastCdefTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            cdefMs = rep == 0 ? cc : Math.Min(cdefMs, cc);
             lpfMs = rep == 0 ? l : Math.Min(lpfMs, l);
             rstMs = rep == 0 ? rr : Math.Min(rstMs, rr);
         }
-        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, restoration {rstMs:F1} ms)");
+        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, cdef {cdefMs:F1} ms, restoration {rstMs:F1} ms)");
         // AOM_SMOKE_PFREPS=n: n more post-filter runs (profiling)
         int pfReps = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_PFREPS") ?? "0");
         for (int rep = 0; rep < pfReps; rep++) AomEncoder.RunPostFilter(cpi, x);
@@ -93,7 +97,22 @@ public sealed class AomEncoderSmoke
             }
             if (Environment.GetEnvironmentVariable("AOM_SMOKE_RANGE") == "0") seqCfg.ColorRange = 0;
             if (Environment.GetEnvironmentVariable("AOM_SMOKE_CSP") is string csp) seqCfg.ChromaSamplePosition = int.Parse(csp);
-            File.WriteAllBytes(obuPath, AomBitstream.PackFrame(cpi, seqCfg, bsTrace));
+            byte[] packet = AomBitstream.PackFrame(cpi, seqCfg, bsTrace);
+            File.WriteAllBytes(obuPath, packet);
+            // AOM_SMOKE_SIDEC=<path>: SharpImage's own AV1 decoder's output of the packet (planes at the frame size)
+            if (Environment.GetEnvironmentVariable("AOM_SMOKE_SIDEC") is string siPath)
+            {
+                var dec = new Av1Decoder();
+                using var f = dec.Decode(packet, 0, isKeyframe: true) ?? throw new InvalidOperationException("SharpImage decode failed: " + Av1Decoder.LastDecodeError);
+                using var fs = File.Create(siPath);
+                for (int p = 0; p < cm.NumPlanes; p++)
+                {
+                    var plane = p == 0 ? f.YPlane : p == 1 ? f.UPlane : f.VPlane;
+                    int stride = p == 0 ? f.YStride : p == 1 ? f.UStride : f.VStride;
+                    int pw = p == 0 ? w : cw, ph = p == 0 ? h : ch;
+                    for (int r = 0; r < ph; r++) fs.Write(plane.Span.Slice(r * stride, pw));
+                }
+            }
         }
         // AOM_SMOKE_RECON=<path>: the reconstruction as 8-bit 4:2:0 planes (compare with a decoder's output)
         string? reconPath = Environment.GetEnvironmentVariable("AOM_SMOKE_RECON");
@@ -115,6 +134,17 @@ public sealed class AomEncoderSmoke
         var sb = new System.Text.StringBuilder();
         sb.Append($"frame {cm.Width} {cm.Height} qindex {cm.BaseQindex} mi {cm.MiRows} {cm.MiCols}\n");
         sb.Append($"hdr sct {(cpi.AllowScreenContentTools ? 1 : 0)} ibc {(cpi.AllowIntrabc ? 1 : 0)}\n");
+        var ci = cpi.PostFilter?.Cdef;
+        sb.Append($"qp ydc {cm.YDcDeltaQ} udc {cm.UDcDeltaQ} uac {cm.UAcDeltaQ} vdc {cm.VDcDeltaQ} vac {cm.VAcDeltaQ} qm {(cm.UsingQmatrix ? 1 : 0)} {cm.QmLevelY} {cm.QmLevelU} {cm.QmLevelV} dq {(cpi.DeltaQPresentFlag ? 1 : 0)} res {cpi.DeltaQRes} sharp {cpi.PostFilter?.LoopFilter.SharpnessLevel}\n");
+        sb.Append($"cdef {(cpi.CdefControl != 0 ? 1 : 0)} damp {ci?.CdefDamping ?? 0} bits {ci?.CdefBits ?? 0}");
+        for (int i = 0; i < (ci?.NbCdefStrengths ?? 1); i++) sb.Append($" {ci?.CdefStrengths[i] ?? 0}/{ci?.CdefUvStrengths[i] ?? 0}");
+        sb.Append('\n');
+        for (int r = 0; r < cm.MiRows; r += cm.MibSize)
+            for (int c = 0; c < cm.MiCols; c += cm.MibSize)
+            {
+                var m = cm.MiGridBase[r * cm.MiStride + c]!;
+                sb.Append($"sbq {r} {c} q {m.CurrentQindex} cdef {m.CdefStrength}\n");
+            }
         for (int r = 0; r < cm.MiRows; r++)
             for (int c = 0; c < cm.MiCols; c++)
             {
