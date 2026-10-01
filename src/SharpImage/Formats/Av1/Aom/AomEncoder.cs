@@ -15,6 +15,8 @@ internal sealed class AomEncodeInput
     public bool AllowScreenContentTools, UseScreenContentTools, AllowIntrabc, IsScreenContentType;
     /// <summary>Run libaom's screen-content detection (sets the flags above from the source).</summary>
     public bool DetectScreenContent = true;
+    /// <summary>oxcf.kf_cfg.enable_intrabc (AV1E_SET_ENABLE_INTRABC): false keeps intrabc off even for screen content.</summary>
+    public bool EnableIntrabc = true;
     /// <summary>Test hook: adjusts the speed features after libaom's setup (e.g. to isolate a stage).</summary>
     public Action<AomSpeedFeatures>? SfOverride;
 }
@@ -56,6 +58,8 @@ internal static partial class AomEncoder
             cpi.UseScreenContentTools = sct;
             cpi.AllowIntrabc = ibc;
         }
+        // encode_frame_internal: features->allow_intrabc &= oxcf->kf_cfg.enable_intrabc
+        cpi.AllowIntrabc &= input.EnableIntrabc;
 
         // speed features (framesize independent / dependent / qindex dependent) and the winner mode params
         var sfIn = new AomSpeedFeatureInputs
@@ -63,6 +67,9 @@ internal static partial class AomEncoder
             Width = input.Width, Height = input.Height, AllowScreenContentTools = input.AllowScreenContentTools,
             UseScreenContentTools = input.UseScreenContentTools, IsScreenContentType = input.IsScreenContentType, BaseQindex = input.BaseQindex,
         };
+        // avifenc --lossless / quality 100 (quantizer 0): libavif sets rc_min_quantizer = rc_max_quantizer = 0 and
+        // AV1E_SET_LOSSLESS, so oxcf.rc_cfg.best_allowed_q = worst_allowed_q = 0 (is_lossless_requested)
+        if (input.BaseQindex == 0) { sfIn.BestAllowedQ = 0; sfIn.WorstAllowedQ = 0; }
         var seqFlags = new AomSpeedFeatureSeqFlags();
         cpi.Sf.SetForFrame(sfIn, seqFlags, cpi.WinnerModeParams, input.Speed);
         cpi.EnableRestoration = seqFlags.enable_restoration != 0;

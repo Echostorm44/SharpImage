@@ -375,7 +375,7 @@ internal static partial class AomEncodeFrame
     }
 
     /// <summary>update_txfm_count.</summary>
-    private static void UpdateTxfmCount(AomMacroblock x, int txSize, int depth, int blkRow, int blkCol, bool allowUpdateCdf)
+    private static void UpdateTxfmCount(AomComp cpi, AomMacroblock x, int txSize, int depth, int blkRow, int blkCol, bool allowUpdateCdf)
     {
         var xd = x.E;
         var mbmi = xd.Mi0;
@@ -405,6 +405,7 @@ internal static partial class AomEncodeFrame
             int subTxs = SubTxSizeMap[txSize];
             int bsw = TxSizeWideUnit[subTxs], bsh = TxSizeHighUnit[subTxs];
             if (allowUpdateCdf) AomCdf.Update(x.TileCtx.Mode.Txpart[ctx], 1, 2);
+            ++cpi.TxbSplitCount;   // x->txfm_search_info.txb_split_count
             if (subTxs == TX_4X4)
             {
                 mbmi.InterTxSize[txbSizeIndex] = TX_4X4;
@@ -414,13 +415,14 @@ internal static partial class AomEncodeFrame
             }
             for (int row = 0; row < TxSizeHighUnit[txSize]; row += bsh)
                 for (int col = 0; col < TxSizeWideUnit[txSize]; col += bsw)
-                    UpdateTxfmCount(x, subTxs, depth + 1, blkRow + row, blkCol + col, allowUpdateCdf);
+                    UpdateTxfmCount(cpi, x, subTxs, depth + 1, blkRow + row, blkCol + col, allowUpdateCdf);
         }
     }
 
     /// <summary>tx_partition_count_update.</summary>
-    private static void TxPartitionCountUpdate(AomCommon cm, AomMacroblock x, int planeBsize, bool allowUpdateCdf)
+    private static void TxPartitionCountUpdate(AomComp cpi, AomMacroblock x, int planeBsize, bool allowUpdateCdf)
     {
+        var cm = cpi.Cm;
         var xd = x.E;
         int miWidth = MiSizeWide[planeBsize], miHeight = MiSizeHigh[planeBsize];
         int maxTxSize = AomTxSearch.GetVartxMaxTxsize(xd, planeBsize, 0);
@@ -430,7 +432,7 @@ internal static partial class AomEncodeFrame
         xd.LeftTxfmContextOffset = xd.MiRow & MAX_MIB_MASK;
         for (int idy = 0; idy < miHeight; idy += bh)
             for (int idx = 0; idx < miWidth; idx += bw)
-                UpdateTxfmCount(x, maxTxSize, 0, idy, idx, allowUpdateCdf);
+                UpdateTxfmCount(cpi, x, maxTxSize, 0, idy, idx, allowUpdateCdf);
     }
 
     /// <summary>set_txfm_context.</summary>

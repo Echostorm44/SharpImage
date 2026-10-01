@@ -1,4 +1,7 @@
 using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomRestoration;
 using static SharpImage.Formats.Av1.AomTables;
 
@@ -522,36 +525,47 @@ internal sealed class AomPickRst
         Array.Clear(M, 0, wienerWin2);
         Array.Clear(H, 0, wienerWin2 * wienerWin2);
         int downsampleFactor = useDownsampledWienerStats != 0 ? 4 : 1;
-        Span<int> y = stackalloc int[WienerWin2];
-        var mRow = new long[WienerWin2];
-        var hRow = new long[WienerWin2 * WienerWin2];
+        // the window samples padded to whole 8-lane vectors; per-row int32 sums (|Y| <= 255 over at most 384 columns
+        // cannot overflow), whole rows accumulated (the entries below the diagonal are dropped: the symmetrisation below
+        // overwrites them)
+        int padded = (wienerWin2 + 7) & ~7;
+        Span<int> y = stackalloc int[padded];
+        y.Clear();
+        var mRow = new int[wienerWin2];
+        var hRow = new int[wienerWin2 * padded];
         byte[] d = dgd.Buf, s = src.Buf;
+        Span<int> rowBase = stackalloc int[WienerWin];
+        ref int y0 = ref MemoryMarshal.GetReference(y);
+        ref int h0 = ref MemoryMarshal.GetArrayDataReference(hRow);
         for (int i = vStart; i < vEnd; i += downsampleFactor)
         {
             if (useDownsampledWienerStats != 0 && vEnd - i < 4) downsampleFactor = vEnd - i;
             Array.Clear(mRow);
             Array.Clear(hRow);
-            // acc_stat_one_line (the int32 row sums cannot overflow: |Y| <= 255 over at most 384 columns)
+            // acc_stat_one_line
             int srow = src.At(0, i);
+            for (int l = -halfwin; l <= halfwin; l++) rowBase[l + halfwin] = dgd.At(0, i + l);
             for (int j = hStart; j < hEnd; j++)
             {
                 int x = s[srow + j] - avg;
                 int idx = 0;
                 for (int k = -halfwin; k <= halfwin; k++)
-                    for (int l = -halfwin; l <= halfwin; l++)
-                        y[idx++] = d[dgd.At(j + k, i + l)] - avg;
+                    for (int l = 0; l < wienerWin; l++)
+                        y[idx++] = d[rowBase[l] + j + k] - avg;
                 for (int k = 0; k < wienerWin2; ++k)
                 {
                     int yk = y[k];
                     mRow[k] += yk * x;
-                    int hr = k * wienerWin2;
-                    for (int l = k; l < wienerWin2; ++l) hRow[hr + l] += yk * y[l];
+                    var vk = Vector256.Create(yk);
+                    ref int hr = ref Unsafe.Add(ref h0, k * padded);
+                    for (int l = k & ~7; l < padded; l += 8)
+                        (Vector256.LoadUnsafe(ref hr, (nuint)l) + vk * Vector256.LoadUnsafe(ref y0, (nuint)l)).StoreUnsafe(ref hr, (nuint)l);
                 }
             }
             for (int k = 0; k < wienerWin2; ++k)
             {
-                M[k] += mRow[k] * downsampleFactor;
-                for (int l = k; l < wienerWin2; ++l) H[k * wienerWin2 + l] += hRow[k * wienerWin2 + l] * downsampleFactor;
+                M[k] += (long)mRow[k] * downsampleFactor;
+                for (int l = k; l < wienerWin2; ++l) H[k * wienerWin2 + l] += (long)hRow[k * padded + l] * downsampleFactor;
             }
         }
         for (int k = 0; k < wienerWin2; ++k)
