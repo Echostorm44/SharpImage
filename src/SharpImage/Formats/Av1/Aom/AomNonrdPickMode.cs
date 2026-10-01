@@ -1,4 +1,7 @@
 using System;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -71,7 +74,7 @@ internal static class AomNonrdPickMode
     }
 
     /// <summary>aom_hadamard_lp_8x8 (the SSE2 kernel; the C reference transposes its output to match it).</summary>
-    internal static void HadamardLp8x8(ReadOnlySpan<short> srcDiff, int srcStride, Span<short> coeff)
+    internal static void HadamardLp8x8Scalar(ReadOnlySpan<short> srcDiff, int srcStride, Span<short> coeff)
     {
         Span<short> buffer = stackalloc short[64];
         Span<short> buffer2 = stackalloc short[64];
@@ -82,10 +85,10 @@ internal static class AomNonrdPickMode
     }
 
     /// <summary>aom_hadamard_lp_16x16 (the AVX2 kernel equals the C reference).</summary>
-    internal static void HadamardLp16x16(ReadOnlySpan<short> srcDiff, int srcStride, Span<short> coeff)
+    internal static void HadamardLp16x16Scalar(ReadOnlySpan<short> srcDiff, int srcStride, Span<short> coeff)
     {
         for (int idx = 0; idx < 4; ++idx)
-            HadamardLp8x8(srcDiff.Slice((idx >> 1) * 8 * srcStride + (idx & 1) * 8), srcStride, coeff.Slice(idx * 64, 64));
+            HadamardLp8x8Scalar(srcDiff.Slice((idx >> 1) * 8 * srcStride + (idx & 1) * 8), srcStride, coeff.Slice(idx * 64, 64));
         for (int idx = 0; idx < 64; ++idx)
         {
             short a0 = coeff[idx], a1 = coeff[idx + 64], a2 = coeff[idx + 128], a3 = coeff[idx + 192];
@@ -154,7 +157,7 @@ internal static class AomNonrdPickMode
 
     /// <summary>av1_quantize_lp_avx2: 16-bit lanes (saturating add of the rounding, mulhi by the quantizer, sign of the
     /// input, 16-bit dequantize); eob = 1 + the largest iscan of a nonzero.</summary>
-    internal static int QuantizeLp(ReadOnlySpan<short> coeff, int nCoeffs, short round0, short round1, short quant0, short quant1,
+    internal static int QuantizeLpScalar(ReadOnlySpan<short> coeff, int nCoeffs, short round0, short round1, short quant0, short quant1,
         Span<short> qcoeff, Span<short> dqcoeff, short dequant0, short dequant1, ReadOnlySpan<short> iscan)
     {
         int eob = 0;
@@ -173,7 +176,7 @@ internal static class AomNonrdPickMode
     }
 
     /// <summary>aom_satd_lp_avx2.</summary>
-    internal static int SatdLp(ReadOnlySpan<short> coeff, int length)
+    internal static int SatdLpScalar(ReadOnlySpan<short> coeff, int length)
     {
         int satd = 0;
         for (int i = 0; i < length; i++) satd += Abs16(coeff[i]);
@@ -182,7 +185,7 @@ internal static class AomNonrdPickMode
 
     /// <summary>av1_block_error_lp_avx2: 16-bit differences, pairwise 32-bit products, the per-lane 32-bit sums read as
     /// unsigned and accumulated in 64 bits.</summary>
-    internal static long BlockErrorLp(ReadOnlySpan<short> coeff, ReadOnlySpan<short> dqcoeff, int blockSize)
+    internal static long BlockErrorLpScalar(ReadOnlySpan<short> coeff, ReadOnlySpan<short> dqcoeff, int blockSize)
     {
         Span<int> err = stackalloc int[8];
         if (blockSize == 16)
@@ -209,6 +212,108 @@ internal static class AomNonrdPickMode
             }
         }
         return sse;
+    }
+
+
+    // ---- vector kernels (the dispatched SIMD arithmetic; the *Scalar versions above are their references)
+
+    /// <summary>aom_hadamard_lp_8x8.</summary>
+    internal static void HadamardLp8x8(ReadOnlySpan<short> srcDiff, int srcStride, Span<short> coeff)
+    {
+        if (Sse2.IsSupported) AomHadamard.H8x8Lp(srcDiff, srcStride, coeff);
+        else HadamardLp8x8Scalar(srcDiff, srcStride, coeff);
+    }
+
+    /// <summary>aom_hadamard_lp_16x16_avx2.</summary>
+    internal static void HadamardLp16x16(ReadOnlySpan<short> srcDiff, int srcStride, Span<short> coeff)
+    {
+        if (!Avx2.IsSupported) { HadamardLp16x16Scalar(srcDiff, srcStride, coeff); return; }
+        for (int idx = 0; idx < 4; ++idx)
+            AomHadamard.H8x8Lp(srcDiff.Slice((idx >> 1) * 8 * srcStride + (idx & 1) * 8), srcStride, coeff.Slice(idx * 64, 64));
+        ref short c = ref MemoryMarshal.GetReference(coeff);
+        for (int idx = 0; idx < 64; idx += 16)
+        {
+            var c0 = Vector256.LoadUnsafe(ref c, (nuint)idx);
+            var c1 = Vector256.LoadUnsafe(ref c, (nuint)(idx + 64));
+            var c2 = Vector256.LoadUnsafe(ref c, (nuint)(idx + 128));
+            var c3 = Vector256.LoadUnsafe(ref c, (nuint)(idx + 192));
+            var b0 = Avx2.ShiftRightArithmetic(c0 + c1, 1);
+            var b1 = Avx2.ShiftRightArithmetic(c0 - c1, 1);
+            var b2 = Avx2.ShiftRightArithmetic(c2 + c3, 1);
+            var b3 = Avx2.ShiftRightArithmetic(c2 - c3, 1);
+            (b0 + b2).StoreUnsafe(ref c, (nuint)idx);
+            (b1 + b3).StoreUnsafe(ref c, (nuint)(idx + 64));
+            (b0 - b2).StoreUnsafe(ref c, (nuint)(idx + 128));
+            (b1 - b3).StoreUnsafe(ref c, (nuint)(idx + 192));
+        }
+    }
+
+    /// <summary>av1_quantize_lp_avx2.</summary>
+    internal static int QuantizeLp(ReadOnlySpan<short> coeff, int nCoeffs, short round0, short round1, short quant0, short quant1,
+        Span<short> qcoeff, Span<short> dqcoeff, short dequant0, short dequant1, ReadOnlySpan<short> iscan)
+    {
+        if (!Avx2.IsSupported)
+            return QuantizeLpScalar(coeff, nCoeffs, round0, round1, quant0, quant1, qcoeff, dqcoeff, dequant0, dequant1, iscan);
+        ref short cp = ref MemoryMarshal.GetReference(coeff);
+        ref short qp = ref MemoryMarshal.GetReference(qcoeff);
+        ref short dp = ref MemoryMarshal.GetReference(dqcoeff);
+        ref short ip = ref MemoryMarshal.GetReference(iscan);
+        var round = Vector256.Create(round1).WithElement(0, round0);
+        var quant = Vector256.Create(quant1).WithElement(0, quant0);
+        var dequant = Vector256.Create(dequant1).WithElement(0, dequant0);
+        var eob = Vector256<short>.Zero;
+        for (int i = 0; i < nCoeffs; i += 16)
+        {
+            if (i == 16)
+            {
+                round = Vector256.Create(round1);
+                quant = Vector256.Create(quant1);
+                dequant = Vector256.Create(dequant1);
+            }
+            var c = Vector256.LoadUnsafe(ref cp, (nuint)i);
+            var absC = Avx2.Abs(c).AsInt16();
+            var tmpRnd = Avx2.AddSaturate(absC, round);
+            var absQ = Avx2.MultiplyHigh(tmpRnd, quant);
+            var q = Avx2.Sign(absQ, c);
+            var dq = Avx2.MultiplyLow(q, dequant);
+            var nz = Avx2.CompareGreaterThan(absQ, Vector256<short>.Zero);
+            q.StoreUnsafe(ref qp, (nuint)i);
+            dq.StoreUnsafe(ref dp, (nuint)i);
+            var isc = Vector256.LoadUnsafe(ref ip, (nuint)i);
+            eob = Avx2.Max(eob, Avx2.And(isc - nz, nz));
+        }
+        var e = Sse2.Max(eob.GetLower(), eob.GetUpper());
+        return Math.Max(Math.Max(Math.Max(e.GetElement(0), e.GetElement(1)), Math.Max(e.GetElement(2), e.GetElement(3))),
+            Math.Max(Math.Max(e.GetElement(4), e.GetElement(5)), Math.Max(e.GetElement(6), e.GetElement(7))));
+    }
+
+    /// <summary>aom_satd_lp_avx2.</summary>
+    internal static int SatdLp(ReadOnlySpan<short> coeff, int length)
+    {
+        if (!Avx2.IsSupported) return SatdLpScalar(coeff, length);
+        ref short cp = ref MemoryMarshal.GetReference(coeff);
+        var one = Vector256.Create((short)1);
+        var acc = Vector256<int>.Zero;
+        for (int i = 0; i < length; i += 16)
+            acc += Avx2.MultiplyAddAdjacent(Avx2.Abs(Vector256.LoadUnsafe(ref cp, (nuint)i)).AsInt16(), one);
+        return Vector256.Sum(acc);
+    }
+
+    /// <summary>av1_block_error_lp_avx2.</summary>
+    internal static long BlockErrorLp(ReadOnlySpan<short> coeff, ReadOnlySpan<short> dqcoeff, int blockSize)
+    {
+        if (!Avx2.IsSupported || blockSize == 16) return BlockErrorLpScalar(coeff, dqcoeff, blockSize);
+        ref short cp = ref MemoryMarshal.GetReference(coeff);
+        ref short dp = ref MemoryMarshal.GetReference(dqcoeff);
+        var sse = Vector256<long>.Zero;
+        for (int i = 0; i < blockSize; i += 32)
+        {
+            var d0 = Vector256.LoadUnsafe(ref dp, (nuint)i) - Vector256.LoadUnsafe(ref cp, (nuint)i);
+            var d1 = Vector256.LoadUnsafe(ref dp, (nuint)(i + 16)) - Vector256.LoadUnsafe(ref cp, (nuint)(i + 16));
+            var e = Avx2.MultiplyAddAdjacent(d0, d0) + Avx2.MultiplyAddAdjacent(d1, d1);
+            sse += Avx2.UnpackLow(e, Vector256<int>.Zero).AsInt64() + Avx2.UnpackHigh(e, Vector256<int>.Zero).AsInt64();
+        }
+        return Vector256.Sum(sse);
     }
 
     // ---- av1_block_yrd
