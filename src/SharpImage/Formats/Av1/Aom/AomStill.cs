@@ -5,8 +5,8 @@ namespace SharpImage.Formats.Av1;
 /// <summary>
 /// The AVIF still-image path through the libaom-port encoder: one all-intra key frame of 8-bit planes encoded exactly
 /// as libaom 3.14.1 does it for libavif (AOM_USAGE_ALL_INTRA, AOM_Q at the given qindex, cpu-used = the avifenc speed,
-/// tune PSNR, one tile), returned as the sequence-header and frame OBUs the AVIF container stores. Used for what the
-/// port covers (8-bit 4:2:0 / 4:4:4 / 4:0:0, speeds 0-9 (10 = 9, as libavif clamps), no film grain / layers / tiling / sharpness); everything else
+/// tune PSNR / SSIM / IQ, one tile), returned as the sequence-header and frame OBUs the AVIF container stores. Used for what the
+/// port covers (8-bit 4:2:0 / 4:2:2 / 4:4:4 / 4:0:0, speeds 0-9 (10 = 9, as libavif clamps), no film grain / layers / tiling / sharpness); everything else
 /// stays on the earlier encoder until ported.
 /// </summary>
 internal static class AomStill
@@ -37,7 +37,7 @@ internal static class AomStill
 
     /// <summary>Whether a frame with these parameters goes through the port.</summary>
     internal static bool Handles(int bitDepth, Av1PixelLayout layout, int width, int height)
-        => Enabled && bitDepth == 8 && layout is Av1PixelLayout.I420 or Av1PixelLayout.I444 or Av1PixelLayout.I400
+        => Enabled && bitDepth == 8 && layout is Av1PixelLayout.I420 or Av1PixelLayout.I422 or Av1PixelLayout.I444 or Av1PixelLayout.I400
            && t_speedPlus1 >= 1 && Av1ObuWriter.PlainStill && width <= 4096 && width * height <= 4096 * 2304;
 
     /// <summary>Encodes one frame. Planes hold samples 0..255 (ushort, the earlier encoder's plane type); chroma planes
