@@ -37,7 +37,7 @@ internal static class AomTrace
     [ThreadStatic] public static System.IO.TextWriter? Out;
 }
 
-internal static class AomTxSearch
+internal static partial class AomTxSearch
 {
     public const int FTXS_NONE = 0, FTXS_DCT_AND_1D_DCT_ONLY = 1 << 0, FTXS_DISABLE_TRELLIS_OPT = 1 << 1, FTXS_USE_TRANSFORM_DOMAIN = 1 << 2;
     public const int FULL_TXFM_RD = 0, LOW_TXFM_RD = 1;
@@ -423,13 +423,29 @@ internal static class AomTxSearch
         var txfmParams = x.TxfmSearchParams;
         var sf = cpi.Sf;
         bool isInter = IsInterBlock(mbmi);
-        if (isInter) throw new NotSupportedException("get_tx_mask: inter blocks are not part of the all-intra port");
         bool fastTxSearch = (ftxsMode & FTXS_DCT_AND_1D_DCT_ONLY) != 0;
         int txkAllowed = TX_TYPES;
         int probsOff = cpi.TxTypeProbsOffset(txSize);
 
-        if (txfmParams.UseDefaultIntraTxType != 0)
+        if ((!isInter && txfmParams.UseDefaultIntraTxType != 0) || (isInter && txfmParams.DefaultInterTxTypeProbThresh == 0))
             txkAllowed = DefaultTxType(0, xd, txSize, cpi.UseScreenContentTools);
+        else if (isInter && txfmParams.DefaultInterTxTypeProbThresh != int.MaxValue)
+        {
+            if (cpi.TxTypeProbs[probsOff + DCT_DCT] > txfmParams.DefaultInterTxTypeProbThresh)   // DEFAULT_INTER_TX_TYPE
+                txkAllowed = DCT_DCT;
+            else
+            {
+                int forceTxType = 0, maxProb = 0;
+                int txTypeProbThreshold = txfmParams.DefaultInterTxTypeProbThresh + 25;   // PROB_THRESH_OFFSET_TX_TYPE
+                for (int i = 1; i < TX_TYPES; i++)
+                    if (cpi.TxTypeProbs[probsOff + i] > maxProb) { maxProb = cpi.TxTypeProbs[probsOff + i]; forceTxType = i; }
+                if (maxProb > txTypeProbThreshold) txkAllowed = forceTxType;
+                else if (x.RdModel == LOW_TXFM_RD)
+                {
+                    if (plane == 0) txkAllowed = DCT_DCT;
+                }
+            }
+        }
         else if (x.RdModel == LOW_TXFM_RD)
         {
             if (plane == 0) txkAllowed = DCT_DCT;
@@ -445,7 +461,8 @@ internal static class AomTxSearch
             ? ReducedIntraTxUsedFlag[intraDir] : ExtTxUsedFlag[txSetType];
         if (sf.tx_sf.tx_type_search.use_reduced_intra_txset == 2) extTxUsedFlag &= DerivedIntraTxUsedFlag[intraDir];
 
-        if (xd.Lossless[mbmi.SegmentId] != 0 || TxsizeSqrUpMap[txSize] > TX_32X32 || extTxUsedFlag == 0x0001 || cpi.UseIntraDctOnly)
+        if (xd.Lossless[mbmi.SegmentId] != 0 || TxsizeSqrUpMap[txSize] > TX_32X32 || extTxUsedFlag == 0x0001 ||
+            (isInter && cpi.UseInterDctOnly) || (!isInter && cpi.UseIntraDctOnly))
             txkAllowed = DCT_DCT;
 
         if (!cpi.EnableFlipIdtx) extTxUsedFlag &= DCT_ADST_TX_MASK;
@@ -461,7 +478,7 @@ internal static class AomTxSearch
             allowedTxMask = 0x0c01;   // V_DCT, H_DCT, DCT_DCT
             allowedTxMask &= extTxUsedFlag;
         }
-        else if (txfmParams.UseDerivedIntraTxTypeSet != 0)
+        else if (!isInter && txfmParams.UseDerivedIntraTxTypeSet != 0)
         {
             allowedTxMask = DerivedIntraTxUsedFlag[intraDir];
             allowedTxMask &= extTxUsedFlag;
@@ -470,6 +487,7 @@ internal static class AomTxSearch
         {
             allowedTxMask = extTxUsedFlag;
             int numAllowed = 0;
+            ushort allowedTxMaskU;
             if (sf.tx_sf.tx_type_search.prune_tx_type_using_stats != 0)
             {
                 int thresh = ThreshArr[sf.tx_sf.tx_type_search.prune_tx_type_using_stats - 1, cpi.UpdateType];
@@ -485,6 +503,7 @@ internal static class AomTxSearch
             }
             for (int i = 0; i < TX_TYPES; i++)
                 if ((allowedTxMask & (1 << i)) != 0) numAllowed++;
+            allowedTxMaskU = (ushort)allowedTxMask;
 
             if (numAllowed > 2 && sf.tx_sf.tx_type_search.prune_tx_type_est_rd != 0)
             {
@@ -503,7 +522,17 @@ internal static class AomTxSearch
                     allowedTxMask &= ~prune;
                 }
             }
-            // (prune_tx_2D runs for inter blocks only)
+            else
+            {
+                int allowedTxCount = txfmParams.Prune2dTxfmMode >= TX_TYPE_PRUNE_4 ? 1 : 5;
+                if (txfmParams.Prune2dTxfmMode >= TX_TYPE_PRUNE_1 && isInter && numAllowed > allowedTxCount)
+                {
+                    int diffStride = BlockSizeWide[planeBsize];
+                    AomMl.PruneTx2D(x.Plane[0].SrcDiff.AsSpan(4 * blkRow * diffStride + 4 * blkCol), diffStride, txSize, txSetType,
+                        txfmParams.Prune2dTxfmMode, txkMap, ref allowedTxMaskU);
+                    allowedTxMask = allowedTxMaskU;
+                }
+            }
         }
 
         // Need to have at least one transform type allowed.
@@ -698,7 +727,7 @@ internal static class AomTxSearch
         for (int idx = 0; idx < TX_TYPES; ++idx)
         {
             int txType = txkMap[idx];
-            if ((allowedTxMask & (1 << txType)) == 0) continue;
+            if (txType == TX_TYPE_INVALID || (allowedTxMask & (1 << txType)) == 0) continue;
             if (plane == 0) xd.TxTypeMap[xd.TxTypeMapOffset + txTypeMapIdx] = (byte)txType;
             AomRdStats thisRdStats = default;
             thisRdStats.Invalidate();
@@ -849,9 +878,20 @@ internal static class AomTxSearch
 
         AomEncodeMb.SetTxbContext(x, plane, block, txSize, a, l);
 
-        // Signal non-skip_txfm for Intra blocks
-        long rd = AomRd.RdCost(x.Rdmult, thisRdStats.Rate, thisRdStats.Dist);
-        thisRdStats.SkipTxfm = 0;
+        long rd;
+        if (isInter)
+        {
+            long noSkipTxfmRd = AomRd.RdCost(x.Rdmult, thisRdStats.Rate, thisRdStats.Dist);
+            long skipTxfmRd = AomRd.RdCost(x.Rdmult, 0, thisRdStats.Sse);
+            rd = Math.Min(noSkipTxfmRd, skipTxfmRd);
+            thisRdStats.SkipTxfm &= (byte)(x.Plane[plane].Eobs[block] == 0 ? 1 : 0);
+        }
+        else
+        {
+            // Signal non-skip_txfm for Intra blocks
+            rd = AomRd.RdCost(x.Rdmult, thisRdStats.Rate, thisRdStats.Dist);
+            thisRdStats.SkipTxfm = 0;
+        }
 
         args.RdStats.Merge(thisRdStats);
         args.CurrentRd += rd;
@@ -1074,7 +1114,15 @@ internal static class AomTxSearch
     {
         var xd = x.E;
         var mbmi = xd.Mi0;
+        bool isInter = IsInterBlock(mbmi);
         rdStats.Init();
+        if (isInter && cpi.Sf.rd_sf.use_mb_rd_hash != 0) throw new NotSupportedException("use_mb_rd_hash (inter mb rd record)");
+        if (x.TxfmSearchParams.SkipTxfmLevel != 0 && isInter && xd.Lossless[mbmi.SegmentId] == 0 &&
+            PredictSkipTxfm(x, bs, out long skipDist, cpi.ReducedTxSetUsed != 0))
+        {
+            SetSkipTxfm(x, ref rdStats, bs, skipDist);
+            return;
+        }
         if (xd.Lossless[mbmi.SegmentId] != 0) ChooseSmallestTxSize(cpi, x, ref rdStats, refBestRd, bs);
         else if (x.TxfmSearchParams.TxSizeSearchMethod == USE_LARGESTALL) ChooseLargestTxSize(cpi, x, ref rdStats, refBestRd, bs);
         else ChooseTxSizeTypeFromRd(cpi, x, ref rdStats, refBestRd, bs);
@@ -1091,14 +1139,20 @@ internal static class AomTxSearch
 
         var xd = x.E;
         var pd = xd.Plane[1];
-        long thisRd, skipTxfmRd;
+        long thisRd = 0, skipTxfmRd = 0;
+        bool isInter = IsInterBlock(xd.Mi0);
         int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, pd.SubsamplingX, pd.SubsamplingY);
+        if (isInter)
+            for (int plane = 1; plane < 3; ++plane) AomEncodeMb.SubtractPlane(x, planeBsize, plane);
         int uvTxSize = AomEncodeMb.GetTxSize(1, xd);
         bool isCostValid = true;
         for (int plane = 1; plane < 3; ++plane)
         {
             AomRdStats thisRdStats = default;
-            TxfmRdInPlane(x, cpi, ref thisRdStats, refBestRd, 0, plane, planeBsize, uvTxSize, FTXS_NONE);
+            long chromaRefBestRd = refBestRd;
+            if (cpi.Sf.inter_sf.perform_best_rd_based_gating_for_chroma != 0 && isInter && chromaRefBestRd != long.MaxValue)
+                chromaRefBestRd = refBestRd - Math.Min(thisRd, skipTxfmRd);
+            TxfmRdInPlane(x, cpi, ref thisRdStats, chromaRefBestRd, 0, plane, planeBsize, uvTxSize, FTXS_NONE);
             if (thisRdStats.Rate == int.MaxValue) { isCostValid = false; break; }
             rdStats.Merge(thisRdStats);
             thisRd = AomRd.RdCost(x.Rdmult, rdStats.Rate, rdStats.Dist);

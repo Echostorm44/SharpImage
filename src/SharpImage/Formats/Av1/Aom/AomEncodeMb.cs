@@ -76,7 +76,10 @@ internal static class AomEncodeMb
     internal static int IntraModeToTxTypeOf(AomMbModeInfo mbmi, int planeType)
         => IntraModeToTxType[planeType == 0 ? mbmi.Mode : UvModeToIntra(mbmi.UvMode)];
 
-    /// <summary>av1_get_tx_type (intra blocks).</summary>
+    /// <summary>is_inter_block.</summary>
+    internal static bool IsInterBlock(AomMbModeInfo mbmi) => mbmi.UseIntrabc != 0 || mbmi.RefFrame0 > 0;
+
+    /// <summary>av1_get_tx_type.</summary>
     internal static int GetTxType(AomMacroblockD xd, int planeType, int blkRow, int blkCol, int txSize, bool reducedTxSet)
     {
         var mbmi = xd.Mi0;
@@ -85,8 +88,17 @@ internal static class AomEncodeMb
         if (planeType == 0) txType = xd.TxTypeMap[xd.TxTypeMapOffset + blkRow * xd.TxTypeMapStride + blkCol];
         else
         {
-            txType = IntraModeToTxTypeOf(mbmi, 1);
-            int setType = ExtTxSetType(txSize, false, reducedTxSet);
+            bool isInter = IsInterBlock(mbmi);
+            if (isInter)
+            {
+                // the luma tx type at the co-located position
+                var pd = xd.Plane[planeType];
+                blkRow <<= pd.SubsamplingY;
+                blkCol <<= pd.SubsamplingX;
+                txType = xd.TxTypeMap[xd.TxTypeMapOffset + blkRow * xd.TxTypeMapStride + blkCol];
+            }
+            else txType = IntraModeToTxTypeOf(mbmi, 1);
+            int setType = ExtTxSetType(txSize, isInter, reducedTxSet);
             if (ExtTxUsed[setType * 16 + txType] == 0) txType = DCT_DCT;
         }
         return txType;
@@ -286,11 +298,16 @@ internal static class AomEncodeMb
         var xd = x.E;
         var mbmi = xd.Mi0;
         int sqr = TxsizeSqrMap[txSize];
-        int setType = ExtTxSetType(txSize, false, reducedTxSetUsed != 0);
+        bool isInter = IsInterBlock(mbmi);
+        int setType = ExtTxSetType(txSize, isInter, reducedTxSetUsed != 0);
         if (NumExtTxSet[setType] > 1 && xd.Lossless[mbmi.SegmentId] == 0)
         {
-            int extTxSet = ExtTxSetIndex[0 * 16 + setType];
-            if (extTxSet > 0)
+            int extTxSet = ExtTxSetIndex[(isInter ? 6 : 0) + setType];
+            if (isInter)
+            {
+                if (extTxSet > 0) return x.ModeCosts.InterTxTypeCosts[(extTxSet * 4 + sqr) * 16 + txType];
+            }
+            else if (extTxSet > 0)
             {
                 int intraDir = mbmi.UseFilterIntra != 0 ? FimodeToIntradir[mbmi.FilterIntraMode] : mbmi.Mode;
                 return x.ModeCosts.IntraTxTypeCosts[((extTxSet * 4 + sqr) * 13 + intraDir) * 16 + txType];
@@ -318,7 +335,7 @@ internal static class AomEncodeMb
         int off = BlockOffset(block), n = MaxEob(txSize);
         var scan = ScanOf(txSize, txType);
         var q = p.Qcoeff.AsSpan(off, n);
-        eob = AomTxb.OptimizeTxb(x.CoeffCosts, txSize, txType, plane == 0 ? 0 : 1, false, txbCtx, p.Coeff.AsSpan(off, n), q,
+        eob = AomTxb.OptimizeTxb(x.CoeffCosts, txSize, txType, plane == 0 ? 0 : 1, IsInterBlock(xd.Mi0), txbCtx, p.Coeff.AsSpan(off, n), q,
             p.Dqcoeff.AsSpan(off, n), eob, p.Dequant0, p.Dequant1, x.Rdmult, xd.Bd, cpi.Sharpness, cpi.Sf.tx_sf.use_chroma_trellis_rd_mult != 0,
             cpi.TuneIq, TxTypeCost(x, plane, txSize, txType, cpi.ReducedTxSetUsed), scan, out rateCost);
         p.Eobs[block] = (ushort)eob;

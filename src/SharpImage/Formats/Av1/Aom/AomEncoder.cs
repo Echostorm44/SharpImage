@@ -30,7 +30,7 @@ internal static partial class AomEncoder
             SelectSbSize(input.Width, input.Height, input.Speed));
         cm.BaseQindex = input.BaseQindex;
         var cpi = new AomComp { Cm = cm, Speed = input.Speed, AllowScreenContentTools = input.AllowScreenContentTools,
-            UseScreenContentTools = input.UseScreenContentTools, SbSize = cm.SbSize };
+            UseScreenContentTools = input.UseScreenContentTools, AllowIntrabc = input.AllowIntrabc, SbSize = cm.SbSize };
 
         // the source frame with libaom's replicated borders (the lookahead copy runs aom_extend_frame_borders)
         cpi.Source = new AomFrameBuffer(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome);
@@ -129,10 +129,31 @@ internal static partial class AomEncoder
         x.WinnerModeStats = new AomWinnerModeStats[AomRdoptUtils.WinnerModeCountAllowed[cpi.Sf.winner_mode_sf.multi_winner_mode_type]];
         for (int i = 0; i < x.WinnerModeStats.Length; i++) x.WinnerModeStats[i] = new AomWinnerModeStats();
 
+        // encode_frame_internal's intrabc setup: allow_intrabc &= enable_intrabc, the source hash table (av1_use_hash_me),
+        // the full-pel search sites / step (init_motion_estimation, av1_set_mv_search_params), sadperbit and the DV
+        // costs (av1_initialize_rd_consts: dv_costs from cm->fc->ndvc)
+        cpi.IntrabcUsed = false;
+        cpi.AllowIntrabc &= cpi.EnableIntrabcCfg;
+        if (cpi.UseHashMe && cpi.Sf.rt_sf.use_nonrd_pick_mode == 0)
+            cpi.IntrabcHash = AomHashMotion.BuildFrameTable(cpi.Source, cm.MibSizeLog2, cpi.Sf.mv_sf.hash_max_8x8_intrabc_blocks != 0,
+                BlockSizeWide[BLOCK_4X4]);   // mi_alloc_bsize
+        cpi.SearchSites = AomMcomp.InitSearchSites();
+        cpi.MvStepParam = AomMcomp.InitSearchRange(Math.Max(input.Width, input.Height));
+        x.SadPerBit = AomEncodeFrame.SadPerBit(input.BaseQindex);
+        if (cpi.Sf.rt_sf.use_nonrd_pick_mode == 0 && cpi.AllowIntrabcNow)   // av1_need_dv_costs
+        {
+            x.DvCosts = new AomDvCosts();
+            AomMvCost.FillDvCosts(cm.Fc.Mv, x.DvCosts);
+            cpi.MbmiExtFrameBase = new AomMbmiExtFrame?[cm.MiGridBase.Length];
+        }
+
         // av1_encode_tile
         cm.ZeroAboveContext();
         if (cpi.EnableCflIntra) AomCfl.CflInit(xd.Cfl, input.SsX, input.SsY);
         for (int miRow = cm.TileMiRowStart; miRow < cm.TileMiRowEnd; miRow += cm.MibSize) EncodeSbRow(cpi, x, miRow);
+
+        // intrabc allowed but never selected: reset the flag
+        if (cpi.AllowIntrabc && !cpi.IntrabcUsed) cpi.AllowIntrabc = false;
         return (cpi, x);
     }
 
@@ -308,6 +329,10 @@ internal static partial class AomEncoder
         int modeLevel = cpi.Sf.inter_sf.mode_cost_upd_level;
         if (modeLevel >= INTERNAL_COST_UPD_SBROW_SET && !SkipCostUpdate(cm, miRow, miCol, modeLevel))
             AomModeCostFill.Fill(x.ModeCosts, x.TileCtx, cpi.EnableFilterIntra);
+        // (mv costs: inter frames only)
+        int dvLevel = cpi.Sf.intra_sf.dv_cost_upd_level;
+        if (dvLevel >= INTERNAL_COST_UPD_SBROW_SET && cpi.AllowIntrabcNow && !SkipCostUpdate(cm, miRow, miCol, dvLevel))   // skip_dv_cost_update
+            AomMvCost.FillDvCosts(x.TileCtx.Mv, x.DvCosts!);
     }
 
     /// <summary>skip_cost_update.</summary>

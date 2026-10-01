@@ -16,11 +16,16 @@ internal static class AomModeCostFill
         (byte)Av1BlockSize.Bs16x64, (byte)Av1BlockSize.Bs64x16,
     };
 
+    // use_inter_ext_tx_for_txsize[EXT_TX_SETS_INTER][EXT_TX_SIZES] (rd.c) and av1_ext_tx_set_idx_to_type[1]
+    internal static readonly int[] UseInterExtTxForTxsize = { 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1 };
+    internal static readonly int[] InterExtTxSetIdxToType = { EXT_TX_SET_DCTONLY, EXT_TX_SET_ALL16, EXT_TX_SET_DTT9_IDTX_1DDCT, EXT_TX_SET_DCT_IDTX };
+
     /// <summary>av1_filter_intra_allowed_bsize.</summary>
     internal static bool FilterIntraAllowedBsize(bool enableFilterIntra, int bs)
         => enableFilterIntra && BlockSizeWide[bs] <= 32 && BlockSizeHigh[bs] <= 32;
 
-    /// <summary>av1_fill_mode_rates for an intra frame (the inter-only costs are not needed), from the tile's CDFs.</summary>
+    /// <summary>av1_fill_mode_rates for an intra frame (plus the tx partition / inter tx type costs of intrabc blocks), from
+    /// the tile's CDFs.</summary>
     internal static void Fill(AomModeCosts mc, Av1CdfContext fc, bool enableFilterIntra)
     {
         var m = fc.Mode;
@@ -89,6 +94,18 @@ internal static class AomModeCostFill
                     ushort[] cdf = s == 1 ? m.TxtpIntra1[i * 13 + j] : m.TxtpIntra2[i * 13 + j];
                     AomCost.CostTokensFromCdf(mc.IntraTxTypeCosts.AsSpan(((s * 4 + i) * 13 + j) * 16, 16), cdf, n, inv);
                 }
+            }
+        // txfm_partition_cost[TXFM_PARTITION_CONTEXTS][2] and inter_tx_type_costs[set][square tx][tx type]
+        for (int i = 0; i < AomModeCosts.TxfmPartitionContexts; i++)
+            AomCost.CostTokensFromCdf(mc.TxfmPartitionCost.AsSpan(i * 2, 2), m.Txpart[i], 2);
+        for (int i = TX_4X4; i < AomModeCosts.ExtTxSizes; i++)
+            for (int s = 1; s < AomModeCosts.ExtTxSetsInter; s++)
+            {
+                if (UseInterExtTxForTxsize[s * 4 + i] == 0) continue;
+                int setType = InterExtTxSetIdxToType[s];
+                int n = NumExtTxSet[setType];
+                ushort[] cdf = s == 1 ? m.TxtpInter1[i] : s == 2 ? m.TxtpInter2 : m.TxtpInter3[i];
+                AomCost.CostTokensFromCdf(mc.InterTxTypeCosts.AsSpan((s * 4 + i) * 16, 16), cdf, n, ExtTxInv.AsSpan(setType * 16, 16));
             }
         for (int i = 0; i < AomModeCosts.DirectionalModes; i++)
             AomCost.CostTokensFromCdf(mc.AngleDeltaCost.AsSpan(i * 7), m.AngleDelta[i], 7);

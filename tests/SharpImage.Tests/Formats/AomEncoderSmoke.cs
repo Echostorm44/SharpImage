@@ -52,13 +52,22 @@ public sealed class AomEncoderSmoke
         var cm = cpi.Cm;
         var sb = new System.Text.StringBuilder();
         sb.Append($"frame {cm.Width} {cm.Height} qindex {cm.BaseQindex} mi {cm.MiRows} {cm.MiCols}\n");
+        sb.Append($"hdr sct {(cpi.AllowScreenContentTools ? 1 : 0)} ibc {(cpi.AllowIntrabc ? 1 : 0)}\n");
         for (int r = 0; r < cm.MiRows; r++)
             for (int c = 0; c < cm.MiCols; c++)
             {
                 var mi = cm.MiGridBase[r * cm.MiStride + c]!;
                 if ((r > 0 && cm.MiGridBase[(r - 1) * cm.MiStride + c] == mi) || (c > 0 && cm.MiGridBase[r * cm.MiStride + c - 1] == mi)) continue;
-                sb.Append($"b {r} {c} bs {mi.Bsize} part {mi.Partition} y {mi.Mode} uv {mi.UvMode} ad {mi.AngleDelta[0]} {mi.AngleDelta[1]} fi {mi.UseFilterIntra} {mi.FilterIntraMode} cfl {mi.CflAlphaIdx} {mi.CflAlphaSigns} pal {mi.Palette.PaletteSize0} {mi.Palette.PaletteSize1} tx {mi.TxSize} skip {mi.SkipTxfm}\n");
+                sb.Append($"b {r} {c} bs {mi.Bsize} part {mi.Partition} y {mi.Mode} uv {mi.UvMode} ad {mi.AngleDelta[0]} {mi.AngleDelta[1]} fi {mi.UseFilterIntra} {mi.FilterIntraMode} cfl {mi.CflAlphaIdx} {mi.CflAlphaSigns} pal {mi.Palette.PaletteSize0} {mi.Palette.PaletteSize1} tx {mi.TxSize} skip {mi.SkipTxfm} ibc {mi.UseIntrabc} dv {mi.Mv0.Row} {mi.Mv0.Col}\n");
             }
+        if (Environment.GetEnvironmentVariable("AOMORACLE_TCOEFF") != null)
+            for (int r = 0; r < cm.MiRows; r++)
+                for (int c = 0; c < cm.MiCols; c++)
+                {
+                    var mi = cm.MiGridBase[r * cm.MiStride + c]!;
+                    if ((r > 0 && cm.MiGridBase[(r - 1) * cm.MiStride + c] == mi) || (c > 0 && cm.MiGridBase[r * cm.MiStride + c - 1] == mi)) continue;
+                    sb.Append($"cbo {r} {c} {cpi.ExtCbOffset[(r * cm.MiStride + c) * 2]} {cpi.ExtCbOffset[(r * cm.MiStride + c) * 2 + 1]}\n");
+                }
         for (int r = 0; r < cm.MiRows; r++)
         {
             sb.Append($"txt {r}");
@@ -100,6 +109,12 @@ public sealed class AomEncoderSmoke
                     for (int i = 0; i < n; i++) th = (th ^ (uint)cb.Tcoeff[p][i]) * 1099511628211UL;
                     for (int i = 0; i < n / 16; i++) ch = (ch ^ cb.EntropyCtx[p][i]) * 1099511628211UL;
                     sb.Append($"cbh {sr} {sc} p {p} tcoeff {th:x16} ctx {ch:x16}\n");
+                    if (Environment.GetEnvironmentVariable("AOMORACLE_TCOEFF") != null)
+                    {
+                        sb.Append($"tc {sr} {sc} p {p}");
+                        for (int i = 0; i < n; i++) sb.Append(' ').Append(cb.Tcoeff[p][i]);
+                        sb.Append('\n');
+                    }
                     sb.Append($"cb {sr} {sc} p {p} eobs");
                     for (int i = 0; i < n / 16; i++) sb.Append(' ').Append(cb.Eobs[p][i]);
                     sb.Append('\n');
