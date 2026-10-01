@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
@@ -15,6 +16,29 @@ internal static class AomHbd
     /// 2 (bd - 8) bits), var = sse - sum^2 / (w h) clamped at 0. b == null: against the constant bConst (var_offs).</summary>
     internal static uint Variance(ushort[] a, int aOff, int aStride, ushort[]? b, int bOff, int bStride, int bConst, int w, int h, int bd, out uint sse)
     {
+        if (Avx2.IsSupported && b != null && w >= 16 && (w & 15) == 0 && aOff >= 0 && bOff >= 0
+            && aOff + (h - 1) * aStride + w <= a.Length && bOff + (h - 1) * bStride + w <= b.Length)
+        {
+            // exact sums: the 16-bit differences, their pair-summed squares per row in 32 bits (8 * 2 * 4095^2 < 2^31),
+            // widened to 64 bits per row
+            ref ushort ra = ref MemoryMarshal.GetArrayDataReference(a), rb = ref MemoryMarshal.GetArrayDataReference(b);
+            var vsum = Vector256<int>.Zero;
+            var vss = Vector256<long>.Zero;
+            for (int r = 0; r < h; r++)
+            {
+                int ar = aOff + r * aStride, br = bOff + r * bStride;
+                var rowSs = Vector256<int>.Zero;
+                for (int c = 0; c < w; c += 16)
+                {
+                    var d = (Vector256.LoadUnsafe(ref ra, (nuint)(ar + c)) - Vector256.LoadUnsafe(ref rb, (nuint)(br + c))).AsInt16();
+                    vsum += Avx2.MultiplyAddAdjacent(d, Vector256<short>.One);
+                    rowSs += Avx2.MultiplyAddAdjacent(d, d);
+                }
+                var (lo, hi) = Vector256.Widen(rowSs);
+                vss += lo + hi;
+            }
+            return Finish((ulong)Vector256.Sum(vss), Vector256.Sum(vsum), w * h, bd, out sse);
+        }
         long sum = 0;
         ulong ss = 0;
         for (int r = 0; r < h; r++)
@@ -248,6 +272,42 @@ internal static class AomHbd
     /// <summary>aom_highbd_sad (any size): the exact sum of absolute differences.</summary>
     internal static uint Sad(ushort[] a, int aOff, int aStride, ushort[] b, int bOff, int bStride, int w, int h)
     {
+        if (Vector256.IsHardwareAccelerated && w >= 16 && (w & 15) == 0 && aOff >= 0 && bOff >= 0
+            && aOff + (h - 1) * aStride + w <= a.Length && bOff + (h - 1) * bStride + w <= b.Length)
+        {
+            // |a - b| per 16-bit lane (max - min), widened to 32 bits per row (exact: no lane overflows)
+            ref ushort ra = ref MemoryMarshal.GetArrayDataReference(a), rb = ref MemoryMarshal.GetArrayDataReference(b);
+            var acc = Vector256<uint>.Zero;
+            for (int r = 0; r < h; r++)
+            {
+                int ar = aOff + r * aStride, br = bOff + r * bStride;
+                var rowAcc = Vector256<ushort>.Zero;
+                for (int c = 0; c < w; c += 16)
+                {
+                    var va = Vector256.LoadUnsafe(ref ra, (nuint)(ar + c));
+                    var vb = Vector256.LoadUnsafe(ref rb, (nuint)(br + c));
+                    // a row is at most 8 vectors (w <= 128) and 8 * 4095 < 65536: the 16-bit row sums stay exact
+                    rowAcc += Vector256.Max(va, vb) - Vector256.Min(va, vb);
+                }
+                var (lo, hi) = Vector256.Widen(rowAcc);
+                acc += lo + hi;
+            }
+            return Vector256.Sum(acc);
+        }
+        if (Vector128.IsHardwareAccelerated && w == 8 && aOff >= 0 && bOff >= 0
+            && aOff + (h - 1) * aStride + w <= a.Length && bOff + (h - 1) * bStride + w <= b.Length)
+        {
+            ref ushort ra = ref MemoryMarshal.GetArrayDataReference(a), rb = ref MemoryMarshal.GetArrayDataReference(b);
+            var acc = Vector128<uint>.Zero;
+            for (int r = 0; r < h; r++)
+            {
+                var va = Vector128.LoadUnsafe(ref ra, (nuint)(aOff + r * aStride));
+                var vb = Vector128.LoadUnsafe(ref rb, (nuint)(bOff + r * bStride));
+                var (lo, hi) = Vector128.Widen(Vector128.Max(va, vb) - Vector128.Min(va, vb));
+                acc += lo + hi;
+            }
+            return Vector128.Sum(acc);
+        }
         uint sad = 0;
         for (int r = 0; r < h; r++)
             for (int c = 0; c < w; c++) sad += (uint)Math.Abs(a[aOff + r * aStride + c] - b[bOff + r * bStride + c]);
