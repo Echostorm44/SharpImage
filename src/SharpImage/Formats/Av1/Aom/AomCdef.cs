@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using static SharpImage.Formats.Av1.AomTables;
 
@@ -17,6 +18,7 @@ internal static partial class AomCdef
     private const int VeryLarge = 0x4000;
     private const int InbufSize = BStride * (128 + 2 * VBorder);
     private const int NBlocks = 16;     // CDEF_NBLOCKS
+    internal const int InbufSizeForScratch = InbufSize, NBlocksForScratch = NBlocks;
     private const int SecStrengths = 4, PriStrengths = 16, TotalStrengths = PriStrengths * SecStrengths;
     private const int MiSize64 = 16, MiSize128 = 32;
 
@@ -317,20 +319,21 @@ internal static partial class AomCdef
         var mse0 = new ulong[nvfb * nhfb][];
         var mse1 = new ulong[nvfb * nhfb][];
         var sbIndex = new int[nvfb * nhfb];
-        int sbCount = 0;
-        var inbuf = new ushort[InbufSize];
-        var dlist = new (byte by, byte bx)[MiSize128 * MiSize128];
-        var dir = new int[NBlocks * NBlocks];
-        var var = new int[NBlocks * NBlocks];
-        var tmpDst8 = new byte[128 * 128];
-        int inOff = VBorder * BStride + HBorder;
+        // (av1_cdef_mse_calc_frame_mt with multi-threading: the same blocks in the same sb_count order, any thread)
+        var jobs = new List<(int fbr, int fbc)>();
         for (int fbr = 0; fbr < nvfb; ++fbr)
             for (int fbc = 0; fbc < nhfb; ++fbc)
-            {
-                if (CdefSbSkip(cm, fbr, fbc)) continue;
-                mse0[sbCount] = new ulong[TotalStrengths];
-                mse1[sbCount] = new ulong[TotalStrengths];
+                if (!CdefSbSkip(cm, fbr, fbc)) jobs.Add((fbr, fbc));
+        int sbCount = jobs.Count;
+        int inOff = VBorder * BStride + HBorder;
+        void CalcBlock(int k, CdefSearchScratch sc)
+        {
+                var (fbr, fbc) = jobs[k];
                 // av1_cdef_mse_calc_block
+                mse0[k] = new ulong[TotalStrengths];
+                mse1[k] = new ulong[TotalStrengths];
+                // av1_cdef_mse_calc_block
+                var inbuf = sc.Inbuf; var dlist = sc.Dlist; var dir = sc.Dir; var var = sc.Var; var tmpDst8 = sc.TmpDst8;
                 Array.Clear(dir); Array.Clear(var);
                 int nhb = Math.Min(MiSize64, cm.MiCols - MiSize64 * fbc), nvb = Math.Min(MiSize64, cm.MiRows - MiSize64 * fbr);
                 int hbStep = 1, vbStep = 1;
@@ -351,8 +354,8 @@ internal static partial class AomCdef
                 {
                     if (adaptiveCdefMode > 0 && pli > 0)
                     {
-                        mse1[sbCount][0] = 0;
-                        for (int gi = 1; gi < totalStrengths; gi++) mse1[sbCount][gi] = 1;
+                        mse1[k][0] = 0;
+                        for (int gi = 1; gi < totalStrengths; gi++) mse1[k][gi] = 1;
                         break;
                     }
                     int xdec = pli == 0 ? 0 : cm.SsX, ydec = pli == 0 ? 0 : cm.SsY;
@@ -397,13 +400,20 @@ internal static partial class AomCdef
                                     : (ulong)Sse(rp.Buf, rp.At(col + bxPos, row + byPos), rp.Stride, tmpDst8, byPos * 128 + bxPos, 128, 1 << bwLog2, 1 << bhLog2);
                             }
                         }
-                        if (pli < 2) (pli == 0 ? mse0 : mse1)[sbCount][gi] = currSse;
-                        else mse1[sbCount][gi] += currSse;
+                        if (pli < 2) (pli == 0 ? mse0 : mse1)[k][gi] = currSse;
+                        else mse1[k][gi] += currSse;
                     }
                 }
-                sbIndex[sbCount] = MiSize64 * fbr * cm.MiStride + MiSize64 * fbc;
-                sbCount++;
-            }
+                sbIndex[k] = MiSize64 * fbr * cm.MiStride + MiSize64 * fbc;
+        }
+        if (cpi.NumWorkers > 1 && sbCount > 1)
+            System.Threading.Tasks.Parallel.For(0, sbCount, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = cpi.NumWorkers },
+                () => new CdefSearchScratch(), (k, _, sc) => { CalcBlock(k, sc); return sc; }, _ => { });
+        else
+        {
+            var sc = new CdefSearchScratch();
+            for (int k = 0; k < sbCount; k++) CalcBlock(k, sc);
+        }
 
         // search for the number of signalling bits
         int nbStrengthBits = 0;
@@ -688,4 +698,14 @@ internal static partial class AomCdef
             }
         }
     }
+}
+
+/// <summary>The per-thread buffers of av1_cdef_mse_calc_block.</summary>
+internal sealed class CdefSearchScratch
+{
+    public readonly ushort[] Inbuf = new ushort[AomCdef.InbufSizeForScratch];
+    public readonly (byte by, byte bx)[] Dlist = new (byte by, byte bx)[32 * 32];
+    public readonly int[] Dir = new int[AomCdef.NBlocksForScratch * AomCdef.NBlocksForScratch];
+    public readonly int[] Var = new int[AomCdef.NBlocksForScratch * AomCdef.NBlocksForScratch];
+    public readonly byte[] TmpDst8 = new byte[128 * 128];
 }
