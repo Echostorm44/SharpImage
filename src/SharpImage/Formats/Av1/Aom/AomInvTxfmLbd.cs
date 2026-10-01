@@ -251,7 +251,7 @@ internal static unsafe partial class AomInvTxfmLbd
         Vector128<int> x1_10 = Sse2.MultiplyAddAdjacent(u2, sinpi_0_p03), x1_11 = Sse2.MultiplyAddAdjacent(u3, sinpi_0_p03);
         Vector128<int> x1_12 = Sse2.MultiplyAddAdjacent(u0, sinpi_p04_p02), x1_13 = Sse2.MultiplyAddAdjacent(u1, sinpi_p04_p02);
         Vector128<int> x1_14 = Sse2.MultiplyAddAdjacent(u2, sinpi_m03_m01), x1_15 = Sse2.MultiplyAddAdjacent(u3, sinpi_m03_m01);
-        Vector128<int>* x2 = stackalloc Vector128<int>[8];
+        Unsafe.SkipInit(out StackArr8<Vector128<int>> x2SA); Vector128<int>* x2 = (Vector128<int>*)Unsafe.AsPointer(ref x2SA[0]);
         x2[0] = Sse2.Add(x1_0, x1_4);
         x2[1] = Sse2.Add(x1_1, x1_5);
         x2[2] = Sse2.Add(x1_2, x1_6);
@@ -285,7 +285,7 @@ internal static unsafe partial class AomInvTxfmLbd
         Vector128<int> x1_5 = Sse2.MultiplyAddAdjacent(u1, sinpi_0_p03);
         Vector128<int> x1_6 = Sse2.MultiplyAddAdjacent(u0, sinpi_p04_p02);
         Vector128<int> x1_7 = Sse2.MultiplyAddAdjacent(u1, sinpi_m03_m01);
-        Vector128<int>* x2 = stackalloc Vector128<int>[4];
+        Unsafe.SkipInit(out StackArr4<Vector128<int>> x2SA); Vector128<int>* x2 = (Vector128<int>*)Unsafe.AsPointer(ref x2SA[0]);
         x2[0] = Sse2.Add(x1_0, x1_2);
         x2[1] = Sse2.Add(x1_1, x1_3);
         x2[2] = Sse2.Add(x1_4, x1_5);
@@ -449,7 +449,7 @@ internal static unsafe partial class AomInvTxfmLbd
     /// <summary>transpose_16bit_16x16_avx2 (in place allowed: every input is read first).</summary>
     private static void Transpose16bit16x16Avx2(V256* input, V256* output)
     {
-        V256* t = stackalloc V256[16];
+        Unsafe.SkipInit(out StackArr16<V256> tSA); V256* t = (V256*)Unsafe.AsPointer(ref tSA[0]);
         for (int idx = 0; idx < 8; idx++)
         {
             // LOADL: the low halves of in[idx], in[idx + 8]; LOADR: their high halves
@@ -574,7 +574,7 @@ internal static unsafe partial class AomInvTxfmLbd
         int colMax = Math.Min(32, txfmSizeCol), rowMax = Math.Min(32, txfmSizeRow);
         int inputStride = rowMax;
         int rectType = GetRectTxLogRatio(txfmSizeCol, txfmSizeRow);
-        V256* buf = stackalloc V256[32];
+        Unsafe.SkipInit(out StackArr32<V256> bufSA); V256* buf = (V256*)Unsafe.AsPointer(ref bufSA[0]);
         for (int i = 0; i < colMax >> 4; ++i)
         {
             for (int j = 0; j < rowMax >> 4; j++)
@@ -599,7 +599,7 @@ internal static unsafe partial class AomInvTxfmLbd
         int funIdxY = ZerosIdx[eoby];
         var colTxfm = ZerosW16Arr[(txhIdx * 3 + VitxTab[txType]) * 4 + funIdxY];
         GetFlipCfg(txType, out int udFlip, out _);
-        V256* buf0 = stackalloc V256[64];
+        Unsafe.SkipInit(out StackArr64<V256> buf0SA); V256* buf0 = (V256*)Unsafe.AsPointer(ref buf0SA[0]);
         for (int i = 0; i < bufSizeWDiv16; i++)
         {
             for (int j = 0; j < bufSizeHDiv16; j++)
@@ -623,7 +623,7 @@ internal static unsafe partial class AomInvTxfmLbd
 
     private static void InvTxfm2dAddVIdentityAvx2(int* input, byte* output, int stride, int txType, int txSize, int eob)
     {
-        V256* buf1 = stackalloc V256[64];
+        Unsafe.SkipInit(out StackArr64<V256> buf1SA); V256* buf1 = (V256*)Unsafe.AsPointer(ref buf1SA[0]);
         GetEobxEobyScanVIdentity(out int eobx, out int eoby, txSize, eob);
         int shift0 = Shift0[txSize];
         int txwIdx = GetTxwIdx(txSize), txhIdx = GetTxhIdx(txSize);
@@ -636,8 +636,8 @@ internal static unsafe partial class AomInvTxfmLbd
         int funIdxX = ZerosIdx[eobx];
         var rowTxfm = ZerosW16Arr[(txwIdx * 3 + HitxTab[txType]) * 4 + funIdxX];
         GetFlipCfg(txType, out _, out int lrFlip);
-        V256* buf0 = stackalloc V256[64];
-        V256* temp = stackalloc V256[16];
+        Unsafe.SkipInit(out StackArr64<V256> buf0SA); V256* buf0 = (V256*)Unsafe.AsPointer(ref buf0SA[0]);
+        Unsafe.SkipInit(out StackArr16<V256> tempSA); V256* temp = (V256*)Unsafe.AsPointer(ref tempSA[0]);
         for (int i = 0; i < bufSizeHDiv16; i++)
         {
             LoadBuffer32BitTo16BitW16(input + i * 16, inputStride, buf0, bufSizeNonzeroW);
@@ -665,7 +665,7 @@ internal static unsafe partial class AomInvTxfmLbd
     /// <summary>lowbd_inv_txfm2d_add_no_identity_avx2: only w >= 16, h >= 16.</summary>
     private static void InvTxfm2dAddNoIdentityAvx2(int* input, byte* output, int stride, int txType, int txSize, int eob)
     {
-        V256* buf1 = stackalloc V256[64 * 16];
+        Unsafe.SkipInit(out StackArr1024<V256> buf1SA); V256* buf1 = (V256*)Unsafe.AsPointer(ref buf1SA[0]);
         GetEobxEobyScanDefault(out int eobx, out int eoby, txSize, eob);
         int shift0 = Shift0[txSize];
         int txwIdx = GetTxwIdx(txSize), txhIdx = GetTxhIdx(txSize);
@@ -680,8 +680,8 @@ internal static unsafe partial class AomInvTxfmLbd
         var colTxfm = ZerosW16Arr[(txhIdx * 3 + VitxTab[txType]) * 4 + funIdxY];
         GetFlipCfg(txType, out int udFlip, out int lrFlip);
         V256 scale0 = Vector256.Create((short)(1 << (15 + shift0)));
-        V256* buf0 = stackalloc V256[64];
-        V256* temp = stackalloc V256[16];
+        Unsafe.SkipInit(out StackArr64<V256> buf0SA); V256* buf0 = (V256*)Unsafe.AsPointer(ref buf0SA[0]);
+        Unsafe.SkipInit(out StackArr16<V256> tempSA); V256* temp = (V256*)Unsafe.AsPointer(ref tempSA[0]);
         for (int i = 0; i < bufSizeNonzeroHDiv16; i++)
         {
             LoadBuffer32BitTo16BitW16(input + 16 * i, inputStride, buf0, bufSizeNonzeroW);
@@ -822,13 +822,13 @@ internal static unsafe partial class AomInvTxfmLbd
 
     private static void InvTxfm2d8x8NoIdentityAvx2(int* input, byte* output, int stride, int txType, int txSize, int eob)
     {
-        V128* buf1 = stackalloc V128[8];
+        Unsafe.SkipInit(out StackArr8<V128> buf1SA); V128* buf1 = (V128*)Unsafe.AsPointer(ref buf1SA[0]);
         const int inputStride = 8;
         int shift0 = Shift0[txSize];
         var rowTxfm = Zeros8x8Arr[HitxTab[txType] * 2 + (eob != 1 ? 1 : 0)];
         var colTxfm = Zeros8x8Arr[VitxTab[txType] * 2 + (eob != 1 ? 1 : 0)];
         GetFlipCfg(txType, out int udFlip, out int lrFlip);
-        V128* buf0 = stackalloc V128[8];
+        Unsafe.SkipInit(out StackArr8<V128> buf0SA); V128* buf0 = (V128*)Unsafe.AsPointer(ref buf0SA[0]);
         LoadBufferAvx2(input, inputStride, buf0);
         rowTxfm(buf0, buf0);
         RoundAndTransposeAvx2(buf0, buf1, shift0, lrFlip);
@@ -1124,7 +1124,7 @@ internal static unsafe partial class AomInvTxfmLbd
         int colMax = Math.Min(32, txfmSizeCol), rowMax = Math.Min(32, txfmSizeRow);
         int inputStride = rowMax;
         int rectType = GetRectTxLogRatio(txfmSizeCol, txfmSizeRow);
-        V128* buf = stackalloc V128[8];
+        Unsafe.SkipInit(out StackArr8<V128> bufSA); V128* buf = (V128*)Unsafe.AsPointer(ref bufSA[0]);
         for (int i = 0; i < colMax >> 3; ++i)
         {
             for (int j = 0; j < rowMax >> 3; j++)
@@ -1138,7 +1138,7 @@ internal static unsafe partial class AomInvTxfmLbd
 
     private static void InvTxfm2dAdd4x4Ssse3(int* input, byte* output, int stride, int txType)
     {
-        V128* buf = stackalloc V128[4];
+        Unsafe.SkipInit(out StackArr4<V128> bufSA); V128* buf = (V128*)Unsafe.AsPointer(ref bufSA[0]);
         const int txSize = TX_4X4;
         int txwIdx = GetTxwIdx(txSize), txhIdx = GetTxhIdx(txSize);
         int txfmSizeCol = TxW[txSize], txfmSizeRow = TxH[txSize];
@@ -1149,7 +1149,7 @@ internal static unsafe partial class AomInvTxfmLbd
         rowTxfm(buf, buf);
         if (lrFlip != 0)
         {
-            V128* temp = stackalloc V128[4];
+            Unsafe.SkipInit(out StackArr4<V128> tempSA); V128* temp = (V128*)Unsafe.AsPointer(ref tempSA[0]);
             FlipBufSse2(buf, temp, txfmSizeCol);
             Transpose16bit4x4(temp, buf);
         }
@@ -1164,7 +1164,7 @@ internal static unsafe partial class AomInvTxfmLbd
 
     private static void InvTxfm2dAddNoIdentitySsse3(int* input, byte* output, int stride, int txType, int txSize, int eob)
     {
-        V128* buf1 = stackalloc V128[64 * 8];
+        Unsafe.SkipInit(out StackArr512<V128> buf1SA); V128* buf1 = (V128*)Unsafe.AsPointer(ref buf1SA[0]);
         GetEobxEobyScanDefault(out int eobx, out int eoby, txSize, eob);
         int shift0 = Shift0[txSize];
         int txwIdx = GetTxwIdx(txSize), txhIdx = GetTxhIdx(txSize);
@@ -1178,8 +1178,8 @@ internal static unsafe partial class AomInvTxfmLbd
         var rowTxfm = ZerosW8Arr[(txwIdx * 3 + HitxTab[txType]) * 4 + funIdxX];
         var colTxfm = ZerosW8Arr[(txhIdx * 3 + VitxTab[txType]) * 4 + funIdxY];
         GetFlipCfg(txType, out int udFlip, out int lrFlip);
-        V128* buf0 = stackalloc V128[64];
-        V128* temp = stackalloc V128[8];
+        Unsafe.SkipInit(out StackArr64<V128> buf0SA); V128* buf0 = (V128*)Unsafe.AsPointer(ref buf0SA[0]);
+        Unsafe.SkipInit(out StackArr8<V128> tempSA); V128* temp = (V128*)Unsafe.AsPointer(ref tempSA[0]);
         for (int i = 0; i < bufSizeNonzeroHDiv8; i++)
         {
             LoadBuffer32BitTo16Bit(input + 8 * i, inputStride, buf0, bufSizeNonzeroW);
@@ -1229,7 +1229,7 @@ internal static unsafe partial class AomInvTxfmLbd
         int funIdx = ZerosIdx[eoby];
         var colTxfm = ZerosW8Arr[(txhIdx * 3 + VitxTab[txType]) * 4 + funIdx];
         GetFlipCfg(txType, out int udFlip, out _);
-        V128* buf0 = stackalloc V128[64];
+        Unsafe.SkipInit(out StackArr64<V128> buf0SA); V128* buf0 = (V128*)Unsafe.AsPointer(ref buf0SA[0]);
         for (int i = 0; i < bufSizeWDiv8; i++)
         {
             for (int j = 0; j < bufSizeHDiv8; j++)
@@ -1257,7 +1257,7 @@ internal static unsafe partial class AomInvTxfmLbd
 
     private static void InvTxfm2dAddVIdentitySsse3(int* input, byte* output, int stride, int txType, int txSize, int eob)
     {
-        V128* buf1 = stackalloc V128[64];
+        Unsafe.SkipInit(out StackArr64<V128> buf1SA); V128* buf1 = (V128*)Unsafe.AsPointer(ref buf1SA[0]);
         GetEobxEobyScanVIdentity(out int eobx, out int eoby, txSize, eob);
         int shift0 = Shift0[txSize];
         int txwIdx = GetTxwIdx(txSize), txhIdx = GetTxhIdx(txSize);
@@ -1270,8 +1270,8 @@ internal static unsafe partial class AomInvTxfmLbd
         int funIdx = ZerosIdx[eobx];
         var rowTxfm = ZerosW8Arr[(txwIdx * 3 + HitxTab[txType]) * 4 + funIdx];
         GetFlipCfg(txType, out _, out int lrFlip);
-        V128* buf0 = stackalloc V128[64];
-        V128* temp = stackalloc V128[8];
+        Unsafe.SkipInit(out StackArr64<V128> buf0SA); V128* buf0 = (V128*)Unsafe.AsPointer(ref buf0SA[0]);
+        Unsafe.SkipInit(out StackArr8<V128> tempSA); V128* temp = (V128*)Unsafe.AsPointer(ref tempSA[0]);
         for (int i = 0; i < bufSizeHDiv8; i++)
         {
             LoadBuffer32BitTo16Bit(input + i * 8, inputStride, buf0, bufSizeNonzeroW);
@@ -1321,7 +1321,7 @@ internal static unsafe partial class AomInvTxfmLbd
 
     private static void InvTxfm2dAdd4x8Ssse3(int* input, byte* output, int stride, int txType)
     {
-        V128* buf = stackalloc V128[8];
+        Unsafe.SkipInit(out StackArr8<V128> bufSA); V128* buf = (V128*)Unsafe.AsPointer(ref bufSA[0]);
         const int txSize = TX_4X8;
         int txwIdx = GetTxwIdx(txSize), txhIdx = GetTxhIdx(txSize);
         int txfmSizeCol = TxW[txSize], txfmSizeRow = TxH[txSize];
@@ -1334,7 +1334,7 @@ internal static unsafe partial class AomInvTxfmLbd
         // round_shift_16bit_ssse3(buf, txfm_size_col, shift[0]); shift[0] is 0
         if (lrFlip != 0)
         {
-            V128* temp = stackalloc V128[4];
+            Unsafe.SkipInit(out StackArr4<V128> tempSA); V128* temp = (V128*)Unsafe.AsPointer(ref tempSA[0]);
             FlipBufSse2(buf, temp, txfmSizeCol);
             Transpose16bit8x4(temp, buf);
         }
@@ -1349,7 +1349,7 @@ internal static unsafe partial class AomInvTxfmLbd
 
     private static void InvTxfm2dAdd8x4Ssse3(int* input, byte* output, int stride, int txType)
     {
-        V128* buf = stackalloc V128[8];
+        Unsafe.SkipInit(out StackArr8<V128> bufSA); V128* buf = (V128*)Unsafe.AsPointer(ref bufSA[0]);
         const int txSize = TX_8X4;
         int txwIdx = GetTxwIdx(txSize), txhIdx = GetTxhIdx(txSize);
         int txfmSizeCol = TxW[txSize], txfmSizeRow = TxH[txSize];
@@ -1362,7 +1362,7 @@ internal static unsafe partial class AomInvTxfmLbd
         // round_shift_16bit_ssse3(buf, txfm_size_col, shift[0]); shift[0] is 0
         if (lrFlip != 0)
         {
-            V128* temp = stackalloc V128[8];
+            Unsafe.SkipInit(out StackArr8<V128> tempSA); V128* temp = (V128*)Unsafe.AsPointer(ref tempSA[0]);
             FlipBufSse2(buf, temp, txfmSizeCol);
             Transpose16bit4x8(temp, buf);
         }
@@ -1377,7 +1377,7 @@ internal static unsafe partial class AomInvTxfmLbd
 
     private static void InvTxfm2dAdd4x16Ssse3(int* input, byte* output, int stride, int txType)
     {
-        V128* buf = stackalloc V128[16];
+        Unsafe.SkipInit(out StackArr16<V128> bufSA); V128* buf = (V128*)Unsafe.AsPointer(ref bufSA[0]);
         const int txSize = TX_4X16;
         int shift0 = Shift0[txSize];
         int txwIdx = GetTxwIdx(txSize), txhIdx = GetTxhIdx(txSize);
@@ -1388,7 +1388,7 @@ internal static unsafe partial class AomInvTxfmLbd
         bool rowIsIdentity = HitxTab[txType] == IIDENTITY_1D;
         GetFlipCfg(txType, out int udFlip, out int lrFlip);
         const int rowOneLoop = 8;
-        V128* temp = stackalloc V128[8];
+        Unsafe.SkipInit(out StackArr8<V128> tempSA); V128* temp = (V128*)Unsafe.AsPointer(ref tempSA[0]);
         for (int i = 0; i < 2; ++i)
         {
             int* inputCur = input + i * rowOneLoop;
@@ -1429,7 +1429,7 @@ internal static unsafe partial class AomInvTxfmLbd
 
     private static void InvTxfm2dAdd16x4Ssse3(int* input, byte* output, int stride, int txType)
     {
-        V128* buf = stackalloc V128[16];
+        Unsafe.SkipInit(out StackArr16<V128> bufSA); V128* buf = (V128*)Unsafe.AsPointer(ref bufSA[0]);
         const int txSize = TX_16X4;
         int shift0 = Shift0[txSize];
         int txwIdx = GetTxwIdx(txSize), txhIdx = GetTxhIdx(txSize);
@@ -1462,7 +1462,7 @@ internal static unsafe partial class AomInvTxfmLbd
         }
         if (lrFlip != 0)
         {
-            V128* temp = stackalloc V128[16];
+            Unsafe.SkipInit(out StackArr16<V128> tempSA); V128* temp = (V128*)Unsafe.AsPointer(ref tempSA[0]);
             FlipBufSse2(buf, temp, 16);
             Transpose16bit4x8(temp, buf);
             Transpose16bit4x8(temp + 8, buf + 8);

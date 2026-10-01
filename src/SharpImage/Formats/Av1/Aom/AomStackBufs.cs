@@ -8,6 +8,7 @@ namespace SharpImage.Formats.Av1;
 [InlineArray(3)] internal struct StackArr3<T> { private T e; }
 [InlineArray(4)] internal struct StackArr4<T> { private T e; }
 [InlineArray(7)] internal struct StackArr7<T> { private T e; }
+[InlineArray(8)] internal struct StackArr8<T> { private T e; }
 [InlineArray(10)] internal struct StackArr10<T> { private T e; }
 [InlineArray(13)] internal struct StackArr13<T> { private T e; }
 [InlineArray(14)] internal struct StackArr14<T> { private T e; }
@@ -19,5 +20,7 @@ namespace SharpImage.Formats.Av1;
 [InlineArray(129)] internal struct StackArr129<T> { private T e; }
 [InlineArray(160)] internal struct StackArr160<T> { private T e; }
 [InlineArray(163)] internal struct StackArr163<T> { private T e; }
+[InlineArray(512)] internal struct StackArr512<T> { private T e; }
 [InlineArray(1024)] internal struct StackArr1024<T> { private T e; }
+[InlineArray(4096)] internal struct StackArr4096<T> { private T e; }
 [InlineArray(1089)] internal struct StackArr1089<T> { private T e; }

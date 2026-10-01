@@ -25,8 +25,8 @@ internal static class AomHadamard
     /// <summary>aom_hadamard_4x4.</summary>
     internal static void H4x4(ReadOnlySpan<short> srcDiff, int srcStride, Span<int> coeff)
     {
-        Span<short> buffer = stackalloc short[16];
-        Span<short> buffer2 = stackalloc short[16];
+        var bufferSA = new StackArr16<short>(); Span<short> buffer = bufferSA;
+        var buffer2SA = new StackArr16<short>(); Span<short> buffer2 = buffer2SA;
         for (int idx = 0; idx < 4; ++idx) Col4(srcDiff.Slice(idx), srcStride, buffer.Slice(4 * idx));
         for (int idx = 0; idx < 4; ++idx) Col4(buffer.Slice(idx), 4, buffer2.Slice(4 * idx));
         // extra transpose to match SSE2
@@ -135,8 +135,8 @@ internal static class AomHadamard
 
     private static void H8x8Scalar(ReadOnlySpan<short> srcDiff, int srcStride, Span<int> coeff)
     {
-        Span<short> buffer = stackalloc short[64];
-        Span<short> buffer2 = stackalloc short[64];
+        var bufferSA = new StackArr64<short>(); Span<short> buffer = bufferSA;
+        var buffer2SA = new StackArr64<short>(); Span<short> buffer2 = buffer2SA;
         for (int idx = 0; idx < 8; ++idx) Col8(srcDiff.Slice(idx), srcStride, buffer.Slice(8 * idx));
         for (int idx = 0; idx < 8; ++idx) Col8(buffer.Slice(idx), 8, buffer2.Slice(8 * idx));
         // extra transpose to match SSE2

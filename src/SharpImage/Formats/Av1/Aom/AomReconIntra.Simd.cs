@@ -67,7 +67,7 @@ internal static unsafe partial class AomReconIntra
     {
         int maxBaseY = bw + bh - 1;
         byte fill = left[maxBaseY];
-        byte* t = stackalloc byte[64 * 64];   // column c at t + c * 64
+        Unsafe.SkipInit(out StackArr4096<byte> tSA); byte* t = (byte*)Unsafe.AsPointer(ref tSA[0]);   // column c at t + c * 64
         int y = dy;
         for (int c = 0; c < bw; ++c, y += dy)
         {
