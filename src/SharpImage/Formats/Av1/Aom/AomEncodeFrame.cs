@@ -506,7 +506,7 @@ internal static partial class AomEncodeFrame
         txfmParams.TxSizeSearchMethod = cpi.WinnerModeParams.tx_size_search_methods[DEFAULT_EVAL];
         if (cpi.Sf.winner_mode_sf.enable_winner_mode_for_tx_size_srch != 0)
             txfmParams.TxSizeSearchMethod = cpi.WinnerModeParams.tx_size_search_methods[WINNER_MODE_EVAL];
-        txfmParams.TxModeSearchType = AomRdoptUtils.SelectTxMode(false, txfmParams.TxSizeSearchMethod);
+        txfmParams.TxModeSearchType = AomRdoptUtils.SelectTxMode(cm.BaseQindex == 0, txfmParams.TxSizeSearchMethod);
 
         int miRow = xd.MiRow, miCol = xd.MiCol;
         bool isInter = AomEncodeMb.IsInterBlock(mbmi);
