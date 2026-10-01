@@ -167,6 +167,7 @@ internal static partial class AomQm
     }
 
     /// <summary>get_coeff_dist with a matrix (txb_rdopt_utils.h).</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal static long CoeffDistQm(int tcoeff, int dqcoeff, int shift, byte[] qm, int ci)
     {
         long diff = (long)(tcoeff - dqcoeff) * (1 << shift);
