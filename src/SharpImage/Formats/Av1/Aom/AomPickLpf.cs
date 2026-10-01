@@ -237,7 +237,7 @@ internal static class AomPickLpf
                     Span<int> last = lastLevels;
                     var lfc = lfChroma;
                     var p1 = cur.Planes[1];
-                    var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border);
+                    var backupUv = new AomYv12Plane(p1.Width, p1.Height, p1.CropWidth, p1.CropHeight, p1.Border, p1.Buf16 != null) { BitDepth = p1.BitDepth };
                     var filterC = new AomLoopFilter();
                     lfc.FilterLevelU = SearchFilterLevel(sd, cur, backupUv, mi, lfc, filterC, cfg, partial, last, 1, 0, out chromaSse[1]);
                     lfc.FilterLevelV = SearchFilterLevel(sd, cur, backupUv, mi, lfc, filterC, cfg, partial, last, 2, 0, out chromaSse[2]);
