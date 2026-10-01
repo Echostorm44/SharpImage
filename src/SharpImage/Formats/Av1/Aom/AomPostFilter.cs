@@ -25,6 +25,10 @@ internal sealed class AomCdefInfo
 /// final application: the parameters are chosen either way).</summary>
 internal static class AomPostFilter
 {
+    /// <summary>Stopwatch ticks of the last Run's deblocking (level search + filtering), CDEF (deblocked boundary lines,
+    /// search + filter) and restoration (frame-edge boundary lines + search).</summary>
+    internal static long LastLpfTicks, LastCdefTicks, LastRstTicks;
+
     /// <param name="src">the source frame (cpi->source)</param>
     /// <param name="cur">the reconstruction (cm->cur_frame->buf); filtered in place</param>
     /// <param name="mi">the frame's mode info</param>
@@ -36,10 +40,15 @@ internal static class AomPostFilter
         AomRstPickConfig? rstCfg, bool applyRestoration, AomLoopFilterParams? lf = null,
         Func<AomYv12, AomCdefInfo>? cdefSearch = null, Action<AomYv12, AomCdefInfo>? cdefApply = null)
     {
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         lf ??= new AomLoopFilterParams();
         var filter = new AomLoopFilter();
         AomPickLpf.PickFilterLevel(src, cur, mi, lf, lpfCfg, filter);
-        if (lf.FilterLevel[0] != 0 || lf.FilterLevel[1] != 0) filter.FilterFrame(cur, mi, lf, 0, cur.NumPlanes);
+        if (lf.FilterLevel[0] != 0 || lf.FilterLevel[1] != 0)
+            filter.FilterFrame(cur, mi, lf, 0, cur.NumPlanes, false, lpfCfg.FrameLpfOptLevel);
+        long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+        LastLpfTicks = t1 - t0;
+        LastRstTicks = LastCdefTicks = 0;
 
         // cdef_restoration_frame: the deblocked stripe boundaries, the CDEF search and the CDEF filter (avifenc's
         // skip_postproc_filtering skips it when nothing after CDEF reads the frame)
@@ -56,9 +65,12 @@ internal static class AomPostFilter
             cdef = cdefSearch(cur);
             if (rstCfg != null || applyRestoration) cdefApply!(cur, cdef);
         }
+        long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        LastCdefTicks = t2 - t1;
         if (rstCfg == null) return new AomPostFilterResult { LoopFilter = lf, Cdef = cdef };
         AomRestoration.SaveBoundaryLines(cur, rst!, afterCdef: true);
         AomPickRst.PickFilterRestoration(src, cur, rst, rstCfg);
+        LastRstTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t2;
         if (applyRestoration && Array.Exists(rst, r => r.FrameRestorationType != AomRestoration.RestoreNone))
             AomRestoration.FilterFrame(cur, rst);
         return new AomPostFilterResult { LoopFilter = lf, Restoration = rst, Cdef = cdef };

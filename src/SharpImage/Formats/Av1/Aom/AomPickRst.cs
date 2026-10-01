@@ -213,51 +213,159 @@ internal sealed class AomPickRst
 
     // ---- self-guided search ---------------------------------------------------------------------------------------------
 
-    /// <summary>av1_lowbd_pixel_proj_error_c.</summary>
+    /// <summary>av1_lowbd_pixel_proj_error (the RTCD choice): av1_lowbd_pixel_proj_error_avx2 when available.</summary>
     public static long LowbdPixelProjError(byte[] src8, int s0, int width, int height, int srcStride, byte[] dat8, int d0,
+        int datStride, int[] flt0, int f0, int flt0Stride, int[] flt1, int f1, int flt1Stride, int xq0, int xq1, int ep)
+    {
+        bool inBounds = d0 >= 0 && s0 >= 0 && f0 >= 0 && f1 >= 0 && height > 0
+            && d0 + (long)(height - 1) * datStride + width <= dat8.Length && s0 + (long)(height - 1) * srcStride + width <= src8.Length
+            && (SgrR0[ep] == 0 || f0 + (long)(height - 1) * flt0Stride + width <= flt0.Length)
+            && (SgrR1[ep] == 0 || f1 + (long)(height - 1) * flt1Stride + width <= flt1.Length);
+        if (Avx2.IsSupported && inBounds)
+            return LowbdPixelProjErrorAvx2(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride,
+                flt1, f1, flt1Stride, xq0, xq1, ep);
+        return LowbdPixelProjErrorC(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride, flt1,
+            f1, flt1Stride, xq0, xq1, ep);
+    }
+
+    /// <summary>av1_lowbd_pixel_proj_error_avx2 (pickrst_avx2.c), line by line: 16 pixels a step in 16-bit lanes (the
+    /// filtered values packed with saturation), squared errors madd-summed in int32 per row (all rows for the
+    /// unfiltered case) and accumulated in int64.</summary>
+    private static unsafe long LowbdPixelProjErrorAvx2(byte[] src8, int s0, int width, int height, int srcStride,
+        byte[] dat8, int d0, int datStride, int[] flt0Arr, int f0, int flt0Stride, int[] flt1Arr, int f1, int flt1Stride,
+        int xq0, int xq1, int ep)
+    {
+        const int shift = SgrprojRstBits + SgrprojPrjBits;
+        var rounding = Vector256.Create(1 << (shift - 1));
+        var sum64 = Vector256<long>.Zero;
+        long err = 0;
+        int i, j, k;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector256<short> PairSet(int a, int b) => Vector256.Create((int)((uint)(ushort)a | ((uint)(ushort)b << 16))).AsInt16();
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector256<short> Flt16(int* f) => Avx2.Permute4x64(Avx2.PackSignedSaturate(Avx.LoadVector256(f), Avx.LoadVector256(f + 8)).AsInt64(), 0xd8).AsInt16();
+        fixed (byte* srcBase = src8)
+        fixed (byte* datBase = dat8)
+        fixed (int* flt0Base = flt0Arr)
+        fixed (int* flt1Base = flt1Arr)
+        {
+            byte* src = srcBase + s0;
+            byte* dat = datBase + d0;
+            int* flt0 = flt0Base + f0;
+            int* flt1 = flt1Base + f1;
+            bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
+            if (r0 && r1)
+            {
+                var xqCoeff = PairSet(xq0, xq1);
+                for (i = 0; i < height; ++i)
+                {
+                    var sum32 = Vector256<int>.Zero;
+                    for (j = 0; j <= width - 16; j += 16)
+                    {
+                        var dd0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(dat + j));
+                        var ss0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(src + j));
+                        var flt016b = Flt16(flt0 + j);
+                        var flt116b = Flt16(flt1 + j);
+                        var u0 = Avx2.ShiftLeftLogical(dd0, SgrprojRstBits);
+                        var flt00SubU = Avx2.Subtract(flt016b, u0);
+                        var flt10SubU = Avx2.Subtract(flt116b, u0);
+                        var v0 = Avx2.MultiplyAddAdjacent(xqCoeff, Avx2.UnpackLow(flt00SubU, flt10SubU));
+                        var v1 = Avx2.MultiplyAddAdjacent(xqCoeff, Avx2.UnpackHigh(flt00SubU, flt10SubU));
+                        var vr0 = Avx2.ShiftRightArithmetic(Avx2.Add(v0, rounding), shift);
+                        var vr1 = Avx2.ShiftRightArithmetic(Avx2.Add(v1, rounding), shift);
+                        var e0 = Avx2.Subtract(Avx2.Add(Avx2.PackSignedSaturate(vr0, vr1), dd0), ss0);
+                        var err0 = Avx2.MultiplyAddAdjacent(e0, e0);
+                        sum32 = Avx2.Add(sum32, err0);
+                    }
+                    for (k = j; k < width; ++k)
+                    {
+                        int u = dat[k] << SgrprojRstBits;
+                        int v = xq0 * (flt0[k] - u) + xq1 * (flt1[k] - u);
+                        int e = ((v + (1 << (shift - 1))) >> shift) + dat[k] - src[k];
+                        err += (long)e * e;
+                    }
+                    dat += datStride;
+                    src += srcStride;
+                    flt0 += flt0Stride;
+                    flt1 += flt1Stride;
+                    sum64 = Avx2.Add(sum64, Avx2.ConvertToVector256Int64(sum32.GetLower()));
+                    sum64 = Avx2.Add(sum64, Avx2.ConvertToVector256Int64(sum32.GetUpper()));
+                }
+            }
+            else if (r0 || r1)
+            {
+                int xqActive = r0 ? xq0 : xq1;
+                var xqCoeff = PairSet(xqActive, -xqActive * (1 << SgrprojRstBits));
+                int* flt = r0 ? flt0 : flt1;
+                int fltStride = r0 ? flt0Stride : flt1Stride;
+                for (i = 0; i < height; ++i)
+                {
+                    var sum32 = Vector256<int>.Zero;
+                    for (j = 0; j <= width - 16; j += 16)
+                    {
+                        var dd0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(dat + j));
+                        var ss0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(src + j));
+                        var flt16b = Flt16(flt + j);
+                        var v0 = Avx2.MultiplyAddAdjacent(xqCoeff, Avx2.UnpackLow(flt16b, dd0));
+                        var v1 = Avx2.MultiplyAddAdjacent(xqCoeff, Avx2.UnpackHigh(flt16b, dd0));
+                        var vr0 = Avx2.ShiftRightArithmetic(Avx2.Add(v0, rounding), shift);
+                        var vr1 = Avx2.ShiftRightArithmetic(Avx2.Add(v1, rounding), shift);
+                        var e0 = Avx2.Subtract(Avx2.Add(Avx2.PackSignedSaturate(vr0, vr1), dd0), ss0);
+                        var err0 = Avx2.MultiplyAddAdjacent(e0, e0);
+                        sum32 = Avx2.Add(sum32, err0);
+                    }
+                    for (k = j; k < width; ++k)
+                    {
+                        int u = dat[k] << SgrprojRstBits;
+                        int v = xqActive * (flt[k] - u);
+                        int e = ((v + (1 << (shift - 1))) >> shift) + dat[k] - src[k];
+                        err += (long)e * e;
+                    }
+                    dat += datStride;
+                    src += srcStride;
+                    flt += fltStride;
+                    sum64 = Avx2.Add(sum64, Avx2.ConvertToVector256Int64(sum32.GetLower()));
+                    sum64 = Avx2.Add(sum64, Avx2.ConvertToVector256Int64(sum32.GetUpper()));
+                }
+            }
+            else
+            {
+                var sum32 = Vector256<int>.Zero;
+                for (i = 0; i < height; ++i)
+                {
+                    for (j = 0; j <= width - 16; j += 16)
+                    {
+                        var dd0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(dat + j));
+                        var ss0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(src + j));
+                        var diff0 = Avx2.Subtract(dd0, ss0);
+                        sum32 = Avx2.Add(sum32, Avx2.MultiplyAddAdjacent(diff0, diff0));
+                    }
+                    for (k = j; k < width; ++k)
+                    {
+                        int e = dat[k] - src[k];
+                        err += (long)e * e;
+                    }
+                    dat += datStride;
+                    src += srcStride;
+                }
+                sum64 = Avx2.Add(Avx2.ConvertToVector256Int64(sum32.GetLower()), Avx2.ConvertToVector256Int64(sum32.GetUpper()));
+            }
+        }
+        err += sum64.GetElement(0) + sum64.GetElement(1) + sum64.GetElement(2) + sum64.GetElement(3);
+        return err;
+    }
+
+    /// <summary>av1_lowbd_pixel_proj_error_c.</summary>
+    public static long LowbdPixelProjErrorC(byte[] src8, int s0, int width, int height, int srcStride, byte[] dat8, int d0,
         int datStride, int[] flt0, int f0, int flt0Stride, int[] flt1, int f1, int flt1Stride, int xq0, int xq1, int ep)
     {
         long err = 0;
         const int sh = SgrprojRstBits + SgrprojPrjBits;
         bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
-        bool simd = Avx2.IsSupported && width >= 8 && d0 >= 0 && s0 >= 0 && f0 >= 0 && f1 >= 0
-            && d0 + (long)(height - 1) * datStride + width <= dat8.Length && s0 + (long)(height - 1) * srcStride + width <= src8.Length
-            && f0 + (long)(height - 1) * flt0Stride + width <= flt0.Length && f1 + (long)(height - 1) * flt1Stride + width <= flt1.Length;
-        var rnd = Vector256.Create(1 << (sh - 1));
-        var vxq0 = Vector256.Create(r0 ? xq0 : 0);
-        var vxq1 = Vector256.Create(r1 ? xq1 : 0);
-        ref byte dat0 = ref MemoryMarshal.GetArrayDataReference(dat8);
-        ref byte src0 = ref MemoryMarshal.GetArrayDataReference(src8);
-        ref int fl0 = ref MemoryMarshal.GetArrayDataReference(flt0);
-        ref int fl1 = ref MemoryMarshal.GetArrayDataReference(flt1);
         for (int i = 0; i < height; ++i)
         {
             int dr = d0 + i * datStride, sr = s0 + i * srcStride, a = f0 + i * flt0Stride, b = f1 + i * flt1Stride;
-            int j0 = 0;
-            if (simd)
-            {
-                // 8 pixels a lane: the same int32 v and e; e^2 summed in int64 lanes (exact)
-                var acc = Vector256<long>.Zero;
-                for (; j0 + 8 <= width; j0 += 8)
-                {
-                    var d = Avx2.ConvertToVector256Int32(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref dat0, dr + j0))).AsByte());
-                    var sv = Avx2.ConvertToVector256Int32(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src0, sr + j0))).AsByte());
-                    Vector256<int> e;
-                    if (r0 || r1)
-                    {
-                        var u = Vector256.ShiftLeft(d, SgrprojRstBits);
-                        var v = Vector256.ShiftLeft(u, SgrprojPrjBits);
-                        if (r0) v += vxq0 * (Vector256.LoadUnsafe(ref fl0, (nuint)(a + j0)) - u);
-                        if (r1) v += vxq1 * (Vector256.LoadUnsafe(ref fl1, (nuint)(b + j0)) - u);
-                        e = Vector256.ShiftRightArithmetic(v + rnd, sh) - sv;
-                    }
-                    else e = d - sv;
-                    var e2 = e * e;
-                    acc += Avx2.ConvertToVector256Int64(e2.GetLower()) + Avx2.ConvertToVector256Int64(e2.GetUpper());
-                }
-                err += Vector256.Sum(acc);
-            }
-            for (int j = j0; j < width; ++j)
+            for (int j = 0; j < width; ++j)
             {
                 int e;
                 if (r0 || r1)
@@ -279,8 +387,131 @@ internal sealed class AomPickRst
         return err;
     }
 
-    /// <summary>av1_calc_proj_params_c: H (2x2, row-major) and C.</summary>
+    /// <summary>get_proj_subspace's av1_calc_proj_params call (width a multiple of 8, the RTCD choice): the line-by-line
+    /// port of av1_calc_proj_params_avx2 (calc_proj_params_r0_r1 / _r0 / _r1_avx2: 64-bit mul_epi32 products of the
+    /// even and odd lanes summed in int64 lanes). Exact integer sums, equal to the C version's.</summary>
+    private static unsafe void CalcProjParamsAvx2(byte[] src8Arr, int s0, int width, int height, int srcStride,
+        byte[] dat8Arr, int d0, int datStride, int[] flt0Arr, int f0, int flt0Stride, int[] flt1Arr, int f1, int flt1Stride,
+        Span<long> H, Span<long> C, int ep)
+    {
+        int size = width * height;
+        bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
+        fixed (byte* src = src8Arr)
+        fixed (byte* dat = dat8Arr)
+        fixed (int* fl0 = flt0Arr)
+        fixed (int* fl1 = flt1Arr)
+        {
+            if (r0 && r1)
+            {
+                ProjParamsR0R1(src + s0, srcStride, dat + d0, datStride, fl0 + f0, flt0Stride, fl1 + f1, flt1Stride, width,
+                    height, out long h00, out long h01, out long h11, out long c0, out long c1);
+                H[0] = h00 / size; H[1] = h01 / size; H[3] = h11 / size; H[2] = H[1];
+                C[0] = c0 / size; C[1] = c1 / size;
+            }
+            else if (r0)
+            {
+                ProjParamsOne(src + s0, srcStride, dat + d0, datStride, fl0 + f0, flt0Stride, width, height, out long h00,
+                    out long c0);
+                H[0] = h00 / size; H[1] = 0;
+                C[0] = c0 / size; C[1] = 0;
+            }
+            else
+            {
+                ProjParamsOne(src + s0, srcStride, dat + d0, datStride, fl1 + f1, flt1Stride, width, height, out long h11,
+                    out long c1);
+                H[2] = 0; H[3] = h11 / size;
+                C[0] = 0; C[1] = c1 / size;
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<long> MulAcc(Vector256<long> acc, Vector256<int> a, Vector256<int> b)
+    {
+        var even = Avx2.Multiply(a, b);
+        var odd = Avx2.Multiply(Avx2.ShiftRightLogical(a.AsInt64(), 32).AsInt32(), Avx2.ShiftRightLogical(b.AsInt64(), 32).AsInt32());
+        return Avx2.Add(Avx2.Add(acc, even), odd);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long Sum4(Vector256<long> v) => v.GetElement(0) + v.GetElement(1) + v.GetElement(2) + v.GetElement(3);
+
+    // calc_proj_params_r0_r1_avx2
+    private static unsafe void ProjParamsR0R1(byte* src, int srcStride, byte* dat, int datStride, int* flt0, int flt0Stride,
+        int* flt1, int flt1Stride, int width, int height, out long h00s, out long h01s, out long h11s, out long c0s, out long c1s)
+    {
+        Vector256<long> h00 = default, h01 = default, h11 = default, c0 = default, c1 = default;
+        for (int i = 0; i < height; ++i)
+        {
+            for (int j = 0; j < width; j += 8)
+            {
+                var uLoad = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(dat + j)).AsByte());
+                var sLoad = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(src + j)).AsByte());
+                var d = Avx2.ShiftLeftLogical(uLoad, SgrprojRstBits);
+                var s = Avx2.Subtract(Avx2.ShiftLeftLogical(sLoad, SgrprojRstBits), d);
+                var fa = Avx2.Subtract(Avx.LoadVector256(flt0 + j), d);
+                var fb = Avx2.Subtract(Avx.LoadVector256(flt1 + j), d);
+                h00 = MulAcc(h00, fa, fa);
+                h01 = MulAcc(h01, fa, fb);
+                h11 = MulAcc(h11, fb, fb);
+                c0 = MulAcc(c0, fa, s);
+                c1 = MulAcc(c1, fb, s);
+            }
+            dat += datStride;
+            src += srcStride;
+            flt0 += flt0Stride;
+            flt1 += flt1Stride;
+        }
+        h00s = Sum4(h00); h01s = Sum4(h01); h11s = Sum4(h11); c0s = Sum4(c0); c1s = Sum4(c1);
+    }
+
+    // calc_proj_params_r0_avx2 / calc_proj_params_r1_avx2
+    private static unsafe void ProjParamsOne(byte* src, int srcStride, byte* dat, int datStride, int* flt, int fltStride,
+        int width, int height, out long hs, out long cs)
+    {
+        Vector256<long> h = default, c = default;
+        for (int i = 0; i < height; ++i)
+        {
+            for (int j = 0; j < width; j += 8)
+            {
+                var uLoad = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(dat + j)).AsByte());
+                var sLoad = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(src + j)).AsByte());
+                var d = Avx2.ShiftLeftLogical(uLoad, SgrprojRstBits);
+                var s = Avx2.Subtract(Avx2.ShiftLeftLogical(sLoad, SgrprojRstBits), d);
+                var f = Avx2.Subtract(Avx.LoadVector256(flt + j), d);
+                h = MulAcc(h, f, f);
+                c = MulAcc(c, f, s);
+            }
+            dat += datStride;
+            src += srcStride;
+            flt += fltStride;
+        }
+        hs = Sum4(h);
+        cs = Sum4(c);
+    }
+
+    /// <summary>get_proj_subspace's projection statistics: av1_calc_proj_params (AVX2) when the width is a multiple of
+    /// 8, else av1_calc_proj_params_c. H is 2x2 row-major.</summary>
     public static void CalcProjParams(byte[] src8, int s0, int width, int height, int srcStride, byte[] dat8, int d0,
+        int datStride, int[] flt0, int f0, int flt0Stride, int[] flt1, int f1, int flt1Stride, Span<long> H,
+        Span<long> C, int ep)
+    {
+        bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
+        if (Avx2.IsSupported && (width & 7) == 0 && width > 0 && height > 0 && (r0 || r1) && d0 >= 0 && s0 >= 0 && f0 >= 0 && f1 >= 0
+            && d0 + (long)(height - 1) * datStride + width <= dat8.Length && s0 + (long)(height - 1) * srcStride + width <= src8.Length
+            && (!r0 || f0 + (long)(height - 1) * flt0Stride + width <= flt0.Length)
+            && (!r1 || f1 + (long)(height - 1) * flt1Stride + width <= flt1.Length))
+        {
+            CalcProjParamsAvx2(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride, flt1, f1,
+                flt1Stride, H, C, ep);
+            return;
+        }
+        CalcProjParamsC(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride, flt1, f1,
+            flt1Stride, H, C, ep);
+    }
+
+    /// <summary>av1_calc_proj_params_c: H (2x2, row-major) and C.</summary>
+    public static void CalcProjParamsC(byte[] src8, int s0, int width, int height, int srcStride, byte[] dat8, int d0,
         int datStride, int[] flt0, int f0, int flt0Stride, int[] flt1, int f1, int flt1Stride, Span<long> H,
         Span<long> C, int ep)
     {
@@ -665,93 +896,265 @@ internal sealed class AomPickRst
             for (int l = k + 1; l < wienerWin2; ++l) H[l * wienerWin2 + k] = H[k * wienerWin2 + l];
     }
 
-    /// <summary>ComputeStats' upper triangle of H and M as av1_compute_stats_avx2 arranges it: the (dgd - avg) samples
-    /// as int16, 16 columns per vector, every (k, l) product pair summed with madd, the downsample weight (zero past the
-    /// unit's width) folded into one operand. Integer sums, so the totals equal the scalar order's exactly: int32
-    /// accumulators (at most 32 sampled rows x 64 chunks x 2 x 255 x 1020 &lt; 2^31) are flushed into the int64 totals.</summary>
+    /// <summary>av1_compute_stats_avx2 (8-bit; compute_stats_win7_avx2 / compute_stats_win5_avx2): the (dgd - avg) and
+    /// (src - avg) blocks as int16 (sub_avg_block_avx2), then for every window sample i the upper-triangle row H[i][l]
+    /// (and with i = 0 all of M) as whole-unit int32 madd sums, one window column (7 or 5 accumulators) per pass, the
+    /// downsample factor folded into the current operand and the last chunk masked to the unit's width. Each sum is
+    /// reduced to int64 the way libaom reduces it: hadd_four_32_to_64 (two int32 4-lane sums, each wrapping, added in
+    /// int64) or the exact int64 sum of all 8 lanes (convert_32_to_64_add / add_64bit_lvl).</summary>
     [SkipLocalsInit]
-    private static void ComputeStatsAvx2(int wienerWin, AomYv12Plane dgd, AomYv12Plane src, int hStart, int hEnd,
+    private static unsafe void ComputeStatsAvx2(int wienerWin, AomYv12Plane dgd, AomYv12Plane src, int hStart, int hEnd,
         int vStart, int vEnd, long[] M, long[] H, int useDownsampledWienerStats, byte avg)
     {
-        int wienerWin2 = wienerWin * wienerWin, half = wienerWin >> 1;
+        int win = wienerWin, win2 = win * win, half = win >> 1;
         int width = hEnd - hStart, height = vEnd - vStart;
-        int chunks = (width + 15) >> 4;
-        // D: rows vStart - half .. vEnd + half, columns hStart - half .. + chunks * 16 + 2 * half (zeros past the unit's
-        // right neighbours)
-        int dw = chunks * 16 + 2 * half + 16, dh = height + 2 * half;
-        var dbuf = new short[dw * dh];
+        int dStride = (width + 2 * half + 15) & ~15, sStride = (width + 15) & ~15;
+        // window rows past the last one are read (and multiplied by nothing) when a block starts below row 0
+        int dRows = height + 2 * half + win;
+        int dSize = dStride * dRows + 32, sSize = sStride * height + 32;
+        if (_statsD == null || _statsD.Length < dSize) _statsD = new short[dSize];
+        if (_statsS == null || _statsS.Length < sSize) _statsS = new short[sSize];
+        short[] dArr = _statsD, sArr = _statsS;
         byte[] db = dgd.Buf, sb = src.Buf;
-        for (int r = 0; r < dh; r++)
+        // sub_avg_block_avx2
+        var avgV = Vector256.Create((short)avg);
+        for (int r = 0; r < dRows; r++)
         {
             int o = dgd.At(hStart - half, vStart - half + r);
             int n = width + 2 * half;
-            for (int c = 0; c < n; c++) dbuf[r * dw + c] = (short)(db[o + c] - avg);
-        }
-        int pairs = wienerWin2 * (wienerWin2 + 1) / 2;
-        Span<Vector256<int>> acc = stackalloc Vector256<int>[pairs];
-        Span<Vector256<int>> accM = stackalloc Vector256<int>[wienerWin2];
-        Span<Vector256<short>> win = stackalloc Vector256<short>[wienerWin2];
-        acc.Clear();
-        accM.Clear();
-        ref short d0 = ref MemoryMarshal.GetArrayDataReference(dbuf);
-        var avgV = Vector256.Create((short)avg);
-        Span<short> maskBuf = stackalloc short[32];
-        int pending = 0;
-        void Flush(Span<Vector256<int>> acc, Span<Vector256<int>> accM)
-        {
-            static long Sum(Vector256<int> v) => Vector256.Sum(Avx2.ConvertToVector256Int64(v.GetLower()) + Avx2.ConvertToVector256Int64(v.GetUpper()));
-            int p = 0;
-            for (int k = 0; k < wienerWin2; k++)
+            int row = r * dStride;
+            if (r < height + 2 * half)
             {
-                M[k] += Sum(accM[k]);
-                for (int l = k; l < wienerWin2; l++) H[k * wienerWin2 + l] += Sum(acc[p++]);
+                int c = 0;
+                for (; c + 16 <= n; c += 16)
+                    (Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref db[o + c])) - avgV).StoreUnsafe(ref dArr[row + c]);
+                for (; c < n; c++) dArr[row + c] = (short)(db[o + c] - avg);
+                Array.Clear(dArr, row + n, dStride - n);
             }
-            acc.Clear();
-            accM.Clear();
-            pending = 0;
+            else Array.Clear(dArr, row, dStride);
         }
-        int downsampleFactor = useDownsampledWienerStats != 0 ? 4 : 1;
-        for (int i = vStart; i < vEnd; i += downsampleFactor)
+        for (int r = 0; r < height; r++)
         {
-            if (useDownsampledWienerStats != 0 && vEnd - i < 4) downsampleFactor = vEnd - i;
-            if (pending == 32) Flush(acc, accM);
-            pending++;
-            int rr = i - vStart;   // D row of the window's top-left is rr (+ dy + half)
-            int so = src.At(hStart, i);
-            for (int c = 0; c < chunks; c++)
+            int o = src.At(hStart, vStart + r), row = r * sStride, c = 0;
+            for (; c + 16 <= width; c += 16)
+                (Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref sb[o + c])) - avgV).StoreUnsafe(ref sArr[row + c]);
+            for (; c < width; c++) sArr[row + c] = (short)(sb[o + c] - avg);
+            Array.Clear(sArr, row + width, sStride - width);
+        }
+        int wdMul16 = width & ~15, beyond = width - wdMul16;
+        var mask = Avx2.CompareGreaterThan(Vector256.Create((short)beyond),
+            Vector256.Create((short)0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+        bool ds = useDownsampledWienerStats != 0;
+        Span<Vector256<int>> accH = stackalloc Vector256<int>[7];
+        Span<Vector256<int>> accM = stackalloc Vector256<int>[7];
+        fixed (short* d = dArr)
+        fixed (short* s = sArr)
+        {
+            // Step 1: all of M and row 0 of H
+            for (int j = 0; j < win; j++)
             {
-                int c0 = c * 16;
-                int valid = Math.Min(16, width - c0);
-                Vector256<short> wv;
-                if (valid == 16) wv = Vector256.Create((short)downsampleFactor);
-                else
+                StatsPass(win, d, d + j, s, dStride, sStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH, accM);
+                for (int g = 0; g < win; g++)
                 {
-                    for (int q = 0; q < 16; q++) maskBuf[q] = (short)(q < valid ? downsampleFactor : 0);
-                    wv = Vector256.Create<short>(maskBuf);
+                    bool exact = win == 5 && g == 4;
+                    M[win * j + g] = exact ? SumExact(accM[g]) : SumHadd4(accM[g]);
+                    H[win * j + g] = exact ? SumExact(accH[g]) : SumHadd4(accH[g]);
                 }
-                // window vectors: index (dx + half) * win + (dy + half), the scalar code's order
-                for (int dx = 0; dx < wienerWin; dx++)
-                    for (int dy = 0; dy < wienerWin; dy++)
-                        win[dx * wienerWin + dy] = Vector256.LoadUnsafe(ref d0, (nuint)((rr + dy) * dw + c0 + dx));
-                Vector256<short> x;
-                if (valid == 16) x = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref sb[so + c0])) - avgV;
-                else
+            }
+            // The remaining rows of H: the current sample (column i / win, row i % win of the window) against every
+            // window column j from its own on (the upper triangle).
+            for (int i = 1; i < win2; i++)
+            {
+                int ci = i / win, ri = i % win;
+                short* cur = d + ci + ri * dStride;
+                for (int j = ci; j < win; j++)
                 {
-                    for (int q = 0; q < 16; q++) maskBuf[16 + q] = (short)(q < valid ? sb[so + c0 + q] - avg : 0);
-                    x = Vector256.Create<short>(maskBuf.Slice(16));
-                }
-                var xw = Avx2.MultiplyLow(x, wv);
-                int p = 0;
-                for (int k = 0; k < wienerWin2; k++)
-                {
-                    var wk = win[k];
-                    accM[k] += Avx2.MultiplyAddAdjacent(xw, wk);
-                    var a = Avx2.MultiplyLow(wk, wv);
-                    for (int l = k; l < wienerWin2; l++) acc[p++] += Avx2.MultiplyAddAdjacent(a, win[l]);
+                    StatsPass(win, cur, d + j, null, dStride, sStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH, accM);
+                    bool first = j == ci && ri != 0;
+                    for (int g = first ? ri : 0; g < win; g++)
+                    {
+                        bool exact = win == 7
+                            ? first && ((ri == 1 && g >= 5) || (ri == 2 && g == 6))
+                            : first ? ri >= 3 : g == 4;
+                        H[i * win2 + win * j + g] = exact ? SumExact(accH[g]) : SumHadd4(accH[g]);
+                    }
                 }
             }
         }
-        if (pending > 0) Flush(acc, accM);
+    }
+
+    [ThreadStatic] private static short[]? _statsD, _statsS;
+
+    /// <summary>hadd_four_32_to_64_avx2's value for one accumulator: the two 4-lane int32 sums (wrapping), added in int64.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long SumHadd4(Vector256<int> v)
+    {
+        unchecked
+        {
+            int lo = v.GetElement(0) + v.GetElement(1) + v.GetElement(2) + v.GetElement(3);
+            int hi = v.GetElement(4) + v.GetElement(5) + v.GetElement(6) + v.GetElement(7);
+            return (long)lo + hi;
+        }
+    }
+
+    /// <summary>convert_and_add + add_64bit_lvl: the int64 sum of the 8 lanes.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long SumExact(Vector256<int> v)
+        => Vector256.Sum(Avx2.ConvertToVector256Int64(v.GetLower()) + Avx2.ConvertToVector256Int64(v.GetUpper()));
+
+    /// <summary>One INIT_H_VALUES / INIT_MH_VALUES sweep over the unit: accH[g] += madd(cur * df, window row g) for the
+    /// win window rows at w (and, with s, accM[g] += madd(src * df, window row g)).</summary>
+    private static unsafe void StatsPass(int win, short* cur, short* w, short* s, int dStride, int sStride, int wdMul16,
+        int beyond, Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH,
+        Span<Vector256<int>> accM)
+    {
+        if (win == 7)
+        {
+            if (s == null) StatsPassH7(cur, w, dStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH);
+            else StatsPassHM(7, cur, w, s, dStride, sStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH, accM);
+        }
+        else
+        {
+            if (s == null) StatsPassH5(cur, w, dStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH);
+            else StatsPassHM(5, cur, w, s, dStride, sStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH, accM);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe Vector256<int> Madd(Vector256<int> acc, Vector256<short> a, short* p)
+        => Avx2.Add(acc, Avx2.MultiplyAddAdjacent(a, Avx.LoadVector256(p)));
+
+    private static unsafe void StatsPassH7(short* cur, short* w, int dStride, int wdMul16, int beyond,
+        Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH)
+    {
+        Vector256<int> a0 = default, a1 = default, a2 = default, a3 = default, a4 = default, a5 = default, a6 = default;
+        nint o1 = dStride, o2 = 2 * (nint)dStride, o3 = 3 * (nint)dStride, o4 = 4 * (nint)dStride, o5 = 5 * (nint)dStride, o6 = 6 * (nint)dStride;
+        int procHt = vStart, df = ds ? 4 : 1;
+        do
+        {
+            if (ds && vEnd - procHt < 4) df = vEnd - procHt;
+            var dfv = Vector256.Create((short)df);
+            int x = 0;
+            for (; x < wdMul16; x += 16)
+            {
+                var c = Avx2.MultiplyLow(Avx.LoadVector256(cur + x), dfv);
+                short* p = w + x;
+                a0 = Madd(a0, c, p);
+                a1 = Madd(a1, c, p + o1);
+                a2 = Madd(a2, c, p + o2);
+                a3 = Madd(a3, c, p + o3);
+                a4 = Madd(a4, c, p + o4);
+                a5 = Madd(a5, c, p + o5);
+                a6 = Madd(a6, c, p + o6);
+            }
+            if (beyond != 0)
+            {
+                var c = Avx2.MultiplyLow(Avx2.And(Avx.LoadVector256(cur + x), mask), dfv);
+                short* p = w + x;
+                a0 = Madd(a0, c, p);
+                a1 = Madd(a1, c, p + o1);
+                a2 = Madd(a2, c, p + o2);
+                a3 = Madd(a3, c, p + o3);
+                a4 = Madd(a4, c, p + o4);
+                a5 = Madd(a5, c, p + o5);
+                a6 = Madd(a6, c, p + o6);
+            }
+            procHt += df;
+            cur += df * dStride;
+            w += df * dStride;
+        } while (procHt < vEnd);
+        accH[0] = a0; accH[1] = a1; accH[2] = a2; accH[3] = a3; accH[4] = a4; accH[5] = a5; accH[6] = a6;
+    }
+
+    private static unsafe void StatsPassH5(short* cur, short* w, int dStride, int wdMul16, int beyond,
+        Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH)
+    {
+        Vector256<int> a0 = default, a1 = default, a2 = default, a3 = default, a4 = default;
+        nint o1 = dStride, o2 = 2 * (nint)dStride, o3 = 3 * (nint)dStride, o4 = 4 * (nint)dStride;
+        int procHt = vStart, df = ds ? 4 : 1;
+        do
+        {
+            if (ds && vEnd - procHt < 4) df = vEnd - procHt;
+            var dfv = Vector256.Create((short)df);
+            int x = 0;
+            for (; x < wdMul16; x += 16)
+            {
+                var c = Avx2.MultiplyLow(Avx.LoadVector256(cur + x), dfv);
+                short* p = w + x;
+                a0 = Madd(a0, c, p);
+                a1 = Madd(a1, c, p + o1);
+                a2 = Madd(a2, c, p + o2);
+                a3 = Madd(a3, c, p + o3);
+                a4 = Madd(a4, c, p + o4);
+            }
+            if (beyond != 0)
+            {
+                var c = Avx2.MultiplyLow(Avx2.And(Avx.LoadVector256(cur + x), mask), dfv);
+                short* p = w + x;
+                a0 = Madd(a0, c, p);
+                a1 = Madd(a1, c, p + o1);
+                a2 = Madd(a2, c, p + o2);
+                a3 = Madd(a3, c, p + o3);
+                a4 = Madd(a4, c, p + o4);
+            }
+            procHt += df;
+            cur += df * dStride;
+            w += df * dStride;
+        } while (procHt < vEnd);
+        accH[0] = a0; accH[1] = a1; accH[2] = a2; accH[3] = a3; accH[4] = a4;
+    }
+
+    private static unsafe void StatsPassHM(int win, short* cur, short* w, short* s, int dStride, int sStride,
+        int wdMul16, int beyond, Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH,
+        Span<Vector256<int>> accM)
+    {
+        Vector256<int> h0 = default, h1 = default, h2 = default, h3 = default, h4 = default, h5 = default, h6 = default;
+        Vector256<int> m0 = default, m1 = default, m2 = default, m3 = default, m4 = default, m5 = default, m6 = default;
+        nint o1 = dStride, o2 = 2 * (nint)dStride, o3 = 3 * (nint)dStride, o4 = 4 * (nint)dStride, o5 = 5 * (nint)dStride, o6 = 6 * (nint)dStride;
+        bool w7 = win == 7;
+        int procHt = vStart, df = ds ? 4 : 1;
+        int xEnd = wdMul16 + (beyond != 0 ? 16 : 0);
+        do
+        {
+            if (ds && vEnd - procHt < 4) df = vEnd - procHt;
+            var dfv = Vector256.Create((short)df);
+            for (int x = 0; x < xEnd; x += 16)
+            {
+                var cv = Avx.LoadVector256(cur + x);
+                var sv = Avx.LoadVector256(s + x);
+                if (x >= wdMul16)
+                {
+                    cv = Avx2.And(cv, mask);
+                    sv = Avx2.And(sv, mask);
+                }
+                var c = Avx2.MultiplyLow(cv, dfv);
+                var sm = Avx2.MultiplyLow(sv, dfv);
+                short* p = w + x;
+                var w0 = Avx.LoadVector256(p);
+                var w1 = Avx.LoadVector256(p + o1);
+                var w2 = Avx.LoadVector256(p + o2);
+                var w3 = Avx.LoadVector256(p + o3);
+                var w4 = Avx.LoadVector256(p + o4);
+                m0 = Avx2.Add(m0, Avx2.MultiplyAddAdjacent(sm, w0)); h0 = Avx2.Add(h0, Avx2.MultiplyAddAdjacent(c, w0));
+                m1 = Avx2.Add(m1, Avx2.MultiplyAddAdjacent(sm, w1)); h1 = Avx2.Add(h1, Avx2.MultiplyAddAdjacent(c, w1));
+                m2 = Avx2.Add(m2, Avx2.MultiplyAddAdjacent(sm, w2)); h2 = Avx2.Add(h2, Avx2.MultiplyAddAdjacent(c, w2));
+                m3 = Avx2.Add(m3, Avx2.MultiplyAddAdjacent(sm, w3)); h3 = Avx2.Add(h3, Avx2.MultiplyAddAdjacent(c, w3));
+                m4 = Avx2.Add(m4, Avx2.MultiplyAddAdjacent(sm, w4)); h4 = Avx2.Add(h4, Avx2.MultiplyAddAdjacent(c, w4));
+                if (w7)
+                {
+                    var w5 = Avx.LoadVector256(p + o5);
+                    var w6 = Avx.LoadVector256(p + o6);
+                    m5 = Avx2.Add(m5, Avx2.MultiplyAddAdjacent(sm, w5)); h5 = Avx2.Add(h5, Avx2.MultiplyAddAdjacent(c, w5));
+                    m6 = Avx2.Add(m6, Avx2.MultiplyAddAdjacent(sm, w6)); h6 = Avx2.Add(h6, Avx2.MultiplyAddAdjacent(c, w6));
+                }
+            }
+            procHt += df;
+            cur += df * dStride;
+            w += df * dStride;
+            s += df * sStride;
+        } while (procHt < vEnd);
+        accH[0] = h0; accH[1] = h1; accH[2] = h2; accH[3] = h3; accH[4] = h4; accH[5] = h5; accH[6] = h6;
+        accM[0] = m0; accM[1] = m1; accM[2] = m2; accM[3] = m3; accM[4] = m4; accM[5] = m5; accM[6] = m6;
     }
 
     private static int WrapIndex(int i, int wienerWin)

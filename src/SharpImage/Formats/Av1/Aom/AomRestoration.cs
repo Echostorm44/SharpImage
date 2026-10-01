@@ -62,10 +62,9 @@ internal sealed class AomRestorationInfo
 
 /// <summary>Port of libaom av1/common/restoration.c (8-bit), the Wiener convolution of convolve.c
 /// (av1_wiener_convolve_add_src_c) and the self-guided filter: filtering one restoration unit stripe by stripe with the
-/// saved boundary lines, applying the whole frame, and saving the boundary lines. The C kernels are ported; libaom's
-/// dispatched AVX2/SSE kernels (av1_wiener_convolve_add_src_avx2, av1_selfguided_restoration_avx2,
-/// av1_apply_selfguided_restoration_avx2) are bit-exact with them (twin-verified).</summary>
-internal static class AomRestoration
+/// saved boundary lines, applying the whole frame, and saving the boundary lines. The C kernels (the *C methods) are
+/// the reference and non-AVX2 fallback; the dispatched entry points run the AVX2 ports in AomRestoration.Simd.cs.</summary>
+internal static partial class AomRestoration
 {
     public const int RestoreNone = 0, RestoreWiener = 1, RestoreSgrproj = 2, RestoreSwitchable = 3;
     public const int RestoreSwitchableTypes = 3, RestoreTypes = 4;
@@ -267,7 +266,7 @@ internal static class AomRestoration
 
     /// <summary>av1_wiener_convolve_add_src_c (8-bit, x/y step 16): horizontal pass to a 13-bit intermediate
     /// (round0 = 3, clamped), vertical pass back to pixels (round1 = 11); the centre tap gets an implicit +128.</summary>
-    public static void WienerConvolveAddSrc(byte[] src, int s0, int srcStride, byte[] dst, int d0, int dstStride,
+    public static void WienerConvolveAddSrcC(byte[] src, int s0, int srcStride, byte[] dst, int d0, int dstStride,
         in AomTaps8 hf, in AomTaps8 vf, int w, int h, ushort[] temp)
     {
         const int round0 = 3, round1 = 11, maxSb = 128, bd = 8;
@@ -405,6 +404,8 @@ internal static class AomRestoration
         public readonly int[] Dgd32 = new int[RestorationProcUnitPels];
         public readonly int[] A = new int[RestorationProcUnitPels];
         public readonly int[] B = new int[RestorationProcUnitPels];
+        /// <summary>av1_selfguided_restoration_avx2's buffer: the A, B and the two integral images.</summary>
+        public readonly int[] Ii = new int[4 * SgrBufElts + 64];
     }
 
     private static void CalculateIntermediateResult(int[] dgd, int dgdIdx, int width, int height, int dgdStride,
@@ -511,7 +512,7 @@ internal static class AomRestoration
 
     /// <summary>av1_selfguided_restoration_c (8-bit): the two filtered versions flt0 (r0) and flt1 (r1) of the width x
     /// height block at dgd[d0] (reads 3 samples around it), scaled by 2^SGRPROJ_RST_BITS.</summary>
-    public static void SelfguidedRestoration(byte[] dgd8, int d0, int width, int height, int dgdStride, int[] flt0,
+    public static void SelfguidedRestorationC(byte[] dgd8, int d0, int width, int height, int dgdStride, int[] flt0,
         int f0, int[] flt1, int f1, int fltStride, int sgrParamsIdx, SgrScratch sc)
     {
         int dgd32Stride = width + 2 * SgrprojBorderHorz;
@@ -549,10 +550,10 @@ internal static class AomRestoration
     }
 
     /// <summary>av1_apply_selfguided_restoration_c (8-bit).</summary>
-    public static void ApplySelfguided(byte[] dat, int d0, int width, int height, int stride, int ep, int xqd0, int xqd1,
+    public static void ApplySelfguidedC(byte[] dat, int d0, int width, int height, int stride, int ep, int xqd0, int xqd1,
         byte[] dst, int dst0, int dstStride, int[] flt0, int[] flt1, SgrScratch sc)
     {
-        SelfguidedRestoration(dat, d0, width, height, stride, flt0, 0, flt1, 0, width, ep, sc);
+        SelfguidedRestorationC(dat, d0, width, height, stride, flt0, 0, flt1, 0, width, ep, sc);
         DecodeXq(xqd0, xqd1, ep, out int xq0, out int xq1);
         bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
         const int sh = SgrprojPrjBits + SgrprojRstBits;

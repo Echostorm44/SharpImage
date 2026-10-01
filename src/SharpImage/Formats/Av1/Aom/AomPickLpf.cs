@@ -53,6 +53,10 @@ internal sealed class AomLpfPickConfig
     public bool TxModeOnly4x4;                               // cm->features.tx_mode == ONLY_4X4
     /// <summary>ppi->filter_level[0..1], filter_level_u, filter_level_v (read for non-intra frames only).</summary>
     public readonly int[] LastFrameFilterLevel = new int[4];
+    /// <summary>try_filter_frame's lpf_opt_level: is_inter_tx_size_search_level_one(&amp;sf.tx_sf).</summary>
+    public int SearchLpfOptLevel;
+    /// <summary>The final deblocking's get_lpf_opt_level(&amp;sf): 0, 1 (dual/quad), 2 (LPF_PICK_FROM_Q: joint chroma).</summary>
+    public int FrameLpfOptLevel;
 }
 
 /// <summary>Port of libaom av1/encoder/picklpf.c (single-threaded semantics; the row-MT loop filter gives the same
@@ -62,7 +66,7 @@ internal static class AomPickLpf
     private const int MaxLoopFilter = AomLoopFilterParams.MaxLoopFilter;
 
     private static long TryFilterFrame(AomYv12 sd, AomYv12 cur, AomYv12Plane backup, AomLfMiGrid mi,
-        AomLoopFilterParams lf, AomLoopFilter filter, int filtLevel, bool partialFrame, int plane, int dir)
+        AomLoopFilterParams lf, AomLoopFilter filter, int filtLevel, bool partialFrame, int plane, int dir, int optLevel)
     {
         int f0 = filtLevel, f1 = filtLevel;
         if (plane == 0 && dir == 0) f1 = lf.FilterLevel[1];
@@ -73,7 +77,7 @@ internal static class AomPickLpf
             case 1: lf.FilterLevelU = f0; break;
             case 2: lf.FilterLevelV = f0; break;
         }
-        filter.FilterFrame(cur, mi, lf, plane, plane + 1, partialFrame);
+        filter.FilterFrame(cur, mi, lf, plane, plane + 1, partialFrame, optLevel);
         long filtErr = AomSse.SsePlane(sd.Planes[plane], cur.Planes[plane]);
         // Re-instate the unfiltered frame
         cur.Planes[plane].CopyAreaFrom(backup);
@@ -100,7 +104,7 @@ internal static class AomPickLpf
         int minFilterStepThresh = cfg.UseCoarseFilterLevelSearch != 0 ? 2 : 0;
 
         backup.CopyAreaFrom(cur.Planes[plane]);
-        long bestErr = TryFilterFrame(sd, cur, backup, mi, lf, filter, filtMid, partialFrame, plane, dir);
+        long bestErr = TryFilterFrame(sd, cur, backup, mi, lf, filter, filtMid, partialFrame, plane, dir, cfg.SearchLpfOptLevel);
         int filtBest = filtMid;
         ssErr[filtMid] = bestErr;
 
@@ -117,7 +121,7 @@ internal static class AomPickLpf
             if (filtDirection <= 0 && filtLow != filtMid)
             {
                 if (ssErr[filtLow] < 0)
-                    ssErr[filtLow] = TryFilterFrame(sd, cur, backup, mi, lf, filter, filtLow, partialFrame, plane, dir);
+                    ssErr[filtLow] = TryFilterFrame(sd, cur, backup, mi, lf, filter, filtLow, partialFrame, plane, dir, cfg.SearchLpfOptLevel);
                 // If value is close to the best so far then bias towards a lower loop filter value.
                 if (ssErr[filtLow] < bestErr + bias)
                 {
@@ -128,7 +132,7 @@ internal static class AomPickLpf
             if (filtDirection >= 0 && filtHigh != filtMid)
             {
                 if (ssErr[filtHigh] < 0)
-                    ssErr[filtHigh] = TryFilterFrame(sd, cur, backup, mi, lf, filter, filtHigh, partialFrame, plane, dir);
+                    ssErr[filtHigh] = TryFilterFrame(sd, cur, backup, mi, lf, filter, filtHigh, partialFrame, plane, dir, cfg.SearchLpfOptLevel);
                 // If value is significantly better than previous best, bias added against raising filter value
                 if (ssErr[filtHigh] < bestErr - bias)
                 {
