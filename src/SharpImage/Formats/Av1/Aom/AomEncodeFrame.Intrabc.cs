@@ -216,6 +216,7 @@ internal static partial class AomEncodeFrame
         bool useTrellis = AomTxSearch.IsTrellisUsed(enableOptimizeB, dryRun);
         int quantIdx = useTrellis ? AomXformQuant.Fp : AomXformQuant.B;   // USE_B_QUANT_NO_TRELLIS
         var qp = AomEncodeMb.SetupQuant(txSize, useTrellis, quantIdx, cpi.QuantBAdapt);
+        AomEncodeMb.SetupQmatrix(x, plane, txSize, txType, ref qp);
         AomEncodeMb.Xform(x, plane, block, blkRow, blkCol, planeBsize, txSize, txType);
         AomEncodeMb.Quant(x, plane, block, txSize, txType, qp);
         if (useTrellis)

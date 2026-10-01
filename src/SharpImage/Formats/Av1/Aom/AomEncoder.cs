@@ -19,6 +19,12 @@ internal sealed class AomEncodeInput
     public bool EnableIntrabc = true;
     /// <summary>Test hook: adjusts the speed features after libaom's setup (e.g. to isolate a stage).</summary>
     public Action<AomSpeedFeatures>? SfOverride;
+    /// <summary>AOME_SET_TUNING AOM_TUNE_IQ (libavif's default for still colour images; libavif never sets it for
+    /// lossless, so it is ignored at qindex 0).</summary>
+    public bool TuneIq;
+    /// <summary>Test hook (tune=iq staging): letters of the sub-features handle_tuning enables to switch back off:
+    /// q enable_qm, d deltaq_mode, c cdef, s sharpness, u chroma deltaq, m qm-psnr dist metric, a adaptive sharpness.</summary>
+    public string? IqOff;
     /// <summary>cfg.g_threads (libaom's row_mt stays at its default 1): 1 encodes single-threaded; from 2 the superblock
     /// rows run in libaom's row-MT wavefront, whose output is the same for every thread count &gt;= 2 (and differs
     /// from the single-threaded one).</summary>
@@ -32,11 +38,27 @@ internal static partial class AomEncoder
 {
     internal static (AomComp cpi, AomMacroblock x) EncodeFrame(AomEncodeInput input)
     {
+        // handle_tuning (av1_cx_iface.c) for AOM_TUNE_IQ
+        bool tuneIq = input.TuneIq && input.BaseQindex != 0;
+        string off = tuneIq ? input.IqOff ?? "" : "";
+        bool deltaqVarianceBoost = tuneIq && !off.Contains('d');
         var cm = new AomCommon(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome,
-            SelectSbSize(input.Width, input.Height, input.Speed));
+            deltaqVarianceBoost ? BLOCK_64X64 : SelectSbSize(input.Width, input.Height, input.Speed));   // Variance Boost: 64x64 SBs
         cm.BaseQindex = input.BaseQindex;
         var cpi = new AomComp { Cm = cm, Speed = input.Speed, AllowScreenContentTools = input.AllowScreenContentTools,
             UseScreenContentTools = input.UseScreenContentTools, AllowIntrabc = input.AllowIntrabc, SbSize = cm.SbSize };
+        if (tuneIq)
+        {
+            cpi.TuneIq = true;
+            cpi.UsingQm = !off.Contains('q');
+            cpi.QmMinLevel = 2; cpi.QmMaxLevel = 10;   // QM_FIRST_IQ_SSIMULACRA2 / QM_LAST_IQ_SSIMULACRA2
+            cpi.Sharpness = off.Contains('s') ? 0 : 7;
+            cpi.QmPsnrDistMetric = !off.Contains('m');
+            cpi.CdefControl = off.Contains('c') ? 0 : 3;   // CDEF_ADAPTIVE
+            cpi.EnableChromaDeltaq = !off.Contains('u');
+            cpi.DeltaqVarianceBoost = deltaqVarianceBoost;
+            cpi.EnableAdaptiveSharpness = !off.Contains('a');
+        }
 
         // the source frame with libaom's replicated borders (the lookahead copy runs aom_extend_frame_borders)
         cpi.Source = new AomFrameBuffer(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome);
@@ -96,14 +118,15 @@ internal static partial class AomEncoder
         bool lossless = input.BaseQindex == 0;
         for (int i = 0; i < 8; ++i) cpi.OptimizeSegArr[i] = lossless ? NO_TRELLIS_OPT : cpi.Sf.rd_sf.optimize_coefficients;
 
-        // av1_frame_init_quantizer's tables
-        var quants = new AomQuants(8, 0, 0, 0, 0, 0, cpi.Sharpness);
+        // av1_set_quantizer: chroma delta q and the quantization matrix levels; av1_init_quantizer
+        AomQuantSetup.SetQuantizer(cpi, input.BaseQindex);
+        cpi.Quants = new AomQuants(8, cm.YDcDeltaQ, cm.UDcDeltaQ, cm.UAcDeltaQ, cm.VDcDeltaQ, cm.VAcDeltaQ, cpi.Sharpness);
 
         // the frame CDFs (key frame defaults for the qindex) and av1_initialize_rd_consts
         cm.Fc = new Av1CdfContext();
         int qCtxQ = input.BaseQindex;
         Av1CdfDefaults.InitializeDefault(cm.Fc, qCtxQ <= 20 ? 0 : qCtxQ <= 60 ? 1 : qCtxQ <= 120 ? 2 : 3);   // get_q_ctx
-        cpi.RdRdmult = AomRd.RdMultKeyFrame(input.BaseQindex, 8);
+        cpi.RdRdmult = AomRd.RdMultKeyFrame(input.BaseQindex + cm.YDcDeltaQ, 8, cpi.TuneIq);
 
         // av1_init_tile_data: allow_update_cdf
         cpi.AllowUpdateCdf = !cpi.DisableCdfUpdate && !DelayWaitForTopRightSb(cpi);
@@ -126,15 +149,24 @@ internal static partial class AomEncoder
         if (cpi.Sf.rt_sf.use_nonrd_pick_mode == 0 && cpi.AllowIntrabcNow)   // av1_need_dv_costs
             cpi.MbmiExtFrameBase = new AomMbmiExtFrame?[cm.MiGridBase.Length];
 
+        // encoder.c: av1_set_mb_ssim_rdmult_scaling (tune SSIM / IQ / SSIMULACRA2)
+        if (cpi.TuneIq) cpi.SetMbSsimRdmultScaling();
+
+        // encode_frame_internal: delta q resolution and presence (Variance Boost: delta_q_res by the base qindex)
+        cpi.DeltaQRes = 0;
+        if (cpi.DeltaqVarianceBoost) cpi.DeltaQRes = input.BaseQindex >= 160 ? 8 : input.BaseQindex >= 120 ? 4 : input.BaseQindex >= 80 ? 2 : 1;
+        cpi.DeltaQPresentFlag = cpi.DeltaqVarianceBoost && input.BaseQindex > 0;
+        cpi.DeltaqUsed = false;
+
         // cpi->td.mb
-        var x = NewThreadData(cpi, input, quants);
+        var x = NewThreadData(cpi, input);
         x.PaletteTokens = cpi.PaletteTokens;
 
         if (cpi.NumWorkers > 1)
         {
             // oxcf->row_mt && mt_info->num_workers > 1: av1_encode_tiles_row_mt (each other worker's thread data is set
             // up like cpi->td's, as prepare_enc_workers copies cpi->td.mb)
-            AomRowMt.EncodeTilesRowMt(cpi, x, () => NewThreadData(cpi, input, quants), input.Threads);
+            AomRowMt.EncodeTilesRowMt(cpi, x, () => NewThreadData(cpi, input), input.Threads);
         }
         else
         {
@@ -146,14 +178,16 @@ internal static partial class AomEncoder
 
         // intrabc allowed but never selected: reset the flag
         if (cpi.AllowIntrabc && !cpi.IntrabcUsed) cpi.AllowIntrabc = false;
+        // no non-zero delta q used: drop delta_q_present_flag
+        if (cpi.DeltaQPresentFlag && !cpi.DeltaqUsed) cpi.DeltaQPresentFlag = false;
         return (cpi, x);
     }
 
     /// <summary>A thread's ThreadData MACROBLOCK for the frame (cpi->td.mb as encode_frame_internal sets it up, and the
     /// row-MT workers' copies of it from prepare_enc_workers): the segment lossless / qindex, the quantizers
     /// (set_q_index), the block planes, the frame-level rate costs from cm->fc (av1_initialize_rd_consts), the tile
-    /// CDFs, the winner mode stats, sadperbit and the DV costs.</summary>
-    private static AomMacroblock NewThreadData(AomComp cpi, AomEncodeInput input, AomQuants quants)
+    /// CDFs, the winner mode stats, sadperbit, the DV costs and the delta q base.</summary>
+    private static AomMacroblock NewThreadData(AomComp cpi, AomEncodeInput input)
     {
         var cm = cpi.Cm;
         var x = new AomMacroblock();
@@ -166,19 +200,7 @@ internal static partial class AomEncoder
         }
 
         // av1_frame_init_quantizer / set_q_index
-        x.Qindex = input.BaseQindex;
-        for (int p = 0; p < 3; p++)
-        {
-            var mp = x.Plane[p];
-            int q = input.BaseQindex;
-            mp.QuantFp0 = quants.QuantFp[p, q, 0]; mp.QuantFp1 = quants.QuantFp[p, q, 1];
-            mp.RoundFp0 = quants.RoundFp[p, q, 0]; mp.RoundFp1 = quants.RoundFp[p, q, 1];
-            mp.Quant0 = quants.Quant[p, q, 0]; mp.Quant1 = quants.Quant[p, q, 1];
-            mp.QuantShift0 = quants.QuantShift[p, q, 0]; mp.QuantShift1 = quants.QuantShift[p, q, 1];
-            mp.Zbin0 = quants.Zbin[p, q, 0]; mp.Zbin1 = quants.Zbin[p, q, 1];
-            mp.Round0 = quants.Round[p, q, 0]; mp.Round1 = quants.Round[p, q, 1];
-            mp.Dequant0 = quants.Dequant[p, q, 0]; mp.Dequant1 = quants.Dequant[p, q, 1];
-        }
+        AomQuantSetup.SetQIndex(cpi, x, input.BaseQindex);
 
         // init_encode_frame_mb_context / av1_setup_block_planes
         for (int p = 0; p < 3; p++)
@@ -211,6 +233,8 @@ internal static partial class AomEncoder
             x.DvCosts = new AomDvCosts();
             AomMvCost.FillDvCosts(cm.Fc.Mv, x.DvCosts);
         }
+
+        xd.CurrentBaseQindex = input.BaseQindex;
 
         // encode_tiles / enc_row_mt_worker_hook: the real-time path preallocates one PC_TREE per thread
         if (cpi.Sf.rt_sf.use_nonrd_pick_mode != 0) x.NonrdPcRoot = new AomPcTree(cm.SbSize);
@@ -365,7 +389,9 @@ internal static partial class AomEncoder
         Array.Clear(xd.LeftPartitionContext);
         Array.Fill(xd.LeftTxfmContextBuffer, (byte)TxSizeHigh[TX_64X64]);
 
-        // (the delta q / delta lf reset at the tile start, and at every row with row-MT: no delta q here)
+        // reset the delta q at the beginning of every tile, and of every row with row-MT (no delta lf here)
+        if ((miRow == cm.TileMiRowStart || rowMt != null) && cpi.DeltaQPresentFlag) xd.CurrentBaseQindex = cm.BaseQindex;
+
         int sbRow = (miRow - cm.TileMiRowStart) >> cm.MibSizeLog2;
         int sbCols = (cm.MiCols + cm.MibSize - 1) >> cm.MibSizeLog2;
         for (int miCol = cm.TileMiColStart, sbCol = 0; miCol < cm.TileMiColEnd; miCol += cm.MibSize, sbCol++)
@@ -431,6 +457,7 @@ internal static partial class AomEncoder
         var sf = cpi.Sf;
         // init_encode_rd_sb
         x.Cnn.Valid = false;
+        if (cpi.DeltaQPresentFlag) AomQuantSetup.SetupDeltaQ(cpi, x, miRow, miCol);
         x.TxfmSearchParams.ModeEvalType = DEFAULT_EVAL;
         AomRdStats dummyRdc = default;
         dummyRdc.Invalidate();

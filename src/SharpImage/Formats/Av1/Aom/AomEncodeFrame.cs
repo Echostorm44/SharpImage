@@ -316,13 +316,35 @@ internal static partial class AomEncodeFrame
         x.E.Mi0.SegmentId = 0;
     }
 
-    /// <summary>setup_block_rdmult (no AQ, no delta q, tune psnr).</summary>
-    internal static void SetupBlockRdmult(AomComp cpi, AomMacroblock x)
+    /// <summary>setup_block_rdmult (no AQ): the frame rdmult, the delta-q superblock's rdmult (av1_get_cb_rdmult without
+    /// TPL stats), tune=iq's SSIM scaling (av1_set_ssim_rdmult) and the all-intra superblock modifier.</summary>
+    internal static void SetupBlockRdmult(AomComp cpi, AomMacroblock x, int miRow, int miCol, int bsize)
     {
         x.Rdmult = cpi.RdRdmult;
-        if (cpi.TuneIq) throw new NotSupportedException("tune=iq rdmult (av1_set_ssim_rdmult) is not ported yet");
+        if (cpi.DeltaQPresentFlag) x.Rdmult = cpi.SetRdmultDeltaQ(x);
+        if (cpi.TuneIq) SetSsimRdmult(cpi, x, bsize, miRow, miCol);
         if (cpi.AllIntra) x.Rdmult = (int)(((long)x.Rdmult * x.IntraSbRdmultModifier) >> 7);
         x.Rdmult = x.Rdmult > 0 ? x.Rdmult : 1;
+    }
+
+    /// <summary>av1_set_ssim_rdmult: scales rdmult by the geometric mean of the 16x16 SSIM scaling factors the block covers.</summary>
+    private static void SetSsimRdmult(AomComp cpi, AomMacroblock x, int bsize, int miRow, int miCol)
+    {
+        var cm = cpi.Cm;
+        const int numMiW = 4, numMiH = 4;   // BLOCK_16X16
+        int numCols = (cm.MiCols + numMiW - 1) / numMiW, numRows = (cm.MiRows + numMiH - 1) / numMiH;
+        int numBcols = (MiSizeWide[bsize] + numMiW - 1) / numMiW, numBrows = (MiSizeHigh[bsize] + numMiH - 1) / numMiH;
+        double numOfMi = 0.0, geomMeanOfScale = 1.0;
+        for (int row = miRow / numMiW; row < numRows && row < miRow / numMiW + numBrows; ++row)
+            for (int col = miCol / numMiH; col < numCols && col < miCol / numMiH + numBcols; ++col)
+            {
+                geomMeanOfScale *= cpi.SsimRdmultScalingFactors![row * numCols + col];
+                numOfMi += 1.0;
+            }
+        geomMeanOfScale = Math.Pow(geomMeanOfScale, 1.0 / numOfMi);
+        x.Rdmult = (int)((double)x.Rdmult * geomMeanOfScale + 0.5);
+        x.Rdmult = Math.Max(x.Rdmult, 0);
+        x.Errorperbit = AomRd.ErrorPerBit(x.Rdmult);
     }
 
     /// <summary>av1_get_perpixel_variance (luma of the source block).</summary>
@@ -389,7 +411,7 @@ internal static partial class AomEncodeFrame
         AomRdoptUtils.SetModeEvalParams(cpi, x, DEFAULT_EVAL);
 
         int origRdmult = x.Rdmult;
-        SetupBlockRdmult(cpi, x);
+        SetupBlockRdmult(cpi, x, miRow, miCol, bsize);
         x.Errorperbit = AomRd.ErrorPerBit(x.Rdmult);
         bestRd.CostUpdate(x.Rdmult);
 
@@ -611,7 +633,7 @@ internal static partial class AomEncodeFrame
         var xd = x.E;
         SetOffsetsWithoutSegmentId(cpi, x, miRow, miCol, bsize);
         int originMult = x.Rdmult;
-        SetupBlockRdmult(cpi, x);
+        SetupBlockRdmult(cpi, x, miRow, miCol, bsize);
         var mbmi = xd.Mi0;
         mbmi.Partition = partition;
         UpdateState(cpi, x, ctx, miRow, miCol, bsize, dryRun);
@@ -639,6 +661,10 @@ internal static partial class AomEncodeFrame
                 int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, cm.SsX, cm.SsY);
                 x.CbOffset[1] += BlockSizeWide[planeBsize] * BlockSizeHigh[planeBsize];
             }
+            // delta quant: the superblock's first coded block moves the running base qindex
+            bool superBlockUpperLeft = (miRow & (cm.MibSize - 1)) == 0 && (miCol & (cm.MibSize - 1)) == 0;
+            if (cpi.DeltaQPresentFlag && (bsize != cm.SbSize || mbmi.SkipTxfm == 0) && superBlockUpperLeft)
+                xd.CurrentBaseQindex = mbmi.CurrentQindex;
             if (cpi.AllowUpdateCdf) UpdateStats(cpi, x);
         }
         extFrame?.CopyFrom(x.MbmiExt);   // av1_copy_mbmi_ext_to_mbmi_ext_frame

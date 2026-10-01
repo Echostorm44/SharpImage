@@ -19,13 +19,19 @@ internal static class AomRd
 
     /// <summary>av1_compute_rd_mult_based_on_qindex for a key frame (KF_UPDATE) with tune=psnr: q = the DC dequantizer,
     /// rdmult = q^2 * (3.3 + 0.0015 q), rounded down to the bit depth.</summary>
-    internal static int RdMultKeyFrame(int qindex, int bitDepth)
+    internal static int RdMultKeyFrame(int qindex, int bitDepth, bool tuneIq = false)
     {
         int bdIdx = bitDepth == 8 ? 0 : bitDepth == 10 ? 1 : 2;
         int q = Av1Tables.DequantTable[bdIdx, qindex, 0];
         long rdmult = (long)q * q;
         double defRdQMult = 3.3 + 0.0015 * q;   // def_kf_rd_multiplier (of the dequantizer, as libaom passes it)
         rdmult = (long)(rdmult * defRdQMult);
+        if (tuneIq)
+        {
+            // AOM_TUNE_IQ (all-intra / good quality): weight up to 200/128, ramping down to 128/128 for high qindexes
+            int weight = Math.Clamp(((255 - qindex) * 3) / 4, 0, 72) + 128;
+            rdmult = (long)((double)rdmult * weight / 128.0);
+        }
         if (bitDepth == 10) rdmult = (rdmult + 8) >> 4;
         else if (bitDepth == 12) rdmult = (rdmult + 128) >> 8;
         return rdmult > 0 ? (int)Math.Min(rdmult, int.MaxValue) : 1;

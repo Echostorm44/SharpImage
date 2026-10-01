@@ -77,7 +77,8 @@ public sealed class AvifLoopRestorationTests
     [Test]
     public async Task PhotoRestorationFollowsSpeedPreset()
     {
-        // Loop restoration through speed 4; at speeds 5-6 only outside 4:2:0 (where it still pays); none from speed 7.
+        // libaom all-intra (avifenc): loop restoration through speed 4; none at speed 6 (its
+        // sequence-level disable) in any layout, none from speed 7.
         var src = FormatRegistry.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", "peppers.jpg"));
         byte[] s4 = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Quality = 50, Speed = 4 });
         byte[] s6 = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Quality = 50 });
@@ -87,7 +88,7 @@ public sealed class AvifLoopRestorationTests
             => t.Y != Av1RestorationType.None || t.U != Av1RestorationType.None || t.V != Av1RestorationType.None;
         await Assert.That(Any(LrTypes(s4))).IsTrue();
         await Assert.That(Any(LrTypes(s6))).IsFalse();
-        await Assert.That(Any(LrTypes(s6x444))).IsTrue();
+        await Assert.That(Any(LrTypes(s6x444))).IsFalse();
         await Assert.That(Any(LrTypes(s7))).IsFalse();
         using var back = HeifCoder.Decode(s4);
         await Assert.That(back.Columns).IsEqualTo(src.Columns);

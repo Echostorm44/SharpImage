@@ -198,6 +198,8 @@ internal sealed partial class AomMacroblock
     public readonly AomMacroblockD E = new();
     public int Qindex;
     public int DeltaQindex;
+    // x->rdmult_delta_qindex / x->rdmult_cur_qindex (the superblock's delta q for its rdmult)
+    public int RdmultDeltaQindex, RdmultCurQindex;
     public int Rdmult;
     public int IntraSbRdmultModifier = 128;
     public readonly AomModeCosts ModeCosts = new();
