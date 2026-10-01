@@ -144,6 +144,7 @@ internal static partial class AomEncodeFrame
         int maxCost = AomCost.CostSymbol(0);
         for (int i = 0; i < 10; ++i) s.TmpPartitionCost[i] = maxCost;
         Span<ushort> cdf2 = stackalloc ushort[2];
+        cdf2.Clear();
         if (bp.HasCols)
         {
             PartitionGatherVertAlike(cdf2, partitionCdf, bp.Bsize);
@@ -544,6 +545,7 @@ internal static partial class AomEncodeFrame
         if (s.TerminatePartitionSearch) return;
 
         Span<bool> abAllowed = stackalloc bool[4];
+        abAllowed.Clear();
         PruneAbPartitions(cpi, x, pcTree, pbSourceVariance, bestRdc.Rdcost, rectPartWinInfo, extPartitionAllowed, s, abAllowed);
 
         Span<int> isCtxReady = stackalloc int[]

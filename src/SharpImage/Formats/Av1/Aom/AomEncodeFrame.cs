@@ -75,6 +75,7 @@ internal sealed partial class AomMacroblock
 // Port of libaom 3.14.1 partition_search.c / encodeframe_utils.c / encodetxb.c block-level encoding for intra frames:
 // av1_set_offsets, setup_block_rdmult, pick_sb_modes, encode_superblock, encode_b, encode_sb, av1_update_state,
 // update_stats / av1_sum_intra_stats, av1_update_intra_mb_txb_context, save / restore context, partition contexts.
+[System.Runtime.CompilerServices.SkipLocalsInit]
 internal static partial class AomEncodeFrame
 {
     public const int OUTPUT_ENABLED = 0, DRY_RUN_NORMAL = 1, DRY_RUN_COSTCOEFFS = 2;
