@@ -57,7 +57,7 @@ internal static partial class AomEncoder
         {
             Method = sf.lpf_sf.lpf_pick, UseCoarseFilterLevelSearch = sf.lpf_sf.use_coarse_filter_level_search,
             SkipLoopFilterUsingFiltError = sf.lpf_sf.skip_loop_filter_using_filt_error, Sharpness = cpi.Sharpness,
-            SharpnessFromConfig = cpi.AllIntra, BaseQindex = cm.BaseQindex, KeyFrame = true, IntraOnly = true,
+            SharpnessFromConfig = cpi.AllIntra || cpi.TuneIq, EnableAdaptiveSharpness = cpi.EnableAdaptiveSharpness, BaseQindex = cm.BaseQindex, KeyFrame = true, IntraOnly = true,
             TxModeOnly4x4 = x.E.Lossless[0] != 0,
         };
 

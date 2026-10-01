@@ -8,6 +8,15 @@ internal sealed class AomPostFilterResult
     public required AomLoopFilterParams LoopFilter { get; init; }
     /// <summary>Per plane; null when loop restoration is off for the sequence.</summary>
     public AomRestorationInfo[]? Restoration { get; init; }
+    /// <summary>cm->cdef_info; null when CDEF is off for the sequence.</summary>
+    public AomCdefInfo? Cdef { get; set; }
+}
+
+/// <summary>CdefInfo: the frame's CDEF damping, strength bits and strength presets (luma / chroma, each primary * 4 + secondary).</summary>
+internal sealed class AomCdefInfo
+{
+    public int CdefDamping = 3, CdefBits, NbCdefStrengths = 1;
+    public readonly int[] CdefStrengths = new int[8], CdefUvStrengths = new int[8];
 }
 
 /// <summary>libaom encoder.c's loopfilter_frame for the all-intra configuration (CDEF off, no superres): pick the

@@ -59,6 +59,10 @@ internal sealed class AomCommon
     // frame-level CDFs (cm->fc) and qindex
     public Av1CdfContext Fc = null!;
     public int BaseQindex;
+    // cm->quant_params: the frame's delta q values and quantization matrix levels
+    public int YDcDeltaQ, UDcDeltaQ, UAcDeltaQ, VDcDeltaQ, VAcDeltaQ;
+    public bool UsingQmatrix;
+    public int QmLevelY = 15, QmLevelU = 15, QmLevelV = 15;
 
     public AomCommon(int width, int height, int ssX, int ssY, bool monochrome, int sbSize = BLOCK_64X64)
     {
