@@ -149,6 +149,25 @@ internal static class AomQuantSetup
         cpi.DeltaqUsed |= x.DeltaQindex != 0;
     }
 
+    /// <summary>setup_delta_q_nonrd (DELTA_Q_VARIANCE_BOOST).</summary>
+    internal static void SetupDeltaQNonrd(AomComp cpi, AomMacroblock x, int miRow, int miCol)
+    {
+        var cm = cpi.Cm;
+        int sbSize = cm.SbSize;
+        AomEncodeFrame.SetupSrcPlanes(cpi, x, miRow, miCol, cm.NumPlanes, sbSize);
+        int currentQindex = cm.BaseQindex;
+        if (cpi.DeltaqVarianceBoost) currentQindex = GetSbqVarianceBoost(cpi, x);
+        x.RdmultCurQindex = currentQindex;
+        var xd = x.E;
+        currentQindex = AdjustQFromDeltaQRes(cpi.DeltaQRes, xd.CurrentBaseQindex, currentQindex);
+        x.DeltaQindex = currentQindex - cm.BaseQindex;
+        x.RdmultDeltaQindex = x.DeltaQindex;
+        AomEncodeFrame.SetOffsets(cpi, x, miRow, miCol, sbSize);
+        xd.Mi0.CurrentQindex = currentQindex;
+        InitPlaneQuantizers(cpi, x, false);
+        cpi.DeltaqUsed |= x.DeltaQindex != 0;
+    }
+
     /// <summary>av1_adjust_q_from_delta_q_res.</summary>
     internal static int AdjustQFromDeltaQRes(int deltaQRes, int prevQindex, int currQindex)
     {

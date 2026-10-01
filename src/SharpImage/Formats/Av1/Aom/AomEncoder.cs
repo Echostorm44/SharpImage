@@ -441,10 +441,11 @@ internal static partial class AomEncoder
         AomEncodeFrame.RdPickPartition(cpi, x, miRow, miCol, cm.SbSize, ref dummyRdc, dummyRdc, pcRoot, ref noneRd, false, null);
     }
 
-    /// <summary>encode_nonrd_sb (VAR_BASED_PARTITION, no segment skip, no delta q).</summary>
+    /// <summary>encode_nonrd_sb (VAR_BASED_PARTITION, no segment skip).</summary>
     private static void EncodeNonrdSb(AomComp cpi, AomMacroblock x, int miRow, int miCol)
     {
         var cm = cpi.Cm;
+        if (cpi.DeltaQPresentFlag) AomQuantSetup.SetupDeltaQNonrd(cpi, x, miRow, miCol);
         // set a variance-based partition
         AomEncodeFrame.SetOffsets(cpi, x, miRow, miCol, cm.SbSize);
         AomVarBasedPart.ChooseVarBasedPartitioning(cpi, x, miRow, miCol);

@@ -189,8 +189,11 @@ internal static partial class AomEncodeFrame
             ReadOnlySpan<uint> varThresh = stackalloc uint[] { 0, 101, 201 };
             if (x.SourceVariance >= varThresh[hybridIntraPickmode - 1]) useRdopt = true;
         }
+        string tag = useRdopt ? "rd" : "nrd";
+        AomTrace.Out?.Write($"hyb {tag} {x.E.MiRow} {x.E.MiCol} bs {bsize} var {x.SourceVariance} rdmult {x.Rdmult} q {x.Qindex}\n");
         if (useRdopt) RdPickIntraModeSb(cpi, x, ref rdCost, bsize, ctx, long.MaxValue);
         else AomNonrdPickMode.NonrdPickIntraMode(cpi, x, ref rdCost, bsize, ctx);
+        AomTrace.Out?.Write($"hyb {tag} -> rate {rdCost.Rate} dist {rdCost.Dist} y {x.E.Mi0.Mode} uv {x.E.Mi0.UvMode}\n");
     }
 
     /// <summary>pick_sb_modes_nonrd (intra-only frames).</summary>
