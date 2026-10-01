@@ -37,6 +37,7 @@ public sealed class AomSearchPerfTwinTests
         [DllImport(D)] public static extern double twin_sum_squares_2d_i16(short* src, int stride, int w, int h, ulong* result, int iters);
         [DllImport(D)] public static extern double twin_txb_init_levels(int* coeff, int w, int h, byte* levels, int iters);
         [DllImport(D)] public static extern double twin_satd(int* coeff, int n, int* result, int iters);
+        [DllImport(D)] public static extern double twin_cnn_partition_bench(byte* src, int stride, float* buf, int iters);
         [DllImport(D)] public static extern double twin_optimize_txb_file(int* costs, int* rec, int nrec, int* work, long* rateSum, long* eobSum);
         [DllImport(D)] public static extern double twin_block_error(int* coeff, int* dqcoeff, int n, long* sse, long* result, int iters);
     }
@@ -170,5 +171,32 @@ public sealed class AomSearchPerfTwinTests
         }
         Console.WriteLine($"optimize_txb: {nrec} blocks, ours {bestB / nrec:F1} ns aom {bestA / nrec:F1} ns ratio {bestB / bestA:F2}");
         await Assert.That($"{eobB} {rateB}").IsEqualTo($"{eobA} {rateA}");
+    }
+
+    /// <summary>Timing only (SHARPIMAGE_AOMTWIN_SP_BENCH=1): the partition CNN on a 65x65 noise block.</summary>
+    [Test]
+    public async Task CnnPartition_Bench()
+    {
+        if (!Bench) return;
+        var rng = new Random(9);
+        var src = new byte[80 * 70];
+        for (int i = 0; i < src.Length; i++) src[i] = (byte)(128 + rng.Next(-40, 41));
+        var buf = new float[AomMl.CnnOutBufSize];
+        for (int i = 0; i < 300; i++) AomMl.CnnPartitionPredict(src, 80, buf);
+        Thread.Sleep(300);
+        double best = double.MaxValue;
+        for (int rep = 0; rep < 7; rep++)
+        {
+            long t0 = Stopwatch.GetTimestamp();
+            for (int i = 0; i < (Environment.GetEnvironmentVariable("CNN_LONG") != null ? 20000 : 200); i++) AomMl.CnnPartitionPredict(src, 80, buf);
+            best = Math.Min(best, Stopwatch.GetElapsedTime(t0).TotalMicroseconds / 200);
+        }
+        Load();
+        var theirs = new float[AomMl.CnnOutBufSize];
+        double bestA = double.MaxValue;
+        for (int rep = 0; rep < 7; rep++)
+            unsafe { fixed (byte* s = src) fixed (float* b = theirs) bestA = Math.Min(bestA, Native.twin_cnn_partition_bench(s, 80, b, 200) / 1000 / 200); }
+        Console.WriteLine($"cnn partition predict: ours {best:F1} us aom {bestA:F1} us");
+        await Assert.That(buf.SequenceEqual(theirs)).IsTrue();
     }
 }

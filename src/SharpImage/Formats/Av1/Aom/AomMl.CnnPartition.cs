@@ -81,6 +81,8 @@ internal static partial class AomMl
                     sw[row] = Avx2.PermuteVar8x32(wr, wmask0);
                 }
                 for (int row = 0; row < 5; row++) sw[5 + row] = Avx2.PermuteVar8x32(sw[row], wmask1);
+                Vector256<float> sw0 = sw[0], sw1 = sw[1], sw2 = sw[2], sw3 = sw[3], sw4 = sw[4], sw5 = sw[5], sw6 = sw[6], sw7 = sw[7], sw8 = sw[8], sw9 = sw[9];
+                float w04 = wbuf[4], w14 = wbuf[12], w24 = wbuf[20], w34 = wbuf[28], w44 = wbuf[36];
                 int plane = k * inStride * inHeight;
                 for (int h = 0, u = 0; h < inHeight - fw + 1; h += skip, ++u)
                 {
@@ -88,17 +90,22 @@ internal static partial class AomMl
                     int v = 0, x = 0, rem = inWidth;
                     while (rem >= skip * 2 + fw)
                     {
-                        var acc0 = Vector256<float>.Zero;
-                        var acc1 = Vector256<float>.Zero;
                         int p = plane + h * inStride + x;
-                        for (int row = 0; row < 5; row++)
-                        {
-                            var l0 = Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref in0, (nuint)p), block01);
-                            var l1 = Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref in0, (nuint)(p + 7)), block12);
-                            acc0 = Avx.Add(Avx.Multiply(l0, sw[row]), acc0);
-                            acc1 = Avx.Add(Avx.Multiply(l1, sw[5 + row]), acc1);
-                            p += inStride;
-                        }
+                        ref float r0 = ref Unsafe.Add(ref in0, p);
+                        var acc0 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0), block01), sw0), Vector256<float>.Zero);
+                        var acc1 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0, 7), block12), sw5), Vector256<float>.Zero);
+                        r0 = ref Unsafe.Add(ref r0, inStride);
+                        acc0 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0), block01), sw1), acc0);
+                        acc1 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0, 7), block12), sw6), acc1);
+                        r0 = ref Unsafe.Add(ref r0, inStride);
+                        acc0 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0), block01), sw2), acc0);
+                        acc1 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0, 7), block12), sw7), acc1);
+                        r0 = ref Unsafe.Add(ref r0, inStride);
+                        acc0 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0), block01), sw3), acc0);
+                        acc1 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0, 7), block12), sw8), acc1);
+                        r0 = ref Unsafe.Add(ref r0, inStride);
+                        acc0 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0), block01), sw4), acc0);
+                        acc1 = Avx.Add(Avx.Multiply(Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref r0, 7), block12), sw9), acc1);
                         var accum = Avx.HorizontalAdd(acc0, acc1);
                         var t0 = acc0.GetUpper();
                         var t1 = acc1.GetUpper();
@@ -117,13 +124,13 @@ internal static partial class AomMl
                         // PERFORM_CONVOLVE_FOR_1_5X5_BLOCK
                         float last = 0;
                         int p = plane + h * inStride + x;
-                        var s0 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[4]; p += inStride;
-                        var s1 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[12]; p += inStride;
-                        var s2 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[20]; p += inStride;
-                        var s3 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[28]; p += inStride;
-                        var s4 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[36];
-                        s0 = Sse.Multiply(s0, sw[0].GetLower()); s1 = Sse.Multiply(s1, sw[1].GetLower()); s2 = Sse.Multiply(s2, sw[2].GetLower());
-                        s3 = Sse.Multiply(s3, sw[3].GetLower()); s4 = Sse.Multiply(s4, sw[4].GetLower());
+                        var s0 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * w04; p += inStride;
+                        var s1 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * w14; p += inStride;
+                        var s2 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * w24; p += inStride;
+                        var s3 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * w34; p += inStride;
+                        var s4 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * w44;
+                        s0 = Sse.Multiply(s0, sw0.GetLower()); s1 = Sse.Multiply(s1, sw1.GetLower()); s2 = Sse.Multiply(s2, sw2.GetLower());
+                        s3 = Sse.Multiply(s3, sw3.GetLower()); s4 = Sse.Multiply(s4, sw4.GetLower());
                         var acc = Sse.Add(s0, Vector128<float>.Zero);
                         s1 = Sse.Add(s1, s2);
                         s3 = Sse.Add(s3, s4);
@@ -337,7 +344,16 @@ internal static partial class AomMl
 
     private static void CnnActivate(float[] buf, int start, int count)
     {
-        for (int j = start; j < start + count; j++) buf[j] = CnnRelu(buf[j]);
+        // relu branch-free (x < 0 ? 0 : x per lane, -0 kept): the signs are data-random, so the scalar branch mispredicts
+        if ((uint)start > (uint)buf.Length || (uint)count > (uint)(buf.Length - start)) throw new ArgumentOutOfRangeException(nameof(count));
+        ref float b0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(buf), start);
+        int j = 0;
+        for (; j + 8 <= count; j += 8)
+        {
+            var v = Vector256.LoadUnsafe(ref b0, (nuint)j);
+            Vector256.ConditionalSelect(Vector256.LessThan(v, Vector256<float>.Zero), Vector256<float>.Zero, v).StoreUnsafe(ref b0, (nuint)j);
+        }
+        for (; j < count; j++) Unsafe.Add(ref b0, j) = CnnRelu(Unsafe.Add(ref b0, j));
     }
 
     [ThreadStatic] private static float[]? t_cnnIn, t_cnnL0, t_cnnL1;
@@ -371,6 +387,7 @@ internal static partial class AomMl
         CnnActivate(cnnBuffer, 0, CnnBranch0OutSize);
     }
 
+
     /// <summary>The CNN half of intra_mode_cnn_partition for one 64x64 superblock: av1_cnn_predict_img_multi_out
     /// (lowbd). src starts one row above and one column left of the 64x64 luma block (65x65 samples are read).
     /// Fills cnnBuffer[CnnOutBufSize] (branch 0: 20 x 1x1, branch 1: 4 x 2x2, branch 2: 20 x 4x4, branch 3: 20 x 8x8).</summary>
@@ -378,8 +395,22 @@ internal static partial class AomMl
     {
         const float maxVal = 255.0f;
         var input = t_cnnIn ??= new float[65 * 65 + 16];   // the AVX2 loads read up to 2 floats past the last row
+        if (src.Length < 64 * stride + 65) throw new ArgumentOutOfRangeException(nameof(src));
+        ref byte s0 = ref MemoryMarshal.GetReference(src);
+        ref float d0 = ref MemoryMarshal.GetArrayDataReference(input);
+        var mv = Vector256.Create(maxVal);
         for (int i = 0; i < 65; i++)
-            for (int j = 0; j < 65; j++) input[i * 65 + j] = (float)src[i * stride + j] / maxVal;
+        {
+            // (float)v / max_val per sample (8 at a time: the same IEEE division)
+            ref byte sr = ref Unsafe.Add(ref s0, i * stride);
+            ref float dr = ref Unsafe.Add(ref d0, i * 65);
+            for (int j = 0; j < 64; j += 8)
+            {
+                var v = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref sr, j))).AsByte());
+                Avx.Divide(Avx.ConvertToVector256Single(v), mv).StoreUnsafe(ref dr, (nuint)j);
+            }
+            Unsafe.Add(ref dr, 64) = (float)Unsafe.Add(ref sr, 64) / maxVal;
+        }
         CnnPartitionPredict(input, cnnBuffer);
     }
 

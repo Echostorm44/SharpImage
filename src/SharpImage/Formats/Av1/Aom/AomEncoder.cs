@@ -454,7 +454,6 @@ internal static partial class AomEncoder
             if (cpi.AllIntra) x.IntraSbRdmultModifier = 128;
             x.SourceVariance = uint.MaxValue;
             x.CbCoefBuff = cpi.CbCoeffBuffers[sbRow * sbCols + sbCol];
-            // (produce_gradients_for_sb: the HOG is computed without the gradient cache; identical results)
             x.ColorPaletteThresh = 64;
             x.InitSrcVarInfo(cm.SbSize);
             if (cpi.Sf.rt_sf.use_nonrd_pick_mode != 0) EncodeNonrdSb(cpi, x, miRow, miCol);
