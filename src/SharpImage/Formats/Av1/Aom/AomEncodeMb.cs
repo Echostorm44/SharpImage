@@ -578,9 +578,10 @@ internal static class AomEncodeMb
     internal static long Sse(byte[] a, int aOff, int aStride, byte[] b, int bOff, int bStride, int width, int height)
     {
         long sse = 0;
-        if (Avx2.IsSupported && (width & 3) == 0 && aOff + (height - 1) * aStride + width <= a.Length && bOff + (height - 1) * bStride + width <= b.Length)
+        if (Avx2.IsSupported && width > 0 && height > 0 && aOff >= 0 && bOff >= 0
+            && aOff + (long)(height - 1) * aStride + width <= a.Length && bOff + (long)(height - 1) * bStride + width <= b.Length)
         {
-            // exact integer sums: the int32 lanes gather at most 16 rows x 64 columns of 255^2 before being flushed to 64 bits
+            // exact integer sums: the int32 lanes gather at most 8 rows (any width up to 4096) of 255^2 before being flushed to 64 bits
             ref byte a0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(a), aOff);
             ref byte b0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(b), bOff);
             var acc = Vector256<int>.Zero;
@@ -602,13 +603,18 @@ internal static class AomEncodeMb
                         Sse41.ConvertToVector128Int16(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref br, x))).AsByte()));
                     acc128 = Sse2.Add(acc128, Sse2.MultiplyAddAdjacent(d, d));
                 }
-                for (; x < width; x += 4)
+                for (; x + 4 <= width; x += 4)
                 {
                     var d = Sse2.Subtract(Sse41.ConvertToVector128Int16(Vector128.CreateScalar(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref ar, x))).AsByte()),
                         Sse41.ConvertToVector128Int16(Vector128.CreateScalar(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref br, x))).AsByte()));
                     acc128 = Sse2.Add(acc128, Sse2.MultiplyAddAdjacent(d, d));
                 }
-                if ((y & 15) == 15 || y == height - 1)
+                for (; x < width; x++)
+                {
+                    int d = Unsafe.Add(ref ar, x) - Unsafe.Add(ref br, x);
+                    sse += d * d;
+                }
+                if ((y & 7) == 7 || y == height - 1)
                 {
                     sse += (long)(uint)Vector256.Sum(acc.AsUInt32()) + (uint)Vector128.Sum(acc128.AsUInt32());
                     acc = Vector256<int>.Zero;

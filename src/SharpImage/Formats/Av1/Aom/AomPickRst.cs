@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using static SharpImage.Formats.Av1.AomRestoration;
 using static SharpImage.Formats.Av1.AomTables;
 
@@ -219,10 +220,44 @@ internal sealed class AomPickRst
         long err = 0;
         const int sh = SgrprojRstBits + SgrprojPrjBits;
         bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
+        bool simd = Avx2.IsSupported && width >= 8 && d0 >= 0 && s0 >= 0 && f0 >= 0 && f1 >= 0
+            && d0 + (long)(height - 1) * datStride + width <= dat8.Length && s0 + (long)(height - 1) * srcStride + width <= src8.Length
+            && f0 + (long)(height - 1) * flt0Stride + width <= flt0.Length && f1 + (long)(height - 1) * flt1Stride + width <= flt1.Length;
+        var rnd = Vector256.Create(1 << (sh - 1));
+        var vxq0 = Vector256.Create(r0 ? xq0 : 0);
+        var vxq1 = Vector256.Create(r1 ? xq1 : 0);
+        ref byte dat0 = ref MemoryMarshal.GetArrayDataReference(dat8);
+        ref byte src0 = ref MemoryMarshal.GetArrayDataReference(src8);
+        ref int fl0 = ref MemoryMarshal.GetArrayDataReference(flt0);
+        ref int fl1 = ref MemoryMarshal.GetArrayDataReference(flt1);
         for (int i = 0; i < height; ++i)
         {
             int dr = d0 + i * datStride, sr = s0 + i * srcStride, a = f0 + i * flt0Stride, b = f1 + i * flt1Stride;
-            for (int j = 0; j < width; ++j)
+            int j0 = 0;
+            if (simd)
+            {
+                // 8 pixels a lane: the same int32 v and e; e^2 summed in int64 lanes (exact)
+                var acc = Vector256<long>.Zero;
+                for (; j0 + 8 <= width; j0 += 8)
+                {
+                    var d = Avx2.ConvertToVector256Int32(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref dat0, dr + j0))).AsByte());
+                    var sv = Avx2.ConvertToVector256Int32(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src0, sr + j0))).AsByte());
+                    Vector256<int> e;
+                    if (r0 || r1)
+                    {
+                        var u = Vector256.ShiftLeft(d, SgrprojRstBits);
+                        var v = Vector256.ShiftLeft(u, SgrprojPrjBits);
+                        if (r0) v += vxq0 * (Vector256.LoadUnsafe(ref fl0, (nuint)(a + j0)) - u);
+                        if (r1) v += vxq1 * (Vector256.LoadUnsafe(ref fl1, (nuint)(b + j0)) - u);
+                        e = Vector256.ShiftRightArithmetic(v + rnd, sh) - sv;
+                    }
+                    else e = d - sv;
+                    var e2 = e * e;
+                    acc += Avx2.ConvertToVector256Int64(e2.GetLower()) + Avx2.ConvertToVector256Int64(e2.GetUpper());
+                }
+                err += Vector256.Sum(acc);
+            }
+            for (int j = j0; j < width; ++j)
             {
                 int e;
                 if (r0 || r1)
@@ -253,8 +288,47 @@ internal sealed class AomPickRst
         bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
         if (!r0 && !r1) return;
         long h00 = 0, h01 = 0, h11 = 0, c0 = 0, c1 = 0;
+        bool simd = Avx2.IsSupported && width >= 8 && d0 >= 0 && s0 >= 0 && f0 >= 0 && f1 >= 0
+            && d0 + (long)(height - 1) * datStride + width <= dat8.Length && s0 + (long)(height - 1) * srcStride + width <= src8.Length
+            && (!r0 || f0 + (long)(height - 1) * flt0Stride + width <= flt0.Length)
+            && (!r1 || f1 + (long)(height - 1) * flt1Stride + width <= flt1.Length);
+        ref byte dat0 = ref MemoryMarshal.GetArrayDataReference(dat8);
+        ref byte src0 = ref MemoryMarshal.GetArrayDataReference(src8);
+        ref int fl0 = ref MemoryMarshal.GetArrayDataReference(flt0);
+        ref int fl1 = ref MemoryMarshal.GetArrayDataReference(flt1);
         for (int i = 0; i < height; ++i)
-            for (int j = 0; j < width; ++j)
+        {
+            int j0 = 0;
+            if (simd)
+            {
+                // the same int32 differences (|.| < 2^12, so every product fits 2^24) summed in int64 lanes
+                Vector256<long> a00 = default, a01 = default, a11 = default, ac0 = default, ac1 = default;
+                static Vector256<long> W(Vector256<int> p) => Avx2.ConvertToVector256Int64(p.GetLower()) + Avx2.ConvertToVector256Int64(p.GetUpper());
+                int dr = d0 + i * datStride, sr = s0 + i * srcStride, fa0 = f0 + i * flt0Stride, fb0 = f1 + i * flt1Stride;
+                for (; j0 + 8 <= width; j0 += 8)
+                {
+                    var u = Vector256.ShiftLeft(Avx2.ConvertToVector256Int32(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref dat0, dr + j0))).AsByte()), SgrprojRstBits);
+                    var sv = Vector256.ShiftLeft(Avx2.ConvertToVector256Int32(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src0, sr + j0))).AsByte()), SgrprojRstBits) - u;
+                    if (r0)
+                    {
+                        var fa = Vector256.LoadUnsafe(ref fl0, (nuint)(fa0 + j0)) - u;
+                        a00 += W(fa * fa); ac0 += W(fa * sv);
+                        if (r1)
+                        {
+                            var fb = Vector256.LoadUnsafe(ref fl1, (nuint)(fb0 + j0)) - u;
+                            a11 += W(fb * fb); a01 += W(fa * fb); ac1 += W(fb * sv);
+                        }
+                    }
+                    else
+                    {
+                        var fb = Vector256.LoadUnsafe(ref fl1, (nuint)(fb0 + j0)) - u;
+                        a11 += W(fb * fb); ac1 += W(fb * sv);
+                    }
+                }
+                h00 += Vector256.Sum(a00); h01 += Vector256.Sum(a01); h11 += Vector256.Sum(a11);
+                c0 += Vector256.Sum(ac0); c1 += Vector256.Sum(ac1);
+            }
+            for (int j = j0; j < width; ++j)
             {
                 int u = dat8[d0 + i * datStride + j] << SgrprojRstBits;
                 int s = (src8[s0 + i * srcStride + j] << SgrprojRstBits) - u;
@@ -278,6 +352,7 @@ internal sealed class AomPickRst
                     c1 += (long)fb * s;
                 }
             }
+        }
         if (r0 && r1)
         {
             H[0] = h00 / size; H[1] = h01 / size; H[3] = h11 / size; H[2] = H[1];
@@ -537,11 +612,26 @@ internal sealed class AomPickRst
         Span<int> rowBase = stackalloc int[WienerWin];
         ref int y0 = ref MemoryMarshal.GetReference(y);
         ref int h0 = ref MemoryMarshal.GetArrayDataReference(hRow);
+        // the int32 row sums of up to 32 rows with one downsample factor are summed before scaling into the int64 totals
+        // (exact: the products distribute; 32 rows x 384 columns x 255^2 stays below 2^31)
+        int pendingRows = 0, pendingFactor = downsampleFactor;
+        void Flush()
+        {
+            for (int k = 0; k < wienerWin2; ++k)
+            {
+                M[k] += (long)mRow[k] * pendingFactor;
+                for (int l = k; l < wienerWin2; ++l) H[k * wienerWin2 + l] += (long)hRow[k * padded + l] * pendingFactor;
+            }
+            Array.Clear(mRow);
+            Array.Clear(hRow);
+            pendingRows = 0;
+        }
         for (int i = vStart; i < vEnd; i += downsampleFactor)
         {
             if (useDownsampledWienerStats != 0 && vEnd - i < 4) downsampleFactor = vEnd - i;
-            Array.Clear(mRow);
-            Array.Clear(hRow);
+            if (pendingRows > 0 && (pendingRows == 32 || downsampleFactor != pendingFactor)) Flush();
+            pendingFactor = downsampleFactor;
+            pendingRows++;
             // acc_stat_one_line
             int srow = src.At(0, i);
             for (int l = -halfwin; l <= halfwin; l++) rowBase[l + halfwin] = dgd.At(0, i + l);
@@ -562,12 +652,8 @@ internal sealed class AomPickRst
                         (Vector256.LoadUnsafe(ref hr, (nuint)l) + vk * Vector256.LoadUnsafe(ref y0, (nuint)l)).StoreUnsafe(ref hr, (nuint)l);
                 }
             }
-            for (int k = 0; k < wienerWin2; ++k)
-            {
-                M[k] += (long)mRow[k] * downsampleFactor;
-                for (int l = k; l < wienerWin2; ++l) H[k * wienerWin2 + l] += (long)hRow[k * padded + l] * downsampleFactor;
-            }
         }
+        if (pendingRows > 0) Flush();
         for (int k = 0; k < wienerWin2; ++k)
             for (int l = k + 1; l < wienerWin2; ++l) H[l * wienerWin2 + k] = H[k * wienerWin2 + l];
     }

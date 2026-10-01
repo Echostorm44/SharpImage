@@ -10,17 +10,8 @@ internal static class AomSse
     /// <summary>aom_get_{y,u,v}_sse_part: SSE of a width x height window at (hstart, vstart).</summary>
     public static long SsePart(AomYv12Plane a, AomYv12Plane b, int hstart, int width, int vstart, int height)
     {
-        long sse = 0;
-        for (int r = 0; r < height; r++)
-        {
-            int ia = a.At(hstart, vstart + r), ib = b.At(hstart, vstart + r);
-            for (int c = 0; c < width; c++)
-            {
-                int d = a.Buf[ia + c] - b.Buf[ib + c];
-                sse += d * d;
-            }
-        }
-        return sse;
+        if (width <= 0 || height <= 0) return 0;
+        return AomEncodeMb.Sse(a.Buf, a.At(hstart, vstart), a.Stride, b.Buf, b.At(hstart, vstart), b.Stride, width, height);
     }
 
     /// <summary>aom_get_sse_plane (8-bit): SSE over the plane's crop.</summary>
