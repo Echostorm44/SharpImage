@@ -33,6 +33,8 @@ public sealed class AomEncoderSmoke
             EnableIntrabc = Environment.GetEnvironmentVariable("AOM_SMOKE_NOIBC") != "1",
             BaseQindex = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_Q") ?? "112"),
             Speed = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_SPEED") ?? "6"),
+            // AOM_SMOKE_THREADS=N: cfg.g_threads (row-MT from 2)
+            Threads = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_THREADS") ?? "1"),
             SfOverride = noMl ? sf => { sf.intra_sf.intra_pruning_with_hog = 0; sf.intra_sf.chroma_intra_pruning_with_hog = 0;
                 sf.part_sf.intra_cnn_based_part_prune_level = 0; sf.part_sf.ml_prune_partition = 0; sf.tx_sf.prune_intra_tx_depths_using_nn = false; } : null };
         string? tracePath = Environment.GetEnvironmentVariable("AOM_TRACE");
@@ -47,6 +49,7 @@ public sealed class AomEncoderSmoke
         }
         var sw = new System.Diagnostics.Stopwatch();
         long searchMs = 0, postMs = 0;
+        double totalMs = 0;
         for (int rep = 0; rep < reps; rep++)
         {
             sw.Restart();
@@ -56,8 +59,18 @@ public sealed class AomEncoderSmoke
             // AOM_SMOKE_APPLYLR=1: apply the chosen loop restoration to the reconstruction (what a decoder outputs)
             AomEncoder.RunPostFilter(cpi, x, Environment.GetEnvironmentVariable("AOM_SMOKE_APPLYLR") == "1");
             postMs = rep == 0 ? sw.ElapsedMilliseconds : Math.Min(postMs, sw.ElapsedMilliseconds);
+            if (reps > 1)
+            {
+                // the whole aom_codec_encode equivalent: encode + post filter + pack
+                var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                var (c2, x2) = AomEncoder.EncodeFrame(input);
+                AomEncoder.RunPostFilter(c2, x2);
+                AomBitstream.PackFrame(c2, new AomSequenceConfig());
+                double ms = System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                totalMs = rep == 0 ? ms : Math.Min(totalMs, ms);
+            }
         }
-        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms");
+        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms, total {totalMs:F1} ms");
         sw.Restart(); sw.Stop();
         AomTrace.Out = null;
         var cm = cpi.Cm; var rec = cm.CurFrame;

@@ -359,6 +359,9 @@ internal static partial class AomEncodeFrame
             return;
         }
 
+        // only needed for row-MT encoding with the cost update frequency off / tile
+        AomRowMt.WaitForTopRightSb(cpi, bsize, miRow, miCol);
+
         var cm = cpi.Cm;
         int numPlanes = cm.NumPlanes;
         var xd = x.E;
@@ -541,7 +544,7 @@ internal static partial class AomEncodeFrame
                 !(isInter && mbmi.SkipTxfm != 0))
             {
                 if (isInter) TxPartitionCountUpdate(cpi, x, bsize, cpi.AllowUpdateCdf);
-                else if (mbmi.TxSize != MaxTxsizeRectLookup[bsize]) ++cpi.TxbSplitCount;
+                else if (mbmi.TxSize != MaxTxsizeRectLookup[bsize]) System.Threading.Interlocked.Increment(ref cpi.TxbSplitCount);
                 if (!isInter && AomTxSearch.BlockSignalsTxsize(bsize))
                 {
                     int txSizeCtx = AomTxSearch.TxSizeContext(xd);
@@ -560,7 +563,7 @@ internal static partial class AomEncodeFrame
                 int rows = Math.Min(cm.MiRows - miRow, miHeight);
                 for (int j = 0; j < rows; j++)
                     for (int i = 0; i < cols; i++) xd.MiGrid[xd.MiOffset + mis * j + i]!.TxSize = intraTxSize;
-                if (intraTxSize != MaxTxsizeRectLookup[bsize]) ++cpi.TxbSplitCount;
+                if (intraTxSize != MaxTxsizeRectLookup[bsize]) System.Threading.Interlocked.Increment(ref cpi.TxbSplitCount);
             }
         }
 

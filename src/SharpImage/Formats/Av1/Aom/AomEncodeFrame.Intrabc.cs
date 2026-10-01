@@ -406,7 +406,7 @@ internal static partial class AomEncodeFrame
             int subTxs = SubTxSizeMap[txSize];
             int bsw = TxSizeWideUnit[subTxs], bsh = TxSizeHighUnit[subTxs];
             if (allowUpdateCdf) AomCdf.Update(x.TileCtx.Mode.Txpart[ctx], 1, 2);
-            ++cpi.TxbSplitCount;   // x->txfm_search_info.txb_split_count
+            System.Threading.Interlocked.Increment(ref cpi.TxbSplitCount);   // x->txfm_search_info.txb_split_count (summed over the threads)
             if (subTxs == TX_4X4)
             {
                 mbmi.InterTxSize[txbSizeIndex] = TX_4X4;
