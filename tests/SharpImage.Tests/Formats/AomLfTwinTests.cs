@@ -384,6 +384,14 @@ public sealed partial class AomLfTwinTests
             var C = new long[2];
             AomPickRst.CalcProjParams(src.Buf, src.Origin, w, h, src.Stride, dgd.Buf, dgd.Origin, dgd.Stride, f0, 0, fs,
                 f1, 0, fs, H, C, ep);
+            var Hc = new long[4];
+            var Cc = new long[2];
+            AomPickRst.CalcProjParamsC(src.Buf, src.Origin, w, h, src.Stride, dgd.Buf, dgd.Origin, dgd.Stride, f0, 0, fs,
+                f1, 0, fs, Hc, Cc, ep);
+            await Assert.That(H.AsSpan().SequenceEqual(Hc)).IsTrue();
+            await Assert.That(C.AsSpan().SequenceEqual(Cc)).IsTrue();
+            await Assert.That(ours).IsEqualTo(AomPickRst.LowbdPixelProjErrorC(src.Buf, src.Origin, w, h, src.Stride, dgd.Buf,
+                dgd.Origin, dgd.Stride, f0, 0, fs, f1, 0, fs, xq0, xq1, ep));
             var tH = new long[4];
             var tC = new long[2];
             long theirs;

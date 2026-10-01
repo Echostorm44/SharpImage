@@ -387,8 +387,131 @@ internal sealed class AomPickRst
         return err;
     }
 
-    /// <summary>av1_calc_proj_params_c: H (2x2, row-major) and C.</summary>
+    /// <summary>get_proj_subspace's av1_calc_proj_params call (width a multiple of 8, the RTCD choice): the line-by-line
+    /// port of av1_calc_proj_params_avx2 (calc_proj_params_r0_r1 / _r0 / _r1_avx2: 64-bit mul_epi32 products of the
+    /// even and odd lanes summed in int64 lanes). Exact integer sums, equal to the C version's.</summary>
+    private static unsafe void CalcProjParamsAvx2(byte[] src8Arr, int s0, int width, int height, int srcStride,
+        byte[] dat8Arr, int d0, int datStride, int[] flt0Arr, int f0, int flt0Stride, int[] flt1Arr, int f1, int flt1Stride,
+        Span<long> H, Span<long> C, int ep)
+    {
+        int size = width * height;
+        bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
+        fixed (byte* src = src8Arr)
+        fixed (byte* dat = dat8Arr)
+        fixed (int* fl0 = flt0Arr)
+        fixed (int* fl1 = flt1Arr)
+        {
+            if (r0 && r1)
+            {
+                ProjParamsR0R1(src + s0, srcStride, dat + d0, datStride, fl0 + f0, flt0Stride, fl1 + f1, flt1Stride, width,
+                    height, out long h00, out long h01, out long h11, out long c0, out long c1);
+                H[0] = h00 / size; H[1] = h01 / size; H[3] = h11 / size; H[2] = H[1];
+                C[0] = c0 / size; C[1] = c1 / size;
+            }
+            else if (r0)
+            {
+                ProjParamsOne(src + s0, srcStride, dat + d0, datStride, fl0 + f0, flt0Stride, width, height, out long h00,
+                    out long c0);
+                H[0] = h00 / size; H[1] = 0;
+                C[0] = c0 / size; C[1] = 0;
+            }
+            else
+            {
+                ProjParamsOne(src + s0, srcStride, dat + d0, datStride, fl1 + f1, flt1Stride, width, height, out long h11,
+                    out long c1);
+                H[2] = 0; H[3] = h11 / size;
+                C[0] = 0; C[1] = c1 / size;
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<long> MulAcc(Vector256<long> acc, Vector256<int> a, Vector256<int> b)
+    {
+        var even = Avx2.Multiply(a, b);
+        var odd = Avx2.Multiply(Avx2.ShiftRightLogical(a.AsInt64(), 32).AsInt32(), Avx2.ShiftRightLogical(b.AsInt64(), 32).AsInt32());
+        return Avx2.Add(Avx2.Add(acc, even), odd);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long Sum4(Vector256<long> v) => v.GetElement(0) + v.GetElement(1) + v.GetElement(2) + v.GetElement(3);
+
+    // calc_proj_params_r0_r1_avx2
+    private static unsafe void ProjParamsR0R1(byte* src, int srcStride, byte* dat, int datStride, int* flt0, int flt0Stride,
+        int* flt1, int flt1Stride, int width, int height, out long h00s, out long h01s, out long h11s, out long c0s, out long c1s)
+    {
+        Vector256<long> h00 = default, h01 = default, h11 = default, c0 = default, c1 = default;
+        for (int i = 0; i < height; ++i)
+        {
+            for (int j = 0; j < width; j += 8)
+            {
+                var uLoad = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(dat + j)).AsByte());
+                var sLoad = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(src + j)).AsByte());
+                var d = Avx2.ShiftLeftLogical(uLoad, SgrprojRstBits);
+                var s = Avx2.Subtract(Avx2.ShiftLeftLogical(sLoad, SgrprojRstBits), d);
+                var fa = Avx2.Subtract(Avx.LoadVector256(flt0 + j), d);
+                var fb = Avx2.Subtract(Avx.LoadVector256(flt1 + j), d);
+                h00 = MulAcc(h00, fa, fa);
+                h01 = MulAcc(h01, fa, fb);
+                h11 = MulAcc(h11, fb, fb);
+                c0 = MulAcc(c0, fa, s);
+                c1 = MulAcc(c1, fb, s);
+            }
+            dat += datStride;
+            src += srcStride;
+            flt0 += flt0Stride;
+            flt1 += flt1Stride;
+        }
+        h00s = Sum4(h00); h01s = Sum4(h01); h11s = Sum4(h11); c0s = Sum4(c0); c1s = Sum4(c1);
+    }
+
+    // calc_proj_params_r0_avx2 / calc_proj_params_r1_avx2
+    private static unsafe void ProjParamsOne(byte* src, int srcStride, byte* dat, int datStride, int* flt, int fltStride,
+        int width, int height, out long hs, out long cs)
+    {
+        Vector256<long> h = default, c = default;
+        for (int i = 0; i < height; ++i)
+        {
+            for (int j = 0; j < width; j += 8)
+            {
+                var uLoad = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(dat + j)).AsByte());
+                var sLoad = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(src + j)).AsByte());
+                var d = Avx2.ShiftLeftLogical(uLoad, SgrprojRstBits);
+                var s = Avx2.Subtract(Avx2.ShiftLeftLogical(sLoad, SgrprojRstBits), d);
+                var f = Avx2.Subtract(Avx.LoadVector256(flt + j), d);
+                h = MulAcc(h, f, f);
+                c = MulAcc(c, f, s);
+            }
+            dat += datStride;
+            src += srcStride;
+            flt += fltStride;
+        }
+        hs = Sum4(h);
+        cs = Sum4(c);
+    }
+
+    /// <summary>get_proj_subspace's projection statistics: av1_calc_proj_params (AVX2) when the width is a multiple of
+    /// 8, else av1_calc_proj_params_c. H is 2x2 row-major.</summary>
     public static void CalcProjParams(byte[] src8, int s0, int width, int height, int srcStride, byte[] dat8, int d0,
+        int datStride, int[] flt0, int f0, int flt0Stride, int[] flt1, int f1, int flt1Stride, Span<long> H,
+        Span<long> C, int ep)
+    {
+        bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
+        if (Avx2.IsSupported && (width & 7) == 0 && width > 0 && height > 0 && (r0 || r1) && d0 >= 0 && s0 >= 0 && f0 >= 0 && f1 >= 0
+            && d0 + (long)(height - 1) * datStride + width <= dat8.Length && s0 + (long)(height - 1) * srcStride + width <= src8.Length
+            && (!r0 || f0 + (long)(height - 1) * flt0Stride + width <= flt0.Length)
+            && (!r1 || f1 + (long)(height - 1) * flt1Stride + width <= flt1.Length))
+        {
+            CalcProjParamsAvx2(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride, flt1, f1,
+                flt1Stride, H, C, ep);
+            return;
+        }
+        CalcProjParamsC(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride, flt1, f1,
+            flt1Stride, H, C, ep);
+    }
+
+    /// <summary>av1_calc_proj_params_c: H (2x2, row-major) and C.</summary>
+    public static void CalcProjParamsC(byte[] src8, int s0, int width, int height, int srcStride, byte[] dat8, int d0,
         int datStride, int[] flt0, int f0, int flt0Stride, int[] flt1, int f1, int flt1Stride, Span<long> H,
         Span<long> C, int ep)
     {
@@ -905,6 +1028,7 @@ internal sealed class AomPickRst
         Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH)
     {
         Vector256<int> a0 = default, a1 = default, a2 = default, a3 = default, a4 = default, a5 = default, a6 = default;
+        nint o1 = dStride, o2 = 2 * (nint)dStride, o3 = 3 * (nint)dStride, o4 = 4 * (nint)dStride, o5 = 5 * (nint)dStride, o6 = 6 * (nint)dStride;
         int procHt = vStart, df = ds ? 4 : 1;
         do
         {
@@ -916,24 +1040,24 @@ internal sealed class AomPickRst
                 var c = Avx2.MultiplyLow(Avx.LoadVector256(cur + x), dfv);
                 short* p = w + x;
                 a0 = Madd(a0, c, p);
-                a1 = Madd(a1, c, p + dStride);
-                a2 = Madd(a2, c, p + 2 * dStride);
-                a3 = Madd(a3, c, p + 3 * dStride);
-                a4 = Madd(a4, c, p + 4 * dStride);
-                a5 = Madd(a5, c, p + 5 * dStride);
-                a6 = Madd(a6, c, p + 6 * dStride);
+                a1 = Madd(a1, c, p + o1);
+                a2 = Madd(a2, c, p + o2);
+                a3 = Madd(a3, c, p + o3);
+                a4 = Madd(a4, c, p + o4);
+                a5 = Madd(a5, c, p + o5);
+                a6 = Madd(a6, c, p + o6);
             }
             if (beyond != 0)
             {
                 var c = Avx2.MultiplyLow(Avx2.And(Avx.LoadVector256(cur + x), mask), dfv);
                 short* p = w + x;
                 a0 = Madd(a0, c, p);
-                a1 = Madd(a1, c, p + dStride);
-                a2 = Madd(a2, c, p + 2 * dStride);
-                a3 = Madd(a3, c, p + 3 * dStride);
-                a4 = Madd(a4, c, p + 4 * dStride);
-                a5 = Madd(a5, c, p + 5 * dStride);
-                a6 = Madd(a6, c, p + 6 * dStride);
+                a1 = Madd(a1, c, p + o1);
+                a2 = Madd(a2, c, p + o2);
+                a3 = Madd(a3, c, p + o3);
+                a4 = Madd(a4, c, p + o4);
+                a5 = Madd(a5, c, p + o5);
+                a6 = Madd(a6, c, p + o6);
             }
             procHt += df;
             cur += df * dStride;
@@ -946,6 +1070,7 @@ internal sealed class AomPickRst
         Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH)
     {
         Vector256<int> a0 = default, a1 = default, a2 = default, a3 = default, a4 = default;
+        nint o1 = dStride, o2 = 2 * (nint)dStride, o3 = 3 * (nint)dStride, o4 = 4 * (nint)dStride;
         int procHt = vStart, df = ds ? 4 : 1;
         do
         {
@@ -957,20 +1082,20 @@ internal sealed class AomPickRst
                 var c = Avx2.MultiplyLow(Avx.LoadVector256(cur + x), dfv);
                 short* p = w + x;
                 a0 = Madd(a0, c, p);
-                a1 = Madd(a1, c, p + dStride);
-                a2 = Madd(a2, c, p + 2 * dStride);
-                a3 = Madd(a3, c, p + 3 * dStride);
-                a4 = Madd(a4, c, p + 4 * dStride);
+                a1 = Madd(a1, c, p + o1);
+                a2 = Madd(a2, c, p + o2);
+                a3 = Madd(a3, c, p + o3);
+                a4 = Madd(a4, c, p + o4);
             }
             if (beyond != 0)
             {
                 var c = Avx2.MultiplyLow(Avx2.And(Avx.LoadVector256(cur + x), mask), dfv);
                 short* p = w + x;
                 a0 = Madd(a0, c, p);
-                a1 = Madd(a1, c, p + dStride);
-                a2 = Madd(a2, c, p + 2 * dStride);
-                a3 = Madd(a3, c, p + 3 * dStride);
-                a4 = Madd(a4, c, p + 4 * dStride);
+                a1 = Madd(a1, c, p + o1);
+                a2 = Madd(a2, c, p + o2);
+                a3 = Madd(a3, c, p + o3);
+                a4 = Madd(a4, c, p + o4);
             }
             procHt += df;
             cur += df * dStride;
@@ -983,13 +1108,17 @@ internal sealed class AomPickRst
         int wdMul16, int beyond, Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH,
         Span<Vector256<int>> accM)
     {
-        for (int g = 0; g < win; g++) accH[g] = accM[g] = default;
+        Vector256<int> h0 = default, h1 = default, h2 = default, h3 = default, h4 = default, h5 = default, h6 = default;
+        Vector256<int> m0 = default, m1 = default, m2 = default, m3 = default, m4 = default, m5 = default, m6 = default;
+        nint o1 = dStride, o2 = 2 * (nint)dStride, o3 = 3 * (nint)dStride, o4 = 4 * (nint)dStride, o5 = 5 * (nint)dStride, o6 = 6 * (nint)dStride;
+        bool w7 = win == 7;
         int procHt = vStart, df = ds ? 4 : 1;
+        int xEnd = wdMul16 + (beyond != 0 ? 16 : 0);
         do
         {
             if (ds && vEnd - procHt < 4) df = vEnd - procHt;
             var dfv = Vector256.Create((short)df);
-            for (int x = 0; x < wdMul16 + (beyond != 0 ? 16 : 0); x += 16)
+            for (int x = 0; x < xEnd; x += 16)
             {
                 var cv = Avx.LoadVector256(cur + x);
                 var sv = Avx.LoadVector256(s + x);
@@ -1000,11 +1129,23 @@ internal sealed class AomPickRst
                 }
                 var c = Avx2.MultiplyLow(cv, dfv);
                 var sm = Avx2.MultiplyLow(sv, dfv);
-                for (int g = 0; g < win; g++)
+                short* p = w + x;
+                var w0 = Avx.LoadVector256(p);
+                var w1 = Avx.LoadVector256(p + o1);
+                var w2 = Avx.LoadVector256(p + o2);
+                var w3 = Avx.LoadVector256(p + o3);
+                var w4 = Avx.LoadVector256(p + o4);
+                m0 = Avx2.Add(m0, Avx2.MultiplyAddAdjacent(sm, w0)); h0 = Avx2.Add(h0, Avx2.MultiplyAddAdjacent(c, w0));
+                m1 = Avx2.Add(m1, Avx2.MultiplyAddAdjacent(sm, w1)); h1 = Avx2.Add(h1, Avx2.MultiplyAddAdjacent(c, w1));
+                m2 = Avx2.Add(m2, Avx2.MultiplyAddAdjacent(sm, w2)); h2 = Avx2.Add(h2, Avx2.MultiplyAddAdjacent(c, w2));
+                m3 = Avx2.Add(m3, Avx2.MultiplyAddAdjacent(sm, w3)); h3 = Avx2.Add(h3, Avx2.MultiplyAddAdjacent(c, w3));
+                m4 = Avx2.Add(m4, Avx2.MultiplyAddAdjacent(sm, w4)); h4 = Avx2.Add(h4, Avx2.MultiplyAddAdjacent(c, w4));
+                if (w7)
                 {
-                    var wv = Avx.LoadVector256(w + x + g * dStride);
-                    accM[g] = Avx2.Add(accM[g], Avx2.MultiplyAddAdjacent(sm, wv));
-                    accH[g] = Avx2.Add(accH[g], Avx2.MultiplyAddAdjacent(c, wv));
+                    var w5 = Avx.LoadVector256(p + o5);
+                    var w6 = Avx.LoadVector256(p + o6);
+                    m5 = Avx2.Add(m5, Avx2.MultiplyAddAdjacent(sm, w5)); h5 = Avx2.Add(h5, Avx2.MultiplyAddAdjacent(c, w5));
+                    m6 = Avx2.Add(m6, Avx2.MultiplyAddAdjacent(sm, w6)); h6 = Avx2.Add(h6, Avx2.MultiplyAddAdjacent(c, w6));
                 }
             }
             procHt += df;
@@ -1012,6 +1153,8 @@ internal sealed class AomPickRst
             w += df * dStride;
             s += df * sStride;
         } while (procHt < vEnd);
+        accH[0] = h0; accH[1] = h1; accH[2] = h2; accH[3] = h3; accH[4] = h4; accH[5] = h5; accH[6] = h6;
+        accM[0] = m0; accM[1] = m1; accM[2] = m2; accM[3] = m3; accM[4] = m4; accM[5] = m5; accM[6] = m6;
     }
 
     private static int WrapIndex(int i, int wienerWin)
