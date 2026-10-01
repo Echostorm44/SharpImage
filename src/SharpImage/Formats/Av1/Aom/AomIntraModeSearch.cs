@@ -381,7 +381,7 @@ internal static class AomIntraModeSearch
     private static bool PruneLumaOddDeltaAnglesUsingRdCost(AomMbModeInfo mbmi, ReadOnlySpan<long> intraModesRdCost, long bestRd, int level)
     {
         int lda = mbmi.AngleDelta[0];
-        if (level == 0 || !IsDirectionalMode(mbmi.Mode) || (Math.Abs(lda) & 1) == 0 || bestRd == long.MaxValue) return false;
+        if (level == 0 || !IsDirectionalMode(mbmi.Mode) || (AbsI(lda) & 1) == 0 || bestRd == long.MaxValue) return false;
         long rdThresh = bestRd + (bestRd >> 3);
         return intraModesRdCost[lda + MAX_ANGLE_DELTA] > rdThresh && intraModesRdCost[lda + MAX_ANGLE_DELTA + 2] > rdThresh;
     }
@@ -709,7 +709,7 @@ internal static class AomIntraModeSearch
     {
         int lin = cflIdx - CFL_INDEX_ZERO;
         if (lin == 0) { cflSign = CFL_SIGN_ZERO; cflAlpha = 0; }
-        else { cflSign = lin > 0 ? CFL_SIGN_POS : CFL_SIGN_NEG; cflAlpha = Math.Abs(lin) - 1; }
+        else { cflSign = lin > 0 ? CFL_SIGN_POS : CFL_SIGN_NEG; cflAlpha = AbsI(lin) - 1; }
     }
 
     /// <summary>cfl_compute_rd.</summary>

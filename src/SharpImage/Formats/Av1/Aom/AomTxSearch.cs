@@ -203,7 +203,7 @@ internal static partial class AomTxSearch
         {
             double normFactor = 1.0 / (visibleCols * visibleRows);
             int signSum = sum > 0 ? 1 : -1;
-            perPxMean = (long)(normFactor * Math.Abs(sum)) << 7;
+            perPxMean = (long)(normFactor * AbsI(sum)) << 7;
             perPxMean = signSum * perPxMean;
             blockMseQ8 = (uint)(normFactor * (256 * sse));
             blockVar = sse - (ulong)(normFactor * sum * sum);
@@ -597,7 +597,7 @@ internal static partial class AomTxSearch
         int off = AomEncodeMb.BlockOffset(block);
         int nCoeffs = AomEncodeMb.MaxEob(txSize);
         int shift = MAX_TX_SCALE - AomQuantize.TxScale(txSize);
-        int satd = dcOnlyBlk ? Math.Abs(p.Coeff[off]) : AomEncodeMb.Satd(p.Coeff.AsSpan(off, nCoeffs), nCoeffs);
+        int satd = dcOnlyBlk ? AbsI(p.Coeff[off]) : AomEncodeMb.Satd(p.Coeff.AsSpan(off, nCoeffs), nCoeffs);
         satd = (int)RightSignedShift(satd, shift);
         satd >>= x.E.Bd - 8;
         bool skipBlockTrellis = (ulong)satd > (ulong)coeffOptSatdThreshold * (ulong)qstep * (ulong)SqrtTxPixels2d[txSize];

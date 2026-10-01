@@ -154,7 +154,7 @@ internal static partial class AomPalette
         for (int i = 1; i < n; ++i)
         {
             int delta = pmi.PaletteColors[2 * PALETTE_MAX_SIZE + i] - pmi.PaletteColors[2 * PALETTE_MAX_SIZE + i - 1];
-            int v = Math.Abs(delta);
+            int v = AbsI(delta);
             int d = Math.Min(v, maxVal - v);
             if (d > maxD) maxD = d;
             if (d == 0) ++zeroCount;
@@ -214,11 +214,11 @@ internal static partial class AomPalette
         if (nCache <= 0) return;
         for (int i = 0; i < nColors * stride; i += stride)
         {
-            int minDiff = Math.Abs(centroids[i] - colorCache[0]);
+            int minDiff = AbsI(centroids[i] - colorCache[0]);
             int idx = 0;
             for (int j = 1; j < nCache; ++j)
             {
-                int thisDiff = Math.Abs(centroids[i] - colorCache[j]);
+                int thisDiff = AbsI(centroids[i] - colorCache[j]);
                 if (thisDiff < minDiff)
                 {
                     minDiff = thisDiff;

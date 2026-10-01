@@ -431,7 +431,7 @@ internal static class AomTxb
             int coeffCtx = coeffContexts[pos];
             int v = qcoeff[pos];
             if (v == 0) { cost += coeffCosts.Base[coeffCtx * 8]; continue; }
-            int level = Math.Abs(v);
+            int level = AbsI(v);
             cost += coeffCosts.Base[coeffCtx * 8 + Math.Min(level, 3)];
             cost += AomCost.CostLiteral(1);
             if (level > NumBaseLevels)
@@ -496,8 +496,8 @@ internal static class AomTxb
         // av1_cost_coeffs_txb_estimate
         int est = 0;
         int c = eob - 1;
-        est += (Math.Abs(qcoeff[scan[c]]) - 1) << (AomCost.ProbCostShift + 2);
-        for (c = eob - 2; c >= 0; c--) est += CostLut[Math.Min(Math.Abs(qcoeff[scan[c]]), 14)];
+        est += (AbsI(qcoeff[scan[c]]) - 1) << (AomCost.ProbCostShift + 2);
+        for (c = eob - 2; c >= 0; c--) est += CostLut[Math.Min(AbsI(qcoeff[scan[c]]), 14)];
         est += (ConstTerm + LogePar) * (eob - 1);
         return cost + est;
     }
@@ -547,7 +547,7 @@ internal static class AomTxb
         int si = eob - 1;
         int ci = scan[si];
         int qc = qcoeff[ci];
-        int absQc = Math.Abs(qc);
+        int absQc = AbsI(qc);
         int sign = qc < 0 ? 1 : 0;
         const int maxNzNum = 2;
         int nzNum = 1;
@@ -739,7 +739,7 @@ internal static class AomTxb
         int coeffCtx = isLast ? LowerLevelsCtxEob(t.Bhl, t.Width, si) : LowerLevelsCtx(ref t, ci);
         if (qc == 0) { accuRate += Unsafe.Add(ref t.Base, coeffCtx * 8); return; }
         int sign = qc < 0 ? 1 : 0;
-        int absQc = Math.Abs(qc);
+        int absQc = AbsI(qc);
         int tqc = Unsafe.Add(ref t.Tcoeff, ci), dqc = Unsafe.Add(ref t.Dqcoeff, ci);
         int rate = isLast ? CoeffCostEob(ref t, ci, absQc, sign, coeffCtx) : CoeffCostNotLast(ref t, ci, absQc, sign, coeffCtx);
         int qcLow = 0, dqcLow = 0, absQcLow = 0, rateLow;
@@ -814,7 +814,7 @@ internal static class AomTxb
             }
             ref int b = ref Unsafe.Add(ref baseCost, coeffCtx * 8);
             if (qc == 0) { accuRate += b; continue; }
-            int absQc = Math.Abs(qc), absTqc = Math.Abs(Unsafe.Add(ref tcoeff, ci)), absDqc = Math.Abs(Unsafe.Add(ref dqcoeff, ci));
+            int absQc = AbsI(qc), absTqc = AbsI(Unsafe.Add(ref tcoeff, ci)), absDqc = AbsI(Unsafe.Add(ref dqcoeff, ci));
             if (absQc == 1)
             {
                 int rate = Unsafe.Add(ref b, 1) + AomCost.CostLiteral(1);
@@ -934,7 +934,7 @@ internal static class AomTxb
         long rdmult = t.Rdmult;
         int dqv = Dqv(ref t, ci);
         bool lowerLevel = false;
-        int absQc = Math.Abs(qc);
+        int absQc = AbsI(qc);
         int tqc = Unsafe.Add(ref t.Tcoeff, ci), dqc = Unsafe.Add(ref t.Dqcoeff, ci);
         int sign = qc < 0 ? 1 : 0;
         int qcLow = 0, dqcLow = 0, absQcLow = 0, rateLow;
@@ -1018,7 +1018,7 @@ internal static class AomTxb
         {
             int v = qcoeff[scan[c]];
             if (v == 0) continue;
-            culLevel += Math.Abs(v);
+            culLevel += AbsI(v);
             if (culLevel > CoeffContextMask) break;
         }
         culLevel = Math.Min(CoeffContextMask, culLevel);

@@ -985,7 +985,7 @@ internal static partial class AomEncodeFrame
                 int pos = scan[c];
                 int coeffCtx = coeffContexts[pos];
                 int v = p.Qcoeff[blockOffset + pos];
-                int level = Math.Abs(v);
+                int level = AbsI(v);
                 if (allowUpdateCdf)
                 {
                     if (c == eob - 1) AomCdf.Update(ec.EobBaseTok[(txsizeCtx * 2 + planeType) * 4 + coeffCtx], Math.Min(level, 3) - 1, 3);

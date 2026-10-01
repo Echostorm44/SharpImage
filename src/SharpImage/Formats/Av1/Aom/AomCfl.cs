@@ -224,7 +224,7 @@ internal static unsafe partial class AomCfl
         {
             // libaom's kernel: mulhrs(|ac|, |alpha| << 9) = (|alpha * ac| + 32) >> 6, the sign of alpha * ac put back,
             // dc added, packed with unsigned saturation (the clip)
-            var aq12 = System.Runtime.Intrinsics.Vector128.Create((short)(Math.Abs(alphaQ3) << 9));
+            var aq12 = System.Runtime.Intrinsics.Vector128.Create((short)(AbsI(alphaQ3) << 9));
             var dcV = System.Runtime.Intrinsics.Vector128.Create((short)dc);
             var negAlpha = System.Runtime.Intrinsics.Vector128.Create((short)(alphaQ3 < 0 ? -1 : 1));
             for (int j = 0; j < height; j++, dst += dstStride, acBufQ3 += CFL_BUF_LINE)

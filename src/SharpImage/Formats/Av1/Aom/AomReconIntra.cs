@@ -57,7 +57,7 @@ internal static unsafe partial class AomReconIntra
     /// <summary>av1_use_intra_edge_upsample.</summary>
     public static int UseIntraEdgeUpsample(int bs0, int bs1, int delta, int type)
     {
-        int d = Math.Abs(delta);
+        int d = AbsI(delta);
         int blkWh = bs0 + bs1;
         if (d == 0 || d >= 40) return 0;
         return type != 0 ? (blkWh <= 8 ? 1 : 0) : (blkWh <= 16 ? 1 : 0);
@@ -433,7 +433,7 @@ internal static unsafe partial class AomReconIntra
     /// <summary>intra_edge_filter_strength (reconintra.c, static).</summary>
     public static int IntraEdgeFilterStrength(int bs0, int bs1, int delta, int type)
     {
-        int d = Math.Abs(delta);
+        int d = AbsI(delta);
         int strength = 0;
         int blkWh = bs0 + bs1;
         if (type == 0)

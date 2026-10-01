@@ -754,7 +754,7 @@ internal static partial class AomEncodeMb
             for (; i + 8 <= length; i += 8) acc += Vector256.Abs(Vector256.LoadUnsafe(ref c0, (nuint)i));
             satd = Vector256.Sum(acc);
         }
-        for (; i < length; i++) satd += Math.Abs(coeff[i]);
+        for (; i < length; i++) satd += AbsI(coeff[i]);
         return satd;
     }
 

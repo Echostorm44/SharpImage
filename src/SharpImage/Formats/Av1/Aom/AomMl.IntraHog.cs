@@ -38,7 +38,7 @@ internal static partial class AomMl
     private static void HogAccumulate(int dx, int dy, ref float total, Span<float> hist)
     {
         if (dx == 0 && dy == 0) return;
-        int temp = Math.Abs(dx) + Math.Abs(dy);
+        int temp = AbsI(dx) + AbsI(dy);
         if (temp == 0) return;
         total += temp;
         if (dx == 0)
@@ -121,7 +121,7 @@ internal static partial class AomMl
                 int dy = (src[p + stride - 1] + 2 * src[p + stride] + src[p + stride + 1]) -
                          (src[p - stride - 1] + 2 * src[p - stride] + src[p - stride + 1]);
                 int i = baseOff + r * sbW + c;
-                absSum[i] = (ushort)(Math.Abs(dx) + Math.Abs(dy));
+                absSum[i] = (ushort)(AbsI(dx) + AbsI(dy));
                 bin[i] = (sbyte)(dx != 0 ? GetHistBinIdx(dx, dy) : -1);
             }
         }
@@ -141,7 +141,7 @@ internal static partial class AomMl
                 int dy = (src[p + stride - 1] + 2 * src[p + stride] + src[p + stride + 1]) -
                          (src[p - stride - 1] + 2 * src[p - stride] + src[p - stride + 1]);
                 int i = baseOff + r * sbW + c;
-                absSum[i] = (ushort)(Math.Abs(dx) + Math.Abs(dy));
+                absSum[i] = (ushort)(AbsI(dx) + AbsI(dy));
                 bin[i] = (sbyte)(dx != 0 ? GetHistBinIdx(dx, dy) : -1);
             }
         }

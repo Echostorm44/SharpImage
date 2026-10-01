@@ -175,7 +175,7 @@ internal static class AomQuantSetup
         int sign = currQindex - prevQindex >= 0 ? 1 : -1;
         int deadzone = deltaQRes / 4;
         int qmask = ~(deltaQRes - 1);
-        int abs = Math.Abs(currQindex - prevQindex);
+        int abs = AbsI(currQindex - prevQindex);
         abs = (abs + deadzone) & qmask;
         int adjust = prevQindex + sign * abs;
         return Math.Max(adjust, 1);   // MINQ + 1
