@@ -350,6 +350,23 @@ internal static class AomMcomp
         }
     }
 
+    // one scale of pattern_search: in bounds, calc_sad4_update_bestmv over the groups of 4, then
+    // calc_sad_update_bestmv(..., remaining_cand, no_of_4_cand_loops * 4) whose loop runs i from the start up to the
+    // REMAINING COUNT, so libaom never evaluates the remainder (the HEX scales' last 2 of 6 candidates) when in bounds;
+    // out of bounds, every candidate with the range check
+    private static void ScaleCandidates(AomFullPelMsParams p, ref AomMv bestMv, AomMv center, int centerOff, ref uint bestSad,
+        ref uint rawBestSad, int step, ref int bestSite, int numCandidates, bool inBounds)
+    {
+        if (!inBounds)
+        {
+            CalcSadUpdateBestmv(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, step, ref bestSite, numCandidates, 0, true);
+            return;
+        }
+        int loops4 = numCandidates >> 2;
+        CalcSadUpdateBestmv(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, step, ref bestSite, loops4 * 4, 0, false);
+        CalcSadUpdateBestmv(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, step, ref bestSite, numCandidates % 4, loops4 * 4, true);
+    }
+
     // calc_sad3_update_bestmv / calc_sad_update_bestmv_with_indices: best_site is the index into chkpts
     private static void CalcSadUpdateBestmvWithIndices(AomFullPelMsParams p, ref AomMv bestMv, AomMv center, int centerOff, ref uint bestSad,
         ref uint rawBestSad, int step, ref int bestSite, ReadOnlySpan<int> chkpts, bool checkRange)
@@ -392,7 +409,7 @@ internal static class AomMcomp
                 int bestSite = -1;
                 var center = new AomMv(br, bc);
                 bool inb = CheckBounds(p.MvLimits, br, bc, 1 << t);
-                CalcSadUpdateBestmv(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, t, ref bestSite, numCandidates[t], 0, !inb);
+                ScaleCandidates(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, t, ref bestSite, numCandidates[t], inb);
                 if (bestSite == -1) continue;
                 bestInitS = t;
                 k = bestSite;
@@ -416,7 +433,7 @@ internal static class AomMcomp
                 {
                     var center = new AomMv(br, bc);
                     bool inb = CheckBounds(p.MvLimits, br, bc, 1 << s);
-                    CalcSadUpdateBestmv(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, s, ref bestSite, numCandidates[s], 0, !inb);
+                    ScaleCandidates(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, s, ref bestSite, numCandidates[s], inb);
                     if (bestSite == -1) continue;
                     var st = cfg.Site[s, bestSite];
                     br += st.Row; bc += st.Col;

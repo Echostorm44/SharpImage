@@ -29,8 +29,8 @@ internal sealed class AomRdcostBlockArgs
 // luma and chroma): search_tx_type and its pruning (get_tx_mask, prune_txk_type(_separ), predict_dc_only_block,
 // skip_trellis_opt_based_on_satd), the distortions, recon_intra, block_rd_txfm, av1_txfm_rd_in_plane,
 // uniform_txfm_yrd, choose_tx_size_type_from_rd / choose_largest_tx_size / choose_smallest_tx_size,
-// av1_pick_uniform_tx_size_type_yrd and av1_txfm_uvrd. (The inter-only paths - var-tx, the residual hash, skip
-// prediction, prune_tx_2D - are not used by the all-intra encoder.)
+// av1_pick_uniform_tx_size_type_yrd and av1_txfm_uvrd, with their inter (intrabc) branches; the var-tx search,
+// skip prediction and av1_txfm_search are in AomTxSearch.Inter.cs.
 /// <summary>Optional per-call RD trace (same lines as the scratchpad aomoracle's libaom wrappers).</summary>
 internal static class AomTrace
 {
@@ -414,7 +414,7 @@ internal static partial class AomTxSearch
 
     private static readonly int[,] ThreshArr = { { 10, 15, 15, 10, 15, 15, 15 }, { 10, 17, 17, 10, 17, 17, 17 } };
 
-    /// <summary>get_tx_mask (intra blocks).</summary>
+    /// <summary>get_tx_mask.</summary>
     private static ushort GetTxMask(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize,
         AomTxbCtx txbCtx, int ftxsMode, long refBestRd, out int allowedTxkTypes, Span<int> txkMap)
     {
@@ -645,7 +645,7 @@ internal static partial class AomTxSearch
         }
     }
 
-    /// <summary>search_tx_type: the best transform type for one tx block (intra blocks, luma or chroma).</summary>
+    /// <summary>search_tx_type: the best transform type for one tx block (intra or intrabc, luma or chroma).</summary>
     internal static void SearchTxType(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize,
         AomTxbCtx txbCtx, int ftxsMode, long refBestRd, ref AomRdStats bestRdStats)
     {
@@ -833,7 +833,7 @@ internal static partial class AomTxSearch
         p.Dqcoeff = origDqcoeff;
     }
 
-    /// <summary>block_rd_txfm (intra blocks).</summary>
+    /// <summary>block_rd_txfm.</summary>
     private static void BlockRdTxfm(AomRdcostBlockArgs args, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize)
     {
         if (args.ExitEarly)
@@ -1109,7 +1109,7 @@ internal static partial class AomTxSearch
         TxfmRdInPlane(x, cpi, ref rdStats, refBestRd, 0, 0, bs, TX_4X4, FTXS_NONE);
     }
 
-    /// <summary>av1_pick_uniform_tx_size_type_yrd (intra blocks).</summary>
+    /// <summary>av1_pick_uniform_tx_size_type_yrd (no mb rd hash: use_mb_rd_hash is off for all-intra).</summary>
     internal static void PickUniformTxSizeTypeYrd(AomComp cpi, AomMacroblock x, ref AomRdStats rdStats, int bs, long refBestRd)
     {
         var xd = x.E;
@@ -1130,7 +1130,7 @@ internal static partial class AomTxSearch
             AomTrace.Out.Write($"yrd {xd.MiRow} {xd.MiCol} bs {bs} y {mbmi.Mode} ad {mbmi.AngleDelta[0]} fi {mbmi.UseFilterIntra} {mbmi.FilterIntraMode} ref {refBestRd} -> rate {rdStats.Rate} dist {rdStats.Dist} sse {rdStats.Sse} skip {rdStats.SkipTxfm} tx {mbmi.TxSize}\n");
     }
 
-    /// <summary>av1_txfm_uvrd (intra blocks). Returns whether the cost is valid.</summary>
+    /// <summary>av1_txfm_uvrd. Returns whether the cost is valid.</summary>
     internal static bool TxfmUvrd(AomComp cpi, AomMacroblock x, ref AomRdStats rdStats, int bsize, long refBestRd)
     {
         rdStats.Init();
