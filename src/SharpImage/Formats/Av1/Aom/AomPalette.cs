@@ -238,6 +238,26 @@ internal static partial class AomPalette
         stepSize = Math.Max(1, maxN - minN);
     }
 
+    /// <summary>fill_data_and_get_bounds (high bit depth).</summary>
+    internal static void FillDataAndGetBounds(ushort[] src, int srcOffset, int srcStride, int rows, int cols, short[] data,
+        out int lowerBound, out int upperBound)
+    {
+        int s = srcOffset, d = 0;
+        lowerBound = upperBound = src[s];
+        for (int r = 0; r < rows; ++r)
+        {
+            for (int c = 0; c < cols; ++c)
+            {
+                int val = src[s + c];
+                data[d + c] = (short)val;
+                lowerBound = Math.Min(lowerBound, val);
+                upperBound = Math.Max(upperBound, val);
+            }
+            s += srcStride;
+            d += cols;
+        }
+    }
+
     /// <summary>fill_data_and_get_bounds (8-bit).</summary>
     internal static void FillDataAndGetBounds(byte[] src, int srcOffset, int srcStride, int rows, int cols, bool isHighBitdepth, short[] data,
         out int lowerBound, out int upperBound)
@@ -320,19 +340,27 @@ internal static partial class AomPalette
         int bsize = mbmi.Bsize;
         int srcStride = x.Plane[1].Src.Stride;
         byte[] srcU = x.Plane[1].Src.Buf, srcV = x.Plane[2].Src.Buf;
+        ushort[]? srcU16 = x.Plane[1].Src.Buf16, srcV16 = x.Plane[2].Src.Buf16;
         int srcUOff = x.Plane[1].Src.Offset, srcVOff = x.Plane[2].Src.Offset;
         short[] data = x.KmeansDataBuf;
         Span<short> centroids = stackalloc short[2 * PALETTE_MAX_SIZE];
         byte[] colorMap = xd.Plane[1].ColorIndexMap;
-        if (cpi.UseHighbitdepth) throw new NotImplementedException("high-bitdepth palette: av1_restore_uv_color_map");
         AomRdoptUtils.GetBlockDimensions(bsize, 1, xd, out int planeBlockWidth, out int planeBlockHeight, out int rows, out int cols);
 
         for (int r = 0; r < rows; ++r)
         {
             for (int c = 0; c < cols; ++c)
             {
-                data[(r * cols + c) * 2] = srcU[srcUOff + r * srcStride + c];
-                data[(r * cols + c) * 2 + 1] = srcV[srcVOff + r * srcStride + c];
+                if (cpi.UseHighbitdepth)
+                {
+                    data[(r * cols + c) * 2] = (short)srcU16![srcUOff + r * srcStride + c];
+                    data[(r * cols + c) * 2 + 1] = (short)srcV16![srcVOff + r * srcStride + c];
+                }
+                else
+                {
+                    data[(r * cols + c) * 2] = srcU[srcUOff + r * srcStride + c];
+                    data[(r * cols + c) * 2 + 1] = srcV[srcVOff + r * srcStride + c];
+                }
             }
         }
         for (int r = 1; r < 3; ++r)
@@ -504,6 +532,34 @@ internal static partial class AomPalette
             for (int c = 0; c < cols; ++c)
                 ++valCount[src[srcOffset + r * stride + c]];
         int n = 0;
+        for (int i = 0; i < maxPixVal; ++i)
+            if (valCount[i] != 0) ++n;
+        return n;
+    }
+
+    /// <summary>av1_count_colors_highbd: the colors of the block down-converted to 8 bits (numColorBins, the palette
+    /// gate) and, with valCount, the actual colors (returned).</summary>
+    internal static int CountColorsHighbd(ushort[] src, int srcOffset, int stride, int rows, int cols, int bitDepth, Span<int> valCount,
+        Span<int> binValCount, out int numColorBins)
+    {
+        const int maxBinVal = 1 << 8;
+        int maxPixVal = 1 << bitDepth;
+        binValCount.Slice(0, maxBinVal).Clear();
+        valCount.Slice(0, maxPixVal).Clear();
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c)
+            {
+                int v = src[srcOffset + r * stride + c];
+                int thisVal = v >> (bitDepth - 8);
+                if (thisVal >= maxBinVal) continue;
+                ++binValCount[thisVal];
+                ++valCount[v];
+            }
+        int n = 0;
+        for (int i = 0; i < maxBinVal; ++i)
+            if (binValCount[i] != 0) ++n;
+        numColorBins = n;
+        n = 0;
         for (int i = 0; i < maxPixVal; ++i)
             if (valCount[i] != 0) ++n;
         return n;

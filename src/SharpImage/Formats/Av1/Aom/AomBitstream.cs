@@ -948,13 +948,13 @@ internal static class AomBitstream
             t.W.WriteBit(found);
             nInCache += found;
         }
-        DeltaEncodePaletteColors(t.W, outCacheColors, nOutCache, 8, 1);
+        DeltaEncodePaletteColors(t.W, outCacheColors, nOutCache, t.Cm.BitDepth, 1);
     }
 
     /// <summary>write_palette_colors_uv.</summary>
     private static void WritePaletteColorsUv(TileWriter t)
     {
-        const int bitDepth = 8;
+        int bitDepth = t.Cm.BitDepth;
         var w = t.W;
         var pmi = t.Xd.Mi0.Palette;
         int n = pmi.PaletteSize1;

@@ -231,7 +231,11 @@ internal static partial class AomTxSearch
         var noSplit = new TxCandidateInfo { Rd = long.MaxValue, TxbEntropyCtx = 0, TxType = TX_TYPES };
 
         if (txSize != TX_4X4 && trySplit && tryNoSplit && sf.tx_sf.prune_tx_size_level > 0)
-            throw new NotSupportedException("prune_tx_split_no_split (prune_tx_size_level is set for high bit depth only)");
+        {
+            int diffStride = BlockSizeWide[planeBsize];
+            AomMl.PruneTxSplitNoSplit(p.SrcDiff.AsSpan(4 * blkRow * diffStride + 4 * blkCol), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
+                p.Dequant0, p.Dequant1, ref tryNoSplit, ref trySplit, sf.tx_sf.prune_tx_size_level);
+        }
         // (rt_sf.skip_tx_no_split_var_based_partition is a real-time feature)
 
         if (tryNoSplit)

@@ -38,6 +38,8 @@ internal sealed class AomFullPelMsParams
     public AomBuf2d Src, Ref;
     // sdf / sdx4df / sdx3df: the skip-row SAD (use_downsampled_sad) or the full one
     public bool SkipSad;
+    // the frame bit depth (the highbd fn_ptr _bits10 / _bits12 wrappers)
+    public int Bd = 8;
 }
 
 // Port of libaom 3.14.1 av1/encoder/mcomp.c's full-pixel motion search as the intrabc search uses it
@@ -254,6 +256,7 @@ internal static class AomMcomp
         var p = new AomFullPelMsParams { Bsize = bsize };
         p.Src = x.Plane[0].Src;
         p.Ref = x.E.Plane[0].Pre0;
+        p.Bd = x.E.Bd;
         p.SearchMethod = searchMethod;
         p.SearchSites = searchSites[SearchMethodLookup[searchMethod]];
         p.MeshPatterns[0] = mvSf.mesh_patterns;
@@ -291,6 +294,9 @@ internal static class AomMcomp
     private static uint SdfAt(AomFullPelMsParams p, int refOff, bool skip)
     {
         int w = BlockSizeWide[p.Bsize], h = BlockSizeHigh[p.Bsize];
+        if (p.Src.Buf16 != null)
+            return (skip ? 2 * AomHbd.Sad(p.Src.Buf16, p.Src.Offset, 2 * p.Src.Stride, p.Ref.Buf16!, refOff, 2 * p.Ref.Stride, w, h / 2)
+                         : AomHbd.Sad(p.Src.Buf16, p.Src.Offset, p.Src.Stride, p.Ref.Buf16!, refOff, p.Ref.Stride, w, h)) >> (p.Bd - 8);
         return skip ? AomSad.SadSkip(p.Src.Buf, p.Src.Offset, p.Src.Stride, p.Ref.Buf, refOff, p.Ref.Stride, w, h)
                     : AomSad.Sad(p.Src.Buf, p.Src.Offset, p.Src.Stride, p.Ref.Buf, refOff, p.Ref.Stride, w, h);
     }
@@ -310,7 +316,10 @@ internal static class AomMcomp
     public static int GetMvpredVarCost(AomFullPelMsParams p, AomMv thisMv)
     {
         int w = BlockSizeWide[p.Bsize], h = BlockSizeHigh[p.Bsize];
-        uint var = AomSad.Variance(p.Src.Buf, p.Src.Offset, p.Src.Stride, p.Ref.Buf, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride,
+        uint var = p.Src.Buf16 != null
+            ? AomHbd.Variance(p.Src.Buf16, p.Src.Offset, p.Src.Stride, p.Ref.Buf16, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride, 0, w, h,
+                p.Bd, out _)
+            : AomSad.Variance(p.Src.Buf, p.Src.Offset, p.Src.Stride, p.Ref.Buf, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride,
             w, h, out _);
         return (int)var + MvErrCost(p, thisMv.ToMv());
     }
@@ -698,7 +707,7 @@ internal static class AomMcomp
         int miRow = xd.MiRow, miCol = xd.MiCol;
         int xPos = miCol * 4, yPos = miRow * 4;
         int bestHashCost = int.MaxValue;
-        AomHashMotion.GetBlockHashValue(info, p.Src.Buf, p.Src.Offset, p.Src.Stride, blockWidth, out uint hashValue1, out uint hashValue2);
+        AomHashMotion.GetBlockHashValue(info, p.Src.Buf, p.Src.Buf16, p.Src.Offset, p.Src.Stride, blockWidth, out uint hashValue1, out uint hashValue2);
         int count = AomHashMotion.Count(info, hashValue1);
         if (count <= 1) return int.MaxValue;
         if (cpi.Sf.mv_sf.prune_intrabc_candidate_block_hash_search != 0) count = Math.Min(64, count);
