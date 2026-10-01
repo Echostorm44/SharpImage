@@ -506,6 +506,7 @@ internal static class AomTxb
     /// the transform coefficients). rdmult: x->rdmult; txTypeCost: get_tx_type_cost. Returns the new eob; rate: the
     /// block's coded bits (1/512).</summary>
     [SkipLocalsInit]   // libaom's levels_buf / coeff_contexts are uninitialized stack arrays filled before use
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int OptimizeTxb(AomCoeffCosts costs, int txSize, int txType, int planeType, bool isInter, AomTxbCtx txbCtx,
         ReadOnlySpan<int> tcoeff, Span<int> qcoeff, Span<int> dqcoeff, int eob, short dequant0, short dequant1,
         int rdmultIn, int bitDepth, int sharpness, bool useChromaTrellisRdMult, bool tuneIq, int txTypeCost,
