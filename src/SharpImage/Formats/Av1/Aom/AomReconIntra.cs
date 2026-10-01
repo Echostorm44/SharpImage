@@ -315,16 +315,19 @@ internal static unsafe partial class AomReconIntra
         if (angle > 0 && angle < 90)
         {
             if (simd && upsampleAbove == 0) DrPredictionZ1Simd(dst, stride, bw, bh, above, dx);
+            else if (simd && bw <= 8 && bh <= 8) DrPredictionZ1UpSimd(dst, stride, bw, bh, above, dx);
             else DrPredictionZ1(dst, stride, bw, bh, above, left, upsampleAbove, dx, dy);
         }
         else if (angle > 90 && angle < 180)
         {
             if (simd && upsampleAbove == 0 && upsampleLeft == 0) DrPredictionZ2Simd(dst, stride, bw, bh, above, left, dx, dy);
+            else if (simd && bw <= 8) DrPredictionZ2UpSimd(dst, stride, bw, bh, above, left, upsampleAbove, upsampleLeft, dx, dy);
             else DrPredictionZ2(dst, stride, bw, bh, above, left, upsampleAbove, upsampleLeft, dx, dy);
         }
         else if (angle > 180 && angle < 270)
         {
             if (simd && upsampleLeft == 0) DrPredictionZ3Simd(dst, stride, bw, bh, left, dy);
+            else if (simd && bw <= 8 && bh <= 8) DrPredictionZ3UpSimd(dst, stride, bw, bh, left, dy);
             else DrPredictionZ3(dst, stride, bw, bh, above, left, upsampleLeft, dx, dy);
         }
         else if (angle == 90)

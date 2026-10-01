@@ -117,4 +117,55 @@ public sealed class AomDrPredSimdTests
         Console.WriteLine($"{cases} cases, {mismatches} mismatches");
         return mismatches;
     }
+
+    [Test]
+    public async Task VectorUpsampledDirectionalPredictorsMatchScalar() => await Assert.That(RunUp()).IsEqualTo(0);
+
+    // the upsampled-edge sizes (bw, bh <= 8), every angle, every upsample combination zone 2 can take
+    private static unsafe int RunUp()
+    {
+        var rng = new Random(23);
+        int cases = 0, mismatches = 0;
+        const int N = AomReconIntra.NUM_INTRA_NEIGHBOUR_PIXELS;
+        byte* aboveData = stackalloc byte[N], leftData = stackalloc byte[N];
+        byte* a = stackalloc byte[64 * 16], b = stackalloc byte[64 * 16];
+        foreach (int bw in new[] { 4, 8 })
+            foreach (int bh in new[] { 4, 8, 16 })
+                for (int angle = 3; angle < 270; angle += 3)
+                {
+                    if (angle == 90 || angle == 180) continue;
+                    for (int ups = 0; ups < 4; ups++)
+                        for (int trial = 0; trial < 6; trial++)
+                        {
+                            int upA = ups & 1, upL = ups >> 1;
+                            if (angle < 90 && (upA == 0 || bh > 8 || upL != 0)) continue;
+                            if (angle > 180 && (upL == 0 || bh > 8 || upA != 0)) continue;
+                            if (angle > 90 && angle < 180 && ups == 0) continue;
+                            for (int i = 0; i < N; i++) { aboveData[i] = (byte)rng.Next(256); leftData[i] = (byte)rng.Next(256); }
+                            byte* above = aboveData + 16, left = leftData + 16;
+                            int dx = AomReconIntra.GetDx(angle), dy = AomReconIntra.GetDy(angle);
+                            new Span<byte>(a, 64 * 16).Fill(1); new Span<byte>(b, 64 * 16).Fill(1);
+                            if (angle < 90)
+                            {
+                                AomReconIntra.DrPredictionZ1(a, 64, bw, bh, above, left, 1, dx, dy);
+                                AomReconIntra.DrPredictionZ1UpSimd(b, 64, bw, bh, above, dx);
+                            }
+                            else if (angle < 180)
+                            {
+                                AomReconIntra.DrPredictionZ2(a, 64, bw, bh, above, left, upA, upL, dx, dy);
+                                AomReconIntra.DrPredictionZ2UpSimd(b, 64, bw, bh, above, left, upA, upL, dx, dy);
+                            }
+                            else
+                            {
+                                AomReconIntra.DrPredictionZ3(a, 64, bw, bh, above, left, 1, dx, dy);
+                                AomReconIntra.DrPredictionZ3UpSimd(b, 64, bw, bh, left, dy);
+                            }
+                            cases++;
+                            if (!new Span<byte>(a, 64 * 16).SequenceEqual(new Span<byte>(b, 64 * 16)) && mismatches++ < 10)
+                                Console.WriteLine($"{bw}x{bh} angle {angle} up {upA}{upL} differs");
+                        }
+                }
+        Console.WriteLine($"upsampled: {cases} cases, {mismatches} mismatches");
+        return mismatches;
+    }
 }
