@@ -154,7 +154,7 @@ public sealed class AomCdefTwinTests
                 bool bad = false;
                 for (int r = 0; r < bh; r++)
                     for (int c = 0; c < bw; c++)
-                        if (ours[r * 16 + c] != cref[r * 16 + c]) { bad = true; if (Environment.GetEnvironmentVariable("CDDBG") != null) throw new Exception($"cref idx {idx} {bw}x{bh} pri {pri} sec {sec} dir {dir} damp {damping} r{r} c{c} ours {ours[r * 16 + c]} c {cref[r * 16 + c]}"); }
+                        if (ours[r * 16 + c] != cref[r * 16 + c]) bad = true;
                 if (Available)
                 {
                     new Span<ushort>(b).CopyTo(new Span<ushort>(nat, Size));
@@ -162,7 +162,7 @@ public sealed class AomCdefTwinTests
                     Native.twin_cdef_filter_8(idx, natDst, 16, nat + off, pri, sec, dir, damping, damping, cs, bw, bh);
                     for (int r = 0; r < bh; r++)
                         for (int c = 0; c < bw; c++)
-                            if (ours[r * 16 + c] != natDst[r * 16 + c]) { bad = true; if (Environment.GetEnvironmentVariable("CDDBG") != null) throw new Exception($"native idx {idx} {bw}x{bh} pri {pri} sec {sec} dir {dir} damp {damping} r{r} c{c} ours {ours[r * 16 + c]} t {natDst[r * 16 + c]}"); }
+                            if (ours[r * 16 + c] != natDst[r * 16 + c]) bad = true;
                 }
                 if (bad) mismatches++;
             }
