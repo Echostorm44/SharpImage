@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System;
 using System.Numerics;
 using static SharpImage.Formats.Av1.AomTables;
@@ -568,22 +570,26 @@ internal static partial class AomPalette
     /// <summary>av1_count_colors_with_threshold: false (with the running count) as soon as more than the threshold.</summary>
     internal static bool CountColorsWithThreshold(byte[] src, int srcOffset, int stride, int rows, int cols, int numColorsThreshold, out int numColors)
     {
-        Span<bool> hasColor = stackalloc bool[1 << 8];
-        hasColor.Clear();
-        numColors = 0;
+        // branch-free counting (a new colour is data-random), the threshold checked per row: the same verdict, and
+        // numColors = threshold + 1 when it is exceeded, as the per-sample check reports
+        if (rows <= 0 || cols <= 0) { numColors = 0; return true; }
+        if (srcOffset < 0 || (long)srcOffset + (long)(rows - 1) * stride + cols > src.Length) throw new ArgumentOutOfRangeException(nameof(rows));
+        var hasColorBuf = new StackArr256<byte>();
+        ref byte has = ref hasColorBuf[0];
+        ref byte s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), srcOffset);
+        int n = 0;
         for (int r = 0; r < rows; ++r)
         {
+            ref byte row = ref Unsafe.Add(ref s0, r * stride);
             for (int c = 0; c < cols; ++c)
             {
-                int thisVal = src[srcOffset + r * stride + c];
-                if (!hasColor[thisVal])
-                {
-                    hasColor[thisVal] = true;
-                    numColors++;
-                    if (numColors > numColorsThreshold) return false;
-                }
+                ref byte h = ref Unsafe.Add(ref has, Unsafe.Add(ref row, c));
+                n += h ^ 1;
+                h = 1;
             }
+            if (n > numColorsThreshold) { numColors = numColorsThreshold + 1; return false; }
         }
+        numColors = n;
         return true;
     }
 

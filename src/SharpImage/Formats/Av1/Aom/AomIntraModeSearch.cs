@@ -1,3 +1,5 @@
+using System.Runtime.Intrinsics;
+using System.Runtime.CompilerServices;
 using System;
 using static SharpImage.Formats.Av1.AomTables;
 
@@ -176,6 +178,34 @@ internal static class AomIntraModeSearch
     internal static uint VarianceVsZero(byte[] buf, int off, int stride, int w, int h, out uint sse)
     {
         long sum = 0; ulong ss = 0;
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && (w & 3) == 0 && w > 0 && h > 0 && off >= 0 && off + (long)(h - 1) * stride + w <= buf.Length)
+        {
+            // sums of the samples and their squares in int32 lanes (at most 128 x 128 x 255^2 < 2^31 per lane group)
+            ref byte b0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(buf);
+            var sv = System.Runtime.Intrinsics.Vector256<int>.Zero;
+            var qv = System.Runtime.Intrinsics.Vector256<int>.Zero;
+            for (int r = 0; r < h; r++)
+            {
+                ref byte row = ref Unsafe.Add(ref b0, off + r * stride);
+                int c = 0;
+                for (; c + 16 <= w; c += 16)
+                {
+                    var v = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int16(System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref row, (nuint)c));
+                    sv += System.Runtime.Intrinsics.X86.Avx2.MultiplyAddAdjacent(v, System.Runtime.Intrinsics.Vector256.Create((short)1));
+                    qv += System.Runtime.Intrinsics.X86.Avx2.MultiplyAddAdjacent(v, v);
+                }
+                for (; c < w; c += 4)
+                {
+                    var v = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref row, c))).AsByte());
+                    sv += v & System.Runtime.Intrinsics.Vector256.Create(-1, -1, -1, -1, 0, 0, 0, 0);
+                    qv += (v * v) & System.Runtime.Intrinsics.Vector256.Create(-1, -1, -1, -1, 0, 0, 0, 0);
+                }
+            }
+            sum = System.Runtime.Intrinsics.Vector256.Sum(sv);
+            ss = (ulong)(uint)System.Runtime.Intrinsics.Vector256.Sum(qv);
+            sse = (uint)ss;
+            return (uint)(ss - (ulong)(sum * sum / (w * h)));
+        }
         for (int r = 0; r < h; r++)
             for (int c = 0; c < w; c++) { int v = buf[off + r * stride + c]; sum += v; ss += (ulong)(v * v); }
         sse = (uint)ss;
