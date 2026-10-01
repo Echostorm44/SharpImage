@@ -29,10 +29,14 @@ internal sealed class AomEncodeInput
     /// rows run in libaom's row-MT wavefront, whose output is the same for every thread count &gt;= 2 (and differs
     /// from the single-threaded one).</summary>
     public int Threads = 1;
+    /// <summary>tile_cfg.tile_columns / tile_rows (AV1E_SET_TILE_COLUMNS / AV1E_SET_TILE_ROWS, log2): the requested
+    /// uniform tile layout; libaom raises it to what MAX_TILE_WIDTH / MAX_TILE_AREA require and caps it at the
+    /// superblock counts.</summary>
+    public int TileColumns, TileRows;
 }
 
 // Port of libaom 3.14.1 av1_encode_frame / encode_frame_internal / encode_tiles / av1_encode_tile / encode_sb_row /
-// encode_rd_sb for one all-intra key frame (one tile, no segmentation, no delta q): the search and the final encode
+// encode_rd_sb for one all-intra key frame (uniform tiles, no segmentation): the search and the final encode
 // that leave the mode info, the coefficients and the reconstruction for the bitstream writer and the loop filters.
 /// <summary>The aom_tune_metric values the port implements.</summary>
 internal enum AomTune { Psnr, Ssim, Iq }
@@ -49,6 +53,8 @@ internal static partial class AomEncoder
         var cm = new AomCommon(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome,
             deltaqVarianceBoost ? BLOCK_64X64 : SelectSbSize(input.Width, input.Height, input.Speed));   // Variance Boost: 64x64 SBs
         cm.BaseQindex = input.BaseQindex;
+        // av1_update_frame_size: set_tile_info
+        cm.SetTileInfo(input.TileColumns, input.TileRows);
         var cpi = new AomComp { Cm = cm, Speed = input.Speed, AllowScreenContentTools = input.AllowScreenContentTools,
             UseScreenContentTools = input.UseScreenContentTools, AllowIntrabc = input.AllowIntrabc, SbSize = cm.SbSize, Tune = tune };
         if (tuneIq)
@@ -134,6 +140,9 @@ internal static partial class AomEncoder
         // av1_init_tile_data: allow_update_cdf
         cpi.AllowUpdateCdf = !cpi.DisableCdfUpdate && !DelayWaitForTopRightSb(cpi);
 
+        // av1_init_tile_data
+        cpi.TileData = AomTileDataEnc.InitAll(cpi);
+
         int sbPixels = 1 << NumPelsLog2Lookup[cm.SbSize];
         int sbCols = (cm.MiCols + cm.MibSize - 1) >> cm.MibSizeLog2, sbRows = (cm.MiRows + cm.MibSize - 1) >> cm.MibSizeLog2;
         cpi.CbCoeffBuffers = new AomCbCoeffBuffer[sbRows * sbCols];
@@ -173,10 +182,13 @@ internal static partial class AomEncoder
         }
         else
         {
-            // av1_encode_tile
-            cm.ZeroAboveContext();
-            if (cpi.EnableCflIntra) AomCfl.CflInit(x.E.Cfl, input.SsX, input.SsY);
-            for (int miRow = cm.TileMiRowStart; miRow < cm.TileMiRowEnd; miRow += cm.MibSize) EncodeSbRow(cpi, x, miRow);
+            // encode_tiles: the tiles in raster order, each with its own CDFs (xd->tile_ctx = &this_tile->tctx)
+            foreach (var td in cpi.TileData)
+            {
+                x.TileData = td;
+                x.TileCtx = td.Tctx;
+                EncodeTile(cpi, x, td.Tile);
+            }
         }
 
         // intrabc allowed but never selected: reset the flag
@@ -184,6 +196,18 @@ internal static partial class AomEncoder
         // no non-zero delta q used: drop delta_q_present_flag
         if (cpi.DeltaQPresentFlag && !cpi.DeltaqUsed) cpi.DeltaQPresentFlag = false;
         return (cpi, x);
+    }
+
+    /// <summary>av1_encode_tile.</summary>
+    private static void EncodeTile(AomComp cpi, AomMacroblock x, AomTileInfo tile)
+    {
+        var cm = cpi.Cm;
+        var xd = x.E;
+        xd.SetTile(tile);
+        cm.ZeroAboveContext(tile.MiColStart, tile.MiColEnd, tile.TileRow);
+        xd.InitAboveContext(cm, tile.TileRow);
+        if (cpi.EnableCflIntra) AomCfl.CflInit(xd.Cfl, cm.SsX, cm.SsY);
+        for (int miRow = tile.MiRowStart; miRow < tile.MiRowEnd; miRow += cm.MibSize) EncodeSbRow(cpi, x, miRow);
     }
 
     /// <summary>A thread's ThreadData MACROBLOCK for the frame (cpi->td.mb as encode_frame_internal sets it up, and the
@@ -211,10 +235,10 @@ internal static partial class AomEncoder
             xd.Plane[p].PlaneType = p == 0 ? 0 : 1;
             xd.Plane[p].SubsamplingX = p == 0 ? 0 : input.SsX;
             xd.Plane[p].SubsamplingY = p == 0 ? 0 : input.SsY;
-            xd.AboveEntropyContext[p] = cm.AboveEntropy[p];
         }
-        xd.AbovePartitionContext = cm.AbovePartition;
-        xd.AboveTxfmContext = cm.AboveTxfm;
+        xd.InitAboveContext(cm, 0);
+        xd.SetTile(cpi.TileData[0].Tile);
+        x.TileData = cpi.TileData[0];
         xd.Bd = 8;
 
         // av1_initialize_rd_consts
@@ -393,25 +417,26 @@ internal static partial class AomEncoder
         Array.Fill(xd.LeftTxfmContextBuffer, (byte)TxSizeHigh[TX_64X64]);
 
         // reset the delta q at the beginning of every tile, and of every row with row-MT (no delta lf here)
-        if ((miRow == cm.TileMiRowStart || rowMt != null) && cpi.DeltaQPresentFlag) xd.CurrentBaseQindex = cm.BaseQindex;
+        if ((miRow == xd.TileMiRowStart || rowMt != null) && cpi.DeltaQPresentFlag) xd.CurrentBaseQindex = cm.BaseQindex;
 
-        int sbRow = (miRow - cm.TileMiRowStart) >> cm.MibSizeLog2;
+        int sbRow = (miRow - xd.TileMiRowStart) >> cm.MibSizeLog2;
+        int sbColsInTile = (xd.TileMiColEnd - xd.TileMiColStart + cm.MibSize - 1) >> cm.MibSizeLog2;
         int sbCols = (cm.MiCols + cm.MibSize - 1) >> cm.MibSizeLog2;
-        for (int miCol = cm.TileMiColStart, sbCol = 0; miCol < cm.TileMiColEnd; miCol += cm.MibSize, sbCol++)
+        for (int miCol = xd.TileMiColStart, sbCol = 0; miCol < xd.TileMiColEnd; miCol += cm.MibSize, sbCol++)
         {
             // row-MT: wait for the top / top-right superblock, then the row's CDFs (restore / left + top-right average)
             if (rowMt != null && !rowMt.BeforeSb(cpi, x, miRow, miCol, sbRow, sbCol)) return;
             SetCostUpdFreq(cpi, x, miRow, miCol);
             if (cpi.AllIntra) x.IntraSbRdmultModifier = 128;
             x.SourceVariance = uint.MaxValue;
-            x.CbCoefBuff = cpi.CbCoeffBuffers[sbRow * sbCols + sbCol];
+            x.CbCoefBuff = cpi.CbCoeffBuffers[(miRow >> cm.MibSizeLog2) * sbCols + (miCol >> cm.MibSizeLog2)];   // av1_get_cb_coeff_buffer
             // (produce_gradients_for_sb: the HOG is computed without the gradient cache; identical results)
             x.ColorPaletteThresh = 64;
             x.InitSrcVarInfo(cm.SbSize);
             if (cpi.Sf.rt_sf.use_nonrd_pick_mode != 0) EncodeNonrdSb(cpi, x, miRow, miCol);
             else EncodeRdSb(cpi, x, miRow, miCol);
             // row-MT: the top-right context for the next row, and this superblock done
-            rowMt?.AfterSb(cpi, x, miRow, sbRow, sbCol, sbCols);
+            rowMt?.AfterSb(cpi, x, miRow, sbRow, sbCol, sbColsInTile);
         }
     }
 
@@ -421,28 +446,28 @@ internal static partial class AomEncoder
         var cm = cpi.Cm;
         if (cpi.DisableCdfUpdate) return;
         int coeffLevel = cpi.Sf.inter_sf.coeff_cost_upd_level;
-        if (coeffLevel >= INTERNAL_COST_UPD_SBROW_SET && !SkipCostUpdate(cm, miRow, miCol, coeffLevel))
+        if (coeffLevel >= INTERNAL_COST_UPD_SBROW_SET && !SkipCostUpdate(cm, x.E, miRow, miCol, coeffLevel))
             x.CoeffCosts.Fill(x.TileCtx.Coef, cm.NumPlanes);
         int modeLevel = cpi.Sf.inter_sf.mode_cost_upd_level;
-        if (modeLevel >= INTERNAL_COST_UPD_SBROW_SET && !SkipCostUpdate(cm, miRow, miCol, modeLevel))
+        if (modeLevel >= INTERNAL_COST_UPD_SBROW_SET && !SkipCostUpdate(cm, x.E, miRow, miCol, modeLevel))
             AomModeCostFill.Fill(x.ModeCosts, x.TileCtx, cpi.EnableFilterIntra);
         // (mv costs: inter frames only)
         int dvLevel = cpi.Sf.intra_sf.dv_cost_upd_level;
-        if (dvLevel >= INTERNAL_COST_UPD_SBROW_SET && cpi.AllowIntrabcNow && !SkipCostUpdate(cm, miRow, miCol, dvLevel))   // skip_dv_cost_update
+        if (dvLevel >= INTERNAL_COST_UPD_SBROW_SET && cpi.AllowIntrabcNow && !SkipCostUpdate(cm, x.E, miRow, miCol, dvLevel))   // skip_dv_cost_update
             AomMvCost.FillDvCosts(x.TileCtx.Mv, x.DvCosts!);
     }
 
     /// <summary>skip_cost_update.</summary>
-    private static bool SkipCostUpdate(AomCommon cm, int miRow, int miCol, int updLevel)
+    private static bool SkipCostUpdate(AomCommon cm, AomMacroblockD tile, int miRow, int miCol, int updLevel)
     {
         if (updLevel == INTERNAL_COST_UPD_SB) return false;
         if (updLevel == INTERNAL_COST_UPD_OFF) return true;
-        if (miCol != cm.TileMiColStart) return true;
+        if (miCol != tile.TileMiColStart) return true;
         if (updLevel == INTERNAL_COST_UPD_SBROW_SET)
         {
-            int sbRow = (miRow - cm.TileMiRowStart) >> cm.MibSizeLog2;
+            int sbRow = (miRow - tile.TileMiRowStart) >> cm.MibSizeLog2;
             int sbSize = cm.MibSize * 4;
-            int tileHeight = (cm.TileMiRowEnd - cm.TileMiRowStart) * 4;
+            int tileHeight = (tile.TileMiRowEnd - tile.TileMiRowStart) * 4;
             int updateFreqSbRows = sbSize != 128 ? 4 : 2;
             int updateFreqNumRows = sbSize * updateFreqSbRows;
             int numUpdatesPerTile = (tileHeight + updateFreqNumRows - 1) / updateFreqNumRows;

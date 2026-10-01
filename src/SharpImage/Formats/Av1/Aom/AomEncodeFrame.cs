@@ -282,16 +282,14 @@ internal static partial class AomEncodeFrame
         xd.MbToRightEdge = ((cm.MiCols - bw - miCol) * 4) * 8;
         xd.MiRow = miRow;
         xd.MiCol = miCol;
-        xd.TileMiRowStart = cm.TileMiRowStart; xd.TileMiRowEnd = cm.TileMiRowEnd;
-        xd.TileMiColStart = cm.TileMiColStart; xd.TileMiColEnd = cm.TileMiColEnd;
-
-        xd.UpAvailable = miRow > cm.TileMiRowStart;
+        // (xd->tile is the current tile: set when a thread starts a tile / an SB row of it)
+        xd.UpAvailable = miRow > xd.TileMiRowStart;
         int ssX = xd.Plane[1].SubsamplingX, ssY = xd.Plane[1].SubsamplingY;
-        xd.LeftAvailable = miCol > cm.TileMiColStart;
+        xd.LeftAvailable = miCol > xd.TileMiColStart;
         xd.ChromaUpAvailable = xd.UpAvailable;
         xd.ChromaLeftAvailable = xd.LeftAvailable;
-        if (ssX != 0 && bw < MiSizeWide[BLOCK_8X8]) xd.ChromaLeftAvailable = (miCol - 1) > cm.TileMiColStart;
-        if (ssY != 0 && bh < MiSizeHigh[BLOCK_8X8]) xd.ChromaUpAvailable = (miRow - 1) > cm.TileMiRowStart;
+        if (ssX != 0 && bw < MiSizeWide[BLOCK_8X8]) xd.ChromaLeftAvailable = (miCol - 1) > xd.TileMiColStart;
+        if (ssY != 0 && bh < MiSizeHigh[BLOCK_8X8]) xd.ChromaUpAvailable = (miRow - 1) > xd.TileMiRowStart;
         xd.AboveMbmi = xd.UpAvailable ? xd.MiGrid[xd.MiOffset - xd.MiStride] : null;
         xd.LeftMbmi = xd.LeftAvailable ? xd.MiGrid[xd.MiOffset - 1] : null;
 
@@ -382,7 +380,7 @@ internal static partial class AomEncodeFrame
         }
 
         // only needed for row-MT encoding with the cost update frequency off / tile
-        AomRowMt.WaitForTopRightSb(cpi, bsize, miRow, miCol);
+        AomRowMt.WaitForTopRightSb(cpi, x, bsize, miRow, miCol);
 
         var cm = cpi.Cm;
         int numPlanes = cm.NumPlanes;

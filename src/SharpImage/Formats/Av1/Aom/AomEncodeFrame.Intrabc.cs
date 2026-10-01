@@ -102,17 +102,17 @@ internal static partial class AomEncodeFrame
         {
             if (dir == IBC_MOTION_ABOVE)
             {
-                fullms.MvLimits.ColMin = (cm.TileMiColStart - miCol) * 4;
-                fullms.MvLimits.ColMax = (cm.TileMiColEnd - miCol) * 4 - w;
-                fullms.MvLimits.RowMin = (cm.TileMiRowStart - miRow) * 4;
+                fullms.MvLimits.ColMin = (xd.TileMiColStart - miCol) * 4;
+                fullms.MvLimits.ColMax = (xd.TileMiColEnd - miCol) * 4 - w;
+                fullms.MvLimits.RowMin = (xd.TileMiRowStart - miRow) * 4;
                 fullms.MvLimits.RowMax = (sbRow * cm.MibSize - miRow) * 4 - h;
             }
             else
             {
-                fullms.MvLimits.ColMin = (cm.TileMiColStart - miCol) * 4;
+                fullms.MvLimits.ColMin = (xd.TileMiColStart - miCol) * 4;
                 fullms.MvLimits.ColMax = (sbCol * cm.MibSize - miCol) * 4 - w;
-                fullms.MvLimits.RowMin = (cm.TileMiRowStart - miRow) * 4;
-                int bottomCodedMiEdge = Math.Min((sbRow + 1) * cm.MibSize, cm.TileMiRowEnd);
+                fullms.MvLimits.RowMin = (xd.TileMiRowStart - miRow) * 4;
+                int bottomCodedMiEdge = Math.Min((sbRow + 1) * cm.MibSize, xd.TileMiRowEnd);
                 fullms.MvLimits.RowMax = (bottomCodedMiEdge - miRow) * 4 - h;
             }
             AomMcomp.SetMvSearchRange(ref fullms.MvLimits, dvRef);
@@ -429,7 +429,7 @@ internal static partial class AomEncodeFrame
         int miWidth = MiSizeWide[planeBsize], miHeight = MiSizeHigh[planeBsize];
         int maxTxSize = AomTxSearch.GetVartxMaxTxsize(xd, planeBsize, 0);
         int bh = TxSizeHighUnit[maxTxSize], bw = TxSizeWideUnit[maxTxSize];
-        xd.AboveTxfmContext = cm.AboveTxfm;
+        xd.AboveTxfmContext = cm.AboveTxfm[xd.TileRow];
         xd.AboveTxfmContextOffset = xd.MiCol;
         xd.LeftTxfmContextOffset = xd.MiRow & MAX_MIB_MASK;
         for (int idy = 0; idy < miHeight; idy += bh)
@@ -477,7 +477,7 @@ internal static partial class AomEncodeFrame
         int miWidth = MiSizeWide[planeBsize], miHeight = MiSizeHigh[planeBsize];
         int maxTxSize = AomTxSearch.GetVartxMaxTxsize(xd, planeBsize, 0);
         int bh = TxSizeHighUnit[maxTxSize], bw = TxSizeWideUnit[maxTxSize];
-        xd.AboveTxfmContext = cm.AboveTxfm;
+        xd.AboveTxfmContext = cm.AboveTxfm[xd.TileRow];
         xd.AboveTxfmContextOffset = xd.MiCol;
         xd.LeftTxfmContextOffset = xd.MiRow & MAX_MIB_MASK;
         for (int idy = 0; idy < miHeight; idy += bh)

@@ -50,12 +50,13 @@ internal sealed class AomCommon
     public int NumPlanes => Monochrome ? 1 : 3;
     // sequence: sb_size, mib_size (log2)
     public int SbSize = BLOCK_64X64, MibSize = 16, MibSizeLog2 = 4;
-    // above contexts (one tile row): entropy per plane, partition, txfm
-    public readonly byte[][] AboveEntropy = new byte[3][];
-    public readonly byte[] AbovePartition;
-    public readonly byte[] AboveTxfm;
-    // the tile (one tile)
-    public int TileMiRowStart, TileMiRowEnd, TileMiColStart, TileMiColEnd;
+    // above contexts (cm->above_contexts: one set per tile row): entropy per plane, partition, txfm
+    public byte[][][] AboveEntropy = Array.Empty<byte[][]>();
+    public byte[][] AbovePartition = Array.Empty<byte[]>();
+    public byte[][] AboveTxfm = Array.Empty<byte[]>();
+    // cm->tiles (CommonTileParams, uniform spacing)
+    public int TileCols = 1, TileRows = 1, Log2Cols, Log2Rows, MinLog2Cols, MaxLog2Cols, MinLog2Rows, MaxLog2Rows, MinLog2, MaxWidthSb;
+    public int[] ColStartSb = Array.Empty<int>(), RowStartSb = Array.Empty<int>();
     // frame-level CDFs (cm->fc) and qindex
     public Av1CdfContext Fc = null!;
     public int BaseQindex;
@@ -80,18 +81,108 @@ internal sealed class AomCommon
         for (int i = 0; i < MiAlloc.Length; i++) MiAlloc[i] = new AomMbModeInfo();
         TxTypeMap = new byte[MiStride * alignedRows];
         CurFrame = new AomFrameBuffer(width, height, ssX, ssY, monochrome);
-        int alignedMiCols = (MiCols + 31) & ~31;
-        for (int p = 0; p < 3; p++) AboveEntropy[p] = new byte[alignedMiCols];
-        AbovePartition = new byte[alignedMiCols];
-        AboveTxfm = new byte[alignedMiCols];
-        TileMiRowStart = 0; TileMiRowEnd = MiRows; TileMiColStart = 0; TileMiColEnd = MiCols;
+        SetTileInfo(0, 0);
     }
 
-    /// <summary>av1_zero_above_context (whole tile width).</summary>
-    public void ZeroAboveContext()
+    // ---- tiles (av1/common/tile_common.c, encoder.c set_tile_info) ------------------------------------------------
+
+    private const int MAX_TILE_WIDTH = 4096, MAX_TILE_AREA = 4096 * 2304, MAX_TILE_ROWS = 64, MAX_TILE_COLS = 64;
+
+    /// <summary>tile_log2: the smallest k &gt;= 0 with (blkSize &lt;&lt; k) &gt;= target.</summary>
+    private static int TileLog2(int blkSize, int target)
     {
-        for (int p = 0; p < 3; p++) Array.Clear(AboveEntropy[p]);
-        Array.Clear(AbovePartition);
-        Array.Fill(AboveTxfm, (byte)TxSizeWide[TX_64X64]);
+        int k = 0;
+        for (; (blkSize << k) < target; k++) { }
+        return k;
     }
+
+    /// <summary>set_tile_info for tile_cfg's tile_columns / tile_rows (log2, uniform spacing: no explicit tile widths /
+    /// heights, no superres): av1_get_tile_limits, the column and row log2s clamped to the limits,
+    /// av1_calculate_tile_cols / av1_calculate_tile_rows; then av1_alloc_above_context_buffer's per-tile-row above
+    /// contexts.</summary>
+    public void SetTileInfo(int tileColumns, int tileRows)
+    {
+        int sbCols = (MiCols + MibSize - 1) >> MibSizeLog2, sbRows = (MiRows + MibSize - 1) >> MibSizeLog2;
+        // av1_get_tile_limits
+        int sbSizeLog2 = MibSizeLog2 + 2;
+        MaxWidthSb = MAX_TILE_WIDTH >> sbSizeLog2;
+        int maxTileAreaSb = MAX_TILE_AREA >> (2 * sbSizeLog2);
+        MinLog2Cols = TileLog2(MaxWidthSb, sbCols);
+        MaxLog2Cols = TileLog2(1, Math.Min(sbCols, MAX_TILE_COLS));
+        MaxLog2Rows = TileLog2(1, Math.Min(sbRows, MAX_TILE_ROWS));
+        MinLog2 = TileLog2(maxTileAreaSb, sbCols * sbRows);
+        MinLog2 = Math.Max(MinLog2, MinLog2Cols);
+        // configure tile columns
+        Log2Cols = Math.Max(tileColumns, MinLog2Cols);
+        int minLog2Cols = 0;
+        for (; (MaxWidthSb << minLog2Cols) <= sbCols; ++minLog2Cols) { }
+        Log2Cols = Math.Max(Log2Cols, minLog2Cols);
+        Log2Cols = Math.Min(Log2Cols, MaxLog2Cols);
+        // av1_calculate_tile_cols (uniform spacing)
+        int sizeSb = (sbCols + (1 << Log2Cols) - 1) >> Log2Cols;
+        var colStart = new System.Collections.Generic.List<int>();
+        for (int startSb = 0; startSb < sbCols; startSb += sizeSb) colStart.Add(startSb);
+        TileCols = colStart.Count;
+        colStart.Add(sbCols);
+        ColStartSb = colStart.ToArray();
+        MinLog2Rows = Math.Max(MinLog2 - Log2Cols, 0);
+        // configure tile rows
+        Log2Rows = Math.Max(tileRows, MinLog2Rows);
+        Log2Rows = Math.Min(Log2Rows, MaxLog2Rows);
+        // av1_calculate_tile_rows
+        sizeSb = (sbRows + (1 << Log2Rows) - 1) >> Log2Rows;
+        var rowStart = new System.Collections.Generic.List<int>();
+        for (int startSb = 0; startSb < sbRows; startSb += sizeSb) rowStart.Add(startSb);
+        TileRows = rowStart.Count;
+        rowStart.Add(sbRows);
+        RowStartSb = rowStart.ToArray();
+
+        // av1_alloc_above_context_buffer: one set of above contexts per tile row, aligned to the superblock size
+        int alignedMiCols = (MiCols + 31) & ~31;
+        AboveEntropy = new byte[TileRows][][];
+        AbovePartition = new byte[TileRows][];
+        AboveTxfm = new byte[TileRows][];
+        for (int r = 0; r < TileRows; r++)
+        {
+            AboveEntropy[r] = new byte[3][];
+            for (int p = 0; p < 3; p++) AboveEntropy[r][p] = new byte[alignedMiCols];
+            AbovePartition[r] = new byte[alignedMiCols];
+            AboveTxfm[r] = new byte[alignedMiCols];
+        }
+    }
+
+    /// <summary>av1_tile_init (av1_tile_set_row / av1_tile_set_col).</summary>
+    public AomTileInfo TileInit(int row, int col) => new()
+    {
+        TileRow = row, TileCol = col,
+        MiRowStart = RowStartSb[row] << MibSizeLog2, MiRowEnd = Math.Min(RowStartSb[row + 1] << MibSizeLog2, MiRows),
+        MiColStart = ColStartSb[col] << MibSizeLog2, MiColEnd = Math.Min(ColStartSb[col + 1] << MibSizeLog2, MiCols),
+    };
+
+    /// <summary>av1_zero_above_context for the tile columns [miColStart, miColEnd) of a tile row.</summary>
+    public void ZeroAboveContext(int miColStart, int miColEnd, int tileRow)
+    {
+        int width = miColEnd - miColStart;
+        int alignedWidth = (width + MibSize - 1) & ~(MibSize - 1);
+        int offsetY = miColStart, widthY = alignedWidth;
+        int offsetUv = offsetY >> SsX, widthUv = widthY >> SsX;
+        var e = AboveEntropy[tileRow];
+        Array.Clear(e[0], offsetY, widthY);
+        if (NumPlanes > 1)
+        {
+            Array.Clear(e[1], offsetUv, widthUv);
+            Array.Clear(e[2], offsetUv, widthUv);
+        }
+        Array.Clear(AbovePartition[tileRow], miColStart, alignedWidth);
+        Array.Fill(AboveTxfm[tileRow], (byte)TxSizeWide[TX_64X64], miColStart, alignedWidth);
+    }
+}
+
+/// <summary>TileInfo (av1/common/tile_common.h).</summary>
+internal sealed class AomTileInfo
+{
+    public int MiRowStart, MiRowEnd, MiColStart, MiColEnd, TileRow, TileCol;
+
+    public int SbRows(AomCommon cm) => (MiRowEnd - MiRowStart + cm.MibSize - 1) >> cm.MibSizeLog2;   // av1_get_sb_rows_in_tile
+    public int SbCols(AomCommon cm) => (MiColEnd - MiColStart + cm.MibSize - 1) >> cm.MibSizeLog2;   // av1_get_sb_cols_in_tile
 }

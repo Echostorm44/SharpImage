@@ -918,7 +918,7 @@ internal static partial class AomEncodeFrame
         SetupBlockRdmult(cpi, x, miRow, miCol, bsize);
         bestRdc.CostUpdate(x.Rdmult);
 
-        xd.AboveTxfmContext = cm.AboveTxfm;
+        xd.AboveTxfmContext = cm.AboveTxfm[xd.TileRow];
         xd.AboveTxfmContextOffset = miCol;
         xd.LeftTxfmContextOffset = miRow & MAX_MIB_MASK;
         SaveContext(x, xCtx, miRow, miCol, bsize, numPlanes);

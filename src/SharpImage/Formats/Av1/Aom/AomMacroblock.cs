@@ -11,8 +11,8 @@ internal sealed partial class AomMacroblockD
     public int MiStride;
     public bool IsChromaRef;
     public readonly AomMbdPlane[] Plane = { new(), new(), new() };
-    // tile (TileInfo): mi bounds
-    public int TileMiRowStart, TileMiRowEnd, TileMiColStart, TileMiColEnd;
+    // tile (xd->tile, TileInfo): mi bounds and position
+    public int TileMiRowStart, TileMiRowEnd, TileMiColStart, TileMiColEnd, TileRow, TileCol;
     // mi grid: xd->mi = &mi_grid[mi_row * stride + mi_col]; Mi0 = xd->mi[0]
     public AomMbModeInfo?[] MiGrid = Array.Empty<AomMbModeInfo?>();
     public int MiOffset;
@@ -38,6 +38,21 @@ internal sealed partial class AomMacroblockD
     public readonly int[] Lossless = new int[8];
     public int CurrentBaseQindex;
     public readonly AomCflCtx Cfl = new();
+
+    /// <summary>xd->tile = *tile.</summary>
+    public void SetTile(AomTileInfo t)
+    {
+        TileMiRowStart = t.MiRowStart; TileMiRowEnd = t.MiRowEnd; TileMiColStart = t.MiColStart; TileMiColEnd = t.MiColEnd;
+        TileRow = t.TileRow; TileCol = t.TileCol;
+    }
+
+    /// <summary>av1_init_above_context: the tile row's above context arrays.</summary>
+    public void InitAboveContext(AomCommon cm, int tileRow)
+    {
+        for (int i = 0; i < cm.NumPlanes; ++i) AboveEntropyContext[i] = cm.AboveEntropy[tileRow][i];
+        AbovePartitionContext = cm.AbovePartition[tileRow];
+        AboveTxfmContext = cm.AboveTxfm[tileRow];
+    }
 
     /// <summary>The MB_MODE_INFO at (row, col) mi offset from the current block's top-left.</summary>
     public AomMbModeInfo? MiAt(int dr, int dc) => MiGrid[MiOffset + dr * MiStride + dc];

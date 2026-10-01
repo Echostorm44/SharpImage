@@ -103,19 +103,19 @@ internal static class AomVarBasedPart
         // On the right and bottom boundary only half the bsize needs to fit (the boundary is extended up to 64): 64x64 SBs
         if (cm.SbSize == BLOCK_64X64)
         {
-            if (cm.TileMiColEnd == cm.MiCols)
+            if (xd.TileMiColEnd == cm.MiCols)
             {
                 bsWidthCheck = (blockWidth >> 1) + 1;
                 bsWidthVertCheck = (blockWidth >> 2) + 1;
             }
-            if (cm.TileMiRowEnd == cm.MiRows)
+            if (xd.TileMiRowEnd == cm.MiRows)
             {
                 bsHeightCheck = (blockHeight >> 1) + 1;
                 bsHeightHorizCheck = (blockHeight >> 2) + 1;
             }
         }
 
-        if (miCol + bsWidthCheck <= cm.TileMiColEnd && miRow + bsHeightCheck <= cm.TileMiRowEnd && forceSplit == PART_EVAL_ONLY_NONE)
+        if (miCol + bsWidthCheck <= xd.TileMiColEnd && miRow + bsHeightCheck <= xd.TileMiRowEnd && forceSplit == PART_EVAL_ONLY_NONE)
         {
             SetBlockSize(cm, miRow, miCol, bsize);
             return true;
@@ -125,7 +125,7 @@ internal static class AomVarBasedPart
         if (bsize == bsizeMin)
         {
             GetVariance(ref vt.None);   // frame_is_intra_only
-            if (miCol + bsWidthCheck <= cm.TileMiColEnd && miRow + bsHeightCheck <= cm.TileMiRowEnd && vt.None.Variance < threshold)
+            if (miCol + bsWidthCheck <= xd.TileMiColEnd && miRow + bsHeightCheck <= xd.TileMiRowEnd && vt.None.Variance < threshold)
             {
                 SetBlockSize(cm, miRow, miCol, bsize);
                 return true;
@@ -138,13 +138,13 @@ internal static class AomVarBasedPart
             // For key frame: take split for bsize above 32X32 or very high variance.
             if (bsize > BLOCK_32X32 || vt.None.Variance > (threshold << 4)) return false;
             // If variance is low, take the bsize (no split).
-            if (miCol + bsWidthCheck <= cm.TileMiColEnd && miRow + bsHeightCheck <= cm.TileMiRowEnd && vt.None.Variance < threshold)
+            if (miCol + bsWidthCheck <= xd.TileMiColEnd && miRow + bsHeightCheck <= xd.TileMiRowEnd && vt.None.Variance < threshold)
             {
                 SetBlockSize(cm, miRow, miCol, bsize);
                 return true;
             }
             // Check vertical split.
-            if (miRow + bsHeightCheck <= cm.TileMiRowEnd && miCol + bsWidthVertCheck <= cm.TileMiColEnd)
+            if (miRow + bsHeightCheck <= xd.TileMiRowEnd && miCol + bsWidthVertCheck <= xd.TileMiColEnd)
             {
                 int subsize = AomEncodeFrame.PartitionSubsize(bsize, PARTITION_VERT);
                 int planeBsize = AomEncodeMb.PlaneBlockSize(subsize, xd.Plane[1].SubsamplingX, xd.Plane[1].SubsamplingY);
@@ -158,7 +158,7 @@ internal static class AomVarBasedPart
                 }
             }
             // Check horizontal split.
-            if (miCol + bsWidthCheck <= cm.TileMiColEnd && miRow + bsHeightHorizCheck <= cm.TileMiRowEnd)
+            if (miCol + bsWidthCheck <= xd.TileMiColEnd && miRow + bsHeightHorizCheck <= xd.TileMiRowEnd)
             {
                 int subsize = AomEncodeFrame.PartitionSubsize(bsize, PARTITION_HORZ);
                 int planeBsize = AomEncodeMb.PlaneBlockSize(subsize, xd.Plane[1].SubsamplingX, xd.Plane[1].SubsamplingY);
@@ -362,7 +362,7 @@ internal static class AomVarBasedPart
             GetVariance(ref vt.V128.None);
         }
 
-        if (miCol + 32 > cm.TileMiColEnd || miRow + 32 > cm.TileMiRowEnd ||
+        if (miCol + 32 > xd.TileMiColEnd || miRow + 32 > xd.TileMiRowEnd ||
             !SetVtPartitioning(cpi, xd, vt.V128, BLOCK_128X128, miRow, miCol, thresholds[0], BLOCK_16X16, forceSplit[0]))
         {
             for (int blk64Idx = 0; blk64Idx < num64x64Blocks; ++blk64Idx)

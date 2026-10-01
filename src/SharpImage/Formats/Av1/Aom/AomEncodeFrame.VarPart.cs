@@ -10,7 +10,7 @@ internal static partial class AomEncodeFrame
 {
     private static void SetTxfmContextOffsets(AomCommon cm, AomMacroblockD xd, int miRow, int miCol)
     {
-        xd.AboveTxfmContext = cm.AboveTxfm;
+        xd.AboveTxfmContext = cm.AboveTxfm[xd.TileRow];
         xd.AboveTxfmContextOffset = miCol;
         xd.LeftTxfmContextOffset = miRow & MAX_MIB_MASK;
     }
@@ -202,7 +202,7 @@ internal static partial class AomEncodeFrame
     {
         var cm = cpi.Cm;
         // only needed for row-MT encoding with the cost update frequency off / tile
-        AomRowMt.WaitForTopRightSb(cpi, bsize, miRow, miCol);
+        AomRowMt.WaitForTopRightSb(cpi, x, bsize, miRow, miCol);
         // For nonrd mode, av1_set_offsets is already called at the superblock level in encode_nonrd_sb.
         if (bsize != cm.SbSize || cpi.Sf.rt_sf.nonrd_check_partition_split == 1) SetOffsets(cpi, x, miRow, miCol, bsize);
         int numPlanes = cm.NumPlanes;
