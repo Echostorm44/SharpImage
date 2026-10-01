@@ -62,9 +62,8 @@ internal sealed class AomRestorationInfo
 
 /// <summary>Port of libaom av1/common/restoration.c (8-bit), the Wiener convolution of convolve.c
 /// (av1_wiener_convolve_add_src_c) and the self-guided filter: filtering one restoration unit stripe by stripe with the
-/// saved boundary lines, applying the whole frame, and saving the boundary lines. The C kernels are ported; libaom's
-/// dispatched AVX2/SSE kernels (av1_wiener_convolve_add_src_avx2, av1_selfguided_restoration_avx2,
-/// av1_apply_selfguided_restoration_avx2) are bit-exact with them (twin-verified).</summary>
+/// saved boundary lines, applying the whole frame, and saving the boundary lines. The C kernels (the *C methods) are
+/// the reference and non-AVX2 fallback; the dispatched entry points run the AVX2 ports in AomRestoration.Simd.cs.</summary>
 internal static partial class AomRestoration
 {
     public const int RestoreNone = 0, RestoreWiener = 1, RestoreSgrproj = 2, RestoreSwitchable = 3;

@@ -80,10 +80,11 @@ internal sealed class AomLoopFilterParams
 }
 
 /// <summary>Port of libaom av1/common/av1_loopfilter.c + thread_common.c's single-threaded frame driver
-/// (av1_loop_filter_frame_mt with one worker): the per-plane, per-SB-row vertical-then-horizontal edge walk with
-/// set_lpf_parameters (the lpf_opt_level = 0 path; the dual/quad "opt" paths libaom takes at lpf_opt_level 1/2 produce
-/// the same frame, twin-verified). Delta-LF and segmentation loop-filter features are not ported (the all-intra
-/// encoder leaves them off).</summary>
+/// (av1_loop_filter_frame_mt with one worker): the per-plane, per-SB-row vertical-then-horizontal edge walk, either
+/// per edge with set_lpf_parameters (lpf_opt_level 0) or per line with set_lpf_parameters_for_line_* and the dual/quad
+/// kernels (av1_filter_block_plane_*_opt, lpf_opt_level 1; 2 also filters U and V jointly), calling the vectorized
+/// aom_lpf kernels (AomLpf.Horizontal / Vertical). Delta-LF and segmentation loop-filter features are not ported (the
+/// all-intra encoder leaves them off).</summary>
 internal sealed class AomLoopFilter
 {
     private const int MaxMibSize = 32, MaxMibSizeLog2 = 5, MiSize = 4, MaxSegments = 8, RefFrames = 8, MaxModeLfDeltas = 2;
