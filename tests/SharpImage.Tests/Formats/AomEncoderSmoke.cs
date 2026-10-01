@@ -92,8 +92,6 @@ public sealed class AomEncoderSmoke
         double se = 0;
         for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) { int d = rec.Buffers[0][rec.Offsets[0] + r * rec.Strides[0] + c] - y[r * w + c]; se += d * d; }
         double psnr = 10 * Math.Log10(255.0 * 255 / (se / (w * h)));
-        { var xc = AomEncodeMb.XfCount; long tot = xc.Sum(v => (long)v); var lst = Enumerable.Range(0, xc.Length).OrderByDescending(i => xc[i]).Where(i => xc[i] > 0);
-          foreach (var i in lst) Console.WriteLine($"xf tx {i / 16} type {i % 16}: {xc[i]} {100.0 * xc[i] / tot:F1}%"); }
         Console.WriteLine($"smoke: luma PSNR {psnr:F2}");
         string? outPath = Environment.GetEnvironmentVariable("AOM_SMOKE_OUT");
         if (outPath != null) File.WriteAllText(outPath, Dump(cpi));

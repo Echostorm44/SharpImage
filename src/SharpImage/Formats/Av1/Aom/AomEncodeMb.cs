@@ -266,13 +266,11 @@ internal static class AomEncodeMb
             Fwht4x4(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, p.Coeff.AsSpan(BlockOffset(block), 16));
             return;
         }
-        System.Threading.Interlocked.Increment(ref XfCount[txSize * 16 + txType]);
         TxTypeKinds(txType, out int hKind, out int vKind, out bool flipUd, out bool flipLr);
         Av1FwdTxfmAom.ForwardRaw(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
             txSize, hKind, vKind, flipUd, flipLr, p.Coeff.AsSpan(BlockOffset(block), MaxEob(txSize)));
     }
 
-    public static readonly int[] XfCount = new int[19 * 16];
     private const int UnitQuantShift = 2, UnitQuantFactor = 1 << UnitQuantShift;
 
     /// <summary>av1_fwht4x4_c: the 4-point reversible Walsh-Hadamard forward transform (lossless), scaled by UNIT_QUANT_FACTOR.</summary>
