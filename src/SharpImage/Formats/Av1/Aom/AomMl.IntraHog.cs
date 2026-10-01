@@ -24,6 +24,18 @@ internal static partial class AomMl
     internal static int GetHistBinIdx(int dx, int dy)
     {
         int ratio = unchecked(dy * (1 << 16)) / dx;
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            // the first bin whose threshold is >= ratio = the count of thresholds below it (they ascend, the last is
+            // INT32_MAX): libaom's bisection result, without its data-dependent branches
+            var r = System.Runtime.Intrinsics.Vector256.Create(ratio);
+            ref int t0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(HistBinThresholds);
+            uint m0 = System.Runtime.Intrinsics.Vector256.ExtractMostSignificantBits(System.Runtime.Intrinsics.Vector256.LessThan(System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref t0), r));
+            uint m1 = System.Runtime.Intrinsics.Vector256.ExtractMostSignificantBits(System.Runtime.Intrinsics.Vector256.LessThan(System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref t0, 8), r));
+            uint m2 = System.Runtime.Intrinsics.Vector256.ExtractMostSignificantBits(System.Runtime.Intrinsics.Vector256.LessThan(System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref t0, 16), r));
+            uint m3 = System.Runtime.Intrinsics.Vector256.ExtractMostSignificantBits(System.Runtime.Intrinsics.Vector256.LessThan(System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref t0, 24), r));
+            return System.Numerics.BitOperations.PopCount(m0 | (m1 << 8) | (m2 << 16) | (m3 << 24));
+        }
         int lo, hi;
         if (ratio <= HistBinThresholds[7]) { lo = 0; hi = 7; }
         else if (ratio <= HistBinThresholds[15]) { lo = 8; hi = 15; }
