@@ -24,6 +24,12 @@ internal sealed class AomEncodeInput
 // Port of libaom 3.14.1 av1_encode_frame / encode_frame_internal / encode_tiles / av1_encode_tile / encode_sb_row /
 // encode_rd_sb for one all-intra key frame (one tile, no segmentation, no delta q): the search and the final encode
 // that leave the mode info, the coefficients and the reconstruction for the bitstream writer and the loop filters.
+internal sealed partial class AomComp
+{
+    // td->pc_root of the non-RD path (allocated once per frame and reused by every superblock)
+    public AomPcTree? NonrdPcRoot;
+}
+
 internal static partial class AomEncoder
 {
     internal static (AomComp cpi, AomMacroblock x) EncodeFrame(AomEncodeInput input)
@@ -47,7 +53,15 @@ internal static partial class AomEncoder
         }
 
         // av1_set_screen_content_options (anti-aliasing aware detection; the fast variant from speed 3)
-        if (input.DetectScreenContent)
+        // (non-RD pick mode without the hybrid intra search, speed 9: screen content detection is disabled and the
+        // tools stay off)
+        bool nonrdNoHybrid = input.Speed >= 9;
+        if (input.DetectScreenContent && nonrdNoHybrid)
+        {
+            input.AllowScreenContentTools = input.UseScreenContentTools = input.AllowIntrabc = input.IsScreenContentType = false;
+            cpi.AllowScreenContentTools = cpi.UseScreenContentTools = cpi.AllowIntrabc = false;
+        }
+        else if (input.DetectScreenContent)
         {
             var (sct, ibc, isSc) = EstimateScreenContent(cpi.Source, input.Speed >= 3);
             input.AllowScreenContentTools = sct;
@@ -153,6 +167,9 @@ internal static partial class AomEncoder
             AomMvCost.FillDvCosts(cm.Fc.Mv, x.DvCosts);
             cpi.MbmiExtFrameBase = new AomMbmiExtFrame?[cm.MiGridBase.Length];
         }
+
+        // encode_tiles: the real-time path preallocates one PC_TREE for the frame
+        if (cpi.Sf.rt_sf.use_nonrd_pick_mode != 0) cpi.NonrdPcRoot = new AomPcTree(cm.SbSize);
 
         // av1_encode_tile
         cm.ZeroAboveContext();
@@ -320,8 +337,10 @@ internal static partial class AomEncoder
             x.SourceVariance = uint.MaxValue;
             x.CbCoefBuff = cpi.CbCoeffBuffers[sbRow * sbCols + sbCol];
             // (produce_gradients_for_sb: the HOG is computed without the gradient cache; identical results)
+            x.ColorPaletteThresh = 64;
             x.InitSrcVarInfo(cm.SbSize);
-            EncodeRdSb(cpi, x, miRow, miCol);
+            if (cpi.Sf.rt_sf.use_nonrd_pick_mode != 0) EncodeNonrdSb(cpi, x, miRow, miCol);
+            else EncodeRdSb(cpi, x, miRow, miCol);
         }
     }
 
@@ -374,8 +393,17 @@ internal static partial class AomEncoder
         AomRdStats dummyRdc = default;
         dummyRdc.Invalidate();
 
+        if (sf.part_sf.partition_search_type == VAR_BASED_PARTITION)
+        {
+            // partition search starting from a variance-based partition
+            AomEncodeFrame.SetOffsets(cpi, x, miRow, miCol, cm.SbSize);
+            AomVarBasedPart.ChooseVarBasedPartitioning(cpi, x, miRow, miCol);
+            var root = new AomPcTree(cm.SbSize);
+            AomEncodeFrame.RdUsePartition(cpi, x, miRow, miCol, cm.SbSize, out _, out _, true, root);
+            return;
+        }
         if (sf.part_sf.partition_search_type != SEARCH_PARTITION)
-            throw new NotSupportedException("only SEARCH_PARTITION (the all-intra RD speeds) is ported");
+            throw new NotSupportedException("FIXED_PARTITION is not used by the all-intra speeds");
 
         // set_max_min_partition_size (no auto max partition for intra frames)
         x.MaxPartitionSize = Math.Min(sf.part_sf.default_max_partition_size, DimToSize(cpi.MaxPartitionSizeCfg));
@@ -386,6 +414,19 @@ internal static partial class AomEncoder
         var pcRoot = new AomPcTree(cm.SbSize);
         long noneRd = 0;
         AomEncodeFrame.RdPickPartition(cpi, x, miRow, miCol, cm.SbSize, ref dummyRdc, dummyRdc, pcRoot, ref noneRd, false, null);
+    }
+
+    /// <summary>encode_nonrd_sb (VAR_BASED_PARTITION, no segment skip, no delta q).</summary>
+    private static void EncodeNonrdSb(AomComp cpi, AomMacroblock x, int miRow, int miCol)
+    {
+        var cm = cpi.Cm;
+        // set a variance-based partition
+        AomEncodeFrame.SetOffsets(cpi, x, miRow, miCol, cm.SbSize);
+        AomVarBasedPart.ChooseVarBasedPartitioning(cpi, x, miRow, miCol);
+        x.CbOffset[0] = 0;
+        x.CbOffset[1] = 0;
+        // (skip_cdef_sb is off in the all-intra mode)
+        AomEncodeFrame.NonrdUsePartition(cpi, x, miRow, miCol, cm.SbSize, cpi.NonrdPcRoot!);
     }
 
     /// <summary>dim_to_size.</summary>
