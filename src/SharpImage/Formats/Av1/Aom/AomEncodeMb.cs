@@ -483,6 +483,22 @@ internal static class AomEncodeMb
         if (eob == 0) return;
         // av1_inv_txfm_add (lossless -> av1_inv_txfm_add_c -> highbd_inv_txfm_add_4x4_c -> av1_highbd_iwht4x4_add)
         if (lossless && txSize == TX_4X4) { IwhtAdd4x4(dqcoeff, dqOff, dst, dstOff, dstStride, eob); return; }
+        if (AomInvTxfmLbd.Supported)
+        {
+            // av1_lowbd_inv_txfm2d_add_avx2: reads at most the tx block's min(w, 32) x min(h, 32) coefficients and
+            // writes its w x h pixels (rows of exactly w bytes)
+            int w = TxSizeWide[txSize], h = TxSizeHigh[txSize];
+            if ((uint)dqOff > (uint)dqcoeff.Length || dqcoeff.Length - dqOff < MaxEob(txSize) || dstOff < 0
+                || (long)dstOff + (long)(h - 1) * dstStride + w > dst.Length)
+                throw new ArgumentOutOfRangeException(nameof(dstOff));
+            unsafe
+            {
+                fixed (int* pIn = &dqcoeff[dqOff])
+                fixed (byte* pOut = &dst[dstOff])
+                    AomInvTxfmLbd.InvTxfm2dAdd(pIn, pOut, dstStride, txType, txSize, eob);
+            }
+            return;
+        }
         Av1InvTransform.InvTxfmAdd16(dst.AsSpan(dstOff), dstStride, dqcoeff.AsSpan(dqOff, MaxEob(txSize)), eob - 1, txSize,
             Av1InvTransform.TxShift[txSize], (Av1TxType)txType, 8, preserveCoeffs: true);
     }
