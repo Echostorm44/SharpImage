@@ -38,7 +38,7 @@ internal static class AomStill
     /// <summary>Whether a frame with these parameters goes through the port.</summary>
     internal static bool Handles(int bitDepth, Av1PixelLayout layout, int width, int height)
         => Enabled && bitDepth == 8 && layout is Av1PixelLayout.I420 or Av1PixelLayout.I444 or Av1PixelLayout.I400
-           && t_speedPlus1 >= 1 && (!t_tuneIq || t_speedPlus1 <= 7) && Av1ObuWriter.PlainStill && width <= 4096 && width * height <= 4096 * 2304;
+           && t_speedPlus1 >= 1 && Av1ObuWriter.PlainStill && width <= 4096 && width * height <= 4096 * 2304;
 
     /// <summary>Encodes one frame. Planes hold samples 0..255 (ushort, the earlier encoder's plane type); chroma planes
     /// are ((w + ssX) &gt;&gt; ssX) x ((h + ssY) &gt;&gt; ssY); u / v are ignored for 4:0:0. qIdx 0 codes losslessly.</summary>
