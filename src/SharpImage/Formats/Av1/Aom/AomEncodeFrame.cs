@@ -35,10 +35,29 @@ internal sealed class AomCbCoeffBuffer
     public readonly ushort[][] Eobs = new ushort[3][];
     public readonly byte[][] EntropyCtx = new byte[3][];
 
+    public readonly int SbPixels;
+
     public AomCbCoeffBuffer(int sbPixels)
     {
+        SbPixels = sbPixels;
         for (int p = 0; p < 3; p++) { Tcoeff[p] = new int[sbPixels]; Eobs[p] = new ushort[sbPixels / 16]; EntropyCtx[p] = new byte[sbPixels / 16]; }
     }
+
+    // the frame's superblock coefficient buffers, reused across frames (cleared on reuse: as allocated)
+    private static readonly System.Collections.Concurrent.ConcurrentBag<AomCbCoeffBuffer> Pool = new();
+
+    internal static AomCbCoeffBuffer Rent(int sbPixels)
+    {
+        while (Pool.TryTake(out var b))
+        {
+            if (b.SbPixels != sbPixels) continue;   // another geometry: dropped
+            for (int p = 0; p < 3; p++) { Array.Clear(b.Tcoeff[p]); Array.Clear(b.Eobs[p]); Array.Clear(b.EntropyCtx[p]); }
+            return b;
+        }
+        return new AomCbCoeffBuffer(sbPixels);
+    }
+
+    internal static void Return(AomCbCoeffBuffer b) { if (Pool.Count < 1024) Pool.Add(b); }
 }
 
 internal sealed partial class AomComp

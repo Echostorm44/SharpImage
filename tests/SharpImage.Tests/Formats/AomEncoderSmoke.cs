@@ -73,6 +73,7 @@ public sealed class AomEncoderSmoke
         double totalMs = 0, allocMb = 0, gcMs = 0; int gcs = 0;
         for (int rep = 0; rep < reps; rep++)
         {
+            if (rep > 0) AomEncoder.ReleaseFrame(cpi);   // the previous rep's frame (as the production path releases it)
             sw.Restart();
             (cpi, x) = AomEncoder.EncodeFrame(input);
             searchMs = rep == 0 ? sw.ElapsedMilliseconds : Math.Min(searchMs, sw.ElapsedMilliseconds);
@@ -96,6 +97,7 @@ public sealed class AomEncoderSmoke
                 var (c2, x2) = AomEncoder.EncodeFrame(input);
                 AomEncoder.RunPostFilter(c2, x2);
                 AomBitstream.PackFrame(c2, new AomSequenceConfig());
+                AomEncoder.ReleaseFrame(c2);
                 double ms = System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
                 totalMs = rep == 0 ? ms : Math.Min(totalMs, ms);
                 allocMb = (GC.GetAllocatedBytesForCurrentThread() - a0) / 1048576.0; gcs = GC.CollectionCount(0) - g0; gcMs = (GC.GetTotalPauseDuration() - p0).TotalMilliseconds;

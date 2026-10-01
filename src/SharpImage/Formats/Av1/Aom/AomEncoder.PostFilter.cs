@@ -97,6 +97,8 @@ internal static partial class AomEncoder
             for (int r = 0; r < h; r++)
                 Array.Copy(pl.Buf, pl.At(0, r), cm.CurFrame.Buffers[p], cm.CurFrame.Offsets[p] + r * cm.CurFrame.Strides[p], w);
         }
+        src.Release();
+        cur.Release();
         return result;
     }
 

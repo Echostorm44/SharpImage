@@ -18,6 +18,12 @@ internal sealed class AomFrameBuffer
     public readonly int[] CropWidths = new int[2], CropHeights = new int[2];
     public readonly int SsX, SsY, NumPlanes;
 
+    /// <summary>Gives the planes back to AomBufferPool (the frame is unusable afterwards).</summary>
+    public void Release()
+    {
+        for (int p = 0; p < 3; p++) { AomBufferPool.Return(Buffers[p]); AomBufferPool.Return(Buffers16[p]); Buffers[p] = null!; Buffers16[p] = null!; }
+    }
+
     public AomFrameBuffer(int width, int height, int ssX, int ssY, bool monochrome, int bitDepth = 8)
     {
         SsX = ssX; SsY = ssY;
@@ -33,8 +39,8 @@ internal sealed class AomFrameBuffer
             int border = Border >> sx, borderY = Border >> sy;
             int w = (alignedW >> sx) + 2 * border, h = (alignedH >> sy) + 2 * borderY;
             Strides[p] = (w + 31) & ~31;
-            if (bitDepth > 8) Buffers16[p] = new ushort[Strides[p] * h];
-            else Buffers[p] = new byte[Strides[p] * h];
+            if (bitDepth > 8) Buffers16[p] = AomBufferPool.Rent<ushort>(Strides[p] * h);
+            else Buffers[p] = AomBufferPool.Rent<byte>(Strides[p] * h);
             Offsets[p] = borderY * Strides[p] + border;
         }
     }
@@ -84,16 +90,24 @@ internal sealed class AomCommon
         MiRows = ((height + 7) & ~7) >> 2;
         MiStride = (MiCols + 31) & ~31;   // calc_mi_size: aligned to MAX_MIB_SIZE
         int alignedRows = (MiRows + 31) & ~31;
-        MiGridBase = new AomMbModeInfo?[MiStride * alignedRows];
+        MiGridBase = AomBufferPool.Rent<AomMbModeInfo?>(MiStride * alignedRows);
         MiAlloc = new AomMbModeInfo[MiStride * alignedRows];
         for (int i = 0; i < MiAlloc.Length; i++) MiAlloc[i] = new AomMbModeInfo();
-        TxTypeMap = new byte[MiStride * alignedRows];
+        TxTypeMap = AomBufferPool.Rent<byte>(MiStride * alignedRows);
         CurFrame = new AomFrameBuffer(width, height, ssX, ssY, monochrome, bitDepth);
         int alignedMiCols = (MiCols + 31) & ~31;
         for (int p = 0; p < 3; p++) AboveEntropy[p] = new byte[alignedMiCols];
         AbovePartition = new byte[alignedMiCols];
         AboveTxfm = new byte[alignedMiCols];
         TileMiRowStart = 0; TileMiRowEnd = MiRows; TileMiColStart = 0; TileMiColEnd = MiCols;
+    }
+
+    /// <summary>Gives the mi grid, the tx type map and the reconstruction back to AomBufferPool (unusable afterwards).</summary>
+    public void Release()
+    {
+        AomBufferPool.Return(MiGridBase);
+        AomBufferPool.Return(TxTypeMap);
+        CurFrame.Release();
     }
 
     /// <summary>av1_zero_above_context (whole tile width).</summary>

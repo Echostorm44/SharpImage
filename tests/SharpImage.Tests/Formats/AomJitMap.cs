@@ -17,11 +17,27 @@ internal sealed class AomJitMap : EventListener
     protected override void OnEventSourceCreated(EventSource source)
     {
         if (source.Name == "Microsoft-Windows-DotNETRuntime")
-            EnableEvents(source, EventLevel.Verbose, (EventKeywords)0x10);   // JitKeyword: MethodLoadVerbose
+            EnableEvents(source, EventLevel.Verbose, (EventKeywords)(0x10 | (Environment.GetEnvironmentVariable("AOM_SMOKE_ALLOCS") != null ? 0x1 : 0)));   // Jit (+ GC: AllocationTick)
     }
+
+    private readonly Dictionary<string, long> _allocs = new();
 
     protected override void OnEventWritten(EventWrittenEventArgs e)
     {
+        if (e.EventName != null && e.EventName.StartsWith("GCAllocationTick") && e.Payload != null && e.PayloadNames != null)
+        {
+            int it = e.PayloadNames.IndexOf("TypeName"), ia = e.PayloadNames.IndexOf("AllocationAmount64"), ik = e.PayloadNames.IndexOf("AllocationKind"),
+                isz = e.PayloadNames.IndexOf("ObjectSize");
+            if (it >= 0 && ia >= 0)
+                lock (_allocs)
+                {
+                    string kind = ik >= 0 && Convert.ToInt32(e.Payload[ik]) == 1 ? "LOH " : "";
+                    string osz = kind.Length > 0 && isz >= 0 ? $" (object {Convert.ToInt64(e.Payload[isz])})" : "";
+                    string k = kind + (string)e.Payload[it]! + osz;
+                    _allocs[k] = _allocs.GetValueOrDefault(k) + Convert.ToInt64(e.Payload[ia]);
+                }
+            return;
+        }
         if (e.EventName == null || !e.EventName.StartsWith("MethodLoadVerbose") || e.Payload == null) return;
         int iStart = e.PayloadNames!.IndexOf("MethodStartAddress"), iSize = e.PayloadNames.IndexOf("MethodSize"),
             iNs = e.PayloadNames.IndexOf("MethodNamespace"), iName = e.PayloadNames.IndexOf("MethodName"),
@@ -41,6 +57,8 @@ internal sealed class AomJitMap : EventListener
             foreach (System.Diagnostics.ProcessModule m in System.Diagnostics.Process.GetCurrentProcess().Modules)
                 _lines.Add($"{(ulong)m.BaseAddress:x} {m.ModuleMemorySize:x} module:{m.ModuleName}");
             File.WriteAllLines(path, _lines);
+            if (_allocs.Count > 0)
+                File.WriteAllLines(path + ".allocs", _allocs.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Value / 1048576.0:F1} MB  {kv.Key}"));
         }
     }
 }

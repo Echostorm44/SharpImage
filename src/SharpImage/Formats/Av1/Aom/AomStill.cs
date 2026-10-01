@@ -72,7 +72,9 @@ internal static class AomStill
             ColorPrimaries = c.Primaries, TransferCharacteristics = c.Transfer, MatrixCoefficients = c.Matrix,
             ColorRange = c.FullRange ? 1 : 0, FilmGrain = Av1ObuWriter.ActiveFilmGrain, ChromaSamplePosition = layout == Av1PixelLayout.I420 ? Av1ObuWriter.ChromaSamplePosition : 0,
         };
-        return SplitPacket(AomBitstream.PackFrame(cpi, seqCfg));
+        var packet = AomBitstream.PackFrame(cpi, seqCfg);
+        AomEncoder.ReleaseFrame(cpi);
+        return SplitPacket(packet);
     }
 
     private static byte[] Narrow(ReadOnlySpan<ushort> src, int n)

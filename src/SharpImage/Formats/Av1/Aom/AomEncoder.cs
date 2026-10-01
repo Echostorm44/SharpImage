@@ -153,8 +153,8 @@ internal static partial class AomEncoder
         int sbPixels = 1 << NumPelsLog2Lookup[cm.SbSize];
         int sbCols = (cm.MiCols + cm.MibSize - 1) >> cm.MibSizeLog2, sbRows = (cm.MiRows + cm.MibSize - 1) >> cm.MibSizeLog2;
         cpi.CbCoeffBuffers = new AomCbCoeffBuffer[sbRows * sbCols];
-        for (int i = 0; i < cpi.CbCoeffBuffers.Length; i++) cpi.CbCoeffBuffers[i] = new AomCbCoeffBuffer(sbPixels);
-        cpi.ExtCbOffset = new int[cm.MiGridBase.Length * 2];
+        for (int i = 0; i < cpi.CbCoeffBuffers.Length; i++) cpi.CbCoeffBuffers[i] = AomCbCoeffBuffer.Rent(sbPixels);
+        cpi.ExtCbOffset = AomBufferPool.Rent<int>(cm.MiGridBase.Length * 2);
 
         // encode_frame_internal's intrabc setup: allow_intrabc &= enable_intrabc, the source hash table (av1_use_hash_me),
         // the full-pel search sites / step (init_motion_estimation, av1_set_mv_search_params)
@@ -499,6 +499,17 @@ internal static partial class AomEncoder
             if (sbRow % numSbRowsPerUpdate != 0) return true;
         }
         return false;
+    }
+
+    /// <summary>After the frame is packed: its large per-frame arrays back to AomBufferPool (cpi is unusable afterwards).</summary>
+    internal static void ReleaseFrame(AomComp cpi)
+    {
+        cpi.Source?.Release();
+        cpi.Cm.Release();
+        AomBufferPool.Return(cpi.ExtCbOffset);
+        cpi.ExtCbOffset = Array.Empty<int>();
+        foreach (var b in cpi.CbCoeffBuffers) AomCbCoeffBuffer.Return(b);
+        cpi.CbCoeffBuffers = Array.Empty<AomCbCoeffBuffer>();
     }
 
     /// <summary>encode_rd_sb (SEARCH_PARTITION, single pass).</summary>

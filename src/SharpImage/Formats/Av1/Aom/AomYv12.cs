@@ -25,9 +25,12 @@ internal sealed class AomYv12Plane
         Border = border;
         Stride = (width + 2 * border + 31) & ~31;
         Origin = border * Stride + border;
-        if (hbd) Buf16 = new ushort[Stride * (height + 2 * border)];
-        else Buf = new byte[Stride * (height + 2 * border)];
+        if (hbd) Buf16 = AomBufferPool.Rent<ushort>(Stride * (height + 2 * border));
+        else Buf = AomBufferPool.Rent<byte>(Stride * (height + 2 * border));
     }
+
+    /// <summary>Gives the buffer back to AomBufferPool (the plane is unusable afterwards).</summary>
+    public void Release() { AomBufferPool.Return(Buf); AomBufferPool.Return(Buf16); }
 
     /// <summary>Index of sample (x, y) (either may be negative, into the border).</summary>
     public int At(int x, int y) => Origin + y * Stride + x;
@@ -87,6 +90,9 @@ internal sealed class AomYv12
         for (int p = 1; p < numPlanes; p++)
             Planes[p] = new AomYv12Plane(aw >> ssX, ah >> ssY, (width + ssX) >> ssX, (height + ssY) >> ssY, border, bitDepth > 8) { BitDepth = bitDepth };
     }
+
+    /// <summary>Gives every plane's buffer back to AomBufferPool (the frame is unusable afterwards).</summary>
+    public void Release() { foreach (var p in Planes) p.Release(); }
 
     public AomYv12 CloneGeometry() => new(Width, Height, SsX, SsY, NumPlanes, Planes[0].Border, BitDepth);
 
