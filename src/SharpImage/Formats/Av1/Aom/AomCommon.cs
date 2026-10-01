@@ -9,14 +9,19 @@ internal sealed class AomFrameBuffer
     public const int Border = 288;   // AOM_BORDER_IN_PIXELS (libaom's encoder allocates 288 for all-intra; only in-frame
                                      // pixels are ever read by the intra search)
     public readonly byte[][] Buffers = new byte[3][];
+    /// <summary>High bit depth (BitDepth &gt; 8) planes (CONVERT_TO_SHORTPTR buffers); Buffers' entries stay null then.</summary>
+    public readonly ushort[][] Buffers16 = new ushort[3][];
+    public readonly int BitDepth;
+    public bool Hbd => BitDepth > 8;
     public readonly int[] Offsets = new int[3];   // index of the (0, 0) sample in Buffers[p]
     public readonly int[] Strides = new int[3];
     public readonly int[] CropWidths = new int[2], CropHeights = new int[2];
     public readonly int SsX, SsY, NumPlanes;
 
-    public AomFrameBuffer(int width, int height, int ssX, int ssY, bool monochrome)
+    public AomFrameBuffer(int width, int height, int ssX, int ssY, bool monochrome, int bitDepth = 8)
     {
         SsX = ssX; SsY = ssY;
+        BitDepth = bitDepth;
         NumPlanes = monochrome ? 1 : 3;
         CropWidths[0] = width; CropHeights[0] = height;
         CropWidths[1] = (width + ssX) >> ssX; CropHeights[1] = (height + ssY) >> ssY;
@@ -28,7 +33,8 @@ internal sealed class AomFrameBuffer
             int border = Border >> sx, borderY = Border >> sy;
             int w = (alignedW >> sx) + 2 * border, h = (alignedH >> sy) + 2 * borderY;
             Strides[p] = (w + 31) & ~31;
-            Buffers[p] = new byte[Strides[p] * h];
+            if (bitDepth > 8) Buffers16[p] = new ushort[Strides[p] * h];
+            else Buffers[p] = new byte[Strides[p] * h];
             Offsets[p] = borderY * Strides[p] + border;
         }
     }
@@ -64,8 +70,11 @@ internal sealed class AomCommon
     public bool UsingQmatrix;
     public int QmLevelY = 15, QmLevelU = 15, QmLevelV = 15;
 
-    public AomCommon(int width, int height, int ssX, int ssY, bool monochrome, int sbSize = BLOCK_64X64)
+    public readonly int BitDepth;
+
+    public AomCommon(int width, int height, int ssX, int ssY, bool monochrome, int sbSize = BLOCK_64X64, int bitDepth = 8)
     {
+        BitDepth = bitDepth;
         SbSize = sbSize;
         MibSize = MiSizeWide[sbSize];
         MibSizeLog2 = MiSizeWideLog2[sbSize];
@@ -79,7 +88,7 @@ internal sealed class AomCommon
         MiAlloc = new AomMbModeInfo[MiStride * alignedRows];
         for (int i = 0; i < MiAlloc.Length; i++) MiAlloc[i] = new AomMbModeInfo();
         TxTypeMap = new byte[MiStride * alignedRows];
-        CurFrame = new AomFrameBuffer(width, height, ssX, ssY, monochrome);
+        CurFrame = new AomFrameBuffer(width, height, ssX, ssY, monochrome, bitDepth);
         int alignedMiCols = (MiCols + 31) & ~31;
         for (int p = 0; p < 3; p++) AboveEntropy[p] = new byte[alignedMiCols];
         AbovePartition = new byte[alignedMiCols];

@@ -92,8 +92,8 @@ internal static class AomBitstream
         {
             Cpi = cpi; Cm = cpi.Cm; SeqCfg = seqCfg;
             var cm = Cm;
-            // profile: 0 for 4:2:0 / monochrome, 1 for 4:4:4, 2 otherwise (8-bit)
-            Profile = cm.Monochrome || (cm.SsX == 1 && cm.SsY == 1) ? 0 : (cm.SsX == 0 && cm.SsY == 0) ? 1 : 2;
+            // profile: 0 for 4:2:0 / monochrome, 1 for 4:4:4, 2 otherwise (8 / 10-bit); 12-bit is profile 2 only
+            Profile = cm.BitDepth == 12 ? 2 : cm.Monochrome || (cm.SsX == 1 && cm.SsY == 1) ? 0 : (cm.SsX == 0 && cm.SsY == 0) ? 1 : 2;
             SeqLevelIdx = BitstreamLevel(cm.Width, cm.Height, seqCfg.FrameRate);
             NumBitsWidth = cm.Width > 1 ? MostSignificantBit(cm.Width - 1) + 1 : 1;
             NumBitsHeight = cm.Height > 1 ? MostSignificantBit(cm.Height - 1) + 1 : 1;
@@ -216,12 +216,14 @@ internal static class AomBitstream
         return wb.ToArray();
     }
 
-    /// <summary>write_color_config (8-bit).</summary>
+    /// <summary>write_color_config.</summary>
     private static void WriteColorConfig(FrameState f, AomWriteBitBuffer wb)
     {
         var c = f.SeqCfg;
         var cm = f.Cm;
-        wb.WriteBit(0);                                    // write_bitdepth: 8-bit
+        // write_bitdepth: profile 0 / 1: [0] 8-bit, [1] 10-bit; profile 2: [0] 8-bit, [10] 10-bit, [11] 12-bit
+        wb.WriteBit(cm.BitDepth == 8 ? 0 : 1);
+        if (f.Profile == 2 && cm.BitDepth != 8) wb.WriteBit(cm.BitDepth == 10 ? 0 : 1);
         if (f.Profile != 1) wb.WriteBit(cm.Monochrome ? 1 : 0);
         if (c.ColorPrimaries == 2 && c.TransferCharacteristics == 2 && c.MatrixCoefficients == 2) wb.WriteBit(0);
         else
@@ -240,7 +242,12 @@ internal static class AomBitstream
         else
         {
             wb.WriteBit(c.ColorRange);
-            // profile 2 (8-bit) is 4:2:2 only: no subsampling bits
+            // profile 2: 12-bit codes its subsampling (4:2:0 / 4:2:2 / 4:4:4); 8 / 10-bit is 4:2:2 only
+            if (f.Profile == 2 && cm.BitDepth == 12)
+            {
+                wb.WriteBit(cm.SsX);
+                if (cm.SsX != 0) wb.WriteBit(cm.SsY);
+            }
             if (cm.SsX == 1 && cm.SsY == 1) wb.WriteLiteral(c.ChromaSamplePosition, 2);
         }
         wb.WriteBit(0);                                    // separate_uv_delta_q

@@ -150,6 +150,17 @@ internal static class AomIntraModeSearch
             {
                 AomReconIntra.PredictIntraBlockFacade(xd, cpi.SbSize, cpi.EnableIntraEdgeFilter, plane, col, row, txSize);
                 // src_diff / coeff are scratch here: written at offset 0 for every tx block
+                if (p.Src.Buf16 != null)
+                {
+                    AomHbd.SubtractBlock(txbh, txbw, p.SrcDiff, 0, diffStride,
+                        p.Src.Buf16, p.Src.Offset + ((row * p.Src.Stride + col) << 2), p.Src.Stride,
+                        pd.Dst.Buf16, pd.Dst.Offset + ((row * pd.Dst.Stride + col) << 2), pd.Dst.Stride);
+                    if (useHadamard) AomHbd.WhtFwdTxfm(txSize, p.SrcDiff, diffStride, coeff);
+                    else Av1FwdTxfmAom.ForwardRawRef(p.SrcDiff, diffStride, txbw, txbh, txSize, Av1InvTransform.Type1dDct, Av1InvTransform.Type1dDct,
+                        false, false, coeff.AsSpan(0, AomEncodeMb.MaxEob(txSize)));
+                    satdCost += AomEncodeMb.Satd(coeff, TxSize2d[txSize]);
+                    continue;
+                }
                 AomEncodeMb.SubtractBlock(txbh, txbw, p.SrcDiff, 0, diffStride,
                     p.Src.Buf, p.Src.Offset + ((row * p.Src.Stride + col) << 2), p.Src.Stride,
                     pd.Dst.Buf, pd.Dst.Offset + ((row * pd.Dst.Stride + col) << 2), pd.Dst.Stride);
@@ -196,7 +207,8 @@ internal static class AomIntraModeSearch
                 double logSrcVar = x.SrcLogVar4x4[miOffset];
                 if (srcVar < 0)
                 {
-                    srcVar = (int)VarianceVsZero(src.Buf, src.Offset + i * src.Stride + j, src.Stride, 4, 4, out _);
+                    srcVar = src.Buf16 != null ? (int)AomHbd.Variance(src.Buf16, src.Offset + i * src.Stride + j, src.Stride, null, 0, 0, 0, 4, 4, xd.Bd, out _)
+                        : (int)VarianceVsZero(src.Buf, src.Offset + i * src.Stride + j, src.Stride, 4, 4, out _);
                     x.SrcVar4x4[miOffset] = srcVar;
                     logSrcVar = Log1p(srcVar / 16.0);
                     x.SrcLogVar4x4[miOffset] = logSrcVar;
@@ -207,7 +219,8 @@ internal static class AomIntraModeSearch
                     x.SrcLogVar4x4[miOffset] = logSrcVar;
                 }
                 avgLogSrcVariance += logSrcVar;
-                int reconVar = (int)VarianceVsZero(dst.Buf, dst.Offset + i * dst.Stride + j, dst.Stride, 4, 4, out _);
+                int reconVar = dst.Buf16 != null ? (int)AomHbd.Variance(dst.Buf16, dst.Offset + i * dst.Stride + j, dst.Stride, null, 0, 0, 0, 4, 4, xd.Bd, out _)
+                    : (int)VarianceVsZero(dst.Buf, dst.Offset + i * dst.Stride + j, dst.Stride, 4, 4, out _);
                 avgLogReconVariance += Log1p(reconVar / 16.0);
             }
         }
@@ -578,7 +591,10 @@ internal static class AomIntraModeSearch
         int rows = (xd.MbToBottomEdge >= 0 ? bh : (xd.MbToBottomEdge >> 3) + bh) >> pd.SubsamplingY;
         int cols = (xd.MbToRightEdge >= 0 ? bw : (xd.MbToRightEdge >> 3) + bw) >> pd.SubsamplingX;
         var src = x.Plane[plane].Src;
-        AomMl.PruneIntraModeWithHog(src.Buf.AsSpan(src.Offset), src.Stride, rows, cols, pd.SubsamplingX, pd.SubsamplingY, th, directionalModeSkipMask);
+        if (src.Buf16 != null)
+            AomMl.PruneIntraModeWithHog(src.Buf16.AsSpan(src.Offset), src.Stride, rows, cols, pd.SubsamplingX, pd.SubsamplingY, th, directionalModeSkipMask);
+        else
+            AomMl.PruneIntraModeWithHog(src.Buf.AsSpan(src.Offset), src.Stride, rows, cols, pd.SubsamplingX, pd.SubsamplingY, th, directionalModeSkipMask);
     }
 
     // ---- chroma ----
@@ -819,6 +835,11 @@ internal static class AomIntraModeSearch
             var pd = x.E.Plane[i];
             int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, pd.SubsamplingX, pd.SubsamplingY);
             var src = x.Plane[i].Src;
+            if (src.Buf16 != null)
+            {
+                if (AomEncodeFrame.PerpixelVariance(x, bsize, i) >= 20) return false;
+                continue;
+            }
             uint var = VarianceVsZero(src.Buf, src.Offset, src.Stride, BlockSizeWide[planeBsize], BlockSizeHigh[planeBsize], out _);
             int sh = NumPelsLog2Lookup[planeBsize];
             uint variance = (var + ((1u << sh) >> 1)) >> sh;
@@ -1023,7 +1044,7 @@ internal static class AomIntraModeSearch
 
         int eob = p.Eobs[block];
         if (eob != 0)
-            AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst.Buf, dstOff, dstStride, eob, xd.Lossless[xd.Mi0.SegmentId] != 0);
+            AomEncodeMb.InverseTransformBlockDst(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst, dstOff, dstStride, eob, xd.Bd, xd.Lossless[xd.Mi0.SegmentId] != 0);
 
         if (eob == 0 && plane == 0) AomEncodeMb.UpdateTxkArray(xd, blkRow, blkCol, txSize, DCT_DCT);
 

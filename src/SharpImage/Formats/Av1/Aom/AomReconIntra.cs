@@ -940,6 +940,11 @@ internal static unsafe partial class AomReconIntra
     public static void PredictIntraBlockFacade(AomMacroblockD xd, int sbSize, bool enableIntraEdgeFilter, int plane,
         int blkCol, int blkRow, int txSize)
     {
+        if (xd.Plane[plane].Dst.Buf16 != null)
+        {
+            PredictIntraBlockFacadeHbd(xd, sbSize, enableIntraEdgeFilter, plane, blkCol, blkRow, txSize);
+            return;
+        }
         AomMbModeInfo mbmi = xd.Mi0;
         AomMbdPlane pd = xd.Plane[plane];
         int dstStride = pd.Dst.Stride;

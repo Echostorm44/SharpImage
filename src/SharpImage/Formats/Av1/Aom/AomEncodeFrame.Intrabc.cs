@@ -46,10 +46,11 @@ internal static partial class AomEncodeFrame
     private const int IBC_MOTION_ABOVE = 0, IBC_MOTION_LEFT = 1, IBC_MOTION_DIRECTIONS = 2;
     private const int BILINEAR = 3;   // InterpFilter
 
-    /// <summary>av1_set_sad_per_bit (8-bit): sad_per_bit_lut_8[qindex] = (int)(0.0418 q + 2.4107), q = ac_q / 4.</summary>
-    internal static int SadPerBit(int qindex)
+    /// <summary>av1_set_sad_per_bit: sad_per_bit_lut_{8,10,12}[qindex] = (int)(0.0418 q + 2.4107), q = ac_q / 4 (/ 16, / 64).</summary>
+    internal static int SadPerBit(int qindex, int bitDepth = 8)
     {
-        double q = Av1Tables.DequantTable[0, qindex, 1] / 4.0;   // av1_convert_qindex_to_q
+        int bdIdx = bitDepth == 8 ? 0 : bitDepth == 10 ? 1 : 2;
+        double q = Av1Tables.DequantTable[bdIdx, qindex, 1] / (bitDepth == 8 ? 4.0 : bitDepth == 10 ? 16.0 : 64.0);   // av1_convert_qindex_to_q
         return (int)(0.0418 * q + 2.4107);
     }
 
@@ -229,7 +230,7 @@ internal static partial class AomEncodeFrame
         if (eob != 0)
         {
             mbmi.SkipTxfm = 0;
-            AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst.Buf, dstOff, dstStride, eob,
+            AomEncodeMb.InverseTransformBlockDst(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst, dstOff, dstStride, eob, xd.Bd,
                 xd.Lossless[mbmi.SegmentId] != 0);
         }
         else mbmi.SkipTxfm &= 1;

@@ -190,8 +190,9 @@ internal static partial class AomEncodeFrame
 
     /// <summary>setup_pred_plane: the block's sample offset in a plane (4-wide / high chroma blocks at odd mi use the pair's origin).</summary>
     private static void SetupPredPlane(ref AomBuf2d dst, int bsize, byte[] buf, int planeOffset, int width, int height, int stride,
-        int miRow, int miCol, int ssX, int ssY)
+        int miRow, int miCol, int ssX, int ssY, ushort[]? buf16 = null)
     {
+        dst.Buf16 = buf16!;
         if (ssY != 0 && (miRow & 1) != 0 && MiSizeHigh[bsize] == 1) miRow -= 1;
         if (ssX != 0 && (miCol & 1) != 0 && MiSizeWide[bsize] == 1) miCol -= 1;
         int px = (4 * miCol) >> ssX, py = (4 * miRow) >> ssY;
@@ -211,7 +212,7 @@ internal static partial class AomEncodeFrame
             int isUv = i > 0 ? 1 : 0;
             var pd = x.E.Plane[i];
             SetupPredPlane(ref x.Plane[i].Src, bsize, src.Buffers[i], src.Offsets[i], src.CropWidths[isUv], src.CropHeights[isUv], src.Strides[i],
-                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY);
+                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY, src.Buffers16[i]);
         }
     }
 
@@ -258,7 +259,7 @@ internal static partial class AomEncodeFrame
             int isUv = i > 0 ? 1 : 0;
             var pd = xd.Plane[i];
             SetupPredPlane(ref pd.Dst, bsize, cur.Buffers[i], cur.Offsets[i], cur.CropWidths[isUv], cur.CropHeights[isUv], cur.Strides[i],
-                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY);
+                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY, cur.Buffers16[i]);
         }
 
         // set_plane_n4
@@ -353,6 +354,7 @@ internal static partial class AomEncodeFrame
         var pd = x.E.Plane[plane];
         int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, pd.SubsamplingX, pd.SubsamplingY);
         var src = x.Plane[plane].Src;
+        if (src.Buf16 != null) return AomHbd.PerpixelVariance(src.Buf16, src.Offset, src.Stride, BlockSizeWide[planeBsize], BlockSizeHigh[planeBsize], x.E.Bd);
         uint var = AomIntraModeSearch.VarianceVsZero(src.Buf, src.Offset, src.Stride, BlockSizeWide[planeBsize], BlockSizeHigh[planeBsize], out _);
         int sh = NumPelsLog2Lookup[planeBsize];
         return (var + ((1u << sh) >> 1)) >> sh;

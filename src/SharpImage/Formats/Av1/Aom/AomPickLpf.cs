@@ -11,6 +11,8 @@ internal static class AomSse
     public static long SsePart(AomYv12Plane a, AomYv12Plane b, int hstart, int width, int vstart, int height)
     {
         if (width <= 0 || height <= 0) return 0;
+        // aom_highbd_get_{y,u,v}_sse: the exact SSE (aom_highbd_8_mse16x16 blocks + highbd_encoder_sse edges)
+        if (a.Buf16 != null) return AomHbd.Sse(a.Buf16, a.At(hstart, vstart), a.Stride, b.Buf16, b.At(hstart, vstart), b.Stride, width, height);
         return AomEncodeMb.Sse(a.Buf, a.At(hstart, vstart), a.Stride, b.Buf, b.At(hstart, vstart), b.Stride, width, height);
     }
 

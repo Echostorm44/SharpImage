@@ -10,6 +10,11 @@ internal sealed class AomEncodeInput
     public bool Monochrome;
     public byte[][] Planes = null!;
     public int[] Strides = null!;
+    /// <summary>g_bit_depth / g_input_bit_depth: 8, or 10 / 12 with the samples in Planes16 (AOM_CODEC_USE_HIGHBITDEPTH).</summary>
+    public int BitDepth = 8;
+    public ushort[][]? Planes16;
+    /// <summary>oxcf.tool_cfg.enable_restoration (AV1E_SET_ENABLE_RESTORATION; libavif turns it off for 12-bit input).</summary>
+    public bool EnableRestoration = true;
     public int BaseQindex;
     public int Speed = 6;
     public bool AllowScreenContentTools, UseScreenContentTools, AllowIntrabc, IsScreenContentType;
@@ -48,11 +53,13 @@ internal static partial class AomEncoder
         bool tuneIq = tune == AomTune.Iq;
         string off = tuneIq ? input.IqOff ?? "" : "";
         bool deltaqVarianceBoost = tuneIq && !off.Contains('d');
+        int bd = input.BitDepth;
         var cm = new AomCommon(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome,
-            deltaqVarianceBoost ? BLOCK_64X64 : SelectSbSize(input.Width, input.Height, input.Speed));   // Variance Boost: 64x64 SBs
+            deltaqVarianceBoost ? BLOCK_64X64 : SelectSbSize(input.Width, input.Height, input.Speed), bd);   // Variance Boost: 64x64 SBs
         cm.BaseQindex = input.BaseQindex;
         var cpi = new AomComp { Cm = cm, Speed = input.Speed, AllowScreenContentTools = input.AllowScreenContentTools,
-            UseScreenContentTools = input.UseScreenContentTools, AllowIntrabc = input.AllowIntrabc, SbSize = cm.SbSize, Tune = tune };
+            UseScreenContentTools = input.UseScreenContentTools, AllowIntrabc = input.AllowIntrabc, SbSize = cm.SbSize, Tune = tune,
+            BitDepth = bd, UseHighbitdepth = bd > 8 };
         if (tuneIq)
         {
             cpi.UsingQm = !off.Contains('q');
@@ -66,11 +73,19 @@ internal static partial class AomEncoder
         }
 
         // the source frame with libaom's replicated borders (the lookahead copy runs aom_extend_frame_borders)
-        cpi.Source = new AomFrameBuffer(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome);
+        cpi.Source = new AomFrameBuffer(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome, bd);
         for (int p = 0; p < cm.NumPlanes; p++)
         {
             int isUv = p > 0 ? 1 : 0;
             int w = cpi.Source.CropWidths[isUv], h = cpi.Source.CropHeights[isUv];
+            if (bd > 8)
+            {
+                var dst16 = cpi.Source.Buffers16[p];
+                for (int r = 0; r < h; r++) Array.Copy(input.Planes16![p], r * input.Strides[p], dst16, cpi.Source.Offsets[p] + r * cpi.Source.Strides[p], w);
+                ExtendPlane(dst16, cpi.Source.Offsets[p], cpi.Source.Strides[p], w, h, p == 0 ? AomFrameBuffer.Border : AomFrameBuffer.Border >> input.SsX,
+                    p == 0 ? AomFrameBuffer.Border : AomFrameBuffer.Border >> input.SsY);
+                continue;
+            }
             var dst = cpi.Source.Buffers[p];
             for (int r = 0; r < h; r++) Array.Copy(input.Planes[p], r * input.Strides[p], dst, cpi.Source.Offsets[p] + r * cpi.Source.Strides[p], w);
             ExtendPlane(dst, cpi.Source.Offsets[p], cpi.Source.Strides[p], w, h, p == 0 ? AomFrameBuffer.Border : AomFrameBuffer.Border >> input.SsX,
@@ -109,7 +124,8 @@ internal static partial class AomEncoder
         // avifenc --lossless / quality 100 (quantizer 0): libavif sets rc_min_quantizer = rc_max_quantizer = 0 and
         // AV1E_SET_LOSSLESS, so oxcf.rc_cfg.best_allowed_q = worst_allowed_q = 0 (is_lossless_requested)
         if (input.BaseQindex == 0) { sfIn.BestAllowedQ = 0; sfIn.WorstAllowedQ = 0; }
-        var seqFlags = new AomSpeedFeatureSeqFlags();
+        sfIn.UseHighBitDepth = bd > 8;
+        var seqFlags = new AomSpeedFeatureSeqFlags { enable_restoration = input.EnableRestoration ? 1 : 0 };
         cpi.Sf.SetForFrame(sfIn, seqFlags, cpi.WinnerModeParams, input.Speed);
         cpi.EnableRestoration = seqFlags.enable_restoration != 0;
         input.SfOverride?.Invoke(cpi.Sf);
@@ -127,7 +143,7 @@ internal static partial class AomEncoder
 
         // av1_set_quantizer: chroma delta q and the quantization matrix levels; av1_init_quantizer
         AomQuantSetup.SetQuantizer(cpi, input.BaseQindex);
-        cpi.Quants = new AomQuants(8, cm.YDcDeltaQ, cm.UDcDeltaQ, cm.UAcDeltaQ, cm.VDcDeltaQ, cm.VAcDeltaQ, cpi.Sharpness);
+        cpi.Quants = new AomQuants(bd, cm.YDcDeltaQ, cm.UDcDeltaQ, cm.UAcDeltaQ, cm.VDcDeltaQ, cm.VAcDeltaQ, cpi.Sharpness);
         // av1_frame_init_quantizer / set_q_index
         AomQuantSetup.SetQIndex(cpi, x, input.BaseQindex);
 
@@ -141,13 +157,13 @@ internal static partial class AomEncoder
         }
         xd.AbovePartitionContext = cm.AbovePartition;
         xd.AboveTxfmContext = cm.AboveTxfm;
-        xd.Bd = 8;
+        xd.Bd = bd;
 
         // the frame CDFs (key frame defaults for the qindex) and av1_initialize_rd_consts
         cm.Fc = new Av1CdfContext();
         int qCtxQ = input.BaseQindex;
         Av1CdfDefaults.InitializeDefault(cm.Fc, qCtxQ <= 20 ? 0 : qCtxQ <= 60 ? 1 : qCtxQ <= 120 ? 2 : 3);   // get_q_ctx
-        cpi.RdRdmult = AomRd.RdMultKeyFrame(input.BaseQindex + cm.YDcDeltaQ, 8, cpi.TuneIq);
+        cpi.RdRdmult = AomRd.RdMultKeyFrame(input.BaseQindex + cm.YDcDeltaQ, bd, cpi.TuneIq);
         x.Errorperbit = AomRd.ErrorPerBit(cpi.RdRdmult);
         AomModeCostFill.Fill(x.ModeCosts, cm.Fc, cpi.EnableFilterIntra);
         x.CoeffCosts.Fill(cm.Fc.Coef, cm.NumPlanes);
@@ -175,7 +191,7 @@ internal static partial class AomEncoder
                 BlockSizeWide[BLOCK_4X4]);   // mi_alloc_bsize
         cpi.SearchSites = AomMcomp.InitSearchSites();
         cpi.MvStepParam = AomMcomp.InitSearchRange(Math.Max(input.Width, input.Height));
-        x.SadPerBit = AomEncodeFrame.SadPerBit(input.BaseQindex);
+        x.SadPerBit = AomEncodeFrame.SadPerBit(input.BaseQindex, bd);
         if (cpi.Sf.rt_sf.use_nonrd_pick_mode == 0 && cpi.AllowIntrabcNow)   // av1_need_dv_costs
         {
             x.DvCosts = new AomDvCosts();
@@ -219,6 +235,11 @@ internal static partial class AomEncoder
         byte[] buf = src.Buffers[0];
         int stride = src.Strides[0];
         var dilated = new byte[kBlockArea];
+        // high bit depth: each block down-converted to 8 bits (downconv_blk) for the colour counts; the variance is the source's
+        bool useHbd = src.Hbd;
+        int bd = src.BitDepth;
+        ushort[] buf16 = src.Buffers16[0];
+        var downconv = useHbd ? new byte[kBlockArea] : null;
         long countPalette = 0, countIntrabc = 0, countPhoto = 0;
         int multiplier = fastDetection ? 2 : 1;
         for (int r = 0; r + kBlockHeight <= height; r += kBlockHeight)
@@ -227,21 +248,32 @@ internal static partial class AomEncoder
             for (int c = initialCol; c + kBlockWidth <= width; c += kBlockWidth * multiplier)
             {
                 int blkOff = src.Offsets[0] + r * stride + c;
-                bool underThreshold = AomPalette.CountColorsWithThreshold(buf, blkOff, stride, kBlockHeight, kBlockWidth, kComplexInitialColorThresh,
+                byte[] blk = buf;
+                int blkStart = blkOff, blkStride = stride;
+                if (useHbd)
+                {
+                    for (int br = 0; br < kBlockHeight; ++br)
+                        for (int bc = 0; bc < kBlockWidth; ++bc) downconv![br * kBlockWidth + bc] = (byte)(buf16[blkOff + br * stride + bc] >> (bd - 8));
+                    blk = downconv!;
+                    blkStart = 0;
+                    blkStride = kBlockWidth;
+                }
+                bool underThreshold = AomPalette.CountColorsWithThreshold(blk, blkStart, blkStride, kBlockHeight, kBlockWidth, kComplexInitialColorThresh,
                     out int numberOfColors);
                 if (numberOfColors > 1 && underThreshold)
                 {
                     if (numberOfColors <= kSimpleColorThresh)
                     {
                         ++countPalette;
-                        if (PerpixelVariance16x16(buf, blkOff, stride) > kVarThresh) ++countIntrabc;
+                        int var = useHbd ? (int)AomHbd.PerpixelVariance(buf16, blkOff, stride, 16, 16, bd) : PerpixelVariance16x16(buf, blkOff, stride);
+                        if (var > kVarThresh) ++countIntrabc;
                     }
                     else
                     {
-                        DilateBlock(buf, blkOff, stride, dilated, kBlockWidth, kBlockHeight, kBlockWidth);
+                        DilateBlock(blk, blkStart, blkStride, dilated, kBlockWidth, kBlockHeight, kBlockWidth);
                         underThreshold = AomPalette.CountColorsWithThreshold(dilated, 0, kBlockWidth, kBlockHeight, kBlockWidth,
                             kComplexFinalColorThresh, out numberOfColors);
-                        if (underThreshold && PerpixelVariance16x16(buf, blkOff, stride) > kVarThresh)
+                        if (underThreshold && (useHbd ? (int)AomHbd.PerpixelVariance(buf16, blkOff, stride, 16, 16, bd) : PerpixelVariance16x16(buf, blkOff, stride)) > kVarThresh)
                         {
                             ++countPalette;
                             ++countIntrabc;
@@ -330,6 +362,23 @@ internal static partial class AomEncoder
 
     /// <summary>aom_extend_frame_borders for one plane: replicate the edge samples into the border.</summary>
     internal static void ExtendPlane(byte[] buf, int off, int stride, int w, int h, int borderX, int borderY)
+    {
+        for (int r = 0; r < h; r++)
+        {
+            int row = off + r * stride;
+            buf.AsSpan(row - borderX, borderX).Fill(buf[row]);
+            buf.AsSpan(row + w, borderX).Fill(buf[row + w - 1]);
+        }
+        int rowLen = w + 2 * borderX;
+        for (int r = 1; r <= borderY; r++)
+        {
+            Array.Copy(buf, off - borderX, buf, off - borderX - r * stride, rowLen);
+            Array.Copy(buf, off - borderX + (h - 1) * stride, buf, off - borderX + (h - 1 + r) * stride, rowLen);
+        }
+    }
+
+    /// <summary>aom_extend_frame_borders (high bit depth) for one plane.</summary>
+    internal static void ExtendPlane(ushort[] buf, int off, int stride, int w, int h, int borderX, int borderY)
     {
         for (int r = 0; r < h; r++)
         {

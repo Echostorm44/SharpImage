@@ -103,6 +103,7 @@ internal sealed class AomLoopFilter
     private readonly byte[] _mblim = new byte[MaxLf + 1], _lim = new byte[MaxLf + 1], _hevThr = new byte[MaxLf + 1];
     private readonly byte[] _lvl = new byte[3 * MaxSegments * 2 * RefFrames * MaxModeLfDeltas];
     private const int MaxLf = AomLoopFilterParams.MaxLoopFilter;
+    private int _bitDepth = 8;
 
     public AomLoopFilter()
     {
@@ -239,7 +240,7 @@ internal sealed class AomLoopFilter
                     len = 0;
                     txSize = TX_4X4;
                 }
-                if (len != 0) Filter(true, len, pl.Buf, pl.At(currX, currY), pl.Stride, 4, lvl);
+                if (len != 0) Filter(true, len, pl, pl.At(currX, currY), pl.Stride, 4, lvl);
                 x += TxSizeWideUnit[txSize];
             }
     }
@@ -263,13 +264,29 @@ internal sealed class AomLoopFilter
                     len = 0;
                     txSize = TX_4X4;
                 }
-                if (len != 0) Filter(false, len, pl.Buf, pl.At(currX, currY), pl.Stride, 4, lvl);
+                if (len != 0) Filter(false, len, pl, pl.At(currX, currY), pl.Stride, 4, lvl);
                 y += TxSizeHighUnit[txSize];
             }
     }
 
     /// <summary>filter_vert / filter_horz: the dispatched aom_lpf_{vertical,horizontal}_{len} kernel over lines = 4
     /// (single), 8 (_dual) or 16 (_quad) lines with the level's thresholds.</summary>
+    private void Filter(bool vert, int len, AomYv12Plane pl, int s, int stride, int lines, int lvl)
+    {
+        if (pl.Buf16 != null)
+        {
+            // the highbd kernels (single / _dual) filter line by line like the C: 4 lines per call
+            int bl16 = _mblim[lvl], li16 = _lim[lvl], th16 = _hevThr[lvl];
+            for (int k = 0; k < lines; k += 4)
+            {
+                if (vert) AomLpf.ApplyHighbd(len, pl.Buf16, s + k * stride, 1, stride, bl16, li16, th16, _bitDepth);
+                else AomLpf.ApplyHighbd(len, pl.Buf16, s + k, stride, 1, bl16, li16, th16, _bitDepth);
+            }
+            return;
+        }
+        Filter(vert, len, pl.Buf, s, stride, lines, lvl);
+    }
+
     private void Filter(bool vert, int len, byte[] buf, int s, int stride, int lines, int lvl)
     {
         int bl = _mblim[lvl], li = _lim[lvl], th = _hevThr[lvl];
@@ -522,7 +539,7 @@ internal sealed class AomLoopFilter
                     _pLen[x] = 0;
                     ts = TX_4X4;
                 }
-                if (_pLen[x] != 0) Filter(true, _pLen[x], pl.Buf, s + x * MiSize, pl.Stride, lines, _pLvl[x]);
+                if (_pLen[x] != 0) Filter(true, _pLen[x], pl, s + x * MiSize, pl.Stride, lines, _pLvl[x]);
                 x += TxSizeWideUnit[ts];
             }
         }
@@ -557,7 +574,7 @@ internal sealed class AomLoopFilter
                     _pLen[y] = 0;
                     ts = TX_4X4;
                 }
-                if (_pLen[y] != 0) Filter(false, _pLen[y], pl.Buf, s + y * MiSize * pl.Stride, pl.Stride, lines, _pLvl[y]);
+                if (_pLen[y] != 0) Filter(false, _pLen[y], pl, s + y * MiSize * pl.Stride, pl.Stride, lines, _pLvl[y]);
                 y += TxSizeHighUnit[ts];
             }
         }
@@ -601,8 +618,8 @@ internal sealed class AomLoopFilter
                 int off = s0 + y * MiSize * pl.Stride + x * MiSize;
                 if (_pLen[x] != 0)
                 {
-                    Filter(true, _pLen[x], pl.Buf, off, pl.Stride, lines, _pLvl[x]);
-                    if (plV != null) Filter(true, _pLen[x], plV.Buf, off, plV.Stride, lines, _pLvl[x]);
+                    Filter(true, _pLen[x], pl, off, pl.Stride, lines, _pLvl[x]);
+                    if (plV != null) Filter(true, _pLen[x], plV, off, plV.Stride, lines, _pLvl[x]);
                 }
                 x += TxSizeWideUnit[ts];
             }
@@ -647,8 +664,8 @@ internal sealed class AomLoopFilter
                 int off = s0 + y * MiSize * pl.Stride + x * MiSize;
                 if (_pLen[y] != 0)
                 {
-                    Filter(false, _pLen[y], pl.Buf, off, pl.Stride, lines, _pLvl[y]);
-                    if (plV != null) Filter(false, _pLen[y], plV.Buf, off, plV.Stride, lines, _pLvl[y]);
+                    Filter(false, _pLen[y], pl, off, pl.Stride, lines, _pLvl[y]);
+                    if (plV != null) Filter(false, _pLen[y], plV, off, plV.Stride, lines, _pLvl[y]);
                 }
                 y += TxSizeHighUnit[ts];
             }
@@ -663,6 +680,7 @@ internal sealed class AomLoopFilter
         bool partialFrame = false, int lpfOptLevel = 0)
     {
         planeEnd = Math.Min(planeEnd, frame.NumPlanes);
+        _bitDepth = frame.BitDepth;
         // check_planes_to_loop_filter
         Span<bool> planesToLf = stackalloc bool[3];
         planesToLf[0] = (lf.FilterLevel[0] != 0 || lf.FilterLevel[1] != 0) && planeStart <= 0 && 0 < planeEnd;
