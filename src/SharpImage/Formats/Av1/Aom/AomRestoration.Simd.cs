@@ -255,108 +255,101 @@ internal static partial class AomRestoration
 
     // Compute two integral images from src. B sums elements; A sums their squares. The images are offset by one pixel,
     // so will have width and height equal to width + 1, height + 1 and the first row and column will be zero.
+    // (Row pointers hoisted; the same operations as integral_images.)
     private static unsafe void IntegralImages(byte* src, int srcStride, int width, int height, int* A, int* B, int bufStride)
     {
         MemsetZeroAvx(A, width + 8);
         MemsetZeroAvx(B, width + 8);
-        for (int i = 0; i < height; ++i)
+        int* aAbove = A + 1, bAbove = B + 1;
+        for (int i = 0; i < height; ++i, src += srcStride)
         {
+            int* aRow = aAbove + bufStride, bRow = bAbove + bufStride;
             // Zero the left column.
-            A[(i + 1) * bufStride] = B[(i + 1) * bufStride] = 0;
+            aRow[-1] = bRow[-1] = 0;
             // ldiff is the difference H - D where H is the output sample immediately to the left and D is the output
             // sample above it. These are scalars, replicated across the eight lanes.
             Vector256<int> ldiff1 = Vector256<int>.Zero, ldiff2 = Vector256<int>.Zero;
             for (int j = 0; j < width; j += 8)
             {
-                int abj = 1 + j;
-                var above1 = Avx.LoadVector256(B + abj + i * bufStride);
-                var above2 = Avx.LoadVector256(A + abj + i * bufStride);
-                var x1 = Avx2.ConvertToVector256Int32(Vector128.CreateScalar(*(ulong*)(src + j + i * srcStride)).AsByte());
+                var above1 = Avx.LoadVector256(bAbove + j);
+                var above2 = Avx.LoadVector256(aAbove + j);
+                var x1 = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(src + j)).AsByte());
                 var x2 = Avx2.MultiplyAddAdjacent(x1.AsInt16(), x1.AsInt16());
                 var sc1 = Scan32(x1);
                 var sc2 = Scan32(x2);
                 var row1 = Avx2.Add(Avx2.Add(sc1, above1), ldiff1);
                 var row2 = Avx2.Add(Avx2.Add(sc2, above2), ldiff2);
-                Avx.Store(B + abj + (i + 1) * bufStride, row1);
-                Avx.Store(A + abj + (i + 1) * bufStride, row2);
+                Avx.Store(bRow + j, row1);
+                Avx.Store(aRow + j, row2);
                 // Calculate the new H - D.
-                ldiff1 = Vector256.Create(Avx2.Subtract(row1, above1).GetElement(7));
-                ldiff2 = Vector256.Create(Avx2.Subtract(row2, above2).GetElement(7));
+                ldiff1 = Avx2.PermuteVar8x32(Avx2.Subtract(row1, above1), Vector256.Create(7));
+                ldiff2 = Avx2.PermuteVar8x32(Avx2.Subtract(row2, above2), Vector256.Create(7));
             }
+            aAbove = aRow;
+            bAbove = bRow;
         }
-    }
-
-    // Compute 8 values of boxsum from the given integral image. ii should point at the middle of the box (for the
-    // first value). r is the box radius.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe Vector256<int> BoxsumFromIi(int* ii, int stride, int r)
-    {
-        var tl = Avx.LoadVector256(ii - (r + 1) - (r + 1) * stride);
-        var tr = Avx.LoadVector256(ii + (r + 0) - (r + 1) * stride);
-        var bl = Avx.LoadVector256(ii - (r + 1) + r * stride);
-        var br = Avx.LoadVector256(ii + (r + 0) + r * stride);
-        var u = Avx2.Subtract(tr, tl);
-        var v = Avx2.Subtract(br, bl);
-        return Avx2.Subtract(v, u);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<int> RoundForShift(int shift) => Vector256.Create((1 << shift) >> 1);
 
-    // compute_p (8-bit)
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector256<int> ComputeP(Vector256<int> sum1, Vector256<int> sum2, int n)
-    {
-        var bb = Avx2.MultiplyAddAdjacent(sum1.AsInt16(), sum1.AsInt16());
-        var an = Avx2.MultiplyLow(sum2, Vector256.Create(n));
-        return Avx2.Subtract(an, bb);
-    }
-
-    // calc_ab / calc_ab_fast: step 1 or 2 rows. Assumes that C, D are integral images for the original buffer which has
-    // been extended to have a padding of SGRPROJ_BORDER_VERT/SGRPROJ_BORDER_HORZ pixels on the sides. A, B, C, D point
-    // at logical position (0, 0).
+    // calc_ab (step 1) / calc_ab_fast (step 2). Assumes that C, D are integral images for the original buffer which
+    // has been extended to have a padding of SGRPROJ_BORDER_VERT/SGRPROJ_BORDER_HORZ pixels on the sides. A, B, C, D
+    // point at logical position (0, 0). The boxsum_from_ii corners are fixed offsets from the centre.
     private static unsafe void CalcAb(int* A, int* B, int* C, int* D, int width, int height, int bufStride,
         int sgrParamsIdx, int radiusIdx, int step)
     {
         int r = radiusIdx == 0 ? SgrR0[sgrParamsIdx] : SgrR1[sgrParamsIdx];
         int n = (2 * r + 1) * (2 * r + 1);
         var s = Vector256.Create(radiusIdx == 0 ? SgrS0[sgrParamsIdx] : SgrS1[sgrParamsIdx]);
+        var nV = Vector256.Create(n);
         // one_over_n[n-1] is 2^12/n, so easily fits in an int16
-        var oneOverN = Vector256.Create(OneByX[n - 1]);
+        var oneOverN = Vector256.Create(OneByX[n - 1]).AsInt16();
         var rndZ = RoundForShift(SgrprojMtableBits);
         var rndRes = RoundForShift(SgrprojRecipBits);
         var c255 = Vector256.Create(255);
         var sgr = Vector256.Create(SgrprojSgr);
+        nint oTl = -(r + 1) - (nint)(r + 1) * bufStride, oTr = r - (nint)(r + 1) * bufStride;
+        nint oBl = -(r + 1) + (nint)r * bufStride, oBr = r + (nint)r * bufStride;
+        // the last 8-lane group of a row covers width + 1 - j valid samples (mask[idx])
+        int jLast = -1 + ((width + 1) / 8) * 8;   // first j whose group is partial (if < width + 1)
+        int idxLast = width + 1 - jLast;
+        var maskLast = SgrMask(Math.Min(idxLast, 8));
         fixed (int* xByXplus1 = SgrTables.XByXplus1)
         {
             for (int i = -1; i < height + 1; i += step)
             {
+                nint rowOff = (nint)i * bufStride;
+                int* cRow = C + rowOff, dRow = D + rowOff, aRow = A + rowOff, bRow = B + rowOff;
                 for (int j = -1; j < width + 1; j += 8)
                 {
-                    int* cij = C + i * bufStride + j;
-                    int* dij = D + i * bufStride + j;
-                    var sum1 = BoxsumFromIi(dij, bufStride, r);
-                    var sum2 = BoxsumFromIi(cij, bufStride, r);
-                    // When width + 2 isn't a multiple of 8, sum1 and sum2 will contain some uninitialised data in their
-                    // upper words. We use a mask to ensure that these bits are set to 0.
-                    int idx = Math.Min(8, width + 1 - j);
-                    if (idx < 8)
+                    int* cij = cRow + j, dij = dRow + j;
+                    var sum1 = Avx2.Subtract(Avx2.Subtract(Avx.LoadVector256(dij + oBr), Avx.LoadVector256(dij + oBl)),
+                        Avx2.Subtract(Avx.LoadVector256(dij + oTr), Avx.LoadVector256(dij + oTl)));
+                    var sum2 = Avx2.Subtract(Avx2.Subtract(Avx.LoadVector256(cij + oBr), Avx.LoadVector256(cij + oBl)),
+                        Avx2.Subtract(Avx.LoadVector256(cij + oTr), Avx.LoadVector256(cij + oTl)));
+                    // When width + 2 isn't a multiple of 8, sum1 and sum2 will contain some uninitialised data in
+                    // their upper words. We use a mask to ensure that these bits are set to 0.
+                    if (j == jLast)
                     {
-                        var mask = SgrMask(idx);
-                        sum1 = Avx2.And(mask, sum1);
-                        sum2 = Avx2.And(mask, sum2);
+                        sum1 = Avx2.And(maskLast, sum1);
+                        sum2 = Avx2.And(maskLast, sum2);
                     }
-                    var p = ComputeP(sum1, sum2, n);
+                    // compute_p (8-bit)
+                    var bb = Avx2.MultiplyAddAdjacent(sum1.AsInt16(), sum1.AsInt16());
+                    var an = Avx2.MultiplyLow(sum2, nV);
+                    var p = Avx2.Subtract(an, bb);
                     var z = Avx2.Min(Avx2.ShiftRightLogical(Avx2.Add(Avx2.MultiplyLow(p, s), rndZ), SgrprojMtableBits), c255);
                     var aRes = Avx2.GatherVector256(xByXplus1, z, 4);
-                    Avx.Store(A + i * bufStride + j, aRes);
+                    Avx.Store(aRow + j, aRes);
                     var aComplement = Avx2.Subtract(sgr, aRes);
                     // sum1 might have lanes greater than 2^15, so we can't use madd to do multiplication involving
-                    // sum1. However, a_complement and one_over_n are both less than 256, so we can multiply them first.
-                    var aCompOverN = Avx2.MultiplyAddAdjacent(aComplement.AsInt16(), oneOverN.AsInt16());
+                    // sum1. However, a_complement and one_over_n are both less than 256, so we can multiply them
+                    // first.
+                    var aCompOverN = Avx2.MultiplyAddAdjacent(aComplement.AsInt16(), oneOverN);
                     var bInt = Avx2.MultiplyLow(aCompOverN, sum1);
                     var bRes = Avx2.ShiftRightLogical(Avx2.Add(bInt, rndRes), SgrprojRecipBits);
-                    Avx.Store(B + i * bufStride + j, bRes);
+                    Avx.Store(bRow + j, bRes);
                 }
             }
         }
@@ -367,94 +360,73 @@ internal static partial class AomRestoration
     private static Vector256<int> SgrMask(int idx)
         => Avx2.CompareGreaterThan(Vector256.Create(idx), Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7));
 
-    // Calculate 8 values of the "cross sum" starting at buf: a 3x3 filter where the outer four corners have weight 3
-    // and all other pixels have weight 4.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe Vector256<int> CrossSum(int* buf, int stride)
-    {
-        var xtl = Avx.LoadVector256(buf - 1 - stride);
-        var xt = Avx.LoadVector256(buf - stride);
-        var xtr = Avx.LoadVector256(buf + 1 - stride);
-        var xl = Avx.LoadVector256(buf - 1);
-        var x = Avx.LoadVector256(buf);
-        var xr = Avx.LoadVector256(buf + 1);
-        var xbl = Avx.LoadVector256(buf - 1 + stride);
-        var xb = Avx.LoadVector256(buf + stride);
-        var xbr = Avx.LoadVector256(buf + 1 + stride);
-        var fours = Avx2.Add(xl, Avx2.Add(xt, Avx2.Add(xr, Avx2.Add(xb, x))));
-        var threes = Avx2.Add(xtl, Avx2.Add(xtr, Avx2.Add(xbr, xbl)));
-        return Avx2.Subtract(Avx2.ShiftLeftLogical(Avx2.Add(fours, threes), 2), threes);
-    }
-
-    // The final filter for self-guided restoration.
+    // The final filter for self-guided restoration: the "cross sum" (a 3x3 filter where the outer four corners have
+    // weight 3 and all other pixels have weight 4) of A and B, then a weighted average with the source.
     private static unsafe void FinalFilter(int* dst, int dstStride, int* A, int* B, int bufStride, byte* dgd8, int dgdStride,
         int width, int height)
     {
         const int nb = 5;
         var rounding = RoundForShift(SgrprojSgrBits + nb - SgrprojRstBits);
+        nint up = -bufStride, dn = bufStride;
         for (int i = 0; i < height; ++i)
         {
+            int* aRow = A + (nint)i * bufStride, bRow = B + (nint)i * bufStride, dRow = dst + (nint)i * dstStride;
+            byte* sRow = dgd8 + (nint)i * dgdStride;
             for (int j = 0; j < width; j += 8)
             {
-                var a = CrossSum(A + i * bufStride + j, bufStride);
-                var b = CrossSum(B + i * bufStride + j, bufStride);
-                var raw = Sse2.LoadVector128(dgd8 + i * dgdStride + j);
-                var src = Avx2.ConvertToVector256Int32(raw);
+                int* a0 = aRow + j, b0 = bRow + j;
+                // fours = xl + xt + xr + xb + x; threes = xtl + xtr + xbr + xbl; cross_sum = (fours + threes) << 2 - threes
+                var aFours = Avx2.Add(Avx.LoadVector256(a0 - 1), Avx2.Add(Avx.LoadVector256(a0 + up),
+                    Avx2.Add(Avx.LoadVector256(a0 + 1), Avx2.Add(Avx.LoadVector256(a0 + dn), Avx.LoadVector256(a0)))));
+                var aThrees = Avx2.Add(Avx.LoadVector256(a0 - 1 + up), Avx2.Add(Avx.LoadVector256(a0 + 1 + up),
+                    Avx2.Add(Avx.LoadVector256(a0 + 1 + dn), Avx.LoadVector256(a0 - 1 + dn))));
+                var a = Avx2.Subtract(Avx2.ShiftLeftLogical(Avx2.Add(aFours, aThrees), 2), aThrees);
+                var bFours = Avx2.Add(Avx.LoadVector256(b0 - 1), Avx2.Add(Avx.LoadVector256(b0 + up),
+                    Avx2.Add(Avx.LoadVector256(b0 + 1), Avx2.Add(Avx.LoadVector256(b0 + dn), Avx.LoadVector256(b0)))));
+                var bThrees = Avx2.Add(Avx.LoadVector256(b0 - 1 + up), Avx2.Add(Avx.LoadVector256(b0 + 1 + up),
+                    Avx2.Add(Avx.LoadVector256(b0 + 1 + dn), Avx.LoadVector256(b0 - 1 + dn))));
+                var b = Avx2.Subtract(Avx2.ShiftLeftLogical(Avx2.Add(bFours, bThrees), 2), bThrees);
+                var src = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(sRow + j)).AsByte());
                 var v = Avx2.Add(Avx2.MultiplyAddAdjacent(a.AsInt16(), src.AsInt16()), b);
                 var w = Avx2.ShiftRightArithmetic(Avx2.Add(v, rounding), SgrprojSgrBits + nb - SgrprojRstBits);
-                Avx.Store(dst + i * dstStride + j, w);
+                Avx.Store(dRow + j, w);
             }
         }
     }
 
-    // Pixels weighted 5 6 5 / 0 0 0 / 5 6 5 around buf.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe Vector256<int> CrossSumFastEvenRow(int* buf, int stride)
-    {
-        var xtl = Avx.LoadVector256(buf - 1 - stride);
-        var xt = Avx.LoadVector256(buf - stride);
-        var xtr = Avx.LoadVector256(buf + 1 - stride);
-        var xbl = Avx.LoadVector256(buf - 1 + stride);
-        var xb = Avx.LoadVector256(buf + stride);
-        var xbr = Avx.LoadVector256(buf + 1 + stride);
-        var fives = Avx2.Add(xtl, Avx2.Add(xtr, Avx2.Add(xbr, xbl)));
-        var sixes = Avx2.Add(xt, xb);
-        var fivesPlusSixes = Avx2.Add(fives, sixes);
-        return Avx2.Add(Avx2.Add(Avx2.ShiftLeftLogical(fivesPlusSixes, 2), fivesPlusSixes), sixes);
-    }
-
-    // Pixels weighted 5 6 5 on buf's row.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe Vector256<int> CrossSumFastOddRow(int* buf)
-    {
-        var xl = Avx.LoadVector256(buf - 1);
-        var x = Avx.LoadVector256(buf);
-        var xr = Avx.LoadVector256(buf + 1);
-        var fives = Avx2.Add(xl, xr);
-        var sixes = x;
-        var fivesPlusSixes = Avx2.Add(fives, sixes);
-        return Avx2.Add(Avx2.Add(Avx2.ShiftLeftLogical(fivesPlusSixes, 2), fivesPlusSixes), sixes);
-    }
-
+    // final_filter_fast: even rows weight the rows above and below 5 6 5 (cross_sum_fast_even_row), odd rows their own
+    // row 5 6 5 (cross_sum_fast_odd_row); 5 * fives + 6 * sixes = (fives + sixes) << 2 + (fives + sixes) + sixes.
     private static unsafe void FinalFilterFast(int* dst, int dstStride, int* A, int* B, int bufStride, byte* dgd8,
         int dgdStride, int width, int height)
     {
         const int nb0 = 5, nb1 = 4;
         var rounding0 = RoundForShift(SgrprojSgrBits + nb0 - SgrprojRstBits);
         var rounding1 = RoundForShift(SgrprojSgrBits + nb1 - SgrprojRstBits);
+        nint up = -bufStride, dn = bufStride;
         for (int i = 0; i < height; ++i)
         {
+            int* aRow = A + (nint)i * bufStride, bRow = B + (nint)i * bufStride, dRow = dst + (nint)i * dstStride;
+            byte* sRow = dgd8 + (nint)i * dgdStride;
             if ((i & 1) == 0)
             {
                 // even row
                 for (int j = 0; j < width; j += 8)
                 {
-                    var a = CrossSumFastEvenRow(A + i * bufStride + j, bufStride);
-                    var b = CrossSumFastEvenRow(B + i * bufStride + j, bufStride);
-                    var src = Avx2.ConvertToVector256Int32(Sse2.LoadVector128(dgd8 + i * dgdStride + j));
+                    int* a0 = aRow + j, b0 = bRow + j;
+                    var aFives = Avx2.Add(Avx.LoadVector256(a0 - 1 + up), Avx2.Add(Avx.LoadVector256(a0 + 1 + up),
+                        Avx2.Add(Avx.LoadVector256(a0 + 1 + dn), Avx.LoadVector256(a0 - 1 + dn))));
+                    var aSixes = Avx2.Add(Avx.LoadVector256(a0 + up), Avx.LoadVector256(a0 + dn));
+                    var aFs = Avx2.Add(aFives, aSixes);
+                    var a = Avx2.Add(Avx2.Add(Avx2.ShiftLeftLogical(aFs, 2), aFs), aSixes);
+                    var bFives = Avx2.Add(Avx.LoadVector256(b0 - 1 + up), Avx2.Add(Avx.LoadVector256(b0 + 1 + up),
+                        Avx2.Add(Avx.LoadVector256(b0 + 1 + dn), Avx.LoadVector256(b0 - 1 + dn))));
+                    var bSixes = Avx2.Add(Avx.LoadVector256(b0 + up), Avx.LoadVector256(b0 + dn));
+                    var bFs = Avx2.Add(bFives, bSixes);
+                    var b = Avx2.Add(Avx2.Add(Avx2.ShiftLeftLogical(bFs, 2), bFs), bSixes);
+                    var src = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(sRow + j)).AsByte());
                     var v = Avx2.Add(Avx2.MultiplyAddAdjacent(a.AsInt16(), src.AsInt16()), b);
                     var w = Avx2.ShiftRightArithmetic(Avx2.Add(v, rounding0), SgrprojSgrBits + nb0 - SgrprojRstBits);
-                    Avx.Store(dst + i * dstStride + j, w);
+                    Avx.Store(dRow + j, w);
                 }
             }
             else
@@ -462,12 +434,17 @@ internal static partial class AomRestoration
                 // odd row
                 for (int j = 0; j < width; j += 8)
                 {
-                    var a = CrossSumFastOddRow(A + i * bufStride + j);
-                    var b = CrossSumFastOddRow(B + i * bufStride + j);
-                    var src = Avx2.ConvertToVector256Int32(Sse2.LoadVector128(dgd8 + i * dgdStride + j));
+                    int* a0 = aRow + j, b0 = bRow + j;
+                    var aSixes = Avx.LoadVector256(a0);
+                    var aFs = Avx2.Add(Avx2.Add(Avx.LoadVector256(a0 - 1), Avx.LoadVector256(a0 + 1)), aSixes);
+                    var a = Avx2.Add(Avx2.Add(Avx2.ShiftLeftLogical(aFs, 2), aFs), aSixes);
+                    var bSixes = Avx.LoadVector256(b0);
+                    var bFs = Avx2.Add(Avx2.Add(Avx.LoadVector256(b0 - 1), Avx.LoadVector256(b0 + 1)), bSixes);
+                    var b = Avx2.Add(Avx2.Add(Avx2.ShiftLeftLogical(bFs, 2), bFs), bSixes);
+                    var src = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(*(ulong*)(sRow + j)).AsByte());
                     var v = Avx2.Add(Avx2.MultiplyAddAdjacent(a.AsInt16(), src.AsInt16()), b);
                     var w = Avx2.ShiftRightArithmetic(Avx2.Add(v, rounding1), SgrprojSgrBits + nb1 - SgrprojRstBits);
-                    Avx.Store(dst + i * dstStride + j, w);
+                    Avx.Store(dRow + j, w);
                 }
             }
         }

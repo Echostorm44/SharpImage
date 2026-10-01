@@ -69,6 +69,24 @@ public sealed partial class AomLfTwinTests
                 }
             });
             Console.WriteLine($"pixel_proj_error 64x64 ep {ep}: ours {oursE * 1000 / reps:F2} us, libaom {theirsE * 1000 / reps:F2} us");
+            var Hh = new long[4];
+            var Cc = new long[2];
+            double oursP = TimeMs(reps, () => AomPickRst.CalcProjParams(src.Buf, src.Origin, w, h, src.Stride, dgd.Buf, dgd.Origin,
+                dgd.Stride, f0, 0, fs, f1, 0, fs, Hh, Cc, ep));
+            double theirsP = TimeMs(reps, () =>
+            {
+                unsafe
+                {
+                    fixed (byte* d = dgd.Buf)
+                    fixed (byte* s = src.Buf)
+                    fixed (int* p0 = f0)
+                    fixed (int* p1 = f1)
+                    fixed (long* ph = Hh)
+                    fixed (long* pc = Cc)
+                        Native.twin_calc_proj_params(s + src.Origin, w, h, src.Stride, d + dgd.Origin, dgd.Stride, p0, fs, p1, fs, ph, pc, ep);
+                }
+            });
+            Console.WriteLine($"calc_proj_params 64x64 ep {ep}: ours {oursP * 1000 / reps:F2} us, libaom {theirsP * 1000 / reps:F2} us");
         }
         {
             var hf = new AomTaps8();

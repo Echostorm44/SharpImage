@@ -213,51 +213,159 @@ internal sealed class AomPickRst
 
     // ---- self-guided search ---------------------------------------------------------------------------------------------
 
-    /// <summary>av1_lowbd_pixel_proj_error_c.</summary>
+    /// <summary>av1_lowbd_pixel_proj_error (the RTCD choice): av1_lowbd_pixel_proj_error_avx2 when available.</summary>
     public static long LowbdPixelProjError(byte[] src8, int s0, int width, int height, int srcStride, byte[] dat8, int d0,
+        int datStride, int[] flt0, int f0, int flt0Stride, int[] flt1, int f1, int flt1Stride, int xq0, int xq1, int ep)
+    {
+        bool inBounds = d0 >= 0 && s0 >= 0 && f0 >= 0 && f1 >= 0 && height > 0
+            && d0 + (long)(height - 1) * datStride + width <= dat8.Length && s0 + (long)(height - 1) * srcStride + width <= src8.Length
+            && (SgrR0[ep] == 0 || f0 + (long)(height - 1) * flt0Stride + width <= flt0.Length)
+            && (SgrR1[ep] == 0 || f1 + (long)(height - 1) * flt1Stride + width <= flt1.Length);
+        if (Avx2.IsSupported && inBounds)
+            return LowbdPixelProjErrorAvx2(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride,
+                flt1, f1, flt1Stride, xq0, xq1, ep);
+        return LowbdPixelProjErrorC(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride, flt1,
+            f1, flt1Stride, xq0, xq1, ep);
+    }
+
+    /// <summary>av1_lowbd_pixel_proj_error_avx2 (pickrst_avx2.c), line by line: 16 pixels a step in 16-bit lanes (the
+    /// filtered values packed with saturation), squared errors madd-summed in int32 per row (all rows for the
+    /// unfiltered case) and accumulated in int64.</summary>
+    private static unsafe long LowbdPixelProjErrorAvx2(byte[] src8, int s0, int width, int height, int srcStride,
+        byte[] dat8, int d0, int datStride, int[] flt0Arr, int f0, int flt0Stride, int[] flt1Arr, int f1, int flt1Stride,
+        int xq0, int xq1, int ep)
+    {
+        const int shift = SgrprojRstBits + SgrprojPrjBits;
+        var rounding = Vector256.Create(1 << (shift - 1));
+        var sum64 = Vector256<long>.Zero;
+        long err = 0;
+        int i, j, k;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector256<short> PairSet(int a, int b) => Vector256.Create((int)((uint)(ushort)a | ((uint)(ushort)b << 16))).AsInt16();
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector256<short> Flt16(int* f) => Avx2.Permute4x64(Avx2.PackSignedSaturate(Avx.LoadVector256(f), Avx.LoadVector256(f + 8)).AsInt64(), 0xd8).AsInt16();
+        fixed (byte* srcBase = src8)
+        fixed (byte* datBase = dat8)
+        fixed (int* flt0Base = flt0Arr)
+        fixed (int* flt1Base = flt1Arr)
+        {
+            byte* src = srcBase + s0;
+            byte* dat = datBase + d0;
+            int* flt0 = flt0Base + f0;
+            int* flt1 = flt1Base + f1;
+            bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
+            if (r0 && r1)
+            {
+                var xqCoeff = PairSet(xq0, xq1);
+                for (i = 0; i < height; ++i)
+                {
+                    var sum32 = Vector256<int>.Zero;
+                    for (j = 0; j <= width - 16; j += 16)
+                    {
+                        var dd0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(dat + j));
+                        var ss0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(src + j));
+                        var flt016b = Flt16(flt0 + j);
+                        var flt116b = Flt16(flt1 + j);
+                        var u0 = Avx2.ShiftLeftLogical(dd0, SgrprojRstBits);
+                        var flt00SubU = Avx2.Subtract(flt016b, u0);
+                        var flt10SubU = Avx2.Subtract(flt116b, u0);
+                        var v0 = Avx2.MultiplyAddAdjacent(xqCoeff, Avx2.UnpackLow(flt00SubU, flt10SubU));
+                        var v1 = Avx2.MultiplyAddAdjacent(xqCoeff, Avx2.UnpackHigh(flt00SubU, flt10SubU));
+                        var vr0 = Avx2.ShiftRightArithmetic(Avx2.Add(v0, rounding), shift);
+                        var vr1 = Avx2.ShiftRightArithmetic(Avx2.Add(v1, rounding), shift);
+                        var e0 = Avx2.Subtract(Avx2.Add(Avx2.PackSignedSaturate(vr0, vr1), dd0), ss0);
+                        var err0 = Avx2.MultiplyAddAdjacent(e0, e0);
+                        sum32 = Avx2.Add(sum32, err0);
+                    }
+                    for (k = j; k < width; ++k)
+                    {
+                        int u = dat[k] << SgrprojRstBits;
+                        int v = xq0 * (flt0[k] - u) + xq1 * (flt1[k] - u);
+                        int e = ((v + (1 << (shift - 1))) >> shift) + dat[k] - src[k];
+                        err += (long)e * e;
+                    }
+                    dat += datStride;
+                    src += srcStride;
+                    flt0 += flt0Stride;
+                    flt1 += flt1Stride;
+                    sum64 = Avx2.Add(sum64, Avx2.ConvertToVector256Int64(sum32.GetLower()));
+                    sum64 = Avx2.Add(sum64, Avx2.ConvertToVector256Int64(sum32.GetUpper()));
+                }
+            }
+            else if (r0 || r1)
+            {
+                int xqActive = r0 ? xq0 : xq1;
+                var xqCoeff = PairSet(xqActive, -xqActive * (1 << SgrprojRstBits));
+                int* flt = r0 ? flt0 : flt1;
+                int fltStride = r0 ? flt0Stride : flt1Stride;
+                for (i = 0; i < height; ++i)
+                {
+                    var sum32 = Vector256<int>.Zero;
+                    for (j = 0; j <= width - 16; j += 16)
+                    {
+                        var dd0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(dat + j));
+                        var ss0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(src + j));
+                        var flt16b = Flt16(flt + j);
+                        var v0 = Avx2.MultiplyAddAdjacent(xqCoeff, Avx2.UnpackLow(flt16b, dd0));
+                        var v1 = Avx2.MultiplyAddAdjacent(xqCoeff, Avx2.UnpackHigh(flt16b, dd0));
+                        var vr0 = Avx2.ShiftRightArithmetic(Avx2.Add(v0, rounding), shift);
+                        var vr1 = Avx2.ShiftRightArithmetic(Avx2.Add(v1, rounding), shift);
+                        var e0 = Avx2.Subtract(Avx2.Add(Avx2.PackSignedSaturate(vr0, vr1), dd0), ss0);
+                        var err0 = Avx2.MultiplyAddAdjacent(e0, e0);
+                        sum32 = Avx2.Add(sum32, err0);
+                    }
+                    for (k = j; k < width; ++k)
+                    {
+                        int u = dat[k] << SgrprojRstBits;
+                        int v = xqActive * (flt[k] - u);
+                        int e = ((v + (1 << (shift - 1))) >> shift) + dat[k] - src[k];
+                        err += (long)e * e;
+                    }
+                    dat += datStride;
+                    src += srcStride;
+                    flt += fltStride;
+                    sum64 = Avx2.Add(sum64, Avx2.ConvertToVector256Int64(sum32.GetLower()));
+                    sum64 = Avx2.Add(sum64, Avx2.ConvertToVector256Int64(sum32.GetUpper()));
+                }
+            }
+            else
+            {
+                var sum32 = Vector256<int>.Zero;
+                for (i = 0; i < height; ++i)
+                {
+                    for (j = 0; j <= width - 16; j += 16)
+                    {
+                        var dd0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(dat + j));
+                        var ss0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(src + j));
+                        var diff0 = Avx2.Subtract(dd0, ss0);
+                        sum32 = Avx2.Add(sum32, Avx2.MultiplyAddAdjacent(diff0, diff0));
+                    }
+                    for (k = j; k < width; ++k)
+                    {
+                        int e = dat[k] - src[k];
+                        err += (long)e * e;
+                    }
+                    dat += datStride;
+                    src += srcStride;
+                }
+                sum64 = Avx2.Add(Avx2.ConvertToVector256Int64(sum32.GetLower()), Avx2.ConvertToVector256Int64(sum32.GetUpper()));
+            }
+        }
+        err += sum64.GetElement(0) + sum64.GetElement(1) + sum64.GetElement(2) + sum64.GetElement(3);
+        return err;
+    }
+
+    /// <summary>av1_lowbd_pixel_proj_error_c.</summary>
+    public static long LowbdPixelProjErrorC(byte[] src8, int s0, int width, int height, int srcStride, byte[] dat8, int d0,
         int datStride, int[] flt0, int f0, int flt0Stride, int[] flt1, int f1, int flt1Stride, int xq0, int xq1, int ep)
     {
         long err = 0;
         const int sh = SgrprojRstBits + SgrprojPrjBits;
         bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
-        bool simd = Avx2.IsSupported && width >= 8 && d0 >= 0 && s0 >= 0 && f0 >= 0 && f1 >= 0
-            && d0 + (long)(height - 1) * datStride + width <= dat8.Length && s0 + (long)(height - 1) * srcStride + width <= src8.Length
-            && f0 + (long)(height - 1) * flt0Stride + width <= flt0.Length && f1 + (long)(height - 1) * flt1Stride + width <= flt1.Length;
-        var rnd = Vector256.Create(1 << (sh - 1));
-        var vxq0 = Vector256.Create(r0 ? xq0 : 0);
-        var vxq1 = Vector256.Create(r1 ? xq1 : 0);
-        ref byte dat0 = ref MemoryMarshal.GetArrayDataReference(dat8);
-        ref byte src0 = ref MemoryMarshal.GetArrayDataReference(src8);
-        ref int fl0 = ref MemoryMarshal.GetArrayDataReference(flt0);
-        ref int fl1 = ref MemoryMarshal.GetArrayDataReference(flt1);
         for (int i = 0; i < height; ++i)
         {
             int dr = d0 + i * datStride, sr = s0 + i * srcStride, a = f0 + i * flt0Stride, b = f1 + i * flt1Stride;
-            int j0 = 0;
-            if (simd)
-            {
-                // 8 pixels a lane: the same int32 v and e; e^2 summed in int64 lanes (exact)
-                var acc = Vector256<long>.Zero;
-                for (; j0 + 8 <= width; j0 += 8)
-                {
-                    var d = Avx2.ConvertToVector256Int32(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref dat0, dr + j0))).AsByte());
-                    var sv = Avx2.ConvertToVector256Int32(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src0, sr + j0))).AsByte());
-                    Vector256<int> e;
-                    if (r0 || r1)
-                    {
-                        var u = Vector256.ShiftLeft(d, SgrprojRstBits);
-                        var v = Vector256.ShiftLeft(u, SgrprojPrjBits);
-                        if (r0) v += vxq0 * (Vector256.LoadUnsafe(ref fl0, (nuint)(a + j0)) - u);
-                        if (r1) v += vxq1 * (Vector256.LoadUnsafe(ref fl1, (nuint)(b + j0)) - u);
-                        e = Vector256.ShiftRightArithmetic(v + rnd, sh) - sv;
-                    }
-                    else e = d - sv;
-                    var e2 = e * e;
-                    acc += Avx2.ConvertToVector256Int64(e2.GetLower()) + Avx2.ConvertToVector256Int64(e2.GetUpper());
-                }
-                err += Vector256.Sum(acc);
-            }
-            for (int j = j0; j < width; ++j)
+            for (int j = 0; j < width; ++j)
             {
                 int e;
                 if (r0 || r1)
