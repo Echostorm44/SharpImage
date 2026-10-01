@@ -347,10 +347,19 @@ public sealed partial class AomLfTwinTests
             FillPlane(rng, dgd, rng.Next(0, 40));
             FillPlane(rng, src, rng.Next(0, 40));
             if (iter % 9 == 0) rng.NextBytes(dgd.Buf);
+            if (iter % 13 == 0) Array.Fill(dgd.Buf, (byte)(iter % 26 == 0 ? 255 : 0));
             int fs = ((w + 7) & ~7) + 8;
             var f0 = new int[fs * h];
             var f1 = new int[fs * h];
             AomRestoration.SelfguidedRestoration(dgd.Buf, dgd.Origin, w, h, dgd.Stride, f0, 0, f1, 0, fs, ep, sc);
+            var c0 = new int[fs * h];
+            var c1 = new int[fs * h];
+            AomRestoration.SelfguidedRestorationC(dgd.Buf, dgd.Origin, w, h, dgd.Stride, c0, 0, c1, 0, fs, ep, sc);
+            for (int r = 0; r < h; r++)
+            {
+                if (AomRestoration.SgrR0[ep] > 0) await Assert.That(f0.AsSpan(r * fs, w).SequenceEqual(c0.AsSpan(r * fs, w))).IsTrue();
+                if (AomRestoration.SgrR1[ep] > 0) await Assert.That(f1.AsSpan(r * fs, w).SequenceEqual(c1.AsSpan(r * fs, w))).IsTrue();
+            }
             var t0 = new int[fs * h + 64];
             var t1 = new int[fs * h + 64];
             unsafe
@@ -420,6 +429,7 @@ public sealed partial class AomLfTwinTests
             var dat = new AomYv12Plane(w, h, w, h, 8);
             FillPlane(rng, dat, rng.Next(0, 60));
             if (iter % 5 == 0) rng.NextBytes(dat.Buf);
+            if (iter % 13 == 0) Array.Fill(dat.Buf, (byte)(iter % 26 == 0 ? 255 : 0));
             var ours = new AomYv12Plane(w, h, w, h, 8);
             var theirs = new AomYv12Plane(w, h, w, h, 8);
             AomRestoration.ApplySelfguided(dat.Buf, dat.Origin, w, h, dat.Stride, ep, xqd0, xqd1, ours.Buf, ours.Origin,
@@ -443,7 +453,7 @@ public sealed partial class AomLfTwinTests
         var temp = new ushort[135 * 128];
         for (int iter = 0; iter < 1500; iter++)
         {
-            int w = 16 * rng.Next(1, 5), h = rng.Next(1, 65);
+            int w = (iter & 1) == 0 ? 16 * rng.Next(1, 5) : 8 * rng.Next(1, 9), h = rng.Next(1, 65);
             var hf = new AomTaps8();
             var vf = new AomTaps8();
             bool extreme = iter % 8 == 0;
@@ -464,10 +474,16 @@ public sealed partial class AomLfTwinTests
             var src = new AomYv12Plane(w, h, w, h, 16);
             FillPlane(rng, src, rng.Next(0, 80));
             if (iter % 4 == 0) rng.NextBytes(src.Buf);
+            if (iter % 13 == 0) Array.Fill(src.Buf, (byte)(iter % 26 == 0 ? 255 : 0));
             var ours = new AomYv12Plane(w, h, w, h, 8);
             var theirs = new AomYv12Plane(w, h, w, h, 8);
             AomRestoration.WienerConvolveAddSrc(src.Buf, src.Origin, src.Stride, ours.Buf, ours.Origin, ours.Stride, hf, vf,
                 w, h, temp);
+            var oursC = new AomYv12Plane(w, h, w, h, 8);
+            AomRestoration.WienerConvolveAddSrcC(src.Buf, src.Origin, src.Stride, oursC.Buf, oursC.Origin, oursC.Stride, hf, vf,
+                w, h, temp);
+            for (int r = 0; r < h; r++)
+                await Assert.That(ours.Buf.AsSpan(ours.At(0, r), w).SequenceEqual(oursC.Buf.AsSpan(oursC.At(0, r), w))).IsTrue();
             var ha = new short[8];
             var va = new short[8];
             for (int i = 0; i < 8; i++) { ha[i] = hf[i]; va[i] = vf[i]; }
