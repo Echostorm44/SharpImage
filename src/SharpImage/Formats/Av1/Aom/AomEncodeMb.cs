@@ -13,9 +13,10 @@ internal static class AomXformQuant
     public const int Fp = 0, B = 1, Dc = 2, SkipQuant = 3;
 }
 
-/// <summary>QUANT_PARAM (av1/encoder/av1_quantize.h), without matrices (libaom's all-intra configuration).</summary>
+/// <summary>QUANT_PARAM (av1/encoder/av1_quantize.h).</summary>
 internal struct AomQuantParam
 {
+    public byte[]? Qmatrix, Iqmatrix;
     public int LogScale;
     public int TxSize;
     public int UseQuantBAdapt;
@@ -377,7 +378,15 @@ internal static class AomEncodeMb
         coeff[0] = (int)((perPxMean * DcCoeffScale[txSize]) >> 12);
     }
 
-    /// <summary>av1_setup_quant.</summary>
+    /// <summary>av1_setup_qmatrix: the plane's matrices for the tx size / type (flat for 1D and identity transforms).</summary>
+    internal static void SetupQmatrix(AomMacroblock x, int plane, int txSize, int txType, ref AomQuantParam qp)
+    {
+        int level = x.E.Plane[plane].QmLevel;
+        qp.Qmatrix = AomQm.Qmatrix(level, plane, txSize, txType);
+        qp.Iqmatrix = AomQm.Iqmatrix(level, plane, txSize, txType);
+    }
+
+    /// <summary>av1_setup_quant (the matrices are reset to none).</summary>
     internal static AomQuantParam SetupQuant(int txSize, bool useOptimizeB, int xformQuantIdx, int useQuantBAdapt)
         => new() { LogScale = AomQuantize.TxScale(txSize), TxSize = txSize, UseQuantBAdapt = useQuantBAdapt, UseOptimizeB = useOptimizeB, XformQuantIdx = xformQuantIdx };
 
@@ -394,7 +403,14 @@ internal static class AomEncodeMb
         if (qp.XformQuantIdx != AomXformQuant.SkipQuant)
         {
             short[] iscan = IScanOf(txSize, txType);
-            int eob = qp.XformQuantIdx switch
+            int eob = qp.Qmatrix != null && qp.Iqmatrix != null ? qp.XformQuantIdx switch
+            {
+                AomXformQuant.Fp => AomQm.QuantizeFpHelper(coeff, n, scan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
+                    p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                AomXformQuant.B => AomQm.QuantizeBHelper(coeff, n, scan, p.Zbin0, p.Zbin1, p.Round0, p.Round1, p.Quant0, p.Quant1,
+                    p.QuantShift0, p.QuantShift1, p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                _ => throw new NotSupportedException("AV1_XFORM_QUANT_DC is not used on the all-intra path"),
+            } : qp.XformQuantIdx switch
             {
                 AomXformQuant.Fp => AomQuantize.QuantizeFpAvx2(coeff, n, iscan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
                     p.Dequant0, p.Dequant1, qp.LogScale, q, dq),
@@ -468,7 +484,9 @@ internal static class AomEncodeMb
         var q = p.Qcoeff.AsSpan(off, n);
         eob = AomTxb.OptimizeTxb(x.CoeffCosts, txSize, txType, plane == 0 ? 0 : 1, IsInterBlock(xd.Mi0), txbCtx, p.Coeff.AsSpan(off, n), q,
             p.Dqcoeff.AsSpan(off, n), eob, p.Dequant0, p.Dequant1, x.Rdmult, xd.Bd, cpi.Sharpness, cpi.Sf.tx_sf.use_chroma_trellis_rd_mult != 0,
-            cpi.TuneIq, TxTypeCost(x, plane, txSize, txType, cpi.ReducedTxSetUsed), scan, out rateCost);
+            cpi.TuneIq, TxTypeCost(x, plane, txSize, txType, cpi.ReducedTxSetUsed), scan, out rateCost,
+            AomQm.Iqmatrix(xd.Plane[plane].QmLevel, plane, txSize, txType),
+            cpi.QmPsnrDistMetric ? AomQm.Qmatrix(xd.Plane[plane].QmLevel, plane, txSize, txType) : null);
         p.Eobs[block] = (ushort)eob;
         p.TxbEntropyCtx[block] = AomTxb.TxbEntropyContext(q, scan, eob);
         return eob;

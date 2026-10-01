@@ -51,7 +51,7 @@ internal static partial class AomEncodeFrame
 
         // Save rdmult before it might be changed, so it can be restored later.
         int origRdmult = x.Rdmult;
-        SetupBlockRdmult(cpi, x);
+        SetupBlockRdmult(cpi, x, miRow, miCol, bsize);
 
         // (is_adjust_var_based_part_enabled: adjust_var_based_rd_partitioning is 0)
 
@@ -220,7 +220,7 @@ internal static partial class AomEncodeFrame
 
         // Save rdmult before it might be changed, so it can be restored later.
         int origRdmult = x.Rdmult;
-        SetupBlockRdmult(cpi, x);
+        SetupBlockRdmult(cpi, x, miRow, miCol, bsize);
         x.Errorperbit = AomRd.ErrorPerBit(x.Rdmult);
         HybridIntraModeSearch(cpi, x, ref rdCost, bsize, ctx);
         // (skip_cdef_sb is off in the all-intra mode)
