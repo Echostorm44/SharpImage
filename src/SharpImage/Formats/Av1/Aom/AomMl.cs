@@ -40,7 +40,10 @@ internal static partial class AomMl
 
     // _mm_max_ps(x, 0) / (x > 0 ? x : 0): +0 for -0 and NaN
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float Relu(float x) => x > 0f ? x : 0f;
+    // x > 0 ? x : 0 as maxss(x, 0) (libaom's _mm_max_ps; branch-free on data-random signs)
+    private static float Relu(float x) => System.Runtime.Intrinsics.X86.Sse.IsSupported
+        ? System.Runtime.Intrinsics.Vector128.ToScalar(System.Runtime.Intrinsics.X86.Sse.MaxScalar(System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(x), System.Runtime.Intrinsics.Vector128<float>.Zero))
+        : x > 0f ? x : 0f;
 
     // ---- libm as libaom links it (mingw-w64 msvcrt runtime) ----
 
