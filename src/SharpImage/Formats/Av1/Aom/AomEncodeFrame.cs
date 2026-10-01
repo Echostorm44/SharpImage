@@ -506,7 +506,7 @@ internal static partial class AomEncodeFrame
         txfmParams.TxSizeSearchMethod = cpi.WinnerModeParams.tx_size_search_methods[DEFAULT_EVAL];
         if (cpi.Sf.winner_mode_sf.enable_winner_mode_for_tx_size_srch != 0)
             txfmParams.TxSizeSearchMethod = cpi.WinnerModeParams.tx_size_search_methods[WINNER_MODE_EVAL];
-        txfmParams.TxModeSearchType = AomRdoptUtils.SelectTxMode(false, txfmParams.TxSizeSearchMethod);
+        txfmParams.TxModeSearchType = AomRdoptUtils.SelectTxMode(cm.BaseQindex == 0, txfmParams.TxSizeSearchMethod);
 
         int miRow = xd.MiRow, miCol = xd.MiCol;
         bool isInter = AomEncodeMb.IsInterBlock(mbmi);
@@ -600,8 +600,9 @@ internal static partial class AomEncodeFrame
         return mbmi.UvMode == UV_CFL_PRED;
     }
 
-    /// <summary>encode_b.</summary>
-    internal static void EncodeB(AomComp cpi, AomMacroblock x, int miRow, int miCol, int dryRun, int bsize, int partition, AomPickModeContext ctx)
+    /// <summary>encode_b (and encode_b_nonrd with nonrd: the skip flag of intra blocks is cleared).</summary>
+    internal static void EncodeB(AomComp cpi, AomMacroblock x, int miRow, int miCol, int dryRun, int bsize, int partition, AomPickModeContext ctx,
+        bool nonrd = false)
     {
         var cm = cpi.Cm;
         var xd = x.E;
@@ -622,6 +623,8 @@ internal static partial class AomEncodeFrame
             if (extFrame != null) { extFrame.CbOffset[0] = (ushort)x.CbOffset[0]; extFrame.CbOffset[1] = (ushort)x.CbOffset[1]; }
         }
 
+        // encode_b_nonrd: intra blocks are coded as non-skip
+        if (nonrd && !AomEncodeMb.IsInterBlock(xd.Mi0)) xd.Mi0.SkipTxfm = 0;
         EncodeSuperblock(cpi, x, dryRun, bsize);
 
         if (dryRun == OUTPUT_ENABLED)

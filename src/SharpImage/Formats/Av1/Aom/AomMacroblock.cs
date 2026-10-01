@@ -88,6 +88,7 @@ internal sealed class AomModeCosts
     public readonly int[] InterTxTypeCosts = new int[ExtTxSetsInter * ExtTxSizes * TxTypes];                // [set][sqr tx][type]
     public readonly int[] AngleDeltaCost = new int[DirectionalModes * (2 * MaxAngleDelta + 1)];
     public readonly int[] IntrabcCost = new int[2];
+    public readonly int[] MbmodeCost = new int[4 * IntraModes];                                // [BLOCK_SIZE_GROUPS][INTRA_MODES]
     public readonly int[] SwitchableRestoreCost = new int[RestoreSwitchableTypes];
     public readonly int[] WienerRestoreCost = new int[2];
     public readonly int[] SgrprojRestoreCost = new int[2];

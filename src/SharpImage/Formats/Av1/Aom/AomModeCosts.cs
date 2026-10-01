@@ -41,6 +41,7 @@ internal static class AomModeCostFill
         for (int i = 0; i < 5; i++)
             for (int j = 0; j < 5; j++)
                 AomCost.CostTokensFromCdf(mc.YModeCosts.AsSpan((i * 13 + j) * 13), fc.Kfym[i * 5 + j], 13);
+        for (int i = 0; i < 4; i++) AomCost.CostTokensFromCdf(mc.MbmodeCost.AsSpan(i * 13), m.YMode[i], 13);
         for (int i = 0; i < 2; i++)
             for (int j = 0; j < 13; j++)
                 AomCost.CostTokensFromCdf(mc.IntraUvModeCost.AsSpan((i * 13 + j) * 14), m.UvMode[i * 13 + j], i == 1 ? 14 : 13);
