@@ -29,7 +29,17 @@ internal static class AomPostFilter
         lf ??= new AomLoopFilterParams();
         var filter = new AomLoopFilter();
         AomPickLpf.PickFilterLevel(src, cur, mi, lf, lpfCfg, filter);
-        if (lf.FilterLevel[0] != 0 || lf.FilterLevel[1] != 0) filter.FilterFrame(cur, mi, lf, 0, cur.NumPlanes);
+        if (lf.FilterLevel[0] != 0 || lf.FilterLevel[1] != 0)
+        {
+            if (lpfCfg.Parallel && cur.NumPlanes > 1)
+            {
+                // the planes filter independently (luma beside chroma, as the MT loop filter's planes)
+                var chroma = System.Threading.Tasks.Task.Run(() => new AomLoopFilter().FilterFrame(cur, mi, lf, 1, cur.NumPlanes));
+                filter.FilterFrame(cur, mi, lf, 0, 1);
+                chroma.Wait();
+            }
+            else filter.FilterFrame(cur, mi, lf, 0, cur.NumPlanes);
+        }
         if (rstCfg == null) return new AomPostFilterResult { LoopFilter = lf };
 
         var rst = new AomRestorationInfo[cur.NumPlanes];

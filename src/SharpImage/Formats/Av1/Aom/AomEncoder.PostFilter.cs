@@ -59,6 +59,7 @@ internal static partial class AomEncoder
             SkipLoopFilterUsingFiltError = sf.lpf_sf.skip_loop_filter_using_filt_error, Sharpness = cpi.Sharpness,
             SharpnessFromConfig = cpi.AllIntra, BaseQindex = cm.BaseQindex, KeyFrame = true, IntraOnly = true,
             TxModeOnly4x4 = x.E.Lossless[0] != 0,
+            Parallel = cpi.NumWorkers > 1,
         };
 
         AomRstPickConfig? rstCfg = null;
