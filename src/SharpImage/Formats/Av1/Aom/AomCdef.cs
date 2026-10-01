@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
+using System.Runtime.Intrinsics.X86;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -13,10 +15,12 @@ namespace SharpImage.Formats.Av1;
 internal static partial class AomCdef
 {
     private const int VBorder = 2, HBorder = 8;
-    internal const int BStride = 144;   // ALIGN_POWER_OF_TWO(128 + 2 * CDEF_HBORDER, 3)
-    private const int VeryLarge = 0x4000;
-    private const int InbufSize = BStride * (128 + 2 * VBorder);
+    internal const int BStride = 144;
+    internal const int InOff = VBorder * BStride + HBorder;   // the filter block's origin in the 16-bit input buffer   // ALIGN_POWER_OF_TWO(128 + 2 * CDEF_HBORDER, 3)
+    internal const int VeryLarge = 0x4000;
+    internal const int InbufSize = BStride * (128 + 2 * VBorder);
     private const int NBlocks = 16;     // CDEF_NBLOCKS
+    internal const int InbufSizeForScratch = InbufSize, NBlocksForScratch = NBlocks;
     private const int SecStrengths = 4, PriStrengths = 16, TotalStrengths = PriStrengths * SecStrengths;
     private const int MiSize64 = 16, MiSize128 = 32;
 
@@ -51,7 +55,7 @@ internal static partial class AomCdef
     private static readonly int[] NbCdefStrengths = { 64, 8 * 4, 5 * 4, 5 * 2, 2 * 2, 2 * 1, 64 };
 
     /// <summary>cdef_find_dir_c: the 8x8 block's dominant direction and its directional variance.</summary>
-    private static int FindDir(ushort[] img, int off, int stride, out int var, int coeffShift)
+    internal static int FindDir(ushort[] img, int off, int stride, out int var, int coeffShift)
     {
         Span<int> cost = stackalloc int[8];
         Span<int> partial = stackalloc int[8 * 15];
@@ -107,7 +111,7 @@ internal static partial class AomCdef
     }
 
     /// <summary>cdef_filter_block_internal (8-bit output).</summary>
-    private static void FilterBlock(byte[] dst, int dstOff, int dstride, ushort[] inb, int inOff, int priStrength, int secStrength, int dir,
+    internal static void FilterBlock(byte[] dst, int dstOff, int dstride, ushort[] inb, int inOff, int priStrength, int secStrength, int dir,
         int priDamping, int secDamping, int coeffShift, int bw, int bh, bool enablePrimary, bool enableSecondary)
     {
         bool clippingRequired = enablePrimary && enableSecondary;
@@ -167,8 +171,41 @@ internal static partial class AomCdef
         return var != 0 ? (strength * (4 + i) + 8) >> 4 : 0;
     }
 
+    /// <summary>aom_cdef_find_dir: the luma directions / variances of the listed blocks (pairs through cdef_find_dir_dual,
+    /// then the odd one).</summary>
+    internal static unsafe void FindDirs(ushort[] inb, int inOff, (byte by, byte bx)[] dlist, int cdefCount, int[] dir, int[] var, int coeffShift)
+    {
+        if (!Avx2.IsSupported)
+        {
+            for (int bi = 0; bi < cdefCount; bi++)
+            {
+                int by = dlist[bi].by, bx = dlist[bi].bx;
+                dir[by * NBlocks + bx] = FindDir(inb, inOff + 8 * by * BStride + 8 * bx, BStride, out var[by * NBlocks + bx], coeffShift);
+            }
+            return;
+        }
+        fixed (ushort* ib = inb)
+        {
+            ushort* inp = ib + inOff;
+            int bi;
+            for (bi = 0; bi < cdefCount - 1; bi += 2)
+            {
+                int by = dlist[bi].by, bx = dlist[bi].bx, by2 = dlist[bi + 1].by, bx2 = dlist[bi + 1].bx;
+                FindDirDualAvx2(inp + 8 * by * BStride + 8 * bx, inp + 8 * by2 * BStride + 8 * bx2, BStride, out var[by * NBlocks + bx],
+                    out var[by2 * NBlocks + bx2], coeffShift, out dir[by * NBlocks + bx], out dir[by2 * NBlocks + bx2]);
+            }
+            if ((cdefCount & 1) != 0)
+            {
+                // cdef_find_dir_avx2 is the same per-lane arithmetic as the dual kernel's first lane
+                int by = dlist[bi].by, bx = dlist[bi].bx;
+                ushort* p = inp + 8 * by * BStride + 8 * bx;
+                FindDirDualAvx2(p, p, BStride, out var[by * NBlocks + bx], out _, coeffShift, out dir[by * NBlocks + bx], out _);
+            }
+        }
+    }
+
     /// <summary>av1_cdef_filter_fb with 8-bit output (dirinit: the search caches the luma directions per block).</summary>
-    private static void FilterFb(byte[] dst8, int dstOff, int dstride, ushort[] inb, int inOff, int xdec, int ydec, int[] dir, ref bool dirinit,
+    internal static unsafe void FilterFb(byte[] dst8, int dstOff, int dstride, ushort[] inb, int inOff, int xdec, int ydec, int[] dir, ref bool dirinit,
         bool useDirinit, int[] var, int pli, (byte by, byte bx)[] dlist, int cdefCount, int level, int secStrength, int damping, int coeffShift)
     {
         int priStrength = level << coeffShift;
@@ -179,12 +216,7 @@ internal static partial class AomCdef
             throw new InvalidOperationException("the 8-bit search never filters with zero strengths");
         if (pli == 0 && (!useDirinit || !dirinit))
         {
-            // aom_cdef_find_dir (pairs then the odd one: the same per-block result)
-            for (int bi = 0; bi < cdefCount; bi++)
-            {
-                int by = dlist[bi].by, bx = dlist[bi].bx;
-                dir[by * NBlocks + bx] = FindDir(inb, inOff + 8 * by * BStride + 8 * bx, BStride, out var[by * NBlocks + bx], coeffShift);
-            }
+            FindDirs(inb, inOff, dlist, cdefCount, dir, var, coeffShift);
             if (useDirinit) dirinit = true;
         }
         if (pli == 1 && xdec != ydec)
@@ -197,6 +229,25 @@ internal static partial class AomCdef
             }
         }
         int bw = 8 >> xdec, bh = 8 >> ydec;
+        if (Avx2.IsSupported)
+        {
+            fixed (byte* d0 = dst8)
+            fixed (ushort* i0 = inb)
+            {
+                byte* d = d0 + dstOff;
+                short* inp = (short*)i0 + inOff;
+                for (int bi = 0; bi < cdefCount; bi++)
+                {
+                    int by = dlist[bi].by, bx = dlist[bi].bx;
+                    int t = pli != 0 ? priStrength : AdjustStrength(priStrength, var[by * NBlocks + bx]);
+                    int strengthIndex = (secStrength == 0 ? 1 : 0) | (t == 0 ? 2 : 0);
+                    FilterBlock8Avx2(strengthIndex, d + (by << bhLog2) * dstride + (bx << bwLog2), dstride,
+                        inp + (by * BStride << bhLog2) + (bx << bwLog2), t, secStrength, priStrength != 0 ? dir[by * NBlocks + bx] : 0,
+                        damping, damping, coeffShift, bw, bh);
+                }
+            }
+            return;
+        }
         for (int bi = 0; bi < cdefCount; bi++)
         {
             int by = dlist[bi].by, bx = dlist[bi].bx;
@@ -254,16 +305,17 @@ internal static partial class AomCdef
         for (int i = 0; i < v; i++) dst.AsSpan(off + i * dstride, h).Fill(x);
     }
 
-    private static long Sse(byte[] a, int aOff, int aStride, byte[] b, int bOff, int bStride, int w, int h)
+    /// <summary>aom_sse (the vectorized 8-bit kernel; integer sums, so exactly libaom's).</summary>
+    private static long Sse(byte[] a, int aOff, int aStride, byte[] b, int bOff, int bStride, int w, int h) =>
+        AomEncodeMb.Sse(a, aOff, aStride, b, bOff, bStride, w, h);
+
+    /// <summary>get_error_calc_width_in_filt_units: how many horizontally adjacent listed blocks one SSE call covers.</summary>
+    private static int ErrorCalcWidthInFiltUnits((byte by, byte bx)[] dlist, int cdefCount, int bi, int ssX, int ssY)
     {
-        long sse = 0;
-        for (int r = 0; r < h; r++)
-            for (int c = 0; c < w; c++)
-            {
-                int d = a[aOff + r * aStride + c] - b[bOff + r * bStride + c];
-                sse += d * d;
-            }
-        return sse;
+        if (ssX != ssY) return 1;
+        if (bi + 3 < cdefCount && dlist[bi].by == dlist[bi + 3].by && dlist[bi].bx + 3 == dlist[bi + 3].bx) return 4;
+        if (bi + 1 < cdefCount && dlist[bi].by == dlist[bi + 1].by && dlist[bi].bx + 1 == dlist[bi + 1].bx) return 2;
+        return 1;
     }
 
     /// <summary>get_cdef_filter_strengths.</summary>
@@ -317,20 +369,21 @@ internal static partial class AomCdef
         var mse0 = new ulong[nvfb * nhfb][];
         var mse1 = new ulong[nvfb * nhfb][];
         var sbIndex = new int[nvfb * nhfb];
-        int sbCount = 0;
-        var inbuf = new ushort[InbufSize];
-        var dlist = new (byte by, byte bx)[MiSize128 * MiSize128];
-        var dir = new int[NBlocks * NBlocks];
-        var var = new int[NBlocks * NBlocks];
-        var tmpDst8 = new byte[128 * 128];
-        int inOff = VBorder * BStride + HBorder;
+        // (av1_cdef_mse_calc_frame_mt with multi-threading: the same blocks in the same sb_count order, any thread)
+        var jobs = new List<(int fbr, int fbc)>();
         for (int fbr = 0; fbr < nvfb; ++fbr)
             for (int fbc = 0; fbc < nhfb; ++fbc)
-            {
-                if (CdefSbSkip(cm, fbr, fbc)) continue;
-                mse0[sbCount] = new ulong[TotalStrengths];
-                mse1[sbCount] = new ulong[TotalStrengths];
+                if (!CdefSbSkip(cm, fbr, fbc)) jobs.Add((fbr, fbc));
+        int sbCount = jobs.Count;
+        int inOff = VBorder * BStride + HBorder;
+        void CalcBlock(int k, CdefSearchScratch sc)
+        {
+                var (fbr, fbc) = jobs[k];
                 // av1_cdef_mse_calc_block
+                mse0[k] = new ulong[TotalStrengths];
+                mse1[k] = new ulong[TotalStrengths];
+                // av1_cdef_mse_calc_block
+                var inbuf = sc.Inbuf; var dlist = sc.Dlist; var dir = sc.Dir; var var = sc.Var; var tmpDst8 = sc.TmpDst8;
                 Array.Clear(dir); Array.Clear(var);
                 int nhb = Math.Min(MiSize64, cm.MiCols - MiSize64 * fbc), nvb = Math.Min(MiSize64, cm.MiRows - MiSize64 * fbr);
                 int hbStep = 1, vbStep = 1;
@@ -351,8 +404,8 @@ internal static partial class AomCdef
                 {
                     if (adaptiveCdefMode > 0 && pli > 0)
                     {
-                        mse1[sbCount][0] = 0;
-                        for (int gi = 1; gi < totalStrengths; gi++) mse1[sbCount][gi] = 1;
+                        mse1[k][0] = 0;
+                        for (int gi = 1; gi < totalStrengths; gi++) mse1[k][gi] = 1;
                         break;
                     }
                     int xdec = pli == 0 ? 0 : cm.SsX, ydec = pli == 0 ? 0 : cm.SsY;
@@ -362,10 +415,11 @@ internal static partial class AomCdef
                     int row = fbr * MiSize64 << miHighL2, col = fbc * MiSize64 << miWideL2;
                     var dp = cur.Planes[pli];
                     // av1_cdef_copy_sb8_16_lowbd
-                    for (int i = 0; i < ysize; i++)
+                    unsafe
                     {
-                        int so = dp.At(col - xoff, row - yoff + i), d0 = inOff + (i - yoff) * BStride - xoff;
-                        for (int j = 0; j < xsize; j++) inbuf[d0 + j] = dp.Buf[so + j];
+                        fixed (ushort* ib = inbuf)
+                        fixed (byte* sb = dp.Buf)
+                            CopyRect8To16(ib + inOff - yoff * BStride - xoff, BStride, sb + dp.At(col - xoff, row - yoff), dp.Stride, xsize, ysize);
                     }
                     FillBordersOnFrameBoundary(inbuf, hfiltSize, vfiltSize, left, right, top, bottom);
                     var rp = src.Planes[pli];
@@ -389,21 +443,30 @@ internal static partial class AomCdef
                         }
                         else
                         {
-                            for (int bi = 0; bi < cdefCount; bi++)
+                            int units;
+                            for (int bi = 0; bi < cdefCount; bi += units)
                             {
                                 int byPos = dlist[bi].by << bhLog2, bxPos = dlist[bi].bx << bwLog2;
+                                units = ErrorCalcWidthInFiltUnits(dlist, cdefCount, bi, xdec, ydec);
                                 currSse += zero
-                                    ? (ulong)Sse(rp.Buf, rp.At(col + bxPos, row + byPos), rp.Stride, dp.Buf, dp.At(col + bxPos, row + byPos), dp.Stride, 1 << bwLog2, 1 << bhLog2)
-                                    : (ulong)Sse(rp.Buf, rp.At(col + bxPos, row + byPos), rp.Stride, tmpDst8, byPos * 128 + bxPos, 128, 1 << bwLog2, 1 << bhLog2);
+                                    ? (ulong)Sse(rp.Buf, rp.At(col + bxPos, row + byPos), rp.Stride, dp.Buf, dp.At(col + bxPos, row + byPos), dp.Stride, units << bwLog2, 1 << bhLog2)
+                                    : (ulong)Sse(rp.Buf, rp.At(col + bxPos, row + byPos), rp.Stride, tmpDst8, byPos * 128 + bxPos, 128, units << bwLog2, 1 << bhLog2);
                             }
                         }
-                        if (pli < 2) (pli == 0 ? mse0 : mse1)[sbCount][gi] = currSse;
-                        else mse1[sbCount][gi] += currSse;
+                        if (pli < 2) (pli == 0 ? mse0 : mse1)[k][gi] = currSse;
+                        else mse1[k][gi] += currSse;
                     }
                 }
-                sbIndex[sbCount] = MiSize64 * fbr * cm.MiStride + MiSize64 * fbc;
-                sbCount++;
-            }
+                sbIndex[k] = MiSize64 * fbr * cm.MiStride + MiSize64 * fbc;
+        }
+        if (cpi.NumWorkers > 1 && sbCount > 1)
+            System.Threading.Tasks.Parallel.For(0, sbCount, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = cpi.NumWorkers },
+                () => new CdefSearchScratch(), (k, _, sc) => { CalcBlock(k, sc); return sc; }, _ => { });
+        else
+        {
+            var sc = new CdefSearchScratch();
+            for (int k = 0; k < sbCount; k++) CalcBlock(k, sc);
+        }
 
         // search for the number of signalling bits
         int nbStrengthBits = 0;
@@ -636,7 +699,7 @@ internal static partial class AomCdef
         var cm = cpi.Cm;
         int numPlanes = cm.NumPlanes;
         int nvfb = (cm.MiRows + MiSize64 - 1) / MiSize64, nhfb = (cm.MiCols + MiSize64 - 1) / MiSize64;
-        var pre = frame.Clone();
+        AomYv12? pre = null;   // the pre-CDEF copy, taken once something is filtered
         var inbuf = new ushort[InbufSize];
         var dlist = new (byte by, byte bx)[MiSize128 * MiSize128];
         var dir = new int[NBlocks * NBlocks];
@@ -663,6 +726,7 @@ internal static partial class AomCdef
                 if (zeroY && zeroUv) continue;
                 int cdefCount = ComputeSbList(cm, fbr * MiSize64, fbc * MiSize64, dlist, BLOCK_64X64);
                 if (cdefCount == 0) continue;
+                pre ??= frame.Clone();
                 for (int plane = 0; plane < numPlanes; plane++)
                 {
                     if (plane != 0 && zeroUv) continue;
@@ -674,12 +738,18 @@ internal static partial class AomCdef
                     var pp = pre.Planes[plane];
                     int planeW = cm.MiCols << miWideL2, planeH = cm.MiRows << miHighL2;
                     // the 16-bit input block: pre-CDEF pixels, CDEF_VERY_LARGE outside the frame (mi-aligned)
-                    for (int i = -VBorder; i < vsize + VBorder; i++)
-                        for (int j = -HBorder; j < hsize + HBorder; j++)
-                        {
-                            int y = roffset + i, x = coffset + j;
-                            inbuf[inOff + i * BStride + j] = y < 0 || x < 0 || y >= planeH || x >= planeW ? (ushort)VeryLarge : pp.Buf[pp.At(x, y)];
-                        }
+                    int i0 = Math.Max(-VBorder, -roffset), i1 = Math.Min(vsize + VBorder, planeH - roffset);
+                    int j0 = Math.Max(-HBorder, -coffset), j1 = Math.Min(hsize + HBorder, planeW - coffset);
+                    if (i0 > -VBorder) FillRect(inbuf, inOff - VBorder * BStride - HBorder, BStride, i0 + VBorder, hsize + 2 * HBorder, VeryLarge);
+                    if (i1 < vsize + VBorder) FillRect(inbuf, inOff + i1 * BStride - HBorder, BStride, vsize + VBorder - i1, hsize + 2 * HBorder, VeryLarge);
+                    if (j0 > -HBorder) FillRect(inbuf, inOff + i0 * BStride - HBorder, BStride, i1 - i0, j0 + HBorder, VeryLarge);
+                    if (j1 < hsize + HBorder) FillRect(inbuf, inOff + i0 * BStride + j1, BStride, i1 - i0, hsize + HBorder - j1, VeryLarge);
+                    unsafe
+                    {
+                        fixed (ushort* ib = inbuf)
+                        fixed (byte* sb = pp.Buf)
+                            CopyRect8To16(ib + inOff + i0 * BStride + j0, BStride, sb + pp.At(coffset + j0, roffset + i0), pp.Stride, j1 - j0, i1 - i0);
+                    }
                     var dp = frame.Planes[plane];
                     bool dirinit = false;
                     FilterFb(dp.Buf, dp.At(coffset, roffset), dp.Stride, inbuf, inOff, xdec, ydec, dir, ref dirinit, false, var, plane, dlist,
@@ -688,4 +758,14 @@ internal static partial class AomCdef
             }
         }
     }
+}
+
+/// <summary>The per-thread buffers of av1_cdef_mse_calc_block.</summary>
+internal sealed class CdefSearchScratch
+{
+    public readonly ushort[] Inbuf = new ushort[AomCdef.InbufSizeForScratch];
+    public readonly (byte by, byte bx)[] Dlist = new (byte by, byte bx)[32 * 32];
+    public readonly int[] Dir = new int[AomCdef.NBlocksForScratch * AomCdef.NBlocksForScratch];
+    public readonly int[] Var = new int[AomCdef.NBlocksForScratch * AomCdef.NBlocksForScratch];
+    public readonly byte[] TmpDst8 = new byte[128 * 128];
 }
