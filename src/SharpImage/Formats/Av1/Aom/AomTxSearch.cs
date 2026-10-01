@@ -1126,7 +1126,7 @@ internal static partial class AomTxSearch
         if (xd.Lossless[mbmi.SegmentId] != 0) ChooseSmallestTxSize(cpi, x, ref rdStats, refBestRd, bs);
         else if (x.TxfmSearchParams.TxSizeSearchMethod == USE_LARGESTALL) ChooseLargestTxSize(cpi, x, ref rdStats, refBestRd, bs);
         else ChooseTxSizeTypeFromRd(cpi, x, ref rdStats, refBestRd, bs);
-        if (AomTrace.Out != null)
+        if (AomTrace.Out != null && !isInter)
             AomTrace.Out.Write($"yrd {xd.MiRow} {xd.MiCol} bs {bs} y {mbmi.Mode} ad {mbmi.AngleDelta[0]} fi {mbmi.UseFilterIntra} {mbmi.FilterIntraMode} ref {refBestRd} -> rate {rdStats.Rate} dist {rdStats.Dist} sse {rdStats.Sse} skip {rdStats.SkipTxfm} tx {mbmi.TxSize}\n");
     }
 
