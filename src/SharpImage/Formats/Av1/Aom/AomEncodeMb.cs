@@ -423,6 +423,7 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>av1_xform_dc_only.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     internal static void XformDcOnly(AomMacroblock x, int plane, int block, int txSize, long perPxMean)
     {
         var coeff = x.Plane[plane].Coeff.AsSpan(BlockOffset(block), MaxEob(txSize));

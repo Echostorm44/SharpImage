@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System;
 using static SharpImage.Formats.Av1.AomTables;
 
@@ -605,6 +606,7 @@ internal static partial class AomTxSearch
     }
 
     /// <summary>predict_dc_only_block.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private static void PredictDcOnlyBlock(AomMacroblock x, int plane, int planeBsize, int txSize, int block, int blkRow, int blkCol,
         ref AomRdStats bestRdStats, out long blockSse, out uint blockMseQ8, ref long perPxMean, ref bool dcOnlyBlk)
     {
@@ -667,6 +669,7 @@ internal static partial class AomTxSearch
     }
 
     /// <summary>recon_intra.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private static void ReconIntra(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize,
         AomTxbCtx txbCtx, bool skipTrellis, int bestTxType, bool doQuant, ref int rateCost, int bestEob)
     {
