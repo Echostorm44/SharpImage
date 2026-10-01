@@ -569,8 +569,7 @@ internal static class AomTxb
         }
         // update_coeff_eob_facade
         ref int nz0 = ref MemoryMarshal.GetReference(nzCi);
-        for (; si >= 0 && nzNum <= maxNzNum; --si)
-            UpdateCoeffEob(ref t, ref accuRate, ref accuDist, ref eob, ref nzNum, ref nz0, si);
+        si = UpdateCoeffEobLoop(ref t, ref accuRate, ref accuDist, ref eob, ref nzNum, ref nz0, si, maxNzNum);
         if (si == -1 && nzNum <= maxNzNum && sharpness == 0)
         {
             // update_skip
@@ -913,6 +912,18 @@ internal static class AomTxb
     }
 
     /// <summary>update_coeff_eob.</summary>
+    /// <summary>update_coeff_eob_facade's loop (update_coeff_eob inlined into it). Returns the next si.</summary>
+    private static int UpdateCoeffEobLoop(ref Trellis t, ref int accuRate, ref long accuDist, ref int eob, ref int nzNum, ref int nzCi, int si,
+        int maxNzNum)
+    {
+        int ar = accuRate, e = eob, nn = nzNum;
+        long ad = accuDist;
+        for (; si >= 0 && nn <= maxNzNum; --si) UpdateCoeffEob(ref t, ref ar, ref ad, ref e, ref nn, ref nzCi, si);
+        accuRate = ar; accuDist = ad; eob = e; nzNum = nn;
+        return si;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void UpdateCoeffEob(ref Trellis t, ref int accuRate, ref long accuDist, ref int eob, ref int nzNum, ref int nzCi, int si)
     {
         int ci = Unsafe.Add(ref t.Scan, si);

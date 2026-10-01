@@ -579,8 +579,37 @@ internal static partial class AomEncodeMb
     internal static ulong SumSquares2dI16(short[] src, int off, int stride, int width, int height)
     {
         ulong ss = 0;
+        if (width <= 0 || height <= 0) return 0;
+        if (off < 0 || (long)off + (long)(height - 1) * stride + width > src.Length) throw new ArgumentOutOfRangeException(nameof(height));
+        ref short s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), off);
+        // squares of int16 values paired by madd: exact in int32 lanes for a row (at most 64 values of |v| <= 2^15 per
+        // lane pair group... flushed to 64 bits every row)
         for (int r = 0; r < height; r++)
-            for (int c = 0; c < width; c++) { int v = src[off + r * stride + c]; ss += (ulong)(v * v); }
+        {
+            ref short row = ref Unsafe.Add(ref s0, r * stride);
+            int c = 0;
+            var acc = Vector256<long>.Zero;
+            for (; c + 16 <= width; c += 16)
+            {
+                var v = Vector256.LoadUnsafe(ref row, (nuint)c);
+                var m = Avx2.MultiplyAddAdjacent(v, v);   // pairs, each < 2^31
+                acc += Avx2.ConvertToVector256Int64(m.GetLower().AsUInt32()).AsInt64() + Avx2.ConvertToVector256Int64(m.GetUpper().AsUInt32()).AsInt64();
+            }
+            for (; c + 8 <= width; c += 8)
+            {
+                var v = Vector128.LoadUnsafe(ref row, (nuint)c);
+                var m = Sse2.MultiplyAddAdjacent(v, v);
+                acc += Avx2.ConvertToVector256Int64(m.AsUInt32()).AsInt64();
+            }
+            for (; c + 4 <= width; c += 4)
+            {
+                var v = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(ref Unsafe.As<short, byte>(ref Unsafe.Add(ref row, c)))).AsInt16();
+                var m = Sse2.MultiplyAddAdjacent(v, v);
+                acc += Avx2.ConvertToVector256Int64(m.AsUInt32()).AsInt64();
+            }
+            ss += (ulong)Vector256.Sum(acc);
+            for (; c < width; c++) { int v = Unsafe.Add(ref row, c); ss += (ulong)(v * v); }
+        }
         return ss;
     }
 
@@ -588,8 +617,39 @@ internal static partial class AomEncodeMb
     internal static ulong SumSse2dI16(short[] src, int off, int stride, int width, int height, ref int sum)
     {
         long ss = 0;
+        if (width <= 0 || height <= 0) return 0;
+        if (off < 0 || (long)off + (long)(height - 1) * stride + width > src.Length) throw new ArgumentOutOfRangeException(nameof(height));
+        ref short s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), off);
+        var one = Vector256.Create((short)1);
+        var sumV = Vector256<int>.Zero;
         for (int r = 0; r < height; r++)
-            for (int c = 0; c < width; c++) { int v = src[off + r * stride + c]; ss += v * v; sum += v; }
+        {
+            ref short row = ref Unsafe.Add(ref s0, r * stride);
+            int c = 0;
+            var acc = Vector256<long>.Zero;
+            for (; c + 16 <= width; c += 16)
+            {
+                var v = Vector256.LoadUnsafe(ref row, (nuint)c);
+                var m = Avx2.MultiplyAddAdjacent(v, v);
+                acc += Avx2.ConvertToVector256Int64(m.GetLower().AsUInt32()).AsInt64() + Avx2.ConvertToVector256Int64(m.GetUpper().AsUInt32()).AsInt64();
+                sumV += Avx2.MultiplyAddAdjacent(v, one);
+            }
+            for (; c + 8 <= width; c += 8)
+            {
+                var v = Vector128.LoadUnsafe(ref row, (nuint)c);
+                acc += Avx2.ConvertToVector256Int64(Sse2.MultiplyAddAdjacent(v, v).AsUInt32()).AsInt64();
+                sumV += Vector256.Create(Sse2.MultiplyAddAdjacent(v, one.GetLower()), Vector128<int>.Zero);
+            }
+            for (; c + 4 <= width; c += 4)
+            {
+                var v = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(ref Unsafe.As<short, byte>(ref Unsafe.Add(ref row, c)))).AsInt16();
+                acc += Avx2.ConvertToVector256Int64(Sse2.MultiplyAddAdjacent(v, v).AsUInt32()).AsInt64();
+                sumV += Vector256.Create(Sse2.MultiplyAddAdjacent(v, one.GetLower()), Vector128<int>.Zero);
+            }
+            ss += Vector256.Sum(acc);
+            for (; c < width; c++) { int v = Unsafe.Add(ref row, c); ss += v * v; sum += v; }
+        }
+        sum += Vector256.Sum(sumV);
         return (ulong)ss;
     }
 
