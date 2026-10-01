@@ -53,7 +53,7 @@ public sealed class AomEncoderSmoke
         var sw = new System.Diagnostics.Stopwatch();
         long searchMs = 0, postMs = 0;
         double lpfMs = 0, rstMs = 0, cdefMs = 0;
-        double totalMs = 0;
+        double totalMs = 0, allocMb = 0; int gcs = 0;
         for (int rep = 0; rep < reps; rep++)
         {
             sw.Restart();
@@ -72,15 +72,17 @@ public sealed class AomEncoderSmoke
             if (reps > 1)
             {
                 // the whole aom_codec_encode equivalent: encode + post filter + pack
+                long a0 = GC.GetAllocatedBytesForCurrentThread(); int g0 = GC.CollectionCount(0);
                 var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 var (c2, x2) = AomEncoder.EncodeFrame(input);
                 AomEncoder.RunPostFilter(c2, x2);
                 AomBitstream.PackFrame(c2, new AomSequenceConfig());
                 double ms = System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
                 totalMs = rep == 0 ? ms : Math.Min(totalMs, ms);
+                allocMb = (GC.GetAllocatedBytesForCurrentThread() - a0) / 1048576.0; gcs = GC.CollectionCount(0) - g0;
             }
         }
-        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, cdef {cdefMs:F1} ms, restoration {rstMs:F1} ms), total {totalMs:F1} ms");
+        Console.WriteLine($"timing (min of {reps}): search {searchMs} ms, post filter {postMs} ms (deblock {lpfMs:F1} ms, cdef {cdefMs:F1} ms, restoration {rstMs:F1} ms), total {totalMs:F1} ms, alloc {allocMb:F1} MB gen0 {gcs}");
         // AOM_SMOKE_PFREPS=n: n more post-filter runs (profiling)
         int pfReps = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_PFREPS") ?? "0");
         for (int rep = 0; rep < pfReps; rep++) AomEncoder.RunPostFilter(cpi, x);
@@ -90,6 +92,8 @@ public sealed class AomEncoderSmoke
         double se = 0;
         for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) { int d = rec.Buffers[0][rec.Offsets[0] + r * rec.Strides[0] + c] - y[r * w + c]; se += d * d; }
         double psnr = 10 * Math.Log10(255.0 * 255 / (se / (w * h)));
+        { var xc = AomEncodeMb.XfCount; long tot = xc.Sum(v => (long)v); var lst = Enumerable.Range(0, xc.Length).OrderByDescending(i => xc[i]).Where(i => xc[i] > 0);
+          foreach (var i in lst) Console.WriteLine($"xf tx {i / 16} type {i % 16}: {xc[i]} {100.0 * xc[i] / tot:F1}%"); }
         Console.WriteLine($"smoke: luma PSNR {psnr:F2}");
         string? outPath = Environment.GetEnvironmentVariable("AOM_SMOKE_OUT");
         if (outPath != null) File.WriteAllText(outPath, Dump(cpi));

@@ -17,7 +17,12 @@ internal static partial class Av1FwdTxfmAom
         bool flipUd, bool flipLr, Span<int> coeff)
     {
         // 8-bit residuals: libaom's av1_lowbd_fwd_txfm (16-bit lanes) below 64-point axes, as the 8-bit encoder runs it
-        if (w <= 32 && h <= 32 && Avx2.IsSupported) ForwardRawLbd(diff, diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
+        if (w <= 32 && h <= 32 && Avx2.IsSupported)
+        {
+            if (diff.Length < (h - 1) * diffStride + w || coeff.Length < w * h) throw new ArgumentException("tx block buffers smaller than the tx size");
+            if (!ForwardLbdSized(ref MemoryMarshal.GetReference(diff), diffStride, txSize, hKind, vKind, flipUd, flipLr, ref MemoryMarshal.GetReference(coeff)))
+                ForwardRawLbd(diff, diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
+        }
         else ForwardRawRef(diff, diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
     }
 
