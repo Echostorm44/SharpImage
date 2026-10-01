@@ -37,13 +37,13 @@ internal static partial class Av1FwdTxfmAom
         bool rect2 = w == 2 * h || h == 2 * w;
         int sw = Math.Min(w, 32), sh = Math.Min(h, 32), ng = (w + 7) >> 3;
         int hp = Math.Max(h, 8);
-        Span<V> colS = stackalloc V[ng * hp + 64];
-        ref V col = ref MemoryMarshal.GetReference(colS);
+        Unsafe.SkipInit(out StackArr576<V> colS);
+        ref V col = ref colS[0];
         ref V tmp = ref Unsafe.Add(ref col, ng * hp);
-        Span<int> rowBuf = stackalloc int[8];
         var rnd1 = Vector256.Create(sh1 > 0 ? 1 << (sh1 - 1) : 0);
         ref short d0 = ref MemoryMarshal.GetReference(diff);
         var reverse8 = Vector128.Create((short)7, 6, 5, 4, 3, 2, 1, 0);
+        var reverse4 = Vector128.Create((short)3, 2, 1, 0, 4, 5, 6, 7);
         for (int g = 0; g < ng; g++)
         {
             ref V cg = ref Unsafe.Add(ref col, g * hp);
@@ -62,9 +62,10 @@ internal static partial class Av1FwdTxfmAom
                 }
                 else
                 {
-                    for (int j = 0; j < 4; j++) rowBuf[j] = Unsafe.Add(ref row, flipLr ? 3 - j : j);
-                    rowBuf.Slice(4).Clear();
-                    v = Vector256.Create<int>(rowBuf);
+                    // the 4 residuals (upper lanes zero)
+                    var raw = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(ref Unsafe.As<short, byte>(ref row))).AsInt16();
+                    if (flipLr) raw = Vector128.Shuffle(raw, reverse4);
+                    v = Avx2.ConvertToVector256Int32(raw);
                 }
                 Unsafe.Add(ref tmp, r) = Vector256.ShiftLeft(v, sh0);
             }
@@ -76,10 +77,10 @@ internal static partial class Av1FwdTxfmAom
             }
             for (int r = h; r < hp; r++) Unsafe.Add(ref cg, r) = V.Zero;
         }
-        Span<V> rinS = stackalloc V[64];
-        ref V rin = ref MemoryMarshal.GetReference(rinS);
+        Unsafe.SkipInit(out StackArr64<V> rinS);
+        ref V rin = ref rinS[0];
         var rnd2 = Vector256.Create(sh2 > 0 ? 1 << (sh2 - 1) : 0);
-        Span<int> lanes = stackalloc int[8];
+        Unsafe.SkipInit(out StackArr8<int> lanes);
         for (int r0 = 0; r0 < sh; r0 += 8)
         {
             for (int g = 0; g < ng; g++)
@@ -100,7 +101,7 @@ internal static partial class Av1FwdTxfmAom
                 if (nr == 8) v.StoreUnsafe(ref MemoryMarshal.GetReference(coeff), (nuint)rc);
                 else
                 {
-                    v.CopyTo(lanes);
+                    v.CopyTo((Span<int>)lanes);
                     for (int k = 0; k < nr; k++) coeff[rc + k] = lanes[k];
                 }
             }

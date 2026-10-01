@@ -287,4 +287,28 @@ public sealed class AomSearchPerfTwinTests
         Console.WriteLine($"hbd quantizers: {cases} cases, {bad} mismatches");
         await Assert.That(bad).IsEqualTo(0);
     }
+    [Test]
+    public async Task HbdComputeStats_Vector_MatchScalar()
+    {
+        var rng = new Random(41);
+        int cases = 0, bad = 0;
+        foreach (int bd in new[] { 10, 12 })
+            foreach (int win in new[] { 7, 5 })
+                for (int trial = 0; trial < 6; trial++)
+                {
+                    var dgd = new AomYv12Plane(96, 80, 96, 80, 16, true); var src = new AomYv12Plane(96, 80, 96, 80, 16, true);
+                    int max = (1 << bd) - 1;
+                    for (int i = 0; i < dgd.Buf16.Length; i++) dgd.Buf16[i] = (ushort)(trial % 2 == 0 ? rng.Next(max + 1) : (rng.Next(2) == 0 ? 0 : max));
+                    for (int i = 0; i < src.Buf16.Length; i++) src.Buf16[i] = (ushort)rng.Next(max + 1);
+                    int hs = rng.Next(0, 8), he = hs + rng.Next(1, 88 - hs), vs = rng.Next(0, 8), ve = vs + rng.Next(1, 72 - vs);
+                    int n = win * win;
+                    long[] m1 = new long[n], h1 = new long[n * n], m2 = new long[n], h2 = new long[n * n];
+                    AomPickRst.ComputeStatsHbdScalar(win, dgd, src, hs, he, vs, ve, m1, h1, bd);
+                    AomPickRst.ComputeStatsHbdAvx2(win, dgd, src, hs, he, vs, ve, m2, h2, bd);
+                    cases++;
+                    if (!m1.AsSpan().SequenceEqual(m2) || !h1.AsSpan().SequenceEqual(h2)) bad++;
+                }
+        Console.WriteLine($"hbd compute stats: {cases} cases, {bad} mismatches");
+        await Assert.That(bad).IsEqualTo(0);
+    }
 }

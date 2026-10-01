@@ -25,6 +25,14 @@ internal sealed partial class AomPickRst
     public static void ComputeStatsHbd(int wienerWin, AomYv12Plane dgd, AomYv12Plane src, int hStart, int hEnd, int vStart, int vEnd,
         long[] M, long[] H, int bd)
     {
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && wienerWin <= 7)
+            ComputeStatsHbdAvx2(wienerWin, dgd, src, hStart, hEnd, vStart, vEnd, M, H, bd);
+        else ComputeStatsHbdScalar(wienerWin, dgd, src, hStart, hEnd, vStart, vEnd, M, H, bd);
+    }
+
+    internal static void ComputeStatsHbdScalar(int wienerWin, AomYv12Plane dgd, AomYv12Plane src, int hStart, int hEnd, int vStart, int vEnd,
+        long[] M, long[] H, int bd)
+    {
         int wienerWin2 = wienerWin * wienerWin, halfwin = wienerWin >> 1;
         long avg = FindAverageHbd(dgd, hStart, hEnd, vStart, vEnd);
         int divider = bd == 12 ? 16 : bd == 10 ? 4 : 1;
