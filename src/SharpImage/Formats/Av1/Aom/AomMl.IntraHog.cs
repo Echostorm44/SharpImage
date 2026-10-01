@@ -107,6 +107,76 @@ internal static partial class AomMl
         for (int b = 0; b < HogBins; ++b) hog[b] *= (1 + ssX) * (1 + ssY);
     }
 
+    /// <summary>lowbd_compute_gradient_info_sb over rows / cols [1, vis - 1) of a superblock (row stride sbW in the cache).</summary>
+    internal static void ComputeGradientInfoSb(ReadOnlySpan<byte> src, int stride, int sbW, int visW, int visH, ushort[] absSum, sbyte[] bin, int baseOff)
+    {
+        for (int r = 1; r < visH - 1; ++r)
+        {
+            int o = r * stride;
+            for (int c = 1; c < visW - 1; ++c)
+            {
+                int p = o + c;
+                int dx = (src[p + 1 - stride] + 2 * src[p + 1] + src[p + 1 + stride]) -
+                         (src[p - 1 - stride] + 2 * src[p - 1] + src[p - 1 + stride]);
+                int dy = (src[p + stride - 1] + 2 * src[p + stride] + src[p + stride + 1]) -
+                         (src[p - stride - 1] + 2 * src[p - stride] + src[p - stride + 1]);
+                int i = baseOff + r * sbW + c;
+                absSum[i] = (ushort)(Math.Abs(dx) + Math.Abs(dy));
+                bin[i] = (sbyte)(dx != 0 ? GetHistBinIdx(dx, dy) : -1);
+            }
+        }
+    }
+
+    /// <summary>highbd_compute_gradient_info_sb.</summary>
+    internal static void ComputeGradientInfoSb(ReadOnlySpan<ushort> src, int stride, int sbW, int visW, int visH, ushort[] absSum, sbyte[] bin, int baseOff)
+    {
+        for (int r = 1; r < visH - 1; ++r)
+        {
+            int o = r * stride;
+            for (int c = 1; c < visW - 1; ++c)
+            {
+                int p = o + c;
+                int dx = (src[p + 1 - stride] + 2 * src[p + 1] + src[p + 1 + stride]) -
+                         (src[p - 1 - stride] + 2 * src[p - 1] + src[p - 1 + stride]);
+                int dy = (src[p + stride - 1] + 2 * src[p + stride] + src[p + stride + 1]) -
+                         (src[p - stride - 1] + 2 * src[p - stride] + src[p - stride + 1]);
+                int i = baseOff + r * sbW + c;
+                absSum[i] = (ushort)(Math.Abs(dx) + Math.Abs(dy));
+                bin[i] = (sbyte)(dx != 0 ? GetHistBinIdx(dx, dy) : -1);
+            }
+        }
+    }
+
+    /// <summary>prune_intra_mode_with_hog through generate_hog_using_gradient_cache (the superblock cache at off, row
+    /// stride sbW): the same histogram, in the same float order, as the direct path.</summary>
+    internal static void PruneIntraModeWithHogCached(ushort[] absSum, sbyte[] bin, int off, int sbW, int rows, int cols, int ssX, int ssY,
+        float th, Span<byte> directionalModeSkipMask)
+    {
+        Span<float> hist = stackalloc float[HogBins];
+        hist.Clear();
+        float total = 0.1f;
+        for (int r = 1; r < rows - 1; ++r)
+        {
+            int o = off + r * sbW;
+            for (int c = 1; c < cols - 1; ++c)
+            {
+                int s = absSum[o + c];
+                if (s == 0) continue;
+                total += s;
+                int idx = bin[o + c];
+                if (idx < 0)
+                {
+                    hist[0] += s >> 1;
+                    hist[HogBins - 1] += s >> 1;
+                }
+                else hist[idx] += s;
+            }
+        }
+        for (int i = 0; i < HogBins; ++i) hist[i] /= total;
+        for (int b = 0; b < HogBins; ++b) hist[b] *= (1 + ssX) * (1 + ssY);
+        PruneIntraModeFromHog(hist, th, directionalModeSkipMask);
+    }
+
     // the scoring half of prune_intra_mode_with_hog
     private static void PruneIntraModeFromHog(ReadOnlySpan<float> hist, float th, Span<byte> directionalModeSkipMask)
     {

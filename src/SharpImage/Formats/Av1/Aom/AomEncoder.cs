@@ -532,6 +532,7 @@ internal static partial class AomEncoder
         x.MaxPartitionSize = Math.Min(x.MaxPartitionSize, cm.SbSize);
         x.MinPartitionSize = Math.Min(x.MinPartitionSize, cm.SbSize);
 
+        AomIntraModeSearch.ProduceGradientsForSb(cpi, x, cm.SbSize, miRow, miCol);
         var pcRoot = new AomPcTree(cm.SbSize);
         long noneRd = 0;
         AomEncodeFrame.RdPickPartition(cpi, x, miRow, miCol, cm.SbSize, ref dummyRdc, dummyRdc, pcRoot, ref noneRd, false, null);

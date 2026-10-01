@@ -34,7 +34,11 @@ internal sealed class AomRdcostBlockArgs
 /// <summary>Optional per-call RD trace (same lines as the scratchpad aomoracle's libaom wrappers).</summary>
 internal static class AomTrace
 {
-    [ThreadStatic] public static System.IO.TextWriter? Out;
+    // tracing compiles away unless AOM_TRACE is set at startup (a static readonly the JIT folds; the thread-static
+    // writer alone cost a TLS lookup per check in the hot search loops)
+    private static readonly bool On = Environment.GetEnvironmentVariable("AOM_TRACE") != null;
+    [ThreadStatic] private static System.IO.TextWriter? t_out;
+    public static System.IO.TextWriter? Out { get => On ? t_out : null; set => t_out = value; }
 }
 
 internal static partial class AomTxSearch

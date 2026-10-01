@@ -581,6 +581,36 @@ internal static class AomIntraModeSearch
         return bestRd;
     }
 
+    /// <summary>produce_gradients_for_sb: with is_gradient_caching_for_hog_enabled, the superblock's per-sample Sobel
+    /// gradients of the planes the HOG prunes use (compute_gradient_info_sb), for the blocks' histograms.</summary>
+    internal static void ProduceGradientsForSb(AomComp cpi, AomMacroblock x, int sbSize, int miRow, int miCol)
+    {
+        x.SbGradientCached[0] = x.SbGradientCached[1] = false;
+        var sf = cpi.Sf;
+        if (!(cpi.FrameIsIntraOnly && sf.rt_sf.use_nonrd_pick_mode == 0 && sf.part_sf.partition_search_type == SEARCH_PARTITION &&
+              (sf.intra_sf.intra_pruning_with_hog != 0 || sf.intra_sf.chroma_intra_pruning_with_hog != 0)))
+            return;
+        int numPlanes = cpi.Cm.NumPlanes;
+        AomEncodeFrame.SetupSrcPlanes(cpi, x, miRow, miCol, numPlanes, sbSize);
+        if (sf.intra_sf.intra_pruning_with_hog != 0) { ComputeGradientInfoSb(cpi, x, sbSize, 0, miRow, miCol); x.SbGradientCached[0] = true; }
+        if (sf.intra_sf.chroma_intra_pruning_with_hog != 0 && numPlanes > 1) { ComputeGradientInfoSb(cpi, x, sbSize, 1, miRow, miCol); x.SbGradientCached[1] = true; }
+    }
+
+    // compute_gradient_info_sb over the superblock's samples that a block's histogram can read (the interior of the
+    // mi-aligned frame area; libaom computes the whole superblock, the rest never being read)
+    private static void ComputeGradientInfoSb(AomComp cpi, AomMacroblock x, int sbSize, int plane, int miRow, int miCol)
+    {
+        var pd = x.E.Plane[plane];
+        int ssX = pd.SubsamplingX, ssY = pd.SubsamplingY;
+        int sbH = BlockSizeHigh[sbSize] >> ssY, sbW = BlockSizeWide[sbSize] >> ssX;
+        int visH = Math.Min(sbH, ((cpi.Cm.MiRows - miRow) * 4) >> ssY), visW = Math.Min(sbW, ((cpi.Cm.MiCols - miCol) * 4) >> ssX);
+        var src = x.Plane[plane].Src;
+        if (src.Buf16 != null)
+            AomMl.ComputeGradientInfoSb(src.Buf16.AsSpan(src.Offset), src.Stride, sbW, visW, visH, x.GradAbsSum, x.GradBin, plane * AomMbPlane.MaxSbSquare);
+        else
+            AomMl.ComputeGradientInfoSb(src.Buf.AsSpan(src.Offset), src.Stride, sbW, visW, visH, x.GradAbsSum, x.GradBin, plane * AomMbPlane.MaxSbSquare);
+    }
+
     /// <summary>prune_intra_mode_with_hog (collect_hog_data over the block's visible source).</summary>
     private static void PruneIntraModeWithHog(AomComp cpi, AomMacroblock x, int bsize, float th, Span<byte> directionalModeSkipMask, bool isChroma)
     {
@@ -590,6 +620,16 @@ internal static class AomIntraModeSearch
         int bh = BlockSizeHigh[bsize], bw = BlockSizeWide[bsize];
         int rows = (xd.MbToBottomEdge >= 0 ? bh : (xd.MbToBottomEdge >> 3) + bh) >> pd.SubsamplingY;
         int cols = (xd.MbToRightEdge >= 0 ? bw : (xd.MbToRightEdge >> 3) + bw) >> pd.SubsamplingX;
+        if (x.SbGradientCached[plane])
+        {
+            // generate_hog_using_gradient_cache
+            int sbSize = cpi.Cm.SbSize;
+            int sbWidth = BlockSizeWide[sbSize] >> pd.SubsamplingX;
+            int miRowInSb = xd.MiRow & (MiSizeHigh[sbSize] - 1), miColInSb = xd.MiCol & (MiSizeWide[sbSize] - 1);
+            int off = plane * AomMbPlane.MaxSbSquare + sbWidth * (miRowInSb << (2 - pd.SubsamplingY)) + (miColInSb << (2 - pd.SubsamplingX));
+            AomMl.PruneIntraModeWithHogCached(x.GradAbsSum, x.GradBin, off, sbWidth, rows, cols, pd.SubsamplingX, pd.SubsamplingY, th, directionalModeSkipMask);
+            return;
+        }
         var src = x.Plane[plane].Src;
         if (src.Buf16 != null)
             AomMl.PruneIntraModeWithHog(src.Buf16.AsSpan(src.Offset), src.Stride, rows, cols, pd.SubsamplingX, pd.SubsamplingY, th, directionalModeSkipMask);
