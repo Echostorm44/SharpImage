@@ -10,7 +10,7 @@ namespace SharpImage.Formats.Av1;
 // every candidate strength against the source, the greedy joint luma / chroma strength search, the signalling-bit RD
 // choice, CDEF_ADAPTIVE's strength reduction / zeroing, av1_pick_cdef_from_qp). CDEF is normative, so libaom's SIMD
 // kernels give exactly the C results ported here.
-internal static class AomCdef
+internal static partial class AomCdef
 {
     private const int VBorder = 2, HBorder = 8;
     internal const int BStride = 144;   // ALIGN_POWER_OF_TWO(128 + 2 * CDEF_HBORDER, 3)
@@ -202,7 +202,7 @@ internal static class AomCdef
             int by = dlist[bi].by, bx = dlist[bi].bx;
             int t = pli != 0 ? priStrength : AdjustStrength(priStrength, var[by * NBlocks + bx]);
             bool enablePrimary = t != 0, enableSecondary = secStrength != 0;
-            FilterBlock(dst8, dstOff + (by << bhLog2) * dstride + (bx << bwLog2), dstride, inb, inOff + (by * BStride << bhLog2) + (bx << bwLog2),
+            FilterBlockV(dst8, dstOff + (by << bhLog2) * dstride + (bx << bwLog2), dstride, inb, inOff + (by * BStride << bhLog2) + (bx << bwLog2),
                 t, secStrength, priStrength != 0 ? dir[by * NBlocks + bx] : 0, damping, damping, coeffShift, bw, bh, enablePrimary, enableSecondary);
         }
     }
