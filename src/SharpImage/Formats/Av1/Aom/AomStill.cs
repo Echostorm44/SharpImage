@@ -17,23 +17,23 @@ internal static class AomStill
     /// <summary>The avifenc speed (cpu-used) of the current AVIF all-intra encode, + 1 (0: no such encode is active, so
     /// the port is not used).</summary>
     [ThreadStatic] private static int t_speedPlus1;
-    /// <summary>The colour image is coded with libaom's tune=iq (libavif's default for non-identity colour); alpha items
-    /// (no colour description) keep tune=psnr, as libavif sets for alpha.</summary>
-    [ThreadStatic] private static bool t_tuneIq;
+    /// <summary>The colour image's libaom tuning (libavif's default: tune=iq for non-identity colour, tune=ssim for the
+    /// identity matrix); alpha items (no colour description) keep tune=psnr, as libavif sets for alpha.</summary>
+    [ThreadStatic] private static AomTune t_tune;
 
     internal static int Speed => t_speedPlus1 - 1;
 
     /// <summary>Activates the port for an all-intra encode at this avifenc speed (clamped to libaom's 0-9 as libavif does);
     /// a negative speed deactivates it. Returns the previous state for <see cref="Exit"/>.</summary>
-    internal static (int, bool) Enter(int speed, bool tuneIq = false)
+    internal static (int, AomTune) Enter(int speed, AomTune tune = AomTune.Psnr)
     {
-        var prev = (t_speedPlus1, t_tuneIq);
+        var prev = (t_speedPlus1, t_tune);
         t_speedPlus1 = speed < 0 ? 0 : Math.Clamp(speed, 0, 9) + 1;
-        t_tuneIq = tuneIq;
+        t_tune = tune;
         return prev;
     }
 
-    internal static void Exit((int SpeedPlus1, bool TuneIq) prev) => (t_speedPlus1, t_tuneIq) = prev;
+    internal static void Exit((int SpeedPlus1, AomTune Tune) prev) => (t_speedPlus1, t_tune) = prev;
 
     /// <summary>Whether a frame with these parameters goes through the port.</summary>
     internal static bool Handles(int bitDepth, Av1PixelLayout layout, int width, int height)
@@ -53,7 +53,7 @@ internal static class AomStill
         {
             Width = width, Height = height, SsX = ssX, SsY = ssY, Monochrome = mono, Planes = planes,
             Strides = mono ? new[] { width } : new[] { width, cw, cw }, BaseQindex = qIdx, Speed = Speed,
-            TuneIq = t_tuneIq && color != null,
+            Tune = color != null ? t_tune : AomTune.Psnr,
         };
         var (cpi, x) = AomEncoder.EncodeFrame(input);
         AomEncoder.RunPostFilter(cpi, x, applyRestoration: false);

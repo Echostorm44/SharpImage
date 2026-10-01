@@ -317,12 +317,12 @@ internal static partial class AomEncodeFrame
     }
 
     /// <summary>setup_block_rdmult (no AQ): the frame rdmult, the delta-q superblock's rdmult (av1_get_cb_rdmult without
-    /// TPL stats), tune=iq's SSIM scaling (av1_set_ssim_rdmult) and the all-intra superblock modifier.</summary>
+    /// TPL stats), tune=ssim / iq's SSIM scaling (av1_set_ssim_rdmult) and the all-intra superblock modifier.</summary>
     internal static void SetupBlockRdmult(AomComp cpi, AomMacroblock x, int miRow, int miCol, int bsize)
     {
         x.Rdmult = cpi.RdRdmult;
         if (cpi.DeltaQPresentFlag && cpi.Sf.rt_sf.use_nonrd_pick_mode == 0) x.Rdmult = cpi.SetRdmultDeltaQ(x);
-        if (cpi.TuneIq) SetSsimRdmult(cpi, x, bsize, miRow, miCol);
+        if (cpi.SsimRdmult) SetSsimRdmult(cpi, x, bsize, miRow, miCol);
         if (cpi.AllIntra) x.Rdmult = (int)(((long)x.Rdmult * x.IntraSbRdmultModifier) >> 7);
         x.Rdmult = x.Rdmult > 0 ? x.Rdmult : 1;
     }

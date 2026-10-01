@@ -1121,13 +1121,14 @@ public static partial class HeifCoder
         private readonly bool prevAvoid;
         private readonly Av1.Av1EncodeSpeed? prevSpeed;
         private readonly int prevThreads, prevSharpness;
-        private readonly (int, bool) prevAom;
+        private readonly (int, Av1.AomTune) prevAom;
         public EncoderScope(AvifEncodeOptions options, bool allIntra = false)
         {
             // libavif's all-intra stills go through the libaom-port encoder (Av1.AomStill) where it applies
             // (tune=iq: libaom's own CDEF choice, so only without an explicit enable-cdef)
             bool aomTune = options.Tune == AvifTune.Psnr ? options.EnableCdef != true : options.Tune == AvifTune.Iq && options.EnableCdef == null;
-            prevAom = Av1.AomStill.Enter(allIntra && aomTune ? options.Speed : -1, options.Tune == AvifTune.Iq);
+            prevAom = Av1.AomStill.Enter(allIntra && aomTune ? options.Speed : -1,
+                options.Tune == AvifTune.Iq ? Av1.AomTune.Iq : Av1.AomTune.Psnr);
             if (options.Sharpness is < 0 or > 7) throw new ArgumentOutOfRangeException(nameof(options), "Sharpness must be 0..7.");
             prevSharpness = Av1.Av1ObuWriter.t_sharpness;
             Av1.Av1ObuWriter.t_sharpness = options.Sharpness;
@@ -1398,8 +1399,9 @@ public static partial class HeifCoder
             options.DenoiseBlockSize, options.DenoiseApply);
         // Quality (libavif scale) overrides Qp; quality 100 = lossless AV1 coding (matrix unchanged).
         var (qIdx, aQIdx, qualityLossless) = QualityQIndices(options, color);
-        // libavif tunes identity-matrix colour for SSIM, not IQ: not through the libaom port (yet)
-        var aomScope = options.Tune == AvifTune.Iq && color.Matrix == 0 ? Av1.AomStill.Enter(-1) : ((int, bool)?)null;
+        // libavif's default tuning of identity-matrix colour is tune=ssim (tune=iq for every other matrix)
+        var aomScope = options.Tune == AvifTune.Iq && color.Matrix == 0 ? Av1.AomStill.Enter(Av1.AomStill.Speed, Av1.AomTune.Ssim)
+            : ((int, Av1.AomTune)?)null;
         try
         {
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied

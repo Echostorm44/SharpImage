@@ -9,10 +9,10 @@ public sealed class AomEncoderSmoke
     {
         string? yuvPath = Environment.GetEnvironmentVariable("AOM_SMOKE_YUV");
         int w = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_W") ?? "200"), h = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_H") ?? "150");
-        // AOM_SMOKE_FMT=444 (4:4:4 planes in the file) / mono (luma only is read)
+        // AOM_SMOKE_FMT=444 (4:4:4 planes in the file) / 422 (chroma halved horizontally) / mono (luma only is read)
         string fmt = Environment.GetEnvironmentVariable("AOM_SMOKE_FMT") ?? "420";
-        bool is444 = fmt == "444", mono = fmt == "mono";
-        int cw = is444 ? w : (w + 1) / 2, ch = is444 ? h : (h + 1) / 2;
+        bool is444 = fmt == "444", is422 = fmt == "422", mono = fmt == "mono";
+        int cw = is444 ? w : (w + 1) / 2, ch = is444 || is422 ? h : (h + 1) / 2;
         byte[] y = new byte[w * h], u = new byte[cw * ch], v = new byte[cw * ch];
         if (yuvPath != null && File.Exists(yuvPath))
         {
@@ -29,12 +29,13 @@ public sealed class AomEncoderSmoke
         }
         bool noMl = Environment.GetEnvironmentVariable("AOM_SMOKE_NOML") == "1";
         var input = new AomEncodeInput { Width = w, Height = h, Planes = new[] { y, u, v }, Strides = new[] { w, cw, cw },
-            SsX = is444 ? 0 : 1, SsY = is444 ? 0 : 1, Monochrome = mono,
+            SsX = is444 ? 0 : 1, SsY = is444 || is422 ? 0 : 1, Monochrome = mono,
             EnableIntrabc = Environment.GetEnvironmentVariable("AOM_SMOKE_NOIBC") != "1",
             BaseQindex = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_Q") ?? "112"),
             Speed = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_SPEED") ?? "6"),
-            // AOM_SMOKE_TUNE=iq (AOM_TUNE_IQ), AOM_SMOKE_IQOFF=<letters> (tune-iq sub-features switched back off, as AOMORACLE_IQOFF)
-            TuneIq = Environment.GetEnvironmentVariable("AOM_SMOKE_TUNE") == "iq", IqOff = Environment.GetEnvironmentVariable("AOM_SMOKE_IQOFF"),
+            // AOM_SMOKE_TUNE=iq / ssim (AOM_TUNE_IQ / AOM_TUNE_SSIM), AOM_SMOKE_IQOFF=<letters> (tune-iq sub-features switched back off, as AOMORACLE_IQOFF)
+            Tune = Environment.GetEnvironmentVariable("AOM_SMOKE_TUNE") switch { "iq" => AomTune.Iq, "ssim" => AomTune.Ssim, _ => AomTune.Psnr },
+            IqOff = Environment.GetEnvironmentVariable("AOM_SMOKE_IQOFF"),
             SfOverride = noMl ? sf => { sf.intra_sf.intra_pruning_with_hog = 0; sf.intra_sf.chroma_intra_pruning_with_hog = 0;
                 sf.part_sf.intra_cnn_based_part_prune_level = 0; sf.part_sf.ml_prune_partition = 0; sf.tx_sf.prune_intra_tx_depths_using_nn = false; } : null };
         string? tracePath = Environment.GetEnvironmentVariable("AOM_TRACE");
