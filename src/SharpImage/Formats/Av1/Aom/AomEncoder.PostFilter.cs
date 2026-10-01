@@ -19,6 +19,11 @@ internal static partial class AomEncoder
     internal static AomPostFilterResult RunPostFilter(AomComp cpi, AomMacroblock x, bool applyRestoration = false)
     {
         var cm = cpi.Cm;
+        if (cpi.AllowIntrabc)
+        {
+            // set_postproc_filter_default_params; loopfilter_frame is not run for frames coded with intrabc
+            return cpi.PostFilter = new AomPostFilterResult { LoopFilter = new AomLoopFilterParams(), Restoration = null };
+        }
         int np = cm.NumPlanes;
         var src = ToYv12(cpi.Source, cm);
         var cur = ToYv12(cm.CurFrame, cm);
