@@ -116,6 +116,32 @@ public static class BmpCoder
                 throw new InvalidDataException($"Invalid BMP dimensions: {width}x{height}");
             }
 
+            // A BITMAPINFOHEADER (v3) with bit fields keeps its masks just after the header:
+            // three DWORDs, or four with BI_ALPHABITFIELDS.
+            if (dibHeaderSize == 40 && (compression == BiBitfields || compression == BiAlphaBitfields))
+            {
+                Span<byte> masks = stackalloc byte[16];
+                int maskBytes = compression == BiAlphaBitfields ? 16 : 12;
+                stream.ReadExactly(masks[..maskBytes]);
+                redMask = BinaryPrimitives.ReadUInt32LittleEndian(masks);
+                greenMask = BinaryPrimitives.ReadUInt32LittleEndian(masks[4..]);
+                blueMask = BinaryPrimitives.ReadUInt32LittleEndian(masks[8..]);
+                if (compression == BiAlphaBitfields)
+                {
+                    alphaMask = BinaryPrimitives.ReadUInt32LittleEndian(masks[12..]);
+                }
+            }
+
+            // 32-bpp BI_RGB is BGRX: the fourth byte is alpha only if the image actually uses it
+            // (checked after decoding).
+            if (bitsPerPixel == 32 && compression == BiRgb)
+            {
+                redMask = 0x00FF0000;
+                greenMask = 0x0000FF00;
+                blueMask = 0x000000FF;
+                alphaMask = 0xFF000000;
+            }
+
             // Read color palette
             ushort[][]? palette = null;
             if (bitsPerPixel <= 8)
@@ -129,9 +155,9 @@ public static class BmpCoder
             // Seek to pixel data
             long currentPos = FileHeaderSize + dibHeaderSize +
                 (palette != null ? palette.Length * (dibHeaderSize == 12 ? 3 : 4) : 0);
-            if (compression == BiBitfields && dibHeaderSize == 40)
+            if ((compression == BiBitfields || compression == BiAlphaBitfields) && dibHeaderSize == 40)
             {
-                currentPos += 12; // 3 mask uint32s after v3 header
+                currentPos += compression == BiAlphaBitfields ? 16 : 12; // masks after a v3 header
             }
 
             if (stream.CanSeek && stream.Position != pixelDataOffset)
@@ -147,9 +173,9 @@ public static class BmpCoder
                 blueMask = 0x001F;
             }
 
-            bool hasAlpha = alphaMask != 0 || bitsPerPixel == 32;
+            bool hasAlpha = bitsPerPixel == 32 && alphaMask != 0;
             var frame = new ImageFrame();
-            frame.Initialize(width, height, ColorspaceType.SRGB, hasAlpha && bitsPerPixel == 32);
+            frame.Initialize(width, height, ColorspaceType.SRGB, hasAlpha);
             frame.FormatName = "BMP";
 
             // Read pixel data based on compression and bit depth
@@ -160,6 +186,10 @@ public static class BmpCoder
                 case BiAlphaBitfields:
                     ReadUncompressed(stream, frame, bitsPerPixel, topDown, palette,
                         redMask, greenMask, blueMask, alphaMask);
+                    if (hasAlpha)
+                    {
+                        MakeOpaqueIfAlphaUnused(frame);
+                    }
                     break;
                 case BiRle8:
                     ReadRle8(stream, frame, topDown, palette!);
@@ -323,7 +353,7 @@ public static class BmpCoder
                         Decode24Bit(rowBuffer, pixels, width, channels);
                         break;
                     case 32:
-                        Decode32Bit(rowBuffer, pixels, width, channels, alphaMask);
+                        Decode32Bit(rowBuffer, pixels, width, channels, redMask, greenMask, blueMask, alphaMask);
                         break;
                 }
             }
@@ -420,20 +450,78 @@ public static class BmpCoder
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Decode32Bit(byte[] src, Span<ushort> dst, int width, int channels, uint alphaMask)
+    private static void Decode32Bit(byte[] src, Span<ushort> dst, int width, int channels,
+        uint redMask, uint greenMask, uint blueMask, uint alphaMask)
     {
+        // Bit fields with no masks (malformed) fall back to the BGRA layout.
+        if (redMask == 0 && greenMask == 0 && blueMask == 0)
+        {
+            redMask = 0x00FF0000;
+            greenMask = 0x0000FF00;
+            blueMask = 0x000000FF;
+        }
+
+        bool alpha = channels >= 4 && alphaMask != 0;
+        if (redMask == 0x00FF0000 && greenMask == 0x0000FF00 && blueMask == 0x000000FF
+            && (!alpha || alphaMask == 0xFF000000))
+        {
+            for (int x = 0;x < width;x++)
+            {
+                int srcOffset = x * 4;
+                int dstOffset = x * channels;
+                dst[dstOffset + 2] = Quantum.ScaleFromByte(src[srcOffset]);     // B
+                dst[dstOffset + 1] = Quantum.ScaleFromByte(src[srcOffset + 1]); // G
+                dst[dstOffset] = Quantum.ScaleFromByte(src[srcOffset + 2]);     // R
+                if (alpha)
+                {
+                    dst[dstOffset + 3] = Quantum.ScaleFromByte(src[srcOffset + 3]); // A
+                }
+            }
+            return;
+        }
+
+        int redShift = BitShift(redMask), greenShift = BitShift(greenMask), blueShift = BitShift(blueMask), alphaShift = BitShift(alphaMask);
+        int redBits = BitCount(redMask), greenBits = BitCount(greenMask), blueBits = BitCount(blueMask), alphaBits = BitCount(alphaMask);
         for (int x = 0;x < width;x++)
         {
-            int srcOffset = x * 4;
-            int dstOffset = x * channels;
-            dst[dstOffset + 2] = Quantum.ScaleFromByte(src[srcOffset]);     // B
-            dst[dstOffset + 1] = Quantum.ScaleFromByte(src[srcOffset + 1]); // G
-            dst[dstOffset] = Quantum.ScaleFromByte(src[srcOffset + 2]);     // R
-
-            if (channels >= 4)
+            uint pixel = BinaryPrimitives.ReadUInt32LittleEndian(src.AsSpan(x * 4));
+            int offset = x * channels;
+            dst[offset] = ScaleBitsToQuantum((int)((pixel & redMask) >> redShift), redBits);
+            dst[offset + 1] = ScaleBitsToQuantum((int)((pixel & greenMask) >> greenShift), greenBits);
+            dst[offset + 2] = ScaleBitsToQuantum((int)((pixel & blueMask) >> blueShift), blueBits);
+            if (alpha)
             {
-                dst[dstOffset + 3] = Quantum.ScaleFromByte(src[srcOffset + 3]); // A
+                dst[offset + 3] = ScaleBitsToQuantum((int)((pixel & alphaMask) >> alphaShift), alphaBits);
+            }
+        }
+    }
+
+    // Many writers (screen captures, the Windows clipboard's CF_DIB) leave the fourth byte of a
+    // 32-bpp pixel at zero. An image whose alpha is zero everywhere was never meant to be invisible:
+    // treat it as opaque, as ImageMagick and browsers do.
+    private static void MakeOpaqueIfAlphaUnused(ImageFrame frame)
+    {
+        int width = (int)frame.Columns;
+        int height = (int)frame.Rows;
+        int channels = frame.NumberOfChannels;
+        for (int y = 0;y < height;y++)
+        {
+            ReadOnlySpan<ushort> row = frame.GetPixelRow(y);
+            for (int x = 3;x < width * channels;x += channels)
+            {
+                if (row[x] != 0)
+                {
+                    return;
+                }
+            }
+        }
+
+        for (int y = 0;y < height;y++)
+        {
+            Span<ushort> row = frame.GetPixelRowForWrite(y);
+            for (int x = 3;x < width * channels;x += channels)
+            {
+                row[x] = Quantum.Opaque;
             }
         }
     }
