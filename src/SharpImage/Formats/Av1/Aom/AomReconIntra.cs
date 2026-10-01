@@ -349,6 +349,29 @@ internal static unsafe partial class AomReconIntra
         Buffer.MemoryCopy(above - 1, buffer, bw + 1, bw + 1);
 
         ReadOnlySpan<sbyte> taps = FilterIntraTaps.Slice(mode * 64, 64);
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            // the 8 outputs of a 4x2 cell in 8 int lanes: sum over the 7 neighbours p_j of p_j * taps[k][j]
+            Span<Vector256<int>> tc = stackalloc Vector256<int>[7];
+            for (int j = 0; j < 7; j++)
+                tc[j] = Vector256.Create(taps[j], taps[8 + j], taps[16 + j], taps[24 + j], taps[32 + j], taps[40 + j], taps[48 + j], taps[56 + j]);
+            var rnd = Vector256.Create(1 << (FILTER_INTRA_SCALE_BITS - 1));
+            for (int r = 1; r < bh + 1; r += 2)
+                for (int c = 1; c < bw + 1; c += 4)
+                {
+                    byte* row0 = buffer + (r - 1) * B;
+                    var pr = Vector256.Create((int)row0[c - 1]) * tc[0] + Vector256.Create((int)row0[c]) * tc[1]
+                        + Vector256.Create((int)row0[c + 1]) * tc[2] + Vector256.Create((int)row0[c + 2]) * tc[3]
+                        + Vector256.Create((int)row0[c + 3]) * tc[4] + Vector256.Create((int)buffer[r * B + c - 1]) * tc[5]
+                        + Vector256.Create((int)buffer[(r + 1) * B + c - 1]) * tc[6];
+                    var v = Vector256.ShiftRightArithmetic(pr + rnd, FILTER_INTRA_SCALE_BITS);
+                    var w = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(v.GetLower(), v.GetUpper());
+                    var b8 = System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(w, w).AsUInt32();
+                    *(uint*)(buffer + r * B + c) = b8.GetElement(0);
+                    *(uint*)(buffer + (r + 1) * B + c) = b8.GetElement(1);
+                }
+        }
+        else
         for (int r = 1; r < bh + 1; r += 2)
             for (int c = 1; c < bw + 1; c += 4)
             {
