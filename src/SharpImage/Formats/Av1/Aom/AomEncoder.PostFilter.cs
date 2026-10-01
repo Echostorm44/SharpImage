@@ -69,7 +69,8 @@ internal static partial class AomEncoder
         AomRstPickConfig? rstCfg = null;
         if (cpi.EnableRestoration && x.E.Lossless[0] == 0)
         {
-            rstCfg = new AomRstPickConfig { Rdmult = cpi.RdRdmult, BaseQindex = cm.BaseQindex, SbSize = cm.SbSize };
+            rstCfg = new AomRstPickConfig { Rdmult = cpi.RdRdmult, BaseQindex = cm.BaseQindex, SbSize = cm.SbSize,
+                TileRowStartSb = cm.RowStartSb, TileColStartSb = cm.ColStartSb };
             rstCfg.SetSpeedFeatures(sf.lpf_sf);
             // av1_fill_lr_rates from the tile's CDFs
             AomModeCostFill.FillLr(x.ModeCosts, x.TileCtx);

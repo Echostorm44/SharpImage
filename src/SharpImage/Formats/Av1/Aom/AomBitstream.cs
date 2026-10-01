@@ -17,7 +17,7 @@ internal sealed class AomSequenceConfig
 }
 
 // Port of libaom 3.14.1 av1/encoder/bitstream.c (av1_pack_bitstream and what it reaches) and encodetxb.c's coefficient
-// writer for one shown all-intra key frame of a still picture (reduced still picture header, one tile, one tile
+// writer for one shown all-intra key frame of a still picture (reduced still picture header, uniform tiles in one tile
 // group, no segmentation / delta q / CDEF / superres / film grain), plus the temporal delimiter av1_cx_iface.c
 // prepends: the bytes libaom's aom_codec_get_cx_data returns for the frame.
 internal static class AomBitstream
@@ -46,17 +46,47 @@ internal static class AomBitstream
         outBuf.WriteByte(ObuHeader(OBU_SEQUENCE_HEADER));
         WriteUleb(outBuf, (ulong)seq.Length);
         outBuf.Write(seq);
-        // OBU_FRAME: the uncompressed header (no trailing bits, byte aligned) then the one tile group of one tile
+        // OBU_FRAME (num_tg 1): the uncompressed header (no trailing bits, byte aligned), the tile group header, then
+        // the tiles in raster order, each but the last preceded by its size - 1 in tile_size_bytes little-endian bytes
+        // (write_tile_obu / write_tile_obu_size: context_update_tile_id = the first largest tile, tile_size_bytes =
+        // choose_size_bytes of the largest tile size, the OBU size field minimal after remux_tiles)
+        int numTiles = cm.TileCols * cm.TileRows;
+        var tiles = new byte[numTiles][];
+        int tokIdx = 0, largestTileId = 0, maxTileSize = 0;
+        for (int tileRow = 0, i = 0; tileRow < cm.TileRows; tileRow++)
+            for (int tileCol = 0; tileCol < cm.TileCols; tileCol++, i++)
+            {
+                tiles[i] = WriteTile(f, cm.TileInit(tileRow, tileCol), ref tokIdx, trace);
+                if (tiles[i].Length > maxTileSize) { largestTileId = i; maxTileSize = tiles[i].Length; }
+            }
+        if (tokIdx != cpi.PaletteTokens.Count)
+            throw new InvalidOperationException($"palette tokens: wrote {tokIdx} of {cpi.PaletteTokens.Count}");
+        int tileSizeBytes = ChooseSizeBytes((uint)maxTileSize);
         var wb = new AomWriteBitBuffer();
-        WriteUncompressedHeader(f, wb);
+        WriteUncompressedHeader(f, wb, largestTileId, tileSizeBytes);
         byte[] hdr = wb.ToArray();
-        byte[] tile = WriteTile(f, trace);
+        var payload = new System.IO.MemoryStream();
+        payload.Write(hdr);
+        // write_tile_group_header: tile_start_and_end_present_flag 0 when there is more than one tile
+        if (cm.Log2Rows + cm.Log2Cols > 0) payload.WriteByte(0);
+        for (int i = 0; i < numTiles; i++)
+        {
+            if (i < numTiles - 1)
+            {
+                uint sz = (uint)(tiles[i].Length - 1);   // AV1_MIN_TILE_SIZE_BYTES
+                for (int b = 0; b < tileSizeBytes; b++) payload.WriteByte((byte)(sz >> (8 * b)));
+            }
+            payload.Write(tiles[i]);
+        }
         outBuf.WriteByte(ObuHeader(OBU_FRAME));
-        WriteUleb(outBuf, (ulong)(hdr.Length + tile.Length));
-        outBuf.Write(hdr);
-        outBuf.Write(tile);
+        WriteUleb(outBuf, (ulong)payload.Length);
+        payload.Position = 0;
+        payload.CopyTo(outBuf);
         return outBuf.ToArray();
     }
+
+    /// <summary>choose_size_bytes (no spare msbs).</summary>
+    private static int ChooseSizeBytes(uint size) => size >> 24 != 0 ? 4 : size >> 16 != 0 ? 3 : size >> 8 != 0 ? 2 : 1;
 
     /// <summary>av1_write_obu_header (no extension, has_size_field).</summary>
     private static byte ObuHeader(int type) => (byte)((type << 3) | (1 << 1));
@@ -86,7 +116,6 @@ internal static class AomBitstream
         public readonly AomLoopFilterParams Lf;
         public readonly AomRestorationInfo[]? Rst;
         public readonly int[] FrameRestorationType = new int[3];
-        public int Log2Cols, MinLog2Cols, MaxLog2Cols, Log2Rows, MinLog2Rows, MaxLog2Rows;
 
         public FrameState(AomComp cpi, AomSequenceConfig seqCfg)
         {
@@ -117,30 +146,6 @@ internal static class AomBitstream
             for (int p = 0; p < 3; p++)
                 FrameRestorationType[p] = Rst != null && p < Rst.Length && EnableRestoration && !AllLossless && !AllowIntrabc
                     ? Rst[p].FrameRestorationType : AomRestoration.RestoreNone;
-            SetTileInfo();
-        }
-
-        /// <summary>av1_get_tile_limits + set_tile_info (tile_columns = tile_rows = 0, uniform spacing).</summary>
-        private void SetTileInfo()
-        {
-            var cm = Cm;
-            int sbCols = (cm.MiCols + cm.MibSize - 1) >> cm.MibSizeLog2, sbRows = (cm.MiRows + cm.MibSize - 1) >> cm.MibSizeLog2;
-            int sbSizeLog2 = cm.MibSizeLog2 + 2;
-            int maxWidthSb = 4096 >> sbSizeLog2;                       // MAX_TILE_WIDTH
-            int maxTileAreaSb = (4096 * 2304) >> (2 * sbSizeLog2);      // MAX_TILE_AREA
-            MinLog2Cols = TileLog2(maxWidthSb, sbCols);
-            MaxLog2Cols = TileLog2(1, Math.Min(sbCols, 64));
-            MaxLog2Rows = TileLog2(1, Math.Min(sbRows, 64));
-            int minLog2 = Math.Max(TileLog2(maxTileAreaSb, sbCols * sbRows), MinLog2Cols);
-            Log2Cols = MinLog2Cols;
-            int k = 0;
-            for (; (maxWidthSb << k) <= sbCols; ++k) { }
-            Log2Cols = Math.Min(Math.Max(Log2Cols, k), MaxLog2Cols);
-            MinLog2Rows = Math.Max(minLog2 - Log2Cols, 0);
-            Log2Rows = Math.Min(Math.Max(0, MinLog2Rows), MaxLog2Rows);
-            int colSb = (sbCols + (1 << Log2Cols) - 1) >> Log2Cols, rowSb = (sbRows + (1 << Log2Rows) - 1) >> Log2Rows;
-            if (colSb < sbCols || rowSb < sbRows)
-                throw new NotSupportedException("frames needing more than one tile are not supported by the port");
         }
 
         /// <summary>cpi->intrabc_used: any block of the frame coded with intrabc.</summary>
@@ -152,12 +157,6 @@ internal static class AomBitstream
             return false;
         }
 
-        private static int TileLog2(int blkSize, int target)
-        {
-            int k = 0;
-            for (; (blkSize << k) < target; k++) { }
-            return k;
-        }
     }
 
     private static int MostSignificantBit(int v) => 31 - System.Numerics.BitOperations.LeadingZeroCount((uint)v);
@@ -256,7 +255,7 @@ internal static class AomBitstream
     // ---- uncompressed frame header ---------------------------------------------------------------------------------
 
     /// <summary>write_uncompressed_header_obu for the shown key frame of a reduced still picture header.</summary>
-    private static void WriteUncompressedHeader(FrameState f, AomWriteBitBuffer wb)
+    private static void WriteUncompressedHeader(FrameState f, AomWriteBitBuffer wb, int contextUpdateTileId, int tileSizeBytes)
     {
         var cpi = f.Cpi;
         var cm = f.Cm;
@@ -266,12 +265,17 @@ internal static class AomBitstream
         // KEY_FRAME: write_frame_size (frame_size_override_flag 0: no superres scale, render size = frame size)
         wb.WriteBit(0);                                     // write_render_size: scaling_active
         if (f.AllowScreenContentTools) wb.WriteBit(f.AllowIntrabc ? 1 : 0);
-        // write_tile_info (uniform spacing, one tile)
+        // write_tile_info (write_tile_info_max_tile, uniform spacing)
         wb.WriteBit(1);
-        for (int ones = f.Log2Cols - f.MinLog2Cols; ones-- > 0;) wb.WriteBit(1);
-        if (f.Log2Cols < f.MaxLog2Cols) wb.WriteBit(0);
-        for (int ones = f.Log2Rows - f.MinLog2Rows; ones-- > 0;) wb.WriteBit(1);
-        if (f.Log2Rows < f.MaxLog2Rows) wb.WriteBit(0);
+        for (int ones = cm.Log2Cols - cm.MinLog2Cols; ones-- > 0;) wb.WriteBit(1);
+        if (cm.Log2Cols < cm.MaxLog2Cols) wb.WriteBit(0);
+        for (int ones = cm.Log2Rows - cm.MinLog2Rows; ones-- > 0;) wb.WriteBit(1);
+        if (cm.Log2Rows < cm.MaxLog2Rows) wb.WriteBit(0);
+        if (cm.TileRows * cm.TileCols > 1)
+        {
+            wb.WriteLiteral(contextUpdateTileId, cm.Log2Cols + cm.Log2Rows);   // tile id used for cdf update
+            wb.WriteLiteral(tileSizeBytes - 1, 2);                              // number of bytes in tile size - 1
+        }
         // encode_quantization (separate_uv_delta_q 0)
         wb.WriteLiteral(cm.BaseQindex, 8);
         WriteDeltaQ(wb, cm.YDcDeltaQ);
@@ -434,8 +438,8 @@ internal static class AomBitstream
         public readonly bool[] CdefTransmitted = new bool[4];
     }
 
-    /// <summary>av1_pack_tile_info for the frame's single tile: write_modes then aom_stop_encode.</summary>
-    private static byte[] WriteTile(FrameState f, System.IO.TextWriter? trace)
+    /// <summary>av1_pack_tile_info: write_modes for the tile then aom_stop_encode.</summary>
+    private static byte[] WriteTile(FrameState f, AomTileInfo tile, ref int tokIdx, System.IO.TextWriter? trace)
     {
         var cpi = f.Cpi;
         var cm = f.Cm;
@@ -458,7 +462,8 @@ internal static class AomBitstream
         xd.MiStride = cm.MiStride;
         xd.TxTypeMap = cm.TxTypeMap;
         xd.TxTypeMapStride = cm.MiStride;
-        var t = new TileWriter { F = f, Cpi = cpi, Cm = cm, W = w, Fc = fc, Xd = xd };
+        xd.SetTile(tile);
+        var t = new TileWriter { F = f, Cpi = cpi, Cm = cm, W = w, Fc = fc, Xd = xd, TokIdx = tokIdx };
         xd.CurrentBaseQindex = cm.BaseQindex;
 
         // av1_reset_loop_restoration
@@ -468,23 +473,22 @@ internal static class AomBitstream
             AomRestoration.SetDefaultSgrproj(ref t.RefSgrproj[p]);
         }
 
-        // write_modes: av1_zero_above_context
+        // write_modes: av1_zero_above_context (the writer's own above contexts, fresh for each tile)
         Array.Clear(xd.AbovePartitionContext);
         Array.Fill(xd.AboveTxfmContext, (byte)TxSizeWide[TX_64X64]);
         int sbCols = (cm.MiCols + cm.MibSize - 1) >> cm.MibSizeLog2;
-        for (int miRow = 0; miRow < cm.MiRows; miRow += cm.MibSize)
+        for (int miRow = tile.MiRowStart; miRow < tile.MiRowEnd; miRow += cm.MibSize)
         {
             // av1_zero_left_context
             Array.Clear(xd.LeftPartitionContext);
             Array.Fill(xd.LeftTxfmContextBuffer, (byte)TxSizeHigh[TX_64X64]);
-            for (int miCol = 0, sbCol = 0; miCol < cm.MiCols; miCol += cm.MibSize, sbCol++)
+            for (int miCol = tile.MiColStart; miCol < tile.MiColEnd; miCol += cm.MibSize)
             {
-                t.Cb = cpi.CbCoeffBuffers[(miRow >> cm.MibSizeLog2) * sbCols + sbCol];
+                t.Cb = cpi.CbCoeffBuffers[(miRow >> cm.MibSizeLog2) * sbCols + (miCol >> cm.MibSizeLog2)];
                 WriteModesSb(t, miRow, miCol, cm.SbSize);
             }
         }
-        if (t.TokIdx != cpi.PaletteTokens.Count)
-            throw new InvalidOperationException($"palette tokens: wrote {t.TokIdx} of {cpi.PaletteTokens.Count}");
+        tokIdx = t.TokIdx;
         return w.Finish();
     }
 

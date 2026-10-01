@@ -247,7 +247,7 @@ internal static partial class AomEncodeFrame
             pd.LeftEntropyContext = xd.LeftEntropyContext[i];
             pd.LeftEntropyOffset = (rowOffset & MAX_MIB_MASK) >> pd.SubsamplingY;
         }
-        xd.AboveTxfmContext = cm.AboveTxfm;
+        xd.AboveTxfmContext = cm.AboveTxfm[xd.TileRow];
         xd.AboveTxfmContextOffset = miCol;
         xd.LeftTxfmContextOffset = miRow & MAX_MIB_MASK;
 

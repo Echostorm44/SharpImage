@@ -35,6 +35,9 @@ public sealed class AomEncoderSmoke
             Speed = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_SPEED") ?? "6"),
             // AOM_SMOKE_THREADS=N: cfg.g_threads (row-MT from 2)
             Threads = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_THREADS") ?? "1"),
+            // AOM_SMOKE_TILECOLS / AOM_SMOKE_TILEROWS: tile_cfg tile_columns / tile_rows (log2, AV1E_SET_TILE_COLUMNS / ROWS)
+            TileColumns = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_TILECOLS") is { Length: > 0 } tc ? tc : "0"),
+            TileRows = int.Parse(Environment.GetEnvironmentVariable("AOM_SMOKE_TILEROWS") is { Length: > 0 } tr ? tr : "0"),
             // AOM_SMOKE_TUNE=iq / ssim (AOM_TUNE_IQ / AOM_TUNE_SSIM), AOM_SMOKE_IQOFF=<letters> (tune-iq sub-features switched back off, as AOMORACLE_IQOFF)
             Tune = Environment.GetEnvironmentVariable("AOM_SMOKE_TUNE") switch { "iq" => AomTune.Iq, "ssim" => AomTune.Ssim, _ => AomTune.Psnr },
             IqOff = Environment.GetEnvironmentVariable("AOM_SMOKE_IQOFF"),
