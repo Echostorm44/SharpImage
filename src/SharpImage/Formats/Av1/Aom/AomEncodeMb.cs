@@ -271,7 +271,27 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>The (horizontal, vertical) 1D kinds and flips of a TX_TYPE (htx_tab / vtx_tab; FLIPADST = ADST + flip).</summary>
+    // (hKind, vKind, flipUd, flipLr) of each TX_TYPE packed as hKind | vKind << 4 | flipUd << 8 | flipLr << 9
+    private static readonly short[] TxTypeKindTab = BuildTxTypeKindTab();
+    private static short[] BuildTxTypeKindTab()
+    {
+        var t = new short[16];
+        for (int i = 0; i < 16; i++)
+        {
+            TxTypeKindsSlow(i, out int h, out int v, out bool ud, out bool lr);
+            t[i] = (short)(h | v << 4 | (ud ? 1 << 8 : 0) | (lr ? 1 << 9 : 0));
+        }
+        return t;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void TxTypeKinds(int txType, out int hKind, out int vKind, out bool flipUd, out bool flipLr)
+    {
+        int k = TxTypeKindTab[txType & 15];
+        hKind = k & 15; vKind = (k >> 4) & 15; flipUd = (k & (1 << 8)) != 0; flipLr = (k & (1 << 9)) != 0;
+    }
+
+    private static void TxTypeKindsSlow(int txType, out int hKind, out int vKind, out bool flipUd, out bool flipLr)
     {
         static int Kind(int t1d) => t1d switch
         {
