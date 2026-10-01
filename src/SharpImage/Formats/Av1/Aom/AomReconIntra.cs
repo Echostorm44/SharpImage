@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -461,6 +462,35 @@ internal static unsafe partial class AomReconIntra
         if (strength == 0) return;
 
         ReadOnlySpan<byte> kernel = EdgeKernel.Slice((strength - 1) * INTRA_EDGE_TAPS, INTRA_EDGE_TAPS);
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            // the edge with its clamped neighbours materialised (e[-2], e[-1] = p[0]; e[sz ..] = p[sz - 1]), then 16 taps
+            // sums at a time; the stores past p[sz - 1] are overwritten by the extension below
+            byte* buf = stackalloc byte[2 + 129 + 32];
+            byte* e = buf + 2;
+            Buffer.MemoryCopy(p, e, 129, sz);
+            byte first = e[0], last = e[sz - 1];
+            e[-2] = first; e[-1] = first;
+            Unsafe.InitBlockUnaligned(e + sz, last, 32);
+            var k0 = System.Runtime.Intrinsics.Vector256.Create((short)kernel[0]);
+            var k1 = System.Runtime.Intrinsics.Vector256.Create((short)kernel[1]);
+            var k2 = System.Runtime.Intrinsics.Vector256.Create((short)kernel[2]);
+            var eight = System.Runtime.Intrinsics.Vector256.Create((short)8);
+            for (int i = 1; i < sz; i += 16)
+            {
+                var a0 = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int16(System.Runtime.Intrinsics.X86.Sse2.LoadVector128(e + i - 2));
+                var a1 = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int16(System.Runtime.Intrinsics.X86.Sse2.LoadVector128(e + i - 1));
+                var a2 = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int16(System.Runtime.Intrinsics.X86.Sse2.LoadVector128(e + i));
+                var a3 = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int16(System.Runtime.Intrinsics.X86.Sse2.LoadVector128(e + i + 1));
+                var a4 = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int16(System.Runtime.Intrinsics.X86.Sse2.LoadVector128(e + i + 2));
+                // symmetric taps: k0 (e[i-2] + e[i+2]) + k1 (e[i-1] + e[i+1]) + k2 e[i]
+                var s = System.Runtime.Intrinsics.Vector256.ShiftRightLogical((a0 + a4) * k0 + (a1 + a3) * k1 + a2 * k2 + eight, 4);
+                System.Runtime.Intrinsics.X86.Sse2.Store(p + i, System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(s.GetLower(), s.GetUpper()));
+            }
+            p[-1] = first;
+            Unsafe.InitBlockUnaligned(p + sz, last, 16);
+            return;
+        }
         byte* edge = stackalloc byte[129];
         Buffer.MemoryCopy(p, edge, 129, sz);
         for (int i = 1; i < sz; i++)
