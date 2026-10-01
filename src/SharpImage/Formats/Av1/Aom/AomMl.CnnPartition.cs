@@ -1,4 +1,8 @@
 using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -44,9 +48,164 @@ internal static partial class AomMl
     // relu (cnn.c): (x < 0) ? 0 : x, which keeps -0
     private static float CnnRelu(float x) => x < 0 ? 0 : x;
 
+    // cnn_convolve_no_maxpool_padding_valid_5x5_avx2 (layer 0: 5x5, stride 4, one in-channel): three blocks per pair
+    // of 8-lane registers, then single blocks, each with libaom's reduction order (no FMA: libaom's build has none)
+    private static void CnnConvolve5x5Avx2(float[] input, int inWidth, int inHeight, int inStride, int inChannels,
+        int outChannels, float[] weights, float[] bias, float[] output, int outStride)
+    {
+        const int fw = 5, skip = 4;
+        int cstep = inChannels * outChannels;
+        if (!Avx2.IsSupported) { CnnConvolve5x5Scalar(input, inWidth, inHeight, inStride, inChannels, outChannels, weights, bias, output, outStride); return; }
+        var block01 = Vector256.Create(0, 1, 2, 3, 4, 4, 5, 6);
+        var block12 = Vector256.Create(0, 1, 1, 2, 3, 4, 5, 0);
+        var wmask0 = Vector256.Create(0, 1, 2, 3, 4, 0, 1, 2);
+        var wmask1 = Vector256.Create(3, 4, 0, 1, 2, 3, 4, 0);
+        Span<float> wbuf = stackalloc float[5 * 8];
+        Span<Vector256<float>> sw = stackalloc Vector256<float>[10];
+        ref float in0 = ref MemoryMarshal.GetArrayDataReference(input);
+        if ((long)inStride * inHeight * inChannels > input.Length || output.Length < outChannels * outStride * outStride)
+            throw new ArgumentException("cnn buffers");
+        for (int i = 0; i < outChannels; i++)
+        {
+            float outChBias = bias[i];
+            for (int k = 0; k < inChannels; k++)
+            {
+                // prepare_weights_for_5x5_convolve
+                wbuf.Clear();
+                int off = k * outChannels + i;
+                for (int row = 0; row < 5; row++)
+                    for (int col = 0; col < 5; col++) { wbuf[row * 8 + col] = weights[off]; off += cstep; }
+                for (int row = 0; row < 5; row++)
+                {
+                    var wr = Vector256.Create<float>(wbuf.Slice(row * 8, 8));
+                    sw[row] = Avx2.PermuteVar8x32(wr, wmask0);
+                }
+                for (int row = 0; row < 5; row++) sw[5 + row] = Avx2.PermuteVar8x32(sw[row], wmask1);
+                int plane = k * inStride * inHeight;
+                for (int h = 0, u = 0; h < inHeight - fw + 1; h += skip, ++u)
+                {
+                    int outH = i * outStride * outStride + u * outStride;   // channel planes are outStride x outStride
+                    int v = 0, x = 0, rem = inWidth;
+                    while (rem >= skip * 2 + fw)
+                    {
+                        var acc0 = Vector256<float>.Zero;
+                        var acc1 = Vector256<float>.Zero;
+                        int p = plane + h * inStride + x;
+                        for (int row = 0; row < 5; row++)
+                        {
+                            var l0 = Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref in0, (nuint)p), block01);
+                            var l1 = Avx2.PermuteVar8x32(Vector256.LoadUnsafe(ref in0, (nuint)(p + 7)), block12);
+                            acc0 = Avx.Add(Avx.Multiply(l0, sw[row]), acc0);
+                            acc1 = Avx.Add(Avx.Multiply(l1, sw[5 + row]), acc1);
+                            p += inStride;
+                        }
+                        var accum = Avx.HorizontalAdd(acc0, acc1);
+                        var t0 = acc0.GetUpper();
+                        var t1 = acc1.GetUpper();
+                        var al = accum.GetLower();
+                        var ah = accum.GetUpper();
+                        var t2 = Sse.Add(al, t0);
+                        var t3 = Sse.Add(t0, ah);
+                        var t4 = Sse.Add(t1, ah);
+                        output[outH + v] = outChBias + t2.ToScalar() + al.GetElement(1);
+                        output[outH + v + 1] = outChBias + t3.GetElement(1) + al.GetElement(2);
+                        output[outH + v + 2] = outChBias + t4.GetElement(2) + al.GetElement(3);
+                        v += 3; x += skip * 3; rem -= skip * 3;
+                    }
+                    while (rem >= fw)
+                    {
+                        // PERFORM_CONVOLVE_FOR_1_5X5_BLOCK
+                        float last = 0;
+                        int p = plane + h * inStride + x;
+                        var s0 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[4]; p += inStride;
+                        var s1 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[12]; p += inStride;
+                        var s2 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[20]; p += inStride;
+                        var s3 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[28]; p += inStride;
+                        var s4 = Vector128.LoadUnsafe(ref in0, (nuint)p); last += Unsafe.Add(ref in0, p + 4) * wbuf[36];
+                        s0 = Sse.Multiply(s0, sw[0].GetLower()); s1 = Sse.Multiply(s1, sw[1].GetLower()); s2 = Sse.Multiply(s2, sw[2].GetLower());
+                        s3 = Sse.Multiply(s3, sw[3].GetLower()); s4 = Sse.Multiply(s4, sw[4].GetLower());
+                        var acc = Sse.Add(s0, Vector128<float>.Zero);
+                        s1 = Sse.Add(s1, s2);
+                        s3 = Sse.Add(s3, s4);
+                        s1 = Sse.Add(s1, s3);
+                        acc = Sse.Add(acc, s1);
+                        acc = Sse3.HorizontalAdd(acc, acc);
+                        output[outH + v] = outChBias + last + acc.ToScalar() + acc.GetElement(1);
+                        v += 1; x += skip; rem -= skip;
+                    }
+                }
+            }
+        }
+    }
+
+    // cnn_convolve_no_maxpool_padding_valid_layer1_avx2 (16x16 in) / layer2_avx2 (8x8 in): per output channel, the
+    // bias then each in-channel's 2x2 blocks ((p00 w0 + p10 w2) + (p01 w1 + p11 w3) by hadd) added in order
+    private static void CnnConvolve2x2Avx2(float[] input, int inSize, int inChannels, int outChannels, float[] weights,
+        float[] bias, float[] output, int outBase, int outStride)
+    {
+        int cstep = inChannels * outChannels, outSize = inSize / 2;
+        if (!Avx2.IsSupported || (inSize != 16 && inSize != 8)) { CnnConvolve2x2Scalar(input, inSize, inChannels, outChannels, weights, bias, output, outBase, outStride); return; }
+        if (input.Length < inChannels * inSize * inSize || output.Length < outBase + outChannels * outStride * outStride)
+            throw new ArgumentException("cnn buffers");
+        var outMask = Vector256.Create(0, 1, 4, 5, 2, 3, 6, 7);
+        var wm0 = Vector256.Create(0, 1, 0, 1, 0, 1, 0, 1);
+        var wm1 = Vector256.Create(2, 3, 2, 3, 2, 3, 2, 3);
+        ref float in0 = ref MemoryMarshal.GetArrayDataReference(input);
+        ref float out0 = ref MemoryMarshal.GetArrayDataReference(output);
+        Span<Vector256<float>> acc = stackalloc Vector256<float>[8];
+        int nAcc = inSize == 16 ? 8 : 2;
+        for (int i = 0; i < outChannels; i++)
+        {
+            var biasReg = Vector256.Create(bias[i]);
+            for (int j = 0; j < nAcc; j++) acc[j] = biasReg;
+            for (int k = 0; k < inChannels; k++)
+            {
+                int off = k * outChannels + i;
+                var wv = Vector256.Create(weights[off], weights[off + cstep], weights[off + 2 * cstep], weights[off + 3 * cstep], 0, 0, 0, 0);
+                var w0 = Avx2.PermuteVar8x32(wv, wm0);
+                var w1 = Avx2.PermuteVar8x32(wv, wm1);
+                int plane = k * inSize * inSize;
+                if (inSize == 16)
+                {
+                    // perform_convolve_for_8h_2x2_blocks
+                    for (int h = 0, u = 0; h < 15; h += 2, ++u)
+                    {
+                        int p = plane + h * 16;
+                        var l0 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)p), w0);
+                        var l1 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 8)), w0);
+                        var l2 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 16)), w1);
+                        var l3 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 24)), w1);
+                        l0 = Avx.Add(l0, l2);
+                        l1 = Avx.Add(l1, l3);
+                        acc[u] = Avx.Add(acc[u], Avx2.PermuteVar8x32(Avx.HorizontalAdd(l0, l1), outMask));
+                    }
+                }
+                else
+                {
+                    // perform_convolve_for_4hx2v_2x2_blocks
+                    for (int h = 0, u = 0; h < 7; h += 4, ++u)
+                    {
+                        int p = plane + h * 8;
+                        var l0 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)p), w0);
+                        var l1 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 8)), w1);
+                        var l2 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 16)), w0);
+                        var l3 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 24)), w1);
+                        l0 = Avx.Add(l0, l1);
+                        l2 = Avx.Add(l2, l3);
+                        acc[u] = Avx.Add(acc[u], Avx2.PermuteVar8x32(Avx.HorizontalAdd(l0, l2), outMask));
+                    }
+                }
+            }
+            int ob = outBase + i * outStride * outStride;
+            if (inSize == 16) for (int j = 0; j < 8; j++) acc[j].StoreUnsafe(ref out0, (nuint)(ob + j * outStride));
+            else for (int j = 0; j < 2; j++) acc[j].StoreUnsafe(ref out0, (nuint)(ob + j * outStride * 2));
+        }
+    }
+
+    // the scalar emulation of the AVX2 kernels (no AVX2)
     // cnn_convolve_no_maxpool_padding_valid_5x5_avx2 (layer 0: 5x5, stride 4): three blocks per pair of 8-lane
     // registers, then single blocks, each with its own reduction order
-    private static void CnnConvolve5x5Avx2(float[] input, int inWidth, int inHeight, int inStride, int inChannels,
+    private static void CnnConvolve5x5Scalar(float[] input, int inWidth, int inHeight, int inStride, int inChannels,
         int outChannels, float[] weights, float[] bias, float[] output, int outStride)
     {
         const int fw = 5, skip = 4;
@@ -126,7 +285,7 @@ internal static partial class AomMl
         (p00 * w[0] + p10 * w[2]) + (p01 * w[1] + p11 * w[3]);
 
     // cnn_convolve_no_maxpool_padding_valid_layer1_avx2 / layer2_avx2: per output, bias + the in-channels in order
-    private static void CnnConvolve2x2Avx2(float[] input, int inSize, int inChannels, int outChannels, float[] weights,
+    private static void CnnConvolve2x2Scalar(float[] input, int inSize, int inChannels, int outChannels, float[] weights,
         float[] bias, float[] output, int outBase, int outStride)
     {
         int cstep = inChannels * outChannels, outSize = inSize / 2;
@@ -181,11 +340,13 @@ internal static partial class AomMl
         for (int j = start; j < start + count; j++) buf[j] = CnnRelu(buf[j]);
     }
 
+    [ThreadStatic] private static float[]? t_cnnIn, t_cnnL0, t_cnnL1;
+
     // av1_cnn_predict_c over av1_intra_mode_cnn_partition_cnn_config from the 65x65 float input
     private static void CnnPartitionPredict(float[] input, float[] cnnBuffer)
     {
         const int b1 = CnnBranch0OutSize, b2 = b1 + CnnBranch1OutSize, b3 = b2 + CnnBranch2OutSize;
-        var l0 = new float[20 * 16 * 16];
+        var l0 = t_cnnL0 ??= new float[20 * 16 * 16];
         // layer 0: 65x65x1 -> 16x16x20
         CnnConvolve5x5Avx2(input, 65, 65, 65, 1, 20, AomMlModels.IntraModeCnnPartitionCnnLayer0Kernel,
             AomMlModels.IntraModeCnnPartitionCnnLayer0Bias, l0, 16);
@@ -195,7 +356,8 @@ internal static partial class AomMl
             AomMlModels.IntraModeCnnPartitionCnnLayer1Bias, cnnBuffer, b3, 8);
         CnnActivate(cnnBuffer, b3, CnnBranch3OutSize);
         // layer 2: 8x8x20 -> 4x4x20 (output 2)
-        var l1 = cnnBuffer.AsSpan(b3, CnnBranch3OutSize).ToArray();
+        var l1 = t_cnnL1 ??= new float[CnnBranch3OutSize];
+        Array.Copy(cnnBuffer, b3, l1, 0, CnnBranch3OutSize);
         CnnConvolve2x2Avx2(l1, 8, 20, 20, AomMlModels.IntraModeCnnPartitionCnnLayer2Kernel,
             AomMlModels.IntraModeCnnPartitionCnnLayer2Bias, cnnBuffer, b2, 4);
         CnnActivate(cnnBuffer, b2, CnnBranch2OutSize);
@@ -215,7 +377,7 @@ internal static partial class AomMl
     internal static void CnnPartitionPredict(ReadOnlySpan<byte> src, int stride, float[] cnnBuffer)
     {
         const float maxVal = 255.0f;
-        var input = new float[65 * 65];
+        var input = t_cnnIn ??= new float[65 * 65 + 16];   // the AVX2 loads read up to 2 floats past the last row
         for (int i = 0; i < 65; i++)
             for (int j = 0; j < 65; j++) input[i * 65 + j] = (float)src[i * stride + j] / maxVal;
         CnnPartitionPredict(input, cnnBuffer);
@@ -225,7 +387,7 @@ internal static partial class AomMl
     internal static void CnnPartitionPredict(ReadOnlySpan<ushort> src, int stride, int bitDepth, float[] cnnBuffer)
     {
         float maxVal = (float)((1 << bitDepth) - 1);
-        var input = new float[65 * 65];
+        var input = t_cnnIn ??= new float[65 * 65 + 16];   // the AVX2 loads read up to 2 floats past the last row
         for (int i = 0; i < 65; i++)
             for (int j = 0; j < 65; j++) input[i * 65 + j] = (float)src[i * stride + j] / maxVal;
         CnnPartitionPredict(input, cnnBuffer);
