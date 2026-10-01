@@ -599,6 +599,13 @@ internal sealed class AomPickRst
         byte avg = FindAverage(dgd.Buf, dgd, hStart, hEnd, vStart, vEnd);
         Array.Clear(M, 0, wienerWin2);
         Array.Clear(H, 0, wienerWin2 * wienerWin2);
+        if (Avx2.IsSupported && hEnd - hStart <= 1024)
+        {
+            ComputeStatsAvx2(wienerWin, dgd, src, hStart, hEnd, vStart, vEnd, M, H, useDownsampledWienerStats, avg);
+            for (int k = 0; k < wienerWin2; ++k)
+                for (int l = k + 1; l < wienerWin2; ++l) H[l * wienerWin2 + k] = H[k * wienerWin2 + l];
+            return;
+        }
         int downsampleFactor = useDownsampledWienerStats != 0 ? 4 : 1;
         // the window samples padded to whole 8-lane vectors; per-row int32 sums (|Y| <= 255 over at most 384 columns
         // cannot overflow), whole rows accumulated (the entries below the diagonal are dropped: the symmetrisation below
@@ -656,6 +663,95 @@ internal sealed class AomPickRst
         if (pendingRows > 0) Flush();
         for (int k = 0; k < wienerWin2; ++k)
             for (int l = k + 1; l < wienerWin2; ++l) H[l * wienerWin2 + k] = H[k * wienerWin2 + l];
+    }
+
+    /// <summary>ComputeStats' upper triangle of H and M as av1_compute_stats_avx2 arranges it: the (dgd - avg) samples
+    /// as int16, 16 columns per vector, every (k, l) product pair summed with madd, the downsample weight (zero past the
+    /// unit's width) folded into one operand. Integer sums, so the totals equal the scalar order's exactly: int32
+    /// accumulators (at most 32 sampled rows x 64 chunks x 2 x 255 x 1020 &lt; 2^31) are flushed into the int64 totals.</summary>
+    [SkipLocalsInit]
+    private static void ComputeStatsAvx2(int wienerWin, AomYv12Plane dgd, AomYv12Plane src, int hStart, int hEnd,
+        int vStart, int vEnd, long[] M, long[] H, int useDownsampledWienerStats, byte avg)
+    {
+        int wienerWin2 = wienerWin * wienerWin, half = wienerWin >> 1;
+        int width = hEnd - hStart, height = vEnd - vStart;
+        int chunks = (width + 15) >> 4;
+        // D: rows vStart - half .. vEnd + half, columns hStart - half .. + chunks * 16 + 2 * half (zeros past the unit's
+        // right neighbours)
+        int dw = chunks * 16 + 2 * half + 16, dh = height + 2 * half;
+        var dbuf = new short[dw * dh];
+        byte[] db = dgd.Buf, sb = src.Buf;
+        for (int r = 0; r < dh; r++)
+        {
+            int o = dgd.At(hStart - half, vStart - half + r);
+            int n = width + 2 * half;
+            for (int c = 0; c < n; c++) dbuf[r * dw + c] = (short)(db[o + c] - avg);
+        }
+        int pairs = wienerWin2 * (wienerWin2 + 1) / 2;
+        Span<Vector256<int>> acc = stackalloc Vector256<int>[pairs];
+        Span<Vector256<int>> accM = stackalloc Vector256<int>[wienerWin2];
+        Span<Vector256<short>> win = stackalloc Vector256<short>[wienerWin2];
+        acc.Clear();
+        accM.Clear();
+        ref short d0 = ref MemoryMarshal.GetArrayDataReference(dbuf);
+        var avgV = Vector256.Create((short)avg);
+        Span<short> maskBuf = stackalloc short[32];
+        int pending = 0;
+        void Flush(Span<Vector256<int>> acc, Span<Vector256<int>> accM)
+        {
+            static long Sum(Vector256<int> v) => Vector256.Sum(Avx2.ConvertToVector256Int64(v.GetLower()) + Avx2.ConvertToVector256Int64(v.GetUpper()));
+            int p = 0;
+            for (int k = 0; k < wienerWin2; k++)
+            {
+                M[k] += Sum(accM[k]);
+                for (int l = k; l < wienerWin2; l++) H[k * wienerWin2 + l] += Sum(acc[p++]);
+            }
+            acc.Clear();
+            accM.Clear();
+            pending = 0;
+        }
+        int downsampleFactor = useDownsampledWienerStats != 0 ? 4 : 1;
+        for (int i = vStart; i < vEnd; i += downsampleFactor)
+        {
+            if (useDownsampledWienerStats != 0 && vEnd - i < 4) downsampleFactor = vEnd - i;
+            if (pending == 32) Flush(acc, accM);
+            pending++;
+            int rr = i - vStart;   // D row of the window's top-left is rr (+ dy + half)
+            int so = src.At(hStart, i);
+            for (int c = 0; c < chunks; c++)
+            {
+                int c0 = c * 16;
+                int valid = Math.Min(16, width - c0);
+                Vector256<short> wv;
+                if (valid == 16) wv = Vector256.Create((short)downsampleFactor);
+                else
+                {
+                    for (int q = 0; q < 16; q++) maskBuf[q] = (short)(q < valid ? downsampleFactor : 0);
+                    wv = Vector256.Create<short>(maskBuf);
+                }
+                // window vectors: index (dx + half) * win + (dy + half), the scalar code's order
+                for (int dx = 0; dx < wienerWin; dx++)
+                    for (int dy = 0; dy < wienerWin; dy++)
+                        win[dx * wienerWin + dy] = Vector256.LoadUnsafe(ref d0, (nuint)((rr + dy) * dw + c0 + dx));
+                Vector256<short> x;
+                if (valid == 16) x = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref sb[so + c0])) - avgV;
+                else
+                {
+                    for (int q = 0; q < 16; q++) maskBuf[16 + q] = (short)(q < valid ? sb[so + c0 + q] - avg : 0);
+                    x = Vector256.Create<short>(maskBuf.Slice(16));
+                }
+                var xw = Avx2.MultiplyLow(x, wv);
+                int p = 0;
+                for (int k = 0; k < wienerWin2; k++)
+                {
+                    var wk = win[k];
+                    accM[k] += Avx2.MultiplyAddAdjacent(xw, wk);
+                    var a = Avx2.MultiplyLow(wk, wv);
+                    for (int l = k; l < wienerWin2; l++) acc[p++] += Avx2.MultiplyAddAdjacent(a, win[l]);
+                }
+            }
+        }
+        if (pending > 0) Flush(acc, accM);
     }
 
     private static int WrapIndex(int i, int wienerWin)
