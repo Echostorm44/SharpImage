@@ -37,6 +37,7 @@ public sealed class AomSearchPerfTwinTests
         [DllImport(D)] public static extern double twin_sum_squares_2d_i16(short* src, int stride, int w, int h, ulong* result, int iters);
         [DllImport(D)] public static extern double twin_txb_init_levels(int* coeff, int w, int h, byte* levels, int iters);
         [DllImport(D)] public static extern double twin_satd(int* coeff, int n, int* result, int iters);
+        [DllImport(D)] public static extern double twin_optimize_txb_file(int* costs, int* rec, int nrec, int* work, long* rateSum, long* eobSum);
         [DllImport(D)] public static extern double twin_block_error(int* coeff, int* dqcoeff, int n, long* sse, long* result, int iters);
     }
 
@@ -116,5 +117,58 @@ public sealed class AomSearchPerfTwinTests
                 if (print) Console.WriteLine($"{SizeNames[txSize],-6} {txType,4} {best / iters,8:F1} {bestA / iters,8:F1} {best / bestA,6:F2}");
             }
         }
+    }
+
+    // CoeffCosts in libaom's struct layout (coeff_costs[5][2] then eob_costs[7][2])
+    private static int[] Flatten(AomCoeffCosts c)
+    {
+        var l = new List<int>();
+        foreach (var k in c.Coeff) { l.AddRange(k.TxbSkip); l.AddRange(k.BaseEob); l.AddRange(k.Base); l.AddRange(k.EobExtra); l.AddRange(k.DcSign); l.AddRange(k.Lps); }
+        foreach (var e in c.Eob) l.AddRange(e);
+        return l.ToArray();
+    }
+
+    /// <summary>The trellis (av1_optimize_txb) over captured search blocks (SHARPIMAGE_AOMTWIN_SP_TXB: records of tx, type,
+    /// plane, skip ctx, dc ctx, eob, dq0, dq1, rdmult, sharpness, n, coeff, qcoeff, dqcoeff as int32), with the default
+    /// coefficient costs of qindex 120: same eobs / rates as libaom, and both sides timed.</summary>
+    [Test]
+    public async Task OptimizeTxb_Captured_MatchLibaom()
+    {
+        Load();
+        string? path = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_SP_TXB");
+        if (path == null || !File.Exists(path)) return;
+        var raw = File.ReadAllBytes(path);
+        var rec = new int[raw.Length / 4];
+        Buffer.BlockCopy(raw, 0, rec, 0, rec.Length * 4);
+        int nrec = 0;
+        for (int o = 0; o < rec.Length; o += 11 + 3 * rec[o + 10]) nrec++;
+        var fc = new Av1CdfCoefContext();
+        Av1CdfDefaults.InitializeCoef(fc, 2);
+        var costs = new AomCoeffCosts();
+        costs.Fill(fc, 3);
+        var flat = Flatten(costs);
+        var work = new int[rec.Length];
+        long rateA = 0, eobA = 0, rateB = 0, eobB = 0;
+        double bestA = double.MaxValue, bestB = double.MaxValue;
+        for (int rep = 0; rep < (Bench ? 12 : 1); rep++)
+        {
+            Array.Copy(rec, work, rec.Length);
+            unsafe { fixed (int* c = flat) fixed (int* r = rec) fixed (int* w = work) bestA = Math.Min(bestA, Native.twin_optimize_txb_file(c, r, nrec, w, &rateA, &eobA)); }
+            Array.Copy(rec, work, rec.Length);
+            rateB = eobB = 0;
+            long t0 = Stopwatch.GetTimestamp();
+            for (int o = 0; o < rec.Length; o += 11 + 3 * rec[o + 10])
+            {
+                int n = rec[o + 10];
+                eobB += AomTxb.OptimizeTxb(costs, rec[o], rec[o + 1], rec[o + 2] == 0 ? 0 : 1, false,
+                    new AomTxbCtx { TxbSkipCtx = rec[o + 3], DcSignCtx = rec[o + 4] }, rec.AsSpan(o + 11, n), work.AsSpan(o + 11 + n, n),
+                    work.AsSpan(o + 11 + 2 * n, n), rec[o + 5], (short)rec[o + 6], (short)rec[o + 7], rec[o + 8], 8, rec[o + 9], false, false, 0,
+                    AomEncodeMb.ScanOf(rec[o], rec[o + 1]), out int rate);
+                rateB += rate;
+            }
+            bestB = Math.Min(bestB, Stopwatch.GetElapsedTime(t0).TotalNanoseconds);
+        }
+        Console.WriteLine($"optimize_txb: {nrec} blocks, ours {bestB / nrec:F1} ns aom {bestA / nrec:F1} ns ratio {bestB / bestA:F2}");
+        await Assert.That($"{eobB} {rateB}").IsEqualTo($"{eobA} {rateA}");
     }
 }
