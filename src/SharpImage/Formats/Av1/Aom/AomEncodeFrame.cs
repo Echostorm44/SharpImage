@@ -368,7 +368,9 @@ internal static partial class AomEncodeFrame
                 numOfMi += 1.0;
             }
         geomMeanOfScale = Math.Pow(geomMeanOfScale, 1.0 / numOfMi);
+        int rdIn = x.Rdmult;
         x.Rdmult = (int)((double)x.Rdmult * geomMeanOfScale + 0.5);
+        AomTrace.Out?.Write($"ssim {miRow} {miCol} bs {bsize} {rdIn} -> {x.Rdmult} mi {cm.MiRows} {cm.MiCols}" + (char)10);
         x.Rdmult = Math.Max(x.Rdmult, 0);
         x.Errorperbit = AomRd.ErrorPerBit(x.Rdmult);
     }
@@ -445,7 +447,15 @@ internal static partial class AomEncodeFrame
         if (sf.part_sf.use_best_rd_for_pruning == 0) bestRd.Invalidate();
 
         if (cm.FrameIsIntraOnly) RdPickIntraModeSb(cpi, x, ref rdCost, bsize, ctx, bestRd.Rdcost);
-        else AomRdoptInter.RdPickInterMode(cpi, x, ref rdCost, bsize, ctx, bestRd.Rdcost);
+        else
+        {
+            AomRdoptInter.RdPickInterMode(cpi, x, ref rdCost, bsize, ctx, bestRd.Rdcost);
+            if (AomTrace.Out != null)
+            {
+                var tm = x.E.Mi0;
+                AomTrace.Out.Write($"inter {x.E.MiRow} {x.E.MiCol} bs {bsize} in {bestRd.Rdcost} -> rate {rdCost.Rate} dist {rdCost.Dist} rd {rdCost.Rdcost} | y {tm.Mode} uv {tm.UvMode} ref {tm.RefFrame0} {tm.RefFrame1} mv {tm.Mv0.Row} {tm.Mv0.Col} skip {tm.SkipTxfm} tx {tm.TxSize} if {tm.InterpFilters:x} mm {tm.MotionMode} rdmult {x.Rdmult}\n");
+            }
+        }
 
         x.Rdmult = origRdmult;
         if (rdCost.Rate == int.MaxValue) rdCost.Rdcost = long.MaxValue;

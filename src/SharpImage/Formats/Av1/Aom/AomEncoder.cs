@@ -112,7 +112,8 @@ internal static partial class AomEncoder
         cpi.Seq = input.Seq;
         bool isInter = input.Mode != ALLINTRA && input.GfFrameType != KEY_FRAME;
         // oxcf->border_in_pixels (av1_get_enc_border_size, no resize)
-        if (input.Mode != ALLINTRA) cpi.BorderInPixels = BlockSizeWide[cm.SbSize] + 32;
+        if (input.ResizeNeeded) cpi.BorderInPixels = 288;   // AOM_BORDER_IN_PIXELS
+        else if (input.Mode != ALLINTRA) cpi.BorderInPixels = BlockSizeWide[cm.SbSize] + 32;
         if (input.Sharpness is int sharp) cpi.Sharpness = sharp;
         if (input.EnableCdef is bool cdef) cpi.CdefControl = cdef ? 1 : 0;   // CDEF_ALL / CDEF_NONE
 

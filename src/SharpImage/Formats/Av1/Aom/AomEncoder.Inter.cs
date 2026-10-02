@@ -34,6 +34,8 @@ internal sealed partial class AomEncodeInput
     public bool RefreshGolden;
     /// <summary>ppi->filter_level (the previous frame's searched loop filter levels).</summary>
     public int[]? PpiFilterLevel;
+    /// <summary>av1_is_resize_needed (a fixed resize mode from AOME_SET_SCALEMODE).</summary>
+    public bool ResizeNeeded;
 }
 
 internal static partial class AomEncoder

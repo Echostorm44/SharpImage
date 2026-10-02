@@ -872,6 +872,14 @@ internal static class AomMcomp
     public static int FullPixelSearch(AomMv startMv, AomFullPelMsParams p, int stepParam, int[]? costList, out AomMv bestMv,
         out AomFullpelMvStats bestMvStats, ref AomMv secondBestMv, bool trackSecond)
     {
+        int r = FullPixelSearchCore(startMv, p, stepParam, costList, out bestMv, out bestMvStats, ref secondBestMv, trackSecond);
+        AomTrace.Out?.Write($"fps start {startMv.Row} {startMv.Col} step {stepParam} meth {p.SearchMethod} lim {p.MvLimits.RowMin} {p.MvLimits.RowMax} {p.MvLimits.ColMin} {p.MvLimits.ColMax} -> {r} mv {bestMv.Row} {bestMv.Col} dist {(uint)bestMvStats.Distortion} sse {(uint)bestMvStats.Sse} second {(trackSecond ? secondBestMv.Row : -9999)} {(trackSecond ? secondBestMv.Col : -9999)}" + (char)10);
+        return r;
+    }
+
+    private static int FullPixelSearchCore(AomMv startMv, AomFullPelMsParams p, int stepParam, int[]? costList, out AomMv bestMv,
+        out AomFullpelMvStats bestMvStats, ref AomMv secondBestMv, bool trackSecond)
+    {
         int bsize = p.Bsize;
         int searchMethod = p.SearchMethod;
         bool runMeshSearch = p.RunMeshSearch;

@@ -458,12 +458,19 @@ internal static class AomSubpel
     public static int FindFractionalMvStep(AomComp cpi, AomSubpelMsParams p, AomMv startMv, AomFullpelMvStats? startStats, out AomMv bestMv,
         out int distortion, out uint sse1, AomMv[]? lastMvSearchList)
     {
-        return cpi.Sf.mv_sf.subpel_search_method switch
+        int m = cpi.Sf.mv_sf.subpel_search_method;
+        int r = m switch
         {
             SUBPEL_TREE => FindBestSubPixelTree(p, startMv, startStats, out bestMv, out distortion, out sse1, lastMvSearchList),
             SUBPEL_TREE_PRUNED => FindBestSubPixelTreePruned(p, startMv, startStats, out bestMv, out distortion, out sse1, lastMvSearchList),
             _ => FindBestSubPixelTreePrunedMore(p, startMv, startStats, out bestMv, out distortion, out sse1, lastMvSearchList),
         };
+        if (AomTrace.Out != null)
+        {
+            string name = m == SUBPEL_TREE ? "av1_find_best_sub_pixel_tree" : m == SUBPEL_TREE_PRUNED ? "av1_find_best_sub_pixel_tree_pruned" : "av1_find_best_sub_pixel_tree_pruned_more";
+            AomTrace.Out.Write($"subpel {name} start {startMv.Row} {startMv.Col} -> {r} mv {bestMv.Row} {bestMv.Col} dist {distortion} sse {sse1} stop {p.ForcedStop}" + (char)10);
+        }
+        return r;
     }
 
     /// <summary>av1_find_best_sub_pixel_tree_pruned_more.</summary>

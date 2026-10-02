@@ -33,7 +33,19 @@ internal sealed partial class AomGqEncoder
     public List<AomGqPacket> Encode(AomGqFrameInput f)
     {
         if (_cfg.LagInFrames != 0) throw new NotImplementedException("lagged encoding");
-        if (f.ScaleModeH != 0 || f.ScaleModeV != 0) SetInternalSize(f.ScaleModeH, f.ScaleModeV);
+        // libavif sets AOME_SET_CQ_LEVEL / AV1E_SET_LOSSLESS when the quality changes; their av1_change_config resets
+        // cm's frame size (and mi grid) to the configured size before the next encode
+        if (_frameNumber > 0 && f.Quantizer != _prevQuantizer)
+        {
+            _miRows = ((_cfg.Height + 7) & ~7) >> 2;
+            _miCols = ((_cfg.Width + 7) & ~7) >> 2;
+        }
+        _prevQuantizer = f.Quantizer;
+        if (f.ScaleModeH != 0 || f.ScaleModeV != 0)
+        {
+            SetInternalSize(f.ScaleModeH, f.ScaleModeV);
+            _resizeModeFixed = true;   // av1_set_internal_size: resize_mode = RESIZE_FIXED (and the TPL model off)
+        }
         var unscaled = MakeSource(f);
         var packets = new List<AomGqPacket>();
         bool forceKf = (f.Flags & AOM_EFLAG_FORCE_KF) != 0;
@@ -73,7 +85,10 @@ internal sealed partial class AomGqEncoder
         return new GfFrame(LF_UPDATE, Math.Max(logGopLength - count, 0), INTER_FRAME, false);
     }
 
-    private int _gfIndex;
+    private int _gfIndex, _prevQuantizer;
+    /// <summary>oxcf->resize_cfg.resize_mode != RESIZE_NONE (av1_is_resize_needed: the encoder border is
+    /// AOM_BORDER_IN_PIXELS).</summary>
+    private bool _resizeModeFixed;
 
     /// <summary>av1_encode_strategy + av1_encode + encode_frame_to_data_rate + av1_post_encode_updates for one frame.</summary>
     private byte[] EncodeOneFrame(AomFrameBuffer unscaled, AomGqFrameInput f, GfFrame gf)
@@ -178,7 +193,7 @@ internal sealed partial class AomGqEncoder
             Seq = _seq, ShowFrame = true, OrderHint = _frameNumber & ((1 << (_seq.OrderHintBitsMinus1 + 1)) - 1), DisplayOrderHint = _frameNumber,
             FrameNumber = _frameNumber, RefBufs = refBufs, RefFrameFlags = refFrameFlags, UseRefFrameMvs = useRefFrameMvs,
             PrimaryRefBuf = primaryRefBuf, FrameProbs = _frameProbs, FilterScaler = filterScaler, PhaseScaler = phaseScaler,
-            LagInFrames = cfg.LagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, RefreshGolden = refreshGolden, PpiFilterLevel = _ppiFilterLevel,
+            LagInFrames = cfg.LagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, RefreshGolden = refreshGolden, PpiFilterLevel = _ppiFilterLevel, ResizeNeeded = _resizeModeFixed,
         };
         if (!isKey)
         {
