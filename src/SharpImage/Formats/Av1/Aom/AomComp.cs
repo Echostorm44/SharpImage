@@ -29,7 +29,16 @@ internal sealed partial class AomComp
     public readonly int[] OptimizeSegArr = new int[8];
     // gf_group update type of the current frame; cpi->ppi->frame_probs.tx_type_probs [FRAME_UPDATE_TYPES][TX_SIZES_ALL][TX_TYPES]
     public int UpdateType = KF_UPDATE;
-    public readonly int[] TxTypeProbs = (int[])DefaultTxTypeProbs.Clone();
+    public int[] TxTypeProbs = (int[])DefaultTxTypeProbs.Clone();
+    // oxcf->mode, the gf group layer depth (capped at 6), the boost index, current_frame.frame_type and the rate control
+    // flags av1_compute_rd_mult reads; oxcf.tune_cfg.tuning as AOM_TUNE_*
+    public int Mode = ALLINTRA, LayerDepth, BoostIndex, FrameType = KEY_FRAME, UseFixedQpOffsets, Tuning = AOM_TUNE_PSNR;
+    public bool IsStatConsumptionStage;
+
+    /// <summary>av1_compute_rd_mult for the frame at a qindex.</summary>
+    public int ComputeRdMult(int qindex)
+        => AllIntra ? AomRd.RdMultKeyFrame(qindex, BitDepth, TuneIq)
+            : AomRd.ComputeRdMult(qindex, BitDepth, UpdateType, LayerDepth, BoostIndex, FrameType, UseFixedQpOffsets, IsStatConsumptionStage, Tuning, Mode);
 
     /// <summary>av1_dc_quant_QTX.</summary>
     public static int DcQuantQtx(int qindex, int delta, int bitDepth)

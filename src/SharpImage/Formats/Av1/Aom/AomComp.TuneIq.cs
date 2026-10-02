@@ -32,17 +32,20 @@ internal sealed partial class AomComp
 
     /// <summary>set_rdmult(cpi, x, -1) (av1_get_cb_rdmult without TPL stats): the rdmult of the superblock's delta qindex.</summary>
     public int SetRdmultDeltaQ(AomMacroblock x)
-        => AomRd.RdMultKeyFrame(Cm.BaseQindex + x.RdmultDeltaQindex + Cm.YDcDeltaQ, Cm.BitDepth, TuneIq);
+        => ComputeRdMult(Cm.BaseQindex + x.RdmultDeltaQindex + Cm.YDcDeltaQ);
 
     /// <summary>av1_set_mb_ssim_rdmult_scaling: per 16x16 luma block the mean of its 8x8 per-pixel variances through
     /// the exponential SSIM model, normalised by the geometric mean over the frame.</summary>
-    public void SetMbSsimRdmultScaling()
+    public void SetMbSsimRdmultScaling() => SetMbSsimRdmultScaling(Source, Cm.MiRows, Cm.MiCols, null);
+
+    /// <summary>av1_set_mb_ssim_rdmult_scaling as libaom runs it before the frame size is set up: over cpi->source (the
+    /// unscaled source) and the mi grid of cm as it is then (the previous frame's size), into the persistent factor
+    /// buffer (entries past this frame's grid keep earlier frames' values).</summary>
+    public void SetMbSsimRdmultScaling(AomFrameBuffer src, int miRows, int miCols, double[]? buffer)
     {
-        var cm = Cm;
-        var src = Source;
         const int numMiW = 4, numMiH = 4;   // BLOCK_16X16
-        int numCols = (cm.MiCols + numMiW - 1) / numMiW, numRows = (cm.MiRows + numMiH - 1) / numMiH;
-        var f = SsimRdmultScalingFactors = new double[numRows * numCols];
+        int numCols = (miCols + numMiW - 1) / numMiW, numRows = (miRows + numMiH - 1) / numMiH;
+        var f = SsimRdmultScalingFactors = buffer ?? new double[numRows * numCols];
         double logSum = 0.0;
         byte[] buf = src.Buffers[0];
         int yOff = src.Offsets[0], yStride = src.Strides[0];
@@ -51,8 +54,8 @@ internal sealed partial class AomComp
             {
                 double var = 0.0, numOfVar = 0.0;
                 int index = row * numCols + col;
-                for (int miRow = row * numMiH; miRow < cm.MiRows && miRow < (row + 1) * numMiH; miRow += 2)
-                    for (int miCol = col * numMiW; miCol < cm.MiCols && miCol < (col + 1) * numMiW; miCol += 2)
+                for (int miRow = row * numMiH; miRow < miRows && miRow < (row + 1) * numMiH; miRow += 2)
+                    for (int miCol = col * numMiW; miCol < miCols && miCol < (col + 1) * numMiW; miCol += 2)
                     {
                         // av1_get_perpixel_variance_facade(BLOCK_8X8, AOM_PLANE_Y): variance vs. AV1_VAR_OFFS, rounded per pixel
                         if (src.Hbd)
@@ -70,6 +73,6 @@ internal sealed partial class AomComp
                 logSum += Math.Log(var);
             }
         logSum = Math.Exp(logSum / (double)(numRows * numCols));
-        for (int i = 0; i < f.Length; i++) f[i] /= logSum;
+        for (int i = 0; i < numRows * numCols; i++) f[i] /= logSum;
     }
 }

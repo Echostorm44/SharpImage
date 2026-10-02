@@ -62,14 +62,17 @@ internal static class AomQuantSetup
         }
 
         // the QM formulas: tune IQ uses aom_get_qmlevel_allintra for luma and aom_get_qmlevel_444_chroma for 4:4:4 chroma
-        Func<int, int, int, int> luma = QmLevelAllintra;
-        Func<int, int, int, int> chroma = cpi.TuneIq && cm.SsX == 0 && cm.SsY == 0 ? QmLevel444Chroma : QmLevelAllintra;
+        Func<int, int, int, int> luma = cpi.TuneIq || cpi.AllIntra ? QmLevelAllintra : QmLevel;
+        Func<int, int, int, int> chroma = cpi.TuneIq && cm.SsX == 0 && cm.SsY == 0 ? QmLevel444Chroma : cpi.TuneIq || cpi.AllIntra ? QmLevelAllintra : QmLevel;
         cm.QmLevelY = luma(cm.BaseQindex, cpi.QmMinLevel, cpi.QmMaxLevel);
         cm.QmLevelU = chroma(cm.BaseQindex + cm.UAcDeltaQ, cpi.QmMinLevel, cpi.QmMaxLevel);
         cm.QmLevelV = cm.QmLevelU;   // separate_uv_delta_q is 0
         // encode_strategy.c: cm->quant_params.using_qmatrix = oxcf->q_cfg.using_qm
         cm.UsingQmatrix = cpi.UsingQm;
     }
+
+    /// <summary>aom_get_qmlevel.</summary>
+    internal static int QmLevel(int qindex, int first, int last) => first + (qindex * (last + 1 - first)) / 256;
 
     /// <summary>aom_get_qmlevel_allintra.</summary>
     internal static int QmLevelAllintra(int qindex, int first, int last)

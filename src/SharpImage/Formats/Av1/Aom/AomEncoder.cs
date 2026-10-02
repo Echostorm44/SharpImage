@@ -42,6 +42,30 @@ internal sealed class AomEncodeInput
     /// uniform tile layout; libaom raises it to what MAX_TILE_WIDTH / MAX_TILE_AREA require and caps it at the
     /// superblock counts.</summary>
     public int TileColumns, TileRows;
+
+    // ---- good-quality / real-time (AomGqEncoder) frame parameters; the defaults are the all-intra still's
+    /// <summary>oxcf->mode: ALLINTRA (the still), GOOD or REALTIME.</summary>
+    public int Mode = ALLINTRA;
+    /// <summary>The (scaled, border-extended) source frame cpi->source; null: built from Planes / Planes16.</summary>
+    public AomFrameBuffer? SourceFrame;
+    /// <summary>cpi->unfiltered_source (the screen content detection's input); null: the source.</summary>
+    public AomFrameBuffer? UnfilteredSource;
+    /// <summary>gf_group update_type / frame_type / layer_depth of the frame.</summary>
+    public int UpdateType = KF_UPDATE, GfFrameType = KEY_FRAME, LayerDepth;
+    /// <summary>av1_compute_rd_mult inputs: min(15, p_rc.gfu_boost / 100), q_cfg.use_fixed_qp_offsets,
+    /// is_stat_consumption_stage.</summary>
+    public int BoostIndex, UseFixedQpOffsets;
+    public bool IsStatConsumptionStage;
+    /// <summary>seq_params->sb_size chosen at init (0: the all-intra choice).</summary>
+    public int SbSize;
+    /// <summary>cpi->ppi->frame_probs.tx_type_probs, carried across frames (null: the defaults).</summary>
+    public int[]? TxTypeProbs;
+    /// <summary>The sequence's tool flags (persistent; SeqParamsLocked after the first frame); null: per frame.</summary>
+    public AomSpeedFeatureSeqFlags? SeqFlags;
+    /// <summary>The SSIM rdmult scaling as libaom computes it (source, mi grid size, persistent buffer); null: this frame's.</summary>
+    public AomFrameBuffer? SsimSource;
+    public int SsimMiRows, SsimMiCols;
+    public double[]? SsimBuffer;
 }
 
 // Port of libaom 3.14.1 av1_encode_frame / encode_frame_internal / encode_tiles / av1_encode_tile / encode_sb_row /
@@ -61,13 +85,19 @@ internal static partial class AomEncoder
         bool deltaqVarianceBoost = tuneIq && !off.Contains('d');
         int bd = input.BitDepth;
         var cm = new AomCommon(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome,
-            deltaqVarianceBoost ? BLOCK_64X64 : SelectSbSize(input.Width, input.Height, input.Speed), bd);   // Variance Boost: 64x64 SBs
+            input.SbSize != 0 ? input.SbSize : deltaqVarianceBoost ? BLOCK_64X64 : SelectSbSize(input.Width, input.Height, input.Speed), bd);   // Variance Boost: 64x64 SBs
         cm.BaseQindex = input.BaseQindex;
         // av1_update_frame_size: set_tile_info
         cm.SetTileInfo(input.TileColumns, input.TileRows);
         var cpi = new AomComp { Cm = cm, Speed = input.Speed, AllowScreenContentTools = input.AllowScreenContentTools,
             UseScreenContentTools = input.UseScreenContentTools, AllowIntrabc = input.AllowIntrabc, SbSize = cm.SbSize, Tune = tune,
-            BitDepth = bd, UseHighbitdepth = bd > 8 };
+            BitDepth = bd, UseHighbitdepth = bd > 8, AllIntra = input.Mode == ALLINTRA, Mode = input.Mode };
+        if (input.Mode != ALLINTRA)
+        {
+            // av1_cx_iface.c defaults outside all-intra: enable_cdef CDEF_ALL, qm_min / qm_max DEFAULT_QM_FIRST / LAST
+            cpi.CdefControl = 1;
+            cpi.QmMinLevel = DEFAULT_QM_FIRST; cpi.QmMaxLevel = DEFAULT_QM_LAST;
+        }
         if (tuneIq)
         {
             cpi.UsingQm = !off.Contains('q');
@@ -83,6 +113,9 @@ internal static partial class AomEncoder
         if (input.EnableCdef is bool cdef) cpi.CdefControl = cdef ? 1 : 0;   // CDEF_ALL / CDEF_NONE
 
         // the source frame with libaom's replicated borders (the lookahead copy runs aom_extend_frame_borders)
+        if (input.SourceFrame != null) cpi.Source = input.SourceFrame;
+        else
+        {
         cpi.Source = new AomFrameBuffer(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome, bd);
         for (int p = 0; p < cm.NumPlanes; p++)
         {
@@ -101,11 +134,12 @@ internal static partial class AomEncoder
             ExtendPlane(dst, cpi.Source.Offsets[p], cpi.Source.Strides[p], w, h, p == 0 ? AomFrameBuffer.Border : AomFrameBuffer.Border >> input.SsX,
                 p == 0 ? AomFrameBuffer.Border : AomFrameBuffer.Border >> input.SsY);
         }
+        }
 
         // av1_set_screen_content_options (anti-aliasing aware detection; the fast variant from speed 3)
         // (non-RD pick mode without the hybrid intra search, speed 9: screen content detection is disabled and the
         // tools stay off)
-        bool nonrdNoHybrid = input.Speed >= 9;
+        bool nonrdNoHybrid = input.Mode == ALLINTRA && input.Speed >= 9;
         if (input.DetectScreenContent && nonrdNoHybrid)
         {
             input.AllowScreenContentTools = input.UseScreenContentTools = input.AllowIntrabc = input.IsScreenContentType = false;
@@ -113,7 +147,11 @@ internal static partial class AomEncoder
         }
         else if (input.DetectScreenContent)
         {
-            var (sct, ibc, isSc) = EstimateScreenContent(cpi.Source, input.Speed >= 3);
+            // screen_detection_mode: ANTIALIASING_AWARE for all-intra and tune iq, STANDARD otherwise; on
+            // cpi->unfiltered_source (sf.hl_sf.screen_detection_mode2_fast_detection: all-intra speed >= 3)
+            var unfiltered = input.UnfilteredSource ?? cpi.Source;
+            var (sct, ibc, isSc) = input.Mode == ALLINTRA || tuneIq ? EstimateScreenContent(unfiltered, input.Mode == ALLINTRA && input.Speed >= 3)
+                : EstimateScreenContentStandard(unfiltered);
             input.AllowScreenContentTools = sct;
             input.UseScreenContentTools = sct;
             input.AllowIntrabc = ibc;
@@ -134,13 +172,15 @@ internal static partial class AomEncoder
         {
             Width = input.Width, Height = input.Height, AllowScreenContentTools = input.AllowScreenContentTools,
             UseScreenContentTools = input.UseScreenContentTools, IsScreenContentType = input.IsScreenContentType, BaseQindex = input.BaseQindex,
-            NumWorkers = cpi.NumWorkers,
+            NumWorkers = cpi.NumWorkers, Mode = input.Mode, Sharpness = cpi.Sharpness, UpdateType = input.UpdateType, GfFrameType = input.GfFrameType,
+            FrameType = input.GfFrameType == KEY_FRAME ? KEY_FRAME : INTER_FRAME,
+            Tuning = tune switch { AomTune.Iq => AOM_TUNE_IQ, AomTune.Ssim => AOM_TUNE_SSIM, _ => AOM_TUNE_PSNR },
         };
         // avifenc --lossless / quality 100 (quantizer 0): libavif sets rc_min_quantizer = rc_max_quantizer = 0 and
         // AV1E_SET_LOSSLESS, so oxcf.rc_cfg.best_allowed_q = worst_allowed_q = 0 (is_lossless_requested)
         if (input.BaseQindex == 0) { sfIn.BestAllowedQ = 0; sfIn.WorstAllowedQ = 0; }
         sfIn.UseHighBitDepth = bd > 8;
-        var seqFlags = new AomSpeedFeatureSeqFlags { enable_restoration = input.EnableRestoration ? 1 : 0 };
+        var seqFlags = input.SeqFlags ?? new AomSpeedFeatureSeqFlags { enable_restoration = input.EnableRestoration ? 1 : 0 };
         cpi.Sf.SetForFrame(sfIn, seqFlags, cpi.WinnerModeParams, input.Speed);
         cpi.EnableRestoration = seqFlags.enable_restoration != 0;
         input.SfOverride?.Invoke(cpi.Sf);
@@ -157,7 +197,12 @@ internal static partial class AomEncoder
         cm.Fc = new Av1CdfContext();
         int qCtxQ = input.BaseQindex;
         Av1CdfDefaults.InitializeDefault(cm.Fc, qCtxQ <= 20 ? 0 : qCtxQ <= 60 ? 1 : qCtxQ <= 120 ? 2 : 3);   // get_q_ctx
-        cpi.RdRdmult = AomRd.RdMultKeyFrame(input.BaseQindex + cm.YDcDeltaQ, bd, cpi.TuneIq);
+        cpi.UpdateType = input.UpdateType; cpi.LayerDepth = Math.Min(input.LayerDepth, 6); cpi.BoostIndex = input.BoostIndex;
+        cpi.FrameType = input.GfFrameType == KEY_FRAME ? KEY_FRAME : INTER_FRAME;
+        cpi.UseFixedQpOffsets = input.UseFixedQpOffsets; cpi.IsStatConsumptionStage = input.IsStatConsumptionStage;
+        cpi.Tuning = sfIn.Tuning;
+        if (input.TxTypeProbs != null) cpi.TxTypeProbs = input.TxTypeProbs;
+        cpi.RdRdmult = cpi.ComputeRdMult(input.BaseQindex + cm.YDcDeltaQ);
 
         // av1_init_tile_data: allow_update_cdf
         cpi.AllowUpdateCdf = !cpi.DisableCdfUpdate && !DelayWaitForTopRightSb(cpi);
@@ -184,7 +229,11 @@ internal static partial class AomEncoder
             cpi.MbmiExtFrameBase = new AomMbmiExtFrame?[cm.MiGridBase.Length];
 
         // encoder.c: av1_set_mb_ssim_rdmult_scaling (tune SSIM / IQ / SSIMULACRA2)
-        if (cpi.SsimRdmult) cpi.SetMbSsimRdmultScaling();
+        if (cpi.SsimRdmult)
+        {
+            if (input.SsimSource != null) cpi.SetMbSsimRdmultScaling(input.SsimSource, input.SsimMiRows, input.SsimMiCols, input.SsimBuffer);
+            else cpi.SetMbSsimRdmultScaling();
+        }
 
         // encode_frame_internal: delta q resolution and presence (Variance Boost: delta_q_res by the base qindex)
         cpi.DeltaQRes = 0;

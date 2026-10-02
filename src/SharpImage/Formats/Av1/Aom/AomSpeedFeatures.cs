@@ -468,6 +468,10 @@ internal sealed class AomSpeedFeatureInputs
     public int CompressorStage = ENCODE_STAGE;      // cpi->compressor_stage
     public int GfCbrBoostPct;                       // oxcf.rc_cfg.gf_cbr_boost_pct
     public int Tuning = AOM_TUNE_PSNR;              // oxcf.tune_cfg.tuning (not read on the all-intra path)
+    public int Mode = ALLINTRA;                     // oxcf.mode (GOOD / ALLINTRA / REALTIME)
+    public int Sharpness;                           // oxcf.algo_cfg.sharpness
+    public int GfFrameType = KEY_FRAME;             // ppi->gf_group.frame_type[cpi->gf_frame_index]
+    public int UnderShootPct = 25, OverShootPct = 25; // oxcf.rc_cfg.under_shoot_pct / over_shoot_pct
 
     public bool FrameIsIntraOnly => FrameType == KEY_FRAME || FrameType == INTRA_ONLY_FRAME;   // frame_is_intra_only
     public bool IsLosslessRequested => BestAllowedQ == 0 && WorstAllowedQ == 0;             // is_lossless_requested
@@ -1410,7 +1414,9 @@ internal sealed partial class AomSpeedFeatures
     public void SetFramesizeDependent(AomSpeedFeatureInputs cpi, AomSpeedFeatureSeqFlags seq, int speed)
     {
         var sf = this;
-        SetAllintraFramesizeDependent(cpi, sf, speed);
+        if (cpi.Mode == GOOD) SetGoodFramesizeDependent(cpi, sf, speed);
+        else if (cpi.Mode == REALTIME) SetRtFramesizeDependent(cpi, sf, speed);
+        else SetAllintraFramesizeDependent(cpi, sf, speed);
 
         if (!seq.SeqParamsLocked)
         {
@@ -1448,7 +1454,9 @@ internal sealed partial class AomSpeedFeatures
         InitLpfSf(sf.lpf_sf);
         InitRtSf(sf.rt_sf);
 
-        SetAllintraFramesizeIndependent(cpi, sf, speed);
+        if (cpi.Mode == GOOD) SetGoodFramesizeIndependent(cpi, sf, speed);
+        else if (cpi.Mode == REALTIME) SetRtFramesizeIndependent(cpi, sf, speed);
+        else SetAllintraFramesizeIndependent(cpi, sf, speed);
 
         if (!oxcf.EnableTxSizeSearch && sf.rt_sf.use_nonrd_pick_mode == 0)
             sf.winner_mode_sf.tx_size_search_level = 3;
@@ -1529,8 +1537,20 @@ internal sealed partial class AomSpeedFeatures
         bool is_1440p_or_larger = minDim >= 1440;
         bool is_arf2_bwd_type = cpi.UpdateType == INTNL_ARF_UPDATE;
 
-        // (oxcf->mode == ALLINTRA)
-        if (base_qindex <= 140) sf.lpf_sf.zero_low_cdef_strengths = true;
+        if (cpi.Mode == ALLINTRA || cpi.Tuning == AOM_TUNE_IQ || cpi.Tuning == AOM_TUNE_SSIMULACRA2)
+        {
+            if (base_qindex <= 140) sf.lpf_sf.zero_low_cdef_strengths = true;
+        }
+
+        if (cpi.Mode == REALTIME)
+        {
+            if (speed >= 6)
+            {
+                int qindex_thresh_rt = boosted ? 190 : (is_720p_or_larger ? 120 : 150);
+                sf.part_sf.adjust_var_based_rd_partitioning = frame_is_intra_only ? 0 : base_qindex > qindex_thresh_rt ? 1 : 0;
+            }
+            return;
+        }
 
         if (speed == 0)
         {
@@ -1728,7 +1748,7 @@ internal sealed partial class AomSpeedFeatures
                 sf.lpf_sf.min_lr_unit_size = RESTORATION_UNITSIZE_MAX >> 1;
         }
 
-        if (speed >= 1)   // speed >= 3 || (oxcf->mode == ALLINTRA && speed >= 1)
+        if (speed >= 3 || (cpi.Mode == ALLINTRA && speed >= 1))
         {
             // At this speed, a full search is too expensive. Instead, pick a single size based on size and qindex.
             int qindex_thresh = 96;

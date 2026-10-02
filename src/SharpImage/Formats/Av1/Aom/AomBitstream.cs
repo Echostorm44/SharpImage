@@ -23,7 +23,7 @@ internal sealed class AomSequenceConfig
 // writer for one shown all-intra key frame of a still picture (reduced still picture header, uniform tiles in one tile
 // group, no segmentation / delta q / CDEF / superres / film grain), plus the temporal delimiter av1_cx_iface.c
 // prepends: the bytes libaom's aom_codec_get_cx_data returns for the frame.
-internal static class AomBitstream
+internal static partial class AomBitstream
 {
     private const int OBU_SEQUENCE_HEADER = 1, OBU_TEMPORAL_DELIMITER = 2, OBU_FRAME = 6;
     private const int MAX_MIB_MASK = 31;
@@ -112,12 +112,14 @@ internal static class AomBitstream
         public readonly AomComp Cpi;
         public readonly AomCommon Cm;
         public readonly AomSequenceConfig SeqCfg;
-        public readonly int Profile, SeqLevelIdx, NumBitsWidth, NumBitsHeight;
-        public readonly bool EnableFilterIntra, EnableIntraEdgeFilter, EnableRestoration, EnableCdef;
-        public readonly bool AllowScreenContentTools, AllowIntrabc, CodedLossless, AllLossless;
-        public readonly int TxMode, ReducedTxSetUsed;
+        public int Profile, SeqLevelIdx, NumBitsWidth, NumBitsHeight;
+        public bool EnableFilterIntra, EnableIntraEdgeFilter, EnableRestoration, EnableCdef;
+        public bool AllowScreenContentTools, AllowIntrabc, CodedLossless, AllLossless;
+        public int TxMode, ReducedTxSetUsed;
         public readonly AomLoopFilterParams Lf;
         public readonly AomRestorationInfo[]? Rst;
+        /// <summary>The good-quality / real-time frame header (null for the all-intra still).</summary>
+        public AomGqFrameHeader? Gq;
         public readonly int[] FrameRestorationType = new int[3];
 
         public FrameState(AomComp cpi, AomSequenceConfig seqCfg)

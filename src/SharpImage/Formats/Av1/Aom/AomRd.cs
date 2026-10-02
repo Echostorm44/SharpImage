@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
 
@@ -34,6 +35,41 @@ internal static class AomRd
         }
         if (bitDepth == 10) rdmult = (rdmult + 8) >> 4;
         else if (bitDepth == 12) rdmult = (rdmult + 128) >> 8;
+        return rdmult > 0 ? (int)Math.Min(rdmult, int.MaxValue) : 1;
+    }
+
+    private static readonly int[] RdBoostFactor = { 64, 32, 32, 32, 24, 16, 12, 12, 8, 8, 4, 4, 2, 2, 1, 0 };
+    private static readonly int[] RdLayerDepthFactor = { 160, 160, 160, 160, 192, 208, 224 };
+
+    /// <summary>av1_compute_rd_mult_based_on_qindex.</summary>
+    internal static int ComputeRdMultBasedOnQindex(int bitDepth, int updateType, int qindex, int tuning, int mode)
+    {
+        int bdIdx = bitDepth == 8 ? 0 : bitDepth == 10 ? 1 : 2;
+        int q = Av1Tables.DequantTable[bdIdx, qindex, 0];
+        long rdmult = (long)q * q;
+        if (updateType == KF_UPDATE) rdmult = (long)((double)rdmult * (3.3 + 0.0015 * q));
+        else if (updateType == GF_UPDATE || updateType == ARF_UPDATE) rdmult = (long)((double)rdmult * (3.25 + 0.0015 * q));
+        else rdmult = (long)((double)rdmult * (3.2 + 0.0015 * q));
+        if (tuning == AOM_TUNE_IQ || tuning == AOM_TUNE_SSIMULACRA2)
+        {
+            int weight = mode == REALTIME ? 32 : Math.Clamp(((255 - qindex) * 3) / 4, 0, 72) + 128;
+            rdmult = (long)((double)rdmult * weight / 128.0);
+        }
+        if (bitDepth == 10) rdmult = (rdmult + 8) >> 4;
+        else if (bitDepth == 12) rdmult = (rdmult + 128) >> 8;
+        return rdmult > 0 ? (int)Math.Min(rdmult, int.MaxValue) : 1;
+    }
+
+    /// <summary>av1_compute_rd_mult.</summary>
+    internal static int ComputeRdMult(int qindex, int bitDepth, int updateType, int layerDepth, int boostIndex, int frameType,
+        int useFixedQpOffsets, bool isStatConsumptionStage, int tuning, int mode)
+    {
+        long rdmult = ComputeRdMultBasedOnQindex(bitDepth, updateType, qindex, tuning, mode);
+        if (isStatConsumptionStage && useFixedQpOffsets == 0 && frameType != KEY_FRAME)
+        {
+            rdmult = (rdmult * RdLayerDepthFactor[layerDepth]) >> 7;
+            rdmult += (rdmult * RdBoostFactor[boostIndex]) >> 7;
+        }
         return rdmult > 0 ? (int)Math.Min(rdmult, int.MaxValue) : 1;
     }
 
