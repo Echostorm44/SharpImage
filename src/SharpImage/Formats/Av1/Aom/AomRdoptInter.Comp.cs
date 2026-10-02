@@ -212,10 +212,12 @@ internal static partial class AomRdoptInter
             AomMvPred.FindMvRefs(cm, xd, mbmi, refFrameType, ext);
             AomMvPred.CopyUsableRefMvStackAndWeight(xd, ext, refFrameType);
         }
-        var curMv = new AomMv[2];
-        if (!BuildCurMv(curMv, thisMode, cm, x, false)) return;
+        // build_cur_mv(mbmi->mv, ...): writes the block's mvs in place, also when it fails
+        var curMv = new[] { mbmi.Mv0, mbmi.Mv1 };
+        bool built = BuildCurMv(curMv, thisMode, cm, x, false);
         mbmi.Mv0 = curMv[0];
         mbmi.Mv1 = curMv[1];
+        if (!built) return;
         mbmi.UseFilterIntra = 0;
         mbmi.InterintraMode = II_DC_PRED - 1;
         mbmi.CompGroupIdx = 0;

@@ -1176,6 +1176,7 @@ internal static partial class AomRdoptInter
                     rdStatsY.Rate += mc.SkipTxfmCost[skipCtx * 2 + 0];
                 }
                 int thisRate = rdStats.Rate + rdStatsY.Rate + rdStatsUv.Rate - winnerRateY - winnerRateUv;
+                AomTrace.Out?.Write($"rwm {xd.MiRow} {xd.MiCol} r {rdStats.Rate} y {rdStatsY.Rate} uv {rdStatsUv.Rate} wy {winnerRateY} wuv {winnerRateUv} sc {AomTxSearch.SkipTxfmContext(xd)} this {thisRate}" + (char)10);
                 long thisRd = AomRd.RdCost(x.Rdmult, thisRate, rdStatsY.Dist + rdStatsUv.Dist);
                 if (bestRd > thisRd)
                 {

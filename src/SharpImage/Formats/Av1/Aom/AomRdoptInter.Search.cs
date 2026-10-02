@@ -89,7 +89,9 @@ internal static partial class AomRdoptInter
         }
         for (int i = 0; i < (isComp ? 2 : 1); ++i)
         {
-            if (!GetThisMv(out var thisMv, thisMode, i, mbmi.RefMvIdx, skipRepeatedRefMv, mbmi.RefFrame0, mbmi.RefFrame1, x.MbmiExtInter)) return false;
+            // ret = get_this_mv(...): reassigned per reference, so only the last reference's clamp_and_check_mv result counts
+            ret = GetThisMv(out var thisMv, thisMode, i, mbmi.RefMvIdx, skipRepeatedRefMv, mbmi.RefFrame0, mbmi.RefFrame1, x.MbmiExtInter);
+            if (!ret) return false;
             int singleMode = AomInter.GetSingleMode(thisMode, i);
             if (singleMode == NEWMV)
             {

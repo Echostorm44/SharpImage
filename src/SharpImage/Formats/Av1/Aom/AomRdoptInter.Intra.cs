@@ -242,6 +242,7 @@ internal static partial class AomRdoptInter
         intraRdStats.Dist = bestIntraRdStatsY.Dist + intraRdStatsUv.Dist;
         int skipCtx = AomTxSearch.SkipTxfmContext(xd);
         intraRdStats.Rate += mc.SkipTxfmCost[skipCtx * 2 + 0];
+        AomTrace.Out?.Write($"ira {xd.MiRow} {xd.MiCol} bs {bsize} y {bestIntraRdStatsY.Rate} mcy {bestModeCostY} uv {intraRdStatsUv.Rate} uvm {(numPlanes > 1 && xd.IsChromaRef ? AomIntraModeSearch.IntraModeInfoCostUv(cpi, x, mbmi, bsize, mc.IntraUvModeCost[(AomCfl.IsCflAllowed(xd) * 13 + mode) * 14 + mbmi.UvMode]) : 0)} sk {mc.SkipTxfmCost[skipCtx * 2 + 0]} tot {intraRdStats.Rate}" + (char)10);
         long thisRd = AomRd.RdCost(x.Rdmult, intraRdStats.Rate, intraRdStats.Dist);
         if (thisRd < st.BestIntraRd)
         {

@@ -46,7 +46,7 @@ internal sealed partial class AomComp
 {
     public AomFrameProbs FrameProbs = new();
     /// <summary>oxcf->motion_mode_cfg.allow_warped_motion; cpi->mv_stats.valid.</summary>
-    public bool AllowWarpedMotionCfg = true, MvStatsValid;
+    public bool AllowWarpedMotionCfg = true;
     /// <summary>ppi->filter_level[0..1], filter_level_u, filter_level_v (the previous frame's searched levels).</summary>
     public int[] PpiFilterLevel = new int[4];
     /// <summary>The largest mv component written (td->max_mv_magnitude over the tiles).</summary>

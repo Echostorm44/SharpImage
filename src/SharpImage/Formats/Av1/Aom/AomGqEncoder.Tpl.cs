@@ -399,6 +399,7 @@ internal sealed partial class AomGqEncoder
                     }
                 AomTrace.Out.Write($"tpl {f} {t.BaseRdmult} {h1:x} {h2:x} {h3:x}" + (char)10);
             }
+        _cmFrameType = fp.FrameType;   // cm->current_frame.frame_type = frame_params->frame_type
         if (!approxGopEval) _tpl.Ready = true;
         if (gf.MaxLayerDepthAllowed == 0) return 1;
         if (gopEval == 0) return 0;

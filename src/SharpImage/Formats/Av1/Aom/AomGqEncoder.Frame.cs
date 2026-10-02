@@ -325,6 +325,7 @@ internal sealed partial class AomGqEncoder
     private int _curQindex, _curFrameType;
     private bool _curShowExisting;
     private int _prevBaseQindex;
+    private readonly AomMvStats _mvStats = new();   // ppi->mv_stats
     /// <summary>cm->current_frame.frame_type (av1_encode sets it; av1_tpl_preload_rc_estimate overwrites it).</summary>
     private int _cmFrameType = KEY_FRAME;
     private FrameParams _curRefresh = new();
@@ -934,7 +935,7 @@ internal sealed partial class AomGqEncoder
             LagInFrames = _lagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, RefreshGolden = fp.RefreshGolden,
             PpiFilterLevel = _ppiFilterLevel, ResizeNeeded = _resizeModeFixed, IsSrcFrameAltRef = _rc.IsSrcFrameAltRef != 0,
             GfFrameIndex = _gfFrameIndex, GfArfIndex = gf.ArfIndex, CurPyramidLevel = pyramidLevel, ValidGmModelFound = _validGmModelFound,
-            MvSearchState = _maxMvMagnitude, SetMvParamsEarly = _mvSearchParamsDue, PrevBaseQindex = _prevBaseQindex,
+            MvSearchState = _maxMvMagnitude, SetMvParamsEarly = _mvSearchParamsDue, PrevBaseQindex = _prevBaseQindex, MvStats = _mvStats,
         };
         _mvSearchParamsDue = false;
         if (!isKey)
@@ -948,6 +949,13 @@ internal sealed partial class AomGqEncoder
         _seqFlags.SeqParamsLocked = _seqParamsLocked;
         var (cpi, x) = AomEncoder.EncodeFrame(input);
         _lastCpi = cpi;
+        // encode_with_recode_loop: reset the mv stats (an intra / overlay frame interrupts them), then gather them for
+        // the next frame
+        if (cpi.Sf.hl_sf.recode_loop != DISALLOW_RECODE)
+        {
+            if (_mvStats.Valid) _mvStats.Clear();
+            if (cpi.Sf.hl_sf.high_precision_mv_usage == LAST_MV_DATA && AomMvPrec.FrameAllowsSmartMv(cpi)) AomMvPrec.CollectMvStats(cpi, _mvStats, qindex);
+        }
         _prevBaseQindex = cpi.Cm.BaseQindex;   // av1_set_quantizer: max(delta_q_present_flag, q) (q 0 has no delta q)
         if (isKey) { _sct = cpi.AllowScreenContentTools; _isScreenContentType = input.IsScreenContentType; }
         if (!_seqParamsLocked)

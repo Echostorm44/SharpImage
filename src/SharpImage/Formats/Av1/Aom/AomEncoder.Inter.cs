@@ -146,12 +146,12 @@ internal static partial class AomEncoder
     {
         var cm = cpi.Cm;
         var sf = cpi.Sf;
-        // av1_pick_and_set_high_precision_mv (no mv stats yet)
+        // av1_pick_and_set_high_precision_mv (cpi->mv_stats: collected by the previous frame's recode-loop encode)
         int qindex = cm.BaseQindex;
         bool useHp = qindex < 128;   // HIGH_PRECISION_MV_QTHRESH
         if (sf.hl_sf.high_precision_mv_usage == QTR_ONLY) useHp = false;
-        else if (sf.hl_sf.high_precision_mv_usage == LAST_MV_DATA && cpi.MvStatsValid)
-            throw new NotImplementedException("get_smart_mv_prec");
+        else if (sf.hl_sf.high_precision_mv_usage == LAST_MV_DATA && AomMvPrec.FrameAllowsSmartMv(cpi) && input.MvStats is { Valid: true } mvStats)
+            useHp = AomMvPrec.GetSmartMvPrec(cpi, mvStats, qindex);
         cm.AllowHighPrecisionMv = useHp && !cm.CurFrameForceIntegerMv;
 
         // av1_setup_frame_buf_refs, enforce_max_ref_frames, set_rel_frame_dist, av1_setup_frame_sign_bias
