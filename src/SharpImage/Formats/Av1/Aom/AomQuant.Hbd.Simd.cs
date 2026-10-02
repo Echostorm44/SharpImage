@@ -7,19 +7,21 @@ using System.Runtime.Intrinsics.X86;
 namespace SharpImage.Formats.Av1;
 
 // The high bit depth quantizers of AomQuantizeHbd in 8 int32 lanes (av1_highbd_quantize_fp_avx2 /
-// aom_highbd_quantize_b_avx2 run 8 lanes too): the same per-coefficient arithmetic, the 64-bit products formed in
-// doubles (exact below 2^53, the scaling by 2^-k and floor exact), the eob as the largest iscan + 1 of a nonzero lane.
+// aom_highbd_quantize_b_avx2 run 8 lanes too): the same per-coefficient arithmetic, the 64-bit products formed by
+// vpmuldq as the AVX2 kernels do, the eob as the largest iscan + 1 of a nonzero lane.
 internal static partial class AomQuantizeHbdSimd
 {
     internal static bool Supported => Avx2.IsSupported;
 
+    // the low 32 bits of (a * b) >> sh per lane, the products in 64 bits (vpmuldq on the even and the odd lanes; a
+    // logical and an arithmetic shift agree on those bits for sh <= 32)
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector256<int> FloorMulShift(Vector256<int> a, Vector256<int> b, double scale)
+    private static Vector256<int> FloorMulShift(Vector256<int> a, Vector256<int> b, int sh)
     {
-        var s = Vector256.Create(scale);
-        var lo = Avx.RoundToNegativeInfinity(Avx.Multiply(Avx.Multiply(Avx.ConvertToVector256Double(a.GetLower()), Avx.ConvertToVector256Double(b.GetLower())), s));
-        var hi = Avx.RoundToNegativeInfinity(Avx.Multiply(Avx.Multiply(Avx.ConvertToVector256Double(a.GetUpper()), Avx.ConvertToVector256Double(b.GetUpper())), s));
-        return Vector256.Create(Avx.ConvertToVector128Int32WithTruncation(lo), Avx.ConvertToVector128Int32WithTruncation(hi));
+        var even = Vector256.ShiftRightLogical(Avx2.Multiply(a, b), sh).AsInt32();
+        var odd = Vector256.ShiftLeft(Avx2.Multiply(Vector256.ShiftRightLogical(a.AsInt64(), 32).AsInt32(),
+            Vector256.ShiftRightLogical(b.AsInt64(), 32).AsInt32()), 32 - sh).AsInt32();
+        return Avx2.Blend(even, odd, 0b10101010);
     }
 
     /// <summary>AomQuantizeHbd.QuantizeFp vectorised (n a multiple of 8). Returns the eob.</summary>
@@ -34,7 +36,7 @@ internal static partial class AomQuantizeHbdSimd
         var rnd = Vector256.ConditionalSelect(lane0, Vector256.Create(r0), Vector256.Create(r1));
         var q = Vector256.ConditionalSelect(lane0, Vector256.Create((int)(ushort)quant0), Vector256.Create((int)(ushort)quant1));
         var dqv = Vector256.ConditionalSelect(lane0, Vector256.Create((int)(ushort)dequant0), Vector256.Create((int)(ushort)dequant1));
-        double scale = 1.0 / (1 << (16 - logScale));
+        int sh = 16 - logScale;
         ref int c0 = ref MemoryMarshal.GetReference(coeff);
         ref int q0 = ref MemoryMarshal.GetReference(qcoeff);
         ref int d0 = ref MemoryMarshal.GetReference(dqcoeff);
@@ -45,7 +47,7 @@ internal static partial class AomQuantizeHbdSimd
             if (i == 8) { rnd = Vector256.Create(r1); q = Vector256.Create((int)(ushort)quant1); dqv = Vector256.Create((int)(ushort)dequant1); }
             var c = Vector256.LoadUnsafe(ref c0, (nuint)i);
             var abs = Vector256.Abs(c);
-            var lvl = FloorMulShift(abs + rnd, q, scale);
+            var lvl = FloorMulShift(abs + rnd, q, sh);
             // zeroed where dequant > |c| << (1 + log_scale), and for c == 0
             var keep = ~Vector256.GreaterThan(dqv, Vector256.ShiftLeft(abs, 1 + logScale)) & ~Vector256.Equals(c, Vector256<int>.Zero);
             lvl &= keep;
@@ -81,7 +83,7 @@ internal static partial class AomQuantizeHbdSimd
         var q = Vector256.ConditionalSelect(lane0, Vector256.Create((int)quant0), Vector256.Create((int)quant1));
         var qs = Vector256.ConditionalSelect(lane0, Vector256.Create((int)quantShift0), Vector256.Create((int)quantShift1));
         var dqv = Vector256.ConditionalSelect(lane0, Vector256.Create((int)dequant0), Vector256.Create((int)dequant1));
-        double scaleOut = 1.0 / (1 << (16 - logScale));
+        int sh = 16 - logScale;
         ref int c0 = ref MemoryMarshal.GetReference(coeff);
         ref int q0 = ref MemoryMarshal.GetReference(qcoeff);
         ref int d0 = ref MemoryMarshal.GetReference(dqcoeff);
@@ -98,8 +100,8 @@ internal static partial class AomQuantizeHbdSimd
             var abs = Vector256.Abs(c);
             var pass = ~Vector256.LessThan(abs, zb);
             var tmpRnd = abs + rnd;
-            var tmp2 = FloorMulShift(tmpRnd, q, 1.0 / 65536) + tmpRnd;
-            var absQ = FloorMulShift(tmp2, qs, scaleOut) & pass;
+            var tmp2 = FloorMulShift(tmpRnd, q, 16) + tmpRnd;
+            var absQ = FloorMulShift(tmp2, qs, sh) & pass;
             var absDq = Vector256.ShiftRightLogical(absQ * dqv, logScale);
             var neg = Vector256.LessThan(c, Vector256<int>.Zero);
             Vector256.ConditionalSelect(neg, -absQ, absQ).StoreUnsafe(ref q0, (nuint)i);

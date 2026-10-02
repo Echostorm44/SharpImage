@@ -37,8 +37,8 @@ internal static partial class Av1FwdTxfmAom
         bool rect2 = w == 2 * h || h == 2 * w;
         int sw = Math.Min(w, 32), sh = Math.Min(h, 32), ng = (w + 7) >> 3;
         int hp = Math.Max(h, 8);
-        Unsafe.SkipInit(out StackArr576<V> colS);
-        ref V col = ref colS[0];
+        Span<V> colS = stackalloc V[ng * hp + 64];
+        ref V col = ref MemoryMarshal.GetReference(colS);
         ref V tmp = ref Unsafe.Add(ref col, ng * hp);
         var rnd1 = Vector256.Create(sh1 > 0 ? 1 << (sh1 - 1) : 0);
         ref short d0 = ref MemoryMarshal.GetReference(diff);
@@ -99,6 +99,7 @@ internal static partial class Av1FwdTxfmAom
                 if (rect2) v = MulRound(v, 5793, 12);
                 int rc = c * sh + r0;
                 if (nr == 8) v.StoreUnsafe(ref MemoryMarshal.GetReference(coeff), (nuint)rc);
+                else if (nr == 4) v.GetLower().StoreUnsafe(ref MemoryMarshal.GetReference(coeff), (nuint)rc);
                 else
                 {
                     v.CopyTo((Span<int>)lanes);
