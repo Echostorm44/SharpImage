@@ -947,6 +947,20 @@ internal sealed partial class AomGqEncoder
         }
     }
 
+    /// <summary>regions[k] as C reads it: regions[-1] is the 56 bytes of PRIMARY_RATE_CONTROL before the array
+    /// (gf_intervals[3..14] and cur_gf_index; offsets from the mingw-w64 build's layout).</summary>
+    private AomRegion RegionAt(AomRegion[] regions, int k)
+    {
+        if (k >= 0) return regions[k];
+        var g = _pRc.GfIntervals;
+        double D(int i) => BitConverter.Int64BitsToDouble((long)(uint)g[i] | ((long)g[i + 1] << 32));
+        return new AomRegion
+        {
+            Start = g[3], Last = g[4], AvgNoiseVar = D(5), AvgCorCoeff = D(7), AvgSrFrRatio = D(9), AvgIntraErr = D(11), AvgCodedErr = D(13),
+            Type = _pRc.CurGfIndex,
+        };
+    }
+
     private static int FindRegionsIndex(AomRegion[] regions, int numRegions, int frameIdx)
     {
         for (int k = 0; k < numRegions; k++)
@@ -1025,15 +1039,15 @@ internal sealed partial class AomGqEncoder
                     }
                     else
                     {
-                        bool isLastAnalysed = (kLast == numRegions - 1) && (curLast + offset == regions[kLast].Last);
-                        bool notEnoughRegions = kLast - kStart <= 1 + (regions[kStart].Type == SCENECUT_REGION ? 1 : 0);
+                        bool isLastAnalysed = (kLast == numRegions - 1) && (curLast + offset == RegionAt(regions, kLast).Last);
+                        bool notEnoughRegions = kLast - kStart <= 1 + (RegionAt(regions, kStart).Type == SCENECUT_REGION ? 1 : 0);
                         if (!(isLastAnalysed && notEnoughRegions))
                         {
                             const double arfLengthFactor = 0.1;
                             double bestScore = 0;
                             int bestJ = -1;
                             int firstFrame = regions[0].Start - offset;
-                            int lastFrame = regions[numRegions - 1].Last - offset;
+                            int lastFrame = RegionAt(regions, numRegions - 1).Last - offset;
                             double baseScore = 0.0;
                             int countBase = 0;
                             bool staticFrames = false;

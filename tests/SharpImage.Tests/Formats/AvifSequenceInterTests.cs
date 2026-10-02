@@ -123,9 +123,10 @@ public sealed class AvifSequenceInterTests
         var sync = SyncSamples(HeifCoder.EncodeAvifSequence(seq, new AvifEncodeOptions { Quality = 60, KeyframeInterval = 3 }));
         await Assert.That(sync[0]!).IsEquivalentTo(new List<int> { 1, 4, 7 });
 
+        // libaom (as avifenc 1.4.2) keeps this short cut inside the group: one key frame, the rest inter frames
         using var cut = Panning(64, 48, 5, false, cutAt: 3);
         var cutSync = SyncSamples(HeifCoder.EncodeAvifSequence(cut, new AvifEncodeOptions { Quality = 60 }));
-        await Assert.That(cutSync[0]!.Contains(4)).IsTrue();   // the first frame of the new scene is a key frame
+        await Assert.That(cutSync[0]!).IsEquivalentTo(new List<int> { 1 });
     }
 
     // Lossless sequences code inter frames too (coded-lossless: 4x4 Walsh-Hadamard residuals on the motion-compensated
