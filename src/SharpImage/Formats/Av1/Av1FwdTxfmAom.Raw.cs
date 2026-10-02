@@ -26,18 +26,75 @@ internal static partial class Av1FwdTxfmAom
         else ForwardRawRef(diff, diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
     }
 
+    /// <summary>ForwardRawRef for the 4x4 / 4x8 / 8x4 / 8x8 sizes (most of the high bit depth calls): the block in one
+    /// set of 8 vectors (4-wide rows in the low lanes, zeros above), one 8 x 8 transpose between the passes.</summary>
+    [SkipLocalsInit]
+    private static void ForwardRefSmall(ref short d0, int diffStride, int w, int h, int txSize, int hKind, int vKind,
+        bool flipUd, bool flipLr, ref int coeff)
+    {
+        int lw = w == 8 ? 1 : 0, lh = h == 8 ? 1 : 0;
+        int sh0 = Shift[txSize * 3], sh1 = -Shift[txSize * 3 + 1], sh2 = -Shift[txSize * 3 + 2];
+        int cosCol = CosBitCol[lw * 5 + lh], cosRow = CosBitRow[lw * 5 + lh];
+        Unsafe.SkipInit(out StackArr8<V> aS);
+        Unsafe.SkipInit(out StackArr8<V> bS);
+        ref V a = ref aS[0];
+        ref V b = ref bS[0];
+        for (int r = 0; r < h; r++)
+        {
+            ref short row = ref Unsafe.Add(ref d0, (flipUd ? h - 1 - r : r) * diffStride);
+            Vector128<short> raw;
+            if (w == 8)
+            {
+                raw = Vector128.LoadUnsafe(ref row);
+                if (flipLr) raw = Vector128.Shuffle(raw, Vector128.Create((short)7, 6, 5, 4, 3, 2, 1, 0));
+            }
+            else
+            {
+                raw = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(ref Unsafe.As<short, byte>(ref row))).AsInt16();
+                if (flipLr) raw = Vector128.Shuffle(raw, Vector128.Create((short)3, 2, 1, 0, 4, 5, 6, 7));
+            }
+            Unsafe.Add(ref a, r) = Vector256.ShiftLeft(Avx2.ConvertToVector256Int32(raw), sh0);
+        }
+        Txfm1d(vKind, h, ref a, ref b, cosCol);
+        if (sh1 > 0)
+        {
+            var rnd1 = Vector256.Create(1 << (sh1 - 1));
+            for (int r = 0; r < h; r++) Unsafe.Add(ref b, r) = Vector256.ShiftRightArithmetic(Unsafe.Add(ref b, r) + rnd1, sh1);
+        }
+        if (h == 4) { Unsafe.Add(ref b, 4) = V.Zero; Unsafe.Add(ref b, 5) = V.Zero; Unsafe.Add(ref b, 6) = V.Zero; Unsafe.Add(ref b, 7) = V.Zero; }
+        Transpose8(ref b);
+        Txfm1d(hKind, w, ref b, ref a, cosRow);
+        var rnd2 = Vector256.Create(sh2 > 0 ? 1 << (sh2 - 1) : 0);
+        bool rect2 = w != h;
+        for (int c = 0; c < w; c++)
+        {
+            V v = Unsafe.Add(ref a, c);
+            if (sh2 > 0) v = Vector256.ShiftRightArithmetic(v + rnd2, sh2);
+            if (rect2) v = MulRound(v, 5793, 12);
+            if (h == 8) v.StoreUnsafe(ref coeff, (nuint)(c * 8));
+            else v.GetLower().StoreUnsafe(ref coeff, (nuint)(c * 4));
+        }
+    }
+
     /// <summary>ForwardRaw in 32-bit lanes (fwd_txfm2d_c's arithmetic), every size.</summary>
     [SkipLocalsInit]
     internal static void ForwardRawRef(ReadOnlySpan<short> diff, int diffStride, int w, int h, int txSize, int hKind, int vKind,
         bool flipUd, bool flipLr, Span<int> coeff)
     {
+        if (w <= 8 && h <= 8 && Avx2.IsSupported)
+        {
+            if (diff.Length < (h - 1) * diffStride + w || coeff.Length < w * h) throw new ArgumentException("tx block buffers smaller than the tx size");
+            ForwardRefSmall(ref MemoryMarshal.GetReference(diff), diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, ref MemoryMarshal.GetReference(coeff));
+            return;
+        }
         int lw = System.Numerics.BitOperations.Log2((uint)w) - 2, lh = System.Numerics.BitOperations.Log2((uint)h) - 2;
         int sh0 = Shift[txSize * 3], sh1 = -Shift[txSize * 3 + 1], sh2 = -Shift[txSize * 3 + 2];
         int cosCol = CosBitCol[lw * 5 + lh], cosRow = CosBitRow[lw * 5 + lh];
         bool rect2 = w == 2 * h || h == 2 * w;
         int sw = Math.Min(w, 32), sh = Math.Min(h, 32), ng = (w + 7) >> 3;
         int hp = Math.Max(h, 8);
-        Span<V> colS = stackalloc V[ng * hp + 64];
+        // one stack buffer: the column pass output, the 1D scratch (64), the row pass input (ng * 8)
+        Span<V> colS = stackalloc V[ng * hp + 64 + ng * 8];
         ref V col = ref MemoryMarshal.GetReference(colS);
         ref V tmp = ref Unsafe.Add(ref col, ng * hp);
         var rnd1 = Vector256.Create(sh1 > 0 ? 1 << (sh1 - 1) : 0);
@@ -77,8 +134,7 @@ internal static partial class Av1FwdTxfmAom
             }
             for (int r = h; r < hp; r++) Unsafe.Add(ref cg, r) = V.Zero;
         }
-        Unsafe.SkipInit(out StackArr64<V> rinS);
-        ref V rin = ref rinS[0];
+        ref V rin = ref Unsafe.Add(ref tmp, 64);
         var rnd2 = Vector256.Create(sh2 > 0 ? 1 << (sh2 - 1) : 0);
         Unsafe.SkipInit(out StackArr8<int> lanes);
         for (int r0 = 0; r0 < sh; r0 += 8)
