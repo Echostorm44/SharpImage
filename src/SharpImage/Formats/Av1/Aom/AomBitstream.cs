@@ -25,7 +25,7 @@ internal sealed class AomSequenceConfig
 // prepends: the bytes libaom's aom_codec_get_cx_data returns for the frame.
 internal static partial class AomBitstream
 {
-    private const int OBU_SEQUENCE_HEADER = 1, OBU_TEMPORAL_DELIMITER = 2, OBU_FRAME = 6;
+    private const int OBU_SEQUENCE_HEADER = 1, OBU_TEMPORAL_DELIMITER = 2, OBU_FRAME_HEADER = 3, OBU_FRAME = 6;
     private const int MAX_MIB_MASK = 31;
     private const int ONLY_4X4 = 0;
     private const int NUM_BASE_LEVELS = 2, COEFF_BASE_RANGE = 12, BR_CDF_SIZE = 4;

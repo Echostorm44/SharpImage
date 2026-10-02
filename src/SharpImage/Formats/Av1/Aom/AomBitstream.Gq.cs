@@ -127,6 +127,25 @@ internal static partial class AomBitstream
         return outBuf.ToArray();
     }
 
+    /// <summary>av1_pack_bitstream for a show_existing_frame: one OBU_FRAME_HEADER holding show_existing_frame and
+    /// frame_to_show_map_idx (no decoder model / frame ids), then the trailing bits.</summary>
+    internal static byte[] PackShowExistingGq(AomGqFrameHeader fh)
+    {
+        var seq = fh.Seq;
+        var wb = new AomWriteBitBuffer();
+        wb.WriteBit(1);
+        wb.WriteLiteral(fh.ExistingFbIdxToShow, 3);
+        AddTrailingBits(wb);
+        byte[] hdr = wb.ToArray();
+        var outBuf = new System.IO.MemoryStream();
+        bool ext = seq.HasNonzeroOperatingPointIdc;
+        outBuf.WriteByte((byte)((OBU_FRAME_HEADER << 3) | (ext ? 1 << 2 : 0) | (1 << 1)));
+        if (ext) outBuf.WriteByte((byte)(fh.TemporalLayerId << 5 | fh.SpatialLayerId << 3));
+        WriteUleb(outBuf, (ulong)hdr.Length);
+        outBuf.Write(hdr);
+        return outBuf.ToArray();
+    }
+
     /// <summary>The temporal delimiter OBU av1_cx_iface.c writes before the first frame of a temporal unit.</summary>
     internal static readonly byte[] TemporalDelimiter = { (byte)(OBU_TEMPORAL_DELIMITER << 3 | 1 << 1), 0 };
 

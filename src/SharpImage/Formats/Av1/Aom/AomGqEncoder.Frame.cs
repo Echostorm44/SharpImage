@@ -855,7 +855,7 @@ internal sealed partial class AomGqEncoder
         var gf = _gfGroup;
         int frameType = fp.FrameType;
         bool isKey = frameType == KEY_FRAME;
-        if (fp.ShowExistingFrame) throw new NotImplementedException("show_existing_frame");
+        if (fp.ShowExistingFrame) return EncodeShowExisting(fp);
         if (isKey && gf.RefbufState[_gfFrameIndex] == REFBUF_RESET) _frameNumber = 0;
         int orderHintFull = _frameNumber + fp.OrderOffset;
         int displayOrderHint = orderHintFull;
@@ -870,6 +870,7 @@ internal sealed partial class AomGqEncoder
         if (_resizePendingW != 0 && _resizePendingH != 0) { width = _resizePendingW; height = _resizePendingH; _resizePendingW = _resizePendingH = 0; }
         _cmWidth = width;
         _cmHeight = height;
+        if (IsStatConsumptionStage) SetTargetRate(width, height);   // av1_set_frame_size
 
         // encode_without_recode: the source scaler (not svc: phase 8, the filter by the ratio)
         int filterScaler = EIGHTTAP_SMOOTH, phaseScaler = 8;
@@ -1025,6 +1026,33 @@ internal sealed partial class AomGqEncoder
         if (fp.ShowFrame) _frameNumber++;   // update_counters_for_show_frame
         return data;
     }
+
+    /// <summary>av1_encode + encode_frame_to_data_rate for a show_existing_frame (not a forward key frame): the frame
+    /// header OBU only; cur_frame becomes the shown buffer, nothing is refreshed, cm->quant_params.base_qindex stays the
+    /// previous frame's (av1_rc_postencode_update), av1_set_target_rate and update_counters_for_show_frame.</summary>
+    private byte[] EncodeShowExisting(FrameParams fp)
+    {
+        if (fp.FrameType == KEY_FRAME) throw new NotImplementedException("show_existing_frame of a forward key frame");
+        var fh = new AomGqFrameHeader
+        {
+            Seq = _seq, FrameType = fp.FrameType, ShowFrame = true, ShowExistingFrame = true, ExistingFbIdxToShow = fp.ExistingFbIdxToShow,
+            RefreshFrameFlags = 0,
+        };
+        byte[] data = AomBitstream.PackShowExistingGq(fh);
+        if (_lastCpi != null) OnFrameEncoded?.Invoke(_lastCpi, fh);
+        if (IsStatConsumptionStage) SetTargetRate(_cmWidth, _cmHeight);
+        _curFrameBuf = _refFrameMap[fp.ExistingFbIdxToShow];
+        _curRefreshFrameFlags = 0;
+        _curFrameType = fp.FrameType;
+        _curShowExisting = true;
+        _curRefresh = fp;
+        _curRefType = CurrentFrameRefType();
+        _frameNumber++;   // update_counters_for_show_frame
+        return data;
+    }
+
+    /// <summary>av1_set_target_rate (AOM_Q: no vbr_rate_correction).</summary>
+    private void SetTargetRate(int width, int height) => RcSetFrameTarget(_rc.BaseFrameTarget, width, height);
 
     /// <summary>refresh_reference_frames.</summary>
     private void RefreshReferenceFrames()
