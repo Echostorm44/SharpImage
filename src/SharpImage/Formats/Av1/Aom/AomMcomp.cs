@@ -40,6 +40,17 @@ internal sealed class AomFullPelMsParams
     public bool SkipSad;
     // the frame bit depth (the highbd fn_ptr _bits10 / _bits12 wrappers)
     public int Bd = 8;
+    public int MvCostType;   // MV_COST_ENTROPY
+    // ms_buffers.second_pred / mask (compound searches)
+    public bool HasSecondPred;
+    public int FastObmcSearch;
+}
+
+/// <summary>FULLPEL_MV_STATS.</summary>
+internal struct AomFullpelMvStats
+{
+    public int Distortion, ErrCost;
+    public uint Sse;
 }
 
 // Port of libaom 3.14.1 av1/encoder/mcomp.c's full-pixel motion search as the intrabc search uses it
@@ -54,6 +65,7 @@ internal static class AomMcomp
     private const int MAX_PATTERN_SCALES = 11, MAX_PATTERN_CANDIDATES = 8, PATTERN_CANDIDATES_REF = 3;
 
     // search_method_lookup
+    public static int SearchMethodLookupOf(int m) => SearchMethodLookup[m];
     private static readonly int[] SearchMethodLookup = { DIAMOND, NSTEP, NSTEP_8PT, CLAMPED_DIAMOND, HEX, BIGDIA, BIGDIA, BIGDIA, BIGDIA };
 
     /// <summary>av1_init_search_range.</summary>
@@ -250,7 +262,7 @@ internal static class AomMcomp
     /// <summary>av1_make_default_fullpel_ms_params (key frame: use_downsampled_sad 1 does nothing; sharpness 3 unsupported)
     /// followed by the caller's buffers. mvLimits is x->mv_limits (the intrabc search overwrites the limits anyway).</summary>
     public static AomFullPelMsParams MakeDefaultFullpelMsParams(AomComp cpi, AomMacroblock x, int bsize, AomMv refMv,
-        AomSearchSiteConfig[] searchSites, int searchMethod, bool fineSearchInterval, in AomFullMvLimits mvLimits)
+        AomSearchSiteConfig[] searchSites, int searchMethod, bool fineSearchInterval, in AomFullMvLimits mvLimits, AomMv? startMvOpt = null)
     {
         var mvSf = cpi.Sf.mv_sf;
         var p = new AomFullPelMsParams { Bsize = bsize };
@@ -275,7 +287,34 @@ internal static class AomMcomp
         p.FullRefMv = refMv.ToFullMv();
         p.ErrorPerBit = x.Errorperbit;
         p.SadPerBit = x.SadPerBit;
+        p.FastObmcSearch = mvSf.obmc_full_pixel_search_level;
+        if (cpi.Mode != ALLINTRA)
+        {
+            // x->mv_costs (allocated outside the all-intra mode)
+            p.MvJCost = x.MvCosts.NmvJointCost;
+            p.MvCost = x.MvCosts.MvCostStack;
+        }
         p.SkipSad = mvSf.use_downsampled_sad == 2 && BlockSizeHigh[bsize] >= 16;
+        bool isKeyFrame = cpi.UpdateType == KF_UPDATE;
+        if (!p.SkipSad && mvSf.use_downsampled_sad == 1 && BlockSizeHigh[bsize] >= 16 && !isKeyFrame && startMvOpt is AomMv startMv)
+        {
+            var c = ClampFullmv(startMv, p.MvLimits);
+            int off = RefOffset(p.Ref, c.Row, c.Col);
+            int w = BlockSizeWide[bsize], h = BlockSizeHigh[bsize];
+            uint even, odd;
+            if (p.Src.Buf16 != null)
+            {
+                even = AomHbd.Sad(p.Src.Buf16, p.Src.Offset, 2 * p.Src.Stride, p.Ref.Buf16!, off, 2 * p.Ref.Stride, w, h / 2) * 2 >> (p.Bd - 8);
+                odd = AomHbd.Sad(p.Src.Buf16, p.Src.Offset + p.Src.Stride, 2 * p.Src.Stride, p.Ref.Buf16!, off + p.Ref.Stride, 2 * p.Ref.Stride, w, h / 2) * 2 >> (p.Bd - 8);
+            }
+            else
+            {
+                even = AomSad.SadSkip(p.Src.Buf, p.Src.Offset, p.Src.Stride, p.Ref.Buf, off, p.Ref.Stride, w, h);
+                odd = AomSad.SadSkip(p.Src.Buf, p.Src.Offset + p.Src.Stride, p.Src.Stride, p.Ref.Buf, off + p.Ref.Stride, p.Ref.Stride, w, h);
+            }
+            int diff = Math.Abs((int)even - (int)odd);
+            if (diff * 4 < (int)even) p.SkipSad = true;
+        }
         return p;
     }
 
@@ -304,28 +343,74 @@ internal static class AomMcomp
     /// <summary>get_mvpred_sad (ms_params->sdf).</summary>
     private static uint GetMvpredSad(AomFullPelMsParams p, int refOff) => SdfAt(p, refOff, p.SkipSad);
 
-    /// <summary>mvsad_err_cost_.</summary>
-    private static int MvsadErrCost(AomFullPelMsParams p, AomMv mv)
-        => p.MvCost == null ? 0 : AomMvCost.MvSadErrCost(mv, p.FullRefMv, p.MvJCost!, p.MvCost, p.SadPerBit);
-
-    /// <summary>mv_err_cost_ (MV_COST_ENTROPY; 0 without cost tables).</summary>
-    private static int MvErrCost(AomFullPelMsParams p, AomMv mv)
-        => p.MvCost == null ? 0 : AomMvCost.MvErrCost(mv, p.RefMv, p.MvJCost!, p.MvCost, p.ErrorPerBit);
-
-    /// <summary>get_mvpred_var_cost (also get_mvpred_compound_var_cost without a second prediction).</summary>
-    public static int GetMvpredVarCost(AomFullPelMsParams p, AomMv thisMv)
+    /// <summary>get_mvpred_compound_sad.</summary>
+    private static uint GetMvpredCompoundSad(AomFullPelMsParams p, int refOff)
     {
-        int w = BlockSizeWide[p.Bsize], h = BlockSizeHigh[p.Bsize];
-        uint var = p.Src.Buf16 != null
-            ? AomHbd.Variance(p.Src.Buf16, p.Src.Offset, p.Src.Stride, p.Ref.Buf16, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride, 0, w, h,
-                p.Bd, out _)
-            : AomSad.Variance(p.Src.Buf, p.Src.Offset, p.Src.Stride, p.Ref.Buf, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride,
-            w, h, out _);
-        return (int)var + MvErrCost(p, thisMv.ToMv());
+        if (p.HasSecondPred) throw new NotImplementedException("compound motion search sad");
+        return GetMvpredSad(p, refOff);
     }
 
-    /// <summary>update_mvs_and_sad (no second best).</summary>
+    public const int MV_COST_ENTROPY = 0, MV_COST_L1_LOWRES = 1, MV_COST_L1_MIDRES = 2, MV_COST_L1_HDRES = 3, MV_COST_NONE = 4;
+
+    /// <summary>mvsad_err_cost_.</summary>
+    private static int MvsadErrCost(AomFullPelMsParams p, AomMv mv)
+    {
+        int dr = (mv.Row - p.FullRefMv.Row) * 8, dc = (mv.Col - p.FullRefMv.Col) * 8;
+        switch (p.MvCostType)
+        {
+            case MV_COST_ENTROPY: return p.MvCost == null ? 0 : AomMvCost.MvSadErrCost(mv, p.FullRefMv, p.MvJCost!, p.MvCost, p.SadPerBit);
+            case MV_COST_L1_LOWRES: return (32 * (Math.Abs(dr) + Math.Abs(dc))) >> 3;
+            case MV_COST_L1_MIDRES: return (15 * (Math.Abs(dr) + Math.Abs(dc))) >> 3;
+            case MV_COST_L1_HDRES: return (8 * (Math.Abs(dr) + Math.Abs(dc))) >> 3;
+            default: return 0;
+        }
+    }
+
+    /// <summary>mv_err_cost_.</summary>
+    internal static int MvErrCost(AomFullPelMsParams p, AomMv mv) => MvErrCost(p.MvCostType, mv, p.RefMv, p.MvJCost, p.MvCost, p.ErrorPerBit);
+
+    /// <summary>mv_err_cost.</summary>
+    internal static int MvErrCost(int type, AomMv mv, AomMv refMv, int[]? mvjcost, int[][]? mvcost, int errorPerBit)
+    {
+        int ar = Math.Abs(mv.Row - refMv.Row), ac = Math.Abs(mv.Col - refMv.Col);
+        switch (type)
+        {
+            case MV_COST_ENTROPY: return mvcost == null ? 0 : AomMvCost.MvErrCost(mv, refMv, mvjcost!, mvcost, errorPerBit);
+            case MV_COST_L1_LOWRES: return (2 * (ar + ac)) >> 3;
+            case MV_COST_L1_MIDRES: return 0;
+            case MV_COST_L1_HDRES: return (1 * (ar + ac)) >> 3;
+            default: return 0;
+        }
+    }
+
+    /// <summary>get_mvpred_var_cost (also get_mvpred_compound_var_cost without a second prediction).</summary>
+    public static int GetMvpredVarCost(AomFullPelMsParams p, AomMv thisMv) => GetMvpredVarCost(p, thisMv, out _);
+
+    public static int GetMvpredVarCost(AomFullPelMsParams p, AomMv thisMv, out AomFullpelMvStats stats)
+    {
+        if (p.HasSecondPred) throw new NotImplementedException("compound motion search variance");
+        int w = BlockSizeWide[p.Bsize], h = BlockSizeHigh[p.Bsize];
+        uint sse;
+        uint var = p.Src.Buf16 != null
+            ? AomHbd.Variance(p.Src.Buf16, p.Src.Offset, p.Src.Stride, p.Ref.Buf16, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride, 0, w, h,
+                p.Bd, out sse)
+            : AomSad.Variance(p.Src.Buf, p.Src.Offset, p.Src.Stride, p.Ref.Buf, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride,
+            w, h, out sse);
+        stats.Sse = sse;
+        stats.Distortion = (int)var;
+        stats.ErrCost = MvErrCost(p, thisMv.ToMv());
+        return (int)var + stats.ErrCost;
+    }
+
+    /// <summary>update_mvs_and_sad.</summary>
     private static bool UpdateMvsAndSad(AomFullPelMsParams p, uint thisSad, AomMv mv, ref uint bestSad, ref uint rawBestSad, ref AomMv bestMv)
+    {
+        AomMv dummy = default;
+        return UpdateMvsAndSad(p, thisSad, mv, ref bestSad, ref rawBestSad, ref bestMv, ref dummy, false);
+    }
+
+    private static bool UpdateMvsAndSad(AomFullPelMsParams p, uint thisSad, AomMv mv, ref uint bestSad, ref uint rawBestSad, ref AomMv bestMv,
+        ref AomMv secondBestMv, bool trackSecond)
     {
         if (thisSad >= bestSad) return false;
         uint sad = thisSad + (uint)MvsadErrCost(p, mv);
@@ -333,6 +418,7 @@ internal static class AomMcomp
         {
             rawBestSad = thisSad;
             bestSad = sad;
+            if (trackSecond) secondBestMv = bestMv;
             bestMv = mv;
             return true;
         }
@@ -342,11 +428,43 @@ internal static class AomMcomp
     private static bool CheckBounds(in AomFullMvLimits l, int row, int col, int range)
         => (row - range) >= l.RowMin && (row + range) <= l.RowMax && (col - range) >= l.ColMin && (col + range) <= l.ColMax;
 
+    // ---- cost lists ----
+
+    private static readonly AomMv[] CostListNeighbors = { new(0, -1), new(1, 0), new(0, 1), new(-1, 0) };
+
+    /// <summary>calc_int_sad_list (USE_SAD_COSTLIST).</summary>
+    private static void CalcIntSadList(AomMv bestMv, AomFullPelMsParams p, int[] costList, bool costlistHasSad)
+    {
+        int br = bestMv.Row, bc = bestMv.Col;
+        if (!costlistHasSad)
+        {
+            costList[0] = (int)GetMvpredSad(p, RefOffset(p.Ref, br, bc));
+            if (CheckBounds(p.MvLimits, br, bc, 1))
+            {
+                for (int i = 0; i < 4; i++)
+                    costList[i + 1] = (int)GetMvpredSad(p, RefOffset(p.Ref, br + CostListNeighbors[i].Row, bc + CostListNeighbors[i].Col));
+            }
+            else
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    var m = new AomMv(br + CostListNeighbors[i].Row, bc + CostListNeighbors[i].Col);
+                    costList[i + 1] = !IsFullmvInRange(p.MvLimits, m) ? int.MaxValue : (int)GetMvpredSad(p, RefOffset(p.Ref, m.Row, m.Col));
+                }
+            }
+        }
+        costList[0] += MvsadErrCost(p, bestMv);
+        for (int idx = 0; idx < 4; idx++)
+            if (costList[idx + 1] != int.MaxValue)
+                costList[idx + 1] += MvsadErrCost(p, new AomMv(br + CostListNeighbors[idx].Row, bc + CostListNeighbors[idx].Col));
+    }
+
     // ---- pattern search (HEX / BIGDIA / FAST_DIAMOND / FAST_BIGDIA / VFAST_DIAMOND) ----
 
-    // calc_sad_update_bestmv over candidates [candStart, numCandidates) (sad4 / sad3 give the same sums)
+    // calc_sad_update_bestmv over candidates [candStart, numCandidates) (sad4 / sad3 give the same sums); with a cost
+    // list the raw sads land at cost_list[i + 1]
     private static void CalcSadUpdateBestmv(AomFullPelMsParams p, ref AomMv bestMv, AomMv center, int centerOff, ref uint bestSad,
-        ref uint rawBestSad, int step, ref int bestSite, int numCandidates, int candStart, bool checkRange)
+        ref uint rawBestSad, int step, ref int bestSite, int numCandidates, int candStart, bool checkRange, int[]? costList = null)
     {
         var cfg = p.SearchSites;
         for (int i = candStart; i < numCandidates; i++)
@@ -355,6 +473,7 @@ internal static class AomMcomp
             var thisMv = new AomMv(center.Row + s.Row, center.Col + s.Col);
             if (checkRange && !IsFullmvInRange(p.MvLimits, thisMv)) continue;
             uint thisSad = GetMvpredSad(p, centerOff + s.Row * p.Ref.Stride + s.Col);
+            if (costList != null) costList[i + 1] = (int)thisSad;
             if (UpdateMvsAndSad(p, thisSad, thisMv, ref bestSad, ref rawBestSad, ref bestMv)) bestSite = i;
         }
     }
@@ -376,35 +495,46 @@ internal static class AomMcomp
         CalcSadUpdateBestmv(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, step, ref bestSite, numCandidates % 4, loops4 * 4, true);
     }
 
-    // calc_sad3_update_bestmv / calc_sad_update_bestmv_with_indices: best_site is the index into chkpts
+    // calc_sad3_update_bestmv / calc_sad_update_bestmv_with_indices: best_site is the index into chkpts; with a cost
+    // list, cost_list[index + 1] gets the raw sad (INT_MAX out of range)
     private static void CalcSadUpdateBestmvWithIndices(AomFullPelMsParams p, ref AomMv bestMv, AomMv center, int centerOff, ref uint bestSad,
-        ref uint rawBestSad, int step, ref int bestSite, ReadOnlySpan<int> chkpts, bool checkRange)
+        ref uint rawBestSad, int step, ref int bestSite, ReadOnlySpan<int> chkpts, bool checkRange, int[]? costList = null)
     {
         var cfg = p.SearchSites;
         for (int i = 0; i < chkpts.Length; i++)
         {
-            var s = cfg.Site[step, chkpts[i]];
+            int index = chkpts[i];
+            var s = cfg.Site[step, index];
             var thisMv = new AomMv(center.Row + s.Row, center.Col + s.Col);
-            if (checkRange && !IsFullmvInRange(p.MvLimits, thisMv)) continue;
+            if (checkRange && !IsFullmvInRange(p.MvLimits, thisMv))
+            {
+                if (costList != null) costList[index + 1] = int.MaxValue;
+                continue;
+            }
             uint thisSad = GetMvpredSad(p, centerOff + s.Row * p.Ref.Stride + s.Col);
+            if (costList != null) costList[index + 1] = (int)thisSad;
             if (UpdateMvsAndSad(p, thisSad, thisMv, ref bestSad, ref rawBestSad, ref bestMv)) bestSite = i;
         }
     }
 
-    /// <summary>pattern_search (cost_list NULL).</summary>
-    private static int PatternSearch(AomMv startMv, AomFullPelMsParams p, int searchStep, bool doInitSearch, out AomMv bestMv)
+    /// <summary>pattern_search.</summary>
+    private static int PatternSearch(AomMv startMv, AomFullPelMsParams p, int searchStep, bool doInitSearch, int[]? costList, out AomMv bestMv,
+        out AomFullpelMvStats bestMvStats)
     {
         ReadOnlySpan<int> searchSteps = stackalloc int[] { 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
         var cfg = p.SearchSites;
         var numCandidates = cfg.SearchesPerStep;
         int refStride = p.Ref.Stride;
+        bool lastIs4 = numCandidates[0] == 4;
         uint bestSad, rawBestSad;
         int k = -1;
         searchStep = Math.Min(searchStep, MAX_MVSEARCH_STEPS - 1);
         int bestInitS = searchSteps[searchStep];
         startMv = ClampFullmv(startMv, p.MvLimits);
         int br = startMv.Row, bc = startMv.Col;
-        bestMv = startMv;
+        if (costList != null) costList[0] = costList[1] = costList[2] = costList[3] = costList[4] = int.MaxValue;
+        bool costlistHasSad = false;
+        bestMv = startMv;   // (libaom leaves *best_mv untouched until a better candidate; it is only read as the second best)
         rawBestSad = GetMvpredSad(p, RefOffset(p.Ref, startMv.Row, startMv.Col));
         bestSad = rawBestSad + (uint)MvsadErrCost(p, startMv);
         int centerOff = RefOffset(p.Ref, startMv.Row, startMv.Col);
@@ -432,7 +562,7 @@ internal static class AomMcomp
         }
         if (bestInitS != -1)
         {
-            const int lastS = 0;   // (last_is_4 && cost_list) with cost_list NULL
+            int lastS = lastIs4 && costList != null ? 1 : 0;
             int bestSite = -1;
             Span<int> next = stackalloc int[PATTERN_CANDIDATES_REF];
             s = bestInitS;
@@ -467,21 +597,63 @@ internal static class AomMcomp
                     }
                 } while (bestSite != -1);
             }
+            if (s == 0)
+            {
+                costList![0] = (int)rawBestSad;
+                costlistHasSad = true;
+                if (!doInitSearch || s != bestInitS)
+                {
+                    var center = new AomMv(br, bc);
+                    bool inb = CheckBounds(p.MvLimits, br, bc, 1 << s);
+                    // calc_sad4_update_bestmv (in bounds) / calc_sad_update_bestmv (4 candidates from 0), both with the cost list
+                    CalcSadUpdateBestmv(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, s, ref bestSite, 4, 0, !inb, costList);
+                    if (bestSite != -1)
+                    {
+                        var st = cfg.Site[s, bestSite];
+                        br += st.Row; bc += st.Col;
+                        centerOff += st.Row * refStride + st.Col;
+                        k = bestSite;
+                    }
+                }
+                while (bestSite != -1)
+                {
+                    bestSite = -1;
+                    next[0] = k == 0 ? numCandidates[s] - 1 : k - 1;
+                    next[1] = k;
+                    next[2] = k == numCandidates[s] - 1 ? 0 : k + 1;
+                    costList[1] = costList[2] = costList[3] = costList[4] = int.MaxValue;
+                    costList[((k + 2) % 4) + 1] = costList[0];
+                    costList[0] = (int)rawBestSad;
+                    var center = new AomMv(br, bc);
+                    bool inb = CheckBounds(p.MvLimits, br, bc, 1 << s);
+                    CalcSadUpdateBestmvWithIndices(p, ref bestMv, center, centerOff, ref bestSad, ref rawBestSad, s, ref bestSite, next, !inb, costList);
+                    if (bestSite != -1)
+                    {
+                        k = next[bestSite];
+                        var st = cfg.Site[s, k];
+                        br += st.Row; bc += st.Col;
+                        centerOff += st.Row * refStride + st.Col;
+                    }
+                }
+            }
         }
         bestMv = new AomMv(br, bc);
-        return GetMvpredVarCost(p, bestMv);
+        if (costList != null) CalcIntSadList(bestMv, p, costList, costlistHasSad);
+        return GetMvpredVarCost(p, bestMv, out bestMvStats);
     }
 
     // ---- diamond search ----
 
-    /// <summary>diamond_search_sad (single reference).</summary>
-    private static uint DiamondSearchSad(AomMv startMv, uint startMvSad, AomFullPelMsParams p, int searchStep, out int num00, out AomMv bestMv)
+    /// <summary>diamond_search_sad.</summary>
+    private static uint DiamondSearchSad(AomMv startMv, uint startMvSad, AomFullPelMsParams p, int searchStep, out int num00, out AomMv bestMv,
+        ref AomMv secondBestMv, bool trackSecond)
     {
         var cfg = p.SearchSites;
         int refStride = p.Ref.Stride;
         bool isOffCenter = false;
         int numCenterSteps = 0;
         int totSteps = cfg.NumSearchSteps - searchStep;
+        AomMv tmpSecondBestMv = trackSecond ? secondBestMv : default;
         bestMv = startMv;
         int bestAddress = RefOffset(p.Ref, startMv.Row, startMv.Col);
         uint bestSad = startMvSad;
@@ -489,7 +661,8 @@ internal static class AomMcomp
         {
             int numSearches = cfg.SearchesPerStep[step];
             int bestSite = 0;
-            bool allIn = bestMv.Row + cfg.Site[step, 1].Row >= p.MvLimits.RowMin && bestMv.Row + cfg.Site[step, 2].Row <= p.MvLimits.RowMax &&
+            bool allIn = !p.HasSecondPred &&
+                         bestMv.Row + cfg.Site[step, 1].Row >= p.MvLimits.RowMin && bestMv.Row + cfg.Site[step, 2].Row <= p.MvLimits.RowMax &&
                          bestMv.Col + cfg.Site[step, 3].Col >= p.MvLimits.ColMin && bestMv.Col + cfg.Site[step, 4].Col <= p.MvLimits.ColMax;
             if (allIn)
             {
@@ -514,7 +687,7 @@ internal static class AomMcomp
                     var s = cfg.Site[step, idx];
                     var thisMv = new AomMv(bestMv.Row + s.Row, bestMv.Col + s.Col);
                     if (!IsFullmvInRange(p.MvLimits, thisMv)) continue;
-                    uint thisSad = GetMvpredSad(p, s.Row * refStride + s.Col + bestAddress);
+                    uint thisSad = GetMvpredCompoundSad(p, s.Row * refStride + s.Col + bestAddress);
                     if (thisSad < bestSad)
                     {
                         thisSad += (uint)MvsadErrCost(p, thisMv);
@@ -525,6 +698,7 @@ internal static class AomMcomp
             // UPDATE_SEARCH_STEP
             if (bestSite != 0)
             {
+                tmpSecondBestMv = bestMv;
                 var s = cfg.Site[step, bestSite];
                 bestMv = new AomMv(bestMv.Row + s.Row, bestMv.Col + s.Col);
                 bestAddress += s.Row * refStride + s.Col;
@@ -543,38 +717,43 @@ internal static class AomMcomp
             }
         }
         num00 = numCenterSteps;
+        if (trackSecond) secondBestMv = tmpSecondBestMv;
         return bestSad;
     }
 
-    /// <summary>full_pixel_diamond (cost_list NULL).</summary>
-    private static int FullPixelDiamond(AomMv startMv, AomFullPelMsParams p, int stepParam, out AomMv bestMv)
+    /// <summary>full_pixel_diamond.</summary>
+    private static int FullPixelDiamond(AomMv startMv, AomFullPelMsParams p, int stepParam, int[]? costList, out AomMv bestMv,
+        out AomFullpelMvStats bestMvStats, ref AomMv secondBestMv, bool trackSecond)
     {
         var cfg = p.SearchSites;
         startMv = ClampFullmv(startMv, p.MvLimits);
         // get_start_mvpred_sad_cost
-        uint startMvSad = (uint)MvsadErrCost(p, startMv) + GetMvpredSad(p, RefOffset(p.Ref, startMv.Row, startMv.Col));
-        DiamondSearchSad(startMv, startMvSad, p, stepParam, out int n, out bestMv);
-        int bestsme = GetMvpredVarCost(p, bestMv);
+        uint startMvSad = (uint)MvsadErrCost(p, startMv) + GetMvpredCompoundSad(p, RefOffset(p.Ref, startMv.Row, startMv.Col));
+        DiamondSearchSad(startMv, startMvSad, p, stepParam, out int n, out bestMv, ref secondBestMv, trackSecond);
+        int bestsme = GetMvpredVarCost(p, bestMv, out bestMvStats);
         int furtherSteps = cfg.NumSearchSteps - 1 - stepParam;
         while (n < furtherSteps)
         {
             ++n;
-            DiamondSearchSad(startMv, startMvSad, p, stepParam + n, out int num00, out AomMv tmpBestMv);
-            int thissme = GetMvpredVarCost(p, tmpBestMv);
+            DiamondSearchSad(startMv, startMvSad, p, stepParam + n, out int num00, out AomMv tmpBestMv, ref secondBestMv, trackSecond);
+            int thissme = GetMvpredVarCost(p, tmpBestMv, out var tmpStats);
             if (thissme < bestsme)
             {
                 bestsme = thissme;
                 bestMv = tmpBestMv;
+                bestMvStats = tmpStats;
             }
             if (num00 != 0) n += num00;
         }
+        if (costList != null) CalcIntSadList(bestMv, p, costList, false);
         return bestsme;
     }
 
     // ---- exhaustive mesh search ----
 
     /// <summary>exhaustive_mesh_search (libaom's remainder loop covers end_col - c columns, one short).</summary>
-    private static uint ExhaustiveMeshSearch(AomMv startMv, AomFullPelMsParams p, int range, int step, out AomMv bestMv)
+    private static uint ExhaustiveMeshSearch(AomMv startMv, AomFullPelMsParams p, int range, int step, out AomMv bestMv,
+        ref AomMv secondBestMv, bool trackSecond)
     {
         int colStep = step > 1 ? step : 4;
         startMv = ClampFullmv(startMv, p.MvLimits);
@@ -593,7 +772,7 @@ internal static class AomMcomp
                 {
                     var mv = new AomMv(startMv.Row + r, startMv.Col + c);
                     uint sad = GetMvpredSad(p, RefOffset(p.Ref, mv.Row, mv.Col));
-                    UpdateMvsAndSad(p, sad, mv, ref bestSad, ref rawDummy, ref bestMv);
+                    UpdateMvsAndSad(p, sad, mv, ref bestSad, ref rawDummy, ref bestMv, ref secondBestMv, trackSecond);
                 }
                 else if (c + 3 <= endCol)
                 {
@@ -601,7 +780,7 @@ internal static class AomMcomp
                     {
                         var mv = new AomMv(startMv.Row + r, startMv.Col + c + i);
                         uint sad = GetMvpredSad(p, RefOffset(p.Ref, mv.Row, mv.Col));
-                        if (sad < bestSad) UpdateMvsAndSad(p, sad, mv, ref bestSad, ref rawDummy, ref bestMv);
+                        if (sad < bestSad) UpdateMvsAndSad(p, sad, mv, ref bestSad, ref rawDummy, ref bestMv, ref secondBestMv, trackSecond);
                     }
                 }
                 else
@@ -610,55 +789,108 @@ internal static class AomMcomp
                     {
                         var mv = new AomMv(startMv.Row + r, startMv.Col + c + i);
                         uint sad = GetMvpredSad(p, RefOffset(p.Ref, mv.Row, mv.Col));
-                        UpdateMvsAndSad(p, sad, mv, ref bestSad, ref rawDummy, ref bestMv);
+                        UpdateMvsAndSad(p, sad, mv, ref bestSad, ref rawDummy, ref bestMv, ref secondBestMv, trackSecond);
                     }
                 }
             }
         return bestSad;
     }
 
-    /// <summary>full_pixel_exhaustive (cost_list NULL).</summary>
-    private static int FullPixelExhaustive(AomMv startMv, AomFullPelMsParams p, AomMeshPattern[] meshPatterns, out AomMv bestMv)
+    /// <summary>full_pixel_exhaustive.</summary>
+    private static int FullPixelExhaustive(AomMv startMv, AomFullPelMsParams p, AomMeshPattern[] meshPatterns, int[]? costList, out AomMv bestMv,
+        out AomFullpelMvStats mvStats, ref AomMv secondBestMv, bool trackSecond)
     {
         const int kMinRange = 7, kMaxRange = 256, kMinInterval = 1;
         int interval = meshPatterns[0].interval, range = meshPatterns[0].range;
         bestMv = startMv;
+        mvStats = default;
         if (range < kMinRange || range > kMaxRange || interval < kMinInterval || interval > range) return int.MaxValue;
         int baselineIntervalDivisor = range / interval;
         range = Math.Max(range, (5 * Math.Max(Math.Abs((int)bestMv.Row), Math.Abs((int)bestMv.Col))) / 4);
         range = Math.Min(range, kMaxRange);
         interval = Math.Max(interval, range / baselineIntervalDivisor);
         if (p.FineSearchInterval) interval = Math.Min(interval, 4);
-        int bestsme = (int)ExhaustiveMeshSearch(bestMv, p, range, interval, out bestMv);
+        int bestsme = (int)ExhaustiveMeshSearch(bestMv, p, range, interval, out bestMv, ref secondBestMv, trackSecond);
         if (interval > kMinInterval && range > kMinRange)
             for (int i = 1; i < MAX_MESH_STEP; ++i)
             {
-                bestsme = (int)ExhaustiveMeshSearch(bestMv, p, meshPatterns[i].range, meshPatterns[i].interval, out bestMv);
+                bestsme = (int)ExhaustiveMeshSearch(bestMv, p, meshPatterns[i].range, meshPatterns[i].interval, out bestMv, ref secondBestMv, trackSecond);
                 if (meshPatterns[i].interval == 1) break;
             }
-        if (bestsme < int.MaxValue) bestsme = GetMvpredVarCost(p, bestMv);
+        if (bestsme < int.MaxValue) bestsme = GetMvpredVarCost(p, bestMv, out mvStats);
+        if (costList != null) CalcIntSadList(bestMv, p, costList, false);
         return bestsme;
+    }
+
+    /// <summary>av1_refining_search_8p_c.</summary>
+    public static int RefiningSearch8p(AomFullPelMsParams p, AomMv startMv, out AomMv bestMv)
+    {
+        const int SEARCH_RANGE_8P = 3, SEARCH_GRID_STRIDE_8P = 2 * SEARCH_RANGE_8P + 1, SEARCH_GRID_CENTER_8P = SEARCH_RANGE_8P * SEARCH_GRID_STRIDE_8P + SEARCH_RANGE_8P;
+        ReadOnlySpan<int> nr = stackalloc int[] { -1, 0, 0, 1, -1, 1, -1, 1 };
+        ReadOnlySpan<int> nc = stackalloc int[] { 0, -1, 1, 0, -1, -1, 1, 1 };
+        Span<byte> grid = stackalloc byte[SEARCH_GRID_STRIDE_8P * SEARCH_GRID_STRIDE_8P];
+        grid.Clear();
+        int gridCenter = SEARCH_GRID_CENTER_8P;
+        bestMv = ClampFullmv(startMv, p.MvLimits);
+        uint bestSad = GetMvpredCompoundSad(p, RefOffset(p.Ref, bestMv.Row, bestMv.Col));
+        bestSad += (uint)MvsadErrCost(p, bestMv);
+        grid[gridCenter] = 1;
+        for (int i = 0; i < SEARCH_RANGE_8P; ++i)
+        {
+            int bestSite = -1;
+            for (int j = 0; j < 8; ++j)
+            {
+                int gc = gridCenter + nr[j] * SEARCH_GRID_STRIDE_8P + nc[j];
+                if (grid[gc] == 1) continue;
+                var mv = new AomMv(bestMv.Row + nr[j], bestMv.Col + nc[j]);
+                grid[gc] = 1;
+                if (IsFullmvInRange(p.MvLimits, mv))
+                {
+                    uint sad = GetMvpredCompoundSad(p, RefOffset(p.Ref, mv.Row, mv.Col));
+                    if (sad < bestSad)
+                    {
+                        sad += (uint)MvsadErrCost(p, mv);
+                        if (sad < bestSad) { bestSad = sad; bestSite = j; }
+                    }
+                }
+            }
+            if (bestSite == -1) break;
+            bestMv = new AomMv(bestMv.Row + nr[bestSite], bestMv.Col + nc[bestSite]);
+            gridCenter += nr[bestSite] * SEARCH_GRID_STRIDE_8P + nc[bestSite];
+        }
+        return (int)bestSad;
     }
 
     /// <summary>av1_full_pixel_search (single reference, cost_list NULL, no second best).</summary>
     public static int FullPixelSearch(AomMv startMv, AomFullPelMsParams p, int stepParam, out AomMv bestMv)
     {
+        AomMv dummy = default;
+        return FullPixelSearch(startMv, p, stepParam, null, out bestMv, out _, ref dummy, false);
+    }
+
+    /// <summary>av1_full_pixel_search.</summary>
+    public static int FullPixelSearch(AomMv startMv, AomFullPelMsParams p, int stepParam, int[]? costList, out AomMv bestMv,
+        out AomFullpelMvStats bestMvStats, ref AomMv secondBestMv, bool trackSecond)
+    {
         int bsize = p.Bsize;
         int searchMethod = p.SearchMethod;
         bool runMeshSearch = p.RunMeshSearch;
         int var;
+        if (trackSecond) secondBestMv = AomMv.Invalid;
+        if (costList != null) costList[0] = costList[1] = costList[2] = costList[3] = costList[4] = int.MaxValue;
         switch (searchMethod)
         {
-            case FAST_BIGDIA: var = PatternSearch(startMv, p, Math.Max(MAX_MVSEARCH_STEPS - 3, stepParam), false, out bestMv); break;
-            case VFAST_DIAMOND: var = PatternSearch(startMv, p, Math.Max(MAX_MVSEARCH_STEPS - 1, stepParam), false, out bestMv); break;
-            case FAST_DIAMOND: var = PatternSearch(startMv, p, Math.Max(MAX_MVSEARCH_STEPS - 2, stepParam), false, out bestMv); break;
-            case HEX: var = PatternSearch(startMv, p, stepParam, true, out bestMv); break;
-            case BIGDIA: var = PatternSearch(startMv, p, stepParam, true, out bestMv); break;
-            case NSTEP: case NSTEP_8PT: case DIAMOND: case CLAMPED_DIAMOND: var = FullPixelDiamond(startMv, p, stepParam, out bestMv); break;
+            case FAST_BIGDIA: var = PatternSearch(startMv, p, Math.Max(MAX_MVSEARCH_STEPS - 3, stepParam), false, costList, out bestMv, out bestMvStats); break;
+            case VFAST_DIAMOND: var = PatternSearch(startMv, p, Math.Max(MAX_MVSEARCH_STEPS - 1, stepParam), false, costList, out bestMv, out bestMvStats); break;
+            case FAST_DIAMOND: var = PatternSearch(startMv, p, Math.Max(MAX_MVSEARCH_STEPS - 2, stepParam), false, costList, out bestMv, out bestMvStats); break;
+            case HEX: var = PatternSearch(startMv, p, stepParam, true, costList, out bestMv, out bestMvStats); break;
+            case BIGDIA: var = PatternSearch(startMv, p, stepParam, true, costList, out bestMv, out bestMvStats); break;
+            case NSTEP: case NSTEP_8PT: case DIAMOND: case CLAMPED_DIAMOND:
+                var = FullPixelDiamond(startMv, p, stepParam, costList, out bestMv, out bestMvStats, ref secondBestMv, trackSecond); break;
             default: throw new ArgumentOutOfRangeException(nameof(p), "invalid search method");
         }
 
-        if (!runMeshSearch && (searchMethod == NSTEP || searchMethod == NSTEP_8PT))
+        if (!runMeshSearch && (searchMethod == NSTEP || searchMethod == NSTEP_8PT) && !p.HasSecondPred)
         {
             int exhaustiveThr = p.ForceMeshThresh;
             exhaustiveThr >>= 10 - (MiSizeWideLog2[bsize] + MiSizeHighLog2[bsize]);
@@ -679,17 +911,18 @@ internal static class AomMcomp
             if (sad > kSadThresh && Math.Abs(skipSad - sad) * 10 >= Math.Max(sad, 1) * 9)
             {
                 p.SkipSad = false;
-                try { return FullPixelSearch(startMv, p, stepParam, out bestMv); }
+                try { return FullPixelSearch(startMv, p, stepParam, costList, out bestMv, out bestMvStats, ref secondBestMv, trackSecond); }
                 finally { p.SkipSad = true; }
             }
         }
         if (runMeshSearch)
         {
             var meshPatterns = p.MeshPatterns[p.IsIntraMode ? 1 : 0];
-            int varEx = FullPixelExhaustive(bestMv, p, meshPatterns, out AomMv tmpMvEx);
+            int varEx = FullPixelExhaustive(bestMv, p, meshPatterns, costList, out AomMv tmpMvEx, out var tmpStats, ref secondBestMv, trackSecond);
             if (varEx < var)
             {
                 var = varEx;
+                bestMvStats = tmpStats;
                 bestMv = tmpMvEx;
             }
         }
