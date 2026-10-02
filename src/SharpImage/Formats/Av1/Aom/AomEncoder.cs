@@ -265,13 +265,21 @@ internal static partial class AomEncoder
         }
 
         // encode_frame_internal: delta q resolution and presence (Variance Boost: delta_q_res by the base qindex)
+        cpi.Tpl = input.Tpl;
+        cpi.GfFrameIndex = input.GfFrameIndex;
+        cpi.R0 = input.R0;
+        cpi.DeltaqObjective = input.DeltaqObjective && !cpi.DeltaqVarianceBoost;
         cpi.DeltaQRes = 0;
         if (cpi.DeltaqVarianceBoost) cpi.DeltaQRes = input.BaseQindex >= 160 ? 8 : input.BaseQindex >= 120 ? 4 : input.BaseQindex >= 80 ? 2 : 1;
-        cpi.DeltaQPresentFlag = cpi.DeltaqVarianceBoost && input.BaseQindex > 0;
+        else if (cpi.DeltaqObjective) cpi.DeltaQRes = DEFAULT_DELTA_Q_RES_OBJECTIVE;
+        cpi.DeltaQPresentFlag = cpi.DeltaqVarianceBoost || cpi.DeltaqObjective;
+        if (cpi.DeltaQPresentFlag && cpi.DeltaqObjective && input.UpdateType == LF_UPDATE) cpi.DeltaQPresentFlag = false;
         cpi.DeltaqUsed = false;
 
         // cpi->td.mb
         var x = NewThreadData(cpi, input);
+        if (cpi.DeltaQPresentFlag && cpi.DeltaqObjective) cpi.DeltaQPresentFlag = AllowDeltaqMode(cpi, x);
+        cpi.DeltaQPresentFlag &= input.BaseQindex > 0;
         x.PaletteTokens = cpi.PaletteTokens;
 
         if (cpi.NumWorkers > 1)

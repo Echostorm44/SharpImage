@@ -205,6 +205,7 @@ internal sealed class AomRcState
 internal sealed class AomPrimaryRc
 {
     public long GfGroupBits;
+    public int BaseLayerQp;
     public int KfBoost, GfuBoost, GfuBoostAverage, CurGfIndex, NumRegions, RegionsOffset, FramesTillRegionsUpdate, BaselineGfInterval,
         ConstrainedGfGroup, ThisKeyFrameForced, NextKeyFrameForced, ArfQ, NumStatsUsedForKfBoost, NumStatsUsedForGfuBoost,
         NumStatsRequiredForGfuBoost, EnableScenecutDetection, UseArfInThisKfGroup, NiFrames, LastKfQindex, LastBoostedQindex,

@@ -50,6 +50,10 @@ internal sealed partial class AomGqEncoder
         int frameType = kfRequested && updateType0 != OVERLAY_UPDATE && updateType0 != INTNL_OVERLAY_UPDATE ? KEY_FRAME : INTER_FRAME;
         // av1_encode
         if (frameType == KEY_FRAME && _gfGroup.RefbufState[0] == REFBUF_RESET) _lapFrameNumber = 0;
+        // the prev_gop_arf_src copy (the LAP compressor's gf_frame_index stays 0)
+        _lapGfIndexOverride = 0;
+        UpdatePrevGopArfSrc(source.Img, _lapFrameNumber);
+        _lapGfIndexOverride = null;
         FirstPass(source.Img, lastSource?.Img, frameType, source.TsEnd - source.TsStart);
         // av1_post_encode_updates: pop
         LookaheadPopEntry(flush, LapStage);

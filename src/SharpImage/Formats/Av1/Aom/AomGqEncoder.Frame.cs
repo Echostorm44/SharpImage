@@ -340,6 +340,7 @@ internal sealed partial class AomGqEncoder
             _gfMaxPyrHeight = Math.Min(_gfMaxPyrHeight, 1);   // USE_ALTREF_FOR_ONE_PASS
             _gfMinPyrHeight = Math.Min(_gfMinPyrHeight, _gfMaxPyrHeight);
         }
+        if (!_tplBuffersSetup) TplSetupBuffers();   // av1_setup_tpl_buffers (tpl_stats_pool[0] == NULL)
         var fp = new FrameParams();
         _twopass.ThisFrame = -1;
         int ft = fp.FrameType;
@@ -422,11 +423,69 @@ internal sealed partial class AomGqEncoder
             }
 
         // denoise_and_encode: temporal filtering (key frames / ARFs with look-ahead) and the TPL model
-        if (_cfg.LagInFrames > 1) throw new NotImplementedException("temporal filtering / TPL model (look-ahead)");
+        AomFrameBuffer? filtered = null;
+        if (!fp.ShowExistingFrame)
+        {
+            bool isSecondArf = gf.UpdateType[idx] == INTNL_ARF_UPDATE && gf.ArfSrcOffset[idx] >= TF_LOOKAHEAD_IDX_THR;
+            bool applyFiltering = ArnrMaxFrames > 0 && _cfg.LagInFrames > 1;
+            if (frameUpdateType != KF_UPDATE && frameUpdateType != ARF_UPDATE && !isSecondArf) applyFiltering = false;
+            if (applyFiltering)
+            {
+                if (fp.FrameType == KEY_FRAME)
+                {
+                    bool allowKfFiltering = KfFilteringEnabled != 0 && !fp.ShowExistingFrame && !(_losslessRequested);
+                    if (allowKfFiltering)
+                    {
+                        var yNoise = new double[3];
+                        EstimateNoiseLevel(source.Img, yNoise, 0, 0, _cfg.BitDepth, NOISE_ESTIMATION_EDGE_THRESHOLD);
+                        applyFiltering = yNoise[0] > 0;
+                    }
+                    else applyFiltering = false;
+                }
+                else if (isSecondArf) applyFiltering = TfCompressor().Sf.hl_sf.second_alt_ref_filtering != 0;
+            }
+            if (applyFiltering)
+            {
+                bool showExistingAltRef = false;
+                int qIndex = RcPickQAndBounds(_cfg.Width, _cfg.Height, idx, fp.FrameType == KEY_FRAME || fp.FrameType == INTRA_ONLY_FRAME, out _, out _);
+                if (frameUpdateType == KF_UPDATE || frameUpdateType == ARF_UPDATE)
+                {
+                    var tfBuf = TfInfoGetFilteredBuf(idx, out long dSum, out long dSse);
+                    if (tfBuf != null)
+                    {
+                        filtered = tfBuf;
+                        showExistingAltRef = CheckShowFilteredFrame(tfBuf, dSum, dSse, qIndex, _cfg.BitDepth, true, false);
+                        _showableFrame = showExistingAltRef;
+                    }
+                    if (gf.FrameType[idx] != KEY_FRAME) _showExistingAltRef = showExistingAltRef;
+                }
+                if (isSecondArf)
+                {
+                    var tfSecond = new AomFrameBuffer(_cfg.Width, _cfg.Height, _cfg.SsX, _cfg.SsY, _cfg.Monochrome, _cfg.BitDepth);
+                    TemporalFilter(gf.ArfSrcOffset[idx], idx, true, out _, out _, tfSecond);
+                    AomResize.ExtendFrameBorders(tfSecond);
+                    filtered = tfSecond;   // av1_check_show_filtered_frame is 1 for the second ARF
+                    _showableFrame = true;
+                }
+            }
+        }
         bool setMvParams = fp.FrameType == KEY_FRAME || frameUpdateType == ARF_UPDATE || frameUpdateType == GF_UPDATE;
         if (setMvParams) _mvSearchParamsDue = true;
+        if (_gfFrameIndex == 0 && !fp.ShowExistingFrame)
+        {
+            // perform tpl after filtering
+            bool allowTpl = _cfg.LagInFrames > 1 && _enableTplModel;
+            if (gf.Size > AomTplData.MAX_LENGTH_TPL_FRAME_STATS) allowTpl = false;
+            if (fp.FrameType != KEY_FRAME) allowTpl &= frameUpdateType == ARF_UPDATE || frameUpdateType == GF_UPDATE;
+            if (allowTpl)
+            {
+                TplPreloadRcEstimate();
+                TplSetupStats(0, fp);
+            }
+            else TplInitStats();
+        }
 
-        byte[] data = Av1Encode(fp, source, lastSource);
+        byte[] data = Av1Encode(fp, source, lastSource, filtered);
         _lastShowFrame = fp.ShowFrame;
         _lastFrameWasKey = _curFrameType == KEY_FRAME;
         // update_frame_flags
@@ -666,9 +725,9 @@ internal sealed partial class AomGqEncoder
     }
 
     /// <summary>av1_get_ref_frames (no external reference map / parallel encode).</summary>
-    private void GetRefFrames(Span<int> dispOrder, Span<int> pyrLevel, int curFrameDisp)
+    private void GetRefFrames(Span<int> dispOrder, Span<int> pyrLevel, int curFrameDisp, int[]? outRemapped = null)
     {
-        int[] remapped = _remappedRefIdx;
+        int[] remapped = outRemapped ?? _remappedRefIdx;
         for (int i = 0; i < REF_FRAMES; ++i) remapped[i] = -1;
         var mapIdxs = new int[REF_FRAMES];
         var disp = new int[REF_FRAMES];
@@ -790,7 +849,7 @@ internal sealed partial class AomGqEncoder
     }
 
     /// <summary>av1_encode + encode_frame_to_data_rate (no recode in AOM_Q without stats) for one frame.</summary>
-    private byte[] Av1Encode(FrameParams fp, LaEntry src, LaEntry? lastSrc)
+    private byte[] Av1Encode(FrameParams fp, LaEntry src, LaEntry? lastSrc, AomFrameBuffer? filtered = null)
     {
         var cfg = _cfg;
         var gf = _gfGroup;
@@ -802,8 +861,9 @@ internal sealed partial class AomGqEncoder
         int displayOrderHint = orderHintFull;
         int orderHint = orderHintFull % (1 << (_seq.OrderHintBitsMinus1 + 1));
         int pyramidLevel = GetTruePyrLevel(gf.LayerDepth[_gfFrameIndex], displayOrderHint, gf.MaxLayerDepth);
-        var unscaled = src.Img;
+        var unscaled = filtered ?? src.Img;   // the temporally filtered source of a key frame / ARF
         var f = src.Input;
+        UpdatePrevGopArfSrc(unscaled, displayOrderHint);
 
         // av1_setup_frame_size: the pending AOME_SET_SCALEMODE size, else the configured size
         int width = cfg.Width, height = cfg.Height;
@@ -822,14 +882,25 @@ internal sealed partial class AomGqEncoder
         else if ((width << 2) == 3 * cfg.Width && (height << 2) == 3 * cfg.Height) filterScaler = EIGHTTAP_REGULAR;
         var source = AomResize.ScaleIfRequired(unscaled, width, height, filterScaler, phaseScaler, true);
 
-        // av1_set_size_dependent_vars: q
+        // av1_set_size_dependent_vars: the TPL frame statistics (r0, the gfu boost), q
+        if (_enableTplModel && _tpl.StatsReady(_gfFrameIndex)) ProcessTplStatsFrame();
         int qindex;
         if (cfg.UseFixedQpOffsets == 2 && _rcModeQ)
         {
             qindex = _cqLevel;
             _pRc.ArfQ = qindex;
         }
-        else qindex = RcPickQAndBounds(width, height, _gfFrameIndex, frameType == KEY_FRAME || frameType == INTRA_ONLY_FRAME, out _, out _);
+        else
+        {
+            qindex = RcPickQAndBounds(width, height, _gfFrameIndex, frameType == KEY_FRAME || frameType == INTRA_ONLY_FRAME, out _, out _);
+            if (_rcModeQ && _tpl.Frame(_gfFrameIndex).IsValid && !_losslessRequested)
+            {
+                int tplQ = TplGetQIndex(_gfFrameIndex, _rc.ActiveWorstQuality, cfg.BitDepth);
+                qindex = Math.Clamp(tplQ, _rc.BestQuality, _rc.WorstQuality);
+                if (gf.UpdateType[_gfFrameIndex] == ARF_UPDATE) _pRc.ArfQ = qindex;
+            }
+            if (cfg.UseFixedQpOffsets == 1 && _rcModeQ) throw new NotImplementedException("use_fixed_qp_offsets 1");
+        }
 
         var tune = f.Quantizer == 0 ? AomTune.Psnr : cfg.Tune;
         int updateType = gf.UpdateType[_gfFrameIndex];
@@ -840,7 +911,8 @@ internal sealed partial class AomGqEncoder
         {
             Width = width, Height = height, SsX = cfg.Monochrome ? 1 : cfg.SsX, SsY = cfg.Monochrome ? 1 : cfg.SsY, Monochrome = cfg.Monochrome,
             BitDepth = cfg.BitDepth, Mode = cfg.Usage, Speed = cfg.Speed, Tune = tune, Threads = Math.Min(cfg.Threads, 64),
-            TileColumns = cfg.TileColumnsLog2, TileRows = cfg.TileRowsLog2, SourceFrame = source, UnfilteredSource = unscaled,
+            TileColumns = cfg.TileColumnsLog2, TileRows = cfg.TileRowsLog2, SourceFrame = source, UnfilteredSource = src.Img, Tpl = _cfg.LagInFrames > 1 ? _tpl : null, R0 = _r0,
+            DeltaqObjective = cfg.Tune != AomTune.Iq && _enableTplModel,
             BaseQindex = qindex, UpdateType = updateType, GfFrameType = frameType, LayerDepth = gf.LayerDepth[_gfFrameIndex],
             SbSize = _seq.SbSize, SeqFlags = _seqFlags, TxTypeProbs = _txTypeProbs, EnableRestoration = cfg.EnableRestoration,
             Sharpness = cfg.Sharpness, EnableCdef = cfg.EnableCdef, UseFixedQpOffsets = cfg.UseFixedQpOffsets,
@@ -864,6 +936,7 @@ internal sealed partial class AomGqEncoder
         }
         _seqFlags.SeqParamsLocked = _seqParamsLocked;
         var (cpi, x) = AomEncoder.EncodeFrame(input);
+        _lastCpi = cpi;
         if (isKey) { _sct = cpi.AllowScreenContentTools; _isScreenContentType = input.IsScreenContentType; }
         if (!_seqParamsLocked)
         {
@@ -934,6 +1007,7 @@ internal sealed partial class AomGqEncoder
         AomResize.ExtendFrameBorders(buf.Buf);
         buf.FrameContext = new Av1CdfContext();
         buf.FrameContext.CopyFrom(largestTileFc!);   // the writer adapted cpi->tile_data[].tctx (row-mt encodes into td->tctx)
+        _lastFc = buf.FrameContext;   // cm->fc
         buf.FrameContext.ResetCounters();
 
         _curFrameBuf = buf;
@@ -977,10 +1051,5 @@ internal sealed partial class AomGqEncoder
         }
     }
 
-    private void TfInfoFiltering()
-    {
-        if (_cfg.LagInFrames <= 1) return;   // tf_info->is_temporal_filter_on
-        throw new NotImplementedException("av1_tf_info_filtering");
-    }
     private bool IsShorterGfIntervalBetter(int frameType, bool showFrame) => throw new NotImplementedException("is_shorter_gf_interval_better");
 }

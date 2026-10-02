@@ -153,7 +153,7 @@ internal static partial class AomRdoptInter
             {
                 if (list[i] == NONE_FRAME) continue;
                 if (rf0 == list[i] || rf1 == list[i])
-                    if (cpi.Cm.RelativeDist(refDisplayOrderHint[list[i] - LAST_FRAME], frameDisplayOrderHint) < 0) return true;
+                    if (refDisplayOrderHint[list[i] - LAST_FRAME] - frameDisplayOrderHint < 0) return true;   // av1_encoder_get_relative_dist
             }
             return false;
         }

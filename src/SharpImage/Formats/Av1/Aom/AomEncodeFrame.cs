@@ -347,7 +347,7 @@ internal static partial class AomEncodeFrame
     internal static void SetupBlockRdmult(AomComp cpi, AomMacroblock x, int miRow, int miCol, int bsize)
     {
         x.Rdmult = cpi.RdRdmult;
-        if (cpi.DeltaQPresentFlag && cpi.Sf.rt_sf.use_nonrd_pick_mode == 0) x.Rdmult = cpi.SetRdmultDeltaQ(x);
+        if (cpi.DeltaQPresentFlag && cpi.Sf.rt_sf.use_nonrd_pick_mode == 0) x.Rdmult = AomEncoder.GetCbRdmult(cpi, x, bsize, miRow, miCol);
         if (cpi.SsimRdmult) SetSsimRdmult(cpi, x, bsize, miRow, miCol);
         if (cpi.AllIntra) x.Rdmult = (int)(((long)x.Rdmult * x.IntraSbRdmultModifier) >> 7);
         x.Rdmult = x.Rdmult > 0 ? x.Rdmult : 1;

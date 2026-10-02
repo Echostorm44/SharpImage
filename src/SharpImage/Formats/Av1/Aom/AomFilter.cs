@@ -28,7 +28,7 @@ internal static partial class AomFilter
         ParamsList = new Params[]
         {
         new(SubPelFilters8, 8, EIGHTTAP_REGULAR), new(SubPelFilters8Smooth, 8, EIGHTTAP_SMOOTH),
-        new(SubPelFilters8Sharp, 8, MULTITAP_SHARP), new(BilinearFilters, 8, BILINEAR),
+        new(SubPelFilters8Sharp, 8, MULTITAP_SHARP), new(BilinearFilters, 8, BILINEAR), new(SubPelFilters12Sharp, 12, MULTITAP_SHARP2),
         };
         // av1_interp_4tap [SWITCHABLE_FILTERS + 1]
         Interp4Tap = new Params[]
@@ -38,8 +38,19 @@ internal static partial class AomFilter
         };
     }
 
-    /// <summary>av1_get_interp_filter_params_with_block_size (no MULTITAP_SHARP2 in the encoder's filter set).</summary>
-    public static Params WithBlockSize(int interpFilter, int w) => w <= 4 ? Interp4Tap[interpFilter] : ParamsList[interpFilter];
+    /// <summary>av1_get_interp_filter_params_with_block_size.</summary>
+    public static Params WithBlockSize(int interpFilter, int w) => w <= 4 && interpFilter != MULTITAP_SHARP2 ? Interp4Tap[interpFilter] : ParamsList[interpFilter];
+
+    /// <summary>av1_sub_pel_filters_12sharp (MULTITAP_SHARP2: the temporal filter's predictor).</summary>
+    internal static readonly short[] SubPelFilters12Sharp =
+    {
+        0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 1, -2, 3, -7, 127, 8, -4, 2, -1, 1, 0, -1, 2, -3, 6, -13, 124, 18, -8, 4, -2, 2, -1,
+        -1, 3, -4, 8, -18, 120, 28, -12, 7, -4, 2, -1, -1, 3, -6, 10, -21, 115, 38, -15, 8, -5, 3, -1, -2, 4, -6, 12, -24, 108, 49, -18, 10, -6, 3, -2,
+        -2, 4, -7, 13, -25, 100, 60, -21, 11, -7, 4, -2, -2, 4, -7, 13, -26, 91, 71, -24, 13, -7, 4, -2, -2, 4, -7, 13, -25, 81, 81, -25, 13, -7, 4, -2,
+        -2, 4, -7, 13, -24, 71, 91, -26, 13, -7, 4, -2, -2, 4, -7, 11, -21, 60, 100, -25, 13, -7, 4, -2, -2, 3, -6, 10, -18, 49, 108, -24, 12, -6, 4, -2,
+        -1, 3, -5, 8, -15, 38, 115, -21, 10, -6, 3, -1, -1, 2, -4, 7, -12, 28, 120, -18, 8, -4, 3, -1, -1, 2, -2, 4, -8, 18, 124, -13, 6, -3, 2, -1,
+        0, 1, -1, 2, -4, 8, 127, -7, 3, -2, 1, 0,
+    };
 
     /// <summary>av1_get_interp_filter_kernel.</summary>
     public static short[] InterpFilterKernel(int interpFilter, int subpelSearch)

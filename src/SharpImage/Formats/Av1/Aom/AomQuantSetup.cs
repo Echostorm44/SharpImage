@@ -140,7 +140,12 @@ internal static class AomQuantSetup
         AomEncodeFrame.SetupSrcPlanes(cpi, x, miRow, miCol, cm.NumPlanes, sbSize);
         int deltaQRes = cpi.DeltaQRes;
         int currentQindex = cm.BaseQindex;
-        if (cpi.DeltaqVarianceBoost) currentQindex = GetSbqVarianceBoost(cpi, x);
+        if (cpi.DeltaqObjective)
+        {
+            long unused = 0;
+            currentQindex = AomEncoder.GetQForDeltaqObjective(cpi, x, ref unused, false, sbSize, miRow, miCol);
+        }
+        else if (cpi.DeltaqVarianceBoost) currentQindex = GetSbqVarianceBoost(cpi, x);
         x.RdmultCurQindex = currentQindex;
         var xd = x.E;
         currentQindex = AdjustQFromDeltaQRes(deltaQRes, xd.CurrentBaseQindex, currentQindex);

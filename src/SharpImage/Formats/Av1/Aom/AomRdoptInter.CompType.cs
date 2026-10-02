@@ -945,6 +945,9 @@ internal static partial class AomRdoptInter
     }
 
     /// <summary>av1_joint_motion_search.</summary>
+    internal static int JointMotionSearchPublic(AomComp cpi, AomMacroblock x, int bsize, AomMv[] curMv, byte[]? mask, int maskStride, out int rateMv,
+        bool allowSecondMv, int jointMeNumRefineIter) => JointMotionSearch(cpi, x, bsize, curMv, mask, maskStride, out rateMv, allowSecondMv, jointMeNumRefineIter);
+
     private static int JointMotionSearch(AomComp cpi, AomMacroblock x, int bsize, AomMv[] curMv, byte[]? mask, int maskStride, out int rateMv,
         bool allowSecondMv, int jointMeNumRefineIter)
     {

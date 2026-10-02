@@ -252,6 +252,7 @@ internal sealed partial class AomGqEncoder
         topIndex = Math.Clamp(activeWorstQuality, _rc.BestQuality, _rc.WorstQuality);
         bottomIndex = Math.Clamp(activeBestQuality, _rc.BestQuality, _rc.WorstQuality);
         int q = bottomIndex;
+        AomTrace.Out?.Write($"rcq {gfIndex} ft {(frameIsIntraOnly ? 0 : 1)} ut {_gfGroup.UpdateType[gfIndex]} kfb {_pRc.KfBoost} gfb {_pRc.GfuBoost} q {q} b {bottomIndex} t {topIndex} awq {_rc.ActiveWorstQuality} ftk {_rc.FramesToKey}" + (char)10);
         if (_gfGroup.UpdateType[gfIndex] == ARF_UPDATE) _pRc.ArfQ = q;
         return q;
     }
