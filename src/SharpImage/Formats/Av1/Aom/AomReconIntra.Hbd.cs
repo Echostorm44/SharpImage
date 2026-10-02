@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -103,9 +104,22 @@ internal static unsafe partial class AomReconIntra
     {
         int dx = GetDx(angle), dy = GetDy(angle);
         int bw = TxSizeWide[txSize], bh = TxSizeHigh[txSize];
-        if (angle > 0 && angle < 90) HighbdDrPredictionZ1(dst, stride, bw, bh, above, upsampleAbove, dx);
-        else if (angle > 90 && angle < 180) HighbdDrPredictionZ2(dst, stride, bw, bh, above, left, upsampleAbove, upsampleLeft, dx, dy);
-        else if (angle > 180 && angle < 270) HighbdDrPredictionZ3(dst, stride, bw, bh, left, upsampleLeft, dy);
+        bool simd = System.Runtime.Intrinsics.X86.Avx2.IsSupported;
+        if (angle > 0 && angle < 90)
+        {
+            if (simd && upsampleAbove == 0) HighbdDrPredictionZ1Simd(dst, stride, bw, bh, above, dx);
+            else HighbdDrPredictionZ1(dst, stride, bw, bh, above, upsampleAbove, dx);
+        }
+        else if (angle > 90 && angle < 180)
+        {
+            if (simd && upsampleAbove == 0 && upsampleLeft == 0) HighbdDrPredictionZ2Simd(dst, stride, bw, bh, above, left, dx, dy);
+            else HighbdDrPredictionZ2(dst, stride, bw, bh, above, left, upsampleAbove, upsampleLeft, dx, dy);
+        }
+        else if (angle > 180 && angle < 270)
+        {
+            if (simd && upsampleLeft == 0) HighbdDrPredictionZ3Simd(dst, stride, bw, bh, left, dy);
+            else HighbdDrPredictionZ3(dst, stride, bw, bh, left, upsampleLeft, dy);
+        }
         else if (angle == 90) AomIntraPredHbd.Pred(V_PRED, txSize, dst, stride, above, left, bd);
         else if (angle == 180) AomIntraPredHbd.Pred(H_PRED, txSize, dst, stride, above, left, bd);
     }
@@ -143,6 +157,33 @@ internal static unsafe partial class AomReconIntra
     {
         if (strength == 0) return;
         ReadOnlySpan<byte> kernel = EdgeKernel.Slice((strength - 1) * INTRA_EDGE_TAPS, INTRA_EDGE_TAPS);
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && sz <= 129)
+        {
+            // the edge padded by its end samples (the clamped taps), 16 outputs a vector: 16-bit sums (16 * 4095 + 8 < 2^16)
+            ushort* tp = stackalloc ushort[129 + 4 + 32];
+            ushort* o = stackalloc ushort[16];
+            ushort e0 = p[0], eL = p[sz - 1];
+            tp[0] = e0; tp[1] = e0;
+            Buffer.MemoryCopy(p, tp + 2, (129 + 2) * 2, sz * 2);
+            for (int k = sz + 2; k < sz + 2 + 20; k++) tp[k] = eL;
+            var k0 = System.Runtime.Intrinsics.Vector256.Create((ushort)kernel[0]); var k1 = System.Runtime.Intrinsics.Vector256.Create((ushort)kernel[1]);
+            var k2 = System.Runtime.Intrinsics.Vector256.Create((ushort)kernel[2]); var k3 = System.Runtime.Intrinsics.Vector256.Create((ushort)kernel[3]);
+            var k4 = System.Runtime.Intrinsics.Vector256.Create((ushort)kernel[4]); var r8 = System.Runtime.Intrinsics.Vector256.Create((ushort)8);
+            int i = 1;
+            for (; i < sz; i += 16)
+            {
+                ushort* q = tp + i;
+                var v = System.Runtime.Intrinsics.Vector256.Load(q) * k0 + System.Runtime.Intrinsics.Vector256.Load(q + 1) * k1
+                    + System.Runtime.Intrinsics.Vector256.Load(q + 2) * k2 + System.Runtime.Intrinsics.Vector256.Load(q + 3) * k3
+                    + System.Runtime.Intrinsics.Vector256.Load(q + 4) * k4 + r8;
+                v = System.Runtime.Intrinsics.Vector256.ShiftRightLogical(v, 4);
+                if (i + 16 <= sz) v.Store(p + i);
+                else { v.Store(o); Buffer.MemoryCopy(o, p + i, (sz - i) * 2, (sz - i) * 2); }
+            }
+            p[-1] = e0;
+            new Span<ushort>(p + sz, 8).Fill(eL);
+            return;
+        }
         ushort* edge = stackalloc ushort[129];
         Buffer.MemoryCopy(p, edge, 129 * 2, sz * 2);
         for (int i = 1; i < sz; i++)
