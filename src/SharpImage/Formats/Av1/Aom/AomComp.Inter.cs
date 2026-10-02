@@ -90,4 +90,16 @@ internal sealed partial class AomMacroblock
     public int CntZeromv;
     /// <summary>td->rd_counts.tx_type_used[TX_SIZES_ALL][TX_TYPES].</summary>
     public readonly int[] TxTypeUsed = new int[TX_SIZES_ALL * TX_TYPES];
+
+    /// <summary>accumulate_counters_enc_workers for a worker thread: av1_accumulate_frame_counts and accumulate_rd_opt
+    /// into the main thread data (cpi->td).</summary>
+    public void AccumulateWorker(AomMacroblock w)
+    {
+        Counts.Add(w.Counts);
+        CompoundRefUsedFlag |= w.CompoundRefUsedFlag;
+        SkipModeUsedFlag |= w.SkipModeUsedFlag;
+        for (int i = 0; i < TxTypeUsed.Length; i++) TxTypeUsed[i] += w.TxTypeUsed[i];
+        for (int i = 0; i < ObmcUsed.Length; i++) ObmcUsed[i] += w.ObmcUsed[i];
+        for (int i = 0; i < WarpedUsed.Length; i++) WarpedUsed[i] += w.WarpedUsed[i];
+    }
 }

@@ -276,11 +276,14 @@ internal sealed class AomRowMt
 
         Exception? error = null;
         using var done = new CountdownEvent(numWorkers);
+        var workerData = new AomMacroblock?[numWorkers];
         void Run(AomMacroblock? x, int threadId)
         {
             try
             {
-                mt.WorkerHook(cpi, x ?? newThreadData(), threadIdToTileId[threadId]);
+                x ??= newThreadData();
+                workerData[threadId] = x;
+                mt.WorkerHook(cpi, x, threadIdToTileId[threadId]);
             }
             catch (Exception e)
             {
@@ -299,6 +302,9 @@ internal sealed class AomRowMt
         done.Wait();
         cpi.RowMt = null;
         if (error != null) ExceptionDispatchInfo.Capture(error).Throw();
+        // accumulate_counters_enc_workers: the workers' counts into cpi->td (worker i > 0, highest first)
+        for (int i = numWorkers - 1; i > 0; i--)
+            if (workerData[i] is { } w) mainX.AccumulateWorker(w);
 
         // the token lists of the tiles' SB rows, in coding order
         cpi.PaletteTokens.Clear();
