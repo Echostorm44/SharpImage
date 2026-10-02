@@ -914,6 +914,7 @@ internal sealed partial class AomGqEncoder
             TileColumns = cfg.TileColumnsLog2, TileRows = cfg.TileRowsLog2, SourceFrame = source, UnfilteredSource = src.Img, Tpl = _cfg.LagInFrames > 1 ? _tpl : null, R0 = _r0,
             DeltaqObjective = cfg.Tune != AomTune.Iq && _enableTplModel,
             BaseQindex = qindex, UpdateType = updateType, GfFrameType = frameType, LayerDepth = gf.LayerDepth[_gfFrameIndex],
+            IsStatConsumptionStage = IsStatConsumptionStage, BoostIndex = Math.Min(15, _pRc.GfuBoost / 100),
             SbSize = _seq.SbSize, SeqFlags = _seqFlags, TxTypeProbs = _txTypeProbs, EnableRestoration = cfg.EnableRestoration,
             Sharpness = cfg.Sharpness, EnableCdef = cfg.EnableCdef, UseFixedQpOffsets = cfg.UseFixedQpOffsets,
             SsimSource = unscaled, SsimMiRows = _miRows, SsimMiCols = _miCols, SsimBuffer = _ssimFactors,

@@ -772,10 +772,18 @@ internal static partial class AomRdoptInter
         var refFrameRd = new long[REF_FRAMES];
         Array.Fill(refFrameRd, long.MaxValue);
         long interCost = -1, intraCost = -1;
-        if (sf.inter_sf.prune_inter_modes_based_on_tpl != 0 && cpi.TplStatsReady) throw new NotImplementedException("get_block_level_tpl_stats");
+        if (sf.inter_sf.prune_inter_modes_based_on_tpl != 0)
+        {
+            var validRefs = new bool[INTER_REFS_PER_FRAME];
+            for (int frame = LAST_FRAME; frame < REF_FRAMES; frame++)
+                validRefs[frame - 1] = x.TplKeepRefFrame[frame] || !PruneRefBySelectiveRefFrame(cpi, x, frame, NONE_FRAME, cpi.RefDisplayOrderHint);
+            Array.Clear(args.TplRefInterCost);
+            args.TplBestInterCost = 0;
+            GetBlockLevelTplStats(cpi, bsize, xd.MiRow, xd.MiCol, validRefs, args);
+        }
         bool doPruning = !(Math.Min(cm.Width, cm.Height) > 480 && cpi.Speed <= 1);
-        if (doPruning && sf.intra_sf.skip_intra_in_interframe != 0 && cpi.EnableTplModel && x.TplDataCount != 0)
-            throw new NotImplementedException("calculate_cost_from_tpl_data");
+        if (doPruning && sf.intra_sf.skip_intra_in_interframe != 0 && cpi.EnableTplModel && cpi.Tpl != null)
+            CalculateCostFromTplData(cpi, x, bsize, xd.MiRow, xd.MiCol, ref interCost, ref intraCost);
 
         int maxWinnerModeCount = AomRdoptUtils.WinnerModeCountAllowed[sf.winner_mode_sf.multi_winner_mode_type];
         AomRdoptUtils.ZeroWinnerModeStats(bsize, maxWinnerModeCount, x.WinnerModeStats);

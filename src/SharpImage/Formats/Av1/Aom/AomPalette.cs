@@ -55,13 +55,60 @@ internal static partial class AomPalette
     {
         int num = a.Length;
         if (num < 2) return;
-        if (num > 8) throw new NotSupportedException("msvcrt qsort emulation covers the shortsort range (<= 8 elements)");
-        // shortsort(lo, hi)
-        int hi = num - 1;
-        while (hi > 0)
+        // msvcrt's qsort: median-of-three quicksort with an explicit stack, shortsort below CUTOFF (8) elements
+        Span<int> loStk = stackalloc int[64], hiStk = stackalloc int[64];
+        int stkptr = 0;
+        int lo = 0, hi = num - 1;
+        while (true)
         {
-            int max = 0;
-            for (int p = 1; p <= hi; p++)
+            int size = hi - lo + 1;
+            if (size <= 8) ShortSort(a, lo, hi, comp);
+            else
+            {
+                int mid = lo + size / 2;
+                if (comp(in a[lo], in a[mid]) > 0) (a[lo], a[mid]) = (a[mid], a[lo]);
+                if (comp(in a[lo], in a[hi]) > 0) (a[lo], a[hi]) = (a[hi], a[lo]);
+                if (comp(in a[mid], in a[hi]) > 0) (a[mid], a[hi]) = (a[hi], a[mid]);
+                int loguy = lo, higuy = hi;
+                for (;;)
+                {
+                    if (mid > loguy)
+                        do { loguy++; } while (loguy < mid && comp(in a[loguy], in a[mid]) <= 0);
+                    if (mid <= loguy)
+                        do { loguy++; } while (loguy <= hi && comp(in a[loguy], in a[mid]) <= 0);
+                    do { higuy--; } while (higuy > mid && comp(in a[higuy], in a[mid]) > 0);
+                    if (higuy < loguy) break;
+                    (a[loguy], a[higuy]) = (a[higuy], a[loguy]);
+                    if (mid == higuy) mid = loguy;
+                }
+                higuy++;
+                if (mid < higuy)
+                    do { higuy--; } while (higuy > mid && comp(in a[higuy], in a[mid]) == 0);
+                if (mid >= higuy)
+                    do { higuy--; } while (higuy > lo && comp(in a[higuy], in a[mid]) == 0);
+                if (higuy - lo >= hi - loguy)
+                {
+                    if (lo < higuy) { loStk[stkptr] = lo; hiStk[stkptr] = higuy; ++stkptr; }
+                    if (loguy < hi) { lo = loguy; continue; }
+                }
+                else
+                {
+                    if (loguy < hi) { loStk[stkptr] = loguy; hiStk[stkptr] = hi; ++stkptr; }
+                    if (lo < higuy) { hi = higuy; continue; }
+                }
+            }
+            --stkptr;
+            if (stkptr >= 0) { lo = loStk[stkptr]; hi = hiStk[stkptr]; }
+            else return;
+        }
+    }
+
+    private static void ShortSort<T>(Span<T> a, int lo, int hi, QsortComparer<T> comp)
+    {
+        while (hi > lo)
+        {
+            int max = lo;
+            for (int p = lo + 1; p <= hi; p++)
                 if (comp(in a[p], in a[max]) > 0) max = p;
             if (max != hi) (a[max], a[hi]) = (a[hi], a[max]);
             hi--;

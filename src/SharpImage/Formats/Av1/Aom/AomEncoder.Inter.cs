@@ -188,8 +188,7 @@ internal static partial class AomEncoder
         cm.AllowRefFrameMvs &= sf.hl_sf.ref_frame_mvs_lvl != 2;
         if (cm.AllowRefFrameMvs) AomMvPred.SetupMotionField(cm);
         // (check_to_disable_ref_frame_mvs: needs TPL stats)
-        if (cm.AllowRefFrameMvs && sf.hl_sf.ref_frame_mvs_lvl == 1 && cpi.TplStatsReady)
-            throw new NotImplementedException("check_to_disable_ref_frame_mvs");
+        CheckToDisableRefFrameMvs(cpi, input);
         cm.SkipModeFlag = CheckSkipModeEnabled(cpi, input.LagInFrames);
         // the frame's mi-level motion storage and the inter mbmi_ext frame
         cpi.MbmiExtFrameInterBase = new AomMbmiExtFrameInter?[cm.MiGridBase.Length];

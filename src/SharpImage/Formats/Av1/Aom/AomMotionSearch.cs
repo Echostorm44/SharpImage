@@ -180,12 +180,14 @@ internal static class AomMotionSearch
         AomMv startMv = mbmi.MotionMode != SIMPLE_TRANSLATION ? mbmi.Mv0.ToFullMv() : refMv.ToFullMv();
         var fullpelRefMv = startMv;
         // cand_mv_t cand[]: the start mv (and the TPL candidates without full_pixel_search_level)
+        var cands = new TplCand[65];
+        cands[0].Fmv = startMv; cands[0].Weight = 0;
+        int cnt = 1, totalWeight = 0;
+        if (mvSf.full_pixel_search_level == 0 && mbmi.MotionMode == SIMPLE_TRANSLATION)
+            GetMvCandidateFromTpl(cpi, x, bsize, refFrame, cands, ref cnt, ref totalWeight);
         Span<AomMv> candMv = stackalloc AomMv[2];
         Span<int> candWeight = stackalloc int[2];
-        candMv[0] = startMv; candWeight[0] = 0;
-        int cnt = 1, totalWeight = 0;
-        if (mvSf.full_pixel_search_level == 0 && mbmi.MotionMode == SIMPLE_TRANSLATION && cpi.TplDataCount(x) != 0)
-            throw new NotImplementedException("get_mv_candidate_from_tpl");
+        for (int i = 0; i < 2; i++) { candMv[i] = cands[i].Fmv; candWeight[i] = cands[i].Weight; }
         int candCnt = Math.Min(2, cnt);
         bool[] candInvalid = new bool[2];
         if (mvSf.skip_fullpel_search_using_startmv_refmv != 0 && mbmi.MotionMode == SIMPLE_TRANSLATION)
@@ -416,6 +418,62 @@ internal static class AomMotionSearch
         }
         // (bestsme == INT_MAX without integer mvs: libaom leaves the full-pel values in the int_mv)
         rateMv = mvRateCalculated ? bestMvRate : MvBitCost(x, bestMv, refMv);
+    }
+
+    private struct TplCand { public AomMv Fmv; public int Weight; }
+
+    private static int RightShiftMv(int v) => (v + 3 + (v >= 0 ? 1 : 0)) >> 3;
+
+    /// <summary>get_mv_candidate_from_tpl.</summary>
+    private static void GetMvCandidateFromTpl(AomComp cpi, AomMacroblock x, int bsize, int refFrame, TplCand[] cand, ref int candCount, ref int totalCandWeight)
+    {
+        if (x.TplDataCount == 0) return;
+        var cm = cpi.Cm;
+        var xd = x.E;
+        int nw = MiSizeWide[bsize] / 4, nh = MiSizeHigh[bsize] / 4;
+        if (nw < 1 || nh < 1) return;
+        int ofH = xd.MiRow % MiSizeHigh[cm.SbSize], ofW = xd.MiCol % MiSizeWide[cm.SbSize];
+        int start = ofH / 4 * x.TplStride + ofW / 4;
+        bool valid = true;
+        cand[0].Weight = nw * nh;
+        for (int k = 0; k < nh; k++)
+        {
+            for (int l = 0; l < nw; l++)
+            {
+                var mv = x.TplMv[(start + k * x.TplStride + l) * INTER_REFS_PER_FRAME + refFrame - LAST_FRAME];
+                if (mv.AsInt == AomMv.Invalid.AsInt)
+                {
+                    valid = false;
+                    break;
+                }
+                var fmv = new AomMv(AomMv.GetMvRawpel(mv.Row), AomMv.GetMvRawpel(mv.Col));
+                bool unique = true;
+                for (int m = 0; m < candCount; m++)
+                    if (RightShiftMv(fmv.Row) == RightShiftMv(cand[m].Fmv.Row) && RightShiftMv(fmv.Col) == RightShiftMv(cand[m].Fmv.Col))
+                    {
+                        unique = false;
+                        cand[m].Weight++;
+                        break;
+                    }
+                if (unique)
+                {
+                    cand[candCount].Fmv = fmv;
+                    cand[candCount].Weight = 1;
+                    candCount++;
+                }
+            }
+            if (!valid) break;
+        }
+        if (valid)
+        {
+            totalCandWeight = 2 * nh * nw;
+            if (candCount > 2)
+                AomPalette.MsvcrtQsort<TplCand>(cand.AsSpan(0, candCount), static (in TplCand a, in TplCand b) =>
+                {
+                    int diff = a.Weight - b.Weight;
+                    return diff < 0 ? 1 : diff > 0 ? -1 : 0;
+                });
+        }
     }
 
     /// <summary>av1_compound_single_motion_search: a small-range full-pel search (step 5) and an eighth-pel refinement of

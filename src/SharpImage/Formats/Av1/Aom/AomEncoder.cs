@@ -179,7 +179,7 @@ internal static partial class AomEncoder
         {
             Width = input.Width, Height = input.Height, AllowScreenContentTools = input.AllowScreenContentTools,
             UseScreenContentTools = input.UseScreenContentTools, IsScreenContentType = input.IsScreenContentType, BaseQindex = input.BaseQindex,
-            NumWorkers = cpi.NumWorkers, Mode = input.Mode, Sharpness = cpi.Sharpness, UpdateType = input.UpdateType, GfFrameType = input.GfFrameType,
+            NumWorkers = cpi.NumWorkers, Mode = input.Mode, Sharpness = cpi.Sharpness, UpdateType = input.UpdateType, GfFrameType = input.GfFrameType, LapEnabled = input.IsStatConsumptionStage,
             FrameType = input.GfFrameType == KEY_FRAME ? KEY_FRAME : INTER_FRAME,
             Tuning = tune switch { AomTune.Iq => AOM_TUNE_IQ, AomTune.Ssim => AOM_TUNE_SSIM, _ => AOM_TUNE_PSNR },
         };
@@ -268,6 +268,7 @@ internal static partial class AomEncoder
         cpi.Tpl = input.Tpl;
         cpi.GfFrameIndex = input.GfFrameIndex;
         cpi.R0 = input.R0;
+        cpi.TplStatsReady = TplStatsReady(cpi);
         cpi.DeltaqObjective = input.DeltaqObjective && !cpi.DeltaqVarianceBoost;
         cpi.DeltaQRes = 0;
         if (cpi.DeltaqVarianceBoost) cpi.DeltaQRes = input.BaseQindex >= 160 ? 8 : input.BaseQindex >= 120 ? 4 : input.BaseQindex >= 80 ? 2 : 1;
@@ -280,6 +281,7 @@ internal static partial class AomEncoder
         var x = NewThreadData(cpi, input);
         if (cpi.DeltaQPresentFlag && cpi.DeltaqObjective) cpi.DeltaQPresentFlag = AllowDeltaqMode(cpi, x);
         cpi.DeltaQPresentFlag &= input.BaseQindex > 0;
+        AomTrace.Out?.Write($"dqp {(cpi.DeltaQPresentFlag ? 1 : 0)} res {cpi.DeltaQRes}" + (char)10);
         x.PaletteTokens = cpi.PaletteTokens;
 
         if (cpi.NumWorkers > 1)
@@ -655,8 +657,7 @@ internal static partial class AomEncoder
         AomSmsTree? smsRoot = null;
         if (!cm.FrameIsIntraOnly || useSimpleMotionSearch) smsRoot = x.SmsRoot ??= AomSmsTree.Build(cm.SbSize);
         if (useSimpleMotionSearch) AomEncodeFrame.InitSimpleMotionSearchMvsForSb(cpi, x, smsRoot!, miRow, miCol, true);
-        // init_ref_frame_space (no TPL stats: nothing kept)
-        Array.Clear(x.TplKeepRefFrame);
+        InitRefFrameSpace(cpi, x, miRow, miCol);
         x.Cnn.Valid = false;
         if (cpi.DeltaQPresentFlag) AomQuantSetup.SetupDeltaQ(cpi, x, miRow, miCol);
         x.ReuseInterPred = false;
@@ -678,6 +679,7 @@ internal static partial class AomEncoder
         if (sf.part_sf.partition_search_type != SEARCH_PARTITION)
             throw new NotSupportedException("FIXED_PARTITION is not used by the all-intra speeds");
 
+        GetTplStatsSb(cpi, x, cm.SbSize, miRow, miCol);
         // av1_reset_simple_motion_tree_partition, set_max_min_partition_size
         AomSmsTree.ResetPartition(smsRoot, cm.SbSize);
         AomIntraModeSearch.ProduceGradientsForSb(cpi, x, cm.SbSize, miRow, miCol);

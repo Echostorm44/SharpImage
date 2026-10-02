@@ -99,6 +99,9 @@ internal sealed class AomHandleInterModeArgs
     public int StartMvCnt;
     public int InterpFilterStatsIdx;
     public int WedgeIndex = -1, WedgeSign = -1, DiffwtdIndex = -1;
+    /// <summary>PruneInfoFromTpl (rd_pick_inter_mode's inter_cost_info_from_tpl).</summary>
+    public readonly long[] TplRefInterCost = new long[INTER_REFS_PER_FRAME];
+    public long TplBestInterCost;
     public readonly int[] CmpMode = new int[MODE_CTX_REF_FRAMES];
     public readonly uint[] BestSingleSseInRefs = new uint[REF_FRAMES];
     public uint BestPredSse;

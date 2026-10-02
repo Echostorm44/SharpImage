@@ -309,7 +309,12 @@ internal static partial class AomRdoptInter
         int bestXskipTxfm = 0;
         var modeInfo = new AomInterModeInfo[MAX_REF_MV_SEARCH];
         yrd = long.MaxValue;
-        if (pruneModesBasedOnTpl) throw new NotImplementedException("prune_modes_based_on_tpl_stats");
+        bool refMatchAbove = false, refMatchLeft = false;
+        if (pruneModesBasedOnTpl)
+        {
+            refMatchAbove = FindRefMatchInAboveNbs(cm.MiCols, xd);
+            refMatchLeft = FindRefMatchInLeftNbs(cm.MiRows, xd);
+        }
         int refSet = GetDrlRefmvCount(x, mbmi.RefFrame0, mbmi.RefFrame1, thisMode);
         var saveMv = new AomMv[MAX_REF_MV_SEARCH - 1, 2];
         int bestRefMvIdx = -1;
@@ -331,6 +336,9 @@ internal static partial class AomRdoptInter
             modeInfo[refMvIdx].DrlCost = drlCost;
             modeInfo[refMvIdx].Skip = 0;
             if (((idxMask >> refMvIdx) & 1) == 0) continue;
+            if (pruneModesBasedOnTpl && !refMatchAbove && !refMatchLeft && refBestRd != long.MaxValue)
+                if (PruneModesBasedOnTplStats(args, mbmi.RefFrame0, mbmi.RefFrame1, refMvIdx, thisMode, cpi.Sf.inter_sf.prune_inter_modes_based_on_tpl))
+                    continue;
             rdStats.Init();
             mbmi.InterinterComp.Type = COMPOUND_AVERAGE;
             mbmi.CompGroupIdx = 0;

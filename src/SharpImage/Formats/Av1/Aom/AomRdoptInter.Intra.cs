@@ -300,6 +300,22 @@ internal static partial class AomRdoptInter
                 return;
             }
         }
-        if (interCost >= 0 && intraCost >= 0) throw new NotImplementedException("skip_intra_modes_in_interframe NN (TPL costs)");
+        if (interCost >= 0 && intraCost >= 0)
+        {
+            var cm = cpi.Cm;
+            var nnConfig = Math.Min(cm.Width, cm.Height) <= 480 ? AomIntrapNn.Config : AomIntrapNn.HdConfig;
+            Span<float> nnFeatures = stackalloc float[6];
+            Span<float> scores = stackalloc float[2];
+            nnFeatures[0] = st.BestMbmode.SkipTxfm;
+            nnFeatures[1] = MiSizeWideLog2[bsize];
+            nnFeatures[2] = MiSizeHighLog2[bsize];
+            nnFeatures[3] = intraCost;
+            nnFeatures[4] = interCost;
+            int bdIdx = x.E.Bd == 8 ? 0 : x.E.Bd == 10 ? 1 : 2;
+            int acQ = Av1Tables.DequantTable[bdIdx, x.Qindex, 1], acQMax = Av1Tables.DequantTable[bdIdx, 255, 1];
+            nnFeatures[5] = acQMax / acQ;
+            AomMl.NnPredict(nnFeatures, nnConfig, true, scores);
+            if (scores[1] > scores[0] + 1.4f) st.IntraSearchState.SkipIntraModes = true;
+        }
     }
 }

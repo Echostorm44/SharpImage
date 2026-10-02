@@ -151,6 +151,7 @@ internal static class AomQuantSetup
         currentQindex = AdjustQFromDeltaQRes(deltaQRes, xd.CurrentBaseQindex, currentQindex);
         x.DeltaQindex = currentQindex - cm.BaseQindex;
         x.RdmultDeltaQindex = x.DeltaQindex;
+        AomTrace.Out?.Write(FormattableString.Invariant($"dq {miRow} {miCol} {currentQindex} {x.Rb:F6}") + (char)10);
         AomEncodeFrame.SetOffsets(cpi, x, miRow, miCol, sbSize);
         xd.Mi0.CurrentQindex = currentQindex;
         InitPlaneQuantizers(cpi, x, false);
