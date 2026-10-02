@@ -75,7 +75,7 @@ internal sealed partial class AomCflCtx
 }
 
 /// <summary>ModeCosts (av1/encoder/block.h): the intra key-frame mode symbol costs.</summary>
-internal sealed class AomModeCosts
+internal sealed partial class AomModeCosts
 {
     public const int PartitionContexts = 20, SkipContexts = 3, KfModeContexts = 5, IntraModes = 13, UvIntraModes = 14,
         BlockSizesAll = 22, PalatteBsizeCtxs = 7, PaletteYModeContexts = 3, PaletteUvModeContexts = 2, PaletteSizes = 7,

@@ -49,7 +49,7 @@ internal sealed class AomFrameBuffer
 /// <summary>AV1_COMMON / CommonModeInfoParams (the parts the all-intra encoder reads): frame size in mi units, the mi
 /// grid (MB_MODE_INFO pointers per 4x4) and its allocation (one MB_MODE_INFO per 4x4: mi_alloc_bsize BLOCK_4X4), the
 /// frame tx type map, the above contexts, the reconstruction (cur_frame) and the tile.</summary>
-internal sealed class AomCommon
+internal sealed partial class AomCommon
 {
     public readonly int Width, Height;
     public readonly int MiRows, MiCols, MiStride;

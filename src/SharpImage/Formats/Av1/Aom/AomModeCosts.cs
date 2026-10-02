@@ -3,7 +3,7 @@ using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
 
-internal static class AomModeCostFill
+internal static partial class AomModeCostFill
 {
     /// <summary>libaom BLOCK_SIZE -> the decoder's Av1BlockSize (dav1d order, 128x128 first).</summary>
     internal static readonly byte[] LibaomToDav1dBs =

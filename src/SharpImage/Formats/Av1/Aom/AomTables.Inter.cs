@@ -1155,5 +1155,23 @@ internal static partial class AomTables
     internal const int PYRAMID_PADDING = 16;
     internal const int PYRAMID_ALIGNMENT = 32;
     internal const int MAX_CORNERS = 4096;
+    internal const int CFL_JOINT_SIGNS = 8;
+    internal const int CFL_ALPHA_CONTEXTS = 6;
+    internal const int LUMA_MODE_COUNT = 61;
+    internal const int INTER_MODES = 4;
+    internal const int INTER_COMPOUND_MODES = 8;
+    internal const int FRAME_BUFFERS = 16;
+    internal const int TOTAL_COMP_REFS = 21;
+    internal const int COMP_REFS = 16;
+    internal const int MODE_CTX_REF_FRAMES = 29;
+    internal const int SUPERRES_SCALE_DENOMINATOR_MIN = 9;
+    internal const int SWITCHABLE_FILTER_CONTEXTS = 16;
+    internal const int INTER_FILTER_COMP_OFFSET = 4;
+    internal const int INTER_FILTER_DIR_OFFSET = 8;
+    internal const int DEFAULT_WMTYPE = 3;
+    internal const int FRAME_CONTEXTS = 17;
+    internal const int FRAME_CONTEXT_DEFAULTS = 16;
+    internal const int MAX_TPL_FRAME_IDX = 96;
+    internal const int MAX_LENGTH_TPL_FRAME_STATS = 105;
     internal const int DEFAULT_EXPLICIT_ORDER_HINT_BITS = 7;
 }

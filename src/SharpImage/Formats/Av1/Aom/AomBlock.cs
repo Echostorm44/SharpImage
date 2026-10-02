@@ -94,6 +94,7 @@ internal sealed partial class AomMbModeInfo
         Array.Copy(s.InterTxSize, InterTxSize, InterTxSize.Length);
         SegmentId = s.SegmentId; UseIntrabc = s.UseIntrabc; SkipMode = s.SkipMode; CdefStrength = s.CdefStrength;
         Mv0 = s.Mv0; Mv1 = s.Mv1; MotionMode = s.MotionMode; InterpFilters = s.InterpFilters;
+        CopyInterFrom(s);
     }
 
     public static readonly AomMbModeInfo Zero = new();
@@ -108,6 +109,8 @@ internal struct AomBuf2d
     /// <summary>The high bit depth samples (CONVERT_TO_SHORTPTR(buf)); null for 8-bit buffers (Buf is null for high bit depth ones).</summary>
     public ushort[] Buf16;
     public int Offset, Stride, Width, Height;
+    /// <summary>buf0: the offset of the plane's (0, 0) sample (reference planes of inter prediction).</summary>
+    public int Offset0;
 }
 
 /// <summary>struct macroblock_plane (MACROBLOCK_PLANE).</summary>
