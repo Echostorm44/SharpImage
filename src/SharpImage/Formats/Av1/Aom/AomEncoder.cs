@@ -329,7 +329,7 @@ internal static partial class AomEncoder
         if (cpi.Sf.rt_sf.use_nonrd_pick_mode == 0 && cpi.AllowIntrabcNow)   // av1_need_dv_costs
         {
             x.DvCosts = new AomDvCosts();
-            AomMvCost.FillDvCosts(cm.Fc.Mv, x.DvCosts);
+            AomMvCost.FillDvCosts(cm.Fc.Dmv, x.DvCosts);
         }
 
         xd.CurrentBaseQindex = input.BaseQindex;
@@ -557,7 +557,7 @@ internal static partial class AomEncoder
         // (mv costs: inter frames only)
         int dvLevel = cpi.Sf.intra_sf.dv_cost_upd_level;
         if (dvLevel >= INTERNAL_COST_UPD_SBROW_SET && cpi.AllowIntrabcNow && !SkipCostUpdate(cm, x.E, miRow, miCol, dvLevel))   // skip_dv_cost_update
-            AomMvCost.FillDvCosts(x.TileCtx.Mv, x.DvCosts!);
+            AomMvCost.FillDvCosts(x.TileCtx.Dmv, x.DvCosts!);
     }
 
     /// <summary>skip_cost_update.</summary>

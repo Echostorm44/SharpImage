@@ -783,7 +783,7 @@ internal static partial class AomBitstream
             if (mbmi.UseIntrabc != 0)
             {
                 var ext = t.Cpi.MbmiExtFrameAt(xd.MiRow, xd.MiCol)!;   // x->mbmi_ext_frame
-                EncodeDv(t.W, mbmi.Mv0, ext.RefMvStack[0].ThisMv, t.Fc.Mv);
+                EncodeDv(t.W, mbmi.Mv0, ext.RefMvStack[0].ThisMv, t.Fc.Dmv);
                 return;
             }
         }

@@ -3856,6 +3856,7 @@ public static class Av1CdfDefaults
         InitializeCoef(ctx.Coef, qcat);
         InitializeMode(ctx.Mode);
         InitializeMv(ctx.Mv);
+        InitializeMv(ctx.Dmv);
         InitializeKfym(ctx.Kfym);
     }
 }

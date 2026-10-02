@@ -32,6 +32,8 @@ internal sealed partial class AomCommon
     public AomMvRefStore[]? CurFrameMvs;
     public readonly int[] CurRefOrderHints = new int[INTER_REFS_PER_FRAME];
     // cm->features
+    /// <summary>seq_params->order_hint_info.enable_ref_frame_mvs.</summary>
+    public bool EnableRefFrameMvs;
     public bool AllowRefFrameMvs, AllowHighPrecisionMv, CurFrameForceIntegerMv, AllowWarpedMotion, SwitchableMotionMode;
     public int InterpFilter = SWITCHABLE;
     public int ReferenceMode = SINGLE_REFERENCE;

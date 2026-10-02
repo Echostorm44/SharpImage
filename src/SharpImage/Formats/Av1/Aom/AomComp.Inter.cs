@@ -43,6 +43,8 @@ internal sealed class AomFrameProbs
 internal sealed partial class AomComp
 {
     public AomFrameProbs FrameProbs = new();
+    /// <summary>cpi->mbmi_ext_info.frame_base of an inter frame (per mi; entries on first write).</summary>
+    public AomMbmiExtFrameInter?[]? MbmiExtFrameInterBase;
 
     /// <summary>frame_probs.switchable_interp_probs[update_type][ctx][filter].</summary>
     public int SwitchableInterpProb(int updateType, int ctx, int filter)
@@ -58,4 +60,24 @@ internal sealed partial class AomComp
         if (Sf.interp_sf.adaptive_interp_filter_search == 2)
             Array.Copy(DefaultSwitchableInterpProbs, FrameProbs.SwitchableInterpProbs, DefaultSwitchableInterpProbs.Length);
     }
+}
+
+/// <summary>FRAME_COUNTS (the parts the encoder decisions read).</summary>
+internal sealed class AomFrameCounts
+{
+    public readonly int[] SwitchableInterp = new int[SWITCHABLE_FILTER_CONTEXTS * SWITCHABLE_FILTERS];
+    public void Clear() => Array.Clear(SwitchableInterp);
+    public void Add(AomFrameCounts o) { for (int i = 0; i < SwitchableInterp.Length; i++) SwitchableInterp[i] += o.SwitchableInterp[i]; }
+}
+
+internal sealed partial class AomMacroblock
+{
+    /// <summary>td->counts.</summary>
+    public readonly AomFrameCounts Counts = new();
+    /// <summary>td->rd_counts: skip_mode_used_flag, compound_ref_used_flag, obmc_used[bsize][2], warped_used[2].</summary>
+    public bool SkipModeUsedFlag, CompoundRefUsedFlag;
+    public readonly int[] ObmcUsed = new int[BLOCK_SIZES_ALL * 2];
+    public readonly int[] WarpedUsed = new int[2];
+    /// <summary>x->cnt_zeromv.</summary>
+    public int CntZeromv;
 }

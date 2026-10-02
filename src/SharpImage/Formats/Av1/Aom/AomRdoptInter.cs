@@ -458,6 +458,8 @@ internal static partial class AomRdoptInter
         return skipRd <= rdThresh;
     }
 
+    internal static void CollectNeighborsRefCountsPublic(AomMacroblockD xd) => CollectNeighborsRefCounts(xd);
+
     /// <summary>av1_collect_neighbors_ref_counts.</summary>
     private static void CollectNeighborsRefCounts(AomMacroblockD xd)
     {

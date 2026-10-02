@@ -163,6 +163,8 @@ public sealed class Av1CdfContext
     public Av1CdfCoefContext Coef = new();
     public Av1CdfModeContext Mode = new();
     public Av1CdfMvContext Mv = new();
+    /// <summary>The intrabc displacement vector context (libaom's ndvc; the encoder keeps it apart from nmvc).</summary>
+    public Av1CdfMvContext Dmv = new();
     public ushort[][] Kfym = AllocKfym(); // [5][5][N_INTRA_PRED_MODES + 3] = [25][16]
 
     private static ushort[][] AllocKfym()
@@ -195,6 +197,9 @@ public sealed class Av1CdfContext
         CopyMvComponent(src.Mv.Comp0, Mv.Comp0);
         CopyMvComponent(src.Mv.Comp1, Mv.Comp1);
         Array.Copy(src.Mv.Joint, Mv.Joint, Mv.Joint.Length);
+        CopyMvComponent(src.Dmv.Comp0, Dmv.Comp0);
+        CopyMvComponent(src.Dmv.Comp1, Dmv.Comp1);
+        Array.Copy(src.Dmv.Joint, Dmv.Joint, Dmv.Joint.Length);
         for (int i = 0; i < 25; i++)
             CopyCdf(src.Kfym[i], Kfym[i]);
     }
@@ -229,6 +234,7 @@ public sealed class Av1CdfContext
         ResetModeCounters(Mode);
         ResetCoefCounters(Coef);
         ResetMvCounters(Mv);
+        ResetMvCounters(Dmv);
         ResetJaggedCounter(Kfym, 12); // 13 intra modes → 12 CDF values, counter at [12]
     }
 

@@ -184,4 +184,24 @@ internal static class AomInter
         if (mbmi.HasSecondRef && xd.GlobalMotion[mbmi.RefFrame1].WmType == TRANSLATION) return false;
         return true;
     }
+
+    /// <summary>is_interinter_compound_used.</summary>
+    public static bool IsInterinterCompoundUsed(int type, int bsize)
+    {
+        bool compAllowed = IsCompRefAllowed(bsize);
+        return type switch
+        {
+            COMPOUND_WEDGE => compAllowed && AomInterPred.WedgeTypes(bsize) > 0,
+            _ => compAllowed,
+        };
+    }
+
+    /// <summary>is_any_masked_compound_used.</summary>
+    public static bool IsAnyMaskedCompoundUsed(int bsize)
+    {
+        if (!IsCompRefAllowed(bsize)) return false;
+        for (int t = 0; t < COMPOUND_TYPES; t++)
+            if (IsMaskedCompoundType(t) && IsInterinterCompoundUsed(t, bsize)) return true;
+        return false;
+    }
 }

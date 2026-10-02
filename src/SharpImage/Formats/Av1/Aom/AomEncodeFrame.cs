@@ -384,7 +384,7 @@ internal static partial class AomEncodeFrame
         return (var + ((1u << sh) >> 1)) >> sh;
     }
 
-    /// <summary>pick_sb_modes (intra frames).</summary>
+    /// <summary>pick_sb_modes (no segmentation / AQ).</summary>
     internal static void PickSbModes(AomComp cpi, AomMacroblock x, int miRow, int miCol, ref AomRdStats rdCost, int partition, int bsize,
         AomPickModeContext ctx, AomRdStats bestRd)
     {
@@ -443,7 +443,8 @@ internal static partial class AomEncodeFrame
 
         if (sf.part_sf.use_best_rd_for_pruning == 0) bestRd.Invalidate();
 
-        RdPickIntraModeSb(cpi, x, ref rdCost, bsize, ctx, bestRd.Rdcost);
+        if (cm.FrameIsIntraOnly) RdPickIntraModeSb(cpi, x, ref rdCost, bsize, ctx, bestRd.Rdcost);
+        else AomRdoptInter.RdPickInterMode(cpi, x, ref rdCost, bsize, ctx, bestRd.Rdcost);
 
         x.Rdmult = origRdmult;
         if (rdCost.Rate == int.MaxValue) rdCost.Rdcost = long.MaxValue;
@@ -513,7 +514,8 @@ internal static partial class AomEncodeFrame
         int mis = cm.MiStride;
 
         miAddr.CopyFrom(mi);
-        ctx.MbmiExtBest.CopyTo(x.MbmiExt);   // copy_mbmi_ext_frame_to_mbmi_ext
+        if (cm.FrameIsIntraOnly) ctx.MbmiExtBest.CopyTo(x.MbmiExt);   // copy_mbmi_ext_frame_to_mbmi_ext
+        else ctx.MbmiExtBestInter.CopyTo(x.MbmiExtInter, AomInter.RefFrameType(mi.RefFrame0, mi.RefFrame1));
         x.TxfmSkip = ctx.RdStats.SkipTxfm;
 
         xd.TxTypeMap = ctx.TxTypeMap;
@@ -529,6 +531,16 @@ internal static partial class AomEncodeFrame
             xd.TxTypeMapStride = mis;
         }
 
+        if (dryRun == OUTPUT_ENABLED && !cm.FrameIsIntraOnly)
+        {
+            var mv = mi.Mv0;
+            if (mi.IsInterBlock && mi.RefFrame0 == LAST_FRAME && Math.Abs((int)mv.Row) < 8 && Math.Abs((int)mv.Col) < 8)
+            {
+                int ymis = Math.Min(cm.MiRows - miRow, bh);
+                for (int miY = 0; miY < ymis; miY += 2) x.CntZeromv += bw << 1;
+            }
+        }
+
         for (int i = 0; i < numPlanes; ++i)
         {
             x.Plane[i].Eobs = ctx.Eobs[i];
@@ -540,9 +552,20 @@ internal static partial class AomEncodeFrame
         int rows = Math.Min((xd.MbToBottomEdge >> (3 + 2)) + bh, bh);
         for (int y = 0; y < rows; y++)
             for (int xi = 0; xi < cols; xi++) xd.MiGrid[xd.MiOffset + xi + y * mis] = miAddr;
+
+        if (dryRun != OUTPUT_ENABLED) return;
+        if (!cm.FrameIsIntraOnly && mi.IsInterBlock && cm.InterpFilter == SWITCHABLE)
+            for (int dir = 0; dir < 2; ++dir)   // update_filter_type_count
+            {
+                int ctx2 = AomPredCommon.SwitchableInterp(xd, dir);
+                int filter = AomPredCommon.ExtractInterpFilter(miAddr.InterpFilters, dir);
+                x.Counts.SwitchableInterp[ctx2 * SWITCHABLE_FILTERS + filter]++;
+            }
+        int xMis = Math.Min(bw, cm.MiCols - miCol), yMis = Math.Min(bh, cm.MiRows - miRow);
+        if (cm.EnableRefFrameMvs) AomMvPred.CopyFrameMvs(cm, mi, miRow, miCol, xMis, yMis);
     }
 
-    /// <summary>encode_superblock (intra blocks).</summary>
+    /// <summary>encode_superblock.</summary>
     internal static void EncodeSuperblock(AomComp cpi, AomMacroblock x, int dryRun, int bsize)
     {
         var cm = cpi.Cm;
@@ -579,8 +602,25 @@ internal static partial class AomEncodeFrame
         {
             // intrabc: the prediction from the current frame, then the residual and tokens (x->reuse_inter_pred is
             // real-time only: all planes are predicted)
-            for (int i = 0; i < numPlanes; ++i) xd.Plane[i].Pre0 = xd.Plane[i].Dst;
-            AomReconInter.BuildIntrabcPredictor(cm, xd, miRow, miCol, 0, numPlanes - 1);
+            if (mbmi.UseIntrabc != 0)
+            {
+                for (int i = 0; i < numPlanes; ++i) xd.Plane[i].Pre0 = xd.Plane[i].Dst;
+                AomReconInter.BuildIntrabcPredictor(cm, xd, miRow, miCol, 0, numPlanes - 1);
+            }
+            else
+            {
+                bool isCompound = mbmi.HasSecondRef;
+                AomRdoptInter.SetRefPtrs(cm, xd, mbmi.RefFrame0, mbmi.RefFrame1);
+                for (int r = 0; r < 1 + (isCompound ? 1 : 0); ++r)
+                {
+                    var cfg = cm.RefBufs[r == 0 ? mbmi.RefFrame0 : mbmi.RefFrame1]!.Buf;
+                    AomInterPred.SetupPrePlanes(xd, r, cfg, miRow, miCol, xd.BlockRefScaleFactors[r]!, numPlanes);
+                }
+                int startPlane = x.ReuseInterPred && cpi.Sf.rt_sf.nonrd_check_partition_split == 0 && cm.BitDepth == 8 ? 1 : 0;
+                AomInterPred.EncBuildInterPredictor(cm, xd, miRow, miCol, null, bsize, startPlane, numPlanes - 1, cpi.EnableIntraEdgeFilter);
+                if (mbmi.MotionMode == OBMC_CAUSAL)
+                    AomInterPred.BuildObmcInterPredictorsSb(cm, xd, () => SetupDstPlanes(cpi, xd, mbmi.Bsize, miRow, miCol));
+            }
             EncodeSbInter(cpi, x, bsize, dryRun);
             TokenizeSbVartx(cpi, x, dryRun, bsize, cpi.AllowUpdateCdf);
         }
@@ -638,6 +678,7 @@ internal static partial class AomEncodeFrame
         }
 
         if (isInter && !xd.IsChromaRef && AomCfl.IsCflAllowed(xd) != 0) AomCfl.CflStoreBlock(xd, mbmi.Bsize, mbmi.TxSize);
+        if (dryRun == OUTPUT_ENABLED && cpi.Sf.rt_sf.use_temporal_noise_estimate != 0) throw new NotImplementedException("update_zeromv_cnt");
     }
 
     private static readonly byte[] BsizeToMaxDepth = { 0, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 };
@@ -689,11 +730,43 @@ internal static partial class AomEncodeFrame
             }
             // delta quant: the superblock's first coded block moves the running base qindex
             bool superBlockUpperLeft = (miRow & (cm.MibSize - 1)) == 0 && (miCol & (cm.MibSize - 1)) == 0;
+            if (!nonrd && mbmi.HasSecondRef)
+                mbmi.CompGroupIdx = (byte)(mbmi.CompoundIdx == 0 || mbmi.InterinterComp.Type == COMPOUND_AVERAGE ? 0 : 1);
             if (!nonrd && cpi.DeltaQPresentFlag && (bsize != cm.SbSize || mbmi.SkipTxfm == 0) && superBlockUpperLeft)   // (encode_b only; encode_b_nonrd does not)
                 xd.CurrentBaseQindex = mbmi.CurrentQindex;
+            if (!cm.FrameIsIntraOnly)
+            {
+                if (nonrd) throw new NotImplementedException("encode_b_nonrd inter blocks");
+                if (mbmi.SkipMode != 0)
+                {
+                    x.SkipModeUsedFlag = true;
+                    if (cm.ReferenceMode == REFERENCE_MODE_SELECT) x.CompoundRefUsedFlag = true;
+                    AomRdoptInter.SetRefPtrs(cm, xd, mbmi.RefFrame0, mbmi.RefFrame1);
+                }
+                else if (mbmi.IsInterBlock)
+                {
+                    AomRdoptInter.CollectNeighborsRefCountsPublic(xd);
+                    if (cm.ReferenceMode == REFERENCE_MODE_SELECT && mbmi.HasSecondRef) x.CompoundRefUsedFlag = true;
+                    AomRdoptInter.SetRefPtrs(cm, xd, mbmi.RefFrame0, mbmi.RefFrame1);
+                }
+            }
             if (cpi.AllowUpdateCdf) UpdateStats(cpi, x);
+            if (!cm.FrameIsIntraOnly &&
+                ((cpi.Sf.inter_sf.prune_obmc_prob_thresh > 0 && cpi.Sf.inter_sf.prune_obmc_prob_thresh < int.MaxValue) ||
+                 (cm.AllowWarpedMotion && cpi.Sf.inter_sf.prune_warped_prob_thresh > 0)) && mbmi.IsInterBlock)
+            {
+                int motionAllowed = cm.SwitchableMotionMode ? AomRdoptInter.MotionModeAllowed(xd.GlobalMotion, xd, mbmi, cm.AllowWarpedMotion) : SIMPLE_TRANSLATION;
+                if (mbmi.RefFrame1 != INTRA_FRAME)
+                {
+                    if (motionAllowed >= OBMC_CAUSAL) x.ObmcUsed[bsize * 2 + (mbmi.MotionMode == OBMC_CAUSAL ? 1 : 0)]++;
+                    if (motionAllowed == WARPED_CAUSAL) x.WarpedUsed[mbmi.MotionMode == WARPED_CAUSAL ? 1 : 0]++;
+                }
+            }
         }
-        extFrame?.CopyFrom(x.MbmiExt);   // av1_copy_mbmi_ext_to_mbmi_ext_frame
+        if (cm.FrameIsIntraOnly) extFrame?.CopyFrom(x.MbmiExt);   // av1_copy_mbmi_ext_to_mbmi_ext_frame
+        else
+            (cpi.MbmiExtFrameInterBase![miRow * cm.MiStride + miCol] ??= new AomMbmiExtFrameInter())
+                .CopyFrom(x.MbmiExtInter, AomInter.RefFrameType(xd.Mi0.RefFrame0, xd.Mi0.RefFrame1));
         x.Rdmult = originMult;
     }
 
@@ -780,27 +853,185 @@ internal static partial class AomEncodeFrame
         UpdateExtPartitionContext(xd, miRow, miCol, subsize, bsize, partition);
     }
 
-    /// <summary>update_stats (intra frames): skip flag, av1_sum_intra_stats, intrabc flag.</summary>
+    /// <summary>update_stats (no segmentation; the delta q / lf counts are statistics only).</summary>
     private static void UpdateStats(AomComp cpi, AomMacroblock x)
     {
+        var cm = cpi.Cm;
         var xd = x.E;
         var mbmi = xd.Mi0;
         var fc = x.TileCtx;
-        int skipCtx = AomTxSearch.SkipTxfmContext(xd);
-        AomCdf.Update(fc.Mode.Skip[skipCtx], mbmi.SkipTxfm, 2);
+        var m = fc.Mode;
+        int bsize = mbmi.Bsize;
+        if (cm.SkipModeFlag && AomInter.IsCompRefAllowed(bsize))
+            AomCdf.Update(m.SkipMode[AomPredCommon.SkipMode(xd)], mbmi.SkipMode, 2);
+        if (mbmi.SkipMode == 0)
+        {
+            int skipCtx = AomTxSearch.SkipTxfmContext(xd);
+            AomCdf.Update(m.Skip[skipCtx], mbmi.SkipTxfm, 2);
+        }
         if (!AomEncodeMb.IsInterBlock(mbmi)) SumIntraStats(cpi, x, mbmi);
         if (cpi.AllowIntrabcNow)
         {
-            AomCdf.Update(fc.Mode.Intrabc, mbmi.UseIntrabc, 2);
+            AomCdf.Update(m.Intrabc, mbmi.UseIntrabc, 2);
             if (mbmi.UseIntrabc != 0)
             {
                 var dvRef = x.MbmiExt.RefMvStack[0].ThisMv;
-                AomMvCost.UpdateMvStats(mbmi.Mv0, dvRef, fc.Mv, AomMvCost.MV_SUBPEL_NONE);   // fc->ndvc
+                AomMvCost.UpdateMvStats(mbmi.Mv0, dvRef, fc.Dmv, AomMvCost.MV_SUBPEL_NONE);   // fc->ndvc
+            }
+        }
+        if (cm.FrameIsIntraOnly || mbmi.SkipMode != 0) return;
+
+        bool interBlock = mbmi.IsInterBlock;
+        AomCdf.Update(m.Intra[AomPredCommon.IntraInter(xd)], interBlock ? 1 : 0, 2);
+        if (interBlock)
+        {
+            int ref0 = mbmi.RefFrame0, ref1 = mbmi.RefFrame1;
+            if (cm.ReferenceMode == REFERENCE_MODE_SELECT && AomInter.IsCompRefAllowed(bsize))
+                AomCdf.Update(m.Comp[AomPredCommon.ReferenceMode(xd)], mbmi.HasSecondRef ? 1 : 0, 2);
+            if (mbmi.HasSecondRef)
+            {
+                bool uni = AomInter.HasUniCompRefs(mbmi);
+                AomCdf.Update(m.CompDir[AomPredCommon.CompReferenceType(xd)], uni ? 0 : 1, 2);   // UNIDIR 0 / BIDIR 1
+                if (uni)
+                {
+                    int bit = ref0 == BWDREF_FRAME ? 1 : 0;
+                    AomCdf.Update(m.CompUniRef[0 * 3 + AomPredCommon.UniCompRefP(xd)], bit, 2);
+                    if (bit == 0)
+                    {
+                        int bit1 = ref1 == LAST3_FRAME || ref1 == GOLDEN_FRAME ? 1 : 0;
+                        AomCdf.Update(m.CompUniRef[1 * 3 + AomPredCommon.UniCompRefP1(xd)], bit1, 2);
+                        if (bit1 != 0) AomCdf.Update(m.CompUniRef[2 * 3 + AomPredCommon.UniCompRefP2(xd)], ref1 == GOLDEN_FRAME ? 1 : 0, 2);
+                    }
+                }
+                else
+                {
+                    int bit = ref0 == GOLDEN_FRAME || ref0 == LAST3_FRAME ? 1 : 0;
+                    AomCdf.Update(m.CompFwdRef[0 * 3 + AomPredCommon.CompRefP(xd)], bit, 2);
+                    if (bit == 0) AomCdf.Update(m.CompFwdRef[1 * 3 + AomPredCommon.CompRefP1(xd)], ref0 == LAST2_FRAME ? 1 : 0, 2);
+                    else AomCdf.Update(m.CompFwdRef[2 * 3 + AomPredCommon.CompRefP2(xd)], ref0 == GOLDEN_FRAME ? 1 : 0, 2);
+                    AomCdf.Update(m.CompBwdRef[0 * 3 + AomPredCommon.CompBwdrefP(xd)], ref1 == ALTREF_FRAME ? 1 : 0, 2);
+                    if (ref1 != ALTREF_FRAME) AomCdf.Update(m.CompBwdRef[1 * 3 + AomPredCommon.CompBwdrefP1(xd)], ref1 == ALTREF2_FRAME ? 1 : 0, 2);
+                }
+            }
+            else
+            {
+                int bit = ref0 >= BWDREF_FRAME ? 1 : 0;
+                AomCdf.Update(m.Ref[0 * 3 + AomPredCommon.SingleRefP1(xd)], bit, 2);
+                if (bit != 0)
+                {
+                    AomCdf.Update(m.Ref[1 * 3 + AomPredCommon.SingleRefP2(xd)], ref0 == ALTREF_FRAME ? 1 : 0, 2);
+                    if (ref0 != ALTREF_FRAME) AomCdf.Update(m.Ref[5 * 3 + AomPredCommon.SingleRefP6(xd)], ref0 == ALTREF2_FRAME ? 1 : 0, 2);
+                }
+                else
+                {
+                    int bit1 = !(ref0 == LAST2_FRAME || ref0 == LAST_FRAME) ? 1 : 0;
+                    AomCdf.Update(m.Ref[2 * 3 + AomPredCommon.SingleRefP3(xd)], bit1, 2);
+                    if (bit1 == 0) AomCdf.Update(m.Ref[3 * 3 + AomPredCommon.SingleRefP4(xd)], ref0 != LAST_FRAME ? 1 : 0, 2);
+                    else AomCdf.Update(m.Ref[4 * 3 + AomPredCommon.SingleRefP5(xd)], ref0 != LAST3_FRAME ? 1 : 0, 2);
+                }
+            }
+            if (cpi.Seq!.EnableInterintraCompound && AomInter.IsInterintraAllowed(mbmi))
+            {
+                int g = SizeGroupLookup[bsize];
+                if (mbmi.RefFrame1 == INTRA_FRAME)
+                {
+                    AomCdf.Update(m.Interintra[g], 1, 2);
+                    AomCdf.Update(m.InterintraMode[g], mbmi.InterintraMode, INTERINTRA_MODES);
+                    if (AomInterPred.IsWedgeUsed(bsize))
+                    {
+                        int w = AomModeCostFill.WedgeCtx[bsize];
+                        AomCdf.Update(m.InterintraWedge[w], mbmi.UseWedgeInterintra, 2);
+                        if (mbmi.UseWedgeInterintra != 0) AomCdf.Update(m.WedgeIdx[w], mbmi.InterintraWedgeIndex, 16);
+                    }
+                }
+                else AomCdf.Update(m.Interintra[g], 0, 2);
+            }
+            int motionAllowed = cm.SwitchableMotionMode ? AomRdoptInter.MotionModeAllowed(xd.GlobalMotion, xd, mbmi, cm.AllowWarpedMotion) : SIMPLE_TRANSLATION;
+            if (mbmi.RefFrame1 != INTRA_FRAME)
+            {
+                int db = AomModeCostFill.LibaomToDav1dBs[bsize];
+                if (motionAllowed == WARPED_CAUSAL) AomCdf.Update(m.MotionMode[db], mbmi.MotionMode, MOTION_MODES);
+                else if (motionAllowed == OBMC_CAUSAL) AomCdf.Update(m.Obmc[db], mbmi.MotionMode == OBMC_CAUSAL ? 1 : 0, 2);
+            }
+            if (mbmi.HasSecondRef)
+            {
+                bool maskedCompoundUsed = AomInter.IsAnyMaskedCompoundUsed(bsize) && cpi.Seq.EnableMaskedCompound;
+                if (maskedCompoundUsed) AomCdf.Update(m.MaskComp[AomPredCommon.CompGroupIdx(xd)], mbmi.CompGroupIdx, 2);
+                if (mbmi.CompGroupIdx == 0) AomCdf.Update(m.JntComp[AomPredCommon.CompIndex(cm, xd)], mbmi.CompoundIdx, 2);
+                else if (AomInter.IsInterinterCompoundUsed(COMPOUND_WEDGE, bsize))
+                    AomCdf.Update(m.WedgeComp[AomModeCostFill.WedgeCtx[bsize]], mbmi.InterinterComp.Type - COMPOUND_WEDGE, MASKED_COMPOUND_TYPES);
+            }
+            if (mbmi.InterinterComp.Type == COMPOUND_WEDGE && AomInter.IsInterinterCompoundUsed(COMPOUND_WEDGE, bsize))
+                AomCdf.Update(m.WedgeIdx[AomModeCostFill.WedgeCtx[bsize]], mbmi.InterinterComp.WedgeIndex, 16);
+        }
+        if (interBlock && cm.InterpFilter == SWITCHABLE && AomInterpSearch.IsInterpNeeded(xd))
+            for (int dir = 0; dir < 2; ++dir)   // update_filter_type_cdf
+            {
+                if (dir != 0 && !cpi.Seq!.EnableDualFilter) break;
+                int ctx = AomPredCommon.SwitchableInterp(xd, dir);
+                AomCdf.Update(m.Filter[ctx], AomPredCommon.ExtractInterpFilter(mbmi.InterpFilters, dir), SWITCHABLE_FILTERS);
+            }
+        if (interBlock)
+        {
+            var ext = x.MbmiExtInter;
+            int mode = mbmi.Mode;
+            int modeCtx = AomInter.ModeContextAnalyzer(ext.ModeContext, mbmi.RefFrame0, mbmi.RefFrame1);
+            if (mbmi.HasSecondRef) AomCdf.Update(m.CompInterMode[modeCtx], mode - NEAREST_NEARESTMV, INTER_COMPOUND_MODES);
+            else UpdateInterModeStats(m, mode, modeCtx);
+            bool newMv = mode == NEWMV || mode == NEW_NEWMV;
+            int rft = AomInter.RefFrameType(mbmi.RefFrame0, mbmi.RefFrame1);
+            if (newMv)
+                for (int idx = 0; idx < 2; ++idx)
+                    if (ext.RefMvCount[rft] > idx + 1)
+                    {
+                        int drlCtx = AomInter.DrlCtx(ext.Weight[rft], idx);
+                        AomCdf.Update(m.DrlBit[drlCtx], mbmi.RefMvIdx != idx ? 1 : 0, 2);
+                        if (mbmi.RefMvIdx == idx) break;
+                    }
+            if (AomInter.HaveNearmvInInterMode(mode))
+                for (int idx = 1; idx < 3; ++idx)
+                    if (ext.RefMvCount[rft] > idx + 1)
+                    {
+                        int drlCtx = AomInter.DrlCtx(ext.Weight[rft], idx);
+                        AomCdf.Update(m.DrlBit[drlCtx], mbmi.RefMvIdx != idx - 1 ? 1 : 0, 2);
+                        if (mbmi.RefMvIdx == idx - 1) break;
+                    }
+            if (AomInter.HaveNewmvInInterMode(mode))
+            {
+                int allowHp = cm.CurFrameForceIntegerMv ? AomMvCost.MV_SUBPEL_NONE : (cm.AllowHighPrecisionMv ? 1 : 0);
+                if (newMv)
+                {
+                    AomMvCost.UpdateMvStats(mbmi.Mv0, AomMotionSearch.GetRefMv(x, 0), fc.Mv, allowHp);
+                    if (mbmi.HasSecondRef) AomMvCost.UpdateMvStats(mbmi.Mv1, AomMotionSearch.GetRefMv(x, 1), fc.Mv, allowHp);
+                }
+                else if (mode == NEAREST_NEWMV || mode == NEAR_NEWMV) AomMvCost.UpdateMvStats(mbmi.Mv1, AomMotionSearch.GetRefMv(x, 1), fc.Mv, allowHp);
+                else if (mode == NEW_NEARESTMV || mode == NEW_NEARMV) AomMvCost.UpdateMvStats(mbmi.Mv0, AomMotionSearch.GetRefMv(x, 0), fc.Mv, allowHp);
             }
         }
     }
 
-    /// <summary>av1_sum_intra_stats (key frames).</summary>
+    /// <summary>av1_update_inter_mode_stats.</summary>
+    private static void UpdateInterModeStats(Av1CdfModeContext m, int mode, int modeContext)
+    {
+        int modeCtx = modeContext & NEWMV_CTX_MASK;
+        if (mode == NEWMV)
+        {
+            AomCdf.Update(m.NewmvMode[modeCtx], 0, 2);
+            return;
+        }
+        AomCdf.Update(m.NewmvMode[modeCtx], 1, 2);
+        modeCtx = (modeContext >> GLOBALMV_OFFSET) & GLOBALMV_CTX_MASK;
+        if (mode == GLOBALMV)
+        {
+            AomCdf.Update(m.GlobalmvMode[modeCtx], 0, 2);
+            return;
+        }
+        AomCdf.Update(m.GlobalmvMode[modeCtx], 1, 2);
+        modeCtx = (modeContext >> REFMV_OFFSET) & REFMV_CTX_MASK;
+        AomCdf.Update(m.RefmvMode[modeCtx], mode != NEARESTMV ? 1 : 0, 2);
+    }
+
+    /// <summary>av1_sum_intra_stats.</summary>
     private static void SumIntraStats(AomComp cpi, AomMacroblock x, AomMbModeInfo mbmi)
     {
         var xd = x.E;
@@ -808,8 +1039,12 @@ internal static partial class AomEncodeFrame
         var m = fc.Mode;
         int yMode = mbmi.Mode;
         int bsize = mbmi.Bsize;
-        int above = xd.AboveMbmi?.Mode ?? DC_PRED, left = xd.LeftMbmi?.Mode ?? DC_PRED;
-        AomCdf.Update(fc.Kfym[IntraModeContext[above] * 5 + IntraModeContext[left]], yMode, 13);
+        if (cpi.Cm.FrameIsIntraOnly)
+        {
+            int above = xd.AboveMbmi?.Mode ?? DC_PRED, left = xd.LeftMbmi?.Mode ?? DC_PRED;
+            AomCdf.Update(fc.Kfym[IntraModeContext[above] * 5 + IntraModeContext[left]], yMode, 13);
+        }
+        else AomCdf.Update(m.YMode[SizeGroupLookup[bsize]], yMode, 13);
 
         if (AomIntraModeSearch.FilterIntraAllowed(cpi, mbmi))
         {

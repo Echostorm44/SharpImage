@@ -59,6 +59,16 @@ internal sealed class AomMbmiExtFrameInter
         Array.Copy(e.GlobalMvs, GlobalMvs, REF_FRAMES);
     }
 
+    /// <summary>copy_mbmi_ext_frame_to_mbmi_ext.</summary>
+    public void CopyTo(AomMbmiExtInter e, int refFrameType)
+    {
+        Array.Copy(RefMvStack, e.RefMvStack[refFrameType], USABLE_REF_MV_STACK_SIZE);
+        Array.Copy(Weight, e.Weight[refFrameType], USABLE_REF_MV_STACK_SIZE);
+        e.ModeContext[refFrameType] = ModeContext;
+        e.RefMvCount[refFrameType] = RefMvCount;
+        Array.Copy(GlobalMvs, e.GlobalMvs, REF_FRAMES);
+    }
+
     public void CopyFrom(AomMbmiExtFrameInter s)
     {
         Array.Copy(s.RefMvStack, RefMvStack, USABLE_REF_MV_STACK_SIZE);
