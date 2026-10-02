@@ -7,13 +7,13 @@ namespace SharpImage.Formats.Av1;
 // av1_has_optimized_scaler) and aom_dsp/aom_convolve.c (aom_scaled_2d_c): the encoder's source / reference scaler.
 internal static partial class AomResize
 {
-    /// <summary>av1_has_optimized_scaler: the scaler handles ratios from 1/4 to 16 (and the 3/4 SIMD special case is
-    /// identical to C).</summary>
+    /// <summary>av1_has_optimized_scaler (with HAVE_SSSE3): ratios from 1/4 to 16 whose 1/16 steps divide both sizes,
+    /// or exactly 3/4.</summary>
     public static bool HasOptimizedScaler(int srcW, int srcH, int dstW, int dstH)
     {
-        bool hasOptimizedScaler = (dstW * 4 >= srcW) && (dstH * 4 >= srcH);
-        if (hasOptimizedScaler) hasOptimizedScaler = (dstW <= srcW * 16) && (dstH <= srcH * 16);
-        return hasOptimizedScaler;
+        bool hasOptimizedScaler = dstW * 4 >= srcW && dstH * 4 >= srcH && dstW <= srcW * 16 && dstH <= srcH * 16 &&
+                                  16 * dstW % srcW == 0 && 16 * srcW % dstW == 0 && 16 * dstH % srcH == 0 && 16 * srcH % dstH == 0;
+        return hasOptimizedScaler || (4 * dstW == 3 * srcW && 4 * dstH == 3 * srcH);
     }
 
     /// <summary>av1_realloc_and_scale_if_required (use_optimized_scaler): <paramref name="unscaled"/> scaled to

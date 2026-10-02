@@ -1202,6 +1202,11 @@ public static partial class HeifCoder
         }
         if (layers[^1].ScaleNumerator != layers[^1].ScaleDenominator)
             throw new ArgumentException("The last layer must be coded at full size.", nameof(options));
+        if (!forceColor && !forceAlpha && TryEncodeLayersAom(image, options,
+                layers.Select(l => new AomLayerSpec(l.Image ?? image, l.Quality ?? options.Quality,
+                    l.QualityAlpha ?? l.Quality ?? options.QualityAlpha ?? options.Quality, l.ScaleNumerator, l.ScaleDenominator)).ToArray(),
+                reapplyCodecOptions: options.Tune != null || options.Sharpness != null || options.EnableCdef != null) is { } aomLayered)
+            return aomLayered;
 
         int bd = options.BitDepth == 0 ? AutoBitDepth(image) : options.BitDepth;
         if (bd is not (8 or 10 or 12)) throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
@@ -1422,6 +1427,8 @@ public static partial class HeifCoder
             : ((int, Av1.AomTune, int?, bool?)?)null;
         try
         {
+        // libavif's progressive encoding: the libaom port's layered good-quality path
+        if (options.Progressive && !forceColor && !forceAlpha && TryEncodeProgressiveAom(image, options) is { } progressive) return progressive;
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
                && options.FilmGrain == null && !denoise && !options.Progressive && !forceColor && !forceAlpha && qIdx == null && aQIdx == null
                && !qualityLossless && !options.SharpYuv && !SourcePlanes.TryGetValue(image, out _)

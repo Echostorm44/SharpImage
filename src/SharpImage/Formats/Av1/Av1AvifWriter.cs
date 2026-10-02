@@ -429,7 +429,11 @@ internal static class Av1AvifWriter
             foreach (var smp in sq.ColorSamples) { chunks.Add(smp); pos += smp.Length; }
         }
         bool layeredItems = x?.ColorLayerSizes != null || x?.AlphaLayerSizes != null;
-        if (sq == null && !layeredItems)
+        // a layered colour / alpha item: one extent per layer (offsets relative to the mdat payload start)
+        var layerExtentOffsets = new long[items.Count][];
+        bool IsLayered(int i) => (items[i].Id == 1 && x?.ColorLayerSizes is { Length: > 1 }) ||
+                                 (items[i].Id == 2 && alphaData != null && x?.AlphaLayerSizes is { Length: > 1 });
+        if (sq == null)
         {
             // libavif's packing (write.c): pass 0 the metadata (Exif / XMP / tmap), pass 1 alpha and the gain map image,
             // pass 2 everything else (the colour data), each in item order; a payload identical to one already written
@@ -445,7 +449,7 @@ internal static class Av1AvifWriter
             for (int pass = 0; pass < 3; pass++)
                 for (int i = 0; i < items.Count; i++)
                 {
-                    if (PassOf(i) != pass) continue;
+                    if (PassOf(i) != pass || IsLayered(i)) continue;
                     byte[] data = items[i].Payload;
                     if (data.Length == 0) continue;
                     long found = -1;
@@ -456,18 +460,38 @@ internal static class Av1AvifWriter
                     chunks.Add(data);
                     pos += data.Length;
                 }
+            if (layeredItems)
+            {
+                // the layered items' samples interleaved (write.c): layer by layer, alpha before colour; a sample identical
+                // to one already written reuses it
+                int colorIdx = items.FindIndex(it => it.Id == 1), alphaIdx = alphaData != null ? items.FindIndex(it => it.Id == 2) : -1;
+                int layerCount = Math.Max(IsLayered(colorIdx) ? x!.ColorLayerSizes!.Length : 0,
+                    alphaIdx >= 0 && IsLayered(alphaIdx) ? x!.AlphaLayerSizes!.Length : 0);
+                foreach (int i in new[] { alphaIdx, colorIdx })
+                    if (i >= 0 && IsLayered(i)) layerExtentOffsets[i] = new long[(items[i].Id == 1 ? x!.ColorLayerSizes : x!.AlphaLayerSizes)!.Length];
+                for (int layer = 0; layer < layerCount; layer++)
+                    foreach (int i in new[] { alphaIdx, colorIdx })
+                    {
+                        if (i < 0 || !IsLayered(i)) continue;
+                        var sizes = (items[i].Id == 1 ? x!.ColorLayerSizes : x!.AlphaLayerSizes)!;
+                        if (layer >= sizes.Length) continue;
+                        long layerStart = 0;
+                        for (int k = 0; k < layer; k++) layerStart += sizes[k];
+                        byte[] data = items[i].Payload.AsSpan((int)layerStart, (int)sizes[layer]).ToArray();
+                        long found = -1;
+                        foreach (var (d, o) in written) if (d.AsSpan().SequenceEqual(data)) { found = o; break; }
+                        if (found >= 0) { layerExtentOffsets[i][layer] = found; continue; }
+                        layerExtentOffsets[i][layer] = pos;
+                        written.Add((data, pos));
+                        chunks.Add(data);
+                        pos += data.Length;
+                    }
+            }
         }
-        else if (sq != null)
+        else
         {
             itemOffset[0] = colorChunk;
             if (alphaData != null) itemOffset[1] = alphaChunk;
-        }
-        else
-        for (int i = 0; i < items.Count; i++)
-        {
-            itemOffset[i] = pos;
-            chunks.Add(items[i].Payload);
-            pos += items[i].Payload.Length;
         }
 
         // iloc: version 0, offset_size=4/length_size=4/base_offset_size=0; one extent per item, or per layer of a layered
@@ -479,7 +503,13 @@ internal static class Av1AvifWriter
             for (int i = 0; i < items.Count; i++)
             {
                 long[]? layers = items[i].Id == 1 ? x?.ColorLayerSizes : items[i].Id == 2 && alphaData != null ? x?.AlphaLayerSizes : null;
-                body.Add(IlocEntry(items[i].Id, (uint)(mdatStart + itemOffset[i]), items[i].Payload.Length, layers));
+                if (layerExtentOffsets[i] is { } lo)
+                {
+                    var parts = new List<byte[]> { U16(items[i].Id), U16(0), U16(lo.Length) };
+                    for (int k = 0; k < lo.Length; k++) { parts.Add(U32((uint)(mdatStart + lo[k]))); parts.Add(U32((uint)layers![k])); }
+                    body.Add(Concat(parts.ToArray()));
+                }
+                else body.Add(IlocEntry(items[i].Id, (uint)(mdatStart + itemOffset[i]), items[i].Payload.Length, layers));
             }
             return FullBox("iloc", 0, 0, Concat(body.ToArray()));
         }
