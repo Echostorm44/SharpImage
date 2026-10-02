@@ -946,6 +946,9 @@ internal sealed partial class AomGqEncoder
             input.AllowIntrabc = false;
             input.IsScreenContentType = _isScreenContentType;
         }
+        // av1_compute_global_motion_facade (encode_frame_internal, every encoded frame incl. key frames): a new GF group
+        // starts the global motion statistics over
+        if (_gfFrameIndex == 0) Array.Fill(_validGmModelFound, int.MaxValue);
         _seqFlags.SeqParamsLocked = _seqParamsLocked;
         var (cpi, x) = AomEncoder.EncodeFrame(input);
         _lastCpi = cpi;

@@ -84,12 +84,15 @@ public enum AvifTune
     Iq,
     /// <summary>tune=psnr: the linear quality mapping quantizer = ((100 - quality) * 63 + 50) / 100.</summary>
     Psnr,
+    /// <summary>tune=ssim (libavif's default for image sequences and identity-matrix colour): the linear quality mapping.</summary>
+    Ssim,
 }
 
 public sealed class AvifEncodeOptions
 {
-    /// <summary>libavif's -a tune (default <see cref="AvifTune.Iq"/>, as libavif chooses for still colour images).</summary>
-    public AvifTune Tune { get; set; } = AvifTune.Iq;
+    /// <summary>libavif's -a tune. Null (default): libavif's own choice — tune=iq for still and layered colour images
+    /// (tune=ssim for the identity matrix), tune=ssim for image sequences, tune=psnr for alpha.</summary>
+    public AvifTune? Tune { get; set; }
 
     /// <summary>avifenc -a enable-cdef: the CDEF filter search. Null = libaom's default for the coding mode: off for a single
     /// still image (all-intra mode, where libaom disables CDEF), on for layered images and sequences.</summary>
@@ -1132,7 +1135,8 @@ public static partial class HeifCoder
             if (options.Sharpness is < 0 or > 7) throw new ArgumentOutOfRangeException(nameof(options), "Sharpness must be 0..7.");
             // -a sharpness / -a enable-cdef apply after the tune's defaults (libavif sets codec options after AOME_SET_TUNING)
             prevAom = Av1.AomStill.Enter(allIntra ? options.Speed : -1,
-                options.Tune == AvifTune.Iq ? Av1.AomTune.Iq : Av1.AomTune.Psnr, options.Sharpness, options.EnableCdef);
+                options.Tune switch { AvifTune.Psnr => Av1.AomTune.Psnr, AvifTune.Ssim => Av1.AomTune.Ssim, _ => Av1.AomTune.Iq },
+                options.Sharpness, options.EnableCdef);
             prevSharpness = Av1.Av1ObuWriter.t_sharpness;
             Av1.Av1ObuWriter.t_sharpness = options.Sharpness ?? 0;
             prevAvoid = t_avoidLibyuv; prevSpeed = Av1.Av1StillImageEncoder.t_speed; prevThreads = Av1.Av1StillImageEncoder.t_threads;
@@ -1253,7 +1257,7 @@ public static partial class HeifCoder
             int? lq = l.Quality ?? options.Quality;
             int? lqa = l.QualityAlpha ?? l.Quality ?? options.QualityAlpha ?? options.Quality;
             if (lq >= 100 || lqa >= 100) throw new NotSupportedException("Lossless layers are not supported.");
-            int qIdx = lq is { } q ? QualityToQIndex(q, color.Matrix == 0 || options.Tune == AvifTune.Psnr) : defQ;
+            int qIdx = lq is { } q ? QualityToQIndex(q, color.Matrix == 0 || options.Tune is AvifTune.Psnr or AvifTune.Ssim) : defQ;
             int aQIdx = lqa is { } qa ? QualityToQIndex(qa, identityMatrix: true) : Math.Clamp(qIdx / 2, 4, 255);
             inputs.Add(new Av1.Av1StillImageEncoder.LayerInput(y, u, v, alpha, lw, lh, qIdx, aQIdx));
         }
@@ -1270,7 +1274,7 @@ public static partial class HeifCoder
     private static (int? QIdx, int? AlphaQIdx, bool Lossless) QualityQIndices(AvifEncodeOptions o, Av1.Av1ObuWriter.Av1ColorDesc color,
         bool sequence = false)
     {
-        bool linear = color.Matrix == 0 || sequence || o.Tune == AvifTune.Psnr;
+        bool linear = color.Matrix == 0 || sequence || o.Tune is AvifTune.Psnr or AvifTune.Ssim;
         int? q = o.Quality is { } c && c < 100 ? QualityToQIndex(c, linear) : null;
         int? qa = (o.QualityAlpha ?? o.Quality) is { } a ? QualityToQIndex(a, identityMatrix: true) : null;
         return (q, qa, o.Quality >= 100);
@@ -1413,7 +1417,7 @@ public static partial class HeifCoder
         // Quality (libavif scale) overrides Qp; quality 100 = lossless AV1 coding (matrix unchanged).
         var (qIdx, aQIdx, qualityLossless) = QualityQIndices(options, color);
         // libavif's default tuning of identity-matrix colour is tune=ssim (tune=iq for every other matrix)
-        var aomScope = options.Tune == AvifTune.Iq && color.Matrix == 0 ? Av1.AomStill.Enter(Av1.AomStill.Speed, Av1.AomTune.Ssim,
+        var aomScope = options.Tune == null && color.Matrix == 0 ? Av1.AomStill.Enter(Av1.AomStill.Speed, Av1.AomTune.Ssim,
                 Av1.AomStill.SharpnessOverride, Av1.AomStill.CdefOverride)
             : ((int, Av1.AomTune, int?, bool?)?)null;
         try
@@ -1585,6 +1589,10 @@ public static partial class HeifCoder
         }
         frames.Clear();
 
+        // libavif's path: the libaom port's good-quality encoder (lossless / grain / real-time speeds: the coder below)
+        if (!TryEncodeSequenceAom(options, coded, w, h, bd, mono, codedLayout, color, hasAlpha, lossless,
+                sequence.Count > 0 ? SourceChromaPosition(sequence[0], options) : 0, sq))
+        {
         int n = coded.Count;
         var cSamples = new byte[n][];
         var cSync = new bool[n];
@@ -1852,6 +1860,8 @@ public static partial class HeifCoder
                     }
                 }
             }
+        }
+
         }
 
         // Timing (libavif: mdhd/mvhd timescale, per-sample stts durations, elst repetition).

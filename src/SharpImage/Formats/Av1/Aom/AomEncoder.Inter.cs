@@ -422,8 +422,9 @@ internal static partial class AomEncoder
                 int tr = sf.gm_sf.gm_erroradv_tr_level;
                 double bestErroradv = AomGlobalMotion.ErroradvTr[tr];
                 var r = refBuf[frame]!;
-                if (AomGlobalMotion.ComputeGlobalMotionDisflow(src, r, cm.BitDepth, sf.gm_sf.downsample_level, parms, out var inliers, out int numInliers) &&
-                    numInliers != 0)
+                bool gmOk = AomGlobalMotion.ComputeGlobalMotionDisflow(src, r, cm.BitDepth, sf.gm_sf.downsample_level, parms, out var inliers, out int numInliers);
+                if (gmOk) AomTrace.Out?.Write(FormattableString.Invariant($"gmc oh {cm.OrderHint} rf {frame} n {numInliers} p {parms[0]:F6} {parms[1]:F6} {parms[2]:F6} {parms[3]:F6} {parms[4]:F6} {parms[5]:F6}") + (char)10);
+                if (gmOk && numInliers != 0)
                 {
                     var tmp = new AomWarpedMotionParams();
                     AomGlobalMotion.ConvertModelToParams(parms, tmp);
@@ -438,6 +439,7 @@ internal static partial class AomEncoder
                             if (tmp.WmType > TRANSLATION)
                             {
                                 double erroradvantage = (double)warpError / refFrameError;
+                                AomTrace.Out?.Write($"gme oh {cm.OrderHint} rf {frame} t {tmp.WmType} we {warpError} re {refFrameError}" + (char)10);
                                 if (AomGlobalMotion.IsEnoughErroradvantage(erroradvantage,
                                         AomGlobalMotion.GmGetParamsCost(tmp, refParams, cm.AllowHighPrecisionMv), AomGlobalMotion.ErroradvTr[tr]) &&
                                     erroradvantage < bestErroradv)

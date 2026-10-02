@@ -498,10 +498,11 @@ internal static class Av1AvifWriter
             ? SampleEntryChildren(Box("av1C", BuildAv1C(Av1PixelLayout.I400, bitDepth, width, height)), null, null, true, alpha: true,
                 sq.AllKeyFrames && sq.AlphaAllSync)
             : null;
-        int moovLen = Moov(sq, width, height, colorEntry, alphaEntry, 0, 0, x?.Premultiplied == true).Length;
+        int metadataItems = (x?.Exif is { Length: > 0 } ? 1 : 0) + (x?.Xmp is { Length: > 0 } ? 1 : 0);
+        int moovLen = Moov(sq, width, height, colorEntry, alphaEntry, 0, 0, x?.Premultiplied == true, metadataItems).Length;
         uint start = (uint)(ftyp.Length + metaLen + moovLen + 8);
         return Concat(ftyp, Meta(start), Moov(sq, width, height, colorEntry, alphaEntry, start + (uint)colorChunk, start + (uint)alphaChunk,
-            x?.Premultiplied == true), Box("mdat", Concat(chunks.ToArray())));
+            x?.Premultiplied == true, metadataItems), Box("mdat", Concat(chunks.ToArray())));
     }
 
     /// <summary>
@@ -783,7 +784,7 @@ internal static class Av1AvifWriter
     // track 2 with tref auxl -> 1), each with an edit list carrying the repetition count, mdhd/hdlr/minf and a
     // sample table (stsd av01, stts, stsc, stsz, stco; stss only when some sample is not a sync sample).
     private static byte[] Moov(AvifSequenceData sq, int width, int height, byte[] colorEntry, byte[]? alphaEntry,
-        uint colorChunkOffset, uint alphaChunkOffset, bool premultiplied)
+        uint colorChunkOffset, uint alphaChunkOffset, bool premultiplied, int metadataItems = 0)
     {
         byte[] unity = Concat(U32(0x00010000), U32(0), U32(0), U32(0), U32(0x00010000), U32(0), U32(0), U32(0), U32(0x40000000));
         ulong framesDuration = 0;
@@ -791,7 +792,7 @@ internal static class Av1AvifWriter
         ulong duration = sq.RepetitionCount < 0 ? ulong.MaxValue : framesDuration * (ulong)(sq.RepetitionCount + 1);
         int tracks = alphaEntry != null ? 2 : 1;
         byte[] mvhd = FullBox("mvhd", 1, 0, Concat(U64(sq.CreationTime), U64(sq.ModificationTime), U32(sq.Timescale), U64(duration), U32(0x00010000), U16(0x0100),
-            U16(0), new byte[8], unity, new byte[24], U32((uint)(tracks + 1))));
+            U16(0), new byte[8], unity, new byte[24], U32((uint)(tracks + metadataItems))));   // libavif: next_track_ID = items.count
 
         byte[] Trak(int trackId, List<byte[]> samples, byte[] entryChildren, bool alpha, uint chunkOffset, List<bool>? sync)
         {
