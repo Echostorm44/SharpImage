@@ -121,7 +121,7 @@ internal static class AomMvRef
     }
 
     /// <summary>is_inside (the tile is the frame's single tile).</summary>
-    private static bool IsInside(AomMacroblockD xd, int miCol, int miRow, int dr, int dc)
+    internal static bool IsInside(AomMacroblockD xd, int miCol, int miRow, int dr, int dc)
         => !(miRow + dr < xd.TileMiRowStart || miCol + dc < xd.TileMiColStart || miRow + dr >= xd.TileMiRowEnd || miCol + dc >= xd.TileMiColEnd);
 
     private static void ScanBlkMbmi(AomMacroblockD xd, int miRow, int miCol, int rf0, int rowOffset, int colOffset, AomCandidateMv[] stack,
@@ -134,7 +134,7 @@ internal static class AomMvRef
     }
 
     /// <summary>has_top_right.</summary>
-    private static bool HasTopRight(AomCommon cm, AomMacroblockD xd, int miRow, int miCol, int bs)
+    internal static bool HasTopRight(AomCommon cm, AomMacroblockD xd, int miRow, int miCol, int bs)
     {
         int sbMiSize = MiSizeWide[cm.SbSize];
         int maskRow = miRow & (sbMiSize - 1), maskCol = miCol & (sbMiSize - 1);

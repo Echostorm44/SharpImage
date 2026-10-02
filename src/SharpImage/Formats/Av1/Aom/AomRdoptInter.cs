@@ -198,6 +198,7 @@ internal static partial class AomRdoptInter
         if (scaledRef != null) SetupPredBlock(xd, yv12Mb, refFrame, scaledRef, null, numPlanes);
         else SetupPredBlock(xd, yv12Mb, refFrame, yv12, sf, numPlanes);
         AomMvPred.FindMvRefs(cm, xd, mbmi, refFrame, ext);
+        AomTrace.Out?.Write($"rmv {xd.MiRow} {xd.MiCol} {refFrame} {ext.RefMvCount[refFrame]} {ext.ModeContext[refFrame]} {xd.RefMvStacks[refFrame][0].ThisMv.Row} {xd.RefMvStacks[refFrame][0].ThisMv.Col} {xd.RefMvStacks[refFrame][1].ThisMv.Row} {xd.RefMvStacks[refFrame][1].ThisMv.Col}" + (char)10);
         AomMvPred.CopyUsableRefMvStackAndWeight(xd, ext, refFrame);
         AomMotionSearch.MvPred(cpi, x, yv12Mb[refFrame, 0], refFrame, bsize);
         if (scaledRef != null) SetupPredBlock(xd, yv12Mb, refFrame, yv12, sf, numPlanes);

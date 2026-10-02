@@ -109,6 +109,8 @@ internal static partial class AomBitstream
     /// <summary>The frame-level state the writer derives from the encoder (cm->features, cm->seq_params, cm->tiles).</summary>
     private sealed class FrameState
     {
+        /// <summary>The CDFs the last written tile ended with (cpi->tile_data[].tctx after av1_pack_bitstream).</summary>
+        public Av1CdfContext? LastTileFc;
         public readonly AomComp Cpi;
         public readonly AomCommon Cm;
         public readonly AomSequenceConfig SeqCfg;
@@ -541,6 +543,7 @@ internal static partial class AomBitstream
         }
         tokIdx = t.TokIdx;
         if (t.MaxMvMagnitude > cpi.MaxMvMagnitudeTd) cpi.MaxMvMagnitudeTd = t.MaxMvMagnitude;
+        f.LastTileFc = fc;
         return w.Finish();
     }
 

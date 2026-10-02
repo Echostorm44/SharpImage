@@ -238,6 +238,22 @@ internal static partial class AomEncoder
                 BlockSizeWide[BLOCK_4X4]);   // mi_alloc_bsize
         cpi.SearchSites = AomMcomp.InitSearchSites();
         cpi.MvStepParam = AomMcomp.InitSearchRange(Math.Max(input.Width, input.Height));
+        if (input.MvSearchState is { } mss && cpi.Sf.mv_sf.auto_mv_step_size != 0)
+        {
+            // av1_set_mv_search_params: denoise_and_encode's call for key / ARF / GF frames, then encode_without_recode's
+            int maxMvDef = Math.Max(input.Width, input.Height);
+            for (int call = input.SetMvParamsEarly ? 0 : 1; call < 2; call++)
+            {
+                cpi.MvStepParam = AomMcomp.InitSearchRange(maxMvDef);
+                if (input.GfFrameType == KEY_FRAME || input.GfFrameType == INTRA_ONLY_FRAME) mss[0] = maxMvDef;
+                else
+                {
+                    bool useAuto = (input.ShowFrame || input.UpdateType == INTNL_ARF_UPDATE) && mss[0] != -1 && cpi.Sf.mv_sf.auto_mv_step_size >= 2;
+                    if (useAuto) cpi.MvStepParam = AomMcomp.InitSearchRange(Math.Min(maxMvDef, 2 * mss[0]));
+                    mss[0] = -1;
+                }
+            }
+        }
         if (cpi.Sf.rt_sf.use_nonrd_pick_mode == 0 && cpi.AllowIntrabcNow)   // av1_need_dv_costs
             cpi.MbmiExtFrameBase = new AomMbmiExtFrame?[cm.MiGridBase.Length];
 

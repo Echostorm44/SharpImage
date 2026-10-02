@@ -442,6 +442,9 @@ internal sealed partial class AomGqEncoder
     }
 
     private bool _mvSearchParamsDue;
+    private readonly int[] _maxMvMagnitude = { 0 };
+    /// <summary>ppi->valid_gm_model_found [FRAME_UPDATE_TYPES].</summary>
+    private readonly int[] _validGmModelFound = { int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue };
 
     /// <summary>allow_show_existing.</summary>
     private bool AllowShowExisting(uint frameFlags)
@@ -847,7 +850,10 @@ internal sealed partial class AomGqEncoder
             PrimaryRefBuf = primaryRefBuf, FrameProbs = _frameProbs, FilterScaler = filterScaler, PhaseScaler = phaseScaler,
             LagInFrames = cfg.LagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, RefreshGolden = fp.RefreshGolden,
             PpiFilterLevel = _ppiFilterLevel, ResizeNeeded = _resizeModeFixed, IsSrcFrameAltRef = _rc.IsSrcFrameAltRef != 0,
+            GfFrameIndex = _gfFrameIndex, GfArfIndex = gf.ArfIndex, CurPyramidLevel = pyramidLevel, ValidGmModelFound = _validGmModelFound,
+            MvSearchState = _maxMvMagnitude, SetMvParamsEarly = _mvSearchParamsDue,
         };
+        _mvSearchParamsDue = false;
         if (!isKey)
         {
             // screen content detection runs on intra frames only; inter frames keep the flags
@@ -873,6 +879,13 @@ internal sealed partial class AomGqEncoder
         AomEncoder.RunPostFilter(cpi, x, applyRestoration: true);
 
         var cm = cpi.Cm;
+        // update_gm_stats
+        {
+            bool isGmPresent = false;
+            for (int i = LAST_FRAME; i <= ALTREF_FRAME; i++) if (cm.GlobalMotion[i].WmType != IDENTITY) { isGmPresent = true; break; }
+            if (_validGmModelFound[updateType] == int.MaxValue) _validGmModelFound[updateType] = isGmPresent ? 1 : 0;
+            else _validGmModelFound[updateType] |= isGmPresent ? 1 : 0;
+        }
         var fh = new AomGqFrameHeader
         {
             Seq = _seq, FrameType = frameType, ShowFrame = fp.ShowFrame, ShowableFrame = !fp.ShowFrame && _showableFrame, OrderHint = orderHint,
@@ -891,8 +904,18 @@ internal sealed partial class AomGqEncoder
         }
         for (int i = LAST_FRAME; i <= ALTREF_FRAME; i++) fh.GlobalMotion[i].CopyFrom(cm.GlobalMotion[i]);
         for (int i = 0; i < REF_FRAMES; i++) { fh.RemappedRefIdx[i] = _remappedRefIdx[i]; fh.RefFrameMap[i] = _refFrameMap[i]; }
-        byte[] data = AomBitstream.PackFrameGq(cpi, fh, out int largestTileId, BitstreamTrace);
+        if (AomTrace.Out != null)
+        {
+            var tm = cpi.TileData[0].Tctx.Mode;
+            var sb = new System.Text.StringBuilder("cic");
+            for (int i = 0; i < 5; i++) sb.Append(' ').Append(tm.Comp[i][0]).Append('/').Append(tm.Comp[i][^1]);
+            sb.Append(" | ii");
+            for (int i = 0; i < 4; i++) sb.Append(' ').Append(tm.Intra[i][0]);
+            AomTrace.Out.Write(sb.ToString() + (char)10);
+        }
+        byte[] data = AomBitstream.PackFrameGq(cpi, fh, out int largestTileId, out var largestTileFc, BitstreamTrace);
         OnFrameEncoded?.Invoke(cpi, fh);
+        if (cpi.Sf.mv_sf.auto_mv_step_size != 0) _maxMvMagnitude[0] = Math.Max(_maxMvMagnitude[0], cpi.MaxMvMagnitudeTd);
 
         // the reconstruction (cur_frame) with the frame context of the largest tile
         var buf = new AomRefBuffer
@@ -910,7 +933,7 @@ internal sealed partial class AomGqEncoder
         Array.Copy(cpi.PostFilter.LoopFilter.ModeDeltas, buf.ModeDeltas, 2);
         AomResize.ExtendFrameBorders(buf.Buf);
         buf.FrameContext = new Av1CdfContext();
-        buf.FrameContext.CopyFrom(cpi.TileData[largestTileId].Tctx);
+        buf.FrameContext.CopyFrom(largestTileFc!);   // the writer adapted cpi->tile_data[].tctx (row-mt encodes into td->tctx)
         buf.FrameContext.ResetCounters();
 
         _curFrameBuf = buf;

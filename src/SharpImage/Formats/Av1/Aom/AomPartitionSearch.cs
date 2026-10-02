@@ -993,6 +993,7 @@ internal static partial class AomEncodeFrame
                 s.DoRectangularSplit = false;
         }
         PrunePartitionsAfterSplit(cpi, x, sms, s, bestRdc, partNoneRd, partSplitRd);
+        AomTrace.Out?.Write($"pas {s.BlkParams.MiRow} {s.BlkParams.MiCol} bs {s.BlkParams.Bsize} rect {(s.DoRectangularSplit ? 1 : 0)} term {(s.TerminatePartitionSearch ? 1 : 0)} allow {(s.PartitionRectAllowed[HORZ] ? 1 : 0)} {(s.PartitionRectAllowed[VERT] ? 1 : 0)} prune {(s.PruneRectPart[HORZ] ? 1 : 0)} {(s.PruneRectPart[VERT] ? 1 : 0)} best {bestRdc.Rdcost}" + (char)10);
 
         RectangularPartitionSearch(cpi, x, pcTree, xCtx, s, ref bestRdc, rectPartWinInfo);
 

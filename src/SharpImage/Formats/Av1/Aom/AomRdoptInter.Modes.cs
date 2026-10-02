@@ -90,7 +90,40 @@ internal static partial class AomRdoptInter
             }
             else if (mbmi.MotionMode == WARPED_CAUSAL)
             {
-                throw new NotImplementedException("warped motion mode search (av1_find_projection / av1_refine_warped_mv)");
+                var pts = x.ScratchWarpPts;
+                var ptsInref = x.ScratchWarpPtsInref;
+                mbmi.MotionMode = WARPED_CAUSAL;
+                mbmi.WmParams.WmType = DEFAULT_WMTYPE;
+                AomInterpSearch.SetDefaultInterpFilters(mbmi, interpFilter);
+                Array.Copy(warpInfo.Pts, pts, totalSamples * 2);
+                Array.Copy(warpInfo.PtsInref, ptsInref, totalSamples * 2);
+                if (mbmi.NumProjRef > 1) mbmi.NumProjRef = (byte)AomWarp.SelectSamples(mbmi.Mv0, pts, ptsInref, mbmi.NumProjRef, bsize);
+                if (!AomWarp.FindProjection(mbmi.NumProjRef, pts, ptsInref, bsize, mbmi.Mv0.Row, mbmi.Mv0.Col, mbmi.WmParams, miRow, miCol))
+                {
+                    if (AomInter.HaveNewmvInInterMode(thisMode))
+                    {
+                        var mv0 = mbmi.Mv0;
+                        var wm0 = mbmi.WmParams.Clone();
+                        byte numProjRef0 = mbmi.NumProjRef;
+                        var refMv = AomMotionSearch.GetRefMv(x, 0);
+                        var ms = AomSubpel.MakeDefaultSubpelMsParams(cpi, x, bsize, refMv, null);
+                        AomWarp.RefineWarpedMv(xd, cm, ms, bsize, warpInfo.Pts, warpInfo.PtsInref, totalSamples, cpi.Sf.mv_sf.warp_search_method,
+                            cpi.Sf.mv_sf.warp_search_iters, cpi.EnableIntraEdgeFilter);
+                        if (mv0.AsInt != mbmi.Mv0.AsInt)
+                        {
+                            tmpRateMv = AomMotionSearch.MvBitCost(x, mbmi.Mv0, refMv);
+                            tmpRate2 = rate2Nocoeff - rateMv0 + tmpRateMv;
+                        }
+                        else
+                        {
+                            mbmi.Mv0 = mv0;
+                            mbmi.WmParams.CopyFrom(wm0);
+                            mbmi.NumProjRef = numProjRef0;
+                        }
+                    }
+                    AomInterPred.EncBuildInterPredictor(cm, xd, miRow, miCol, null, bsize, 0, numPlanes - 1, cpi.EnableIntraEdgeFilter);
+                }
+                else continue;
             }
             else if (isInterintraMode)
             {
@@ -285,6 +318,7 @@ internal static partial class AomRdoptInter
         var mc = x.ModeCosts;
         int refMvCost = CostMvRef(mc, thisMode, modeCtx);
         int baseRate = args.RefFrameCost + args.SingleCompCost + refMvCost;
+        AomTrace.Out?.Write($"brt {xd.MiRow} {xd.MiCol} {thisMode} {mbmi.RefFrame0} {args.RefFrameCost} {args.SingleCompCost} {refMvCost}" + (char)10);
         for (int i = 0; i < MAX_REF_MV_SEARCH - 1; ++i) { saveMv[i, 0] = AomMv.Invalid; saveMv[i, 1] = AomMv.Invalid; }
         args.StartMvCnt = 0;
         var curMv = new AomMv[2];

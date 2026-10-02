@@ -205,6 +205,7 @@ internal static partial class AomEncodeFrame
         {
             if ((cpi.RefFrameFlags & RefFrameFlag(r)) == 0) continue;
             var bestMv = SimpleMotionSearchSseVar(cpi, x, miRow, miCol, bsize, r, t.StartMvs[r], useSubpixel, out uint currSse, out uint currVar);
+            AomTrace.Out?.Write($"sgb {miRow} {miCol} bs {bsize} st {t.StartMvs[r].Row} {t.StartMvs[r].Col} -> {bestMv.Row} {bestMv.Col} sse {currSse} var {currVar} save {(saveMv ? 1 : 0)}" + (char)10);
             if (currSse < bestSse)
             {
                 bestSse = currSse;
@@ -356,6 +357,12 @@ internal static partial class AomEncodeFrame
         Span<float> features = stackalloc float[FEATURE_SIZE_SMS_PRUNE_PART];
         features.Clear();
         SimpleMotionSearchPrunePartFeatures(cpi, x, t, miRow, miCol, bsize, features, FEATURE_SMS_PRUNE_PART_FLAG);
+        if (AomTrace.Out != null)
+        {
+            var sb = new System.Text.StringBuilder($"spf {miRow} {miCol}");
+            for (int i = 0; i < FEATURE_SIZE_SMS_PRUNE_PART; i++) sb.Append(' ').Append(((double)features[i]).ToString("G9"));
+            AomTrace.Out.Write(sb.ToString() + (char)10);
+        }
         for (int i = 0; i < FEATURE_SIZE_SMS_PRUNE_PART; i++) features[i] = (features[i] - mlMean![i]) / mlStd![i];
         Span<float> scores = stackalloc float[10];
         Span<float> probs = stackalloc float[10];
@@ -364,6 +371,7 @@ internal static partial class AomEncodeFrame
         int numClasses = bsize == BLOCK_128X128 || bsize == BLOCK_8X8 ? 4 : 10;   // PARTITION_TYPES : EXT_PARTITION_TYPES
         AomMl.NnPredict(features, nnConfig, true, scores);
         AomMl.NnSoftmax(scores, probs, numClasses);
+        AomTrace.Out?.Write($"spr {miRow} {miCol} bs {bsize} h {((double)probs[PARTITION_HORZ]).ToString("G9")} v {((double)probs[PARTITION_VERT]).ToString("G9")} th {((double)pruneThresh).ToString("G9")} f0 {((double)features[0]).ToString("G9")}" + (char)10);
         if (probs[PARTITION_HORZ] <= pruneThresh) s.PruneRectPart[HORZ] = true;
         if (probs[PARTITION_VERT] <= pruneThresh) s.PruneRectPart[VERT] = true;
     }
@@ -444,6 +452,7 @@ internal static partial class AomEncodeFrame
             s.HasRowsAndCols && s.ThisRdc.Rdcost < long.MaxValue && s.ThisRdc.Rdcost >= 0 && s.ThisRdc.Rate < int.MaxValue &&
             s.ThisRdc.Rate >= 0 && (s.DoSquareSplit || s.DoRectangularSplit))
             SimpleMotionSearchEarlyTermNone(cpi, x, t!, s.ThisRdc, s);
+        AomTrace.Out?.Write($"pan {bp.MiRow} {bp.MiCol} bs {bsize} pr {(s.PruneRectPart[HORZ] ? 1 : 0)} {(s.PruneRectPart[VERT] ? 1 : 0)} sq {(s.DoSquareSplit ? 1 : 0)} rect {(s.DoRectangularSplit ? 1 : 0)} term {(s.TerminatePartitionSearch ? 1 : 0)} rd {s.ThisRdc.Rdcost} rate {s.ThisRdc.Rate} skippable {ctxNone.Skippable}" + (char)10);
     }
 
     /// <summary>get_min_bsize.</summary>

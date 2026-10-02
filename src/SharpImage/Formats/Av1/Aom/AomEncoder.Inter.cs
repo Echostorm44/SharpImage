@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using static SharpImage.Formats.Av1.AomTables;
 
@@ -36,6 +37,13 @@ internal sealed partial class AomEncodeInput
     public int[]? PpiFilterLevel;
     /// <summary>av1_is_resize_needed (a fixed resize mode from AOME_SET_SCALEMODE).</summary>
     public bool ResizeNeeded;
+    /// <summary>gf_frame_index, gf_group->arf_index, ppi->valid_gm_model_found [FRAME_UPDATE_TYPES], cur_frame pyramid level.</summary>
+    public int GfFrameIndex, GfArfIndex = -1, CurPyramidLevel;
+    public int[]? ValidGmModelFound;
+    /// <summary>cpi->mv_search_params.max_mv_magnitude (one-element, persistent) and whether denoise_and_encode set the mv
+    /// search params before av1_encode (key / ARF / GF frames).</summary>
+    public int[]? MvSearchState;
+    public bool SetMvParamsEarly;
 }
 
 internal static partial class AomEncoder
@@ -175,7 +183,7 @@ internal static partial class AomEncoder
         SetupPruneRefFrameMask(cpi);
         SetupKeepRefFrameMask(cpi);
         // av1_compute_global_motion_facade (identity unless a same-size reference is searched)
-        ComputeGlobalMotionFacade(cpi);
+        ComputeGlobalMotionFacade(cpi, input);
         AomMvPred.CalculateRefFrameSide(cm);
         cm.AllowRefFrameMvs &= sf.hl_sf.ref_frame_mvs_lvl != 2;
         if (cm.AllowRefFrameMvs) AomMvPred.SetupMotionField(cm);
@@ -313,20 +321,110 @@ internal static partial class AomEncoder
         for (int i = 0; i < numCompToKeep[pruneCompRefFrames]; ++i) cpi.KeepCompRefFrameMask |= 1 << index[i];
     }
 
-    /// <summary>av1_compute_global_motion_facade's reference selection: the search itself is not ported yet, so it
-    /// fails when a reference would be searched.</summary>
-    private static void ComputeGlobalMotionFacade(AomComp cpi)
+    /// <summary>av1_compute_global_motion_facade (single-threaded search order).</summary>
+    private static void ComputeGlobalMotionFacade(AomComp cpi, AomEncodeInput input)
     {
         var cm = cpi.Cm;
+        var sf = cpi.Sf;
+        var valid = input.ValidGmModelFound!;
+        if (cpi.EnableGlobalMotion && input.GfFrameIndex == 0) Array.Fill(valid, int.MaxValue);
         for (int r = LAST_FRAME; r <= ALTREF_FRAME; r++) cm.GlobalMotion[r].CopyFrom(AomWarpedMotionParams.Default);
-        if (!cpi.EnableGlobalMotion || cpi.Sf.gm_sf.gm_search_type == GM_DISABLE_SEARCH) return;
+        if (!cpi.EnableGlobalMotion || sf.gm_sf.gm_search_type == GM_DISABLE_SEARCH) return;
+        var src = cpi.Source;
+        // setup_global_motion_info_params / update_valid_ref_frames_for_gm
+        int segW = (src.CropWidths[0] + 31) >> 5, segH = (src.CropHeights[0] + 31) >> 5;
+        var past = new List<(int dist, int frame)>();
+        var future = new List<(int dist, int frame)>();
+        int ut = cpi.UpdateType;
+        bool refPruningEnabled = sf.inter_sf.selective_ref_frame > 0 && !(ut == ARF_UPDATE || ut == GF_UPDATE || ut == KF_UPDATE);
+        bool curFrameGmDisabled = false;
+        if (sf.gm_sf.disable_gm_search_based_on_stats != 0 && input.GfArfIndex > -1)
+            curFrameGmDisabled = !(valid[ARF_UPDATE] != 0 || valid[INTNL_ARF_UPDATE] != 0 || valid[LF_UPDATE] != 0);
+        var refBuf = new AomFrameBuffer?[REF_FRAMES];
         for (int frame = ALTREF_FRAME; frame >= LAST_FRAME; --frame)
         {
             var buf = cm.RefBufs[frame];
             bool refDisabled = (cpi.RefFrameFlags & RefFlag(frame)) == 0;
-            if (buf == null || (refDisabled && cpi.Sf.hl_sf.recode_loop != DISALLOW_RECODE)) continue;
-            if (buf.Buf.CropWidths[0] == cpi.Source.CropWidths[0] && buf.Buf.CropHeights[0] == cpi.Source.CropHeights[0])
-                throw new NotImplementedException("global motion estimation");
+            if (buf == null || (refDisabled && sf.hl_sf.recode_loop != DISALLOW_RECODE)) continue;
+            refBuf[frame] = buf.Buf;
+            bool pruneRef = refPruningEnabled && AomRdoptInter.PruneRefBySelectiveRefFrame(cpi, null, frame, NONE_FRAME, cpi.RefDisplayOrderHint);
+            bool doSearch = sf.gm_sf.gm_search_type switch
+            {
+                GM_REDUCED_REF_SEARCH_SKIP_L2_L3 => !(frame == LAST2_FRAME || frame == LAST3_FRAME),
+                GM_REDUCED_REF_SEARCH_SKIP_L2_L3_ARF2 => !(frame == LAST2_FRAME || frame == LAST3_FRAME || frame == ALTREF2_FRAME),
+                _ => true,
+            };
+            if (buf.Buf.CropWidths[0] == src.CropWidths[0] && buf.Buf.CropHeights[0] == src.CropHeights[0] && doSearch && !pruneRef &&
+                buf.PyramidLevel <= input.CurPyramidLevel && !curFrameGmDisabled)
+            {
+                int rel = buf.DisplayOrderHint - cm.DisplayOrderHint;
+                if (rel < 0) past.Add((-rel, frame));
+                else if (rel > 0) future.Add((rel, frame));
+            }
+        }
+        // qsort by distance: the MSVC CRT's qsort on <= 8 elements is shortsort (repeatedly swap the first maximum to
+        // the end), which the order of equal distances follows
+        static void SortByDist(List<(int dist, int frame)> l)
+        {
+            for (int hi = l.Count - 1; hi > 0; hi--)
+            {
+                int max = 0;
+                for (int p = 1; p <= hi; p++) if (l[p].dist > l[max].dist) max = p;
+                (l[max], l[hi]) = (l[hi], l[max]);
+            }
+        }
+        SortByDist(past);
+        SortByDist(future);
+        int nPast = past.Count, nFuture = future.Count;
+        if (sf.gm_sf.gm_search_type == GM_SEARCH_CLOSEST_REFS_ONLY)
+        {
+            if (nFuture > 0) { nPast = Math.Min(nPast, 1); nFuture = Math.Min(nFuture, 1); }
+            else nPast = Math.Min(nPast, 2);
+        }
+        if (nPast == 0 && nFuture == 0) return;
+        var segMap = new byte[segW * segH];
+        var prevGm = input.PrimaryRefBuf?.GlobalMotion;
+        var parms = new double[6];
+        for (int dir = 0; dir < 2; dir++)
+        {
+            var list = dir == 0 ? past : future;
+            int n = dir == 0 ? nPast : nFuture;
+            for (int fi = 0; fi < n; fi++)
+            {
+                int frame = list[fi].frame;
+                var refParams = prevGm != null ? prevGm[frame] : AomWarpedMotionParams.Default;
+                int tr = sf.gm_sf.gm_erroradv_tr_level;
+                double bestErroradv = AomGlobalMotion.ErroradvTr[tr];
+                var r = refBuf[frame]!;
+                if (AomGlobalMotion.ComputeGlobalMotionDisflow(src, r, cm.BitDepth, sf.gm_sf.downsample_level, parms, out var inliers, out int numInliers) &&
+                    numInliers != 0)
+                {
+                    var tmp = new AomWarpedMotionParams();
+                    AomGlobalMotion.ConvertModelToParams(parms, tmp);
+                    if (AomWarp.GetShearParams(tmp) && tmp.WmType > TRANSLATION)
+                    {
+                        AomGlobalMotion.ComputeFeatureSegmentationMap(segMap, segW, segH, inliers, numInliers);
+                        long refFrameError = AomGlobalMotion.SegmentedFrameError(r, src, src.CropWidths[0], src.CropHeights[0], segMap, segW);
+                        if (refFrameError != 0)
+                        {
+                            long warpError = AomGlobalMotion.RefineIntegerizedParam(tmp, tmp.WmType, cm.BitDepth, r, src, sf.gm_sf.num_refinement_steps,
+                                refFrameError, segMap, segW, AomGlobalMotion.ErroradvTr[tr]);
+                            if (tmp.WmType > TRANSLATION)
+                            {
+                                double erroradvantage = (double)warpError / refFrameError;
+                                if (AomGlobalMotion.IsEnoughErroradvantage(erroradvantage,
+                                        AomGlobalMotion.GmGetParamsCost(tmp, refParams, cm.AllowHighPrecisionMv), AomGlobalMotion.ErroradvTr[tr]) &&
+                                    erroradvantage < bestErroradv)
+                                {
+                                    bestErroradv = erroradvantage;
+                                    cm.GlobalMotion[frame].CopyFrom(tmp);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (sf.gm_sf.prune_ref_frame_for_gm_search != 0 && cm.GlobalMotion[frame].WmType <= TRANSLATION) break;
+            }
         }
     }
 

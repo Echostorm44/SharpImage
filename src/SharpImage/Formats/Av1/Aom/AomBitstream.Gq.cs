@@ -66,6 +66,11 @@ internal static partial class AomBitstream
     /// frames), then one OBU_FRAME (one tile group); the temporal delimiter is the caller's (av1_cx_iface.c adds it
     /// to the first frame of a temporal unit).</summary>
     internal static byte[] PackFrameGq(AomComp cpi, AomGqFrameHeader fh, out int largestTileId, System.IO.TextWriter? trace = null)
+        => PackFrameGq(cpi, fh, out largestTileId, out _, trace);
+
+    /// <summary>PackFrameGq, also returning the largest tile's adapted CDFs (the frame context libaom stores).</summary>
+    internal static byte[] PackFrameGq(AomComp cpi, AomGqFrameHeader fh, out int largestTileId, out Av1CdfContext? largestTileFc,
+        System.IO.TextWriter? trace = null)
     {
         var cm = cpi.Cm;
         var seq = fh.Seq;
@@ -88,14 +93,16 @@ internal static partial class AomBitstream
         var tiles = new byte[numTiles][];
         int tokIdx = 0, maxTileSize = 0;
         largestTileId = 0;
+        Av1CdfContext? largestTileFc0 = null;
         for (int tileRow = 0, i = 0; tileRow < cm.TileRows; tileRow++)
             for (int tileCol = 0; tileCol < cm.TileCols; tileCol++, i++)
             {
                 tiles[i] = WriteTile(f, cm.TileInit(tileRow, tileCol), ref tokIdx, trace);
-                if (tiles[i].Length > maxTileSize) { largestTileId = i; maxTileSize = tiles[i].Length; }
+                if (tiles[i].Length > maxTileSize) { largestTileId = i; maxTileSize = tiles[i].Length; largestTileFc0 = f.LastTileFc; }
             }
         int tileSizeBytes = ChooseSizeBytes((uint)maxTileSize);
         var wb = new AomWriteBitBuffer();
+        largestTileFc = largestTileFc0;
         WriteUncompressedHeaderGq(f, fh, wb, largestTileId, tileSizeBytes);
         byte[] hdr = wb.ToArray();
         var payload = new System.IO.MemoryStream();

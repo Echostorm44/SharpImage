@@ -6,6 +6,7 @@ namespace SharpImage.Formats.Av1;
 internal sealed partial class AomMacroblock
 {
     public readonly AomMbModeInfo ScratchBaseMbmi = new(), ScratchBestMotionMbmi = new(), ScratchBestInterMbmi = new(), ScratchIntraBestMbmi = new();
+    public readonly int[] ScratchWarpPts = new int[16], ScratchWarpPtsInref = new int[16];
     public readonly AomInterModeSearchState InterSearchState = new();
     public readonly AomHandleInterModeArgs InterArgs = new();
     public readonly AomMotionModeCandidate MotionModeCand = new();
@@ -323,6 +324,7 @@ internal static partial class AomRdoptInter
         InitNeighborPredBuf(x, args, xd.IsHbd);
         CollectNeighborsRefCounts(xd);
         EstimateRefFrameCosts(cm, xd, x.ModeCosts, refCostsSingle, refCostsComp);
+        AomTrace.Out?.Write($"rcs {xd.MiRow} {xd.MiCol} {refCostsSingle[0]} {refCostsSingle[1]} {refCostsSingle[2]} {refCostsSingle[3]} {refCostsSingle[4]} {refCostsSingle[5]} {refCostsSingle[6]} {refCostsSingle[7]}" + (char)10);
         int miRow = xd.MiRow, miCol = xd.MiCol;
         x.BestPredMvSad[0] = int.MaxValue;
         x.BestPredMvSad[1] = int.MaxValue;
