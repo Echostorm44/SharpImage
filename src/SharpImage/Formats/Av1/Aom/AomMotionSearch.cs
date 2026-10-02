@@ -417,4 +417,58 @@ internal static class AomMotionSearch
         // (bestsme == INT_MAX without integer mvs: libaom leaves the full-pel values in the int_mv)
         rateMv = mvRateCalculated ? bestMvRate : MvBitCost(x, bestMv, refMv);
     }
+
+    /// <summary>av1_compound_single_motion_search: a small-range full-pel search (step 5) and an eighth-pel refinement of
+    /// thisMv with the compound (average or masked) prediction against secondPred; returns bestsme.</summary>
+    public static int CompoundSingleMotionSearch(AomComp cpi, AomMacroblock x, int bsize, ref AomMv thisMv, AomCompoundRefs comp, out int rateMv, int refIdx)
+    {
+        var cm = cpi.Cm;
+        int numPlanes = cm.NumPlanes;
+        var xd = x.E;
+        var mbmi = xd.Mi0;
+        int refFrame = refIdx == 0 ? mbmi.RefFrame0 : mbmi.RefFrame1;
+        var refMv = GetRefMv(x, refIdx);
+        var pd = xd.Plane[0];
+        var scaledRef = cpi.GetScaledRefFrame(refFrame);
+        AomBuf2d origYv12 = default;
+        if (refIdx != 0)
+        {
+            origYv12 = pd.Pre(0);
+            pd.Pre(0) = pd.Pre(refIdx);
+        }
+        var backup = new AomBuf2d[3];
+        if (scaledRef != null)
+        {
+            for (int i = 0; i < numPlanes; i++) backup[i] = xd.Plane[i].Pre(refIdx);
+            AomInterPred.SetupPrePlanes(xd, 0, scaledRef, xd.MiRow, xd.MiCol, null!, numPlanes);
+        }
+        int searchMethod = AomMcomp.GetDefaultMvSearchMethod(x, cpi.Sf.mv_sf, bsize);
+        var startFullmv = thisMv.ToFullMv();
+        var fp = AomMcomp.MakeDefaultFullpelMsParams(cpi, x, bsize, refMv, cpi.SearchSites, searchMethod, false, x.MvLimits, startFullmv);
+        comp.InvMask = refIdx != 0;
+        fp.Comp = comp;
+        fp.HasSecondPred = true;
+        AomMv dummy = default;
+        int bestsme = AomMcomp.FullPixelSearch(startFullmv, fp, 5, null, out var bestFull, out var bestMvStats, ref dummy, false);
+        if (scaledRef != null)
+            for (int i = 0; i < numPlanes; i++) xd.Plane[i].Pre(0) = backup[i];
+        AomMv bestMv = bestFull;
+        if (cm.CurFrameForceIntegerMv) bestMv = bestFull.ToMv();
+        bool useFractionalMv = bestsme < int.MaxValue && !cm.CurFrameForceIntegerMv;
+        if (useFractionalMv)
+        {
+            var ms = AomSubpel.MakeDefaultSubpelMsParams(cpi, x, bsize, refMv, null, cpi.SubpelParamsScratch(x));
+            ms.Comp = comp;
+            ms.HasSecondPred = true;
+            ms.ForcedStop = AomSubpel.EIGHTH_PEL;
+            var startMv = bestFull.ToMv();
+            bestsme = AomSubpel.FindFractionalMvStep(cpi, ms, startMv, bestMvStats, out bestMv, out _, out _, null);
+            ms.HasSecondPred = false;
+            ms.Comp = null;
+        }
+        if (refIdx != 0) pd.Pre(0) = origYv12;
+        if (bestsme < int.MaxValue) thisMv = bestMv;
+        rateMv = MvBitCost(x, thisMv, refMv);
+        return bestsme;
+    }
 }

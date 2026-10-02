@@ -4,7 +4,7 @@ using static SharpImage.Formats.Av1.AomTables;
 namespace SharpImage.Formats.Av1;
 
 /// <summary>SUBPEL_MOTION_SEARCH_PARAMS (with its SUBPEL_SEARCH_VAR_PARAMS / MV_COST_PARAMS / MSBuffers).</summary>
-internal sealed class AomSubpelMsParams
+internal sealed partial class AomSubpelMsParams
 {
     public bool AllowHp;
     public int ForcedStop, ItersPerStep;
@@ -150,7 +150,13 @@ internal static class AomSubpel
     /// <summary>estimated_pref_error.</summary>
     private static int EstimatedPrefError(AomSubpelMsParams p, AomMv mv, out uint sse)
     {
-        if (p.HasSecondPred) throw new NotImplementedException("compound sub-pixel variance");
+        if (p.HasSecondPred)
+        {
+            // vfp->svaf / vfp->msvf: the bilinear prediction, then its average / mask blend with the second predictor
+            BilinearFilter(p, RefOff(p.Ref, mv), mv.Col & 7, mv.Row & 7);
+            return (int)AomCompound.VarianceOfComp(p.Comp!, p.Ref.Buf16 == null ? p.Pred : null, p.Ref.Buf16 != null ? p.Pred16 : null, 0, p.W, p.Src,
+                p.W, p.H, p.Bd, out sse);
+        }
         return (int)SubPixelVariance(p, RefOff(p.Ref, mv), mv.Col & 7, mv.Row & 7, out sse);
     }
 
@@ -262,8 +268,10 @@ internal static class AomSubpel
     /// <summary>upsampled_pref_error.</summary>
     private static int UpsampledPrefError(AomSubpelMsParams p, AomMv mv, out uint sse)
     {
-        if (p.HasSecondPred) throw new NotImplementedException("compound upsampled prediction");
         UpsampledPred(p, mv, mv.Col & 7, mv.Row & 7, RefOff(p.Ref, mv));
+        if (p.HasSecondPred)   // aom_comp_avg_upsampled_pred / aom_comp_mask_upsampled_pred
+            return (int)AomCompound.VarianceOfComp(p.Comp!, p.Ref.Buf16 == null ? p.Pred : null, p.Ref.Buf16 != null ? p.Pred16 : null, 0, p.W, p.Src,
+                p.W, p.H, p.Bd, out sse);
         return (int)VarianceAt(p, p.Pred, p.Ref.Buf16 != null ? p.Pred16 : null, 0, p.W, out sse);
     }
 
@@ -407,9 +415,10 @@ internal static class AomSubpel
     /// <summary>setup_center_error.</summary>
     private static uint SetupCenterError(AomSubpelMsParams p, AomMv bestMv, State st)
     {
-        if (p.HasSecondPred) throw new NotImplementedException("compound center error");
         int off = RefOff(p.Ref, bestMv);
-        uint besterr = VarianceAt(p, p.Ref.Buf, p.Ref.Buf16, off, p.Ref.Stride, out st.Sse1);
+        uint besterr = p.HasSecondPred
+            ? AomCompound.VarianceOfComp(p.Comp!, p.Ref.Buf16 == null ? p.Ref.Buf : null, p.Ref.Buf16, off, p.Ref.Stride, p.Src, p.W, p.H, p.Bd, out st.Sse1)
+            : VarianceAt(p, p.Ref.Buf, p.Ref.Buf16, off, p.Ref.Stride, out st.Sse1);
         st.Distortion = (int)besterr;
         besterr += (uint)MvErrCost(p, bestMv);
         return besterr;

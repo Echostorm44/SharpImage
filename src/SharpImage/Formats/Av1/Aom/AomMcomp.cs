@@ -16,7 +16,7 @@ internal sealed class AomSearchSiteConfig
 }
 
 /// <summary>FULLPEL_MOTION_SEARCH_PARAMS for the single-reference, non-OBMC searches (intrabc).</summary>
-internal sealed class AomFullPelMsParams
+internal sealed partial class AomFullPelMsParams
 {
     public int Bsize;
     public int SearchMethod;
@@ -346,7 +346,8 @@ internal static class AomMcomp
     /// <summary>get_mvpred_compound_sad.</summary>
     private static uint GetMvpredCompoundSad(AomFullPelMsParams p, int refOff)
     {
-        if (p.HasSecondPred) throw new NotImplementedException("compound motion search sad");
+        if (p.HasSecondPred)
+            return AomCompound.Sad(p.Comp!, p.Src, p.Ref, refOff, BlockSizeWide[p.Bsize], BlockSizeHigh[p.Bsize], p.Bd);
         return GetMvpredSad(p, refOff);
     }
 
@@ -388,10 +389,12 @@ internal static class AomMcomp
 
     public static int GetMvpredVarCost(AomFullPelMsParams p, AomMv thisMv, out AomFullpelMvStats stats)
     {
-        if (p.HasSecondPred) throw new NotImplementedException("compound motion search variance");
         int w = BlockSizeWide[p.Bsize], h = BlockSizeHigh[p.Bsize];
         uint sse;
-        uint var = p.Src.Buf16 != null
+        uint var = p.HasSecondPred
+            ? AomCompound.VarianceOfComp(p.Comp!, p.Ref.Buf16 == null ? p.Ref.Buf : null, p.Ref.Buf16, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride,
+                p.Src, w, h, p.Bd, out sse)
+            : p.Src.Buf16 != null
             ? AomHbd.Variance(p.Src.Buf16, p.Src.Offset, p.Src.Stride, p.Ref.Buf16, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride, 0, w, h,
                 p.Bd, out sse)
             : AomSad.Variance(p.Src.Buf, p.Src.Offset, p.Src.Stride, p.Ref.Buf, RefOffset(p.Ref, thisMv.Row, thisMv.Col), p.Ref.Stride,

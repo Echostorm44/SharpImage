@@ -267,7 +267,26 @@ internal static class AomInterIntraSearch
             long rdw = long.MaxValue;
             tmpRateMv = rateMv;   // (set below by the compound search when it runs)
             if (AomInter.HaveNewmvInInterMode(mbmi.Mode))
-                throw new NotImplementedException("av1_compound_single_motion_search (wedge inter-intra NEWMV refinement)");
+            {
+                // refine the motion vector against the (negated) wedge-masked intra prediction
+                var comp = new AomCompoundRefs
+                {
+                    SecondPred8 = xd.IsHbd ? null : b.Intra8, SecondPred16 = xd.IsHbd ? b.Intra16 : null,
+                    Mask = AomInterPred.GetContiguousSoftMask(mbmi.InterintraWedgeIndex, 1, bsize), MaskOffset = 0, MaskStride = bw,
+                };
+                AomMotionSearch.CompoundSingleMotionSearch(cpi, x, bsize, ref tmpMv, comp, out tmpRateMv, 0);
+                if (mbmi.Mv0.AsInt != tmpMv.AsInt)
+                {
+                    mbmi.Mv0 = tmpMv;
+                    mbmi.RefFrame1 = NONE_FRAME;   // no intra prediction inside the inter build
+                    AomInterPred.EncBuildInterPredictor(cm, xd, miRow, miCol, origDst, bsize, 0, 0, cpi.EnableIntraEdgeFilter);
+                    mbmi.RefFrame1 = INTRA_FRAME;
+                    AomInterPred.CombineInterintra(xd, bsize, 0, xd.Plane[0].Dst, b.Intra8, b.Intra16, 0, bw);
+                    AomModelRd.SbFn(AomModelRd.MODELRD_TYPE_MASKED_COMPOUND, cpi, bsize, x, xd, 0, 0, out int rateSum, out long distSum,
+                        out _, out _, null, null, null);
+                    rdw = AomRd.RdCost(x.Rdmult, tmpRateMv + rateOverhead + rateSum, distSum);
+                }
+            }
             if (rdw >= bestRdWedge)
             {
                 tmpMv = mv0;
