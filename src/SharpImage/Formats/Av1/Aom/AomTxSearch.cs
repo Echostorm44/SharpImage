@@ -1087,7 +1087,7 @@ internal static partial class AomTxSearch
             initDepth = MAX_TX_DEPTH;
         }
 
-        var bestTxkTypeMapBuf13 = new StackArr1024<byte>(); Span<byte> bestTxkTypeMap = bestTxkTypeMapBuf13;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr1024<byte> bestTxkTypeMapBuf13); Span<byte> bestTxkTypeMap = bestTxkTypeMapBuf13;   // written before read (uninitialized in libaom)
         int bestTxSize = maxRectTxSize;
         long bestRd = long.MaxValue;
         int numBlks = BsizeToNumBlk(bs);

@@ -309,7 +309,7 @@ internal static class AomIntraModeSearch
         bool filterIntraSelectedFlag = false;
         int bestTxSize = TX_8X8;
         byte bestUse = 0, bestFiMode = 0;
-        var bestTxTypeMapBuf15 = new StackArr1024<byte>(); Span<byte> bestTxTypeMap = bestTxTypeMapBuf15;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr1024<byte> bestTxTypeMapBuf15); Span<byte> bestTxTypeMap = bestTxTypeMapBuf15;   // written before read (uninitialized in libaom)
         mbmi.UseFilterIntra = 1;
         mbmi.Mode = DC_PRED;
         mbmi.Palette.PaletteSize0 = 0;
