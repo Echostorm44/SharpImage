@@ -170,6 +170,20 @@ internal static class AomHbd
     /// <summary>A w x h 16-bit block copy.</summary>
     internal static void CopyBlock(ushort[] src, int srcOff, int srcStride, ushort[] dst, int dstOff, int dstStride, int w, int h)
     {
+        if ((w == 4 || (w & 7) == 0) && h > 0 && srcOff >= 0 && dstOff >= 0
+            && srcOff + (h - 1) * srcStride + w <= src.Length && dstOff + (h - 1) * dstStride + w <= dst.Length)
+        {
+            // whole rows in registers (Array.Copy per row is a call and a length dispatch each)
+            ref ushort s = ref MemoryMarshal.GetArrayDataReference(src), d = ref MemoryMarshal.GetArrayDataReference(dst);
+            for (int r = 0; r < h; r++)
+            {
+                ref byte sr = ref Unsafe.As<ushort, byte>(ref Unsafe.Add(ref s, srcOff + r * srcStride));
+                ref byte dr = ref Unsafe.As<ushort, byte>(ref Unsafe.Add(ref d, dstOff + r * dstStride));
+                if (w == 4) Unsafe.WriteUnaligned(ref dr, Unsafe.ReadUnaligned<long>(ref sr));
+                else for (int c = 0; c < 2 * w; c += 16) Unsafe.WriteUnaligned(ref Unsafe.Add(ref dr, c), Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref sr, c)));
+            }
+            return;
+        }
         for (int r = 0; r < h; r++) Array.Copy(src, srcOff + r * srcStride, dst, dstOff + r * dstStride, w);
     }
 
