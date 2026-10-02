@@ -367,7 +367,12 @@ internal static partial class AomRdoptInter
                 if (PruneZeroMvWithSse(x, bsize, args, cpi.Sf.gm_sf.prune_zero_mv_with_sse)) continue;
             int skipBuildPred = 0;   // INTERP_EVAL_LUMA_EVAL_CHROMA
             int miRow = xd.MiRow, miCol = xd.MiCol;
-            if (isComp) throw new NotImplementedException("process_compound_inter_mode (compound type rd)");
+            if (isComp)
+            {
+                bool notBest = ProcessCompoundInterMode(cpi, x, args, refBestRd, curMv, bsize, out compmodeInterinterCost, origDst, tmpDst, ref rateMv,
+                    ref rdStats, skipRd, ref skipBuildPred);
+                if (notBest) continue;
+            }
             if (!args.SkipIfs)
             {
                 retVal = AomInterpSearch.InterpolationFilterSearch(x, cpi, bsize, tmpDst, origDst, ref rd, ref rs, ref skipBuildPred, args, refBestRd);

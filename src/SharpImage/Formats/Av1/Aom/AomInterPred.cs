@@ -296,7 +296,7 @@ internal static partial class AomInterPred
     }
 
     /// <summary>allow_warp / av1_init_warp_params.</summary>
-    private static void InitWarpParams(AomInterPredParams p, bool globalWarpAllowed, bool localWarpAllowed, int r, AomMacroblockD xd, AomMbModeInfo mi)
+    internal static void InitWarpParams(AomInterPredParams p, bool globalWarpAllowed, bool localWarpAllowed, int r, AomMacroblockD xd, AomMbModeInfo mi)
     {
         if (p.BlockHeight < 8 || p.BlockWidth < 8) return;
         if (xd.CurFrameForceIntegerMv) return;

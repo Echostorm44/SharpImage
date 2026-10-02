@@ -38,7 +38,7 @@ internal static class AomInterIntraSearch
     }
 
     /// <summary>aom_subtract_block / aom_highbd_subtract_block into a contiguous diff.</summary>
-    private static void Subtract(short[] diff, int w, int h, byte[]? a8, ushort[]? a16, int aOff, int aStride, byte[]? b8, ushort[]? b16, int bOff,
+    internal static void Subtract(short[] diff, int w, int h, byte[]? a8, ushort[]? a16, int aOff, int aStride, byte[]? b8, ushort[]? b16, int bOff,
         int bStride)
     {
         for (int r = 0; r < h; r++)
@@ -51,7 +51,7 @@ internal static class AomInterIntraSearch
     }
 
     /// <summary>pick_wedge_fixed_sign.</summary>
-    private static long PickWedgeFixedSign(AomComp cpi, AomMacroblock x, int bsize, short[] residual1, short[] diff10, int wedgeSign, out int bestWedgeIndex,
+    internal static long PickWedgeFixedSign(AomComp cpi, AomMacroblock x, int bsize, short[] residual1, short[] diff10, int wedgeSign, out int bestWedgeIndex,
         out ulong bestSse)
     {
         var xd = x.E;
@@ -116,7 +116,7 @@ internal static class AomInterIntraSearch
     }
 
     /// <summary>estimate_yrd_for_sb.</summary>
-    private static long EstimateYrdForSb(AomComp cpi, int bs, AomMacroblock x, long refBestRd, out AomRdStats rdStats)
+    internal static long EstimateYrdForSb(AomComp cpi, int bs, AomMacroblock x, long refBestRd, out AomRdStats rdStats)
     {
         rdStats = default;
         if (refBestRd < 0) return long.MaxValue;
@@ -140,7 +140,7 @@ internal static class AomInterIntraSearch
     }
 
     /// <summary>get_rd_thresh_from_best_rd.</summary>
-    private static long RdThreshFromBestRd(long refBestRd, int mulFactor, int divFactor)
+    internal static long RdThreshFromBestRd(long refBestRd, int mulFactor, int divFactor)
     {
         long t = refBestRd;
         if (divFactor != 0) t = refBestRd < divFactor * (long.MaxValue / mulFactor) ? (refBestRd / divFactor) * mulFactor : long.MaxValue;
