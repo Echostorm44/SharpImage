@@ -127,7 +127,7 @@ internal static partial class AomEncoder
             if (cm.NumPlanes > 1)
                 opt = opt && AomResize.HasOptimizedScaler(reff.CropWidths[1], reff.CropHeights[1], scaled.CropWidths[1], scaled.CropHeights[1]);
             if (opt && cm.BitDepth == 8) AomResize.ResizeAndExtendFrame(reff, scaled, filter, phase);
-            else throw new NotImplementedException("av1_resize_and_extend_frame_nonnormative");
+            else AomResize.ResizeAndExtendFrameNonnormative(reff, scaled);
             cpi.ScaledRefBufs[r] = scaled;
         }
     }

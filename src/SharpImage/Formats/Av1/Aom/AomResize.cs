@@ -5,7 +5,7 @@ namespace SharpImage.Formats.Av1;
 
 // Port of libaom 3.14.1 av1/common/resize.c (av1_realloc_and_scale_if_required, av1_resize_and_extend_frame_c,
 // av1_has_optimized_scaler) and aom_dsp/aom_convolve.c (aom_scaled_2d_c): the encoder's source / reference scaler.
-internal static class AomResize
+internal static partial class AomResize
 {
     /// <summary>av1_has_optimized_scaler: the scaler handles ratios from 1/4 to 16 (and the 3/4 SIMD special case is
     /// identical to C).</summary>
@@ -26,7 +26,7 @@ internal static class AomResize
         if (unscaled.NumPlanes > 1)
             opt = opt && HasOptimizedScaler(unscaled.CropWidths[1], unscaled.CropHeights[1], scaled.CropWidths[1], scaled.CropHeights[1]);
         if (useOptimizedScaler && opt && unscaled.BitDepth == 8) ResizeAndExtendFrame(unscaled, scaled, filter, phase);
-        else throw new NotImplementedException("av1_resize_and_extend_frame_nonnormative");
+        else ResizeAndExtendFrameNonnormative(unscaled, scaled);
         return scaled;
     }
 
