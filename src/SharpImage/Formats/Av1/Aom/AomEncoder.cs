@@ -214,8 +214,9 @@ internal static partial class AomEncoder
         cpi.Tuning = sfIn.Tuning;
         if (input.TxTypeProbs != null) cpi.TxTypeProbs = input.TxTypeProbs;
         if (input.FrameProbs != null) cpi.FrameProbs = input.FrameProbs;
-        // encode_without_recode: copy_frame_prob_info on key frames (and golden refreshes with extra_prune_warped)
-        if (input.Mode != ALLINTRA && !input.SkipCopyFrameProbInfo && (cm.FrameType == KEY_FRAME || (cpi.Sf.inter_sf.extra_prune_warped != 0 && input.RefreshGolden)))
+        // copy_frame_prob_info on key frames; encode_without_recode also on golden refreshes with extra_prune_warped
+        if (input.Mode != ALLINTRA && !input.SkipCopyFrameProbInfo && (cm.FrameType == KEY_FRAME ||
+            (cpi.Sf.hl_sf.recode_loop == DISALLOW_RECODE && cpi.Sf.inter_sf.extra_prune_warped != 0 && input.RefreshGolden)))
             cpi.CopyFrameProbInfo();
         cpi.RdRdmult = cpi.ComputeRdMult(input.BaseQindex + cm.YDcDeltaQ);
         if (isInter) PrepareInterFrameEncode(cpi, input);

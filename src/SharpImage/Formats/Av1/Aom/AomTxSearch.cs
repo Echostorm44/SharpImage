@@ -479,7 +479,7 @@ internal static partial class AomTxSearch
             else
             {
                 int forceTxType = 0, maxProb = 0;
-                int txTypeProbThreshold = txfmParams.DefaultInterTxTypeProbThresh + 25;   // PROB_THRESH_OFFSET_TX_TYPE
+                int txTypeProbThreshold = txfmParams.DefaultInterTxTypeProbThresh + 100;   // PROB_THRESH_OFFSET_TX_TYPE
                 for (int i = 1; i < TX_TYPES; i++)
                     if (cpi.TxTypeProbs[probsOff + i] > maxProb) { maxProb = cpi.TxTypeProbs[probsOff + i]; forceTxType = i; }
                 if (maxProb > txTypeProbThreshold) txkAllowed = forceTxType;
@@ -584,6 +584,7 @@ internal static partial class AomTxSearch
             txkAllowed = plane != 0 ? uvTxType : DCT_DCT;
             allowedTxMask = 1 << txkAllowed;
         }
+        if (AomTrace.Out != null) { int mp = 0; for (int q = 1; q < TX_TYPES; q++) if (cpi.TxTypeProbs[probsOff + q] > mp) mp = cpi.TxTypeProbs[probsOff + q]; AomTrace.Out.Write($"txp {cpi.TxTypeProbs[probsOff]} {mp}" + (char)10); }
         AomTrace.Out?.Write($"txmask p {plane} ts {txSize} allowed {txkAllowed} mask {allowedTxMask:x} dth {txfmParams.DefaultInterTxTypeProbThresh} p2d {txfmParams.Prune2dTxfmMode} rdm {x.RdModel} ut {cpi.UpdateType}" + (char)10);
         allowedTxkTypes = txkAllowed;
         return (ushort)allowedTxMask;

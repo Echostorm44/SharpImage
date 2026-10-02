@@ -600,5 +600,12 @@ internal static partial class AomEncoder
                 cpi.TxTypeProbs[off + j] = prob;
             }
         }
+        if (AomTrace.Out != null)
+        {
+            ulong h = 0, hc = 0;
+            for (int i = 0; i < TX_SIZES_ALL; i++)
+                for (int j = 0; j < TX_TYPES; j++) { h = h * 31 + (ulong)cpi.TxTypeProbs[cpi.TxTypeProbsOffset(i) + j]; hc = hc * 31 + (ulong)x.TxTypeUsed[i * TX_TYPES + j]; }
+            AomTrace.Out.Write($"ttp ut {cpi.UpdateType} h {h:x} c {hc:x}" + (char)10);
+        }
     }
 }
