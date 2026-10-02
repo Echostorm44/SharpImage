@@ -42,7 +42,7 @@ internal struct AomRdStats
     /// <summary>av1_rd_cost_update.</summary>
     public void CostUpdate(int rdmult)
     {
-        if (Rate < int.MaxValue && Dist < long.MaxValue && Rdcost < long.MaxValue) Rdcost = AomRd.RdCost(rdmult, Rate, Dist);
+        if (Rate < int.MaxValue && Dist < long.MaxValue && Rdcost < long.MaxValue) Rdcost = AomRd.CalculateRdCost(rdmult, Rate, Dist);   // av1_rd_cost_update
         else Invalidate();
     }
 }

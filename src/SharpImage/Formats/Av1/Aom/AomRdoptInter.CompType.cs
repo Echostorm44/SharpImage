@@ -581,6 +581,7 @@ internal static partial class AomRdoptInter
         int groupCtx = AomPredCommon.CompGroupIdx(xd);
         int indexCtx = AomPredCommon.CompIndex(cm, xd);
         CalcMaskedTypeCost(x.ModeCosts, bsize, groupCtx, indexCtx, maskedCompoundUsed, maskedTypeCost);
+        AomTrace.Out?.Write($"mtc {xd.MiRow} {xd.MiCol} bs {bsize} g {groupCtx} i {indexCtx} mcu {(maskedCompoundUsed ? 1 : 0)} {maskedTypeCost[0]} {maskedTypeCost[1]} {maskedTypeCost[2]} {maskedTypeCost[3]} vt {validCompTypes[0]} {validCompTypes[1]} {validCompTypes[2]} {validCompTypes[3]} n {validTypeCount}" + (char)10);
         long compModelRdCur;
         long bestRdCur;
         int miRow = xd.MiRow, miCol = xd.MiCol;
@@ -875,6 +876,7 @@ internal static partial class AomRdoptInter
         if (thisMode == NEW_NEWMV) args.CmpMode[refFrame] = mbmi.InterinterComp.Type;
         AomInterpSearch.RestoreDstBuf(xd, origDst, 1);
         if (!matchFound) SaveCompRdSearchStat(x, mbmi, compRate, compDist, compModelRate, compModelDist, curMv, compRs2);
+        AomTrace.Out?.Write($"cte {xd.MiRow} {xd.MiCol} type {bestCompoundData.Type} rd {rd} cost {bestCompmodeInterinterCost} rate_mv {rateMv}" + (char)10);
         return bestCompmodeInterinterCost;
     }
 

@@ -69,8 +69,7 @@ internal static partial class AomEncodeFrame
         }
         result.Rate = left.Rate - right.Rate;
         result.Dist = left.Dist - right.Dist;
-        result.Rdcost = result.Rate >= 0 ? AomRd.RdCost(mult, result.Rate, result.Dist)
-            : result.Dist * (1 << AomRd.RdDivBits) - ((((long)-result.Rate * mult) + 256) >> AomCost.ProbCostShift);   // RDCOST_NEG_R
+        result.Rdcost = AomRd.CalculateRdCost(mult, result.Rate, result.Dist);
     }
 
     /// <summary>av1_active_h_edge / av1_active_v_edge (one-pass: the frame edges).</summary>
@@ -827,6 +826,7 @@ internal static partial class AomEncodeFrame
             if (miRow + yIdx >= cm.MiRows || miCol + xIdx >= cm.MiCols) continue;
             pcTree.Split[idx]!.Index = idx;
             RdStatsSubtraction(x.Rdmult, bestRdc, sumRdc, out AomRdStats bestRemainRdcost);
+            AomTrace.Out?.Write($"spl {miRow} {miCol} bs {bsize} idx {idx} rm {x.Rdmult} best {bestRdc.Rate} {bestRdc.Dist} {bestRdc.Rdcost} sum {sumRdc.Rate} {sumRdc.Dist} {sumRdc.Rdcost}" + (char)10);
 
             int currQuadTreeIdx = 0;
             if (cpi.FrameIsIntraOnly && bsize <= BLOCK_64X64)

@@ -507,6 +507,7 @@ internal sealed partial class AomGqEncoder
         // av1_frame_init_quantizer at base_qindex (no delta q / segmentation)
         cpi.Quants = new AomQuants(_cfg.BitDepth, 0, 0, 0, 0, 0, cpi.Sharpness);
         AomQuantSetup.SetQIndex(cpi, x, baseQindex);
+        _prevBaseQindex = baseQindex;   // cm->quant_params.base_qindex = base_qindex
         tf.BaseRdmult = AomRd.ComputeRdMultBasedOnQindex(_cfg.BitDepth, gf.UpdateType[_gfFrameIndex], baseQindex, cpi.Tuning, GOOD) / 6;
         if (tplSf.allow_compound_pred != 0)
         {

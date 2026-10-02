@@ -188,8 +188,11 @@ internal static partial class AomEncoder
         if (input.BaseQindex == 0) { sfIn.BestAllowedQ = 0; sfIn.WorstAllowedQ = 0; }
         sfIn.UseHighBitDepth = bd > 8;
         var seqFlags = input.SeqFlags ?? new AomSpeedFeatureSeqFlags { enable_restoration = input.EnableRestoration ? 1 : 0 };
-        cpi.Sf.SetForFrame(sfIn, seqFlags, cpi.WinnerModeParams, input.Speed);
+        if (input.SfChain != null) input.SfChain(cpi.Sf, cpi.WinnerModeParams);
+        else cpi.Sf.SetForFrame(sfIn, seqFlags, cpi.WinnerModeParams, input.Speed);
         cpi.EnableRestoration = seqFlags.enable_restoration != 0;
+        // encode_with_recode_loop: av1_determine_sc_tools_with_encoding (key frames)
+        if (ScTrialWanted(cpi, input)) DetermineScToolsWithEncoding(cpi, input, sfIn, seqFlags);
         input.SfOverride?.Invoke(cpi.Sf);
 
         // trellis per segment
@@ -202,7 +205,7 @@ internal static partial class AomEncoder
 
         // the frame CDFs (key frame defaults for the qindex) and av1_initialize_rd_consts
         cm.Fc = new Av1CdfContext();
-        int qCtxQ = input.BaseQindex;
+        int qCtxQ = input.CdfQindex ?? input.BaseQindex;   // av1_setup_frame ran at the frame q (before the trial encodes)
         if (input.PrimaryRefBuf != null) cm.Fc.CopyFrom(input.PrimaryRefBuf.FrameContext!);   // av1_setup_frame: the primary reference's CDFs
         else Av1CdfDefaults.InitializeDefault(cm.Fc, qCtxQ <= 20 ? 0 : qCtxQ <= 60 ? 1 : qCtxQ <= 120 ? 2 : 3);   // get_q_ctx
         cpi.UpdateType = input.UpdateType; cpi.LayerDepth = Math.Min(input.LayerDepth, 6); cpi.BoostIndex = input.BoostIndex;
@@ -212,7 +215,7 @@ internal static partial class AomEncoder
         if (input.TxTypeProbs != null) cpi.TxTypeProbs = input.TxTypeProbs;
         if (input.FrameProbs != null) cpi.FrameProbs = input.FrameProbs;
         // encode_without_recode: copy_frame_prob_info on key frames (and golden refreshes with extra_prune_warped)
-        if (input.Mode != ALLINTRA && (cm.FrameType == KEY_FRAME || (cpi.Sf.inter_sf.extra_prune_warped != 0 && input.RefreshGolden)))
+        if (input.Mode != ALLINTRA && !input.SkipCopyFrameProbInfo && (cm.FrameType == KEY_FRAME || (cpi.Sf.inter_sf.extra_prune_warped != 0 && input.RefreshGolden)))
             cpi.CopyFrameProbInfo();
         cpi.RdRdmult = cpi.ComputeRdMult(input.BaseQindex + cm.YDcDeltaQ);
         if (isInter) PrepareInterFrameEncode(cpi, input);
@@ -676,8 +679,15 @@ internal static partial class AomEncoder
             AomEncodeFrame.RdUsePartition(cpi, x, miRow, miCol, cm.SbSize, out _, out _, true, root);
             return;
         }
-        if (sf.part_sf.partition_search_type != SEARCH_PARTITION)
-            throw new NotSupportedException("FIXED_PARTITION is not used by the all-intra speeds");
+        if (sf.part_sf.partition_search_type == FIXED_PARTITION)
+        {
+            // partition search by adjusting a fixed-size partition (no segmentation: no seg_skip)
+            AomEncodeFrame.SetOffsets(cpi, x, miRow, miCol, cm.SbSize);
+            SetFixedPartitioning(cpi, x.TileData.Tile, miRow, miCol, sf.part_sf.fixed_partition_size);
+            var root = new AomPcTree(cm.SbSize);
+            AomEncodeFrame.RdUsePartition(cpi, x, miRow, miCol, cm.SbSize, out _, out _, true, root);
+            return;
+        }
 
         GetTplStatsSb(cpi, x, cm.SbSize, miRow, miCol);
         // av1_reset_simple_motion_tree_partition, set_max_min_partition_size
@@ -690,6 +700,49 @@ internal static partial class AomEncoder
         // update the inter rd model (single tile only)
         if (sf.inter_sf.inter_mode_rd_model_estimation == 1 && cm.TileCols == 1 && cm.TileRows == 1)
             AomRdoptInter.InterModeDataFit(x.TileData);
+    }
+
+    /// <summary>av1_set_fixed_partitioning (with set_partial_sb_partition / find_partition_size).</summary>
+    private static void SetFixedPartitioning(AomComp cpi, AomTileInfo tile, int miRow, int miCol, int bsize)
+    {
+        var cm = cpi.Cm;
+        int miRowsRemaining = tile.MiRowEnd - miRow, miColsRemaining = tile.MiColEnd - miCol;
+        int mibSize = MiSizeWide[cm.SbSize];
+        int bh = MiSizeHigh[bsize], bw = MiSizeWide[bsize];
+        if (miColsRemaining >= mibSize && miRowsRemaining >= mibSize)
+        {
+            for (int r = 0; r < mibSize; r += bh)
+                for (int c = 0; c < mibSize; c += bw) SetFixedMi(cm, miRow + r, miCol + c, bsize);
+            return;
+        }
+        for (int r = 0; r < mibSize; r += bh)
+        {
+            bw = MiSizeWide[bsize];
+            for (int c = 0; c < mibSize; c += bw)
+                SetFixedMi(cm, miRow + r, miCol + c, FindPartitionSize(bsize, miRowsRemaining - r, miColsRemaining - c, ref bh, ref bw));
+        }
+    }
+
+    private static void SetFixedMi(AomCommon cm, int row, int col, int bsize)
+    {
+        int idx = row * cm.MiStride + col;
+        if (idx >= cm.MiGridBase.Length || idx >= cm.MiAlloc.Length) return;   // beyond the allocation: never read
+        var mi = cm.MiGridBase[idx] = cm.MiAlloc[idx];
+        mi.Bsize = bsize;
+    }
+
+    /// <summary>find_partition_size.</summary>
+    private static int FindPartitionSize(int bsize, int rowsLeft, int colsLeft, ref int bh, ref int bw)
+    {
+        int intSize = bsize;
+        if (rowsLeft <= 0 || colsLeft <= 0) return Math.Min(bsize, BLOCK_8X8);
+        for (; intSize > 0; intSize -= 3)
+        {
+            bh = MiSizeHigh[intSize];
+            bw = MiSizeWide[intSize];
+            if (bh <= rowsLeft && bw <= colsLeft) break;
+        }
+        return intSize;
     }
 
     /// <summary>encode_nonrd_sb (VAR_BASED_PARTITION, no segment skip).</summary>

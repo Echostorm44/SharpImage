@@ -323,6 +323,7 @@ internal sealed partial class AomGqEncoder
 
     private int _curQindex, _curFrameType;
     private bool _curShowExisting;
+    private int _prevBaseQindex;
     private FrameParams _curRefresh = new();
     private readonly int[] _curBackupFilterLevel = new int[4];
     private AomRefBuffer? _curFrameBuf;
@@ -925,7 +926,7 @@ internal sealed partial class AomGqEncoder
             LagInFrames = cfg.LagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, RefreshGolden = fp.RefreshGolden,
             PpiFilterLevel = _ppiFilterLevel, ResizeNeeded = _resizeModeFixed, IsSrcFrameAltRef = _rc.IsSrcFrameAltRef != 0,
             GfFrameIndex = _gfFrameIndex, GfArfIndex = gf.ArfIndex, CurPyramidLevel = pyramidLevel, ValidGmModelFound = _validGmModelFound,
-            MvSearchState = _maxMvMagnitude, SetMvParamsEarly = _mvSearchParamsDue,
+            MvSearchState = _maxMvMagnitude, SetMvParamsEarly = _mvSearchParamsDue, PrevBaseQindex = _prevBaseQindex,
         };
         _mvSearchParamsDue = false;
         if (!isKey)
@@ -939,6 +940,7 @@ internal sealed partial class AomGqEncoder
         _seqFlags.SeqParamsLocked = _seqParamsLocked;
         var (cpi, x) = AomEncoder.EncodeFrame(input);
         _lastCpi = cpi;
+        _prevBaseQindex = cpi.Cm.BaseQindex;   // av1_set_quantizer: max(delta_q_present_flag, q) (q 0 has no delta q)
         if (isKey) { _sct = cpi.AllowScreenContentTools; _isScreenContentType = input.IsScreenContentType; }
         if (!_seqParamsLocked)
         {

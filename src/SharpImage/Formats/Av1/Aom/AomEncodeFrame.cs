@@ -607,9 +607,14 @@ internal static partial class AomEncodeFrame
                 AomIntraModeSearch.EncodeIntraBlockPlane(cpi, x, bsize, plane, dryRun, cpi.OptimizeSegArr[mbmi.SegmentId]);
             xd.Cfl.StoreY = 0;
             if (AomIntraModeSearch.AllowPalette(cpi.AllowScreenContentTools, bsize))
+            {
+                // x->palette_pixels: the statistics av1_determine_sc_tools_with_encoding reads
+                if (mbmi.Palette.PaletteSize0 > 0 && dryRun == OUTPUT_ENABLED)
+                    System.Threading.Interlocked.Add(ref cpi.PalettePixelNum, BlockSizeWide[bsize] * BlockSizeHigh[bsize]);
                 for (int plane = 0; plane < Math.Min(2, numPlanes); ++plane)
                     if ((plane == 0 ? mbmi.Palette.PaletteSize0 : mbmi.Palette.PaletteSize1) > 0 && dryRun == OUTPUT_ENABLED)
                         AomPalette.TokenizeColorMap(cpi, x, plane, bsize, mbmi.TxSize, cpi.AllowUpdateCdf);
+            }
 
             UpdateIntraMbTxbContext(cpi, x, dryRun, bsize, cpi.AllowUpdateCdf);
         }

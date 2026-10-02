@@ -35,6 +35,7 @@ internal static partial class AomModeCostFill
 {
     /// <summary>libaom BLOCK_SIZE -> the decoder CDF's wedge context (dav1d_wedge_ctx_lut); -1 for sizes without wedges.</summary>
     internal static readonly sbyte[] WedgeCtx = { -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, -1, -1, -1, -1, -1, -1, -1, -1, 7, 8, -1, -1 };
+    private static readonly ushort[] NonWedgeCompoundTypeCdf = { 16384, 0 };   // AOM_CDF2(16384)
 
     /// <summary>av1_fill_mode_rates' skip mode and switchable interpolation filter costs (every frame) and its
     /// !frame_is_intra_only part, from the frame's CDFs.</summary>
@@ -66,9 +67,9 @@ internal static partial class AomModeCostFill
         {
             int w = WedgeCtx[i];
             // compound_type_cdf[bsize] (COMPOUND_WEDGE / COMPOUND_DIFFWTD): libaom keeps a CDF per block size; the sizes
-            // without wedges never code the symbol (their default CDF is the 8x8 one's shape, unused)
-            if (w >= 0) AomCost.CostTokensFromCdf(mc.CompoundTypeCost.AsSpan(i * 2), m.WedgeComp[w], 2);
-            else Array.Clear(mc.CompoundTypeCost, i * 2, 2);
+            // without wedges never code the symbol, so theirs stays the default AOM_CDF2(16384) (calc_masked_type_cost
+            // still adds its costs)
+            AomCost.CostTokensFromCdf(mc.CompoundTypeCost.AsSpan(i * 2), w >= 0 ? m.WedgeComp[w] : NonWedgeCompoundTypeCdf, 2);
             if (w >= 0) AomCost.CostTokensFromCdf(mc.WedgeIdxCost.AsSpan(i * 16), m.WedgeIdx[w], 16);
         }
         for (int i = 0; i < 4; i++)
