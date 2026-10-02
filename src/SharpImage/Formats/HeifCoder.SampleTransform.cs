@@ -253,7 +253,7 @@ public static partial class HeifCoder
         // Qualities: the base of 8+8 / 12+4 is always lossless (libavif), the hidden items follow Quality / QualityAlpha.
         var (qIdxQ, aQIdxQ, qualityLossless) = QualityQIndices(options, color);
         bool lossless = options.Lossless || qualityLossless;
-        int qIdx = qIdxQ ?? Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        int qIdx = qIdxQ ?? Math.Clamp((int)Math.Round(Math.Clamp(options.Qp ?? 20, 0, 51) * (255.0 / 51.0)), 4, 255);
         int aQIdx = aQIdxQ ?? (lossless ? 0 : Math.Clamp(qIdx / 2, 4, 255));
         int baseBd = recipe == AvifBitDepthExtension.Bits8Plus8 ? 8 : 12;
         bool baseLossless = recipe != AvifBitDepthExtension.Bits12Plus8Overlap4 || lossless;

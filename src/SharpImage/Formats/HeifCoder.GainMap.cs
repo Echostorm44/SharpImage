@@ -636,7 +636,7 @@ public static partial class HeifCoder
         int? gq = o.QualityGainMap ?? (o.GainMapLossless || o.GainMapQp != null ? null : o.Quality);
         bool gmLossless = gq is { } g ? g >= 100 : o.GainMapLossless;
         int? gmQIdx = gq is { } g2 && g2 < 100 ? QualityToQIndex(g2, color.Matrix == 0) : null;
-        byte[] file = EncodeAvifGeneral(img, o.GainMapQp ?? o.Qp, bd, layout, color, new Av1.AvifContainerExtras(), gmLossless,
+        byte[] file = EncodeAvifGeneral(img, o.GainMapQp ?? o.Qp ?? 20, bd, layout, color, new Av1.AvifContainerExtras(), gmLossless,
             scaleYuvTo: (gw, gh), libavifFloatYuv: true, qIdxOverride: gmQIdx);
 
         // Lift the coded item and its properties out of the single-item file.

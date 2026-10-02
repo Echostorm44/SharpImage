@@ -95,8 +95,12 @@ public sealed class AvifEncodeOptions
     /// still image (all-intra mode, where libaom disables CDEF), on for layered images and sequences.</summary>
     public bool? EnableCdef { get; set; }
 
-    /// <summary>Quantization parameter 0..51 (0 = highest quality / largest file). Default 20.</summary>
-    public int Qp { get; set; } = 20;
+    /// <summary>Quantization parameter 0..51 (0 = highest quality / largest file). Null (default): when
+    /// <see cref="Quality"/> is also unset, avifenc's default quality 60 (alpha following it) applies.</summary>
+    public int? Qp { get; set; }
+
+    /// <summary>avifenc's DEFAULT_QUALITY.</summary>
+    public const int DefaultQuality = 60;
 
     /// <summary>Deblocking filter sharpness 0..7 (loop_filter_sharpness; libaom / avifenc -a sharpness=S): higher values
     /// weaken the filter across strong edges. The deblocking level search runs with it.</summary>
@@ -1108,7 +1112,7 @@ public static partial class HeifCoder
     /// <summary>Encodes an image as AVIF (AV1 intra) with the given options.</summary>
     public static byte[] EncodeAvif(ImageFrame image, AvifEncodeOptions? options = null)
     {
-        options ??= new AvifEncodeOptions();
+        options = WithDefaultQuality(options ?? new AvifEncodeOptions());
         // libavif codes a single still image in libaom's all-intra mode (layered images: good quality with libaom 3.14)
         using var scope = new EncoderScope(options, allIntra: !options.Progressive && options.Layers == null);
         return EncodeAvifEntry(image, options);
@@ -1215,7 +1219,7 @@ public static partial class HeifCoder
         bool mono = layout == Av1.Av1PixelLayout.I400 || (!anyColour && color.Matrix is not (0 or 16 or 17));
         var coded = mono ? Av1.Av1PixelLayout.I400 : layout;
         int ssX = coded is Av1.Av1PixelLayout.I420 or Av1.Av1PixelLayout.I422 ? 1 : 0, ssY = coded == Av1.Av1PixelLayout.I420 ? 1 : 0;
-        int defQ = Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        int defQ = Math.Clamp((int)Math.Round(Math.Clamp(options.Qp ?? 20, 0, 51) * (255.0 / 51.0)), 4, 255);
         int max = (1 << bd) - 1;
         var inputs = new List<Av1.Av1StillImageEncoder.LayerInput>();
         for (int i = 0; i < layers.Count; i++)
@@ -1408,8 +1412,8 @@ public static partial class HeifCoder
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
                && options.FilmGrain == null && !denoise && !options.Progressive && !forceColor && !forceAlpha && qIdx == null && aQIdx == null
                && !qualityLossless && !options.SharpYuv && !SourcePlanes.TryGetValue(image, out _)
-            ? EncodeAvif8(image, options.Qp, color, extras)
-            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless || qualityLossless, grain,
+            ? EncodeAvif8(image, options.Qp ?? 20, color, extras)
+            : EncodeAvifGeneral(image, options.Qp ?? 20, bd, layout, color, extras, options.Lossless || qualityLossless, grain,
                 options.Progressive && image.Columns >= 16 && image.Rows >= 16,   // a sub-8px base layer is pointless
                 forceColor: forceColor, forceAlpha: forceAlpha, qIdxOverride: qIdx, alphaQIdxOverride: aQIdx, sharpYuv: options.SharpYuv);
         }
@@ -1431,9 +1435,19 @@ public static partial class HeifCoder
     /// </summary>
     public static byte[] EncodeAvifSequence(ImageSequence sequence, AvifEncodeOptions? options = null)
     {
-        options ??= new AvifEncodeOptions();
+        options = WithDefaultQuality(options ?? new AvifEncodeOptions());
         using var scope = new EncoderScope(options);
         return EncodeAvifSequenceEntry(sequence, options);
+    }
+
+    // avifenc: with neither a quality nor a quantizer given, quality DEFAULT_QUALITY (60), alpha following colour (a
+    // target size searches the quality itself)
+    internal static AvifEncodeOptions WithDefaultQuality(AvifEncodeOptions o)
+    {
+        if (o.Quality != null || o.Qp != null || o.TargetSize != null || o.Lossless) return o;   // --lossless: quality 100
+        var c = o.Clone();
+        c.Quality = AvifEncodeOptions.DefaultQuality;
+        return c;
     }
 
     // ISO BMFF times: seconds since 1904-01-01 UTC (0 = unset).
@@ -1502,7 +1516,7 @@ public static partial class HeifCoder
         var codedLayout = mono ? Av1.Av1PixelLayout.I400 : layout;
         var (qIdxQ, aQIdxQ, qualityLossless) = QualityQIndices(options, color, sequence: true);
         bool lossless = options.Lossless || qualityLossless;
-        int baseQIdx = qIdxQ ?? Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        int baseQIdx = qIdxQ ?? Math.Clamp((int)Math.Round(Math.Clamp(options.Qp ?? 20, 0, 51) * (255.0 / 51.0)), 4, 255);
         int alphaQIdx = aQIdxQ ?? (lossless ? 0 : Math.Clamp(baseQIdx / 2, 4, 255));
         int gssX = layout == Av1.Av1PixelLayout.I444 ? 0 : 1, gssY = layout == Av1.Av1PixelLayout.I420 ? 1 : 0;
         int max = (1 << bd) - 1;
