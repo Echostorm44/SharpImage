@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
@@ -159,6 +160,8 @@ internal static partial class AomRestoration
     /// <summary>av1_highbd_wiener_convolve_add_src_avx2 (w a multiple of 16 here): get_conv_params_wiener(bd)'s round_0 /
     /// round_1 (3 / 11, at 12 bits 5 / 9), the horizontal pass clamped to [0, WIENER_CLAMP_LIMIT), the vertical to the
     /// bit depth (both through packs_epi32, which the clamps subsume). Writes all w samples of each row.</summary>
+    [ThreadStatic] private static ushort[]? _hbdWienerTemp;
+
     public static void HighbdWienerConvolveAddSrc(ushort[] src, int s0, int srcStride, ushort[] dst, int d0, int dstStride,
         in AomTaps8 hf, in AomTaps8 vf, int w, int h, int bd)
     {
@@ -168,13 +171,50 @@ internal static partial class AomRestoration
         if (intbufrange > 16) { round0 += intbufrange - 16; round1 -= intbufrange - 16; }
         int clampHigh = (1 << (bd + 1 + filterBits - round0)) - 1;
         int max = (1 << bd) - 1;
-        Span<ushort> temp = (maxSb + 7) * maxSb <= 16384 ? stackalloc ushort[(maxSb + 7) * maxSb] : new ushort[(maxSb + 7) * maxSb];
+        Span<ushort> temp = _hbdWienerTemp ??= new ushort[(maxSb + 7) * maxSb];
         Span<int> cx = stackalloc int[8], cy = stackalloc int[8];
         for (int k = 0; k < 8; k++) { cx[k] = (short)(hf[k] + (k == 3 ? 1 << filterBits : 0)); cy[k] = (short)(vf[k] + (k == 3 ? 1 << filterBits : 0)); }
         int roundH = (1 << (round0 - 1)) + (1 << (bd + filterBits - 1));
         int roundV = (1 << (round1 - 1)) - (1 << (bd + round1 - 1));
         int intermediateHeight = h + 7;
         int srow = s0 - 3 * srcStride - 3;
+        if (Avx2.IsSupported && (w & 7) == 0 && w <= maxSb && srow >= 0 && d0 >= 0
+            && srow + (intermediateHeight - 1) * srcStride + w + 7 <= src.Length && d0 + (h - 1) * dstStride + w <= dst.Length)
+        {
+            // 8 outputs a vector in 32-bit lanes (the scalar sums exactly), packed with the clamps
+            ref ushort sr = ref MemoryMarshal.GetArrayDataReference(src);
+            ref ushort tr = ref MemoryMarshal.GetReference(temp);
+            var x0 = Vector256.Create(cx[0]); var x1 = Vector256.Create(cx[1]); var x2 = Vector256.Create(cx[2]); var x3 = Vector256.Create(cx[3]);
+            var x4 = Vector256.Create(cx[4]); var x5 = Vector256.Create(cx[5]); var x6 = Vector256.Create(cx[6]); var x7 = Vector256.Create(cx[7]);
+            var rh = Vector256.Create(roundH); var ch = Vector256.Create(clampHigh);
+            for (int i = 0; i < intermediateHeight; ++i, srow += srcStride)
+                for (int j = 0; j < w; j += 8)
+                {
+                    ref ushort q = ref Unsafe.Add(ref sr, srow + j);
+                    var sum = Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q)) * x0 + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 1)) * x1
+                        + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 2)) * x2 + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 3)) * x3
+                        + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 4)) * x4 + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 5)) * x5
+                        + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 6)) * x6 + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 7)) * x7;
+                    var v = Vector256.Min(Vector256.Max(Vector256.ShiftRightArithmetic(sum + rh, round0), Vector256<int>.Zero), ch);
+                    Sse41.PackUnsignedSaturate(v.GetLower(), v.GetUpper()).StoreUnsafe(ref tr, (nuint)(i * maxSb + j));
+                }
+            var y0 = Vector256.Create(cy[0]); var y1 = Vector256.Create(cy[1]); var y2 = Vector256.Create(cy[2]); var y3 = Vector256.Create(cy[3]);
+            var y4 = Vector256.Create(cy[4]); var y5 = Vector256.Create(cy[5]); var y6 = Vector256.Create(cy[6]); var y7 = Vector256.Create(cy[7]);
+            var rv = Vector256.Create(roundV); var mx = Vector256.Create(max);
+            ref ushort dr = ref MemoryMarshal.GetArrayDataReference(dst);
+            for (int i = 0; i < h; ++i)
+                for (int j = 0; j < w; j += 8)
+                {
+                    ref ushort q = ref Unsafe.Add(ref tr, i * maxSb + j);
+                    var sum = Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q)) * y0 + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, maxSb)) * y1
+                        + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 2 * maxSb)) * y2 + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 3 * maxSb)) * y3
+                        + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 4 * maxSb)) * y4 + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 5 * maxSb)) * y5
+                        + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 6 * maxSb)) * y6 + Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref q, 7 * maxSb)) * y7;
+                    var v = Vector256.Min(Vector256.Max(Vector256.ShiftRightArithmetic(sum + rv, round1), Vector256<int>.Zero), mx);
+                    Sse41.PackUnsignedSaturate(v.GetLower(), v.GetUpper()).StoreUnsafe(ref dr, (nuint)(d0 + i * dstStride + j));
+                }
+            return;
+        }
         for (int i = 0; i < intermediateHeight; ++i, srow += srcStride)
             for (int j = 0; j < w; ++j)
             {
