@@ -203,7 +203,7 @@ public sealed class AvifFilmGrainTests
         await Assert.That(() => HeifCoder.EncodeAvif(img, new AvifEncodeOptions { FilmGrain = decreasing })).Throws<ArgumentException>();
         // 4:2:0 needs both chroma planes or neither.
         var oneChroma = new AvifFilmGrain { ScalingPointsY = [(0, 20)], ScalingPointsCb = [(0, 20)] };
-        await Assert.That(() => HeifCoder.EncodeAvif(img, new AvifEncodeOptions { FilmGrain = oneChroma })).Throws<ArgumentException>();
+        await Assert.That(() => HeifCoder.EncodeAvif(img, new AvifEncodeOptions { FilmGrain = oneChroma, ChromaSubsampling = AvifChromaSubsampling.Yuv420 })).Throws<ArgumentException>();
         await Assert.That(() => HeifCoder.EncodeAvif(img, new AvifEncodeOptions { FilmGrain = AvifFilmGrain.TestVector(1), Lossless = true }))
             .Throws<ArgumentException>();
         await Assert.That(() => AvifFilmGrain.TestVector(17)).Throws<ArgumentOutOfRangeException>();

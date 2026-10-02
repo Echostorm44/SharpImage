@@ -25,7 +25,7 @@ public enum HeifContainerType
 /// <summary>Chroma subsampling of an encoded AVIF colour image.</summary>
 public enum AvifChromaSubsampling
 {
-    /// <summary>Automatic: 4:2:0 (the most compact and most widely decoded).</summary>
+    /// <summary>Automatic, as avifenc: 4:4:4 (4:0:0 for a grey source; a JPEG source keeps its own layout).</summary>
     Auto,
     /// <summary>4:2:0 — chroma at half width and half height (AV1 Main profile).</summary>
     Yuv420,
@@ -1357,10 +1357,12 @@ public static partial class HeifCoder
         }
 
         var color = ResolveAvifColor(image, options, bd);
-        // A grey (+ alpha) source keeps 4:0:0 with the default matrix when lossless, as avifenc does for a grey PNG
-        // (its reader picks 4:0:0 from the colour type before --lossless picks the identity matrix).
-        bool greyLossless = options.Lossless && options.MatrixCoefficients == null
-            && options.ChromaSubsampling is AvifChromaSubsampling.Auto or AvifChromaSubsampling.Yuv400 && IsGreyImage(image);
+        // Auto follows avifenc's readers: a grey (+ alpha) source is coded 4:0:0 (with the default matrix, also when
+        // lossless: the reader picks 4:0:0 before --lossless picks the identity matrix), anything else 4:4:4
+        // (AVIF_APP_DEFAULT_PIXEL_FORMAT).
+        bool greyAuto = options.ChromaSubsampling == AvifChromaSubsampling.Auto && options.MatrixCoefficients == null && IsGreyImage(image);
+        bool greyLossless = greyAuto || (options.Lossless && options.MatrixCoefficients == null
+            && options.ChromaSubsampling == AvifChromaSubsampling.Yuv400 && IsGreyImage(image));
         if (options.Lossless && options.MatrixCoefficients == null && !greyLossless)
             color = color with { Matrix = 0 };   // identity (GBR) at 4:4:4 — exact RGB
         // 4:0:0 cannot use the identity matrix: avifenc resets it to BT.601.
@@ -1373,9 +1375,8 @@ public static partial class HeifCoder
             AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
             AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
             AvifChromaSubsampling.Yuv400 => Av1.Av1PixelLayout.I400,
-            // Auto: 4:4:4 for identity and for lossless (subsampled chroma cannot be lossless; avifenc --lossless), else 4:2:0.
-            _ => greyLossless ? Av1.Av1PixelLayout.I400
-                : color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
+            // Auto: avifenc's default, 4:4:4 (4:0:0 for a grey source, above).
+            _ => greyLossless ? Av1.Av1PixelLayout.I400 : Av1.Av1PixelLayout.I444,
         };
         if (color.Matrix == 0 && layout != Av1.Av1PixelLayout.I444)
             throw new ArgumentException("The identity matrix (MatrixCoefficients 0) requires 4:4:4 chroma.", nameof(options));
@@ -1470,7 +1471,7 @@ public static partial class HeifCoder
             AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
             AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
             AvifChromaSubsampling.Yuv400 => Av1.Av1PixelLayout.I400,
-            _ => color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
+            _ => Av1.Av1PixelLayout.I444,
         };
         using var tiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, w, h));
         if (color.Matrix == 0 && layout != Av1.Av1PixelLayout.I444)
@@ -2617,7 +2618,7 @@ public static partial class HeifCoder
             AvifChromaSubsampling.Yuv444 => Av1.Av1PixelLayout.I444,
             AvifChromaSubsampling.Yuv420 => Av1.Av1PixelLayout.I420,
             AvifChromaSubsampling.Yuv400 => Av1.Av1PixelLayout.I400,
-            _ => color.Matrix == 0 || options.Lossless ? Av1.Av1PixelLayout.I444 : Av1.Av1PixelLayout.I420,
+            _ => Av1.Av1PixelLayout.I444,
         };
 
         // The coded chroma format of every cell: grey sources are coded 4:0:0 (except lossy identity / YCgCo-R).
