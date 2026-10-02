@@ -45,8 +45,8 @@ public static partial class HeifCoder
     public static byte[] EncodeAvifFromJpeg(byte[] jpeg, AvifEncodeOptions? options = null, bool ignoreGainMap = false,
         bool swapBase = false, bool ignoreIccProfile = false)
     {
-        var o = (options ?? new AvifEncodeOptions()).Clone();
-        using var scope = new EncoderScope(o);
+        var o = WithDefaultQuality((options ?? new AvifEncodeOptions()).Clone());
+        using var scope = new EncoderScope(o, allIntra: !o.Progressive && o.Layers == null);
         var image = JpegCoder.Read(new MemoryStream(jpeg));
         if (ignoreIccProfile)
         {

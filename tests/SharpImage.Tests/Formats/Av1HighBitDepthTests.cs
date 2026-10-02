@@ -92,8 +92,8 @@ public sealed class Av1HighBitDepthTests
     public async Task HighBitDepth_Color_KeepsPrecision(int bd)
     {
         var src = Smooth16(99, 61);   // odd dims
-        byte[] a8 = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = 2, BitDepth = 8 });
-        byte[] ah = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = 2, BitDepth = bd });
+        byte[] a8 = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = 2, BitDepth = 8, ChromaSubsampling = AvifChromaSubsampling.Yuv420 });
+        byte[] ah = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = 2, BitDepth = bd, ChromaSubsampling = AvifChromaSubsampling.Yuv420 });
         var c = Av1C(ah);
         await Assert.That(c.Hbd).IsTrue();
         await Assert.That(c.Twelve).IsEqualTo(bd == 12);
@@ -136,7 +136,7 @@ public sealed class Av1HighBitDepthTests
         double e = Rmse16(src, dec, 3) / 257.0;
         System.Console.WriteLine($"[Layout] {layout} bd={bd} rmse8={e:F2}");
         // 1-px colour rows: 4:2:0 halves chroma vertically and loses them; 4:2:2 and 4:4:4 keep full chroma rows.
-        var d420 = HeifCoder.Decode(HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = 4, BitDepth = bd }));
+        var d420 = HeifCoder.Decode(HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Qp = 4, BitDepth = bd, ChromaSubsampling = AvifChromaSubsampling.Yuv420 }));
         await Assert.That(e).IsLessThan(Rmse16(src, d420, 3) / 257.0 * 0.5);
     }
 

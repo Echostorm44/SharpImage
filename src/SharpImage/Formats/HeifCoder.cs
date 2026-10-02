@@ -95,8 +95,12 @@ public sealed class AvifEncodeOptions
     /// still image (all-intra mode, where libaom disables CDEF), on for layered images and sequences.</summary>
     public bool? EnableCdef { get; set; }
 
-    /// <summary>Quantization parameter 0..51 (0 = highest quality / largest file). Default 20.</summary>
-    public int Qp { get; set; } = 20;
+    /// <summary>Quantization parameter 0..51 (0 = highest quality / largest file). Null (default): when
+    /// <see cref="Quality"/> is also unset, avifenc's default quality 60 (alpha following it) applies.</summary>
+    public int? Qp { get; set; }
+
+    /// <summary>avifenc's DEFAULT_QUALITY.</summary>
+    public const int DefaultQuality = 60;
 
     /// <summary>Deblocking filter sharpness 0..7 (loop_filter_sharpness; libaom / avifenc -a sharpness=S): higher values
     /// weaken the filter across strong edges. The deblocking level search runs with it.</summary>
@@ -1108,7 +1112,7 @@ public static partial class HeifCoder
     /// <summary>Encodes an image as AVIF (AV1 intra) with the given options.</summary>
     public static byte[] EncodeAvif(ImageFrame image, AvifEncodeOptions? options = null)
     {
-        options ??= new AvifEncodeOptions();
+        options = WithDefaultQuality(options ?? new AvifEncodeOptions());
         // libavif codes a single still image in libaom's all-intra mode (layered images: good quality with libaom 3.14)
         using var scope = new EncoderScope(options, allIntra: !options.Progressive && options.Layers == null);
         return EncodeAvifEntry(image, options);
@@ -1147,12 +1151,21 @@ public static partial class HeifCoder
         }
     }
 
+    [ThreadStatic] private static bool t_targetSizeSearch;
+
     private static byte[] EncodeAvifEntry(ImageFrame image, AvifEncodeOptions options)
     {
         options = AdoptSourceFormat(image, options);
         using var siting = new Av1.Av1ObuWriter.ChromaPositionScope(SourceChromaPosition(image, options));
         if (options.TargetSize is { } target)
-            return SearchTargetSize(options, target, o => EncodeAvif(image, o));
+        {
+            // avifenc --target-size encodes from its input cache, whose image views (avifImageSetViewRect) carry the pixels
+            // and CICP but no ICC / Exif / XMP
+            bool prev = t_targetSizeSearch;
+            t_targetSizeSearch = true;
+            try { return SearchTargetSize(options, target, o => EncodeAvif(image, o)); }
+            finally { t_targetSizeSearch = prev; }
+        }
         if (options.BitDepthExtension != AvifBitDepthExtension.None)
         {
             using var satoTiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, (int)image.Columns, (int)image.Rows));
@@ -1186,7 +1199,7 @@ public static partial class HeifCoder
         if (layers[^1].ScaleNumerator != layers[^1].ScaleDenominator)
             throw new ArgumentException("The last layer must be coded at full size.", nameof(options));
 
-        int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
+        int bd = options.BitDepth == 0 ? AutoBitDepth(image) : options.BitDepth;
         if (bd is not (8 or 10 or 12)) throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
         var color = ResolveAvifColor(image, options, bd);
         if (options.ChromaSubsampling == AvifChromaSubsampling.Yuv400 && color.Matrix == 0) color = color with { Matrix = 6 };
@@ -1215,7 +1228,7 @@ public static partial class HeifCoder
         bool mono = layout == Av1.Av1PixelLayout.I400 || (!anyColour && color.Matrix is not (0 or 16 or 17));
         var coded = mono ? Av1.Av1PixelLayout.I400 : layout;
         int ssX = coded is Av1.Av1PixelLayout.I420 or Av1.Av1PixelLayout.I422 ? 1 : 0, ssY = coded == Av1.Av1PixelLayout.I420 ? 1 : 0;
-        int defQ = Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        int defQ = Math.Clamp((int)Math.Round(Math.Clamp(options.Qp ?? 20, 0, 51) * (255.0 / 51.0)), 4, 255);
         int max = (1 << bd) - 1;
         var inputs = new List<Av1.Av1StillImageEncoder.LayerInput>();
         for (int i = 0; i < layers.Count; i++)
@@ -1349,7 +1362,7 @@ public static partial class HeifCoder
     // cell of a colour / translucent image is still coded in colour / with an alpha item.
     private static byte[] EncodeAvifCore(ImageFrame image, AvifEncodeOptions options, bool forceColor, bool forceAlpha)
     {
-        int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
+        int bd = options.BitDepth == 0 ? AutoBitDepth(image) : options.BitDepth;
         if (bd is not (8 or 10 or 12))
         {
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
@@ -1408,8 +1421,8 @@ public static partial class HeifCoder
         return bd == 8 && layout == Av1.Av1PixelLayout.I420 && bt601Full && !options.Lossless && !extras.Premultiplied
                && options.FilmGrain == null && !denoise && !options.Progressive && !forceColor && !forceAlpha && qIdx == null && aQIdx == null
                && !qualityLossless && !options.SharpYuv && !SourcePlanes.TryGetValue(image, out _)
-            ? EncodeAvif8(image, options.Qp, color, extras)
-            : EncodeAvifGeneral(image, options.Qp, bd, layout, color, extras, options.Lossless || qualityLossless, grain,
+            ? EncodeAvif8(image, options.Qp ?? 20, color, extras)
+            : EncodeAvifGeneral(image, options.Qp ?? 20, bd, layout, color, extras, options.Lossless || qualityLossless, grain,
                 options.Progressive && image.Columns >= 16 && image.Rows >= 16,   // a sub-8px base layer is pointless
                 forceColor: forceColor, forceAlpha: forceAlpha, qIdxOverride: qIdx, alphaQIdxOverride: aQIdx, sharpYuv: options.SharpYuv);
         }
@@ -1431,9 +1444,19 @@ public static partial class HeifCoder
     /// </summary>
     public static byte[] EncodeAvifSequence(ImageSequence sequence, AvifEncodeOptions? options = null)
     {
-        options ??= new AvifEncodeOptions();
+        options = WithDefaultQuality(options ?? new AvifEncodeOptions());
         using var scope = new EncoderScope(options);
         return EncodeAvifSequenceEntry(sequence, options);
+    }
+
+    // avifenc: with neither a quality nor a quantizer given, quality DEFAULT_QUALITY (60), alpha following colour (a
+    // target size searches the quality itself)
+    internal static AvifEncodeOptions WithDefaultQuality(AvifEncodeOptions o)
+    {
+        if (o.Quality != null || o.Qp != null || o.TargetSize != null || o.Lossless) return o;   // --lossless: quality 100
+        var c = o.Clone();
+        c.Quality = AvifEncodeOptions.DefaultQuality;
+        return c;
     }
 
     // ISO BMFF times: seconds since 1904-01-01 UTC (0 = unset).
@@ -1459,7 +1482,7 @@ public static partial class HeifCoder
         if (w > 65536 || h > 65536 || w < 1 || h < 1)
             throw new NotSupportedException($"AVIF encoding supports 1..65536 per dimension (got {w}x{h}).");
 
-        int bd = options.BitDepth == 0 ? (sequence.Frames.Any(HasSubByteDetail) ? 10 : 8) : options.BitDepth;
+        int bd = options.BitDepth == 0 ? sequence.Frames.Max(AutoBitDepth) : options.BitDepth;
         if (bd is not (8 or 10 or 12))
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
         var color = ResolveAvifColor(first, options, bd);
@@ -1502,7 +1525,7 @@ public static partial class HeifCoder
         var codedLayout = mono ? Av1.Av1PixelLayout.I400 : layout;
         var (qIdxQ, aQIdxQ, qualityLossless) = QualityQIndices(options, color, sequence: true);
         bool lossless = options.Lossless || qualityLossless;
-        int baseQIdx = qIdxQ ?? Math.Clamp((int)Math.Round(Math.Clamp(options.Qp, 0, 51) * (255.0 / 51.0)), 4, 255);
+        int baseQIdx = qIdxQ ?? Math.Clamp((int)Math.Round(Math.Clamp(options.Qp ?? 20, 0, 51) * (255.0 / 51.0)), 4, 255);
         int alphaQIdx = aQIdxQ ?? (lossless ? 0 : Math.Clamp(baseQIdx / 2, 4, 255));
         int gssX = layout == Av1.Av1PixelLayout.I444 ? 0 : 1, gssY = layout == Av1.Av1PixelLayout.I420 ? 1 : 0;
         int max = (1 << bd) - 1;
@@ -1901,6 +1924,16 @@ public static partial class HeifCoder
 
     // The frame's samples as RGB in coded-depth units [0, 2^bd - 1] plus the alpha plane (null without an alpha
     // channel), whether any pixel has colour, and whether any pixel is not fully opaque.
+    // avifenc's automatic depth: a YUV source (Y4M, JPEG planes) keeps its own; an RGB source is coded at 8 bits when it is
+    // 8-bit, else at 12 (avifpng: imgBitDepth == 8 ? 8 : 12).
+    private static int AutoBitDepth(ImageFrame image)
+    {
+        if (SourcePlanes.TryGetValue(image, out var src)) return src.Depth;
+        // (Depth 16 is also what in-memory frames report, so there the samples decide)
+        bool deep = image.Depth is > 8 and < 16 || (image.Depth is < 1 or >= 16 && HasSubByteDetail(image));
+        return deep ? 12 : 8;
+    }
+
     // Every pixel has R = G = B (a grey source; readers expand grey to RGB).
     private static bool IsGreyImage(ImageFrame image)
     {
@@ -1961,8 +1994,8 @@ public static partial class HeifCoder
         var x = new Av1.AvifContainerExtras
         {
             Icc = AvifIcc(image, o),
-            Exif = image.Metadata.ExifProfile is { } exif ? SharpImage.Metadata.ExifParser.SerializeForPngExif(exif) : null,
-            Xmp = image.Metadata.Xmp is { Length: > 0 } xmp ? Encoding.UTF8.GetBytes(xmp) : null,
+            Exif = !t_targetSizeSearch && image.Metadata.ExifProfile is { } exif ? SharpImage.Metadata.ExifParser.SerializeForPngExif(exif) : null,
+            Xmp = !t_targetSizeSearch && image.Metadata.Xmp is { Length: > 0 } xmp ? Encoding.UTF8.GetBytes(xmp) : null,
         };
         (int? irot, int? imir) = image.Orientation switch
         {
@@ -2037,6 +2070,7 @@ public static partial class HeifCoder
     // --ignore-icc would (the CICP then defaults to sRGB, as avifenc's does).
     private static byte[]? AvifIcc(ImageFrame image, AvifEncodeOptions o)
     {
+        if (t_targetSizeSearch) return null;
         byte[]? icc = image.Metadata.IccProfile?.Data ?? image.IccProfile;
         if (icc is not { Length: >= 20 }) return icc;
         bool grayIcc = icc[16] == 'G' && icc[17] == 'R' && icc[18] == 'A' && icc[19] == 'Y';   // header data colour space
@@ -2606,7 +2640,7 @@ public static partial class HeifCoder
         int w = (int)image.Columns, h = (int)image.Rows;
         // Layered grids (libavif avifEncoderAddImageGrid with extraLayerCount): every cell is itself layered.
         var layerSpecs = options.Layers is { Count: > 0 } ls ? ls : null;
-        int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
+        int bd = options.BitDepth == 0 ? AutoBitDepth(image) : options.BitDepth;
         if (bd is not (8 or 10 or 12))
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
         var color = ResolveAvifColor(image, options, bd);
@@ -2673,7 +2707,7 @@ public static partial class HeifCoder
                         Image = l.Image == null ? null : Crop(l.Image), Quality = l.Quality, QualityAlpha = l.QualityAlpha,
                         ScaleNumerator = l.ScaleNumerator, ScaleDenominator = l.ScaleDenominator,
                     }).ToList(), forceColor: !mono, forceAlpha: alpha)
-                    : EncodeAvifCore(cellImage, cellOpt, forceColor: !mono, forceAlpha: alpha);
+                    : EncodeAvifCellPadded(cellImage, cellOpt, cellW, cellH, !mono, alpha);
                 var c = HeifContainer.Parse(file);
                 int pid = c.PrimaryId;
                 cells.Color.Add(c.ItemData(pid)!);
@@ -2692,6 +2726,16 @@ public static partial class HeifCoder
         extras.Premultiplied = options.PremultiplyAlpha && alpha;
         if (options.GainMap != null) extras.GainMap = BuildGainMapItem(options.GainMap, options, extras);
         return Av1.Av1AvifWriter.BuildGridAvif(cells, w, h, bd, coded, color, extras);
+    }
+
+    // A grid cell through EncodeAvifCore, coded at the full cell size as libavif pads right / bottom cells (the port pads
+    // the converted planes).
+    private static byte[] EncodeAvifCellPadded(ImageFrame cell, AvifEncodeOptions o, int cellW, int cellH, bool forceColor, bool forceAlpha)
+    {
+        var prev = Av1.AomStill.t_padTo;
+        Av1.AomStill.t_padTo = (cellW, cellH);
+        try { return EncodeAvifCore(cell, o, forceColor: forceColor, forceAlpha: forceAlpha); }
+        finally { Av1.AomStill.t_padTo = prev; }
     }
 
     // avifGetBestCellSize (avifenc): ceil(pixels / cells), raised to MIAF's 64 minimum and to even along subsampled axes,

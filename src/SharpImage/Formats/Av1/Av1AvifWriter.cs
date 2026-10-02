@@ -311,7 +311,7 @@ internal static class Av1AvifWriter
                 assocHiddenAlpha.Add((ispeIdx, false));
                 assocHiddenAlpha.Add((AddShared(stx.HiddenAlphaAv1CBox), true));
                 byte[] urn = System.Text.Encoding.ASCII.GetBytes("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
-                assocHiddenAlpha.Add((AddShared(FullBox("auxC", 0, 0, urn)), true));
+                assocHiddenAlpha.Add((AddShared(FullBox("auxC", 0, 0, urn)), false));
                 assocHiddenAlpha.Add((AddShared(FullBox("pixi", 0, 0, new byte[] { 1, (byte)stx.HiddenDepth })), false));
             }
         }
@@ -400,6 +400,10 @@ internal static class Av1AvifWriter
         }
         if (exifId != 0) refs.Add(Box("cdsc", Concat(U16(exifId), U16(1), U16(1))));
         if (xmpId != 0) refs.Add(Box("cdsc", Concat(U16(xmpId), U16(1), U16(1))));
+        // libavif's order: by from_item_ID (item order), an item's dimg before its single typed reference
+        refs = refs.Select((r, i) => (r, i)).OrderBy(e => (e.r[8] << 8) | e.r[9])
+            .ThenBy(e => e.r[4] == (byte)'d' && e.r[5] == (byte)'i' && e.r[6] == (byte)'m' && e.r[7] == (byte)'g' ? 0 : 1)
+            .ThenBy(e => e.i).Select(e => e.r).ToList();
         byte[]? iref = refs.Count > 0 ? FullBox("iref", 0, 0, Concat(refs.ToArray())) : null;
 
         // mdat: for a sequence, the colour then alpha samples (one chunk each; the first samples are the colour / alpha
@@ -576,12 +580,12 @@ internal static class Av1AvifWriter
             int auxC = Add(FullBox("auxC", 0, 0, auxUrn));
             alphaGridAssoc.Add((ispeFull, false));
             alphaGridAssoc.Add((aPixi, false));
-            alphaGridAssoc.Add((auxC, true));
+            alphaGridAssoc.Add((auxC, false));
             alphaGridAssoc.AddRange(transforms);
             alphaCellAssoc.Add((ispeCell, false));
             alphaCellAssoc.Add((aPixi, false));
             alphaCellAssoc.Add((Add(g.AlphaAv1CBox), true));
-            alphaCellAssoc.Add((auxC, true));
+            alphaCellAssoc.Add((auxC, false));
         }
 
         // Gain map (a single coded item even under a grid base: the tmap derives from [colour grid, gain map]).
@@ -674,7 +678,9 @@ internal static class Av1AvifWriter
             {
                 "Exif" => System.Text.Encoding.ASCII.GetBytes("Exif\0"),
                 "mime" => System.Text.Encoding.ASCII.GetBytes("XMP\0application/rdf+xml\0"),
-                _ => new byte[] { 0 },
+                // libavif's getInfeName: the colour grid and its cells "Color", the alpha ones "Alpha", tmap / gain map "GMap"
+                _ => System.Text.Encoding.ASCII.GetBytes((it.Id == tmapId || it.Id == gmId ? "GMap"
+                    : it.Id == alphaGridId || alphaCellIds.Contains(it.Id) ? "Alpha" : "Color") + "\0"),
             };
             infes.Add(FullBox("infe", 2, it.Flags, Concat(U16(it.Id), U16(0), Fourcc(it.Type), extra)));
         }
@@ -704,7 +710,35 @@ internal static class Av1AvifWriter
 
         var itemOffset = new long[items.Count];
         long pos = 0;
-        for (int i = 0; i < items.Count; i++) { itemOffset[i] = pos; pos += items[i].Payload.Length; }
+        var chunkList = new List<byte[]>();
+        if (layerSizesById.Count == 0)
+        {
+            // libavif's packing (write.c): pass 0 metadata (Exif / XMP / tmap), pass 1 alpha and the gain map image, pass 2
+            // the rest, each in item order; a payload identical to one already written (e.g. the alpha grid's
+            // descriptor) reuses that chunk
+            int PassOf(int i)
+            {
+                var it = items[i];
+                if (it.Type is "Exif" or "mime" or "tmap") return 0;
+                return it.Id == alphaGridId || alphaCellIds.Contains(it.Id) || (gmId != 0 && it.Id == gmId) ? 1 : 2;
+            }
+            var written = new List<(byte[] Data, long Offset)>();
+            for (int pass = 0; pass < 3; pass++)
+                for (int i = 0; i < items.Count; i++)
+                {
+                    if (PassOf(i) != pass) continue;
+                    byte[] data = items[i].Payload;
+                    long found = -1;
+                    foreach (var (d, o) in written) if (d.AsSpan().SequenceEqual(data)) { found = o; break; }
+                    if (found >= 0) { itemOffset[i] = found; continue; }
+                    itemOffset[i] = pos;
+                    written.Add((data, pos));
+                    chunkList.Add(data);
+                    pos += data.Length;
+                }
+        }
+        else
+            for (int i = 0; i < items.Count; i++) { itemOffset[i] = pos; pos += items[i].Payload.Length; chunkList.Add(items[i].Payload); }
         bool largeOffsets = pos > uint.MaxValue - 1_000_000;
         if (largeOffsets) throw new NotSupportedException("AVIF files over 4 GB are not supported.");
         byte[] Iloc(uint mdatStart)
@@ -718,9 +752,7 @@ internal static class Av1AvifWriter
         byte[] Meta(uint mdatStart) => FullBox("meta", 0, 0, Concat(hdlr, pitm, Iloc(mdatStart), iinf, iref, iprp, grpl));
         int metaLen = Meta(0).Length;
         byte[] meta = Meta((uint)(ftyp.Length + metaLen + 8));
-        var payloads = new byte[items.Count][];
-        for (int i = 0; i < items.Count; i++) payloads[i] = items[i].Payload;
-        return Concat(ftyp, meta, Box("mdat", Concat(payloads)));
+        return Concat(ftyp, meta, Box("mdat", Concat(chunkList.ToArray())));
     }
 
     // Sample-entry child boxes (libavif write.c): av1C, then for colour its colr (ICC / nclx) and pasp / clli / mdcv,
