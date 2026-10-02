@@ -1186,7 +1186,7 @@ public static partial class HeifCoder
         if (layers[^1].ScaleNumerator != layers[^1].ScaleDenominator)
             throw new ArgumentException("The last layer must be coded at full size.", nameof(options));
 
-        int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
+        int bd = options.BitDepth == 0 ? AutoBitDepth(image) : options.BitDepth;
         if (bd is not (8 or 10 or 12)) throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
         var color = ResolveAvifColor(image, options, bd);
         if (options.ChromaSubsampling == AvifChromaSubsampling.Yuv400 && color.Matrix == 0) color = color with { Matrix = 6 };
@@ -1349,7 +1349,7 @@ public static partial class HeifCoder
     // cell of a colour / translucent image is still coded in colour / with an alpha item.
     private static byte[] EncodeAvifCore(ImageFrame image, AvifEncodeOptions options, bool forceColor, bool forceAlpha)
     {
-        int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
+        int bd = options.BitDepth == 0 ? AutoBitDepth(image) : options.BitDepth;
         if (bd is not (8 or 10 or 12))
         {
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
@@ -1459,7 +1459,7 @@ public static partial class HeifCoder
         if (w > 65536 || h > 65536 || w < 1 || h < 1)
             throw new NotSupportedException($"AVIF encoding supports 1..65536 per dimension (got {w}x{h}).");
 
-        int bd = options.BitDepth == 0 ? (sequence.Frames.Any(HasSubByteDetail) ? 10 : 8) : options.BitDepth;
+        int bd = options.BitDepth == 0 ? sequence.Frames.Max(AutoBitDepth) : options.BitDepth;
         if (bd is not (8 or 10 or 12))
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
         var color = ResolveAvifColor(first, options, bd);
@@ -1901,6 +1901,16 @@ public static partial class HeifCoder
 
     // The frame's samples as RGB in coded-depth units [0, 2^bd - 1] plus the alpha plane (null without an alpha
     // channel), whether any pixel has colour, and whether any pixel is not fully opaque.
+    // avifenc's automatic depth: a YUV source (Y4M, JPEG planes) keeps its own; an RGB source is coded at 8 bits when it is
+    // 8-bit, else at 12 (avifpng: imgBitDepth == 8 ? 8 : 12).
+    private static int AutoBitDepth(ImageFrame image)
+    {
+        if (SourcePlanes.TryGetValue(image, out var src)) return src.Depth;
+        // (Depth 16 is also what in-memory frames report, so there the samples decide)
+        bool deep = image.Depth is > 8 and < 16 || (image.Depth is < 1 or >= 16 && HasSubByteDetail(image));
+        return deep ? 12 : 8;
+    }
+
     // Every pixel has R = G = B (a grey source; readers expand grey to RGB).
     private static bool IsGreyImage(ImageFrame image)
     {
@@ -2606,7 +2616,7 @@ public static partial class HeifCoder
         int w = (int)image.Columns, h = (int)image.Rows;
         // Layered grids (libavif avifEncoderAddImageGrid with extraLayerCount): every cell is itself layered.
         var layerSpecs = options.Layers is { Count: > 0 } ls ? ls : null;
-        int bd = options.BitDepth == 0 ? (HasSubByteDetail(image) ? 10 : 8) : options.BitDepth;
+        int bd = options.BitDepth == 0 ? AutoBitDepth(image) : options.BitDepth;
         if (bd is not (8 or 10 or 12))
             throw new ArgumentOutOfRangeException(nameof(options), "AVIF bit depth must be 0 (auto), 8, 10 or 12.");
         var color = ResolveAvifColor(image, options, bd);
