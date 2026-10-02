@@ -532,6 +532,7 @@ internal sealed partial class AomSpeedFeatures
             inter.prune_single_ref = 2;
 
             sf.interp_sf.adaptive_interp_filter_search = 2;
+            sf.interp_sf.skip_model_rd_uv = 1;
 
             // TODO(chiyotsai@google.com): the thresholds chosen for intra hog are
             // inherited directly from luma hog with some minor tweaking. Eventually we

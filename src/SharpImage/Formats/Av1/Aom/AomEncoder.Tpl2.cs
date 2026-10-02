@@ -135,6 +135,7 @@ internal static partial class AomEncoder
         float threshold = ThreshBasedOnQ(cm.BaseQindex, cpi.Speed);
         float mvErrReduction = (float)(accumSpatial - accumBest);
         if (mvErrReduction <= threshold * accumSpatial) cm.AllowRefFrameMvs = false;
+        AomTrace.Out?.Write($"crm {cpi.GfFrameIndex} sp {accumSpatial} best {accumBest} allow {(cm.AllowRefFrameMvs ? 1 : 0)}" + (char)10);
     }
 
     private static float ThreshBasedOnQ(int qindex, int speed)

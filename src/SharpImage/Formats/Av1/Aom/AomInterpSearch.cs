@@ -435,6 +435,7 @@ internal static class AomInterpSearch
         rdStats.Init();
         int assignFilter = cm.InterpFilter;
         int matchFoundIdx = FindInterpFilterMatch(mbmi, cpi, assignFilter, needSearch, args.InterpFilterStats, args.InterpFilterStatsIdx);
+        AomTrace.Out?.Write($"ifm {xd.MiRow} {xd.MiCol} bs {bsize} m {mbmi.Mode} r {mbmi.RefFrame0} {mbmi.RefFrame1} idx {matchFoundIdx} n {args.InterpFilterStatsIdx}" + (char)10);
         if (matchFoundIdx != -1)
         {
             rd = args.InterpFilterStats[matchFoundIdx].Rd;
@@ -450,6 +451,7 @@ internal static class AomInterpSearch
         rdStats.Merge(rdStatsLuma);
         rd = AomRd.RdCost(x.Rdmult, switchableRate + rdStats.Rate, rdStats.Dist);
         x.PredSse[refFrame] = (uint)(rdStatsLuma.Sse >> 4);
+        AomTrace.Out?.Write($"ifd rd {rd} sw {switchableRate} y {rdStatsLuma.Rate} {rdStatsLuma.Dist} {rdStatsLuma.Sse} uv {rdStats.Rate} {rdStats.Dist}" + (char)10);
         if (assignFilter != SWITCHABLE || matchFoundIdx != -1) return 0;
         if (!needSearch) return 0;
         if (mbmi.HasSecondRef)
@@ -479,6 +481,7 @@ internal static class AomInterpSearch
         SwapDstBuf(xd, dstBufs, numPlanes);
         if (x.RecalcLumaMcData == 1) AomInterPred.EncBuildInterPredictor(cm, xd, xd.MiRow, xd.MiCol, origDst, bsize, 0, 0, cpi.EnableIntraEdgeFilter);
         x.PredSse[refFrame] = (uint)(rdStatsLuma.Sse >> 4);
+        AomTrace.Out?.Write($"iff rd {rd} f {mbmi.InterpFilters:x}" + (char)10);
         if (cpi.Sf.interp_sf.use_interp_filter != 0)
             args.InterpFilterStatsIdx = SaveInterpFilterSearchStat(mbmi, rd, x.PredSse[refFrame], args.InterpFilterStats, args.InterpFilterStatsIdx);
         return 0;

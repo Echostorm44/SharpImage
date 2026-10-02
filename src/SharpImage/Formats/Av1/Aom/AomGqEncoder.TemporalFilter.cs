@@ -26,7 +26,7 @@ internal sealed partial class AomGqEncoder
     /// <summary>av1_tf_info_filtering.</summary>
     private void TfInfoFiltering()
     {
-        if (!(ArnrMaxFrames > 0 && _cfg.LagInFrames > 1)) return;
+        if (!(ArnrMaxFrames > 0 && _lagInFrames > 1)) return;
         var gf = _gfGroup;
         for (int g = 0; g < gf.Size; ++g)
         {
@@ -52,7 +52,7 @@ internal sealed partial class AomGqEncoder
     {
         AomFrameBuffer? outBuf = null;
         diffSum = diffSse = 0;
-        if (!(ArnrMaxFrames > 0 && _cfg.LagInFrames > 1)) return null;
+        if (!(ArnrMaxFrames > 0 && _lagInFrames > 1)) return null;
         for (int i = 0; i < 2; ++i)
             if (_tfBufValid[i] && _tfBufGfIndex[i] == gfIndex)
             {

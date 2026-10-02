@@ -138,10 +138,10 @@ internal sealed partial class AomGqEncoder
             f.MiRows = miRows;
             f.MiCols = miCols;
         }
-        if (_cfg.LagInFrames <= 1) return;
-        _tpl.StatsPool = new AomTplDepStats[]?[_cfg.LagInFrames];
-        _tpl.RecPool = new AomFrameBuffer?[_cfg.LagInFrames];
-        for (int frame = 0; frame < _cfg.LagInFrames; frame++)
+        if (_lagInFrames <= 1) return;
+        _tpl.StatsPool = new AomTplDepStats[]?[_lagInFrames];
+        _tpl.RecPool = new AomFrameBuffer?[_lagInFrames];
+        for (int frame = 0; frame < _lagInFrames; frame++)
         {
             var b = _tpl.Buffer[frame];
             var arr = new AomTplDepStats[b.Width * b.Height];
@@ -167,11 +167,15 @@ internal sealed partial class AomGqEncoder
     }
 
     /// <summary>av1_tpl_preload_rc_estimate.</summary>
-    private void TplPreloadRcEstimate()
+    private void TplPreloadRcEstimate(int frameType)
     {
         var gf = _gfGroup;
+        _cmFrameType = frameType;   // cm->current_frame.frame_type (left at the last group entry's)
         for (int g = _gfFrameIndex; g < gf.Size; ++g)
+        {
+            _cmFrameType = gf.FrameType[g];
             gf.QVal[g] = RcPickQAndBounds(_cmWidth, _cmHeight, g, gf.FrameType[g] == KEY_FRAME || gf.FrameType[g] == INTRA_ONLY_FRAME, out _, out _);
+        }
     }
 
     private static bool IsFrameTplEligible(AomGfGroup gf, int index)
@@ -248,7 +252,7 @@ internal sealed partial class AomGqEncoder
             if (refreshMask != 0) refPictureMap[refreshIdx] = g;
             ++tplGroupFrames;
         }
-        int tplExtend = _cfg.LagInFrames - MAX_GF_INTERVAL;
+        int tplExtend = _lagInFrames - MAX_GF_INTERVAL;
         int extendFrameCount = 0;
         int extendFrameLength = Math.Min(tplExtend, _rc.FramesToKey - _pRc.BaselineGfInterval);
         int frameDisplayIndex = gf.CurFrameIdx[gopLength - 1] + gf.ArfSrcOffset[gopLength - 1] + 1;

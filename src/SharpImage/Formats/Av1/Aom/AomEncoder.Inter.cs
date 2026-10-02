@@ -186,7 +186,34 @@ internal static partial class AomEncoder
         ComputeGlobalMotionFacade(cpi, input);
         AomMvPred.CalculateRefFrameSide(cm);
         cm.AllowRefFrameMvs &= sf.hl_sf.ref_frame_mvs_lvl != 2;
+        if (AomTrace.Out != null)
+            for (int rf = LAST_FRAME; rf <= ALTREF_FRAME; rf++)
+            {
+                var g = cm.GlobalMotion[rf];
+                AomTrace.Out.Write($"gmp oh {cm.OrderHint} rf {rf} t {g.WmType} {g.WmMat[0]} {g.WmMat[1]} {g.WmMat[2]} {g.WmMat[3]} {g.WmMat[4]} {g.WmMat[5]}" + (char)10);
+            }
+        if (AomTrace.Out != null)
+            for (int rf = LAST_FRAME; rf <= ALTREF_FRAME; rf++)
+            {
+                var b = cm.RefBufs[rf];
+                if (b == null) continue;
+                ulong h = 0;
+                int n = ((cm.MiRows + 1) >> 1) * ((cm.MiCols + 1) >> 1);
+                if (b.Mvs != null) for (int i = 0; i < n; i++) h = h * 31 + (uint)b.Mvs[i].Mv.AsInt + (ulong)(byte)b.Mvs[i].RefFrame * 5;
+                var r = b.RefOrderHints;
+                AomTrace.Out.Write($"mfr {rf} oh {b.OrderHint} ft {b.FrameType} roh {r[0]} {r[1]} {r[2]} {r[3]} {r[4]} {r[5]} {r[6]} h {h:x}" + (char)10);
+            }
         if (cm.AllowRefFrameMvs) AomMvPred.SetupMotionField(cm);
+        if (AomTrace.Out != null)
+        {
+            ulong h = 0;
+            if (cm.AllowRefFrameMvs)
+            {
+                int n = (cm.MiRows >> 1) * (cm.MiStride >> 1);
+                for (int i = 0; i < n; i++) h = h * 31 + (uint)cm.TplMvs![i].Mfmv0.AsInt + (ulong)((byte)cm.TplMvs[i].RefFrameOffset) * 7;
+            }
+            AomTrace.Out.Write($"msf oh {cm.OrderHint} allow {(cm.AllowRefFrameMvs ? 1 : 0)} h {h:x}" + (char)10);
+        }
         // (check_to_disable_ref_frame_mvs: needs TPL stats)
         CheckToDisableRefFrameMvs(cpi, input);
         cm.SkipModeFlag = CheckSkipModeEnabled(cpi, input.LagInFrames);

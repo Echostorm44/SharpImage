@@ -105,6 +105,9 @@ internal sealed partial class AomGqEncoder
         _ssimFactors = new double[((_miRows + 3) / 4) * ((_miCols + 3) / 4)];
 
         // av1_create_primary_compressor / av1_create_compressor / av1_change_config: rate control and look-ahead
+        // set_encoder_config: oxcf->gf_cfg.lag_in_frames (GOOD: 32..38 becomes 39); the LAP buffers use cfg's
+        _lagInFrames = Math.Clamp(cfg.LagInFrames, 0, 48);
+        if (cfg.Usage == GOOD && _lagInFrames >= 32 && _lagInFrames < 39) _lagInFrames = 39;
         int numLapBuffers = Math.Min(cfg.LagInFrames, Math.Min(48, cfg.KfMaxDist + SCENE_CUT_KEY_TEST_INTERVAL));
         int lapLagInFrames = cfg.LagInFrames - numLapBuffers >= 17 ? 17 : 0;
         _lapEnabled = numLapBuffers > 0;

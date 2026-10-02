@@ -1137,7 +1137,7 @@ internal sealed partial class AomGqEncoder
         if (_gfMaxPyrHeight == 0 || _gfMinPyrHeight == 0) gf.MaxLayerDepthAllowed = 1;
         else gf.MaxLayerDepthAllowed = _gfMaxPyrHeight;
         const ulong threshSad = 8 * 64 * 64;
-        if (_pRc.BaselineGfInterval > _cfg.LagInFrames || !IsAltrefEnabled || _pRc.BaselineGfInterval < _rc.MinGfInterval ||
+        if (_pRc.BaselineGfInterval > _lagInFrames || !IsAltrefEnabled || _pRc.BaselineGfInterval < _rc.MinGfInterval ||
             _rc.FrameSourceSadLag[0] > threshSad)
             gf.MaxLayerDepthAllowed = 0;
         GopSetupStructure(isFinalPass);
@@ -1300,10 +1300,10 @@ internal sealed partial class AomGqEncoder
             _internalAltrefAllowed = false;
         bool useAltRef;
         if (canDisableArf)
-            useAltRef = _pRc.UseArfInThisKfGroup != 0 && i < _cfg.LagInFrames && i >= MIN_GF_INTERVAL &&
+            useAltRef = _pRc.UseArfInThisKfGroup != 0 && i < _lagInFrames && i >= MIN_GF_INTERVAL &&
                 (_cfg.Usage != REALTIME || !IsAlmostStatic(g.ZeroMotionAccumulator, _twopass.KfZeromotionPct, _lapEnabled));
         else
-            useAltRef = _pRc.UseArfInThisKfGroup != 0 && i < _cfg.LagInFrames && i > 2;
+            useAltRef = _pRc.UseArfInThisKfGroup != 0 && i < _lagInFrames && i > 2;
         gf.MaxLayerDepthAllowed = useAltRef ? _gfMaxPyrHeight : 0;
         int altOffset = 0;
         bool allowGfLengthReduction = ((_rcModeQ && _cqLevel <= 128) || !_internalAltrefAllowed) && !_losslessRequested;
@@ -1822,8 +1822,12 @@ internal sealed partial class AomGqEncoder
         if (_rc.FramesToFwdKf <= 0) _rc.FramesToFwdKf = -1;   // fwd_kf_dist
         if (_gfFrameIndex == gf.Size)
         {
-            int maxGopLength = _cfg.LagInFrames >= 32 ? Math.Min(MAX_GF_INTERVAL, _cfg.LagInFrames - ArnrMaxFrames / 2) : MAX_GF_LENGTH_LAP;
-            if (_cfg.LagInFrames == 0) maxGopLength = _rc.MaxGfInterval;
+            // av1_tf_info_reset
+            Array.Clear(_tfBufValid);
+            Array.Clear(_tfBufGfIndex);
+            Array.Clear(_tfBufDisplayIndexOffset);
+            int maxGopLength = _lagInFrames >= 32 ? Math.Min(MAX_GF_INTERVAL, _lagInFrames - ArnrMaxFrames / 2) : MAX_GF_LENGTH_LAP;
+            if (_lagInFrames == 0) maxGopLength = _rc.MaxGfInterval;
             maxGopLength = Math.Min(maxGopLength, _rc.FramesToKey);
             if (_rc.FramesSinceKey == 0 || _rc.FramesSinceKey == 1 ||
                 (_pRc.FramesTillRegionsUpdate - _rc.FramesSinceKey < _rc.FramesToKey &&
@@ -1846,7 +1850,7 @@ internal sealed partial class AomGqEncoder
             int curRegionIdx = FindRegionsIndex(_pRc.Regions, _pRc.NumRegions, _rc.FramesSinceKey - _pRc.RegionsOffset);
             if ((curRegionIdx >= 0 && _pRc.Regions[curRegionIdx].Type == SCENECUT_REGION) || _rc.FramesSinceKey == 0) _arfGfBoostLst = 0;
             CalculateGfLength(maxGopLength, MAX_NUM_GF_INTERVALS);
-            if (maxGopLength > 16 && _enableTplModel && _cfg.LagInFrames >= 32 && GopLengthDecisionMethod != 3)
+            if (maxGopLength > 16 && _enableTplModel && _lagInFrames >= 32 && GopLengthDecisionMethod != 3)
             {
                 int thisIdx = _rc.FramesSinceKey + _pRc.GfIntervals[_pRc.CurGfIndex] - _pRc.RegionsOffset - 1;
                 int thisRegion = FindRegionsIndex(_pRc.Regions, _pRc.NumRegions, thisIdx);

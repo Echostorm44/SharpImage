@@ -81,6 +81,12 @@ internal static partial class AomRdoptInter
         var mbmi = x.E.Mi0;
         bool isComp = mbmi.HasSecondRef;
         bool ret = true;
+        if (AomTrace.Out != null && isComp)
+        {
+            int rft0 = AomInter.RefFrameType(mbmi.RefFrame0, mbmi.RefFrame1);
+            var e = x.MbmiExtInter;
+            AomTrace.Out.Write($"bcm {x.E.MiRow} {x.E.MiCol} rft {rft0} cnt {e.RefMvCount[rft0]} m {thisMode} idx {mbmi.RefMvIdx} s {e.RefMvStack[rft0][0].ThisMv.AsInt:x} {e.RefMvStack[rft0][0].CompMv.AsInt:x} g {e.GlobalMvs[mbmi.RefFrame0].AsInt:x} {e.GlobalMvs[mbmi.RefFrame1].AsInt:x}" + (char)10);
+        }
         for (int i = 0; i < (isComp ? 2 : 1); ++i)
         {
             if (!GetThisMv(out var thisMv, thisMode, i, mbmi.RefMvIdx, skipRepeatedRefMv, mbmi.RefFrame0, mbmi.RefFrame1, x.MbmiExtInter)) return false;

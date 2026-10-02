@@ -42,6 +42,7 @@ internal sealed partial class AomGqEncoder
     private double _framerate = 30, _initFramerate = 30;
     private readonly double _targetBandwidth = 256000;
     private readonly bool _lapEnabled;
+    private readonly int _lagInFrames;   // oxcf->gf_cfg.lag_in_frames
     private int _framesLeft;
     private int _gfMaxPyrHeight = 5, _gfMinPyrHeight;
     private int _cqLevel;
@@ -53,7 +54,7 @@ internal sealed partial class AomGqEncoder
     private readonly bool _kfAutoKey;
     private int _tplPrevGopArfDispOrder = -1;
     private readonly bool _enableTplModel = true;
-    private int GopLengthDecisionMethod => 0;
+    private int GopLengthDecisionMethod => TfCompressor().Sf.tpl_sf.gop_length_decision_method;   // cpi->sf: the previous frame's
     private bool HasNoStatsStage => !_lapEnabled;
     private bool IsStatConsumptionStage => _lapEnabled;
     private bool IsStatConsumptionStageTwopass => false;
@@ -324,6 +325,8 @@ internal sealed partial class AomGqEncoder
     private int _curQindex, _curFrameType;
     private bool _curShowExisting;
     private int _prevBaseQindex;
+    /// <summary>cm->current_frame.frame_type (av1_encode sets it; av1_tpl_preload_rc_estimate overwrites it).</summary>
+    private int _cmFrameType = KEY_FRAME;
     private FrameParams _curRefresh = new();
     private readonly int[] _curBackupFilterLevel = new int[4];
     private AomRefBuffer? _curFrameBuf;
@@ -341,6 +344,7 @@ internal sealed partial class AomGqEncoder
             _gfMaxPyrHeight = Math.Min(_gfMaxPyrHeight, 1);   // USE_ALTREF_FOR_ONE_PASS
             _gfMinPyrHeight = Math.Min(_gfMinPyrHeight, _gfMaxPyrHeight);
         }
+        _skipTplSetupStats = false;
         if (!_tplBuffersSetup) TplSetupBuffers();   // av1_setup_tpl_buffers (tpl_stats_pool[0] == NULL)
         var fp = new FrameParams();
         _twopass.ThisFrame = -1;
@@ -428,7 +432,7 @@ internal sealed partial class AomGqEncoder
         if (!fp.ShowExistingFrame)
         {
             bool isSecondArf = gf.UpdateType[idx] == INTNL_ARF_UPDATE && gf.ArfSrcOffset[idx] >= TF_LOOKAHEAD_IDX_THR;
-            bool applyFiltering = ArnrMaxFrames > 0 && _cfg.LagInFrames > 1;
+            bool applyFiltering = ArnrMaxFrames > 0 && _lagInFrames > 1;
             if (frameUpdateType != KF_UPDATE && frameUpdateType != ARF_UPDATE && !isSecondArf) applyFiltering = false;
             if (applyFiltering)
             {
@@ -448,7 +452,7 @@ internal sealed partial class AomGqEncoder
             if (applyFiltering)
             {
                 bool showExistingAltRef = false;
-                int qIndex = RcPickQAndBounds(_cfg.Width, _cfg.Height, idx, fp.FrameType == KEY_FRAME || fp.FrameType == INTRA_ONLY_FRAME, out _, out _);
+                int qIndex = RcPickQAndBounds(_cfg.Width, _cfg.Height, idx, _cmFrameType == KEY_FRAME || _cmFrameType == INTRA_ONLY_FRAME, out _, out _);   // cm->current_frame.frame_type: not yet this frame's
                 if (frameUpdateType == KF_UPDATE || frameUpdateType == ARF_UPDATE)
                 {
                     var tfBuf = TfInfoGetFilteredBuf(idx, out long dSum, out long dSse);
@@ -475,13 +479,16 @@ internal sealed partial class AomGqEncoder
         if (_gfFrameIndex == 0 && !fp.ShowExistingFrame)
         {
             // perform tpl after filtering
-            bool allowTpl = _cfg.LagInFrames > 1 && _enableTplModel;
+            bool allowTpl = _lagInFrames > 1 && _enableTplModel;
             if (gf.Size > AomTplData.MAX_LENGTH_TPL_FRAME_STATS) allowTpl = false;
             if (fp.FrameType != KEY_FRAME) allowTpl &= frameUpdateType == ARF_UPDATE || frameUpdateType == GF_UPDATE;
             if (allowTpl)
             {
-                TplPreloadRcEstimate();
-                TplSetupStats(0, fp);
+                if (!_skipTplSetupStats)
+                {
+                    TplPreloadRcEstimate(fp.FrameType);
+                    TplSetupStats(0, fp);
+                }
             }
             else TplInitStats();
         }
@@ -856,6 +863,7 @@ internal sealed partial class AomGqEncoder
         var gf = _gfGroup;
         int frameType = fp.FrameType;
         bool isKey = frameType == KEY_FRAME;
+        _cmFrameType = fp.FrameType;
         if (fp.ShowExistingFrame) return EncodeShowExisting(fp);
         if (isKey && gf.RefbufState[_gfFrameIndex] == REFBUF_RESET) _frameNumber = 0;
         int orderHintFull = _frameNumber + fp.OrderOffset;
@@ -913,7 +921,7 @@ internal sealed partial class AomGqEncoder
         {
             Width = width, Height = height, SsX = cfg.Monochrome ? 1 : cfg.SsX, SsY = cfg.Monochrome ? 1 : cfg.SsY, Monochrome = cfg.Monochrome,
             BitDepth = cfg.BitDepth, Mode = cfg.Usage, Speed = cfg.Speed, Tune = tune, Threads = Math.Min(cfg.Threads, 64),
-            TileColumns = cfg.TileColumnsLog2, TileRows = cfg.TileRowsLog2, SourceFrame = source, UnfilteredSource = src.Img, Tpl = _cfg.LagInFrames > 1 ? _tpl : null, R0 = _r0,
+            TileColumns = cfg.TileColumnsLog2, TileRows = cfg.TileRowsLog2, SourceFrame = source, UnfilteredSource = src.Img, Tpl = _lagInFrames > 1 ? _tpl : null, R0 = _r0,
             DeltaqObjective = cfg.Tune != AomTune.Iq && _enableTplModel,
             BaseQindex = qindex, UpdateType = updateType, GfFrameType = frameType, LayerDepth = gf.LayerDepth[_gfFrameIndex],
             IsStatConsumptionStage = IsStatConsumptionStage, BoostIndex = Math.Min(15, _pRc.GfuBoost / 100),
@@ -923,7 +931,7 @@ internal sealed partial class AomGqEncoder
             Seq = _seq, ShowFrame = fp.ShowFrame, OrderHint = orderHint, DisplayOrderHint = displayOrderHint,
             FrameNumber = _frameNumber, RefBufs = refBufs, RefFrameFlags = fp.RefFrameFlags, UseRefFrameMvs = _extUseRefFrameMvs,
             PrimaryRefBuf = primaryRefBuf, FrameProbs = _frameProbs, FilterScaler = filterScaler, PhaseScaler = phaseScaler,
-            LagInFrames = cfg.LagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, RefreshGolden = fp.RefreshGolden,
+            LagInFrames = _lagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, RefreshGolden = fp.RefreshGolden,
             PpiFilterLevel = _ppiFilterLevel, ResizeNeeded = _resizeModeFixed, IsSrcFrameAltRef = _rc.IsSrcFrameAltRef != 0,
             GfFrameIndex = _gfFrameIndex, GfArfIndex = gf.ArfIndex, CurPyramidLevel = pyramidLevel, ValidGmModelFound = _validGmModelFound,
             MvSearchState = _maxMvMagnitude, SetMvParamsEarly = _mvSearchParamsDue, PrevBaseQindex = _prevBaseQindex,
@@ -1082,5 +1090,39 @@ internal sealed partial class AomGqEncoder
         }
     }
 
-    private bool IsShorterGfIntervalBetter(int frameType, bool showFrame) => throw new NotImplementedException("is_shorter_gf_interval_better");
+    /// <summary>cpi->skip_tpl_setup_stats: the gop-length TPL run already produced this group's stats.</summary>
+    private bool _skipTplSetupStats;
+
+    /// <summary>is_shorter_gf_interval_better (cpi->sf is the previous frame's: the TPL / TF compressor's).</summary>
+    private bool IsShorterGfIntervalBetter(int frameType, bool showFrame)
+    {
+        const int GF_MIN_BOOST = 50;
+        var fp = new FrameParams { FrameType = frameType, ShowFrame = showFrame };
+        int gopLengthDecisionMethod = TfCompressor().Sf.tpl_sf.gop_length_decision_method;
+        bool shortenGfInterval;
+        TplPreloadRcEstimate(frameType);
+        if (gopLengthDecisionMethod == 2)
+            shortenGfInterval = _pRc.GfuBoost < _pRc.NumStatsUsedForGfuBoost * GF_MIN_BOOST * 1.4 && TplSetupStats(3, fp) == 0;
+        else
+        {
+            bool doCompleteTpl = true;
+            bool isTemporalFilterEnabled = _rc.FramesSinceKey > 0 && _gfGroup.ArfIndex > -1;
+            shortenGfInterval = false;
+            if (gopLengthDecisionMethod == 1)
+            {
+                int gopLengthEval = TplSetupStats(2, fp);
+                if (gopLengthEval != 2)
+                {
+                    doCompleteTpl = false;
+                    shortenGfInterval = gopLengthEval == 0;
+                }
+            }
+            if (doCompleteTpl)
+            {
+                shortenGfInterval = TplSetupStats(1, fp) == 0;
+                if (isTemporalFilterEnabled && !shortenGfInterval) _skipTplSetupStats = true;
+            }
+        }
+        return shortenGfInterval;
+    }
 }

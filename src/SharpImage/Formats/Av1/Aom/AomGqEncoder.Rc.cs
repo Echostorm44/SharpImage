@@ -393,7 +393,7 @@ internal sealed partial class AomGqEncoder
         _rc.FrameNumberEncoded++;
     }
 
-    private bool IsAltrefEnabled => _cfg.LagInFrames >= 3;   // is_altref_enabled(lag, enable_auto_arf = 1)
+    private bool IsAltrefEnabled => _lagInFrames >= 3;   // is_altref_enabled(lag, enable_auto_arf = 1)
 
     /// <summary>av1_calc_pframe_target_size_one_pass_vbr (af_ratio 10).</summary>
     private int CalcPframeTargetSizeOnePassVbr(int frameUpdateType)
