@@ -113,4 +113,105 @@ internal static partial class AomQuantizeHbdSimd
         for (int k = 0; k < 8; k++) e = Math.Max(e, eob.GetElement(k));
         return e;
     }
+    /// <summary>AomQuantizeHbd.QuantizeFpHelperQm over the coefficients in raster order, 8 at a time (every position is
+    /// written, the eob the largest iscan of a nonzero level, as AomQm's 8-bit vector quantizers). Returns the eob.</summary>
+    internal static int QuantizeFpHelperQm(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short round0, short round1,
+        short quant0, short quant1, short dequant0, short dequant1, byte[] qm, byte[] iqm, int logScale, Span<int> qcoeff, Span<int> dqcoeff)
+    {
+        if ((nCoeffs & 7) != 0 || coeff.Length < nCoeffs || iscan.Length < nCoeffs || qm.Length < nCoeffs || iqm.Length < nCoeffs
+            || qcoeff.Length < nCoeffs || dqcoeff.Length < nCoeffs)
+            throw new ArgumentException("quantizer buffers");
+        const int QmBits = 5;
+        int half = (1 << logScale) >> 1;
+        int r0 = (round0 + half) >> logScale, r1 = (round1 + half) >> logScale;
+        ref int c0 = ref MemoryMarshal.GetReference(coeff);
+        ref short is0 = ref MemoryMarshal.GetArrayDataReference(iscan);
+        ref byte wt0 = ref MemoryMarshal.GetArrayDataReference(qm);
+        ref byte iw0 = ref MemoryMarshal.GetArrayDataReference(iqm);
+        ref int q0 = ref MemoryMarshal.GetReference(qcoeff);
+        ref int d0 = ref MemoryMarshal.GetReference(dqcoeff);
+        var lane0 = Vector256.Create(-1, 0, 0, 0, 0, 0, 0, 0);
+        var dqV = Vector256.ConditionalSelect(lane0, Vector256.Create((int)dequant0), Vector256.Create((int)dequant1));
+        var rndV = Vector256.ConditionalSelect(lane0, Vector256.Create(r0), Vector256.Create(r1));
+        var qV = Vector256.ConditionalSelect(lane0, Vector256.Create((int)quant0), Vector256.Create((int)quant1));
+        var rq = Vector256.Create(1 << (QmBits - 1));
+        int sh = 16 - logScale + QmBits;
+        var eobV = Vector256<int>.Zero;
+        for (int i = 0; i < nCoeffs; i += 8)
+        {
+            if (i == 8) { dqV = Vector256.Create((int)dequant1); rndV = Vector256.Create(r1); qV = Vector256.Create((int)quant1); }
+            var c = Vector256.LoadUnsafe(ref c0, (nuint)i);
+            var sign = Vector256.ShiftRightArithmetic(c, 31);
+            var abs = (c ^ sign) - sign;
+            var wt = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref wt0, i))).AsByte());
+            var iwt = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref iw0, i))).AsByte());
+            var dequant = Vector256.ShiftRightArithmetic(dqV * iwt + rq, QmBits);
+            var pass = Vector256.GreaterThanOrEqual(abs * wt, Vector256.ShiftLeft(dqV, QmBits - (1 + logScale)));
+            var absQ = FloorMulShift((abs + rndV) * wt, qV, sh) & pass;
+            var absDq = Vector256.ShiftRightArithmetic(absQ * dequant, logScale);
+            ((absQ ^ sign) - sign).StoreUnsafe(ref q0, (nuint)i);
+            ((absDq ^ sign) - sign).StoreUnsafe(ref d0, (nuint)i);
+            var isc = Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref is0, (nuint)i)) + Vector256<int>.One;
+            eobV = Vector256.Max(eobV, isc & ~Vector256.Equals(absQ, Vector256<int>.Zero));
+        }
+        int e = 0;
+        for (int k = 0; k < 8; k++) e = Math.Max(e, eobV.GetElement(k));
+        return e;
+    }
+
+    /// <summary>AomQuantizeHbd.QuantizeBHelperQm in raster order, 8 at a time (see QuantizeFpHelperQm). Returns the eob.</summary>
+    internal static int QuantizeBHelperQm(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short zbin0, short zbin1,
+        short round0, short round1, short quant0, short quant1, short quantShift0, short quantShift1, short dequant0, short dequant1,
+        byte[] qm, byte[] iqm, int logScale, Span<int> qcoeff, Span<int> dqcoeff)
+    {
+        if ((nCoeffs & 7) != 0 || coeff.Length < nCoeffs || iscan.Length < nCoeffs || qm.Length < nCoeffs || iqm.Length < nCoeffs
+            || qcoeff.Length < nCoeffs || dqcoeff.Length < nCoeffs)
+            throw new ArgumentException("quantizer buffers");
+        const int QmBits = 5;
+        int half = (1 << logScale) >> 1;
+        int z0 = (zbin0 + half) >> logScale, z1 = (zbin1 + half) >> logScale;
+        int r0 = (round0 + half) >> logScale, r1 = (round1 + half) >> logScale;
+        ref int c0 = ref MemoryMarshal.GetReference(coeff);
+        ref short is0 = ref MemoryMarshal.GetArrayDataReference(iscan);
+        ref byte wt0 = ref MemoryMarshal.GetArrayDataReference(qm);
+        ref byte iw0 = ref MemoryMarshal.GetArrayDataReference(iqm);
+        ref int q0 = ref MemoryMarshal.GetReference(qcoeff);
+        ref int d0 = ref MemoryMarshal.GetReference(dqcoeff);
+        var lane0 = Vector256.Create(-1, 0, 0, 0, 0, 0, 0, 0);
+        var zbV = Vector256.ConditionalSelect(lane0, Vector256.Create(z0 << QmBits), Vector256.Create(z1 << QmBits));
+        var rndV = Vector256.ConditionalSelect(lane0, Vector256.Create(r0), Vector256.Create(r1));
+        var qV = Vector256.ConditionalSelect(lane0, Vector256.Create((int)quant0), Vector256.Create((int)quant1));
+        var shV = Vector256.ConditionalSelect(lane0, Vector256.Create((int)quantShift0), Vector256.Create((int)quantShift1));
+        var dqV = Vector256.ConditionalSelect(lane0, Vector256.Create((int)dequant0), Vector256.Create((int)dequant1));
+        var rq = Vector256.Create(1 << (QmBits - 1));
+        int shOut = 16 - logScale + QmBits;
+        var eobV = Vector256<int>.Zero;
+        for (int i = 0; i < nCoeffs; i += 8)
+        {
+            if (i == 8)
+            {
+                zbV = Vector256.Create(z1 << QmBits); rndV = Vector256.Create(r1); qV = Vector256.Create((int)quant1);
+                shV = Vector256.Create((int)quantShift1); dqV = Vector256.Create((int)dequant1);
+            }
+            var c = Vector256.LoadUnsafe(ref c0, (nuint)i);
+            var sign = Vector256.ShiftRightArithmetic(c, 31);
+            var abs = (c ^ sign) - sign;
+            var wt = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref wt0, i))).AsByte());
+            var iwt = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref iw0, i))).AsByte());
+            // c * wt >= zbin << 5 or <= -(zbin << 5): |c| * wt >= zbin << 5
+            var pass = Vector256.GreaterThanOrEqual(abs * wt, zbV);
+            var tmpw = (abs + rndV) * wt;
+            var tmp2 = FloorMulShift(tmpw, qV, 16) + tmpw;
+            var absQ = FloorMulShift(tmp2, shV, shOut) & pass;
+            var dequant = Vector256.ShiftRightArithmetic(dqV * iwt + rq, QmBits);
+            var absDq = Vector256.ShiftRightArithmetic(absQ * dequant, logScale);
+            ((absQ ^ sign) - sign).StoreUnsafe(ref q0, (nuint)i);
+            ((absDq ^ sign) - sign).StoreUnsafe(ref d0, (nuint)i);
+            var isc = Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref is0, (nuint)i)) + Vector256<int>.One;
+            eobV = Vector256.Max(eobV, isc & ~Vector256.Equals(absQ, Vector256<int>.Zero));
+        }
+        int e = 0;
+        for (int k = 0; k < 8; k++) e = Math.Max(e, eobV.GetElement(k));
+        return e;
+    }
 }

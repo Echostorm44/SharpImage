@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.IO.Compression;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -154,7 +155,25 @@ internal static partial class AomQm
             return (e + rounding) >> shift;
         }
         long error = 0, sqcoeff = 0;
-        for (int i = 0; i < blockSize; i++)
+        int i = 0;
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && coeff.Length >= blockSize && dqcoeff.Length >= blockSize && scan.Length >= blockSize)
+        {
+            // 8 terms at a time: the weighted values in 32 bits (|x| * 32 < 2^31), their squares exact in 64 bits (vpmuldq on
+            // the even and the odd lanes), each rounded as the C does before it is summed
+            var acc = System.Runtime.Intrinsics.Vector256<long>.Zero; var accS = System.Runtime.Intrinsics.Vector256<long>.Zero;
+            var rnd = System.Runtime.Intrinsics.Vector256.Create(1L << (2 * AomQmBits - 1));
+            for (; i + 8 <= blockSize; i += 8)
+            {
+                var w = System.Runtime.Intrinsics.Vector256.Create(qm[scan[i]], qm[scan[i + 1]], qm[scan[i + 2]], qm[scan[i + 3]],
+                    qm[scan[i + 4]], qm[scan[i + 5]], qm[scan[i + 6]], (int)qm[scan[i + 7]]);
+                var c = System.Runtime.Intrinsics.Vector256.Create(coeff.Slice(i, 8));
+                var dd = (c - System.Runtime.Intrinsics.Vector256.Create(dqcoeff.Slice(i, 8))) * w;
+                var cc = c * w;
+                acc += SqRound(dd, rnd); accS += SqRound(cc, rnd);
+            }
+            error = System.Runtime.Intrinsics.Vector256.Sum(acc); sqcoeff = System.Runtime.Intrinsics.Vector256.Sum(accS);
+        }
+        for (; i < blockSize; i++)
         {
             long weight = qm[scan[i]];
             long dd = (long)(coeff[i] - dqcoeff[i]) * weight;
@@ -164,6 +183,16 @@ internal static partial class AomQm
         }
         ssz = sqcoeff;
         return error;
+    }
+
+    // per 64-bit lane pair: (x_even^2 + rnd) >> 10 + (x_odd^2 + rnd) >> 10
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static System.Runtime.Intrinsics.Vector256<long> SqRound(System.Runtime.Intrinsics.Vector256<int> x, System.Runtime.Intrinsics.Vector256<long> rnd)
+    {
+        var odd = System.Runtime.Intrinsics.Vector256.ShiftRightLogical(x.AsInt64(), 32).AsInt32();
+        var e = System.Runtime.Intrinsics.X86.Avx2.Multiply(x, x);
+        var o = System.Runtime.Intrinsics.X86.Avx2.Multiply(odd, odd);
+        return System.Runtime.Intrinsics.Vector256.ShiftRightLogical(e + rnd, 2 * AomQmBits) + System.Runtime.Intrinsics.Vector256.ShiftRightLogical(o + rnd, 2 * AomQmBits);
     }
 
     /// <summary>get_coeff_dist with a matrix (txb_rdopt_utils.h).</summary>

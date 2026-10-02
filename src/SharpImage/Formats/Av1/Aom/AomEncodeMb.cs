@@ -458,7 +458,14 @@ internal static partial class AomEncodeMb
         {
             // quant_func_list[...][is_hbd]: av1_highbd_quantize_fp_facade / av1_highbd_quantize_b_facade
             short[] iscanH = IScanOf(txSize, txType);
-            p.Eobs[block] = (ushort)(qp.Qmatrix != null && qp.Iqmatrix != null ? qp.XformQuantIdx switch
+            p.Eobs[block] = (ushort)(qp.Qmatrix != null && qp.Iqmatrix != null ? AomQuantizeHbdSimd.Supported && (n & 7) == 0 ? qp.XformQuantIdx switch
+            {
+                AomXformQuant.Fp => AomQuantizeHbdSimd.QuantizeFpHelperQm(coeff, n, iscanH, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
+                    p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                AomXformQuant.B => AomQuantizeHbdSimd.QuantizeBHelperQm(coeff, n, iscanH, p.Zbin0, p.Zbin1, p.Round0, p.Round1, p.Quant0, p.Quant1,
+                    p.QuantShift0, p.QuantShift1, p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                _ => throw new NotSupportedException("AV1_XFORM_QUANT_DC is not used on the all-intra path"),
+            } : qp.XformQuantIdx switch
             {
                 AomXformQuant.Fp => AomQuantizeHbd.QuantizeFpHelperQm(coeff, n, scan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
                     p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),

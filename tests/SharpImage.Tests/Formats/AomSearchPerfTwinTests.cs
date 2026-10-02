@@ -352,4 +352,85 @@ public sealed class AomSearchPerfTwinTests
         Console.WriteLine($"hbd dsp: {cases} cases, {bad} mismatches");
         await Assert.That(bad).IsEqualTo(0);
     }
+    [Test]
+    public async Task HbdQmQuantizers_Vector_MatchScalar()
+    {
+        var rng = new Random(47);
+        int cases = 0, bad = 0;
+        foreach (int bd in new[] { 10, 12 })
+        {
+            var quants = new AomQuants(bd, 0, 0, 0, 0, 0, 0);
+            for (int txSize = 0; txSize < 19; txSize++)
+            {
+                int n = AomEncodeMb.MaxEob(txSize);
+                for (int level = 0; level < 15; level += 3)
+                    for (int plane = 0; plane < 3; plane++)
+                        foreach (int txType in new[] { 0, 1, 2, 3 })
+                        {
+                            if (Math.Max(TxSizeWide[txSize], TxSizeHigh[txSize]) > 16 && txType != 0) continue;
+                            var qm = AomQm.Qmatrix(level, plane, txSize, txType); var iqm = AomQm.Iqmatrix(level, plane, txSize, txType);
+                            if (qm == null || iqm == null) continue;
+                            var scan = AomEncodeMb.ScanOf(txSize, txType); var iscan = AomEncodeMb.IScanOf(txSize, txType);
+                            int logScale = AomQuantize.TxScale(txSize);
+                            for (int trial = 0; trial < 4; trial++)
+                            {
+                                int q = rng.Next(0, 256);
+                                int amp = trial == 0 ? 40 : trial == 1 ? 4000 : trial == 2 ? 1 << 16 : 1 << (bd + 9);
+                                var c = new int[n];
+                                for (int k = 0; k < n; k++) c[k] = rng.Next(4) == 0 ? 0 : rng.Next(-amp, amp + 1);
+                                var a1 = new int[n]; var a2 = new int[n]; var b1 = new int[n]; var b2 = new int[n];
+                                int e1 = AomQuantizeHbd.QuantizeFpHelperQm(c, n, scan, quants.RoundFp[0, q, 0], quants.RoundFp[0, q, 1], quants.QuantFp[0, q, 0], quants.QuantFp[0, q, 1],
+                                    quants.Dequant[0, q, 0], quants.Dequant[0, q, 1], qm, iqm, logScale, a1, b1);
+                                int e2 = AomQuantizeHbdSimd.QuantizeFpHelperQm(c, n, iscan, quants.RoundFp[0, q, 0], quants.RoundFp[0, q, 1], quants.QuantFp[0, q, 0], quants.QuantFp[0, q, 1],
+                                    quants.Dequant[0, q, 0], quants.Dequant[0, q, 1], qm, iqm, logScale, a2, b2);
+                                cases++;
+                                if (e1 != e2 || !a1.AsSpan().SequenceEqual(a2) || !b1.AsSpan().SequenceEqual(b2)) bad++;
+                                int f1 = AomQuantizeHbd.QuantizeBHelperQm(c, n, scan, quants.Zbin[0, q, 0], quants.Zbin[0, q, 1], quants.Round[0, q, 0], quants.Round[0, q, 1],
+                                    quants.Quant[0, q, 0], quants.Quant[0, q, 1], quants.QuantShift[0, q, 0], quants.QuantShift[0, q, 1], quants.Dequant[0, q, 0], quants.Dequant[0, q, 1],
+                                    qm, iqm, logScale, a1, b1);
+                                int f2 = AomQuantizeHbdSimd.QuantizeBHelperQm(c, n, iscan, quants.Zbin[0, q, 0], quants.Zbin[0, q, 1], quants.Round[0, q, 0], quants.Round[0, q, 1],
+                                    quants.Quant[0, q, 0], quants.Quant[0, q, 1], quants.QuantShift[0, q, 0], quants.QuantShift[0, q, 1], quants.Dequant[0, q, 0], quants.Dequant[0, q, 1],
+                                    qm, iqm, logScale, a2, b2);
+                                cases++;
+                                if (f1 != f2 || !a1.AsSpan().SequenceEqual(a2) || !b1.AsSpan().SequenceEqual(b2)) bad++;
+                            }
+                        }
+            }
+        }
+        Console.WriteLine($"hbd qm quantizers: {cases} cases, {bad} mismatches");
+        await Assert.That(bad).IsEqualTo(0);
+    }
+    [Test]
+    public async Task BlockErrorQm_Vector_MatchReference()
+    {
+        var rng = new Random(53);
+        int cases = 0, bad = 0;
+        for (int txSize = 0; txSize < 19; txSize++)
+        {
+            int n = AomEncodeMb.MaxEob(txSize);
+            var qm = AomQm.Qmatrix(rng.Next(0, 15), rng.Next(0, 3), txSize, 0);
+            if (qm == null) continue;
+            var scan = AomEncodeMb.ScanOf(txSize, 0);
+            foreach (int bd in new[] { 8, 10, 12 })
+                for (int trial = 0; trial < 6; trial++)
+                {
+                    int amp = trial % 2 == 0 ? 3000 : 1 << (bd + 13);
+                    var c = new int[n]; var d = new int[n];
+                    for (int k = 0; k < n; k++) { c[k] = rng.Next(-amp, amp + 1); d[k] = rng.Next(3) == 0 ? 0 : c[k] + rng.Next(-amp / 8, amp / 8 + 1); }
+                    long err = 0, sq = 0;
+                    for (int k = 0; k < n; k++)
+                    {
+                        long w = qm[scan[k]];
+                        long dd = (long)(c[k] - d[k]) * w, cc = c[k] * w;
+                        err += (dd * dd + 512) >> 10; sq += (cc * cc + 512) >> 10;
+                    }
+                    if (bd > 8) { int sh = 2 * (bd - 8), r = (1 << sh) >> 1; err = (err + r) >> sh; sq = (sq + r) >> sh; }
+                    long e2 = AomQm.BlockErrorQm(c, d, n, qm, scan, out long s2, bd);
+                    cases++;
+                    if (e2 != err || s2 != sq) bad++;
+                }
+        }
+        Console.WriteLine($"block error qm: {cases} cases, {bad} mismatches");
+        await Assert.That(bad).IsEqualTo(0);
+    }
 }
