@@ -31,6 +31,9 @@ internal sealed class AomGqConfig
     public AomSequenceConfig Color = new();
     public int? Sharpness;
     public bool? EnableCdef;
+    /// <summary>libavif codec-specific options (avifenc -a tune / sharpness / enable-cdef ...) are present: avifenc
+    /// re-applies them (aom_codec_set_option) before every frame of a sequence, each an av1_change_config.</summary>
+    public bool ReapplyCodecOptions;
 }
 
 /// <summary>One frame handed to the encoder (aom_codec_encode): full-resolution planes and the per-frame controls

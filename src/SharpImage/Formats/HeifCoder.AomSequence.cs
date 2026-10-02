@@ -49,6 +49,7 @@ public static partial class HeifCoder
             TileColumnsLog2 = tileCols, TileRowsLog2 = tileRows, LagInFrames = hasAlpha ? 0 : 35,
             KfMaxDist = options.KeyframeInterval > 0 ? options.KeyframeInterval : 9999, EnableRestoration = bd != 12,
             Sharpness = options.Sharpness, EnableCdef = options.EnableCdef,
+            ReapplyCodecOptions = options.Tune != null || options.Sharpness != null || options.EnableCdef != null,
             Color = alpha
                 ? new AomSequenceConfig { ColorRange = 1 }
                 : new AomSequenceConfig

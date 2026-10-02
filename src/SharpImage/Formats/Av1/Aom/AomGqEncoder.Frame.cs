@@ -164,13 +164,9 @@ internal sealed partial class AomGqEncoder
         bool flush = f == null;
         if (f != null)
         {
-            // libavif sets AOME_SET_CQ_LEVEL / AV1E_SET_LOSSLESS when the quality changes (and once at init); their
-            // av1_change_config resets cm's frame size (and mi grid) to the configured size before the next encode
-            if (_frameNumberPushed > 0 && f.Quantizer != _prevQuantizer)
-            {
-                _miRows = ((_cfg.Height + 7) & ~7) >> 2;
-                _miCols = ((_cfg.Width + 7) & ~7) >> 2;
-            }
+            // libavif sets AOME_SET_CQ_LEVEL / AV1E_SET_LOSSLESS when the quality changes (and once at init), and re-applies
+            // its codec-specific options (-a) before every frame when they are given: each runs av1_change_config
+            if (_frameNumberPushed > 0 && (f.Quantizer != _prevQuantizer || _cfg.ReapplyCodecOptions)) ChangeConfig();
             _prevQuantizer = f.Quantizer;
             _cqLevel = QuantizerToQindex[f.Quantizer];
             _losslessRequested = f.Quantizer == 0;
@@ -1074,6 +1070,18 @@ internal sealed partial class AomGqEncoder
 
     /// <summary>av1_set_target_rate (AOM_Q: no vbr_rate_correction).</summary>
     private void SetTargetRate(int width, int height) => RcSetFrameTarget(_rc.BaseFrameTarget, width, height);
+
+    /// <summary>av1_change_config's effect on the encoder state when the configuration itself is unchanged: cm's frame
+    /// size (and mi grid) back to the configured size, and p_rc->baseline_gf_interval reset.</summary>
+    private void ChangeConfig()
+    {
+        _miRows = ((_cfg.Height + 7) & ~7) >> 2;
+        _miCols = ((_cfg.Width + 7) & ~7) >> 2;
+        const int FIXED_GF_INTERVAL = 16;
+        bool isOnePassRtParams = HasNoStatsStage && _lagInFrames == 0 && _cfg.Usage == REALTIME;
+        if (HasNoStatsStage && _rcModeQ) _pRc.BaselineGfInterval = FIXED_GF_INTERVAL;
+        else if (!isOnePassRtParams || _frameNumber == 0) _pRc.BaselineGfInterval = (MIN_GF_INTERVAL + MAX_GF_INTERVAL) / 2;
+    }
 
     /// <summary>refresh_reference_frames.</summary>
     private void RefreshReferenceFrames()
