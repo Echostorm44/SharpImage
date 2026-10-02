@@ -186,7 +186,7 @@ internal sealed partial class AomGqEncoder
             LookaheadPush(MakeSource(f), tsStart, tsEnd, f.Flags, f);
             _frameNumberPushed++;
         }
-        if (_lapEnabled) throw new NotImplementedException("look-ahead processing (first pass) stage");
+        if (_lapEnabled) RunLapStage(flush);
 
         _libFlags = 0;
         byte[]? pending = null;
