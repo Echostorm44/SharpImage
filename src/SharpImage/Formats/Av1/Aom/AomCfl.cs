@@ -12,7 +12,7 @@ namespace SharpImage.Formats.Av1;
 /// libaom dispatches SSSE3/AVX2 versions of subsample / subtract_average / predict; they equal the C (twin-verified).
 /// </summary>
 [SkipLocalsInit]
-internal static unsafe class AomCfl
+internal static unsafe partial class AomCfl
 {
     public const int CFL_BUF_LINE = AomCflCtx.CflBufLine, CFL_BUF_SQUARE = AomCflCtx.CflBufSquare;
     private const int MI_SIZE_LOG2 = 2;
@@ -136,6 +136,25 @@ internal static unsafe class AomCfl
         int width = TxSizeWide[txSize];
         int height = TxSizeHigh[txSize];
         ushort[] cache = DcPredCache(xd.Cfl, predPlane);
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && width <= 32 && cache.Length >= 32)
+        {
+            // the row as bytes (the cache holds the DC_PRED bytes widened), stored width bytes per row
+            fixed (ushort* c = cache)
+            {
+                var lo = System.Runtime.Intrinsics.Vector256.Load(c);
+                var hi = System.Runtime.Intrinsics.Vector256.Load(c + 16);
+                var row = System.Runtime.Intrinsics.X86.Avx2.Permute4x64(
+                    System.Runtime.Intrinsics.X86.Avx2.PackUnsignedSaturate(lo.AsInt16(), hi.AsInt16()).AsUInt64(), 0xD8).AsByte();
+                for (int j = 0; j < height; j++, dst += dstStride)
+                {
+                    if (width == 32) System.Runtime.Intrinsics.Vector256.Store(row, dst);
+                    else if (width == 16) System.Runtime.Intrinsics.Vector128.Store(row.GetLower(), dst);
+                    else if (width == 8) *(ulong*)dst = row.AsUInt64().ToScalar();
+                    else *(uint*)dst = row.AsUInt32().ToScalar();
+                }
+            }
+            return;
+        }
         for (int j = 0; j < height; j++)
         {
             for (int i = 0; i < width; i++) dst[i] = (byte)cache[i];
@@ -183,6 +202,19 @@ internal static unsafe class AomCfl
         int roundOffset = (width * height) >> 1;
         int sum = roundOffset;
         ushort* recon = src;
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && width >= 8)
+        {
+            var acc = System.Runtime.Intrinsics.Vector256<int>.Zero;
+            for (int j = 0; j < height; j++, recon += CFL_BUF_LINE)
+                for (int i = 0; i < width; i += 8)
+                    acc += System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(System.Runtime.Intrinsics.Vector128.Load(recon + i));
+            int avgV = (sum + System.Runtime.Intrinsics.Vector256.Sum(acc)) >> numPelLog2;
+            var a16 = System.Runtime.Intrinsics.Vector128.Create((short)avgV);
+            for (int j = 0; j < height; j++, src += CFL_BUF_LINE, dst += CFL_BUF_LINE)
+                for (int i = 0; i < width; i += 8)
+                    System.Runtime.Intrinsics.Vector128.Store(System.Runtime.Intrinsics.X86.Sse2.Subtract(System.Runtime.Intrinsics.Vector128.Load(src + i).AsInt16(), a16), dst + i);
+            return;
+        }
         for (int j = 0; j < height; j++)
         {
             for (int i = 0; i < width; i++) sum += recon[i];
@@ -224,7 +256,7 @@ internal static unsafe class AomCfl
         {
             // libaom's kernel: mulhrs(|ac|, |alpha| << 9) = (|alpha * ac| + 32) >> 6, the sign of alpha * ac put back,
             // dc added, packed with unsigned saturation (the clip)
-            var aq12 = System.Runtime.Intrinsics.Vector128.Create((short)(Math.Abs(alphaQ3) << 9));
+            var aq12 = System.Runtime.Intrinsics.Vector128.Create((short)(AbsI(alphaQ3) << 9));
             var dcV = System.Runtime.Intrinsics.Vector128.Create((short)dc);
             var negAlpha = System.Runtime.Intrinsics.Vector128.Create((short)(alphaQ3 < 0 ? -1 : 1));
             for (int j = 0; j < height; j++, dst += dstStride, acBufQ3 += CFL_BUF_LINE)
@@ -236,6 +268,21 @@ internal static unsafe class AomCfl
                     var b = System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(System.Runtime.Intrinsics.X86.Sse2.Add(s, dcV), dcV);
                     *(ulong*)(dst + i) = System.Runtime.Intrinsics.Vector128.AsUInt64(b).ToScalar();
                 }
+            return;
+        }
+        if (System.Runtime.Intrinsics.X86.Ssse3.IsSupported && width == 4)
+        {
+            var aq12 = System.Runtime.Intrinsics.Vector128.Create((short)(AbsI(alphaQ3) << 9));
+            var dcV = System.Runtime.Intrinsics.Vector128.Create((short)dc);
+            var negAlpha = System.Runtime.Intrinsics.Vector128.Create((short)(alphaQ3 < 0 ? -1 : 1));
+            for (int j = 0; j < height; j++, dst += dstStride, acBufQ3 += CFL_BUF_LINE)
+            {
+                var ac = System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(*(ulong*)acBufQ3).AsInt16();
+                var s = System.Runtime.Intrinsics.X86.Ssse3.MultiplyHighRoundScale(System.Runtime.Intrinsics.X86.Ssse3.Abs(ac).AsInt16(), aq12);
+                s = System.Runtime.Intrinsics.X86.Ssse3.Sign(System.Runtime.Intrinsics.X86.Ssse3.Sign(s, ac), negAlpha);
+                var b = System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(System.Runtime.Intrinsics.X86.Sse2.Add(s, dcV), dcV);
+                *(uint*)dst = System.Runtime.Intrinsics.Vector128.AsUInt32(b).ToScalar();
+            }
             return;
         }
         for (int j = 0; j < height; j++)
@@ -282,6 +329,30 @@ internal static unsafe class AomCfl
     /// <summary>cfl_luma_subsampling_420_lbd_c.</summary>
     public static void LumaSubsampling420(byte* input, int inputStride, ushort* outputQ3, int width, int height)
     {
+        if (System.Runtime.Intrinsics.X86.Ssse3.IsSupported && width >= 8)
+        {
+            var ones = System.Runtime.Intrinsics.Vector128.Create((sbyte)1);
+            for (int j = 0; j < height; j += 2, input += inputStride << 1, outputQ3 += CFL_BUF_LINE)
+                for (int i = 0; i < width; i += 16)
+                {
+                    System.Runtime.Intrinsics.Vector128<short> s;
+                    if (width - i >= 16)
+                    {
+                        var t = System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(System.Runtime.Intrinsics.Vector128.Load(input + i), ones);
+                        var b = System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(System.Runtime.Intrinsics.Vector128.Load(input + i + inputStride), ones);
+                        s = System.Runtime.Intrinsics.Vector128.ShiftLeft(System.Runtime.Intrinsics.X86.Sse2.Add(t, b), 1);
+                        System.Runtime.Intrinsics.Vector128.Store(s.AsUInt16(), outputQ3 + (i >> 1));
+                    }
+                    else
+                    {
+                        var t = System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(*(ulong*)(input + i)).AsByte(), ones);
+                        var b = System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(*(ulong*)(input + i + inputStride)).AsByte(), ones);
+                        s = System.Runtime.Intrinsics.Vector128.ShiftLeft(System.Runtime.Intrinsics.X86.Sse2.Add(t, b), 1);
+                        *(ulong*)(outputQ3 + (i >> 1)) = s.AsUInt64().ToScalar();
+                    }
+                }
+            return;
+        }
         for (int j = 0; j < height; j += 2)
         {
             for (int i = 0; i < width; i += 2)
@@ -383,6 +454,11 @@ internal static unsafe class AomCfl
         {
             // Only dimensions of size 4 can have an odd offset.
             Sub8x8AdjustOffset(cfl, xd.MiRow, xd.MiCol, ref row, ref col);
+        }
+        if (pd.Dst.Buf16 != null)
+        {
+            fixed (ushort* buf16 = pd.Dst.Buf16) CflStoreHbd(cfl, buf16 + offset, stride, row, col, txSize);
+            return;
         }
         fixed (byte* buf = pd.Dst.Buf) CflStore(cfl, buf + offset, stride, row, col, txSize);
     }
@@ -487,6 +563,11 @@ internal static unsafe class AomCfl
         int width = MaxIntraBlockWidth(xd, bsize, 0, txSize);
         int height = MaxIntraBlockHeight(xd, bsize, 0, txSize);
         txSize = GetTxSize(width, height);
+        if (pd.Dst.Buf16 != null)
+        {
+            fixed (ushort* buf16 = pd.Dst.Buf16) CflStoreHbd(cfl, buf16 + pd.Dst.Offset, pd.Dst.Stride, row, col, txSize);
+            return;
+        }
         fixed (byte* buf = pd.Dst.Buf) CflStore(cfl, buf + pd.Dst.Offset, pd.Dst.Stride, row, col, txSize);
     }
 }

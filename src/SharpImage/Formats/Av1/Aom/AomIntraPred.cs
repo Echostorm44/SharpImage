@@ -80,9 +80,29 @@ internal static unsafe class AomIntraPred
         for (int r = 0; r < bh; r++, dst += stride) Unsafe.InitBlockUnaligned(dst, v, (uint)bw);
     }
 
-    public static void VPredictor(byte* dst, nint stride, int bw, int bh, byte* above)
+    public static void VPredictor(byte* dst, nint stride, int bw, int bh, byte* above) => ReplicateRow(above, dst, stride, bw, bh);
+
+    /// <summary>rows copies of the nbytes (4, 8, 16 or a multiple of 32) at src, stride bytes apart (no copy call per row).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void ReplicateRow(byte* src, byte* dst, nint stride, int nbytes, int rows)
     {
-        for (int r = 0; r < bh; r++, dst += stride) Buffer.MemoryCopy(above, dst, bw, bw);
+        switch (nbytes)
+        {
+            case 4: { uint v = *(uint*)src; for (int r = 0; r < rows; r++, dst += stride) *(uint*)dst = v; break; }
+            case 8: { ulong v = *(ulong*)src; for (int r = 0; r < rows; r++, dst += stride) *(ulong*)dst = v; break; }
+            case 16: { var v = Vector128.Load(src); for (int r = 0; r < rows; r++, dst += stride) v.Store(dst); break; }
+            case 32: { var v = Vector256.Load(src); for (int r = 0; r < rows; r++, dst += stride) v.Store(dst); break; }
+            case 64:
+            {
+                var v0 = Vector256.Load(src); var v1 = Vector256.Load(src + 32);
+                for (int r = 0; r < rows; r++, dst += stride) { v0.Store(dst); v1.Store(dst + 32); }
+                break;
+            }
+            default:
+                for (int r = 0; r < rows; r++, dst += stride)
+                    for (int c = 0; c < nbytes; c += 32) Vector256.Load(src + c).Store(dst + c);
+                break;
+        }
     }
 
     public static void HPredictor(byte* dst, nint stride, int bw, int bh, byte* left)
@@ -123,6 +143,22 @@ internal static unsafe class AomIntraPred
                     var v = Vector128.ConditionalSelect(useLeft, l, Vector128.ConditionalSelect(Vector128.LessThanOrEqual(pTop, pTopLeft), top, tl));
                     *(ulong*)(dst + c) = Sse2.PackUnsignedSaturate(v, v).AsUInt64().ToScalar();
                 }
+            }
+            return;
+        }
+        if (Sse41.IsSupported && bw == 4)
+        {
+            var tl = Vector128.Create((short)ytopLeft);
+            var top = Sse41.ConvertToVector128Int16(Vector128.CreateScalar(*(uint*)above).AsByte());
+            var pLeft = Vector128.Abs(top - tl);
+            for (int r = 0; r < bh; r++, dst += stride)
+            {
+                var l = Vector128.Create((short)left[r]);
+                var pTop = Vector128.Abs(l - tl);
+                var pTopLeft = Vector128.Abs(top + l - tl - tl);
+                var useLeft = Vector128.LessThanOrEqual(pLeft, pTop) & Vector128.LessThanOrEqual(pLeft, pTopLeft);
+                var v = Vector128.ConditionalSelect(useLeft, l, Vector128.ConditionalSelect(Vector128.LessThanOrEqual(pTop, pTopLeft), top, tl));
+                *(uint*)dst = Sse2.PackUnsignedSaturate(v, v).AsUInt32().ToScalar();
             }
             return;
         }
@@ -167,6 +203,23 @@ internal static unsafe class AomIntraPred
             }
             return;
         }
+        if (Sse41.IsSupported && bw == 4)
+        {
+            fixed (byte* ws = SmoothWeights)
+            {
+                var a = Sse41.ConvertToVector128Int32(above);
+                var ww = Sse41.ConvertToVector128Int32(ws);   // the 4-wide weights are SmoothWeights[0..4)
+                var colPart = (Vector128.Create(scale) - ww) * Vector128.Create(rightPred) + Vector128.Create(1 << (log2Scale - 1));
+                for (int r = 0; r < bh; ++r, dst += stride)
+                {
+                    int wh = smWeightsH[r];
+                    var v = Vector128.ShiftRightLogical(Vector128.Create(wh) * a + Vector128.Create((scale - wh) * belowPred) + ww * Vector128.Create((int)left[r]) + colPart, log2Scale);
+                    var w16 = Sse2.PackSignedSaturate(v, v);
+                    *(uint*)dst = Sse2.PackUnsignedSaturate(w16, w16).AsUInt32().ToScalar();
+                }
+            }
+            return;
+        }
         for (int r = 0; r < bh; ++r, dst += stride)
         {
             int wh = smWeightsH[r], l = left[r];
@@ -196,6 +249,18 @@ internal static unsafe class AomIntraPred
                 var b = Vector256.Create((scale - w) * belowPred) + rnd;
                 for (int c = 0; c < bw; c += 8)
                     StoreInt8(dst + c, Vector256.ShiftRightLogical(wV * Avx2.ConvertToVector256Int32(above + c) + b, log2Scale));
+            }
+            return;
+        }
+        if (Sse41.IsSupported && bw == 4)
+        {
+            var a = Sse41.ConvertToVector128Int32(above);
+            for (int r = 0; r < bh; r++, dst += stride)
+            {
+                int w = smWeights[r];
+                var v = Vector128.ShiftRightLogical(Vector128.Create(w) * a + Vector128.Create((scale - w) * belowPred + (1 << (log2Scale - 1))), log2Scale);
+                var w16 = Sse2.PackSignedSaturate(v, v);
+                *(uint*)dst = Sse2.PackUnsignedSaturate(w16, w16).AsUInt32().ToScalar();
             }
             return;
         }
@@ -233,6 +298,21 @@ internal static unsafe class AomIntraPred
                         var ww = Avx2.ConvertToVector256Int32(wW + c);
                         StoreInt8(dst + c, Vector256.ShiftRightLogical(ww * l + (sc - ww) * right + rnd, log2Scale));
                     }
+                }
+            }
+            return;
+        }
+        if (Sse41.IsSupported && bw == 4)
+        {
+            fixed (byte* ws = SmoothWeights)
+            {
+                var ww = Sse41.ConvertToVector128Int32(ws);
+                var colPart = (Vector128.Create(scale) - ww) * Vector128.Create(rightPred) + Vector128.Create(1 << (log2Scale - 1));
+                for (int r = 0; r < bh; r++, dst += stride)
+                {
+                    var v = Vector128.ShiftRightLogical(ww * Vector128.Create((int)left[r]) + colPart, log2Scale);
+                    var w16 = Sse2.PackSignedSaturate(v, v);
+                    *(uint*)dst = Sse2.PackUnsignedSaturate(w16, w16).AsUInt32().ToScalar();
                 }
             }
             return;

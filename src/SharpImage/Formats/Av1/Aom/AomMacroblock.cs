@@ -227,4 +227,9 @@ internal sealed partial class AomMacroblock
     public int[] DqcoeffBuf = new int[AomMbPlane.MaxSbSquare];
     public uint SourceVariance;
     public bool MustFindValidPartition;
+    // x->pixel_gradient_info / is_sb_gradient_cached (per plane type, MAX_SB_SQUARE each): |dx| + |dy| and the
+    // histogram bin (-1: dx == 0) of every superblock sample, for the HOG prune's gradient cache
+    public readonly ushort[] GradAbsSum = new ushort[2 * AomMbPlane.MaxSbSquare];
+    public readonly sbyte[] GradBin = new sbyte[2 * AomMbPlane.MaxSbSquare];
+    public readonly bool[] SbGradientCached = new bool[2];
 }

@@ -105,6 +105,8 @@ internal sealed partial class AomMbModeInfo
 internal struct AomBuf2d
 {
     public byte[] Buf;
+    /// <summary>The high bit depth samples (CONVERT_TO_SHORTPTR(buf)); null for 8-bit buffers (Buf is null for high bit depth ones).</summary>
+    public ushort[] Buf16;
     public int Offset, Stride, Width, Height;
 }
 

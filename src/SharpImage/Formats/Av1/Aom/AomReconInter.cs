@@ -50,11 +50,64 @@ internal static class AomReconInter
             posY = Math.Clamp(posY, -LeftTopMarginScaled(ssY), bottom);
             posX = Math.Clamp(posX, -LeftTopMarginScaled(ssX), right);
             int subpelX = (posX & SCALE_SUBPEL_MASK) >> SCALE_EXTRA_BITS, subpelY = (posY & SCALE_SUBPEL_MASK) >> SCALE_EXTRA_BITS;
-            byte[] buf = cur.Buffers[plane];
             int stride = cur.Strides[plane];
             int src = cur.Offsets[plane] + (posY >> SCALE_SUBPEL_BITS) * stride + (posX >> SCALE_SUBPEL_BITS);
             var dst = pd.Dst;
+            if (cur.Hbd)
+            {
+                ConvolveHbd(cur.Buffers16![plane], src, stride, dst.Buf16!, dst.Offset, dst.Stride, bw, bh, subpelX, subpelY, cur.BitDepth);
+                continue;
+            }
+            byte[] buf = cur.Buffers[plane];
             Convolve(buf, src, stride, dst.Buf, dst.Offset, dst.Stride, bw, bh, subpelX, subpelY);
+        }
+    }
+
+    /// <summary>av1_highbd_convolve_2d_facade with the intrabc filters (av1_highbd_convolve_{2d,x,y}_sr_intrabc_c,
+    /// av1_get_conv_params_no_round's round_0 / round_1 for bd) / aom_highbd_convolve_copy.</summary>
+    private static void ConvolveHbd(ushort[] s, int so, int ss, ushort[] d, int dOff, int ds, int w, int h, int subpelX, int subpelY, int bd)
+    {
+        const int FILTER_BITS = 7;
+        int round0 = 3, round1 = 2 * FILTER_BITS - 3;
+        int intbufrange = bd + FILTER_BITS - round0 + 2;
+        if (intbufrange > 16) { round0 += intbufrange - 16; round1 -= intbufrange - 16; }
+        int max = (1 << bd) - 1;
+        static int Rp2(int v, int n) => n == 0 ? v : (v + (1 << (n - 1))) >> n;
+        if (subpelX != 0 && subpelY != 0)
+        {
+            int bits = FILTER_BITS * 2 - round0 - round1;
+            var im = new short[(h + 1) * w];
+            for (int y = 0; y < h + 1; ++y)
+                for (int x = 0; x < w; ++x)
+                    im[y * w + x] = (short)Rp2((1 << (bd + FILTER_BITS - 1)) + 64 * (s[so + y * ss + x] + s[so + y * ss + x + 1]), round0);
+            int offsetBits = bd + 2 * FILTER_BITS - round0;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                {
+                    int sum = (1 << offsetBits) + 64 * (im[y * w + x] + im[(y + 1) * w + x]);
+                    int res = Rp2(sum, round1) - ((1 << (offsetBits - round1)) + (1 << (offsetBits - round1 - 1)));
+                    d[dOff + y * ds + x] = (ushort)Math.Clamp(Rp2(res, bits), 0, max);
+                }
+        }
+        else if (subpelX != 0)
+        {
+            int bits = FILTER_BITS - round0;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                {
+                    int res = Rp2(64 * (s[so + y * ss + x] + s[so + y * ss + x + 1]), round0);
+                    d[dOff + y * ds + x] = (ushort)Math.Clamp(Rp2(res, bits), 0, max);
+                }
+        }
+        else if (subpelY != 0)
+        {
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    d[dOff + y * ds + x] = (ushort)Math.Clamp((s[so + y * ss + x] + s[so + (y + 1) * ss + x] + 1) >> 1, 0, max);
+        }
+        else
+        {
+            for (int y = 0; y < h; ++y) Array.Copy(s, so + y * ss, d, dOff + y * ds, w);
         }
     }
 

@@ -213,8 +213,11 @@ internal static partial class AomCdef
     /// <summary>filter_block_8x8 (is_lowbd = 1): two rows of 8 per 256-bit vector. bh4: filter_block_4x4 (four rows of 4).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe void FilterBlockAvx2(byte* dst8, int dstride, short* inp, int priStrength, int secStrength, int dir,
-        int priDamping, int secDamping, int coeffShift, int height, bool w4, bool enablePrimary, bool enableSecondary)
+        int priDamping, int secDamping, int coeffShift, int height, bool w4, bool enablePrimary, bool enableSecondary,
+        bool hbd = false, ushort* dst16 = null)
     {
+        // hbd (is_lowbd = 0): the max skips the CDEF_VERY_LARGE padding by a compare (the byte max only works below 256)
+        // and the result is stored as 16 bits
         bool clippingRequired = enablePrimary && enableSecondary;
         var largeMask = Vector256.Create(unchecked((short)~VeryLarge));
         int po1 = Direction(dir, 0), po2 = Direction(dir, 1);
@@ -253,8 +256,15 @@ internal static partial class AomCdef
                 sum = Avx2.Add(sum, Avx2.MultiplyLow(priTap1, Avx2.Add(p0, p1)));
                 if (clippingRequired)
                 {
-                    var mu8 = Avx2.Max(Avx2.Max(t0.AsByte(), t1.AsByte()), Avx2.Max(t2.AsByte(), t3.AsByte()));
-                    max = Avx2.Max(max, Avx2.And(mu8.AsInt16(), largeMask));
+                    if (hbd)
+                    {
+                        max = MaxNotLarge(max, t0); max = MaxNotLarge(max, t1); max = MaxNotLarge(max, t2); max = MaxNotLarge(max, t3);
+                    }
+                    else
+                    {
+                        var mu8 = Avx2.Max(Avx2.Max(t0.AsByte(), t1.AsByte()), Avx2.Max(t2.AsByte(), t3.AsByte()));
+                        max = Avx2.Max(max, Avx2.And(mu8.AsInt16(), largeMask));
+                    }
                     min = Avx2.Min(min, t0);
                     min = Avx2.Min(min, t1);
                     min = Avx2.Min(min, t2);
@@ -283,9 +293,17 @@ internal static partial class AomCdef
                 sum = Avx2.Add(sum, Avx2.MultiplyLow(secTap1, Avx2.Add(Avx2.Add(p0, p1), Avx2.Add(p2, p3))));
                 if (clippingRequired)
                 {
-                    var mu8 = Avx2.Max(Avx2.Max(Avx2.Max(t0.AsByte(), t1.AsByte()), Avx2.Max(t2.AsByte(), t3.AsByte())),
-                        Avx2.Max(Avx2.Max(t4.AsByte(), t5.AsByte()), Avx2.Max(t6.AsByte(), t7.AsByte())));
-                    max = Avx2.Max(max, Avx2.And(mu8.AsInt16(), largeMask));
+                    if (hbd)
+                    {
+                        max = MaxNotLarge(max, t0); max = MaxNotLarge(max, t1); max = MaxNotLarge(max, t2); max = MaxNotLarge(max, t3);
+                        max = MaxNotLarge(max, t4); max = MaxNotLarge(max, t5); max = MaxNotLarge(max, t6); max = MaxNotLarge(max, t7);
+                    }
+                    else
+                    {
+                        var mu8 = Avx2.Max(Avx2.Max(Avx2.Max(t0.AsByte(), t1.AsByte()), Avx2.Max(t2.AsByte(), t3.AsByte())),
+                            Avx2.Max(Avx2.Max(t4.AsByte(), t5.AsByte()), Avx2.Max(t6.AsByte(), t7.AsByte())));
+                        max = Avx2.Max(max, Avx2.And(mu8.AsInt16(), largeMask));
+                    }
                     min = Avx2.Min(min, t0);
                     min = Avx2.Min(min, t1);
                     min = Avx2.Min(min, t2);
@@ -301,6 +319,23 @@ internal static partial class AomCdef
             var res = Avx2.ShiftRightArithmetic(Avx2.Add(sum, Vector256.Create((short)8)), 4);
             res = Avx2.Add(row, res);
             if (clippingRequired) res = Avx2.Min(Avx2.Max(res, min), max);
+            if (hbd)
+            {
+                if (w4)
+                {
+                    var q = res.AsUInt64();
+                    *(ulong*)(dst16 + i * dstride) = q.GetElement(0);
+                    *(ulong*)(dst16 + (i + 1) * dstride) = q.GetElement(1);
+                    *(ulong*)(dst16 + (i + 2) * dstride) = q.GetElement(2);
+                    *(ulong*)(dst16 + (i + 3) * dstride) = q.GetElement(3);
+                }
+                else
+                {
+                    res.GetLower().AsUInt16().Store(dst16 + i * dstride);
+                    res.GetUpper().AsUInt16().Store(dst16 + (i + 1) * dstride);
+                }
+                continue;
+            }
             var packed = Avx2.PackUnsignedSaturate(res, res).AsUInt64();   // lane k: its rows' bytes, twice
             if (w4)
             {
@@ -315,6 +350,33 @@ internal static partial class AomCdef
                 *(ulong*)(dst8 + i * dstride) = packed.GetElement(0);
                 *(ulong*)(dst8 + (i + 1) * dstride) = packed.GetElement(2);
             }
+        }
+    }
+
+    /// <summary>max(m, t) over the lanes of t that are not the CDEF_VERY_LARGE padding (is_lowbd = 0).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<short> MaxNotLarge(Vector256<short> m, Vector256<short> t)
+        => Avx2.Max(m, Avx2.AndNot(Avx2.CompareEqual(t, Vector256.Create((short)VeryLarge)), t));
+
+    /// <summary>cdef_filter_16_{0,1,2}_avx2 (high bit depth, 16-bit output); the copy case is the caller's.</summary>
+    internal static unsafe void FilterBlock16Avx2(ushort* dst16, int dstride, short* inp, int priStrength, int secStrength, int dir,
+        int priDamping, int secDamping, int coeffShift, int bw, int bh, bool enablePrimary, bool enableSecondary)
+    {
+        bool w4 = bw != 8;
+        if (enablePrimary && enableSecondary)
+        {
+            if (w4) FilterBlockAvx2(null, dstride, inp, priStrength, secStrength, dir, priDamping, secDamping, coeffShift, bh, true, true, true, true, dst16);
+            else FilterBlockAvx2(null, dstride, inp, priStrength, secStrength, dir, priDamping, secDamping, coeffShift, bh, false, true, true, true, dst16);
+        }
+        else if (enablePrimary)
+        {
+            if (w4) FilterBlockAvx2(null, dstride, inp, priStrength, secStrength, dir, priDamping, secDamping, coeffShift, bh, true, true, false, true, dst16);
+            else FilterBlockAvx2(null, dstride, inp, priStrength, secStrength, dir, priDamping, secDamping, coeffShift, bh, false, true, false, true, dst16);
+        }
+        else
+        {
+            if (w4) FilterBlockAvx2(null, dstride, inp, priStrength, secStrength, dir, priDamping, secDamping, coeffShift, bh, true, false, true, true, dst16);
+            else FilterBlockAvx2(null, dstride, inp, priStrength, secStrength, dir, priDamping, secDamping, coeffShift, bh, false, false, true, true, dst16);
         }
     }
 

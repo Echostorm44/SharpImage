@@ -344,6 +344,12 @@ public static class Av1InvTransform
         int sw, int sh, bool isRect2, int rnd, int shift, int pixelMax, int rowClipMin, int rowClipMax,
         int colClipMin, int colClipMax, int lw, int lh, int txtp0, int txtp1, bool preserveCoeffs) where TP : unmanaged
     {
+        if (w <= 8 && h <= 8)
+        {
+            InvTxfmAddSmallV(dst, dstStride, coeffs, w, h, isRect2, rnd, shift, pixelMax, rowClipMin, rowClipMax,
+                colClipMin, colClipMax, lw, lh, txtp0, txtp1, preserveCoeffs);
+            return;
+        }
         int wv = (w + 7) >> 3;                                    // 8-column groups
         Span<Vector256<int>> tmpS = stackalloc Vector256<int>[h * wv];   // row-major intermediate: row y, group gi
         ref Vector256<int> t0 = ref MemoryMarshal.GetReference(tmpS);
@@ -417,6 +423,57 @@ public static class Av1InvTransform
                         Unsafe.Add(ref row, x) = Px.T<TP>(Math.Clamp(Px.I(Unsafe.Add(ref row, x)) + add.GetElement(x), 0, pixelMax));
                 }
         }
+    }
+
+    /// <summary>InvTxfmAdd16V for the 4x4 / 4x8 / 8x4 / 8x8 sizes: the block in one set of 8 vectors (rows of 4 in the
+    /// low lanes, zeros above), one 8 x 8 transpose between the passes; the same lane arithmetic.</summary>
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    private static void InvTxfmAddSmallV<TP>(Span<TP> dst, int dstStride, Span<int> coeffs, int w, int h, bool isRect2, int rnd,
+        int shift, int pixelMax, int rowClipMin, int rowClipMax, int colClipMin, int colClipMax, int lw, int lh, int txtp0, int txtp1,
+        bool preserveCoeffs) where TP : unmanaged
+    {
+        if (coeffs.Length < w * h) throw new ArgumentException("coefficients");
+        Unsafe.SkipInit(out StackArr8<Vector256<int>> vS);
+        Span<Vector256<int>> v = vS;
+        ref Vector256<int> v0 = ref vS[0];
+        ref int c0 = ref MemoryMarshal.GetReference(coeffs);
+        var zero = Vector256<int>.Zero;
+        for (int x = 0; x < w; x++)
+        {
+            ref int p = ref Unsafe.Add(ref c0, x * h);
+            Vector256<int> c;
+            if (h == 8) { c = Vector256.LoadUnsafe(ref p); if (!preserveCoeffs) zero.StoreUnsafe(ref p); }
+            else { c = Vector256.Create(Vector128.LoadUnsafe(ref p), Vector128<int>.Zero); if (!preserveCoeffs) Vector128<int>.Zero.StoreUnsafe(ref p); }
+            if (isRect2) c = Vector256.ShiftRightArithmetic(c * 181 + Vector256.Create(128), 8);
+            Unsafe.Add(ref v0, x) = c;
+        }
+        if (w == 4) { Unsafe.Add(ref v0, 4) = zero; Unsafe.Add(ref v0, 5) = zero; Unsafe.Add(ref v0, 6) = zero; Unsafe.Add(ref v0, 7) = zero; }
+        var cmin = Vector256.Create(colClipMin); var cmax = Vector256.Create(colClipMax);
+        Av1InvTransformV.Apply1d(v, 1, Vector256.Create(rowClipMin), Vector256.Create(rowClipMax), lw, txtp0);
+        var rndV = Vector256.Create(rnd);
+        for (int x = 0; x < w; x++)
+            Unsafe.Add(ref v0, x) = Vector256.Min(Vector256.Max(Vector256.ShiftRightArithmetic(Unsafe.Add(ref v0, x) + rndV, shift), cmin), cmax);
+        if (w == 4) { Unsafe.Add(ref v0, 4) = zero; Unsafe.Add(ref v0, 5) = zero; Unsafe.Add(ref v0, 6) = zero; Unsafe.Add(ref v0, 7) = zero; }
+        Transpose8(ref v0);
+        Av1InvTransformV.Apply1d(v, 1, cmin, cmax, lh, txtp1);
+        var eight = Vector256.Create(8);
+        var pmax = Vector256.Create(pixelMax);
+        ref TP d0 = ref MemoryMarshal.GetReference(dst);
+        if (w == 8)
+            for (int y = 0; y < h; y++)
+            {
+                var add = Vector256.ShiftRightArithmetic(Unsafe.Add(ref v0, y) + eight, 4);
+                ref TP row = ref Unsafe.Add(ref d0, y * dstStride);
+                Px.Store8x32(ref row, Vector256.Min(Vector256.Max(Px.Load8x32(ref row) + add, zero), pmax));
+            }
+        else
+            for (int y = 0; y < h; y++)
+            {
+                var add = Vector256.ShiftRightArithmetic(Unsafe.Add(ref v0, y) + eight, 4);
+                ref TP row = ref Unsafe.Add(ref d0, y * dstStride);
+                for (int x = 0; x < 4; x++)
+                    Unsafe.Add(ref row, x) = Px.T<TP>(Math.Clamp(Px.I(Unsafe.Add(ref row, x)) + add.GetElement(x), 0, pixelMax));
+            }
     }
 
     // 8 x 8 transpose of the 32-bit lanes of r[0..7] (in place)

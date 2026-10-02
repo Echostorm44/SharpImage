@@ -80,6 +80,31 @@ internal static class AomHashMotion
     /// <summary>get_identity_hash_value.</summary>
     private static uint IdentityHash(byte a, byte b, byte c, byte d) => ((uint)a << 24) + ((uint)b << 16) + ((uint)c << 8) + d;
 
+    /// <summary>get_xor_hash_value_hbd.</summary>
+    private static uint XorHashHbd(ushort a, ushort b, ushort c, ushort d)
+    {
+        uint result = ((uint)(a & 0x00ff) << 24) + ((uint)(b & 0x00ff) << 16) + ((uint)(c & 0x00ff) << 8) + (uint)(d & 0x00ff);
+        result ^= ((uint)(a & 0xff00) << 16) + ((uint)(b & 0xff00) << 8) + (uint)(c & 0xff00) + ((uint)(d & 0xff00) >> 8);
+        return result;
+    }
+
+    /// <summary>av1_generate_block_2x2_hash_value (high bit depth) over the luma crop.</summary>
+    public static void GenerateBlock2x2HashValue(ushort[] y, int yOff, int stride, int cropW, int cropH, uint[] picBlockHash)
+    {
+        int xEnd = cropW - 2 + 1, yEnd = cropH - 2 + 1;
+        int pos = 0;
+        for (int yPos = 0; yPos < yEnd; yPos++)
+        {
+            for (int xPos = 0; xPos < xEnd; xPos++)
+            {
+                int p = yOff + yPos * stride + xPos;
+                picBlockHash[pos] = XorHashHbd(y[p], y[p + 1], y[p + stride], y[p + stride + 1]);
+                pos++;
+            }
+            pos += 2 - 1;
+        }
+    }
+
     /// <summary>av1_generate_block_2x2_hash_value (8-bit) over the luma crop.</summary>
     public static void GenerateBlock2x2HashValue(byte[] y, int yOff, int stride, int cropW, int cropH, uint[] picBlockHash)
     {
@@ -155,7 +180,8 @@ internal static class AomHashMotion
         var info = new AomIntrabcHashInfo();
         int picWidth = source.CropWidths[0], picHeight = source.CropHeights[0];
         var buf = new[] { new uint[picWidth * picHeight], new uint[picWidth * picHeight] };
-        GenerateBlock2x2HashValue(source.Buffers[0], source.Offsets[0], source.Strides[0], picWidth, picHeight, buf[0]);
+        if (source.Hbd) GenerateBlock2x2HashValue(source.Buffers16![0], source.Offsets[0], source.Strides[0], picWidth, picHeight, buf[0]);
+        else GenerateBlock2x2HashValue(source.Buffers[0], source.Offsets[0], source.Strides[0], picWidth, picHeight, buf[0]);
         int maxSbSize = 1 << (mibSizeLog2 + 2);
         if (hashMax8x8) maxSbSize = Math.Min(8, maxSbSize);
         int srcIdx = 0;
@@ -169,7 +195,7 @@ internal static class AomHashMotion
     }
 
     /// <summary>av1_get_block_hash_value (8-bit) of a square block.</summary>
-    public static void GetBlockHashValue(AomIntrabcHashInfo info, byte[] y, int off, int stride, int blockSize, out uint hashValue1,
+    public static void GetBlockHashValue(AomIntrabcHashInfo info, byte[]? y, ushort[]? y16, int off, int stride, int blockSize, out uint hashValue1,
         out uint hashValue2)
     {
         int addValue = HashBlockSizeToIndex(blockSize) << AomIntrabcHashInfo.SrcBits;
@@ -181,7 +207,8 @@ internal static class AomHashMotion
             {
                 int pos = (yPos >> 1) * subBlockInWidth + (xPos >> 1);
                 int p = off + yPos * stride + xPos;
-                buf[0][pos] = IdentityHash(y[p], y[p + 1], y[p + stride], y[p + stride + 1]);
+                buf[0][pos] = y16 != null ? XorHashHbd(y16[p], y16[p + 1], y16[p + stride], y16[p + stride + 1])
+                    : IdentityHash(y![p], y[p + 1], y[p + stride], y[p + stride + 1]);
             }
         int srcSubBlockInWidth = subBlockInWidth;
         subBlockInWidth >>= 1;

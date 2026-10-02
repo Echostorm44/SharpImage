@@ -67,7 +67,7 @@ internal static unsafe partial class AomReconIntra
     {
         int maxBaseY = bw + bh - 1;
         byte fill = left[maxBaseY];
-        byte* t = stackalloc byte[64 * 64];   // column c at t + c * 64
+        Unsafe.SkipInit(out StackArr4096<byte> tSA); byte* t = (byte*)Unsafe.AsPointer(ref tSA[0]);   // column c at t + c * 64
         int y = dy;
         for (int c = 0; c < bw; ++c, y += dy)
         {
@@ -117,6 +117,102 @@ internal static unsafe partial class AomReconIntra
                 else Unsafe.CopyBlockUnaligned(dst + c, &b8, (uint)cnt);
             }
             if (c0 < bw) DrRun(dst + c0, above + baseOff + c0, bw - c0, bw - c0, (t & 0x3F) >> 1, 0);
+        }
+    }
+
+    // (a * (32 - shift) + b * shift + 16) >> 5 per lane from 8 gathered edge pairs (the low two bytes of each lane)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<int> DrInterp(byte* edge, Vector256<int> idx, Vector256<int> shift)
+    {
+        var g = Avx2.GatherVector256((int*)edge, idx, 1);
+        var e0 = g & Vector256.Create(0xFF);
+        var e1 = Vector256.ShiftRightLogical(g, 8) & Vector256.Create(0xFF);
+        return Vector256.ShiftRightLogical(e0 * (Vector256.Create(32) - shift) + e1 * shift + Vector256.Create(16), 5);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StoreLanes(byte* dst, Vector256<int> v, int n)
+    {
+        var w16 = Sse2.PackSignedSaturate(v.GetLower(), v.GetUpper());
+        var b8 = Sse2.PackUnsignedSaturate(w16, w16);
+        if (n == 8) *(ulong*)dst = b8.AsUInt64().ToScalar();
+        else *(uint*)dst = b8.AsUInt32().ToScalar();
+    }
+
+    /// <summary>Zone 1 with an upsampled above edge (bw, bh &lt;= 8 there), lane per column: DrPredictionZ1's samples.</summary>
+    internal static void DrPredictionZ1UpSimd(byte* dst, nint stride, int bw, int bh, byte* above, int dx)
+    {
+        const int upsampleAbove = 1;
+        int maxBaseX = ((bw + bh) - 1) << upsampleAbove;
+        const int fracBits = 6 - upsampleAbove;
+        byte fill = above[maxBaseX];
+        var fillV = Vector256.Create((int)fill);
+        int x = dx;
+        for (int r = 0; r < bh; ++r, dst += stride, x += dx)
+        {
+            int b = x >> fracBits;
+            int valid = (maxBaseX - b) >> upsampleAbove;
+            if (valid <= 0)
+            {
+                for (int i = r; i < bh; ++i, dst += stride) Unsafe.InitBlockUnaligned(dst, fill, (uint)bw);
+                return;
+            }
+            int shift = ((x << upsampleAbove) & 0x3F) >> 1;
+            // lanes past min(valid, bw) take the fill; their (clamped) edge reads are discarded
+            var idx = Vector256.Min(Vector256.Create(b) + Lane8 * 2, Vector256.Create(maxBaseX));
+            var v = DrInterp(above, idx, Vector256.Create(shift));
+            v = Vector256.ConditionalSelect(Vector256.LessThan(Lane8, Vector256.Create(valid)), v, fillV);
+            StoreLanes(dst, v, bw);
+        }
+    }
+
+    /// <summary>Zone 3 with an upsampled left edge (bw, bh &lt;= 8): zone 1 down the left edge per column, transposed.</summary>
+    internal static void DrPredictionZ3UpSimd(byte* dst, nint stride, int bw, int bh, byte* left, int dy)
+    {
+        const int upsampleLeft = 1;
+        int maxBaseY = (bw + bh - 1) << upsampleLeft;
+        const int fracBits = 6 - upsampleLeft;
+        byte fill = left[maxBaseY];
+        var fillV = Vector256.Create((int)fill);
+        Unsafe.SkipInit(out StackArr8<ulong> tSA); ulong* t = (ulong*)Unsafe.AsPointer(ref tSA[0]);   // column c's rows at t[c]
+        int y = dy;
+        for (int c = 0; c < bw; ++c, y += dy)
+        {
+            int b = y >> fracBits;
+            int valid = (maxBaseY - b) >> upsampleLeft;
+            int shift = ((y << upsampleLeft) & 0x3F) >> 1;
+            var idx = Vector256.Min(Vector256.Max(Vector256.Create(b) + Lane8 * 2, Vector256<int>.Zero), Vector256.Create(maxBaseY));
+            var v = valid <= 0 ? fillV : Vector256.ConditionalSelect(Vector256.LessThan(Lane8, Vector256.Create(valid)), DrInterp(left, idx, Vector256.Create(shift)), fillV);
+            var w16 = Sse2.PackSignedSaturate(v.GetLower(), v.GetUpper());
+            t[c] = Sse2.PackUnsignedSaturate(w16, w16).AsUInt64().ToScalar();
+        }
+        byte* tb = (byte*)t;
+        for (int r = 0; r < bh; ++r, dst += stride)
+            for (int c = 0; c < bw; ++c) dst[c] = tb[c * 8 + r];
+    }
+
+    /// <summary>Zone 2 with either edge upsampled (bw &lt;= 8): per lane the above sample when its base reaches the above
+    /// edge, else the left one, as av1_dr_prediction_z2_c.</summary>
+    internal static void DrPredictionZ2UpSimd(byte* dst, nint stride, int bw, int bh, byte* above, byte* left,
+        int upsampleAbove, int upsampleLeft, int dx, int dy)
+    {
+        int minBaseX = -(1 << upsampleAbove);
+        int fracBitsX = 6 - upsampleAbove, fracBitsY = 6 - upsampleLeft;
+        var c6 = Lane8 * 64;            // c << 6
+        var c1dy = (Lane8 + Vector256.Create(1)) * Vector256.Create(dy);
+        var m3f = Vector256.Create(0x3F);
+        for (int r = 0; r < bh; ++r, dst += stride)
+        {
+            var xv = c6 - Vector256.Create((r + 1) * dx);
+            var baseX = Vector256.ShiftRightArithmetic(xv, fracBitsX);
+            var useAbove = Vector256.GreaterThanOrEqual(baseX, Vector256.Create(minBaseX));
+            var sA = Vector256.ShiftRightLogical(Vector256.ShiftLeft(xv, upsampleAbove) & m3f, 1);
+            var a = DrInterp(above, Vector256.Max(baseX, Vector256.Create(minBaseX)), sA);
+            var yv = Vector256.Create(r << 6) - c1dy;
+            var baseY = Vector256.ShiftRightArithmetic(yv, fracBitsY);
+            var sL = Vector256.ShiftRightLogical(Vector256.ShiftLeft(yv, upsampleLeft) & m3f, 1);
+            var l = DrInterp(left, Vector256.Max(baseY, Vector256.Create(-2)), sL);
+            StoreLanes(dst, Vector256.ConditionalSelect(useAbove, a, l), bw);
         }
     }
 

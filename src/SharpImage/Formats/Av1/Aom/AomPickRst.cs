@@ -72,7 +72,7 @@ internal sealed class AomRstPickConfig
 /// projection search, switchable, the rd costs with the delta-coded reference parameters per tile). The AVX2 kernels
 /// libaom dispatches (av1_compute_stats, av1_calc_proj_params, av1_lowbd_pixel_proj_error, av1_selfguided_restoration)
 /// are exact integer computations equal to the C ones ported here (twin-verified).</summary>
-internal sealed class AomPickRst
+internal sealed partial class AomPickRst
 {
     private const int NumWienerIters = 5;
     private const double DualSgrPenaltyMult = 0.01, WienerSgrPenaltyMult = 0.005;
@@ -1524,8 +1524,11 @@ internal sealed class AomPickRst
         int reducedWienerWin = wienerWin;
         if (_cfg.ReduceWienerWindowSize != 0) reducedWienerWin = _plane == 0 ? WienerWinReduced : WienerWinChroma;
 
-        ComputeStats(reducedWienerWin, _dgdPlane, _srcPlane, limits.HStart, limits.HEnd, limits.VStart, limits.VEnd, _m,
-            _h, _cfg.UseDownsampledWienerStats);
+        if (_dgdPlane.Buf16 != null)
+            ComputeStatsHbd(reducedWienerWin, _dgdPlane, _srcPlane, limits.HStart, limits.HEnd, limits.VStart, limits.VEnd, _m, _h, _cfg.BitDepth);
+        else
+            ComputeStats(reducedWienerWin, _dgdPlane, _srcPlane, limits.HStart, limits.HEnd, limits.VStart, limits.VEnd, _m,
+                _h, _cfg.UseDownsampledWienerStats);
         var vfilter = new int[WienerWin];
         var hfilter = new int[WienerWin];
         WienerDecomposeSepSym(reducedWienerWin, _m, _h, vfilter, hfilter);
@@ -1578,6 +1581,12 @@ internal sealed class AomPickRst
         }
         bool isUv = _plane > 0;
         int ssX = isUv ? _dgd.SsX : 0, ssY = isUv ? _dgd.SsY : 0;
+        if (_dgdPlane.Buf16 != null)
+            rusi.Sgrproj = SearchSelfguidedHbd(_dgdPlane.Buf16, _dgdPlane.At(limits.HStart, limits.VStart),
+                limits.HEnd - limits.HStart, limits.VEnd - limits.VStart, _dgdPlane.Stride, _srcPlane.Buf16,
+                _srcPlane.At(limits.HStart, limits.VStart), _srcPlane.Stride, RestorationProcUnitSize >> ssX,
+                RestorationProcUnitSize >> ssY, _rstBuf0, _rstBuf1, _cfg.EnableSgrEpPruning, _sc.Sgr, _cfg.BitDepth);
+        else
         rusi.Sgrproj = SearchSelfguided(_dgdPlane.Buf, _dgdPlane.At(limits.HStart, limits.VStart),
             limits.HEnd - limits.HStart, limits.VEnd - limits.VStart, _dgdPlane.Stride, _srcPlane.Buf,
             _srcPlane.At(limits.HStart, limits.VStart), _srcPlane.Stride, RestorationProcUnitSize >> ssX,

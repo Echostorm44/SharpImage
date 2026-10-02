@@ -276,6 +276,68 @@ internal static partial class AomMl
         return s2;
     }
 
+    // get_var (tx_search.c)
+    private static float GetVar(float mean, double x2Sum, int num)
+    {
+        float eX2 = (float)(x2Sum / num);
+        return eX2 - mean * mean;
+    }
+
+    /// <summary>get_blk_var_dev (tx_search.c): the deviation of the means and the variance of the variances of the
+    /// block and its halves / quarters.</summary>
+    internal static void GetBlkVarDev(ReadOnlySpan<short> data, int stride, int bw, int bh, ref float devOfMean, ref float varOfVars)
+    {
+        int subh = bh >= bw ? bh >> 1 : bh;
+        int subw = bw >= bh ? bw >> 1 : bw;
+        int num = bw * bh, subNum = subw * subh;
+        int totalXSum = 0;
+        long totalX2Sum = 0;
+        int blkIdx = 0;
+        float varSum = 0.0f, meanSum = 0.0f;
+        double var2Sum = 0.0f, mean2Sum = 0.0f;
+        for (int row = 0; row < bh; row += subh)
+            for (int col = 0; col < bw; col += subw)
+            {
+                GetBlkSseSum(data[(row * stride + col)..], stride, subw, subh, out int xSum, out long x2Sum);
+                totalXSum += xSum;
+                totalX2Sum += x2Sum;
+                float mean = (float)xSum / subNum;
+                float var = GetVar(mean, x2Sum, subNum);
+                meanSum += mean;
+                mean2Sum += (double)(mean * mean);
+                varSum += var;
+                var2Sum += var * var;
+                blkIdx++;
+            }
+        float lvl0Mean = (float)totalXSum / num;
+        float blockVar = GetVar(lvl0Mean, totalX2Sum, num);
+        meanSum += lvl0Mean;
+        mean2Sum += (double)(lvl0Mean * lvl0Mean);
+        varSum += blockVar;
+        var2Sum += blockVar * blockVar;
+        float avMean = meanSum / 5;
+        if (blkIdx > 1)
+        {
+            devOfMean = GetDev(avMean, mean2Sum, blkIdx + 1);
+            float meanVar = varSum / (blkIdx + 1);
+            varOfVars = GetVar(meanVar, var2Sum, blkIdx + 1);
+        }
+    }
+
+    private static readonly int[] NoSplitThreshScales = { 0, 24, 8, 8 }, SplitThreshScales = { 0, 24, 10, 8 };
+
+    /// <summary>prune_tx_split_no_split (tx_search.c).</summary>
+    internal static void PruneTxSplitNoSplit(ReadOnlySpan<short> diff, int diffStride, int bw, int bh, int dequantDc, int dequantAc,
+        ref bool tryNoSplit, ref bool trySplit, int pruningLevel)
+    {
+        float devOfMeans = 0.0f, varOfVars = 0.0f;
+        GetBlkVarDev(diff, diffStride, bw, bh, ref devOfMeans, ref varOfVars);
+        int dcQ = dequantDc >> 3, acQ = dequantAc >> 3;
+        int noSplitThreshScale = NoSplitThreshScales[pruningLevel], splitThreshScale = SplitThreshScales[pruningLevel];
+        if (devOfMeans <= dcQ && splitThreshScale * varOfVars <= acQ * acQ) trySplit = false;
+        if (devOfMeans > noSplitThreshScale * dcQ && varOfVars > noSplitThreshScale * acQ * acQ) tryNoSplit = false;
+    }
+
     // get_dev (tx_search.c)
     private static float GetDev(float mean, double x2Sum, int num)
     {

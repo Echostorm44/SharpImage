@@ -115,6 +115,7 @@ internal struct AomTxbCtx
 // Port of libaom av1/common/txb_common.{h,c}, av1/encoder/encodetxb.c (the level map, contexts, eob tokens, entropy
 // context) and av1/encoder/txb_rdopt.{c,h} (av1_cost_coeffs_txb, av1_cost_coeffs_txb_laplacian, av1_optimize_txb).
 // Coefficient arrays in libaom's layout: index = col * height + row (column-major, height = the adjusted tx's).
+[System.Runtime.CompilerServices.SkipLocalsInit]
 internal static class AomTxb
 {
     internal const int NumBaseLevels = 2, CoeffBaseRange = 12, MaxBaseBrRange = CoeffBaseRange + NumBaseLevels + 1;
@@ -213,11 +214,17 @@ internal static class AomTxb
             }
             return;
         }
-        int ls = 0;
-        for (int i = 0; i < width; i++)
+        // height 4: two columns (8 coefficients) per vector, each column's 4 levels followed by its 4 pad zeros
+        if ((uint)(width * 4) > (uint)coeff.Length || (uint)(width * 8) > (uint)levels.Length) throw new ArgumentException("levels buffer");
+        var zero = Vector256<int>.Zero;
+        for (int i = 0; i < width; i += 2)
         {
-            for (int j = 0; j < height; j++) levels[ls++] = (byte)Math.Min(Math.Abs(coeff[i * height + j]), 127);
-            for (int j = 0; j < TxPadHor; j++) levels[ls++] = 0;
+            var a = Vector256.Min(Vector256.Abs(Vector256.LoadUnsafe(ref c0, (nuint)(i * 4))), max);
+            // lanes 0-3 -> bytes 0-3, lanes 4-7 -> bytes 8-11 (pads zero)
+            var s16 = System.Runtime.Intrinsics.X86.Avx2.PackSignedSaturate(a, zero);                    // per 128-bit half: 4 shorts, 4 zeros
+            var s8 = System.Runtime.Intrinsics.X86.Avx2.PackUnsignedSaturate(s16, Vector256<short>.Zero); // per half: 4 bytes, 12 zeros
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref l0, i * 8), s8.AsUInt64().GetElement(0));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref l0, i * 8 + 8), s8.AsUInt64().GetElement(2));
         }
     }
 
@@ -383,8 +390,10 @@ internal static class AomTxb
         if (eob == 0) return coeffCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 1];
         int txClass = TxTypeToClass[txType];
         int bhl = TxbBhl(txSize), width = TxbWide(txSize), height = TxbHigh(txSize);
-        Span<byte> levels = stackalloc byte[TxPad2d];
-        Span<sbyte> coeffContexts = stackalloc sbyte[32 * 32];
+        Unsafe.SkipInit(out LevelsBuf levelsBuf);
+        Span<byte> levels = levelsBuf;
+        Unsafe.SkipInit(out StackArr1024<sbyte> ctxBuf);
+        Span<sbyte> coeffContexts = ctxBuf;
         var eobCosts = costs.GetEob(TxsizeLog2Minus4[txSize], planeType);
         int cost = coeffCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 0];
         if (eob > 1) InitLevels(qcoeff, width, height, levels);
@@ -423,7 +432,7 @@ internal static class AomTxb
             int coeffCtx = coeffContexts[pos];
             int v = qcoeff[pos];
             if (v == 0) { cost += coeffCosts.Base[coeffCtx * 8]; continue; }
-            int level = Math.Abs(v);
+            int level = AbsI(v);
             cost += coeffCosts.Base[coeffCtx * 8 + Math.Min(level, 3)];
             cost += AomCost.CostLiteral(1);
             if (level > NumBaseLevels)
@@ -488,8 +497,8 @@ internal static class AomTxb
         // av1_cost_coeffs_txb_estimate
         int est = 0;
         int c = eob - 1;
-        est += (Math.Abs(qcoeff[scan[c]]) - 1) << (AomCost.ProbCostShift + 2);
-        for (c = eob - 2; c >= 0; c--) est += CostLut[Math.Min(Math.Abs(qcoeff[scan[c]]), 14)];
+        est += (AbsI(qcoeff[scan[c]]) - 1) << (AomCost.ProbCostShift + 2);
+        for (c = eob - 2; c >= 0; c--) est += CostLut[Math.Min(AbsI(qcoeff[scan[c]]), 14)];
         est += (ConstTerm + LogePar) * (eob - 1);
         return cost + est;
     }
@@ -498,6 +507,7 @@ internal static class AomTxb
     /// the transform coefficients). rdmult: x->rdmult; txTypeCost: get_tx_type_cost. Returns the new eob; rate: the
     /// block's coded bits (1/512).</summary>
     [SkipLocalsInit]   // libaom's levels_buf / coeff_contexts are uninitialized stack arrays filled before use
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int OptimizeTxb(AomCoeffCosts costs, int txSize, int txType, int planeType, bool isInter, AomTxbCtx txbCtx,
         ReadOnlySpan<int> tcoeff, Span<int> qcoeff, Span<int> dqcoeff, int eob, short dequant0, short dequant1,
         int rdmultIn, int bitDepth, int sharpness, bool useChromaTrellisRdMult, bool tuneIq, int txTypeCost,
@@ -517,7 +527,8 @@ internal static class AomTxb
         var trellisRdMult = useChromaTrellisRdMult ? PlaneRdMultChroma : PlaneRdMult;
         long rdmult = (((long)rdmultIn * (8 - sharpness) * (trellisRdMult[(isInter ? 2 : 0) + planeType] << (2 * (bitDepth - 8)))) + (1L << (rshift - 1))) >> rshift;
 
-        Span<byte> levels = stackalloc byte[TxPad2d];
+        Unsafe.SkipInit(out LevelsBuf levelsBuf);   // a struct local, not stackalloc: keeps the method tier-able (OSR / PGO)
+        Span<byte> levels = levelsBuf;
         if (eob > 1) InitLevels(qcoeff, width, height, levels);
         var t = new Trellis
         {
@@ -538,11 +549,12 @@ internal static class AomTxb
         int si = eob - 1;
         int ci = scan[si];
         int qc = qcoeff[ci];
-        int absQc = Math.Abs(qc);
+        int absQc = AbsI(qc);
         int sign = qc < 0 ? 1 : 0;
         const int maxNzNum = 2;
         int nzNum = 1;
-        Span<int> nzCi = stackalloc int[3];
+        Unsafe.SkipInit(out NzBuf nzBuf);
+        Span<int> nzCi = nzBuf;
         nzCi[0] = ci; nzCi[1] = 0; nzCi[2] = 0;
         if (absQc >= 2)
         {
@@ -559,8 +571,7 @@ internal static class AomTxb
         }
         // update_coeff_eob_facade
         ref int nz0 = ref MemoryMarshal.GetReference(nzCi);
-        for (; si >= 0 && nzNum <= maxNzNum; --si)
-            UpdateCoeffEob(ref t, ref accuRate, ref accuDist, ref eob, ref nzNum, ref nz0, si);
+        si = UpdateCoeffEobLoop(ref t, ref accuRate, ref accuDist, ref eob, ref nzNum, ref nz0, si, maxNzNum);
         if (si == -1 && nzNum <= maxNzNum && sharpness == 0)
         {
             // update_skip
@@ -574,7 +585,7 @@ internal static class AomTxb
             }
         }
         // update_coeff_simple_facade
-        for (; si >= 1; --si) UpdateCoeffSimple(ref t, ref accuRate, si);
+        if (si >= 1) si = UpdateCoeffSimpleLoop(ref t, ref accuRate, si);
         if (si == 0)
         {
             long dummyDist = 0;
@@ -584,6 +595,9 @@ internal static class AomTxb
         rateCost = accuRate;
         return eob;
     }
+
+    [InlineArray(TxPad2d)] private struct LevelsBuf { private byte e; }
+    [InlineArray(3)] private struct NzBuf { private int e; }
 
     /// <summary>The trellis's per-block state (av1_optimize_txb's locals and arguments), passed to the per-coefficient
     /// updates by reference: unchecked views of the block's coefficients, levels, scan and cost tables.</summary>
@@ -727,7 +741,7 @@ internal static class AomTxb
         int coeffCtx = isLast ? LowerLevelsCtxEob(t.Bhl, t.Width, si) : LowerLevelsCtx(ref t, ci);
         if (qc == 0) { accuRate += Unsafe.Add(ref t.Base, coeffCtx * 8); return; }
         int sign = qc < 0 ? 1 : 0;
-        int absQc = Math.Abs(qc);
+        int absQc = AbsI(qc);
         int tqc = Unsafe.Add(ref t.Tcoeff, ci), dqc = Unsafe.Add(ref t.Dqcoeff, ci);
         int rate = isLast ? CoeffCostEob(ref t, ci, absQc, sign, coeffCtx) : CoeffCostNotLast(ref t, ci, absQc, sign, coeffCtx);
         int qcLow = 0, dqcLow = 0, absQcLow = 0, rateLow;
@@ -758,62 +772,326 @@ internal static class AomTxb
         }
     }
 
-    /// <summary>update_coeff_simple.</summary>
-    private static void UpdateCoeffSimple(ref Trellis t, ref int accuRate, int si)
+    /// <summary>update_coeff_simple_facade's loop: update_coeff_simple for si down to 1 (returns 0). The trellis state is
+    /// read into locals once, so the per-coefficient body works on registers rather than on the address-taken struct.</summary>
+    private static int UpdateCoeffSimpleLoop(ref Trellis t, ref int accuRateRef, int si)
     {
-        int ci = Unsafe.Add(ref t.Scan, si);
-        int qc = Unsafe.Add(ref t.Qcoeff, ci);
-        int coeffCtx = LowerLevelsCtx(ref t, ci);
-        if (qc == 0) { accuRate += Unsafe.Add(ref t.Base, coeffCtx * 8); return; }
-        int absQc = Math.Abs(qc), absTqc = Math.Abs(Unsafe.Add(ref t.Tcoeff, ci)), absDqc = Math.Abs(Unsafe.Add(ref t.Dqcoeff, ci));
-        int shift = t.Shift;
-        if (absQc == 1)
+        ref ushort scan = ref t.Scan;
+        ref int qcoeff = ref t.Qcoeff, tcoeff = ref t.Tcoeff, dqcoeff = ref t.Dqcoeff;
+        ref byte levels = ref t.Levels;
+        ref int baseCost = ref t.Base, lps = ref t.Lps;
+        ref sbyte nzOffset = ref t.NzOffset;
+        ref int off1d = ref MemoryMarshal.GetArrayDataReference(NzMapCtxOffset1d);
+        ref int golBits = ref MemoryMarshal.GetArrayDataReference(GolombBitsCost);
+        ref int golDiff = ref MemoryMarshal.GetArrayDataReference(GolombCostDiff);
+        int bhl = t.Bhl, txClass = t.TxClass, shift = t.Shift, sharpness = t.Sharpness;
+        int stride = (1 << bhl) + TxPadHor;
+        long rdmult = t.Rdmult;
+        bool plain = t.Iqm == null && t.Qm == null;
+        int dq1 = t.Dq1;
+        int accuRate = accuRateRef;
+        for (; si >= 1; --si)
         {
-            int rate = Unsafe.Add(ref t.Base, coeffCtx * 8 + 1) + AomCost.CostLiteral(1);
-            if (absDqc < absTqc) { accuRate += rate; return; }
-            if (t.Sharpness == 0)
+            int ci = Unsafe.Add(ref scan, si);
+            int qc = Unsafe.Add(ref qcoeff, ci);
+            // get_lower_levels_ctx (ci > 0 here)
+            int col = ci >> bhl;
+            ref byte l = ref Unsafe.Add(ref levels, ci + (col << TxPadHorLog2));
+            int mag = ClipMax3(Unsafe.Add(ref l, stride)) + ClipMax3(Unsafe.Add(ref l, 1));
+            int coeffCtx;
+            if (txClass == TX_CLASS_2D)
             {
-                long distDiff0 = DistDiff(ref t, absTqc, absDqc, ci);
-                int rateLow = rate - Unsafe.Add(ref t.Base, coeffCtx * 8 + 5);
-                long rd = AomRd.RdCost64(t.Rdmult, rate, distDiff0);
-                long rdLow = AomRd.RdCost64(t.Rdmult, rateLow, 0);
-                if (rdLow < rd)
+                mag += ClipMax3(Unsafe.Add(ref l, stride + 1)) + ClipMax3(Unsafe.Add(ref l, 2 * stride)) + ClipMax3(Unsafe.Add(ref l, 2));
+                coeffCtx = Math.Min((mag + 1) >> 1, 4) + Unsafe.Add(ref nzOffset, ci);
+            }
+            else if (txClass == TX_CLASS_VERT)
+            {
+                mag += ClipMax3(Unsafe.Add(ref l, 2)) + ClipMax3(Unsafe.Add(ref l, 3)) + ClipMax3(Unsafe.Add(ref l, 4));
+                coeffCtx = Math.Min((mag + 1) >> 1, 4) + Unsafe.Add(ref off1d, ci - (col << bhl));
+            }
+            else
+            {
+                mag += ClipMax3(Unsafe.Add(ref l, 2 * stride)) + ClipMax3(Unsafe.Add(ref l, 3 * stride)) + ClipMax3(Unsafe.Add(ref l, 4 * stride));
+                coeffCtx = Math.Min((mag + 1) >> 1, 4) + Unsafe.Add(ref off1d, col);
+            }
+            ref int b = ref Unsafe.Add(ref baseCost, coeffCtx * 8);
+            if (qc == 0) { accuRate += b; continue; }
+            int absQc = AbsI(qc), absTqc = AbsI(Unsafe.Add(ref tcoeff, ci)), absDqc = AbsI(Unsafe.Add(ref dqcoeff, ci));
+            if (absQc == 1)
+            {
+                int rate = Unsafe.Add(ref b, 1) + AomCost.CostLiteral(1);
+                if (absDqc < absTqc || sharpness != 0) { accuRate += rate; continue; }
+                long distDiff0 = plain ? ((long)absDqc * (absDqc - (long)absTqc * 2)) * (1L << (2 * shift)) : DistDiff(ref t, absTqc, absDqc, ci);
+                int rateLow = rate - Unsafe.Add(ref b, 5);
+                if (AomRd.RdCost64(rdmult, rateLow, 0) < AomRd.RdCost64(rdmult, rate, distDiff0))
                 {
-                    Unsafe.Add(ref t.Qcoeff, ci) = 0;
-                    Unsafe.Add(ref t.Dqcoeff, ci) = 0;
-                    Unsafe.Add(ref t.Levels, PaddedIdx(ci, t.Bhl)) = 0;
+                    Unsafe.Add(ref qcoeff, ci) = 0;
+                    Unsafe.Add(ref dqcoeff, ci) = 0;
+                    l = 0;
                     accuRate += rateLow;
-                    return;
+                    continue;
                 }
+                accuRate += rate;
             }
-            accuRate += rate;
-        }
-        else
-        {
-            int rate = TwoCoeffCostSimple(ref t, ci, absQc, coeffCtx, out int rateLow);
-            if (absDqc < absTqc) { accuRate += rate; return; }
-            // allow_lower_qc = sharpness == 0 || abs_qc > 1: always, abs_qc being at least 2 here
-            int dqv = Dqv(ref t, ci);
-            int absQcLow = absQc - 1;
-            int absDqcLow = (absQcLow * dqv) >> shift;
-            long distDiff0 = DistDiff(ref t, absTqc, absDqc, ci);
-            long distDiffLow0 = DistDiff(ref t, absTqc, absDqcLow, ci);
-            long rd = AomRd.RdCost64(t.Rdmult, rate, distDiff0);
-            long rdLow = AomRd.RdCost64(t.Rdmult, rateLow, distDiffLow0);
-            if (rdLow < rd)
+            else
             {
-                int sign = qc < 0 ? 1 : 0;
-                Unsafe.Add(ref t.Qcoeff, ci) = (-sign ^ absQcLow) + sign;
-                Unsafe.Add(ref t.Dqcoeff, ci) = (-sign ^ absDqcLow) + sign;
-                Unsafe.Add(ref t.Levels, PaddedIdx(ci, t.Bhl)) = (byte)Math.Min(absQcLow, 127);
-                accuRate += rateLow;
-                return;
+                // get_two_coeff_cost_simple
+                int cost = Unsafe.Add(ref b, Math.Min(absQc, 3));
+                int diff = absQc <= 3 ? Unsafe.Add(ref b, absQc + 4) : 0;
+                cost += AomCost.CostLiteral(1);
+                if (absQc > NumBaseLevels)
+                {
+                    // get_br_cost_with_diff (get_br_ctx inline; ci > 0)
+                    int row = ci - (col << bhl);
+                    int bm = Unsafe.Add(ref l, 1) + Unsafe.Add(ref l, stride);
+                    int brCtx;
+                    if (txClass == TX_CLASS_2D)
+                    {
+                        bm = Math.Min((bm + Unsafe.Add(ref l, stride + 1) + 1) >> 1, 6);
+                        brCtx = (row < 2 && col < 2) ? bm + 7 : bm + 14;
+                    }
+                    else if (txClass == TX_CLASS_HORIZ)
+                    {
+                        bm = Math.Min((bm + Unsafe.Add(ref l, stride << 1) + 1) >> 1, 6);
+                        brCtx = col == 0 ? bm + 7 : bm + 14;
+                    }
+                    else
+                    {
+                        bm = Math.Min((bm + Unsafe.Add(ref l, 2) + 1) >> 1, 6);
+                        brCtx = row == 0 ? bm + 7 : bm + 14;
+                    }
+                    ref int lp = ref Unsafe.Add(ref lps, brCtx * AomLvMapCoeffCost.LpsStride);
+                    int baseRange = Math.Min(absQc - 1 - NumBaseLevels, CoeffBaseRange);
+                    int golombBits = 0;
+                    if (absQc <= CoeffBaseRange + 1 + NumBaseLevels) diff += Unsafe.Add(ref lp, baseRange + CoeffBaseRange + 1);
+                    if (absQc >= CoeffBaseRange + 1 + NumBaseLevels)
+                    {
+                        int r = absQc - CoeffBaseRange - NumBaseLevels;
+                        if (r < 32)
+                        {
+                            golombBits = Unsafe.Add(ref golBits, r);
+                            diff += Unsafe.Add(ref golDiff, r);
+                        }
+                        else
+                        {
+                            golombBits = GolombCost(absQc);
+                            diff += (r & (r - 1)) == 0 ? 1024 : 0;
+                        }
+                    }
+                    cost += Unsafe.Add(ref lp, baseRange) + golombBits;
+                }
+                int rate = cost, rateLow = cost - diff;
+                if (absDqc < absTqc) { accuRate += rate; continue; }
+                // allow_lower_qc = sharpness == 0 || abs_qc > 1: always, abs_qc being at least 2 here
+                int dqv = plain ? dq1 : Dqv(ref t, ci);
+                int absQcLow = absQc - 1;
+                int absDqcLow = (absQcLow * dqv) >> shift;
+                long distDiff0, distDiffLow0;
+                if (plain)
+                {
+                    distDiff0 = ((long)absDqc * (absDqc - (long)absTqc * 2)) * (1L << (2 * shift));
+                    distDiffLow0 = ((long)absDqcLow * (absDqcLow - (long)absTqc * 2)) * (1L << (2 * shift));
+                }
+                else
+                {
+                    distDiff0 = DistDiff(ref t, absTqc, absDqc, ci);
+                    distDiffLow0 = DistDiff(ref t, absTqc, absDqcLow, ci);
+                }
+                if (AomRd.RdCost64(rdmult, rateLow, distDiffLow0) < AomRd.RdCost64(rdmult, rate, distDiff0))
+                {
+                    int sign = qc < 0 ? 1 : 0;
+                    Unsafe.Add(ref qcoeff, ci) = (-sign ^ absQcLow) + sign;
+                    Unsafe.Add(ref dqcoeff, ci) = (-sign ^ absDqcLow) + sign;
+                    l = (byte)Math.Min(absQcLow, 127);
+                    accuRate += rateLow;
+                    continue;
+                }
+                accuRate += rate;
             }
-            accuRate += rate;
         }
+        accuRateRef = accuRate;
+        return si;
     }
 
     /// <summary>update_coeff_eob.</summary>
+    /// <summary>update_coeff_eob_facade's loop: update_coeff_eob per coefficient while at most maxNzNum nonzero levels
+    /// were kept. Without quantization matrices it runs on locals (the trellis state read once, the br contexts and the
+    /// eob position cost computed once per coefficient); with them, update_coeff_eob as is. Returns the next si.</summary>
+    private static int UpdateCoeffEobLoop(ref Trellis t, ref int accuRate, ref long accuDist, ref int eob, ref int nzNum, ref int nzCi, int si,
+        int maxNzNum)
+    {
+        if (t.Iqm != null || t.Qm != null)
+        {
+            int ar0 = accuRate, e0 = eob, nn0 = nzNum;
+            long ad0 = accuDist;
+            for (; si >= 0 && nn0 <= maxNzNum; --si) UpdateCoeffEob(ref t, ref ar0, ref ad0, ref e0, ref nn0, ref nzCi, si);
+            accuRate = ar0; accuDist = ad0; eob = e0; nzNum = nn0;
+            return si;
+        }
+        ref ushort scan = ref t.Scan;
+        ref int qcoeff = ref t.Qcoeff, tcoeff = ref t.Tcoeff, dqcoeff = ref t.Dqcoeff;
+        ref byte levels = ref t.Levels;
+        ref int baseCost = ref t.Base, baseEob = ref t.BaseEob, lps = ref t.Lps;
+        ref sbyte nzOffset = ref t.NzOffset;
+        ref int off1d = ref MemoryMarshal.GetArrayDataReference(NzMapCtxOffset1d);
+        int bhl = t.Bhl, txClass = t.TxClass, shift = t.Shift, sharpness = t.Sharpness, width = t.Width;
+        int stride = (1 << bhl) + TxPadHor;
+        long rdmult = t.Rdmult;
+        int dq0 = t.Dq0, dq1 = t.Dq1;
+        int dcSignCost0 = Unsafe.Add(ref t.DcSign, t.DcSignCtx * 2), dcSignCost1 = Unsafe.Add(ref t.DcSign, t.DcSignCtx * 2 + 1);
+        int[] eobCosts = t.EobCosts;
+        var costs = t.Costs;
+        long distScale = 1L << (2 * shift);
+        int ar = accuRate, e = eob, nn = nzNum;
+        long ad = accuDist;
+        for (; si >= 0 && nn <= maxNzNum; --si)
+        {
+            int ci = Unsafe.Add(ref scan, si);
+            int qc = Unsafe.Add(ref qcoeff, ci);
+            int col = ci >> bhl, row = ci - (col << bhl);
+            ref byte l = ref Unsafe.Add(ref levels, ci + (col << TxPadHorLog2));
+            // get_lower_levels_ctx
+            int coeffCtx;
+            {
+                int mag = ClipMax3(Unsafe.Add(ref l, stride)) + ClipMax3(Unsafe.Add(ref l, 1));
+                if (txClass == TX_CLASS_2D)
+                {
+                    mag += ClipMax3(Unsafe.Add(ref l, stride + 1)) + ClipMax3(Unsafe.Add(ref l, 2 * stride)) + ClipMax3(Unsafe.Add(ref l, 2));
+                    coeffCtx = ci == 0 ? 0 : Math.Min((mag + 1) >> 1, 4) + Unsafe.Add(ref nzOffset, ci);
+                }
+                else if (txClass == TX_CLASS_VERT)
+                {
+                    mag += ClipMax3(Unsafe.Add(ref l, 2)) + ClipMax3(Unsafe.Add(ref l, 3)) + ClipMax3(Unsafe.Add(ref l, 4));
+                    coeffCtx = Math.Min((mag + 1) >> 1, 4) + Unsafe.Add(ref off1d, row);
+                }
+                else
+                {
+                    mag += ClipMax3(Unsafe.Add(ref l, 2 * stride)) + ClipMax3(Unsafe.Add(ref l, 3 * stride)) + ClipMax3(Unsafe.Add(ref l, 4 * stride));
+                    coeffCtx = Math.Min((mag + 1) >> 1, 4) + Unsafe.Add(ref off1d, col);
+                }
+            }
+            ref int b = ref Unsafe.Add(ref baseCost, coeffCtx * 8);
+            if (qc == 0) { ar += b; continue; }
+            int dqv = ci != 0 ? dq1 : dq0;
+            int absQc = AbsI(qc);
+            int tqc = Unsafe.Add(ref tcoeff, ci), dqc = Unsafe.Add(ref dqcoeff, ci);
+            int sign = qc < 0 ? 1 : 0;
+            int signCost = ci == 0 ? (sign != 0 ? dcSignCost1 : dcSignCost0) : AomCost.CostLiteral(1);
+            // the br context (get_br_ctx, from the neighbours' final levels) and the eob variant (get_br_ctx_eob)
+            int brCtx = 0, brCtxEob = 0;
+            if (absQc > NumBaseLevels)
+            {
+                int bm = Unsafe.Add(ref l, 1) + Unsafe.Add(ref l, stride);
+                if (txClass == TX_CLASS_2D)
+                {
+                    bm = Math.Min((bm + Unsafe.Add(ref l, stride + 1) + 1) >> 1, 6);
+                    brCtx = ci == 0 ? bm : (row < 2 && col < 2) ? bm + 7 : bm + 14;
+                    brCtxEob = ci == 0 ? 0 : (row < 2 && col < 2) ? 7 : 14;
+                }
+                else if (txClass == TX_CLASS_HORIZ)
+                {
+                    bm = Math.Min((bm + Unsafe.Add(ref l, stride << 1) + 1) >> 1, 6);
+                    brCtx = ci == 0 ? bm : col == 0 ? bm + 7 : bm + 14;
+                    brCtxEob = ci == 0 ? 0 : col == 0 ? 7 : 14;
+                }
+                else
+                {
+                    bm = Math.Min((bm + Unsafe.Add(ref l, 2) + 1) >> 1, 6);
+                    brCtx = ci == 0 ? bm : row == 0 ? bm + 7 : bm + 14;
+                    brCtxEob = ci == 0 ? 0 : row == 0 ? 7 : 14;
+                }
+            }
+            // get_coeff_cost_general (is_last 0) at abs_qc
+            int rate = Unsafe.Add(ref b, Math.Min(absQc, 3)) + signCost;
+            if (absQc > NumBaseLevels)
+                rate += Unsafe.Add(ref lps, brCtx * AomLvMapCoeffCost.LpsStride + Math.Min(absQc - 1 - NumBaseLevels, CoeffBaseRange)) + GolombCost(absQc);
+            int qcLow = 0, dqcLow = 0, absQcLow = absQc - 1, rateLow;
+            long distLow;
+            long dist = ((long)dqc * (dqc - (long)tqc * 2)) * distScale;
+            if (absQc == 1)
+            {
+                rateLow = b;
+                distLow = 0;
+            }
+            else
+            {
+                qcLow = (-sign ^ absQcLow) + sign;
+                int absDqcLow = (absQcLow * dqv) >> shift;
+                dqcLow = (-sign ^ absDqcLow) + sign;
+                rateLow = Unsafe.Add(ref b, Math.Min(absQcLow, 3)) + signCost;
+                if (absQcLow > NumBaseLevels)
+                    rateLow += Unsafe.Add(ref lps, brCtx * AomLvMapCoeffCost.LpsStride + Math.Min(absQcLow - 1 - NumBaseLevels, CoeffBaseRange)) + GolombCost(absQcLow);
+                distLow = ((long)dqcLow * (dqcLow - (long)tqc * 2)) * distScale;
+            }
+            long rd = AomRd.RdCost64(rdmult, ar + rate, ad + dist);
+            long rdLow = AomRd.RdCost64(rdmult, ar + rateLow, ad + distLow);
+
+            bool lowerLevelNewEob = false, lowerLevel = false;
+            int newEob = si + 1;
+            int coeffCtxNewEob = LowerLevelsCtxEob(bhl, width, si);
+            int newEobCost = EobCost(newEob, eobCosts, costs, txClass);
+            ref int be = ref Unsafe.Add(ref baseEob, coeffCtxNewEob * 3);
+            // get_coeff_cost_eob at abs_qc / abs_qc_low
+            int rateCoeffEob = newEobCost + Unsafe.Add(ref be, Math.Min(absQc, 3) - 1) + signCost;
+            if (absQc > NumBaseLevels)
+                rateCoeffEob += Unsafe.Add(ref lps, brCtxEob * AomLvMapCoeffCost.LpsStride + Math.Min(absQc - 1 - NumBaseLevels, CoeffBaseRange)) + GolombCost(absQc);
+            long distNewEob = dist;
+            long rdNewEob = AomRd.RdCost64(rdmult, rateCoeffEob, distNewEob);
+            if (absQcLow > 0)
+            {
+                int rateCoeffEobLow = newEobCost + Unsafe.Add(ref be, Math.Min(absQcLow, 3) - 1) + signCost;
+                if (absQcLow > NumBaseLevels)
+                    rateCoeffEobLow += Unsafe.Add(ref lps, brCtxEob * AomLvMapCoeffCost.LpsStride + Math.Min(absQcLow - 1 - NumBaseLevels, CoeffBaseRange)) + GolombCost(absQcLow);
+                long rdNewEobLow = AomRd.RdCost64(rdmult, rateCoeffEobLow, distLow);
+                if (rdNewEobLow < rdNewEob)
+                {
+                    lowerLevelNewEob = true;
+                    rdNewEob = rdNewEobLow;
+                    rateCoeffEob = rateCoeffEobLow;
+                    distNewEob = distLow;
+                }
+            }
+            int qcThreshold = si <= 5 ? 2 : 1;
+            bool allowLowerQc = sharpness == 0 || absQc > qcThreshold;
+            if (allowLowerQc && rdLow < rd)
+            {
+                lowerLevel = true;
+                rd = rdLow;
+                rate = rateLow;
+                dist = distLow;
+            }
+            if ((sharpness == 0 || newEob >= 5) && rdNewEob < rd)
+            {
+                for (int ni = 0; ni < nn; ni++)
+                {
+                    int lastCi = Unsafe.Add(ref nzCi, ni);
+                    Unsafe.Add(ref levels, PaddedIdx(lastCi, bhl)) = 0;
+                    Unsafe.Add(ref qcoeff, lastCi) = 0;
+                    Unsafe.Add(ref dqcoeff, lastCi) = 0;
+                }
+                e = newEob;
+                nn = 0;
+                ar = rateCoeffEob;
+                ad = distNewEob;
+                lowerLevel = lowerLevelNewEob;
+            }
+            else
+            {
+                ar += rate;
+                ad += dist;
+            }
+            if (lowerLevel)
+            {
+                Unsafe.Add(ref qcoeff, ci) = qcLow;
+                Unsafe.Add(ref dqcoeff, ci) = dqcLow;
+                l = (byte)Math.Min(absQcLow, 127);
+            }
+            if (Unsafe.Add(ref qcoeff, ci) != 0) Unsafe.Add(ref nzCi, nn++) = ci;
+        }
+        accuRate = ar; accuDist = ad; eob = e; nzNum = nn;
+        return si;
+    }
+
     private static void UpdateCoeffEob(ref Trellis t, ref int accuRate, ref long accuDist, ref int eob, ref int nzNum, ref int nzCi, int si)
     {
         int ci = Unsafe.Add(ref t.Scan, si);
@@ -824,7 +1102,7 @@ internal static class AomTxb
         long rdmult = t.Rdmult;
         int dqv = Dqv(ref t, ci);
         bool lowerLevel = false;
-        int absQc = Math.Abs(qc);
+        int absQc = AbsI(qc);
         int tqc = Unsafe.Add(ref t.Tcoeff, ci), dqc = Unsafe.Add(ref t.Dqcoeff, ci);
         int sign = qc < 0 ? 1 : 0;
         int qcLow = 0, dqcLow = 0, absQcLow = 0, rateLow;
@@ -903,12 +1181,18 @@ internal static class AomTxb
     internal static byte TxbEntropyContext(ReadOnlySpan<int> qcoeff, ReadOnlySpan<ushort> scan, int eob)
     {
         if (eob == 0) return 0;
+        if ((uint)eob > (uint)scan.Length) throw new ArgumentOutOfRangeException(nameof(eob));
+        // min(sum |level|, 7) without the per-coefficient zero test (data-random): each term clamped to 8 keeps the
+        // minimum and the sum small; the early exit as soon as it passes 7
         int culLevel = 0;
+        ref int q0 = ref MemoryMarshal.GetReference(qcoeff);
+        ref ushort s0 = ref MemoryMarshal.GetReference(scan);
+        int n = qcoeff.Length;
         for (int c = 0; c < eob; c++)
         {
-            int v = qcoeff[scan[c]];
-            if (v == 0) continue;
-            culLevel += Math.Abs(v);
+            int pos = Unsafe.Add(ref s0, c);
+            if ((uint)pos >= (uint)n) throw new ArgumentOutOfRangeException(nameof(scan));
+            culLevel += Math.Min(AbsI(Unsafe.Add(ref q0, pos)), 8);
             if (culLevel > CoeffContextMask) break;
         }
         culLevel = Math.Min(CoeffContextMask, culLevel);

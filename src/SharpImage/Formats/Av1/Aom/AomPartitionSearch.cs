@@ -144,6 +144,7 @@ internal static partial class AomEncodeFrame
         int maxCost = AomCost.CostSymbol(0);
         for (int i = 0; i < 10; ++i) s.TmpPartitionCost[i] = maxCost;
         Span<ushort> cdf2 = stackalloc ushort[2];
+        cdf2.Clear();
         if (bp.HasCols)
         {
             PartitionGatherVertAlike(cdf2, partitionCdf, bp.Bsize);
@@ -218,7 +219,8 @@ internal static partial class AomEncodeFrame
         for (int i = 0; i < bh; i += 4)
             for (int j = 0; j < bw; j += 4)
             {
-                int var = (int)AomIntraModeSearch.VarianceVsZero(src.Buf, src.Offset + i * src.Stride + j, src.Stride, 4, 4, out _);
+                int var = src.Buf16 != null ? (int)AomHbd.Variance(src.Buf16, src.Offset + i * src.Stride + j, src.Stride, null, 0, 0, 0, 4, 4, xd.Bd, out _)
+                    : (int)AomIntraModeSearch.VarianceVsZero(src.Buf, src.Offset + i * src.Stride + j, src.Stride, 4, 4, out _);
                 minVar4x4 = Math.Min(minVar4x4, var);
                 maxVar4x4 = Math.Max(maxVar4x4, var);
             }
@@ -275,8 +277,12 @@ internal static partial class AomEncodeFrame
         Span<int> rectAllowed = stackalloc int[] { s.PartitionRectAllowed[HORZ] ? 1 : 0, s.PartitionRectAllowed[VERT] ? 1 : 0 };
         x.Cnn.QuadTreeIdx = quadTreeIdx;
         // the model reads the 65x65 source from one row above and one column left of the block
-        AomMl.IntraModeCnnPartition(x.Cnn, src.Buf.AsSpan(src.Offset - src.Stride - 1), src.Stride, x.Qindex, s.BlkParams.Bsize,
-            cpi.Cm.Width, cpi.Cm.Height, level, ref none, ref sq, ref rect, rectAllowed);
+        if (src.Buf16 != null)
+            AomMl.IntraModeCnnPartition(x.Cnn, src.Buf16.AsSpan(src.Offset - src.Stride - 1), src.Stride, x.E.Bd, x.Qindex, s.BlkParams.Bsize,
+                cpi.Cm.Width, cpi.Cm.Height, level, ref none, ref sq, ref rect, rectAllowed);
+        else
+            AomMl.IntraModeCnnPartition(x.Cnn, src.Buf.AsSpan(src.Offset - src.Stride - 1), src.Stride, x.Qindex, s.BlkParams.Bsize,
+                cpi.Cm.Width, cpi.Cm.Height, level, ref none, ref sq, ref rect, rectAllowed);
         s.PartitionNoneAllowed = none != 0;
         s.DoSquareSplit = sq != 0;
         s.DoRectangularSplit = rect != 0;
@@ -539,6 +545,7 @@ internal static partial class AomEncodeFrame
         if (s.TerminatePartitionSearch) return;
 
         Span<bool> abAllowed = stackalloc bool[4];
+        abAllowed.Clear();
         PruneAbPartitions(cpi, x, pcTree, pbSourceVariance, bestRdc.Rdcost, rectPartWinInfo, extPartitionAllowed, s, abAllowed);
 
         Span<int> isCtxReady = stackalloc int[]
@@ -701,8 +708,12 @@ internal static partial class AomEncodeFrame
         // the sub-block variances are measured on the block's own source (the searches moved x->plane[].src)
         SetupSrcPlanes(cpi, x, bp.MiRow, bp.MiCol, cpi.Cm.NumPlanes, bp.Bsize);
         var src = x.Plane[0].Src;
-        AomMl.Prune4Partition(src.Buf.AsSpan(src.Offset), src.Stride, bp.Bsize, partCtx, bestRd, s.RectPartRd[HORZ], s.RectPartRd[VERT], s.SplitRd,
-            (uint)pbSourceVariance, cpi.Cm.Width, cpi.Cm.Height, cpi.Sf.part_sf.ml_4_partition_search_level_index, allowed);
+        if (src.Buf16 != null)
+            AomMl.Prune4Partition(src.Buf16.AsSpan(src.Offset), src.Stride, x.E.Bd, bp.Bsize, partCtx, bestRd, s.RectPartRd[HORZ], s.RectPartRd[VERT], s.SplitRd,
+                (uint)pbSourceVariance, cpi.Cm.Width, cpi.Cm.Height, cpi.Sf.part_sf.ml_4_partition_search_level_index, allowed);
+        else
+            AomMl.Prune4Partition(src.Buf.AsSpan(src.Offset), src.Stride, bp.Bsize, partCtx, bestRd, s.RectPartRd[HORZ], s.RectPartRd[VERT], s.SplitRd,
+                (uint)pbSourceVariance, cpi.Cm.Width, cpi.Cm.Height, cpi.Sf.part_sf.ml_4_partition_search_level_index, allowed);
         part4Allowed[0] = allowed[0] != 0;
         part4Allowed[1] = allowed[1] != 0;
     }

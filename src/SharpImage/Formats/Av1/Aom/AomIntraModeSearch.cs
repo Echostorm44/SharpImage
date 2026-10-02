@@ -1,3 +1,5 @@
+using System.Runtime.Intrinsics;
+using System.Runtime.CompilerServices;
 using System;
 using static SharpImage.Formats.Av1.AomTables;
 
@@ -23,6 +25,7 @@ internal sealed partial class AomMacroblock
 // av1_rd_pick_intra_sby_mode (mode / angle loop, model-rd pruning, the ALLINTRA variance factor, filter intra, winner
 // mode processing) and av1_rd_pick_intra_sbuv_mode (chroma modes, angle search, CfL alpha search), plus
 // av1_encode_intra_block_plane (encodemb.c) that the CfL search re-runs for the luma reconstruction.
+[System.Runtime.CompilerServices.SkipLocalsInit]
 internal static class AomIntraModeSearch
 {
     private const int MAX_ANGLE_DELTA = 3, INTRA_MODE_END = 13, INTRA_MODE_START = 0;
@@ -130,7 +133,6 @@ internal static class AomIntraModeSearch
         return totalRate;
     }
 
-    [ThreadStatic] private static int[]? t_coeffScratch;
 
     /// <summary>intra_model_rd: a quick prediction and SATD estimate of the plane without the tx pipeline.</summary>
     internal static long IntraModelRd(AomComp cpi, AomMacroblock x, int plane, int planeBsize, int txSize, bool useHadamard)
@@ -144,12 +146,23 @@ internal static class AomIntraModeSearch
         var p = x.Plane[plane];
         var pd = xd.Plane[plane];
         int diffStride = BlockSizeWide[planeBsize];
-        var coeff = t_coeffScratch ??= new int[64 * 64];
+        var coeff = x.ScratchCoeff;
         for (int row = 0; row < maxBlocksHigh; row += stepr)
             for (int col = 0; col < maxBlocksWide; col += stepc)
             {
                 AomReconIntra.PredictIntraBlockFacade(xd, cpi.SbSize, cpi.EnableIntraEdgeFilter, plane, col, row, txSize);
                 // src_diff / coeff are scratch here: written at offset 0 for every tx block
+                if (p.Src.Buf16 != null)
+                {
+                    AomHbd.SubtractBlock(txbh, txbw, p.SrcDiff, 0, diffStride,
+                        p.Src.Buf16, p.Src.Offset + ((row * p.Src.Stride + col) << 2), p.Src.Stride,
+                        pd.Dst.Buf16, pd.Dst.Offset + ((row * pd.Dst.Stride + col) << 2), pd.Dst.Stride);
+                    if (useHadamard) AomHbd.WhtFwdTxfm(txSize, p.SrcDiff, diffStride, coeff);
+                    else Av1FwdTxfmAom.ForwardRawRef(p.SrcDiff, diffStride, txbw, txbh, txSize, Av1InvTransform.Type1dDct, Av1InvTransform.Type1dDct,
+                        false, false, coeff.AsSpan(0, AomEncodeMb.MaxEob(txSize)));
+                    satdCost += AomEncodeMb.Satd(coeff, TxSize2d[txSize]);
+                    continue;
+                }
                 AomEncodeMb.SubtractBlock(txbh, txbw, p.SrcDiff, 0, diffStride,
                     p.Src.Buf, p.Src.Offset + ((row * p.Src.Stride + col) << 2), p.Src.Stride,
                     pd.Dst.Buf, pd.Dst.Offset + ((row * pd.Dst.Stride + col) << 2), pd.Dst.Stride);
@@ -165,6 +178,34 @@ internal static class AomIntraModeSearch
     internal static uint VarianceVsZero(byte[] buf, int off, int stride, int w, int h, out uint sse)
     {
         long sum = 0; ulong ss = 0;
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && (w & 3) == 0 && w > 0 && h > 0 && off >= 0 && off + (long)(h - 1) * stride + w <= buf.Length)
+        {
+            // sums of the samples and their squares in int32 lanes (at most 128 x 128 x 255^2 < 2^31 per lane group)
+            ref byte b0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(buf);
+            var sv = System.Runtime.Intrinsics.Vector256<int>.Zero;
+            var qv = System.Runtime.Intrinsics.Vector256<int>.Zero;
+            for (int r = 0; r < h; r++)
+            {
+                ref byte row = ref Unsafe.Add(ref b0, off + r * stride);
+                int c = 0;
+                for (; c + 16 <= w; c += 16)
+                {
+                    var v = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int16(System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref row, (nuint)c));
+                    sv += System.Runtime.Intrinsics.X86.Avx2.MultiplyAddAdjacent(v, System.Runtime.Intrinsics.Vector256.Create((short)1));
+                    qv += System.Runtime.Intrinsics.X86.Avx2.MultiplyAddAdjacent(v, v);
+                }
+                for (; c < w; c += 4)
+                {
+                    var v = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref row, c))).AsByte());
+                    sv += v & System.Runtime.Intrinsics.Vector256.Create(-1, -1, -1, -1, 0, 0, 0, 0);
+                    qv += (v * v) & System.Runtime.Intrinsics.Vector256.Create(-1, -1, -1, -1, 0, 0, 0, 0);
+                }
+            }
+            sum = System.Runtime.Intrinsics.Vector256.Sum(sv);
+            ss = (ulong)(uint)System.Runtime.Intrinsics.Vector256.Sum(qv);
+            sse = (uint)ss;
+            return (uint)(ss - (ulong)(sum * sum / (w * h)));
+        }
         for (int r = 0; r < h; r++)
             for (int c = 0; c < w; c++) { int v = buf[off + r * stride + c]; sum += v; ss += (ulong)(v * v); }
         sse = (uint)ss;
@@ -196,7 +237,8 @@ internal static class AomIntraModeSearch
                 double logSrcVar = x.SrcLogVar4x4[miOffset];
                 if (srcVar < 0)
                 {
-                    srcVar = (int)VarianceVsZero(src.Buf, src.Offset + i * src.Stride + j, src.Stride, 4, 4, out _);
+                    srcVar = src.Buf16 != null ? (int)AomHbd.Variance(src.Buf16, src.Offset + i * src.Stride + j, src.Stride, null, 0, 0, 0, 4, 4, xd.Bd, out _)
+                        : (int)VarianceVsZero(src.Buf, src.Offset + i * src.Stride + j, src.Stride, 4, 4, out _);
                     x.SrcVar4x4[miOffset] = srcVar;
                     logSrcVar = Log1p(srcVar / 16.0);
                     x.SrcLogVar4x4[miOffset] = logSrcVar;
@@ -207,7 +249,8 @@ internal static class AomIntraModeSearch
                     x.SrcLogVar4x4[miOffset] = logSrcVar;
                 }
                 avgLogSrcVariance += logSrcVar;
-                int reconVar = (int)VarianceVsZero(dst.Buf, dst.Offset + i * dst.Stride + j, dst.Stride, 4, 4, out _);
+                int reconVar = dst.Buf16 != null ? (int)AomHbd.Variance(dst.Buf16, dst.Offset + i * dst.Stride + j, dst.Stride, null, 0, 0, 0, 4, 4, xd.Bd, out _)
+                    : (int)VarianceVsZero(dst.Buf, dst.Offset + i * dst.Stride + j, dst.Stride, 4, 4, out _);
                 avgLogReconVariance += Log1p(reconVar / 16.0);
             }
         }
@@ -266,7 +309,7 @@ internal static class AomIntraModeSearch
         bool filterIntraSelectedFlag = false;
         int bestTxSize = TX_8X8;
         byte bestUse = 0, bestFiMode = 0;
-        Span<byte> bestTxTypeMap = stackalloc byte[32 * 32];
+        var bestTxTypeMapBuf15 = new StackArr1024<byte>(); Span<byte> bestTxTypeMap = bestTxTypeMapBuf15;
         mbmi.UseFilterIntra = 1;
         mbmi.Mode = DC_PRED;
         mbmi.Palette.PaletteSize0 = 0;
@@ -368,7 +411,7 @@ internal static class AomIntraModeSearch
     private static bool PruneLumaOddDeltaAnglesUsingRdCost(AomMbModeInfo mbmi, ReadOnlySpan<long> intraModesRdCost, long bestRd, int level)
     {
         int lda = mbmi.AngleDelta[0];
-        if (level == 0 || !IsDirectionalMode(mbmi.Mode) || (Math.Abs(lda) & 1) == 0 || bestRd == long.MaxValue) return false;
+        if (level == 0 || !IsDirectionalMode(mbmi.Mode) || (AbsI(lda) & 1) == 0 || bestRd == long.MaxValue) return false;
         long rdThresh = bestRd + (bestRd >> 3);
         return intraModesRdCost[lda + MAX_ANGLE_DELTA] > rdThresh && intraModesRdCost[lda + MAX_ANGLE_DELTA + 2] > rdThresh;
     }
@@ -402,7 +445,6 @@ internal static class AomIntraModeSearch
         return false;
     }
 
-    [ThreadStatic] private static AomMbModeInfo? t_bestMbmi;
 
     /// <summary>av1_rd_pick_intra_sby_mode: the best non-intrabc luma mode of an intra-frame block.</summary>
     internal static long RdPickIntraSbyMode(AomComp cpi, AomMacroblock x, ref int rate, ref int rateTokenonly, ref long distortion,
@@ -424,7 +466,7 @@ internal static class AomIntraModeSearch
         var mbmi = xd.Mi0;
         var sf = cpi.Sf;
         long bestModelRd = long.MaxValue;
-        Span<byte> directionalModeSkipMask = stackalloc byte[INTRA_MODE_END];
+        var directionalModeSkipMaskBuf16 = new StackArr13<byte>(); Span<byte> directionalModeSkipMask = directionalModeSkipMaskBuf16;
         directionalModeSkipMask.Clear();
         bool beatBestRd = false;
         bool tryPalette = cpi.EnablePalette && AllowPalette(cpi.AllowScreenContentTools, mbmi.Bsize);
@@ -437,7 +479,7 @@ internal static class AomIntraModeSearch
         if (sf.intra_sf.intra_pruning_with_hog != 0)
         {
             // Less aggressive thresholds than inter frames: key / intra frames want higher quality
-            ReadOnlySpan<float> thresh = stackalloc float[] { -1.2f, -1.2f, -0.6f, 0.4f };
+            ReadOnlySpan<float> thresh = new float[] { -1.2f, -1.2f, -0.6f, 0.4f };
             PruneIntraModeWithHog(cpi, x, bsize, thresh[sf.intra_sf.intra_pruning_with_hog - 1], directionalModeSkipMask, false);
         }
         mbmi.UseFilterIntra = 0;
@@ -445,15 +487,15 @@ internal static class AomIntraModeSearch
 
         AomRdoptUtils.SetModeEvalParams(cpi, x, MODE_EVAL);
 
-        var bestMbmi = t_bestMbmi ??= new AomMbModeInfo();
+        var bestMbmi = x.ScratchBestMbmi ??= new AomMbModeInfo();
         bestMbmi.CopyFrom(mbmi);
         int maxWinnerModeCount = AomRdoptUtils.WinnerModeCountAllowed[sf.winner_mode_sf.multi_winner_mode_type];
         AomRdoptUtils.ZeroWinnerModeStats(bsize, maxWinnerModeCount, x.WinnerModeStats);
         x.WinnerModeCount = 0;
 
-        Span<long> topIntraModelRd = stackalloc long[TOP_INTRA_MODEL_COUNT];
+        var topIntraModelRdBuf17 = new StackArr4<long>(); Span<long> topIntraModelRd = topIntraModelRdBuf17;
         topIntraModelRd.Fill(long.MaxValue);
-        Span<long> intraModesRdCost = stackalloc long[INTRA_MODE_END * SIZE_OF_ANGLE_DELTA_RD_COST_ARRAY];
+        var intraModesRdCostBuf18 = new StackArr117<long>(); Span<long> intraModesRdCost = intraModesRdCostBuf18;
         intraModesRdCost.Fill(long.MaxValue);
 
         const int LumaModeCount = INTRA_MODE_END + 8 * 2 * MAX_ANGLE_DELTA;   // LUMA_MODE_COUNT: 13 + 48
@@ -568,6 +610,36 @@ internal static class AomIntraModeSearch
         return bestRd;
     }
 
+    /// <summary>produce_gradients_for_sb: with is_gradient_caching_for_hog_enabled, the superblock's per-sample Sobel
+    /// gradients of the planes the HOG prunes use (compute_gradient_info_sb), for the blocks' histograms.</summary>
+    internal static void ProduceGradientsForSb(AomComp cpi, AomMacroblock x, int sbSize, int miRow, int miCol)
+    {
+        x.SbGradientCached[0] = x.SbGradientCached[1] = false;
+        var sf = cpi.Sf;
+        if (!(cpi.FrameIsIntraOnly && sf.rt_sf.use_nonrd_pick_mode == 0 && sf.part_sf.partition_search_type == SEARCH_PARTITION &&
+              (sf.intra_sf.intra_pruning_with_hog != 0 || sf.intra_sf.chroma_intra_pruning_with_hog != 0)))
+            return;
+        int numPlanes = cpi.Cm.NumPlanes;
+        AomEncodeFrame.SetupSrcPlanes(cpi, x, miRow, miCol, numPlanes, sbSize);
+        if (sf.intra_sf.intra_pruning_with_hog != 0) { ComputeGradientInfoSb(cpi, x, sbSize, 0, miRow, miCol); x.SbGradientCached[0] = true; }
+        if (sf.intra_sf.chroma_intra_pruning_with_hog != 0 && numPlanes > 1) { ComputeGradientInfoSb(cpi, x, sbSize, 1, miRow, miCol); x.SbGradientCached[1] = true; }
+    }
+
+    // compute_gradient_info_sb over the superblock's samples that a block's histogram can read (the interior of the
+    // mi-aligned frame area; libaom computes the whole superblock, the rest never being read)
+    private static void ComputeGradientInfoSb(AomComp cpi, AomMacroblock x, int sbSize, int plane, int miRow, int miCol)
+    {
+        var pd = x.E.Plane[plane];
+        int ssX = pd.SubsamplingX, ssY = pd.SubsamplingY;
+        int sbH = BlockSizeHigh[sbSize] >> ssY, sbW = BlockSizeWide[sbSize] >> ssX;
+        int visH = Math.Min(sbH, ((cpi.Cm.MiRows - miRow) * 4) >> ssY), visW = Math.Min(sbW, ((cpi.Cm.MiCols - miCol) * 4) >> ssX);
+        var src = x.Plane[plane].Src;
+        if (src.Buf16 != null)
+            AomMl.ComputeGradientInfoSb(src.Buf16.AsSpan(src.Offset), src.Stride, sbW, visW, visH, x.GradAbsSum, x.GradBin, plane * AomMbPlane.MaxSbSquare);
+        else
+            AomMl.ComputeGradientInfoSb(src.Buf.AsSpan(src.Offset), src.Stride, sbW, visW, visH, x.GradAbsSum, x.GradBin, plane * AomMbPlane.MaxSbSquare);
+    }
+
     /// <summary>prune_intra_mode_with_hog (collect_hog_data over the block's visible source).</summary>
     private static void PruneIntraModeWithHog(AomComp cpi, AomMacroblock x, int bsize, float th, Span<byte> directionalModeSkipMask, bool isChroma)
     {
@@ -577,8 +649,21 @@ internal static class AomIntraModeSearch
         int bh = BlockSizeHigh[bsize], bw = BlockSizeWide[bsize];
         int rows = (xd.MbToBottomEdge >= 0 ? bh : (xd.MbToBottomEdge >> 3) + bh) >> pd.SubsamplingY;
         int cols = (xd.MbToRightEdge >= 0 ? bw : (xd.MbToRightEdge >> 3) + bw) >> pd.SubsamplingX;
+        if (x.SbGradientCached[plane])
+        {
+            // generate_hog_using_gradient_cache
+            int sbSize = cpi.Cm.SbSize;
+            int sbWidth = BlockSizeWide[sbSize] >> pd.SubsamplingX;
+            int miRowInSb = xd.MiRow & (MiSizeHigh[sbSize] - 1), miColInSb = xd.MiCol & (MiSizeWide[sbSize] - 1);
+            int off = plane * AomMbPlane.MaxSbSquare + sbWidth * (miRowInSb << (2 - pd.SubsamplingY)) + (miColInSb << (2 - pd.SubsamplingX));
+            AomMl.PruneIntraModeWithHogCached(x.GradAbsSum, x.GradBin, off, sbWidth, rows, cols, pd.SubsamplingX, pd.SubsamplingY, th, directionalModeSkipMask);
+            return;
+        }
         var src = x.Plane[plane].Src;
-        AomMl.PruneIntraModeWithHog(src.Buf.AsSpan(src.Offset), src.Stride, rows, cols, pd.SubsamplingX, pd.SubsamplingY, th, directionalModeSkipMask);
+        if (src.Buf16 != null)
+            AomMl.PruneIntraModeWithHog(src.Buf16.AsSpan(src.Offset), src.Stride, rows, cols, pd.SubsamplingX, pd.SubsamplingY, th, directionalModeSkipMask);
+        else
+            AomMl.PruneIntraModeWithHog(src.Buf.AsSpan(src.Offset), src.Stride, rows, cols, pd.SubsamplingX, pd.SubsamplingY, th, directionalModeSkipMask);
     }
 
     // ---- chroma ----
@@ -609,7 +694,7 @@ internal static class AomIntraModeSearch
     {
         var mbmi = x.E.Mi0;
         int bestAngleDelta = 0;
-        Span<long> rdCost = stackalloc long[2 * (MAX_ANGLE_DELTA + 2)];
+        var rdCostBuf19 = new StackArr10<long>(); Span<long> rdCost = rdCostBuf19;
         rdStats.Rate = int.MaxValue;
         rdStats.SkipTxfm = 0;
         rdStats.Dist = long.MaxValue;
@@ -653,7 +738,7 @@ internal static class AomIntraModeSearch
     {
         int lin = cflIdx - CFL_INDEX_ZERO;
         if (lin == 0) { cflSign = CFL_SIGN_ZERO; cflAlpha = 0; }
-        else { cflSign = lin > 0 ? CFL_SIGN_POS : CFL_SIGN_NEG; cflAlpha = Math.Abs(lin) - 1; }
+        else { cflSign = lin > 0 ? CFL_SIGN_POS : CFL_SIGN_NEG; cflAlpha = AbsI(lin) - 1; }
     }
 
     /// <summary>cfl_compute_rd.</summary>
@@ -732,15 +817,14 @@ internal static class AomIntraModeSearch
         }
     }
 
-    [ThreadStatic] private static AomRdStats[]? t_cflU, t_cflV;
 
     /// <summary>cfl_rd_pick_alpha.</summary>
     private static bool CflRdPickAlpha(AomMacroblock x, AomComp cpi, int txSize, long refBestRd, int cflSearchRange, ref AomRdStats bestRdStats,
         ref byte bestCflAlphaIdx, ref sbyte bestCflAlphaSigns)
     {
         var mc = x.ModeCosts;
-        var cflRdArrU = t_cflU ??= new AomRdStats[CFL_MAGS_SIZE];
-        var cflRdArrV = t_cflV ??= new AomRdStats[CFL_MAGS_SIZE];
+        var cflRdArrU = x.ScratchCflU ??= new AomRdStats[CFL_MAGS_SIZE];
+        var cflRdArrV = x.ScratchCflV ??= new AomRdStats[CFL_MAGS_SIZE];
         var xd = x.E;
         bestRdStats.Invalidate();
 
@@ -819,6 +903,11 @@ internal static class AomIntraModeSearch
             var pd = x.E.Plane[i];
             int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, pd.SubsamplingX, pd.SubsamplingY);
             var src = x.Plane[i].Src;
+            if (src.Buf16 != null)
+            {
+                if (AomEncodeFrame.PerpixelVariance(x, bsize, i) >= 20) return false;
+                continue;
+            }
             uint var = VarianceVsZero(src.Buf, src.Offset, src.Stride, BlockSizeWide[planeBsize], BlockSizeHigh[planeBsize], out _);
             int sh = NumPelsLog2Lookup[planeBsize];
             uint variance = (var + ((1u << sh) >> 1)) >> sh;
@@ -827,7 +916,6 @@ internal static class AomIntraModeSearch
         return true;
     }
 
-    [ThreadStatic] private static AomMbModeInfo? t_bestUvMbmi;
 
     /// <summary>av1_rd_pick_intra_sbuv_mode.</summary>
     internal static long RdPickIntraSbuvMode(AomComp cpi, AomMacroblock x, ref int rate, ref int rateTokenonly, ref long distortion,
@@ -835,7 +923,7 @@ internal static class AomIntraModeSearch
     {
         var xd = x.E;
         var mbmi = xd.Mi0;
-        var bestMbmi = t_bestUvMbmi ??= new AomMbModeInfo();
+        var bestMbmi = x.ScratchBestUvMbmi ??= new AomMbModeInfo();
         bestMbmi.CopyFrom(mbmi);
         long bestRd = long.MaxValue;
         var mc = x.ModeCosts;
@@ -859,7 +947,7 @@ internal static class AomIntraModeSearch
             xd.Cfl.StoreY = 0;
         }
         bool dirModeSkipMaskReady = false;
-        Span<byte> directionalModeSkipMask = stackalloc byte[14];
+        var directionalModeSkipMaskBuf20 = new StackArr14<byte>(); Span<byte> directionalModeSkipMask = directionalModeSkipMaskBuf20;
         directionalModeSkipMask.Clear();
         int cflAllowed = AomCfl.IsCflAllowed(xd);
 
@@ -898,7 +986,7 @@ internal static class AomIntraModeSearch
             {
                 if (sf.intra_sf.chroma_intra_pruning_with_hog != 0 && !dirModeSkipMaskReady)
                 {
-                    ReadOnlySpan<float> thresh = stackalloc float[] { -1.2f, 0.0f, 0.0f, 1.2f, -1.2f, -1.2f, -0.6f, 0.4f };   // [inter, intra][level]
+                    ReadOnlySpan<float> thresh = new float[] { -1.2f, 0.0f, 0.0f, 1.2f, -1.2f, -1.2f, -0.6f, 0.4f };   // [inter, intra][level]
                     PruneIntraModeWithHog(cpi, x, bsize, thresh[(cpi.FrameIsIntraOnly ? 4 : 0) + sf.intra_sf.chroma_intra_pruning_with_hog - 1],
                         directionalModeSkipMask, true);
                     dirModeSkipMaskReady = true;
@@ -947,7 +1035,6 @@ internal static class AomIntraModeSearch
 
     // ---- encodemb.c: av1_encode_intra_block_plane ----
 
-    [ThreadStatic] private static byte[]? t_ta, t_tl;
 
     /// <summary>av1_encode_intra_block_plane: predict, transform, quantise (and trellis), reconstruct every tx block.</summary>
     internal static void EncodeIntraBlockPlane(AomComp cpi, AomMacroblock x, int bsize, int plane, int dryRun, int enableOptimizeB)
@@ -955,8 +1042,8 @@ internal static class AomIntraModeSearch
         var xd = x.E;
         if (plane != 0 && !xd.IsChromaRef) return;
         var pd = xd.Plane[plane];
-        var ta = t_ta ??= new byte[32];
-        var tl = t_tl ??= new byte[32];
+        var ta = x.ScratchTa;
+        var tl = x.ScratchTl;
         Array.Clear(ta); Array.Clear(tl);
         int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, pd.SubsamplingX, pd.SubsamplingY);
         if (enableOptimizeB != 0) AomTxSearch.GetEntropyContexts(planeBsize, pd, ta, tl);
@@ -1023,7 +1110,7 @@ internal static class AomIntraModeSearch
 
         int eob = p.Eobs[block];
         if (eob != 0)
-            AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst.Buf, dstOff, dstStride, eob, xd.Lossless[xd.Mi0.SegmentId] != 0);
+            AomEncodeMb.InverseTransformBlockDst(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst, dstOff, dstStride, eob, xd.Bd, xd.Lossless[xd.Mi0.SegmentId] != 0);
 
         if (eob == 0 && plane == 0) AomEncodeMb.UpdateTxkArray(xd, blkRow, blkCol, txSize, DCT_DCT);
 

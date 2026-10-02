@@ -35,10 +35,29 @@ internal sealed class AomCbCoeffBuffer
     public readonly ushort[][] Eobs = new ushort[3][];
     public readonly byte[][] EntropyCtx = new byte[3][];
 
+    public readonly int SbPixels;
+
     public AomCbCoeffBuffer(int sbPixels)
     {
+        SbPixels = sbPixels;
         for (int p = 0; p < 3; p++) { Tcoeff[p] = new int[sbPixels]; Eobs[p] = new ushort[sbPixels / 16]; EntropyCtx[p] = new byte[sbPixels / 16]; }
     }
+
+    // the frame's superblock coefficient buffers, reused across frames (cleared on reuse: as allocated)
+    private static readonly System.Collections.Concurrent.ConcurrentBag<AomCbCoeffBuffer> Pool = new();
+
+    internal static AomCbCoeffBuffer Rent(int sbPixels)
+    {
+        while (Pool.TryTake(out var b))
+        {
+            if (b.SbPixels != sbPixels) continue;   // another geometry: dropped
+            for (int p = 0; p < 3; p++) { Array.Clear(b.Tcoeff[p]); Array.Clear(b.Eobs[p]); Array.Clear(b.EntropyCtx[p]); }
+            return b;
+        }
+        return new AomCbCoeffBuffer(sbPixels);
+    }
+
+    internal static void Return(AomCbCoeffBuffer b) { if (Pool.Count < 1024) Pool.Add(b); }
 }
 
 internal sealed partial class AomComp
@@ -75,6 +94,7 @@ internal sealed partial class AomMacroblock
 // Port of libaom 3.14.1 partition_search.c / encodeframe_utils.c / encodetxb.c block-level encoding for intra frames:
 // av1_set_offsets, setup_block_rdmult, pick_sb_modes, encode_superblock, encode_b, encode_sb, av1_update_state,
 // update_stats / av1_sum_intra_stats, av1_update_intra_mb_txb_context, save / restore context, partition contexts.
+[System.Runtime.CompilerServices.SkipLocalsInit]
 internal static partial class AomEncodeFrame
 {
     public const int OUTPUT_ENABLED = 0, DRY_RUN_NORMAL = 1, DRY_RUN_COSTCOEFFS = 2;
@@ -190,8 +210,9 @@ internal static partial class AomEncodeFrame
 
     /// <summary>setup_pred_plane: the block's sample offset in a plane (4-wide / high chroma blocks at odd mi use the pair's origin).</summary>
     private static void SetupPredPlane(ref AomBuf2d dst, int bsize, byte[] buf, int planeOffset, int width, int height, int stride,
-        int miRow, int miCol, int ssX, int ssY)
+        int miRow, int miCol, int ssX, int ssY, ushort[]? buf16 = null)
     {
+        dst.Buf16 = buf16!;
         if (ssY != 0 && (miRow & 1) != 0 && MiSizeHigh[bsize] == 1) miRow -= 1;
         if (ssX != 0 && (miCol & 1) != 0 && MiSizeWide[bsize] == 1) miCol -= 1;
         int px = (4 * miCol) >> ssX, py = (4 * miRow) >> ssY;
@@ -211,7 +232,7 @@ internal static partial class AomEncodeFrame
             int isUv = i > 0 ? 1 : 0;
             var pd = x.E.Plane[i];
             SetupPredPlane(ref x.Plane[i].Src, bsize, src.Buffers[i], src.Offsets[i], src.CropWidths[isUv], src.CropHeights[isUv], src.Strides[i],
-                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY);
+                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY, src.Buffers16[i]);
         }
     }
 
@@ -258,7 +279,7 @@ internal static partial class AomEncodeFrame
             int isUv = i > 0 ? 1 : 0;
             var pd = xd.Plane[i];
             SetupPredPlane(ref pd.Dst, bsize, cur.Buffers[i], cur.Offsets[i], cur.CropWidths[isUv], cur.CropHeights[isUv], cur.Strides[i],
-                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY);
+                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY, cur.Buffers16[i]);
         }
 
         // set_plane_n4
@@ -351,6 +372,7 @@ internal static partial class AomEncodeFrame
         var pd = x.E.Plane[plane];
         int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, pd.SubsamplingX, pd.SubsamplingY);
         var src = x.Plane[plane].Src;
+        if (src.Buf16 != null) return AomHbd.PerpixelVariance(src.Buf16, src.Offset, src.Stride, BlockSizeWide[planeBsize], BlockSizeHigh[planeBsize], x.E.Bd);
         uint var = AomIntraModeSearch.VarianceVsZero(src.Buf, src.Offset, src.Stride, BlockSizeWide[planeBsize], BlockSizeHigh[planeBsize], out _);
         int sh = NumPelsLog2Lookup[planeBsize];
         return (var + ((1u << sh) >> 1)) >> sh;
@@ -916,8 +938,6 @@ internal static partial class AomEncodeFrame
         }
     }
 
-    [ThreadStatic] private static byte[]? t_levels;
-    [ThreadStatic] private static sbyte[]? t_coeffContexts;
 
     /// <summary>av1_update_and_record_txb_context (and av1_record_txb_context without CDF updates).</summary>
     private static void UpdateAndRecordTxbContext(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize,
@@ -961,14 +981,14 @@ internal static partial class AomEncodeFrame
             tcoeffOff = cbOffset + blockOffset;
             Array.Copy(p.Qcoeff, blockOffset, tcoeffArr, tcoeffOff, segEob);
 
-            var levels = t_levels ??= new byte[AomTxb.TxPad2d];
+            var levels = x.ScratchLevels;
             AomTxb.InitLevels(tcoeffArr.AsSpan(tcoeffOff, segEob), width, height, levels);
             UpdateTxTypeCount(cpi, x, blkRow, blkCol, plane, txSize, allowUpdateCdf);
 
             int txClass = AomTxb.TxTypeToClass[txType];
             UpdateEobContext(eob, txSize, txClass, planeType, ec, allowUpdateCdf);
 
-            var coeffContexts = t_coeffContexts ??= new sbyte[64 * 64];
+            var coeffContexts = x.ScratchCoeffContexts;
             // av1_get_nz_map_contexts
             for (int i = 0; i < eob; ++i)
             {
@@ -981,7 +1001,7 @@ internal static partial class AomEncodeFrame
                 int pos = scan[c];
                 int coeffCtx = coeffContexts[pos];
                 int v = p.Qcoeff[blockOffset + pos];
-                int level = Math.Abs(v);
+                int level = AbsI(v);
                 if (allowUpdateCdf)
                 {
                     if (c == eob - 1) AomCdf.Update(ec.EobBaseTok[(txsizeCtx * 2 + planeType) * 4 + coeffCtx], Math.Min(level, 3) - 1, 3);

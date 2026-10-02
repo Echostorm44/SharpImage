@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System;
 using System.Numerics;
 using static SharpImage.Formats.Av1.AomTables;
@@ -154,7 +156,7 @@ internal static partial class AomPalette
         for (int i = 1; i < n; ++i)
         {
             int delta = pmi.PaletteColors[2 * PALETTE_MAX_SIZE + i] - pmi.PaletteColors[2 * PALETTE_MAX_SIZE + i - 1];
-            int v = Math.Abs(delta);
+            int v = AbsI(delta);
             int d = Math.Min(v, maxVal - v);
             if (d > maxD) maxD = d;
             if (d == 0) ++zeroCount;
@@ -214,11 +216,11 @@ internal static partial class AomPalette
         if (nCache <= 0) return;
         for (int i = 0; i < nColors * stride; i += stride)
         {
-            int minDiff = Math.Abs(centroids[i] - colorCache[0]);
+            int minDiff = AbsI(centroids[i] - colorCache[0]);
             int idx = 0;
             for (int j = 1; j < nCache; ++j)
             {
-                int thisDiff = Math.Abs(centroids[i] - colorCache[j]);
+                int thisDiff = AbsI(centroids[i] - colorCache[j]);
                 if (thisDiff < minDiff)
                 {
                     minDiff = thisDiff;
@@ -236,6 +238,26 @@ internal static partial class AomPalette
         minN = winner == PALETTE_MIN_SIZE ? PALETTE_MIN_SIZE + 1 : Math.Max(winner - 1, PALETTE_MIN_SIZE);
         maxN = winner == endN ? winner - 1 : Math.Min(winner + 1, PALETTE_MAX_SIZE);
         stepSize = Math.Max(1, maxN - minN);
+    }
+
+    /// <summary>fill_data_and_get_bounds (high bit depth).</summary>
+    internal static void FillDataAndGetBounds(ushort[] src, int srcOffset, int srcStride, int rows, int cols, short[] data,
+        out int lowerBound, out int upperBound)
+    {
+        int s = srcOffset, d = 0;
+        lowerBound = upperBound = src[s];
+        for (int r = 0; r < rows; ++r)
+        {
+            for (int c = 0; c < cols; ++c)
+            {
+                int val = src[s + c];
+                data[d + c] = (short)val;
+                lowerBound = Math.Min(lowerBound, val);
+                upperBound = Math.Max(upperBound, val);
+            }
+            s += srcStride;
+            d += cols;
+        }
     }
 
     /// <summary>fill_data_and_get_bounds (8-bit).</summary>
@@ -320,19 +342,27 @@ internal static partial class AomPalette
         int bsize = mbmi.Bsize;
         int srcStride = x.Plane[1].Src.Stride;
         byte[] srcU = x.Plane[1].Src.Buf, srcV = x.Plane[2].Src.Buf;
+        ushort[]? srcU16 = x.Plane[1].Src.Buf16, srcV16 = x.Plane[2].Src.Buf16;
         int srcUOff = x.Plane[1].Src.Offset, srcVOff = x.Plane[2].Src.Offset;
         short[] data = x.KmeansDataBuf;
         Span<short> centroids = stackalloc short[2 * PALETTE_MAX_SIZE];
         byte[] colorMap = xd.Plane[1].ColorIndexMap;
-        if (cpi.UseHighbitdepth) throw new NotImplementedException("high-bitdepth palette: av1_restore_uv_color_map");
         AomRdoptUtils.GetBlockDimensions(bsize, 1, xd, out int planeBlockWidth, out int planeBlockHeight, out int rows, out int cols);
 
         for (int r = 0; r < rows; ++r)
         {
             for (int c = 0; c < cols; ++c)
             {
-                data[(r * cols + c) * 2] = srcU[srcUOff + r * srcStride + c];
-                data[(r * cols + c) * 2 + 1] = srcV[srcVOff + r * srcStride + c];
+                if (cpi.UseHighbitdepth)
+                {
+                    data[(r * cols + c) * 2] = (short)srcU16![srcUOff + r * srcStride + c];
+                    data[(r * cols + c) * 2 + 1] = (short)srcV16![srcVOff + r * srcStride + c];
+                }
+                else
+                {
+                    data[(r * cols + c) * 2] = srcU[srcUOff + r * srcStride + c];
+                    data[(r * cols + c) * 2 + 1] = srcV[srcVOff + r * srcStride + c];
+                }
             }
         }
         for (int r = 1; r < 3; ++r)
@@ -509,25 +539,57 @@ internal static partial class AomPalette
         return n;
     }
 
+    /// <summary>av1_count_colors_highbd: the colors of the block down-converted to 8 bits (numColorBins, the palette
+    /// gate) and, with valCount, the actual colors (returned).</summary>
+    internal static int CountColorsHighbd(ushort[] src, int srcOffset, int stride, int rows, int cols, int bitDepth, Span<int> valCount,
+        Span<int> binValCount, out int numColorBins)
+    {
+        const int maxBinVal = 1 << 8;
+        int maxPixVal = 1 << bitDepth;
+        binValCount.Slice(0, maxBinVal).Clear();
+        valCount.Slice(0, maxPixVal).Clear();
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c)
+            {
+                int v = src[srcOffset + r * stride + c];
+                int thisVal = v >> (bitDepth - 8);
+                if (thisVal >= maxBinVal) continue;
+                ++binValCount[thisVal];
+                ++valCount[v];
+            }
+        int n = 0;
+        for (int i = 0; i < maxBinVal; ++i)
+            if (binValCount[i] != 0) ++n;
+        numColorBins = n;
+        n = 0;
+        for (int i = 0; i < maxPixVal; ++i)
+            if (valCount[i] != 0) ++n;
+        return n;
+    }
+
     /// <summary>av1_count_colors_with_threshold: false (with the running count) as soon as more than the threshold.</summary>
     internal static bool CountColorsWithThreshold(byte[] src, int srcOffset, int stride, int rows, int cols, int numColorsThreshold, out int numColors)
     {
-        Span<bool> hasColor = stackalloc bool[1 << 8];
-        hasColor.Clear();
-        numColors = 0;
+        // branch-free counting (a new colour is data-random), the threshold checked per row: the same verdict, and
+        // numColors = threshold + 1 when it is exceeded, as the per-sample check reports
+        if (rows <= 0 || cols <= 0) { numColors = 0; return true; }
+        if (srcOffset < 0 || (long)srcOffset + (long)(rows - 1) * stride + cols > src.Length) throw new ArgumentOutOfRangeException(nameof(rows));
+        var hasColorBuf = new StackArr256<byte>();
+        ref byte has = ref hasColorBuf[0];
+        ref byte s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), srcOffset);
+        int n = 0;
         for (int r = 0; r < rows; ++r)
         {
+            ref byte row = ref Unsafe.Add(ref s0, r * stride);
             for (int c = 0; c < cols; ++c)
             {
-                int thisVal = src[srcOffset + r * stride + c];
-                if (!hasColor[thisVal])
-                {
-                    hasColor[thisVal] = true;
-                    numColors++;
-                    if (numColors > numColorsThreshold) return false;
-                }
+                ref byte h = ref Unsafe.Add(ref has, Unsafe.Add(ref row, c));
+                n += h ^ 1;
+                h = 1;
             }
+            if (n > numColorsThreshold) { numColors = numColorsThreshold + 1; return false; }
         }
+        numColors = n;
         return true;
     }
 

@@ -57,7 +57,7 @@ internal static unsafe partial class AomReconIntra
     /// <summary>av1_use_intra_edge_upsample.</summary>
     public static int UseIntraEdgeUpsample(int bs0, int bs1, int delta, int type)
     {
-        int d = Math.Abs(delta);
+        int d = AbsI(delta);
         int blkWh = bs0 + bs1;
         if (d == 0 || d >= 40) return 0;
         return type != 0 ? (blkWh <= 8 ? 1 : 0) : (blkWh <= 16 ? 1 : 0);
@@ -315,16 +315,19 @@ internal static unsafe partial class AomReconIntra
         if (angle > 0 && angle < 90)
         {
             if (simd && upsampleAbove == 0) DrPredictionZ1Simd(dst, stride, bw, bh, above, dx);
+            else if (simd && bw <= 8 && bh <= 8) DrPredictionZ1UpSimd(dst, stride, bw, bh, above, dx);
             else DrPredictionZ1(dst, stride, bw, bh, above, left, upsampleAbove, dx, dy);
         }
         else if (angle > 90 && angle < 180)
         {
             if (simd && upsampleAbove == 0 && upsampleLeft == 0) DrPredictionZ2Simd(dst, stride, bw, bh, above, left, dx, dy);
+            else if (simd && bw <= 8) DrPredictionZ2UpSimd(dst, stride, bw, bh, above, left, upsampleAbove, upsampleLeft, dx, dy);
             else DrPredictionZ2(dst, stride, bw, bh, above, left, upsampleAbove, upsampleLeft, dx, dy);
         }
         else if (angle > 180 && angle < 270)
         {
             if (simd && upsampleLeft == 0) DrPredictionZ3Simd(dst, stride, bw, bh, left, dy);
+            else if (simd && bw <= 8 && bh <= 8) DrPredictionZ3UpSimd(dst, stride, bw, bh, left, dy);
             else DrPredictionZ3(dst, stride, bw, bh, above, left, upsampleLeft, dx, dy);
         }
         else if (angle == 90)
@@ -341,7 +344,7 @@ internal static unsafe partial class AomReconIntra
     public static void FilterIntraPredictor(byte* dst, nint stride, int txSize, byte* above, byte* left, int mode)
     {
         const int B = 33;
-        byte* buffer = stackalloc byte[B * B];
+        Unsafe.SkipInit(out StackArr1089<byte> bufferBuf); byte* buffer = (byte*)Unsafe.AsPointer(ref bufferBuf[0]);
         int bw = TxSizeWide[txSize];
         int bh = TxSizeHigh[txSize];
 
@@ -352,7 +355,7 @@ internal static unsafe partial class AomReconIntra
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
         {
             // the 8 outputs of a 4x2 cell in 8 int lanes: sum over the 7 neighbours p_j of p_j * taps[k][j]
-            Span<Vector256<int>> tc = stackalloc Vector256<int>[7];
+            Unsafe.SkipInit(out StackArr7<Vector256<int>> tcBuf); Span<Vector256<int>> tc = tcBuf;
             for (int j = 0; j < 7; j++)
                 tc[j] = Vector256.Create(taps[j], taps[8 + j], taps[16 + j], taps[24 + j], taps[32 + j], taps[40 + j], taps[48 + j], taps[56 + j]);
             var rnd = Vector256.Create(1 << (FILTER_INTRA_SCALE_BITS - 1));
@@ -433,7 +436,7 @@ internal static unsafe partial class AomReconIntra
     /// <summary>intra_edge_filter_strength (reconintra.c, static).</summary>
     public static int IntraEdgeFilterStrength(int bs0, int bs1, int delta, int type)
     {
-        int d = Math.Abs(delta);
+        int d = AbsI(delta);
         int strength = 0;
         int blkWh = bs0 + bs1;
         if (type == 0)
@@ -489,7 +492,7 @@ internal static unsafe partial class AomReconIntra
         {
             // the edge with its clamped neighbours materialised (e[-2], e[-1] = p[0]; e[sz ..] = p[sz - 1]), then 16 taps
             // sums at a time; the stores past p[sz - 1] are overwritten by the extension below
-            byte* buf = stackalloc byte[2 + 129 + 32];
+            Unsafe.SkipInit(out StackArr163<byte> bufBuf); byte* buf = (byte*)Unsafe.AsPointer(ref bufBuf[0]);
             byte* e = buf + 2;
             Buffer.MemoryCopy(p, e, 129, sz);
             byte first = e[0], last = e[sz - 1];
@@ -514,7 +517,7 @@ internal static unsafe partial class AomReconIntra
             Unsafe.InitBlockUnaligned(p + sz, last, 16);
             return;
         }
-        byte* edge = stackalloc byte[129];
+        Unsafe.SkipInit(out StackArr129<byte> edgeBuf); byte* edge = (byte*)Unsafe.AsPointer(ref edgeBuf[0]);
         Buffer.MemoryCopy(p, edge, 129, sz);
         for (int i = 1; i < sz; i++)
         {
@@ -552,7 +555,7 @@ internal static unsafe partial class AomReconIntra
         // Extend first/last samples (upper-left p[-1], last p[sz-1]) to support 4-tap filter
         p[-2] = p[-1];
         p[sz] = p[sz - 1];
-        byte* inp = stackalloc byte[48];
+        Unsafe.SkipInit(out StackArr48<byte> inpBuf); byte* inp = (byte*)Unsafe.AsPointer(ref inpBuf[0]);
         Buffer.MemoryCopy(p - 2, inp, 32, 32);
         Unsafe.InitBlockUnaligned(inp + 32, 0, 16);
         int chunks = (sz + 1 + 15) >> 4;
@@ -576,8 +579,8 @@ internal static unsafe partial class AomReconIntra
         int i;
         byte* aboveRef = refp - refStride;
         byte* leftRef = refp - 1;
-        byte* leftData = stackalloc byte[NUM_INTRA_NEIGHBOUR_PIXELS];
-        byte* aboveData = stackalloc byte[NUM_INTRA_NEIGHBOUR_PIXELS];
+        Unsafe.SkipInit(out StackArr160<byte> leftBuf); byte* leftData = (byte*)Unsafe.AsPointer(ref leftBuf[0]);
+        Unsafe.SkipInit(out StackArr160<byte> aboveBuf); byte* aboveData = (byte*)Unsafe.AsPointer(ref aboveBuf[0]);
         byte* aboveRow = aboveData + 16;
         byte* leftCol = leftData + 16;
         int txwpx = TxSizeWide[txSize];
@@ -624,9 +627,8 @@ internal static unsafe partial class AomReconIntra
             i = 0;
             if (nLeftPx > 0)
             {
-                for (; i < nLeftPx; i++) leftCol[i] = leftRef[i * refStride];
-                if (nBottomLeftPx > 0)
-                    for (; i < txhpx + nBottomLeftPx; i++) leftCol[i] = leftRef[i * refStride];
+                GatherColumn(leftCol, leftRef, refStride, nBottomLeftPx > 0 ? txhpx + nBottomLeftPx : nLeftPx);
+                i = nBottomLeftPx > 0 ? txhpx + nBottomLeftPx : nLeftPx;
                 if (i < numLeftPixelsNeeded)
                     Unsafe.InitBlockUnaligned(leftCol + i, leftCol[i - 1], (uint)(numLeftPixelsNeeded - i));
             }
@@ -713,6 +715,16 @@ internal static unsafe partial class AomReconIntra
         DrPredictor(dst, dstStride, txSize, aboveRow, leftCol, upsampleAbove, upsampleLeft, pAngle);
     }
 
+    /// <summary>dst[i] = src[i * stride] for i &lt; n (the left edge column), four at a time.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void GatherColumn(byte* dst, byte* src, nint stride, int n)
+    {
+        int i = 0;
+        for (; i + 4 <= n; i += 4, src += 4 * stride)
+            *(uint*)(dst + i) = (uint)(src[0] | src[stride] << 8 | src[2 * stride] << 16 | src[3 * stride] << 24);
+        for (; i < n; i++, src += stride) dst[i] = *src;
+    }
+
     /// <summary>build_non_directional_intra_predictors (reconintra.c, static): DC, SMOOTH*, PAETH.</summary>
     public static void BuildNonDirectionalIntraPredictors(byte* refp, nint refStride, byte* dst, nint dstStride,
         int mode, int txSize, int nTopPx, int nLeftPx)
@@ -739,8 +751,8 @@ internal static unsafe partial class AomReconIntra
             return;
         }
 
-        byte* leftData = stackalloc byte[NUM_INTRA_NEIGHBOUR_PIXELS];
-        byte* aboveData = stackalloc byte[NUM_INTRA_NEIGHBOUR_PIXELS];
+        Unsafe.SkipInit(out StackArr160<byte> leftBuf); byte* leftData = (byte*)Unsafe.AsPointer(ref leftBuf[0]);
+        Unsafe.SkipInit(out StackArr160<byte> aboveBuf); byte* aboveData = (byte*)Unsafe.AsPointer(ref aboveBuf[0]);
         byte* aboveRow = aboveData + 16;
         byte* leftCol = leftData + 16;
 
@@ -749,7 +761,8 @@ internal static unsafe partial class AomReconIntra
             Unsafe.InitBlockUnaligned(leftData, 129, NUM_INTRA_NEIGHBOUR_PIXELS);
             if (nLeftPx > 0)
             {
-                for (i = 0; i < nLeftPx; i++) leftCol[i] = leftRef[i * refStride];
+                GatherColumn(leftCol, leftRef, refStride, nLeftPx);
+                i = nLeftPx;
                 if (i < txhpx) Unsafe.InitBlockUnaligned(leftCol + i, leftCol[i - 1], (uint)(txhpx - i));
             }
             else if (nTopPx > 0)
@@ -940,6 +953,11 @@ internal static unsafe partial class AomReconIntra
     public static void PredictIntraBlockFacade(AomMacroblockD xd, int sbSize, bool enableIntraEdgeFilter, int plane,
         int blkCol, int blkRow, int txSize)
     {
+        if (xd.Plane[plane].Dst.Buf16 != null)
+        {
+            PredictIntraBlockFacadeHbd(xd, sbSize, enableIntraEdgeFilter, plane, blkCol, blkRow, txSize);
+            return;
+        }
         AomMbModeInfo mbmi = xd.Mi0;
         AomMbdPlane pd = xd.Plane[plane];
         int dstStride = pd.Dst.Stride;

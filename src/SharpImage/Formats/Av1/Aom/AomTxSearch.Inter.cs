@@ -17,9 +17,13 @@ internal static partial class AomTxSearch
 {
     private const int MAX_VARTX_DEPTH_ = 2;
 
-    // skip_pred_threshold[0] (8-bit) and max_predict_sf_tx_size
+    // skip_pred_threshold[bd_idx] (8 / 10 / 12-bit) and max_predict_sf_tx_size
     private static readonly uint[] SkipPredThreshold8 =
         { 64, 64, 64, 70, 60, 60, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 64, 64, 70, 70, 68, 68 };
+    private static readonly uint[] SkipPredThreshold10 =
+        { 88, 88, 88, 86, 87, 87, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 88, 88, 86, 86, 68, 68 };
+    private static readonly uint[] SkipPredThreshold12 =
+        { 90, 93, 93, 90, 93, 93, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 90, 90, 90, 90, 74, 74 };
     private static readonly byte[] MaxPredictSfTxSize =
     {
         TX_4X4, TX_4X8, TX_8X4, TX_8X8, TX_8X16, TX_16X8, TX_16X16, TX_16X16, TX_16X16, TX_16X16, TX_16X16, TX_16X16,
@@ -72,19 +76,24 @@ internal static partial class AomTxSearch
         int maxTxSize = MaxPredictSfTxSize[bsize];
         int txH = TxSizeHigh[maxTxSize], txW = TxSizeWide[maxTxSize];
         Span<int> coefs = stackalloc int[32 * 32];
-        uint maxQcoefThresh = SkipPredThreshold8[bsize];
+        coefs.Clear();
+        uint maxQcoefThresh = (xd.Bd == 8 ? SkipPredThreshold8 : xd.Bd == 10 ? SkipPredThreshold10 : SkipPredThreshold12)[bsize];
         var srcDiff = x.Plane[0].SrcDiff;
         int nCoeff = txW * txH;
-        int acQ = Av1Tables.DequantTable[0, Math.Clamp(x.Qindex, 0, 255), 1];
+        int acQ = Av1Tables.DequantTable[xd.Bd == 8 ? 0 : xd.Bd == 10 ? 1 : 2, Math.Clamp(x.Qindex, 0, 255), 1];
         uint dcThresh = maxQcoefThresh * (uint)dcQ, acThresh = maxQcoefThresh * (uint)acQ;
         int rowOff = 0;
         for (int row = 0; row < bh; row += txH)
         {
             for (int col = 0; col < bw; col += txW)
             {
-                // av1_fwd_txfm (DCT_DCT, lossless 0)
-                Av1FwdTxfmAom.ForwardRaw(srcDiff.AsSpan(rowOff + col), bw, txW, txH, maxTxSize, Av1InvTransform.Type1dDct,
-                    Av1InvTransform.Type1dDct, false, false, coefs.Slice(0, nCoeff));
+                // av1_fwd_txfm (DCT_DCT, lossless 0; high bit depth: av1_highbd_fwd_txfm)
+                if (xd.Bd > 8)
+                    Av1FwdTxfmAom.ForwardRawRef(srcDiff.AsSpan(rowOff + col), bw, txW, txH, maxTxSize, Av1InvTransform.Type1dDct,
+                        Av1InvTransform.Type1dDct, false, false, coefs.Slice(0, nCoeff));
+                else
+                    Av1FwdTxfmAom.ForwardRaw(srcDiff.AsSpan(rowOff + col), bw, txW, txH, maxTxSize, Av1InvTransform.Type1dDct,
+                        Av1InvTransform.Type1dDct, false, false, coefs.Slice(0, nCoeff));
                 uint dcCoef = (uint)Math.Abs(coefs[0]) << 7;
                 if (dcCoef >= dcThresh) return false;
                 for (int i = 1; i < nCoeff; ++i)
@@ -109,6 +118,7 @@ internal static partial class AomTxSearch
         Array.Fill(mbmi.InterTxSize, (byte)txSize);
         mbmi.TxSize = txSize;
         rdStats.SkipTxfm = 1;
+        if (xd.Bd > 8) dist = (dist + (1L << (2 * (xd.Bd - 8) - 1))) >> (2 * (xd.Bd - 8));   // ROUND_POWER_OF_TWO
         rdStats.Dist = rdStats.Sse = dist << 4;
         Span<byte> ctxa = stackalloc byte[AomMacroblockD.MaxMibSize];
         Span<byte> ctxl = stackalloc byte[AomMacroblockD.MaxMibSize];
@@ -231,7 +241,11 @@ internal static partial class AomTxSearch
         var noSplit = new TxCandidateInfo { Rd = long.MaxValue, TxbEntropyCtx = 0, TxType = TX_TYPES };
 
         if (txSize != TX_4X4 && trySplit && tryNoSplit && sf.tx_sf.prune_tx_size_level > 0)
-            throw new NotSupportedException("prune_tx_split_no_split (prune_tx_size_level is set for high bit depth only)");
+        {
+            int diffStride = BlockSizeWide[planeBsize];
+            AomMl.PruneTxSplitNoSplit(p.SrcDiff.AsSpan(4 * blkRow * diffStride + 4 * blkCol), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
+                p.Dequant0, p.Dequant1, ref tryNoSplit, ref trySplit, sf.tx_sf.prune_tx_size_level);
+        }
         // (rt_sf.skip_tx_no_split_var_based_partition is a real-time feature)
 
         if (tryNoSplit)

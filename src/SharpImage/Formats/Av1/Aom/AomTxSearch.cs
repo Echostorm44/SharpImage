@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System;
 using static SharpImage.Formats.Av1.AomTables;
 
@@ -34,9 +35,14 @@ internal sealed class AomRdcostBlockArgs
 /// <summary>Optional per-call RD trace (same lines as the scratchpad aomoracle's libaom wrappers).</summary>
 internal static class AomTrace
 {
-    [ThreadStatic] public static System.IO.TextWriter? Out;
+    // tracing compiles away unless AOM_TRACE is set at startup (a static readonly the JIT folds; the thread-static
+    // writer alone cost a TLS lookup per check in the hot search loops)
+    private static readonly bool On = Environment.GetEnvironmentVariable("AOM_TRACE") != null;
+    [ThreadStatic] private static System.IO.TextWriter? t_out;
+    public static System.IO.TextWriter? Out { get => On ? t_out : null; set => t_out = value; }
 }
 
+[System.Runtime.CompilerServices.SkipLocalsInit]
 internal static partial class AomTxSearch
 {
     public const int FTXS_NONE = 0, FTXS_DCT_AND_1D_DCT_ONLY = 1 << 0, FTXS_DISABLE_TRELLIS_OPT = 1 << 1, FTXS_USE_TRANSFORM_DOMAIN = 1 << 2;
@@ -199,7 +205,7 @@ internal static partial class AomTxSearch
         {
             double normFactor = 1.0 / (visibleCols * visibleRows);
             int signSum = sum > 0 ? 1 : -1;
-            perPxMean = (long)(normFactor * Math.Abs(sum)) << 7;
+            perPxMean = (long)(normFactor * AbsI(sum)) << 7;
             perPxMean = signSum * perPxMean;
             blockMseQ8 = (uint)(normFactor * (256 * sse));
             blockVar = sse - (ulong)(normFactor * sum * sum);
@@ -208,7 +214,17 @@ internal static partial class AomTxSearch
         return (long)sse;
     }
 
-    [ThreadStatic] private static byte[]? t_recon;
+
+    /// <summary>pixel_dist / pixel_dist_visible_only (high bit depth): the variance kernel's SSE or aom_highbd_sse_odd_size,
+    /// both rounded by 2 (bd - 8) bits.</summary>
+    private static uint PixelDist(AomMacroblock x, int plane, ushort[] src, int srcOff, int srcStride, ushort[] dst, int dstOff, int dstStride,
+        int blkRow, int blkCol, int planeBsize, int txBsize)
+    {
+        AomEncodeMb.TxbDimensions(x.E, plane, planeBsize, blkRow, blkCol, txBsize, out _, out _, out int visibleCols, out int visibleRows);
+        long sse = AomHbd.Sse(src, srcOff, srcStride, dst, dstOff, dstStride, visibleCols, visibleRows);
+        int s = (x.E.Bd - 8) * 2;
+        return (uint)((sse + (1L << (s - 1))) >> s);
+    }
 
     /// <summary>dist_block_px_domain: the SSE (x16) of the source against dst plus the block's inverse transform.</summary>
     private static long DistBlockPxDomain(AomComp cpi, AomMacroblock x, int plane, int planeBsize, int block, int blkRow, int blkCol, int txSize)
@@ -223,7 +239,17 @@ internal static partial class AomTxSearch
         int srcIdx = p.Src.Offset + ((blkRow * srcStride + blkCol) << 2);
         int dstIdx = pd.Dst.Offset + ((blkRow * dstStride + blkCol) << 2);
         const int MaxTxSize = 64;
-        var recon = t_recon ??= new byte[MaxTxSize * MaxTxSize];
+        if (pd.Dst.Buf16 != null)
+        {
+            // high bit depth: recon16 (aom_highbd_convolve_copy), av1_highbd_inv_txfm_add, the rounded highbd SSE
+            var recon16 = x.ScratchRecon16 ??= new ushort[MaxTxSize * MaxTxSize];
+            AomHbd.CopyBlock(pd.Dst.Buf16, dstIdx, dstStride, recon16, 0, MaxTxSize, bsw, bsh);
+            int txType16 = AomEncodeMb.GetTxType(xd, plane == 0 ? 0 : 1, blkRow, blkCol, txSize, cpi.ReducedTxSetUsed != 0);
+            AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType16, txSize, recon16, 0, MaxTxSize, eob, xd.Bd,
+                xd.Lossless[xd.Mi0.SegmentId] != 0);
+            return 16 * (long)PixelDist(x, plane, p.Src.Buf16, srcIdx, srcStride, recon16, 0, MaxTxSize, blkRow, blkCol, planeBsize, txBsize);
+        }
+        var recon = x.ScratchRecon;
         AomEncodeMb.CopyBlock(pd.Dst.Buf, dstIdx, dstStride, recon, 0, MaxTxSize, bsw, bsh);
         int txType = AomEncodeMb.GetTxType(xd, plane == 0 ? 0 : 1, blkRow, blkCol, txSize, cpi.ReducedTxSetUsed != 0);
         AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, recon, 0, MaxTxSize, eob, xd.Lossless[xd.Mi0.SegmentId] != 0);
@@ -248,7 +274,15 @@ internal static partial class AomTxSearch
         int shift = (MAX_TX_SCALE - AomQuantize.TxScale(txSize)) * 2;
         int off = AomEncodeMb.BlockOffset(block);
         long dist, thisSse;
-        if (qmatrix == null || x.TxfmSearchParams.UseQmDistMetric == 0)
+        if (x.E.Bd > 8)
+        {
+            if (qmatrix == null || x.TxfmSearchParams.UseQmDistMetric == 0)
+                dist = AomHbd.BlockError(p.Coeff.AsSpan(off, bufferLength), p.Dqcoeff.AsSpan(off, bufferLength), bufferLength, out thisSse, x.E.Bd);
+            else
+                dist = AomQm.BlockErrorQm(p.Coeff.AsSpan(off, bufferLength), p.Dqcoeff.AsSpan(off, bufferLength), bufferLength, qmatrix,
+                    AomEncodeMb.ScanOf(txSize, txType), out thisSse, x.E.Bd);
+        }
+        else if (qmatrix == null || x.TxfmSearchParams.UseQmDistMetric == 0)
             dist = AomEncodeMb.BlockErrorAvx2(p.Coeff.AsSpan(off, bufferLength), p.Dqcoeff.AsSpan(off, bufferLength), bufferLength, out thisSse);
         else
             dist = AomQm.BlockErrorQm(p.Coeff.AsSpan(off, bufferLength), p.Dqcoeff.AsSpan(off, bufferLength), bufferLength, qmatrix,
@@ -305,12 +339,12 @@ internal static partial class AomTxSearch
     private static ushort PruneTxkTypeSepar(AomComp cpi, AomMacroblock x, int plane, int block, int txSize, int blkRow, int blkCol,
         int planeBsize, Span<int> txkMap, int allowedTxMask, int pruneFactor, AomTxbCtx txbCtx, long refBestRd, int numSel)
     {
-        Span<long> rdsV = stackalloc long[4];
-        Span<long> rdsH = stackalloc long[4];
-        Span<int> idxV = stackalloc int[] { 0, 1, 2, 3 };
-        Span<int> idxH = stackalloc int[] { 0, 1, 2, 3 };
-        Span<int> skipV = stackalloc int[4];
-        Span<int> skipH = stackalloc int[4];
+        var rdsVBuf1 = new StackArr4<long>(); Span<long> rdsV = rdsVBuf1;
+        var rdsHBuf2 = new StackArr4<long>(); Span<long> rdsH = rdsHBuf2;
+        var idxVBuf3 = new StackArr4<int>(); Span<int> idxV = idxVBuf3; for (int q = 0; q < 4; q++) idxV[q] = q;
+        var idxHBuf4 = new StackArr4<int>(); Span<int> idxH = idxHBuf4; for (int q = 0; q < 4; q++) idxH[q] = q;
+        var skipVBuf5 = new StackArr4<int>(); Span<int> skipV = skipVBuf5;
+        var skipHBuf6 = new StackArr4<int>(); Span<int> skipH = skipHBuf6;
         skipV.Clear(); skipH.Clear();
         var qp = AomEncodeMb.SetupQuant(txSize, true, AomXformQuant.B, cpi.QuantBAdapt);
         int rateCost;
@@ -350,7 +384,7 @@ internal static partial class AomTxSearch
             if (rdsV[idx] > rdsV[0] * 1.2) skipV[idxV[idx]] = 1;
 
         // combine rd_h and rd_v to prune tx candidates
-        Span<long> rds = stackalloc long[16];
+        var rdsBuf7 = new StackArr16<long>(); Span<long> rds = rdsBuf7;
         int numCand = 0, last = TX_TYPES - 1;
         for (int i = 0; i < 16; i++)
         {
@@ -386,7 +420,7 @@ internal static partial class AomTxSearch
     private static ushort PruneTxkType(AomComp cpi, AomMacroblock x, int plane, int block, int txSize, int blkRow, int blkCol,
         int planeBsize, Span<int> txkMap, int allowedTxMask, int pruneFactor, AomTxbCtx txbCtx)
     {
-        Span<long> rds = stackalloc long[TX_TYPES];
+        var rdsBuf8 = new StackArr16<long>(); Span<long> rds = rdsBuf8;
         int numCand = 0, last = TX_TYPES - 1;
         var qp = AomEncodeMb.SetupQuant(txSize, true, AomXformQuant.B, cpi.QuantBAdapt);
         for (int idx = 0; idx < TX_TYPES; idx++)
@@ -563,7 +597,7 @@ internal static partial class AomTxSearch
         int off = AomEncodeMb.BlockOffset(block);
         int nCoeffs = AomEncodeMb.MaxEob(txSize);
         int shift = MAX_TX_SCALE - AomQuantize.TxScale(txSize);
-        int satd = dcOnlyBlk ? Math.Abs(p.Coeff[off]) : AomEncodeMb.Satd(p.Coeff.AsSpan(off, nCoeffs), nCoeffs);
+        int satd = dcOnlyBlk ? AbsI(p.Coeff[off]) : AomEncodeMb.Satd(p.Coeff.AsSpan(off, nCoeffs), nCoeffs);
         satd = (int)RightSignedShift(satd, shift);
         satd >>= x.E.Bd - 8;
         bool skipBlockTrellis = (ulong)satd > (ulong)coeffOptSatdThreshold * (ulong)qstep * (ulong)SqrtTxPixels2d[txSize];
@@ -573,6 +607,7 @@ internal static partial class AomTxSearch
     }
 
     /// <summary>predict_dc_only_block.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private static void PredictDcOnlyBlock(AomMacroblock x, int plane, int planeBsize, int txSize, int block, int blkRow, int blkCol,
         ref AomRdStats bestRdStats, out long blockSse, out uint blockMseQ8, ref long perPxMean, ref bool dcOnlyBlk)
     {
@@ -597,8 +632,8 @@ internal static partial class AomTxSearch
             bestRdStats.Sse = bestRdStats.Dist;
 
             // (libaom takes the contexts of the whole plane block's top-left here, not of this tx block)
-            Span<byte> ctxa = stackalloc byte[AomMacroblockD.MaxMibSize];
-            Span<byte> ctxl = stackalloc byte[AomMacroblockD.MaxMibSize];
+            var ctxaBuf9 = new StackArr32<byte>(); Span<byte> ctxa = ctxaBuf9;
+            var ctxlBuf10 = new StackArr32<byte>(); Span<byte> ctxl = ctxlBuf10;
             GetEntropyContexts(planeBsize, xd.Plane[plane], ctxa, ctxl);
             int txsCtx = AomTxb.TxsizeEntropyCtx(txSize);
             var txbCtxTmp = AomTxb.TxbCtx(planeBsize, txSize, plane, ctxa, ctxl);
@@ -624,11 +659,18 @@ internal static partial class AomTxSearch
         int txType = AomEncodeMb.GetTxType(xd, plane == 0 ? 0 : 1, blkRow, blkCol, txSize, reducedTxSet != 0);
         var pd = xd.Plane[plane];
         int dstStride = pd.Dst.Stride;
+        if (pd.Dst.Buf16 != null)
+        {
+            AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst.Buf16,
+                pd.Dst.Offset + ((blkRow * dstStride + blkCol) << 2), dstStride, eob, xd.Bd, xd.Lossless[xd.Mi0.SegmentId] != 0);
+            return;
+        }
         AomEncodeMb.InverseTransformBlock(p.Dqcoeff, AomEncodeMb.BlockOffset(block), txType, txSize, pd.Dst.Buf,
             pd.Dst.Offset + ((blkRow * dstStride + blkCol) << 2), dstStride, eob, xd.Lossless[xd.Mi0.SegmentId] != 0);
     }
 
     /// <summary>recon_intra.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private static void ReconIntra(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize,
         AomTxbCtx txbCtx, bool skipTrellis, int bestTxType, bool doQuant, ref int rateCost, int bestEob)
     {
@@ -677,7 +719,7 @@ internal static partial class AomTxSearch
 
         byte bestTxbCtx = 0;
         int txkAllowed = TX_TYPES;
-        Span<int> txkMap = stackalloc int[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        var txkMapBuf11 = new StackArr16<int>(); Span<int> txkMap = txkMapBuf11; for (int q = 0; q < 16; q++) txkMap[q] = q;
         int dequantShift = xd.Bd > 8 ? xd.Bd - 5 : 3;
         int qstep = p.Dequant1 >> dequantShift;
 
@@ -728,7 +770,7 @@ internal static partial class AomTxSearch
         if (calcPixelDomainDistortionFinal && (txkAllowed < TX_TYPES || allowedTxMask == 0x0001))
             calcPixelDomainDistortionFinal = useTransformDomainDistortion = false;
 
-        Span<bool> skipTrellisBasedOnSatd = stackalloc bool[TX_TYPES];
+        var skipTrellisBasedOnSatdBuf12 = new StackArr16<bool>(); Span<bool> skipTrellisBasedOnSatd = skipTrellisBasedOnSatdBuf12;
         skipTrellisBasedOnSatd.Clear();
         var qp = AomEncodeMb.SetupQuant(txSize, !skipTrellis,
             skipTrellis ? (UseBQuantNoTrellis ? AomXformQuant.B : AomXformQuant.Fp) : AomXformQuant.Fp, cpi.QuantBAdapt);
@@ -911,7 +953,6 @@ internal static partial class AomTxSearch
         if (args.CurrentRd > args.BestRd) args.ExitEarly = true;
     }
 
-    [ThreadStatic] private static AomRdcostBlockArgs? t_args;
 
     /// <summary>av1_txfm_rd_in_plane.</summary>
     internal static void TxfmRdInPlane(AomMacroblock x, AomComp cpi, ref AomRdStats rdStats, long refBestRd, long currentRd, int plane,
@@ -922,7 +963,7 @@ internal static partial class AomTxSearch
 
         var xd = x.E;
         var pd = xd.Plane[plane];
-        var args = t_args ??= new AomRdcostBlockArgs();
+        var args = x.ScratchRdArgs ??= new AomRdcostBlockArgs();
         // (re-entrancy: the chroma CfL search can nest a luma search; take a fresh args object when one is live)
         if (args.X != null) args = new AomRdcostBlockArgs();
         args.Reset();
@@ -1046,12 +1087,12 @@ internal static partial class AomTxSearch
             initDepth = MAX_TX_DEPTH;
         }
 
-        Span<byte> bestTxkTypeMap = stackalloc byte[AomMacroblockD.MaxMibSize * AomMacroblockD.MaxMibSize];
+        var bestTxkTypeMapBuf13 = new StackArr1024<byte>(); Span<byte> bestTxkTypeMap = bestTxkTypeMapBuf13;
         int bestTxSize = maxRectTxSize;
         long bestRd = long.MaxValue;
         int numBlks = BsizeToNumBlk(bs);
         x.RdModel = FULL_TXFM_RD;
-        Span<long> rd = stackalloc long[] { long.MaxValue, long.MaxValue, long.MaxValue };
+        var rdBuf14 = new StackArr3<long>(); Span<long> rd = rdBuf14; rd.Fill(long.MaxValue);
         var map = xd.TxTypeMap.AsSpan(xd.TxTypeMapOffset, numBlks);
         for (int txSize = startTx, depth = initDepth; depth <= MAX_TX_DEPTH; depth++, txSize = SubTxSizeMap[txSize])
         {

@@ -335,6 +335,11 @@ internal static class AomNonrdPickMode
         int eobCost = 0;
         int bw = 4 * num4x4W, bh = 4 * num4x4H;
 
+        if (p.Src.Buf16 != null)
+        {
+            BlockYrdHbd(x, ref thisRdc, ref skippable, bsize, txSize);
+            return;
+        }
         AomEncodeMb.SubtractBlock(bh, bw, p.SrcDiff, 0, bw, p.Src.Buf, p.Src.Offset, p.Src.Stride, pd.Dst.Buf, pd.Dst.Offset, pd.Dst.Stride);
 
         int tempSkippable = 1;
@@ -396,6 +401,81 @@ internal static class AomNonrdPickMode
         thisRdc.Rate += eobCost << AV1_PROB_COST_SHIFT;
     }
 
+    // av1_default_iscan_fp_16x16_transpose (nonrd_opt.h)
+    private static readonly short[] IscanFp16x16Transpose =
+    {
+        0, 44, 2, 46, 1, 45, 4, 64, 3, 63, 9, 69, 8, 68, 11, 87, 5, 65, 7, 67, 6, 66, 13, 89, 12, 88, 18, 94, 17, 93, 24, 116,
+        14, 90, 16, 92, 15, 91, 26, 118, 25, 117, 31, 123, 30, 122, 41, 148, 27, 119, 29, 121, 28, 120, 43, 150, 42, 149, 48, 152,
+        47, 151, 62, 177, 10, 86, 20, 96, 19, 95, 22, 114, 21, 113, 35, 127, 34, 126, 37, 144, 23, 115, 33, 125, 32, 124, 39, 146,
+        38, 145, 52, 156, 51, 155, 58, 173, 40, 147, 50, 154, 49, 153, 60, 175, 59, 174, 73, 181, 72, 180, 83, 198, 61, 176, 71, 179,
+        70, 178, 85, 200, 84, 199, 98, 202, 97, 201, 112, 219, 36, 143, 54, 158, 53, 157, 56, 171, 55, 170, 77, 185, 76, 184, 79, 194,
+        57, 172, 75, 183, 74, 182, 81, 196, 80, 195, 102, 206, 101, 205, 108, 215, 82, 197, 100, 204, 99, 203, 110, 217, 109, 216,
+        131, 223, 130, 222, 140, 232, 111, 218, 129, 221, 128, 220, 142, 234, 141, 233, 160, 236, 159, 235, 169, 245, 78, 193, 104,
+        208, 103, 207, 106, 213, 105, 212, 135, 227, 134, 226, 136, 228, 107, 214, 133, 225, 132, 224, 138, 230, 137, 229, 164, 240,
+        163, 239, 165, 241, 139, 231, 162, 238, 161, 237, 167, 243, 166, 242, 189, 249, 188, 248, 190, 250, 168, 244, 187, 247, 186,
+        246, 192, 252, 191, 251, 210, 254, 209, 253, 211, 255,
+    };
+
+    [ThreadStatic] private static int[]? t_hCoeff, t_hQcoeff, t_hDqcoeff;
+
+    /// <summary>av1_block_yrd's high bit depth path: aom_highbd_subtract_block, the lowbd aom_hadamard_16x16 / 8x8 and
+    /// aom_fdct4x4 kernels into tran_low_t, the lowbd av1_quantize_fp (the transposed fp iscans for the Hadamards),
+    /// update_yrd_loop_vars_hbd (aom_satd, av1_highbd_block_error).</summary>
+    private static void BlockYrdHbd(AomMacroblock x, ref AomRdStats thisRdc, ref int skippable, int bsize, int txSize)
+    {
+        var xd = x.E;
+        var pd = xd.Plane[0];
+        var p = x.Plane[0];
+        int num4x4W = MiSizeWide[bsize], num4x4H = MiSizeHigh[bsize];
+        int step = 1 << (txSize << 1);
+        int blockStep = 1 << txSize;
+        int maxBlocksWide = num4x4W + (xd.MbToRightEdge >= 0 ? 0 : xd.MbToRightEdge >> 5);
+        int maxBlocksHigh = num4x4H + (xd.MbToBottomEdge >= 0 ? 0 : xd.MbToBottomEdge >> 5);
+        int eobCost = 0;
+        int bw = 4 * num4x4W, bh = 4 * num4x4H;
+        AomHbd.SubtractBlock(bh, bw, p.SrcDiff, 0, bw, p.Src.Buf16, p.Src.Offset, p.Src.Stride, pd.Dst.Buf16, pd.Dst.Offset, pd.Dst.Stride);
+        int tempSkippable = 1;
+        thisRdc.Dist = 0;
+        thisRdc.Rate = 0;
+        var coeff = t_hCoeff ??= new int[256];
+        var qcoeff = t_hQcoeff ??= new int[256];
+        var dqcoeff = t_hDqcoeff ??= new int[256];
+        int diffStride = bw;
+        int n = step << 4;
+        for (int r = 0; r < maxBlocksHigh; r += blockStep)
+            for (int c = 0; c < maxBlocksWide; c += blockStep)
+            {
+                var srcDiff = p.SrcDiff.AsSpan((r * diffStride + c) << 2);
+                short[] iscan;
+                switch (txSize)
+                {
+                    case TX_16X16: AomHbd.Hadamard16x16Lbd(srcDiff, diffStride, coeff); iscan = IscanFp16x16Transpose; break;
+                    case TX_8X8: AomHadamard.H8x8(srcDiff, diffStride, coeff); iscan = Iscan8x8Transpose; break;
+                    default: AomHbd.Fdct4x4Sse2(srcDiff, diffStride, coeff); iscan = AomEncodeMb.IScanOf(TX_4X4, DCT_DCT); break;
+                }
+                int eob = AomQuantize.QuantizeFpAvx2(coeff, n, iscan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1, p.Dequant0, p.Dequant1,
+                    0, qcoeff, dqcoeff);
+                tempSkippable &= eob == 0 ? 1 : 0;
+                eobCost += System.Numerics.BitOperations.Log2((uint)(eob + 1));
+                if (eob == 1) thisRdc.Rate += Math.Abs(qcoeff[0]);
+                else if (eob > 1) thisRdc.Rate += AomEncodeMb.Satd(qcoeff, n);
+                thisRdc.Dist += AomHbd.BlockError(coeff, dqcoeff, n, out _, xd.Bd) >> 2;
+            }
+        thisRdc.SkipTxfm = (byte)tempSkippable;
+        skippable = tempSkippable;
+        if (thisRdc.Sse < long.MaxValue)
+        {
+            thisRdc.Sse = (thisRdc.Sse << 6) >> 2;
+            if (tempSkippable != 0)
+            {
+                thisRdc.Dist = thisRdc.Sse;
+                return;
+            }
+        }
+        thisRdc.Rate <<= 2 + AV1_PROB_COST_SHIFT;
+        thisRdc.Rate += eobCost << AV1_PROB_COST_SHIFT;
+    }
+
     // ---- av1_nonrd_pick_intra_mode
 
     private sealed class EstimateBlockIntraArgs
@@ -421,7 +501,10 @@ internal static class AomNonrdPickMode
 
         if (args.PruneModeBasedOnSad)
         {
-            uint thisSad = AomSad.Sad(p.Src.Buf, p.Src.Offset, p.Src.Stride, pd.Dst.Buf, pd.Dst.Offset, pd.Dst.Stride,
+            uint thisSad = p.Src.Buf16 != null
+                ? AomHbd.Sad(p.Src.Buf16, p.Src.Offset, p.Src.Stride, pd.Dst.Buf16, pd.Dst.Offset, pd.Dst.Stride,
+                    BlockSizeWide[planeBsize], BlockSizeHigh[planeBsize]) >> (xd.Bd - 8)   // fn_ptr sdf: the _bits10 / _bits12 wrappers
+                : AomSad.Sad(p.Src.Buf, p.Src.Offset, p.Src.Stride, pd.Dst.Buf, pd.Dst.Offset, pd.Dst.Stride,
                 BlockSizeWide[planeBsize], BlockSizeHigh[planeBsize]);
             uint sadThreshold = args.BestSad != uint.MaxValue ? args.BestSad + (args.BestSad >> 4) : uint.MaxValue;
             // Skip the evaluation of the current mode if its SAD is more than a threshold.
@@ -429,6 +512,7 @@ internal static class AomNonrdPickMode
             {
                 rdc.Rate = int.MaxValue;
                 rdc.Dist = long.MaxValue;
+                AomTrace.Out?.Write($"ebi {xd.MiRow} {xd.MiCol} p{plane} {blkRow} {blkCol} mode {args.Mode} tx {txSize} sad {args.BestSad} rate {rdc.Rate} dist {rdc.Dist} skip {args.Skippable}\n");
                 return;
             }
             if (thisSad < args.BestSad) args.BestSad = thisSad;
@@ -443,6 +527,7 @@ internal static class AomNonrdPickMode
         pd.Dst = dstBase;
         rdc.Rate += thisRdc.Rate;
         rdc.Dist += thisRdc.Dist;
+        AomTrace.Out?.Write($"ebi {xd.MiRow} {xd.MiCol} p{plane} {blkRow} {blkCol} mode {args.Mode} tx {txSize} sad {args.BestSad} rate {rdc.Rate} dist {rdc.Dist} skip {args.Skippable}\n");
     }
 
     /// <summary>should_prune_intra_modes_using_neighbors.</summary>

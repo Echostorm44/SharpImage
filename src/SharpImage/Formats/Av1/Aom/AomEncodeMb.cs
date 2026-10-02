@@ -27,7 +27,8 @@ internal struct AomQuantParam
 // Port of libaom 3.14.1 av1/encoder/encodemb.{c,h} (subtract, xform, quant, optimize_b, set_txb_context), the
 // transform-block iterator, av1_inverse_transform_block's use, and the 8-bit distortion kernels the search uses
 // (aom_sum_squares_2d_i16, aom_sum_sse_2d_i16, aom_sse, av1_block_error as AVX2 runs it, aom_satd).
-internal static class AomEncodeMb
+[System.Runtime.CompilerServices.SkipLocalsInit]
+internal static partial class AomEncodeMb
 {
     /// <summary>BLOCK_OFFSET: a tx block's coefficient offset (block counts 4x4 units).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -216,6 +217,21 @@ internal static class AomEncodeMb
             }
             return;
         }
+        if (cols == 4 && Sse41.IsSupported && rows > 0 && diffOff >= 0 && srcOff >= 0 && predOff >= 0
+            && diffOff + (long)(rows - 1) * diffStride + 4 <= diff.Length && srcOff + (long)(rows - 1) * srcStride + 4 <= src.Length
+            && predOff + (long)(rows - 1) * predStride + 4 <= pred.Length)
+        {
+            ref byte sr = ref MemoryMarshal.GetArrayDataReference(src);
+            ref byte pr = ref MemoryMarshal.GetArrayDataReference(pred);
+            ref short dr = ref MemoryMarshal.GetArrayDataReference(diff);
+            for (int r = 0; r < rows; r++)
+            {
+                var a = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref sr, srcOff + r * srcStride))).AsByte());
+                var b = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pr, predOff + r * predStride))).AsByte());
+                Unsafe.WriteUnaligned(ref Unsafe.As<short, byte>(ref Unsafe.Add(ref dr, diffOff + r * diffStride)), (a - b).AsUInt64().ToScalar());
+            }
+            return;
+        }
         for (int r = 0; r < rows; r++)
         {
             int d = diffOff + r * diffStride, s = srcOff + r * srcStride, p = predOff + r * predStride;
@@ -229,6 +245,13 @@ internal static class AomEncodeMb
         var p = x.Plane[plane];
         var pd = x.E.Plane[plane];
         int diffStride = BlockSizeWide[planeBsize];
+        if (p.Src.Buf16 != null)
+        {
+            AomHbd.SubtractBlock(TxSizeHigh[txSize], TxSizeWide[txSize], p.SrcDiff, (blkRow * diffStride + blkCol) << 2, diffStride,
+                p.Src.Buf16, p.Src.Offset + ((blkRow * p.Src.Stride + blkCol) << 2), p.Src.Stride,
+                pd.Dst.Buf16, pd.Dst.Offset + ((blkRow * pd.Dst.Stride + blkCol) << 2), pd.Dst.Stride);
+            return;
+        }
         SubtractBlock(TxSizeHigh[txSize], TxSizeWide[txSize], p.SrcDiff, (blkRow * diffStride + blkCol) << 2, diffStride,
             p.Src.Buf, p.Src.Offset + ((blkRow * p.Src.Stride + blkCol) << 2), p.Src.Stride,
             pd.Dst.Buf, pd.Dst.Offset + ((blkRow * pd.Dst.Stride + blkCol) << 2), pd.Dst.Stride);
@@ -240,11 +263,36 @@ internal static class AomEncodeMb
         var p = x.Plane[plane];
         var pd = x.E.Plane[plane];
         int bw = BlockSizeWide[planeBsize], bh = BlockSizeHigh[planeBsize];
+        if (p.Src.Buf16 != null)
+        {
+            AomHbd.SubtractBlock(bh, bw, p.SrcDiff, 0, bw, p.Src.Buf16, p.Src.Offset, p.Src.Stride, pd.Dst.Buf16, pd.Dst.Offset, pd.Dst.Stride);
+            return;
+        }
         SubtractBlock(bh, bw, p.SrcDiff, 0, bw, p.Src.Buf, p.Src.Offset, p.Src.Stride, pd.Dst.Buf, pd.Dst.Offset, pd.Dst.Stride);
     }
 
     /// <summary>The (horizontal, vertical) 1D kinds and flips of a TX_TYPE (htx_tab / vtx_tab; FLIPADST = ADST + flip).</summary>
+    // (hKind, vKind, flipUd, flipLr) of each TX_TYPE packed as hKind | vKind << 4 | flipUd << 8 | flipLr << 9
+    private static readonly short[] TxTypeKindTab = BuildTxTypeKindTab();
+    private static short[] BuildTxTypeKindTab()
+    {
+        var t = new short[16];
+        for (int i = 0; i < 16; i++)
+        {
+            TxTypeKindsSlow(i, out int h, out int v, out bool ud, out bool lr);
+            t[i] = (short)(h | v << 4 | (ud ? 1 << 8 : 0) | (lr ? 1 << 9 : 0));
+        }
+        return t;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void TxTypeKinds(int txType, out int hKind, out int vKind, out bool flipUd, out bool flipLr)
+    {
+        int k = TxTypeKindTab[txType & 15];
+        hKind = k & 15; vKind = (k >> 4) & 15; flipUd = (k & (1 << 8)) != 0; flipLr = (k & (1 << 9)) != 0;
+    }
+
+    private static void TxTypeKindsSlow(int txType, out int hKind, out int vKind, out bool flipUd, out bool flipLr)
     {
         static int Kind(int t1d) => t1d switch
         {
@@ -267,8 +315,13 @@ internal static class AomEncodeMb
             return;
         }
         TxTypeKinds(txType, out int hKind, out int vKind, out bool flipUd, out bool flipLr);
-        Av1FwdTxfmAom.ForwardRaw(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
-            txSize, hKind, vKind, flipUd, flipLr, p.Coeff.AsSpan(BlockOffset(block), MaxEob(txSize)));
+        // high bit depth: av1_highbd_fwd_txfm (av1_fwd_txfm2d_* in 32-bit lanes, every size)
+        if (x.E.Bd > 8)
+            Av1FwdTxfmAom.ForwardRawRef(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
+                txSize, hKind, vKind, flipUd, flipLr, p.Coeff.AsSpan(BlockOffset(block), MaxEob(txSize)));
+        else
+            Av1FwdTxfmAom.ForwardRaw(p.SrcDiff.AsSpan((blkRow * diffStride + blkCol) << 2), diffStride, TxSizeWide[txSize], TxSizeHigh[txSize],
+                txSize, hKind, vKind, flipUd, flipLr, p.Coeff.AsSpan(BlockOffset(block), MaxEob(txSize)));
     }
 
     private const int UnitQuantShift = 2, UnitQuantFactor = 1 << UnitQuantShift;
@@ -371,6 +424,7 @@ internal static class AomEncodeMb
     }
 
     /// <summary>av1_xform_dc_only.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     internal static void XformDcOnly(AomMacroblock x, int plane, int block, int txSize, long perPxMean)
     {
         var coeff = x.Plane[plane].Coeff.AsSpan(BlockOffset(block), MaxEob(txSize));
@@ -400,10 +454,44 @@ internal static class AomEncodeMb
         var coeff = p.Coeff.AsSpan(off, n);
         var q = p.Qcoeff.AsSpan(off, n);
         var dq = p.Dqcoeff.AsSpan(off, n);
-        if (qp.XformQuantIdx != AomXformQuant.SkipQuant)
+        if (qp.XformQuantIdx != AomXformQuant.SkipQuant && x.E.Bd > 8)
+        {
+            // quant_func_list[...][is_hbd]: av1_highbd_quantize_fp_facade / av1_highbd_quantize_b_facade
+            short[] iscanH = IScanOf(txSize, txType);
+            p.Eobs[block] = (ushort)(qp.Qmatrix != null && qp.Iqmatrix != null ? AomQuantizeHbdSimd.Supported && (n & 7) == 0 ? qp.XformQuantIdx switch
+            {
+                AomXformQuant.Fp => AomQuantizeHbdSimd.QuantizeFpHelperQm(coeff, n, iscanH, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
+                    p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                AomXformQuant.B => AomQuantizeHbdSimd.QuantizeBHelperQm(coeff, n, iscanH, p.Zbin0, p.Zbin1, p.Round0, p.Round1, p.Quant0, p.Quant1,
+                    p.QuantShift0, p.QuantShift1, p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                _ => throw new NotSupportedException("AV1_XFORM_QUANT_DC is not used on the all-intra path"),
+            } : qp.XformQuantIdx switch
+            {
+                AomXformQuant.Fp => AomQuantizeHbd.QuantizeFpHelperQm(coeff, n, scan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
+                    p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                AomXformQuant.B => AomQuantizeHbd.QuantizeBHelperQm(coeff, n, scan, p.Zbin0, p.Zbin1, p.Round0, p.Round1, p.Quant0, p.Quant1,
+                    p.QuantShift0, p.QuantShift1, p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                _ => throw new NotSupportedException("AV1_XFORM_QUANT_DC is not used on the all-intra path"),
+            } : qp.XformQuantIdx switch
+            {
+                AomXformQuant.Fp => AomQuantizeHbd.QuantizeFp(coeff, n, iscanH, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
+                    p.Dequant0, p.Dequant1, qp.LogScale, q, dq),
+                AomXformQuant.B => AomQuantizeHbd.QuantizeB(coeff, n, iscanH, p.Zbin0, p.Zbin1, p.Round0, p.Round1, p.Quant0, p.Quant1,
+                    p.QuantShift0, p.QuantShift1, p.Dequant0, p.Dequant1, qp.LogScale, q, dq),
+                _ => throw new NotSupportedException("AV1_XFORM_QUANT_DC is not used on the all-intra path"),
+            });
+        }
+        else if (qp.XformQuantIdx != AomXformQuant.SkipQuant)
         {
             short[] iscan = IScanOf(txSize, txType);
-            int eob = qp.Qmatrix != null && qp.Iqmatrix != null ? qp.XformQuantIdx switch
+            int eob = qp.Qmatrix != null && qp.Iqmatrix != null ? AomQm.QmSimdSupported ? qp.XformQuantIdx switch
+            {
+                AomXformQuant.Fp => AomQm.QuantizeFpHelperAvx2(coeff, n, iscan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
+                    p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                AomXformQuant.B => AomQm.QuantizeBHelperAvx2(coeff, n, iscan, p.Zbin0, p.Zbin1, p.Round0, p.Round1, p.Quant0, p.Quant1,
+                    p.QuantShift0, p.QuantShift1, p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
+                _ => throw new NotSupportedException("AV1_XFORM_QUANT_DC is not used on the all-intra path"),
+            } : qp.XformQuantIdx switch
             {
                 AomXformQuant.Fp => AomQm.QuantizeFpHelper(coeff, n, scan, p.RoundFp0, p.RoundFp1, p.QuantFp0, p.QuantFp1,
                     p.Dequant0, p.Dequant1, qp.Qmatrix, qp.Iqmatrix, qp.LogScale, q, dq),
@@ -542,8 +630,37 @@ internal static class AomEncodeMb
     internal static ulong SumSquares2dI16(short[] src, int off, int stride, int width, int height)
     {
         ulong ss = 0;
+        if (width <= 0 || height <= 0) return 0;
+        if (off < 0 || (long)off + (long)(height - 1) * stride + width > src.Length) throw new ArgumentOutOfRangeException(nameof(height));
+        ref short s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), off);
+        // squares of int16 values paired by madd: exact in int32 lanes for a row (at most 64 values of |v| <= 2^15 per
+        // lane pair group... flushed to 64 bits every row)
         for (int r = 0; r < height; r++)
-            for (int c = 0; c < width; c++) { int v = src[off + r * stride + c]; ss += (ulong)(v * v); }
+        {
+            ref short row = ref Unsafe.Add(ref s0, r * stride);
+            int c = 0;
+            var acc = Vector256<long>.Zero;
+            for (; c + 16 <= width; c += 16)
+            {
+                var v = Vector256.LoadUnsafe(ref row, (nuint)c);
+                var m = Avx2.MultiplyAddAdjacent(v, v);   // pairs, each < 2^31
+                acc += Avx2.ConvertToVector256Int64(m.GetLower().AsUInt32()).AsInt64() + Avx2.ConvertToVector256Int64(m.GetUpper().AsUInt32()).AsInt64();
+            }
+            for (; c + 8 <= width; c += 8)
+            {
+                var v = Vector128.LoadUnsafe(ref row, (nuint)c);
+                var m = Sse2.MultiplyAddAdjacent(v, v);
+                acc += Avx2.ConvertToVector256Int64(m.AsUInt32()).AsInt64();
+            }
+            for (; c + 4 <= width; c += 4)
+            {
+                var v = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(ref Unsafe.As<short, byte>(ref Unsafe.Add(ref row, c)))).AsInt16();
+                var m = Sse2.MultiplyAddAdjacent(v, v);
+                acc += Avx2.ConvertToVector256Int64(m.AsUInt32()).AsInt64();
+            }
+            ss += (ulong)Vector256.Sum(acc);
+            for (; c < width; c++) { int v = Unsafe.Add(ref row, c); ss += (ulong)(v * v); }
+        }
         return ss;
     }
 
@@ -551,8 +668,39 @@ internal static class AomEncodeMb
     internal static ulong SumSse2dI16(short[] src, int off, int stride, int width, int height, ref int sum)
     {
         long ss = 0;
+        if (width <= 0 || height <= 0) return 0;
+        if (off < 0 || (long)off + (long)(height - 1) * stride + width > src.Length) throw new ArgumentOutOfRangeException(nameof(height));
+        ref short s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), off);
+        var one = Vector256.Create((short)1);
+        var sumV = Vector256<int>.Zero;
         for (int r = 0; r < height; r++)
-            for (int c = 0; c < width; c++) { int v = src[off + r * stride + c]; ss += v * v; sum += v; }
+        {
+            ref short row = ref Unsafe.Add(ref s0, r * stride);
+            int c = 0;
+            var acc = Vector256<long>.Zero;
+            for (; c + 16 <= width; c += 16)
+            {
+                var v = Vector256.LoadUnsafe(ref row, (nuint)c);
+                var m = Avx2.MultiplyAddAdjacent(v, v);
+                acc += Avx2.ConvertToVector256Int64(m.GetLower().AsUInt32()).AsInt64() + Avx2.ConvertToVector256Int64(m.GetUpper().AsUInt32()).AsInt64();
+                sumV += Avx2.MultiplyAddAdjacent(v, one);
+            }
+            for (; c + 8 <= width; c += 8)
+            {
+                var v = Vector128.LoadUnsafe(ref row, (nuint)c);
+                acc += Avx2.ConvertToVector256Int64(Sse2.MultiplyAddAdjacent(v, v).AsUInt32()).AsInt64();
+                sumV += Vector256.Create(Sse2.MultiplyAddAdjacent(v, one.GetLower()), Vector128<int>.Zero);
+            }
+            for (; c + 4 <= width; c += 4)
+            {
+                var v = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(ref Unsafe.As<short, byte>(ref Unsafe.Add(ref row, c)))).AsInt16();
+                acc += Avx2.ConvertToVector256Int64(Sse2.MultiplyAddAdjacent(v, v).AsUInt32()).AsInt64();
+                sumV += Vector256.Create(Sse2.MultiplyAddAdjacent(v, one.GetLower()), Vector128<int>.Zero);
+            }
+            ss += Vector256.Sum(acc);
+            for (; c < width; c++) { int v = Unsafe.Add(ref row, c); ss += v * v; sum += v; }
+        }
+        sum += Vector256.Sum(sumV);
         return (ulong)ss;
     }
 
@@ -596,6 +744,44 @@ internal static class AomEncodeMb
     internal static long Sse(byte[] a, int aOff, int aStride, byte[] b, int bOff, int bStride, int width, int height)
     {
         long sse = 0;
+        if (Avx2.IsSupported && width > 0 && height > 0 && height <= 64 && (width == 4 || width == 8 || width == 16) && aOff >= 0 && bOff >= 0
+            && aOff + (long)(height - 1) * aStride + width <= a.Length && bOff + (long)(height - 1) * bStride + width <= b.Length)
+        {
+            // the tx widths up to 16 (at most 64 rows: 64 x 16 x 255^2 fits the int32 lanes): one accumulator, one reduction
+            ref byte pa = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(a), aOff);
+            ref byte pb = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(b), bOff);
+            var acc = Vector256<int>.Zero;
+            if (width == 16)
+                for (int y = 0; y < height; y++)
+                {
+                    var d = Avx2.Subtract(Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref pa, (nuint)(y * aStride))),
+                        Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref pb, (nuint)(y * bStride))));
+                    acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(d, d));
+                }
+            else if (width == 8)
+                for (int y = 0; y < height; y += 2)
+                {
+                    // two rows of 8 per 256-bit register (height is even for the 8-wide tx sizes; an odd last row alone)
+                    ulong r0a = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pa, y * aStride)), r0b = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pb, y * bStride));
+                    ulong r1a = y + 1 < height ? Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pa, (y + 1) * aStride)) : 0;
+                    ulong r1b = y + 1 < height ? Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pb, (y + 1) * bStride)) : 0;
+                    var d = Avx2.Subtract(Avx2.ConvertToVector256Int16(Vector128.Create(r0a, r1a).AsByte()), Avx2.ConvertToVector256Int16(Vector128.Create(r0b, r1b).AsByte()));
+                    acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(d, d));
+                }
+            else
+                for (int y = 0; y < height; y += 4)
+                {
+                    // four rows of 4
+                    int n = Math.Min(4, height - y);
+                    uint a0 = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pa, y * aStride)), b0 = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pb, y * bStride));
+                    uint a1 = n > 1 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pa, (y + 1) * aStride)) : 0, b1 = n > 1 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pb, (y + 1) * bStride)) : 0;
+                    uint a2 = n > 2 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pa, (y + 2) * aStride)) : 0, b2 = n > 2 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pb, (y + 2) * bStride)) : 0;
+                    uint a3 = n > 3 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pa, (y + 3) * aStride)) : 0, b3 = n > 3 ? Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pb, (y + 3) * bStride)) : 0;
+                    var d = Avx2.Subtract(Avx2.ConvertToVector256Int16(Vector128.Create(a0, a1, a2, a3).AsByte()), Avx2.ConvertToVector256Int16(Vector128.Create(b0, b1, b2, b3).AsByte()));
+                    acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(d, d));
+                }
+            return (long)(uint)Vector256.Sum(acc.AsUInt32());
+        }
         if (Avx2.IsSupported && width > 0 && height > 0 && aOff >= 0 && bOff >= 0
             && aOff + (long)(height - 1) * aStride + width <= a.Length && bOff + (long)(height - 1) * bStride + width <= b.Length)
         {
@@ -657,7 +843,7 @@ internal static class AomEncodeMb
             for (; i + 8 <= length; i += 8) acc += Vector256.Abs(Vector256.LoadUnsafe(ref c0, (nuint)i));
             satd = Vector256.Sum(acc);
         }
-        for (; i < length; i++) satd += Math.Abs(coeff[i]);
+        for (; i < length; i++) satd += AbsI(coeff[i]);
         return satd;
     }
 
