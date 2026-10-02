@@ -62,9 +62,10 @@ public sealed class AvifLoopRestorationTests
     [Test]
     public async Task SharpnessIsSignalled()
     {
-        // avifenc -a sharpness=S: loop_filter_sharpness in every frame header (the deblocking search decodes with it).
+        // avifenc -a sharpness=S: loop_filter_sharpness in the frame header (libaom picklpf: all-intra signals the configured
+        // sharpness; tune=iq's adaptive sharpness would cap it by qindex, so tune=psnr here).
         var src = FormatRegistry.Read(Path.Combine(AppContext.BaseDirectory, "TestAssets", "peppers.jpg"));
-        byte[] avif = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Quality = 40, Sharpness = 5 });
+        byte[] avif = HeifCoder.EncodeAvif(src, new AvifEncodeOptions { Quality = 40, Sharpness = 5, Tune = AvifTune.Psnr });
         var c = HeifContainer.Parse(avif);
         var dec = new Av1Decoder();
         using var frame = dec.Decode(c.ItemData(c.PrimaryId)!, 0, isKeyframe: true);

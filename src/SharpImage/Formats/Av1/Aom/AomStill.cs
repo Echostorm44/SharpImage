@@ -21,20 +21,27 @@ internal static class AomStill
     /// <summary>The colour image's libaom tuning (libavif's default: tune=iq for non-identity colour, tune=ssim for the
     /// identity matrix); alpha items (no colour description) keep tune=psnr, as libavif sets for alpha.</summary>
     [ThreadStatic] private static AomTune t_tune;
+    /// <summary>The user's -a sharpness / -a enable-cdef (colour and alpha alike, as libavif's unprefixed options).</summary>
+    [ThreadStatic] private static int? t_sharpness;
+    [ThreadStatic] private static bool? t_enableCdef;
+    internal static int? SharpnessOverride => t_sharpness;
+    internal static bool? CdefOverride => t_enableCdef;
 
     internal static int Speed => t_speedPlus1 - 1;
 
     /// <summary>Activates the port for an all-intra encode at this avifenc speed (clamped to libaom's 0-9 as libavif does);
     /// a negative speed deactivates it. Returns the previous state for <see cref="Exit"/>.</summary>
-    internal static (int, AomTune) Enter(int speed, AomTune tune = AomTune.Psnr)
+    internal static (int, AomTune, int?, bool?) Enter(int speed, AomTune tune = AomTune.Psnr, int? sharpness = null, bool? enableCdef = null)
     {
-        var prev = (t_speedPlus1, t_tune);
+        var prev = (t_speedPlus1, t_tune, t_sharpness, t_enableCdef);
         t_speedPlus1 = speed < 0 ? 0 : Math.Clamp(speed, 0, 9) + 1;
         t_tune = tune;
+        if (speed >= 0) { t_sharpness = sharpness; t_enableCdef = enableCdef; }
         return prev;
     }
 
-    internal static void Exit((int SpeedPlus1, AomTune Tune) prev) => (t_speedPlus1, t_tune) = prev;
+    internal static void Exit((int SpeedPlus1, AomTune Tune, int? Sharpness, bool? EnableCdef) prev)
+        => (t_speedPlus1, t_tune, t_sharpness, t_enableCdef) = prev;
 
     /// <summary>Whether a frame with these parameters goes through the port.</summary>
     internal static bool Handles(int bitDepth, Av1PixelLayout layout, int width, int height)
@@ -62,7 +69,7 @@ internal static class AomStill
             Strides = mono ? new[] { width } : new[] { width, cw, cw }, BaseQindex = qIdx, Speed = Speed,
             // libavif: maxThreads > 1 -> cfg.g_threads = min(maxThreads, 64) (row-MT, libaom's default)
             Threads = Math.Min(Av1StillImageEncoder.ThreadCount, 64),
-            Tune = color != null ? t_tune : AomTune.Psnr,
+            Tune = color != null ? t_tune : AomTune.Psnr, Sharpness = t_sharpness, EnableCdef = t_enableCdef,
             // libavif: AV1E_SET_TILE_COLUMNS / AV1E_SET_TILE_ROWS (explicit --tilecolslog2 / --tilerowslog2 or autotiling)
             TileColumns = Av1ObuWriter.TileLog2Request.Cols, TileRows = Av1ObuWriter.TileLog2Request.Rows,
         };

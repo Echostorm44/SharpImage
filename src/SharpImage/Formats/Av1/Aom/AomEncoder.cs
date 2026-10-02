@@ -27,6 +27,10 @@ internal sealed class AomEncodeInput
     /// <summary>AOME_SET_TUNING: AOM_TUNE_IQ is libavif's default for still non-identity colour images, AOM_TUNE_SSIM
     /// for identity-matrix colour (libavif never sets a tuning for lossless, so it is ignored at qindex 0).</summary>
     public AomTune Tune;
+    /// <summary>avifenc -a sharpness=S / -a enable-cdef=B (AOME_SET_SHARPNESS / AV1E_SET_ENABLE_CDEF), applied after the
+    /// tune's defaults as libavif applies codec options after AOME_SET_TUNING; null = libaom's default.</summary>
+    public int? Sharpness;
+    public bool? EnableCdef;
     /// <summary>Test hook (tune=iq staging): letters of the sub-features handle_tuning enables to switch back off:
     /// q enable_qm, d deltaq_mode, c cdef, s sharpness, u chroma deltaq, m qm-psnr dist metric, a adaptive sharpness.</summary>
     public string? IqOff;
@@ -75,6 +79,8 @@ internal static partial class AomEncoder
             cpi.DeltaqVarianceBoost = deltaqVarianceBoost;
             cpi.EnableAdaptiveSharpness = !off.Contains('a');
         }
+        if (input.Sharpness is int sharp) cpi.Sharpness = sharp;
+        if (input.EnableCdef is bool cdef) cpi.CdefControl = cdef ? 1 : 0;   // CDEF_ALL / CDEF_NONE
 
         // the source frame with libaom's replicated borders (the lookahead copy runs aom_extend_frame_borders)
         cpi.Source = new AomFrameBuffer(input.Width, input.Height, input.SsX, input.SsY, input.Monochrome, bd);
