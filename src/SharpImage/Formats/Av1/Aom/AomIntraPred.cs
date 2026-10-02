@@ -80,9 +80,29 @@ internal static unsafe class AomIntraPred
         for (int r = 0; r < bh; r++, dst += stride) Unsafe.InitBlockUnaligned(dst, v, (uint)bw);
     }
 
-    public static void VPredictor(byte* dst, nint stride, int bw, int bh, byte* above)
+    public static void VPredictor(byte* dst, nint stride, int bw, int bh, byte* above) => ReplicateRow(above, dst, stride, bw, bh);
+
+    /// <summary>rows copies of the nbytes (4, 8, 16 or a multiple of 32) at src, stride bytes apart (no copy call per row).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void ReplicateRow(byte* src, byte* dst, nint stride, int nbytes, int rows)
     {
-        for (int r = 0; r < bh; r++, dst += stride) Buffer.MemoryCopy(above, dst, bw, bw);
+        switch (nbytes)
+        {
+            case 4: { uint v = *(uint*)src; for (int r = 0; r < rows; r++, dst += stride) *(uint*)dst = v; break; }
+            case 8: { ulong v = *(ulong*)src; for (int r = 0; r < rows; r++, dst += stride) *(ulong*)dst = v; break; }
+            case 16: { var v = Vector128.Load(src); for (int r = 0; r < rows; r++, dst += stride) v.Store(dst); break; }
+            case 32: { var v = Vector256.Load(src); for (int r = 0; r < rows; r++, dst += stride) v.Store(dst); break; }
+            case 64:
+            {
+                var v0 = Vector256.Load(src); var v1 = Vector256.Load(src + 32);
+                for (int r = 0; r < rows; r++, dst += stride) { v0.Store(dst); v1.Store(dst + 32); }
+                break;
+            }
+            default:
+                for (int r = 0; r < rows; r++, dst += stride)
+                    for (int c = 0; c < nbytes; c += 32) Vector256.Load(src + c).Store(dst + c);
+                break;
+        }
     }
 
     public static void HPredictor(byte* dst, nint stride, int bw, int bh, byte* left)

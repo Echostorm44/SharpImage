@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -22,10 +23,17 @@ internal static unsafe class AomIntraPredHbd
         switch (mode)
         {
             case V_PRED:
-                for (int r = 0; r < bh; r++, dst += stride) Buffer.MemoryCopy(above, dst, bw * 2, bw * 2);
+                AomIntraPred.ReplicateRow((byte*)above, (byte*)dst, stride * 2, bw * 2, bh);
                 break;
             case H_PRED:
-                for (int r = 0; r < bh; r++, dst += stride) new Span<ushort>(dst, bw).Fill(left[r]);
+                if (bw == 4) for (int r = 0; r < bh; r++, dst += stride) *(ulong*)dst = left[r] * 0x0001000100010001UL;
+                else if (bw == 8) for (int r = 0; r < bh; r++, dst += stride) System.Runtime.Intrinsics.Vector128.Create(left[r]).Store(dst);
+                else
+                    for (int r = 0; r < bh; r++, dst += stride)
+                    {
+                        var v = System.Runtime.Intrinsics.Vector256.Create(left[r]);
+                        for (int c = 0; c < bw; c += 16) v.Store(dst + c);
+                    }
                 break;
             case SMOOTH_PRED: SmoothPredictor(dst, stride, bw, bh, above, left); break;
             case SMOOTH_V_PRED: SmoothVPredictor(dst, stride, bw, bh, above, left); break;

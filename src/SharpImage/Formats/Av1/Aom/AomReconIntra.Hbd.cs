@@ -148,7 +148,12 @@ internal static unsafe partial class AomReconIntra
                     buffer[(r + (k >> 2)) * B + c + (k & 3)] = (ushort)(v < 0 ? 0 : v > max ? max : v);
                 }
             }
-        for (int r = 0; r < bh; ++r, dst += stride) Buffer.MemoryCopy(buffer + (r + 1) * B + 1, dst, bw * 2, bw * 2);
+        for (int r = 0; r < bh; ++r, dst += stride)
+        {
+            ushort* src = buffer + (r + 1) * B + 1;
+            if (bw == 4) *(ulong*)dst = *(ulong*)src;
+            else for (int c = 0; c < bw; c += 8) Vector128.Store(Vector128.Load(src + c), dst + c);
+        }
     }
 
     /// <summary>av1_highbd_filter_intra_edge as libaom's dispatched SSE4.1 kernel runs it: the filtered samples equal
