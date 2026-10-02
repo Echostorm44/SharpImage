@@ -376,7 +376,7 @@ internal static class AomIntraModeSearch
     }
 
     /// <summary>get_model_rd_index_for_pruning.</summary>
-    private static int GetModelRdIndexForPruning(AomMacroblock x, AomSpeedFeatures sf)
+    internal static int GetModelRdIndexForPruning(AomMacroblock x, AomSpeedFeatures sf)
     {
         int topAllowed = sf.intra_sf.top_intra_model_count_allowed;
         if (sf.intra_sf.adapt_top_model_rd_count_using_neighbors == 0) return topAllowed - 1;
@@ -391,7 +391,7 @@ internal static class AomIntraModeSearch
     }
 
     /// <summary>prune_intra_y_mode.</summary>
-    private static bool PruneIntraYMode(long thisModelRd, ref long bestModelRd, Span<long> topIntraModelRd, int maxModelCntAllowed, int modelRdIndexForPruning)
+    internal static bool PruneIntraYMode(long thisModelRd, ref long bestModelRd, Span<long> topIntraModelRd, int maxModelCntAllowed, int modelRdIndexForPruning)
     {
         const double threshBest = 1.50, threshTop = 1.00;
         for (int i = 0; i < maxModelCntAllowed; i++)
@@ -641,7 +641,7 @@ internal static class AomIntraModeSearch
     }
 
     /// <summary>prune_intra_mode_with_hog (collect_hog_data over the block's visible source).</summary>
-    private static void PruneIntraModeWithHog(AomComp cpi, AomMacroblock x, int bsize, float th, Span<byte> directionalModeSkipMask, bool isChroma)
+    internal static void PruneIntraModeWithHog(AomComp cpi, AomMacroblock x, int bsize, float th, Span<byte> directionalModeSkipMask, bool isChroma)
     {
         var xd = x.E;
         int plane = isChroma ? 1 : 0;
