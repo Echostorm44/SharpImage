@@ -63,6 +63,10 @@ internal sealed class AomLoopFilterParams
     // av1_set_default_ref_deltas / av1_set_default_mode_deltas
     public readonly sbyte[] RefDeltas = { 1, 0, 0, 0, -1, 0, -1, -1 };
     public readonly sbyte[] ModeDeltas = { 0, 0 };
+    /// <summary>lf->backup_filter_level[0..1], _u, _v (the searched levels before the skip heuristics) and
+    /// cm->cur_frame->filter_level[0..1] (-1 when the level was not searched).</summary>
+    public readonly int[] BackupFilterLevel = new int[4];
+    public readonly int[] FrameFilterLevel = { -1, -1 };
 
     public AomLoopFilterParams Clone()
     {

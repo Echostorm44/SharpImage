@@ -1226,6 +1226,7 @@ internal static partial class AomEncodeFrame
             var levels = x.ScratchLevels;
             AomTxb.InitLevels(tcoeffArr.AsSpan(tcoeffOff, segEob), width, height, levels);
             UpdateTxTypeCount(cpi, x, blkRow, blkCol, plane, txSize, allowUpdateCdf);
+            x.TxTypeUsed[txSize * TX_TYPES + txType]++;   // record tx type usage
 
             int txClass = AomTxb.TxTypeToClass[txType];
             UpdateEobContext(eob, txSize, txClass, planeType, ec, allowUpdateCdf);

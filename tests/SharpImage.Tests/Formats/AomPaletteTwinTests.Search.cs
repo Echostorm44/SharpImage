@@ -230,7 +230,7 @@ public sealed partial class AomPaletteTwinTests
     {
         int[] cfg = sc.Cfg;
         int bsize = cfg[0];
-        var cpi = new AomComp { AllowScreenContentTools = true, AllowIntrabc = cfg[16] != 0, EnableFilterIntra = cfg[20] != 0, FrameIsIntraOnly = true };
+        var cpi = new AomComp { AllowScreenContentTools = true, AllowIntrabc = cfg[16] != 0, EnableFilterIntra = cfg[20] != 0 };
         cpi.Sf.intra_sf.prune_palette_search_level = cfg[6];
         cpi.Sf.intra_sf.prune_luma_palette_size_search_level = cfg[7];
         cpi.Sf.intra_sf.early_term_chroma_palette_size_search = cfg[8];

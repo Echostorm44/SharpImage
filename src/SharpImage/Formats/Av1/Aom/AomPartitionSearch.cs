@@ -655,8 +655,8 @@ internal static partial class AomEncodeFrame
     }
 
     /// <summary>prune_4_way_partition_search (intra frames).</summary>
-    private static void Prune4WayPartitionSearch(AomComp cpi, AomMacroblock x, AomPcTree pcTree, AomPartitionSearchState s, ref AomRdStats bestRdc,
-        int pbSourceVariance, bool pruneExtPartState, Span<bool> part4Allowed)
+    private static void Prune4WayPartitionSearch(AomComp cpi, AomMacroblock x, AomPcTree pcTree, AomSmsTree? sms, AomPartitionSearchState s,
+        ref AomRdStats bestRdc, int pbSourceVariance, bool pruneExtPartState, Span<bool> part4Allowed)
     {
         var sf = cpi.Sf;
         var bp = s.BlkParams;
@@ -697,7 +697,9 @@ internal static partial class AomEncodeFrame
                 if (numChildRectWin < numWinThresh) part4Allowed[i] = false;
             }
         }
-        // (prune_part4_using_sms: inter frames only)
+        if (sf.part_sf.prune_h_or_v_4part_using_sms_info && partition4Allowed && bestRdc.Rdcost != long.MaxValue &&
+            IsWholeBlkInFrame(bp, cpi.Cm) && !cpi.Cm.FrameIsIntraOnly)
+            PrunePart4UsingSms(cpi, x, s, sms!, bp.MiRow, bp.MiCol, bsize, part4Allowed);
     }
 
     /// <summary>av1_ml_prune_4_partition glue (the model and its features are AomMl's).</summary>
@@ -729,7 +731,7 @@ internal static partial class AomEncodeFrame
     }
 
     /// <summary>none_partition_search.</summary>
-    private static void NonePartitionSearch(AomComp cpi, AomMacroblock x, AomPcTree pcTree, AomSearchMbContext xCtx, AomPartitionSearchState s,
+    private static void NonePartitionSearch(AomComp cpi, AomMacroblock x, AomPcTree pcTree, AomSmsTree? sms, AomSearchMbContext xCtx, AomPartitionSearchState s,
         ref AomRdStats bestRdc, ref uint pbSourceVariance, ref long noneRd, bool hasNoneRd, ref long partNoneRd)
     {
         var cm = cpi.Cm;
@@ -760,6 +762,11 @@ internal static partial class AomEncodeFrame
         s.NoneRd = s.ThisRdc.Rdcost;
         if (s.ThisRdc.Rate != int.MaxValue)
         {
+            if (cpi.Sf.inter_sf.prune_ref_frame_for_rect_partitions != 0)
+            {
+                int refType = AomInter.RefFrameType(pcTree.None.Mic.RefFrame0, pcTree.None.Mic.RefFrame1);
+                UpdatePickedRefFramesMask(x, refType, bsize, cm.MibSize, miRow, miCol);
+            }
             if (bp.BsizeAtLeast8x8)
             {
                 s.ThisRdc.Rate += ptCost;
@@ -771,7 +778,7 @@ internal static partial class AomEncodeFrame
                 bestRdc = s.ThisRdc;
                 s.FoundBestPartition = true;
                 if (bp.BsizeAtLeast8x8) pcTree.Partitioning = PARTITION_NONE;
-                // prune_partitions_after_none: inter-frame only for intra frames (skippable breakout / sms)
+                PrunePartitionsAfterNone(cpi, x, sms, pcTree.None, s, bestRdc, pbSourceVariance);
             }
             if (cpi.Sf.part_sf.prune_rect_part_using_none_pred_mode)
                 PruneRectPartUsingNonePredMode(x.E, s, pcTree.None.Mic.Mode, bsize);
@@ -794,7 +801,7 @@ internal static partial class AomEncodeFrame
     }
 
     /// <summary>split_partition_search.</summary>
-    private static void SplitPartitionSearch(AomComp cpi, AomMacroblock x, AomPcTree pcTree, AomSearchMbContext xCtx, AomPartitionSearchState s,
+    private static void SplitPartitionSearch(AomComp cpi, AomMacroblock x, AomPcTree pcTree, AomSmsTree? sms, AomSearchMbContext xCtx, AomPartitionSearchState s,
         ref AomRdStats bestRdc, ref long partSplitRd)
     {
         var cm = cpi.Cm;
@@ -829,7 +836,7 @@ internal static partial class AomEncodeFrame
             }
             long splitRd = s.SplitRd[idx];
             bool ok = RdPickPartition(cpi, x, miRow + yIdx, miCol + xIdx, subsize, ref s.ThisRdc, bestRemainRdcost, pcTree.Split[idx]!,
-                ref splitRd, true, s.SplitPartRectWin[idx]);
+                sms?.Split[idx], ref splitRd, true, s.SplitPartRectWin[idx]);
             s.SplitRd[idx] = splitRd;
             if (!ok)
             {
@@ -885,7 +892,7 @@ internal static partial class AomEncodeFrame
 
     /// <summary>av1_rd_pick_partition (intra frames, single pass).</summary>
     internal static bool RdPickPartition(AomComp cpi, AomMacroblock x, int miRow, int miCol, int bsize, ref AomRdStats rdCost, AomRdStats bestRdc,
-        AomPcTree pcTree, ref long noneRd, bool hasNoneRd, bool[]? rectPartWinInfo)
+        AomPcTree pcTree, AomSmsTree? sms, ref long noneRd, bool hasNoneRd, bool[]? rectPartWinInfo)
     {
         var cm = cpi.Cm;
         int numPlanes = cm.NumPlanes;
@@ -895,6 +902,7 @@ internal static partial class AomEncodeFrame
         var s = new AomPartitionSearchState();
 
         InitPartitionSearchStateParams(x, cpi, s, miRow, miCol, bsize);
+        if (sms != null) sms.Partitioning = PARTITION_NONE;   // set_sms_tree_partitioning
 
         if (bestRdc.Rdcost < 0)
         {
@@ -935,6 +943,7 @@ internal static partial class AomEncodeFrame
         SaveContext(x, xCtx, miRow, miCol, bsize, numPlanes);
 
         PrunePartitionsBeforeSearch(cpi, x, s);
+        PrunePartitionsBeforeSearchInter(cpi, x, sms, s);
         PrunePartitionsByMaxMinBsize(x, s);
 
     BEGIN_PARTITION_SEARCH:
@@ -968,15 +977,22 @@ internal static partial class AomEncodeFrame
         }
 
         long partNoneRd = long.MaxValue;
-        NonePartitionSearch(cpi, x, pcTree, xCtx, s, ref bestRdc, ref pbSourceVariance, ref noneRd, hasNoneRd, ref partNoneRd);
+        NonePartitionSearch(cpi, x, pcTree, sms, xCtx, s, ref bestRdc, ref pbSourceVariance, ref noneRd, hasNoneRd, ref partNoneRd);
 
         long partSplitRd = long.MaxValue;
-        SplitPartitionSearch(cpi, x, pcTree, xCtx, s, ref bestRdc, ref partSplitRd);
+        SplitPartitionSearch(cpi, x, pcTree, sms, xCtx, s, ref bestRdc, ref partSplitRd);
 
         if (sf.part_sf.early_term_after_none_split != 0 && partNoneRd == long.MaxValue && partSplitRd == long.MaxValue &&
             !x.MustFindValidPartition && bsize != cm.SbSize)
             s.TerminatePartitionSearch = true;
-        // (skip_non_sq_part_based_on_none >= 2: inter modes only; prune_partitions_after_split: inter frames only)
+        if (sf.part_sf.skip_non_sq_part_based_on_none >= 2 && pcTree.None != null)
+        {
+            int noneMode = pcTree.None.Mic.Mode;
+            if (x.Qindex <= 200 && noneMode >= INTRA_MODE_END && !AomInter.HaveNewmvInInterMode(noneMode) && pcTree.None.Skippable != 0 &&
+                !x.MustFindValidPartition && bsize >= BLOCK_16X16)
+                s.DoRectangularSplit = false;
+        }
+        PrunePartitionsAfterSplit(cpi, x, sms, s, bestRdc, partNoneRd, partSplitRd);
 
         RectangularPartitionSearch(cpi, x, pcTree, xCtx, s, ref bestRdc, rectPartWinInfo);
 
@@ -1004,7 +1020,7 @@ internal static partial class AomEncodeFrame
         AbPartitionsSearch(cpi, x, xCtx, pcTree, s, ref bestRdc, rectPartWinInfo, (int)pbSourceVariance, abPartitionAllowed);
 
         Span<bool> part4Allowed = stackalloc bool[] { true, true };
-        Prune4WayPartitionSearch(cpi, x, pcTree, s, ref bestRdc, (int)pbSourceVariance, pruneExtPartState, part4Allowed);
+        Prune4WayPartitionSearch(cpi, x, pcTree, sms, s, ref bestRdc, (int)pbSourceVariance, pruneExtPartState, part4Allowed);
 
         if (!s.TerminatePartitionSearch && part4Allowed[HORZ4])
             RdPick4Partition(cpi, x, xCtx, pcTree, pcTree.Horizontal4, s, ref bestRdc, MiSizeHigh[s.BlkParams.Bsize] / 4, 0, PARTITION_HORZ_4);
@@ -1018,6 +1034,7 @@ internal static partial class AomEncodeFrame
         }
 
         rdCost = bestRdc;
+        if (sms != null) sms.Partitioning = pcTree.Partitioning;
 
         bool pcTreeDealloc = false;
         if (s.FoundBestPartition)

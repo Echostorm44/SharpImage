@@ -79,7 +79,8 @@ internal static partial class AomModeCostFill
         for (int i = 0; i < BLOCK_SIZES_ALL; i++)
         {
             int w = WedgeCtx[i];
-            if (w >= 0) AomCost.CostTokensFromCdf(mc.WedgeInterintraCost.AsSpan(i * 2), m.InterintraWedge[w], 2);
+            // (the decoder's CDF set has interintra wedge CDFs only for the interintra sizes 8x8 .. 32x32)
+            if (w >= 0 && w < m.InterintraWedge.Length) AomCost.CostTokensFromCdf(mc.WedgeInterintraCost.AsSpan(i * 2), m.InterintraWedge[w], 2);
             else Array.Clear(mc.WedgeInterintraCost, i * 2, 2);
         }
         for (int i = BLOCK_8X8; i < BLOCK_SIZES_ALL; i++)

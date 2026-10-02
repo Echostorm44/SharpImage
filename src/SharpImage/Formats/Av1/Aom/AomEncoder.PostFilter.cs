@@ -36,12 +36,17 @@ internal static partial class AomEncoder
                 int i = r * cm.MiCols + c;
                 mi.Coded[i] = true;
                 mi.Bsize[i] = (byte)m.Bsize;
-                mi.TxSize[i] = (byte)m.TxSize;
+                bool isInter = AomEncodeMb.IsInterBlock(m);
+                int ts = m.TxSize;
+                // get_transform_size: an inter block's luma transform size is its inter_tx_size at this mi
+                if (isInter && m.SkipTxfm == 0)
+                    ts = m.InterTxSize[AomTxSearch.GetTxbSizeIndex(m.Bsize, r & (MiSizeHigh[m.Bsize] - 1), c & (MiSizeWide[m.Bsize] - 1))];
+                mi.TxSize[i] = (byte)ts;
                 mi.Skip[i] = m.SkipTxfm != 0;
-                mi.RefFrame0[i] = 0;   // INTRA_FRAME
+                mi.RefFrame0[i] = (sbyte)Math.Max(m.RefFrame0, 0);   // INTRA_FRAME for intra / intrabc blocks
                 mi.Mode[i] = (byte)m.Mode;
                 mi.SegmentId[i] = m.SegmentId;
-                mi.IsInter[i] = m.UseIntrabc != 0;
+                mi.IsInter[i] = isInter;
             }
         for (int s = 0; s < 8; s++) mi.LosslessSeg[s] = x.E.Lossless[s] != 0;
 
@@ -57,10 +62,27 @@ internal static partial class AomEncoder
         {
             Method = sf.lpf_sf.lpf_pick, UseCoarseFilterLevelSearch = sf.lpf_sf.use_coarse_filter_level_search,
             SkipLoopFilterUsingFiltError = sf.lpf_sf.skip_loop_filter_using_filt_error, Sharpness = cpi.Sharpness,
-            SharpnessFromConfig = cpi.AllIntra || cpi.TuneIq, EnableAdaptiveSharpness = cpi.EnableAdaptiveSharpness, BaseQindex = cm.BaseQindex, KeyFrame = true, IntraOnly = true,
+            SharpnessFromConfig = cpi.AllIntra || cpi.TuneIq, EnableAdaptiveSharpness = cpi.EnableAdaptiveSharpness, BaseQindex = cm.BaseQindex,
+            KeyFrame = cm.FrameType == KEY_FRAME, IntraOnly = cm.FrameIsIntraOnly, AdaptiveLumaLoopFilterSkip = sf.lpf_sf.adaptive_luma_loop_filter_skip,
+            PyramidLevel = cpi.LayerDepth,
             TxModeOnly4x4 = x.E.Lossless[0] != 0, BitDepth = cm.BitDepth,
             Parallel = cpi.NumWorkers > 1,
         };
+        if (!cm.FrameIsIntraOnly)
+        {
+            cpi.PpiFilterLevel.CopyTo(lpfCfg.LastFrameFilterLevel, 0);
+            for (int r = LAST_FRAME; r <= ALTREF_FRAME; r++)
+            {
+                var b = cm.RefBufs[r];
+                if (b == null) continue;
+                if (b.FilterLevel[0] != -1) lpfCfg.MinRefFilterLevel[0] = Math.Min(lpfCfg.MinRefFilterLevel[0], b.FilterLevel[0]);
+                if (b.FilterLevel[1] != -1) lpfCfg.MinRefFilterLevel[1] = Math.Min(lpfCfg.MinRefFilterLevel[1], b.FilterLevel[1]);
+            }
+            // the frame's deltas (av1_setup_past_independence's defaults, or the primary reference's)
+            for (int i = 0; i < 8; i++) lf.RefDeltas[i] = cm.LfRefDeltas[i];
+            lf.ModeDeltas[0] = cm.LfModeDeltas[0];
+            lf.ModeDeltas[1] = cm.LfModeDeltas[1];
+        }
         // is_inter_tx_size_search_level_one / get_lpf_opt_level
         bool txLevelOne = sf.tx_sf.inter_tx_size_search_init_depth_rect >= 1 && sf.tx_sf.inter_tx_size_search_init_depth_sqr >= 1;
         lpfCfg.SearchLpfOptLevel = txLevelOne ? 1 : 0;

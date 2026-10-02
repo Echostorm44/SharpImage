@@ -47,7 +47,9 @@ internal sealed class AomRefBuffer
     public int OrderHint, DisplayOrderHint;
     public readonly int[] RefOrderHints = new int[INTER_REFS_PER_FRAME];
     public readonly int[] RefDisplayOrderHint = new int[INTER_REFS_PER_FRAME];
-    public int FrameType;
+    public int FrameType, PyramidLevel;
+    /// <summary>cur_frame->filter_level[0..1] (-1: not searched).</summary>
+    public readonly int[] FilterLevel = { -1, -1 };
     public bool Showable;
     public int BaseQindex;
     public int MiRows, MiCols;

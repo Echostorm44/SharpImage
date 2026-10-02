@@ -40,6 +40,10 @@ internal sealed partial class AomCommon
     public bool SkipModeAllowed, SkipModeFlag;
     public int SkipModeRefFrame0, SkipModeRefFrame1;
 
+    /// <summary>cm->lf.ref_deltas / mode_deltas of the frame.</summary>
+    public readonly sbyte[] LfRefDeltas = { 1, 0, 0, 0, -1, 0, -1, -1 };
+    public readonly sbyte[] LfModeDeltas = { 0, 0 };
+
     public bool FrameIsIntraOnly => FrameType == KEY_FRAME || FrameType == INTRA_ONLY_FRAME;
     public int RelativeDist(int a, int b) => AomInter.GetRelativeDist(EnableOrderHint, OrderHintBits, a, b);
 }

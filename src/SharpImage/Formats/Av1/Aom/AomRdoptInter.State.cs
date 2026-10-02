@@ -199,7 +199,7 @@ internal sealed partial class AomMacroblock
     /// <summary>x->tmp_pred_bufs[2] (three planes of MAX_SB_SQUARE each).</summary>
     public readonly byte[][] TmpPredBufs = { new byte[3 * 128 * 128], new byte[3 * 128 * 128] };
     public readonly ushort[][] TmpPredBufs16 = { new ushort[3 * 128 * 128], new ushort[3 * 128 * 128] };
-    public readonly byte[] PickedRefFramesMask = new byte[32 * 32];
+    public readonly int[] PickedRefFramesMask = new int[32 * 32];
     public readonly long[,] TopInterTxNoSplitRd = new long[MAX_TX_BLOCKS_IN_MAX_SB, TOP_INTER_TX_NO_SPLIT_COUNT];
     public readonly long[] TopCompAvgEstRd = new long[TOP_COMP_AVG_EST_RD_COUNT];
     public readonly AomWarpSampleInfo[] WarpSampleInfo = NewWarpSamples();

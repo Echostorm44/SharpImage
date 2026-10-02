@@ -45,6 +45,12 @@ internal sealed class AomFrameProbs
 internal sealed partial class AomComp
 {
     public AomFrameProbs FrameProbs = new();
+    /// <summary>oxcf->motion_mode_cfg.allow_warped_motion; cpi->mv_stats.valid.</summary>
+    public bool AllowWarpedMotionCfg = true, MvStatsValid;
+    /// <summary>ppi->filter_level[0..1], filter_level_u, filter_level_v (the previous frame's searched levels).</summary>
+    public int[] PpiFilterLevel = new int[4];
+    /// <summary>The largest mv component written (td->max_mv_magnitude over the tiles).</summary>
+    public int MaxMvMagnitudeTd;
     /// <summary>cpi->mbmi_ext_info.frame_base of an inter frame (per mi; entries on first write).</summary>
     public AomMbmiExtFrameInter?[]? MbmiExtFrameInterBase;
 
@@ -82,4 +88,6 @@ internal sealed partial class AomMacroblock
     public readonly int[] WarpedUsed = new int[2];
     /// <summary>x->cnt_zeromv.</summary>
     public int CntZeromv;
+    /// <summary>td->rd_counts.tx_type_used[TX_SIZES_ALL][TX_TYPES].</summary>
+    public readonly int[] TxTypeUsed = new int[TX_SIZES_ALL * TX_TYPES];
 }

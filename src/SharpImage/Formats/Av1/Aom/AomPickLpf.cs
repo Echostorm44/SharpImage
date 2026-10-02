@@ -64,6 +64,10 @@ internal sealed class AomLpfPickConfig
     public bool KeyFrame = true;                             // current_frame.frame_type == KEY_FRAME
     public bool IntraOnly = true;                            // frame_is_intra_only
     public bool TxModeOnly4x4;                               // cm->features.tx_mode == ONLY_4X4
+    /// <summary>sf.lpf_sf.adaptive_luma_loop_filter_skip, the references' minimum luma levels (cur_frame filter_level,
+    /// -1 skipped) and current_frame.pyramid_level.</summary>
+    public int AdaptiveLumaLoopFilterSkip, PyramidLevel;
+    public readonly int[] MinRefFilterLevel = { AomLoopFilterParams.MaxLoopFilter, AomLoopFilterParams.MaxLoopFilter };
     /// <summary>ppi->filter_level[0..1], filter_level_u, filter_level_v (read for non-intra frames only).</summary>
     public readonly int[] LastFrameFilterLevel = new int[4];
     /// <summary>try_filter_frame's lpf_opt_level: is_inter_tx_size_search_level_one(&amp;sf.tx_sf).</summary>
@@ -272,7 +276,17 @@ internal static class AomPickLpf
                 lf.FilterLevelV = SearchFilterLevel(sd, cur, backupUv, mi, lf, filter, cfg, partial,
                     lastFrameFilterLevel, 2, 0, out bestFilterSse[2]);
             }
-            // (adaptive_luma_loop_filter_skip reads reference frames: inter-only, not ported)
+            lf.BackupFilterLevel[0] = lf.FilterLevel[0];
+            lf.BackupFilterLevel[1] = lf.FilterLevel[1];
+            lf.BackupFilterLevel[2] = lf.FilterLevelU;
+            lf.BackupFilterLevel[3] = lf.FilterLevelV;
+            if (cfg.AdaptiveLumaLoopFilterSkip >= 1 && cfg.PyramidLevel > 1)
+            {
+                int filterThreshold = cfg.PyramidLevel >= 4 ? 16 : 8;
+                bool resetY = lf.FilterLevel[0] < filterThreshold && lf.FilterLevel[1] < filterThreshold && lf.FilterLevelU < filterThreshold &&
+                    lf.FilterLevelV < filterThreshold && cfg.MinRefFilterLevel[0] == 0 && cfg.MinRefFilterLevel[1] == 0;
+                if (resetY) { lf.FilterLevel[0] = 0; lf.FilterLevel[1] = 0; }
+            }
             if (lf.FilterLevel[0] != 0 && lf.FilterLevel[1] != 0 && cfg.SkipLoopFilterUsingFiltError >= 1)
             {
                 const double pctImprovementThresh = 2.0;
@@ -288,6 +302,8 @@ internal static class AomPickLpf
                     lf.FilterLevel[1] = 0;
                 }
             }
+            lf.FrameFilterLevel[0] = lf.FilterLevel[0];
+            lf.FrameFilterLevel[1] = lf.FilterLevel[1];
         }
     }
 }

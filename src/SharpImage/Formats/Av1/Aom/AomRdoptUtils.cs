@@ -15,7 +15,7 @@ internal sealed partial class AomComp
         EnableCflIntra = true, EnableAngleDelta = true;
     // oxcf.tool_cfg.enable_palette; cm->features.allow_screen_content_tools / allow_intrabc; seq enable_filter_intra, monochrome
     public bool EnablePalette = true, AllowScreenContentTools, AllowIntrabc, EnableFilterIntra = true, Monochrome;
-    public bool FrameIsIntraOnly => Cm.FrameIsIntraOnly;
+    public bool FrameIsIntraOnly => Cm?.FrameIsIntraOnly ?? true;
     // oxcf.txfm_cfg.use_intra_default_tx_only
     public bool UseIntraDefaultTxOnly;
 }

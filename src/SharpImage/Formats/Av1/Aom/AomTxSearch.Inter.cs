@@ -275,9 +275,7 @@ internal static partial class AomTxSearch
         if (tryNoSplit)
         {
             TryTxBlockNoSplit(cpi, x, blkRow, blkCol, block, txSize, depth, planeBsize, ta, tl, ctx, ref rdStats, refBestRd, ftxsMode, ref noSplit);
-            // push_inter_block_tx_no_split_rd / prune_tx_split_eval_using_no_split_rd: never for intrabc blocks
-            if (sf.tx_sf.prune_inter_tx_split_rd_eval_lvl != 0 && mbmi.UseIntrabc == 0 && mbmi.SkipMode == 0)
-                throw new NotSupportedException("prune_inter_tx_split_rd_eval_lvl (inter frames)");
+            PushInterBlockTxNoSplitRd(x, mbmi, noSplit.Rd, blkIdx, sf.tx_sf.prune_inter_tx_split_rd_eval_lvl);
             int searchLevel = sf.tx_sf.adaptive_txb_search_level;
             if (searchLevel != 0)
             {
@@ -289,6 +287,7 @@ internal static partial class AomTxSearch
                 if (noSplit.Rd - (noSplit.Rd >> (2 + searchLevel)) > prevLevelRd) trySplit = false;
             }
             if (sf.tx_sf.txb_split_cap != 0 && p.Eobs[block] == 0) trySplit = false;
+            if (PruneTxSplitEvalUsingNoSplitRd(x, mbmi, noSplit.Rd, blkIdx, sf.tx_sf.prune_inter_tx_split_rd_eval_lvl)) trySplit = false;
         }
 
         // ML based speed feature to skip searching for split transform blocks
@@ -704,5 +703,34 @@ internal static partial class AomTxSearch
             mbmi.SkipTxfm = 0;
         }
         return true;
+    }
+
+    private static readonly int[] NumInterTxNoSplitCand = { 4, 3 };
+
+    /// <summary>push_inter_block_tx_no_split_rd.</summary>
+    private static void PushInterBlockTxNoSplitRd(AomMacroblock x, AomMbModeInfo mbmi, long tmpRd, int blkIdx, int lvl)
+    {
+        if (lvl == 0) return;
+        if (blkIdx == -1 || tmpRd == long.MaxValue) return;
+        if (mbmi.SkipMode != 0 || mbmi.UseIntrabc != 0) return;
+        int numTopCand = NumInterTxNoSplitCand[lvl - 1];
+        for (int i = 0; i < numTopCand; i++)
+            if (tmpRd < x.TopInterTxNoSplitRd[blkIdx, i])
+            {
+                for (int j = numTopCand - 1; j > i; j--) x.TopInterTxNoSplitRd[blkIdx, j] = x.TopInterTxNoSplitRd[blkIdx, j - 1];
+                x.TopInterTxNoSplitRd[blkIdx, i] = tmpRd;
+                break;
+            }
+    }
+
+    /// <summary>prune_tx_split_eval_using_no_split_rd.</summary>
+    private static bool PruneTxSplitEvalUsingNoSplitRd(AomMacroblock x, AomMbModeInfo mbmi, long tmpRd, int blkIdx, int lvl)
+    {
+        if (lvl == 0) return false;
+        if (blkIdx == -1 || tmpRd == long.MaxValue) return false;
+        if (mbmi.SkipMode != 0 || mbmi.UseIntrabc != 0) return false;
+        int numTopCand = NumInterTxNoSplitCand[lvl - 1];
+        if (x.TopInterTxNoSplitRd[blkIdx, numTopCand - 1] == long.MaxValue) return false;
+        return tmpRd > x.TopInterTxNoSplitRd[blkIdx, numTopCand - 1];
     }
 }

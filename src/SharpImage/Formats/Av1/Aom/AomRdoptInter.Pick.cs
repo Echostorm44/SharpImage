@@ -489,7 +489,32 @@ internal static partial class AomRdoptInter
         if (cpi.Sf.rt_sf.use_real_time_ref_set == 0 && PruneRefFrame(cpi, x, refType)) return 1;
         var cm = cpi.Cm;
         if (SkipRepeatedMv(cm, x, mode, rf0, rf1, st)) return 1;
-        if (x.UseMbModeCache) throw new NotImplementedException("mb mode cache");
+        if (x.UseMbModeCache)
+        {
+            // reuse the prediction mode in cache
+            var cachedMi = x.MbModeCache!;
+            int cachedMode = cachedMi.Mode;
+            int cf0 = cachedMi.RefFrame0, cf1 = cachedMi.RefFrame1;
+            bool cachedModeIsSingle = cf1 <= INTRA_FRAME;
+            if (cachedMode < INTRA_MODE_END && mode != cachedMode) return 1;
+            if (cachedModeIsSingle)
+            {
+                if (mode != cachedMode || rf0 != cf0) return 1;
+            }
+            else
+            {
+                bool modeIsSingle = rf1 <= INTRA_FRAME;
+                if (modeIsSingle)
+                {
+                    bool skipMotionModeOnly = false;
+                    if (cachedMode == NEW_NEARMV || cachedMode == NEW_NEARESTMV) skipMotionModeOnly = rf0 == cf0;
+                    else if (cachedMode == NEAR_NEWMV || cachedMode == NEAREST_NEWMV) skipMotionModeOnly = rf0 == cf1;
+                    else if (cachedMode == NEW_NEWMV) skipMotionModeOnly = rf0 == cf0 || rf0 == cf1;
+                    return 1 + (skipMotionModeOnly ? 1 : 0);
+                }
+                if (mode != cachedMode || rf0 != cf0 || rf1 != cf1) return 1;
+            }
+        }
         var mbmi = x.E.Mi0;
         if (st.BestRd == long.MaxValue && mbmi.Partition == PARTITION_NONE && x.MustFindValidPartition) return 0;
         var sf = cpi.Sf;

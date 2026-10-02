@@ -483,6 +483,8 @@ internal static partial class AomBitstream
         public readonly byte[] Levels = new byte[AomTxb.TxPad2d];
         public readonly sbyte[] CoeffContexts = new sbyte[64 * 64];
         public readonly bool[] CdefTransmitted = new bool[4];
+        /// <summary>td->max_mv_magnitude (auto_mv_step_size).</summary>
+        public int MaxMvMagnitude;
     }
 
     /// <summary>av1_pack_tile_info: write_modes for the tile then aom_stop_encode.</summary>
@@ -510,6 +512,7 @@ internal static partial class AomBitstream
         xd.TxTypeMap = cm.TxTypeMap;
         xd.TxTypeMapStride = cm.MiStride;
         xd.SetTile(tile);
+        xd.GlobalMotion = cm.GlobalMotion;
         var t = new TileWriter { F = f, Cpi = cpi, Cm = cm, W = w, Fc = fc, Xd = xd, TokIdx = tokIdx };
         xd.CurrentBaseQindex = cm.BaseQindex;
 
@@ -536,6 +539,7 @@ internal static partial class AomBitstream
             }
         }
         tokIdx = t.TokIdx;
+        if (t.MaxMvMagnitude > cpi.MaxMvMagnitudeTd) cpi.MaxMvMagnitudeTd = t.MaxMvMagnitude;
         return w.Finish();
     }
 
@@ -728,7 +732,8 @@ internal static partial class AomBitstream
         xd.AboveTxfmContextOffset = miCol;
         xd.LeftTxfmContextOffset = miRow & MAX_MIB_MASK;
 
-        WriteMbModesKf(t);
+        if (cm.FrameIsIntraOnly) WriteMbModesKf(t);
+        else PackInterModeMvs(t);
 
         for (int plane = 0; plane < Math.Min(2, cm.NumPlanes); ++plane)
         {
@@ -867,7 +872,7 @@ internal static partial class AomBitstream
     }
 
     /// <summary>write_intra_prediction_modes (key frame).</summary>
-    private static void WriteIntraPredictionModes(TileWriter t)
+    private static void WriteIntraPredictionModes(TileWriter t, bool isKeyframe = true)
     {
         var cpi = t.Cpi;
         var cm = t.Cm;
@@ -880,8 +885,12 @@ internal static partial class AomBitstream
         int bsize = mbmi.Bsize;
 
         // write_intra_y_mode_kf (get_y_mode_cdf: av1_above_block_mode / av1_left_block_mode)
-        int above = xd.AboveMbmi?.Mode ?? DC_PRED, left = xd.LeftMbmi?.Mode ?? DC_PRED;
-        w.WriteSymbol(mode, fc.Kfym[IntraModeContext[above] * 5 + IntraModeContext[left]], 13);
+        if (isKeyframe)
+        {
+            int above = xd.AboveMbmi?.Mode ?? DC_PRED, left = xd.LeftMbmi?.Mode ?? DC_PRED;
+            w.WriteSymbol(mode, fc.Kfym[IntraModeContext[above] * 5 + IntraModeContext[left]], 13);
+        }
+        else w.WriteSymbol(mode, m.YMode[SizeGroupLookup[bsize]], 13);   // write_intra_y_mode_nonkf
 
         bool useAngleDelta = bsize >= BLOCK_8X8;
         if (useAngleDelta && mode >= V_PRED && mode <= AomTables.D67_PRED)
