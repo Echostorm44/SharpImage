@@ -44,7 +44,9 @@ public static partial class HeifCoder
 
         AomGqConfig Config(bool alpha) => new()
         {
-            Width = w, Height = h, SsX = layout == Av1PixelLayout.I444 ? 0 : 1, SsY = layout == Av1PixelLayout.I420 ? 1 : 0,
+            Width = w, Height = h,
+            // libavif's aom_image: chroma shift 1 / 1 for alpha and monochrome (profile 0)
+            SsX = alpha || mono || layout != Av1PixelLayout.I444 ? 1 : 0, SsY = alpha || mono || layout == Av1PixelLayout.I420 ? 1 : 0,
             Monochrome = alpha || mono, BitDepth = bd, Speed = speed, Tune = alpha ? alphaTune : colorTune, Threads = Math.Min(threads, 64),
             TileColumnsLog2 = tileCols, TileRowsLog2 = tileRows, LagInFrames = hasAlpha ? 0 : 35,
             KfMaxDist = options.KeyframeInterval > 0 ? options.KeyframeInterval : 9999, EnableRestoration = bd != 12,

@@ -406,20 +406,27 @@ internal static class Av1AvifWriter
             .ThenBy(e => e.i).Select(e => e.r).ToList();
         byte[]? iref = refs.Count > 0 ? FullBox("iref", 0, 0, Concat(refs.ToArray())) : null;
 
-        // mdat: for a sequence, the colour then alpha samples (one chunk each; the first samples are the colour / alpha
-        // items' data, as in libavif), then the other items; otherwise every item's payload in order.
+        // mdat: for a sequence, libavif's passes (write.c): the metadata items (Exif / XMP), then the alpha samples, then
+        // the colour samples (one chunk per track; the first samples are the colour / alpha items' data); otherwise
+        // every item's payload in order.
         var chunks = new List<byte[]>();
         var itemOffset = new long[items.Count];   // relative to the mdat payload start
         long colorChunk = 0, alphaChunk = 0, pos = 0;
         if (sq != null)
         {
-            colorChunk = pos;
-            foreach (var smp in sq.ColorSamples) { chunks.Add(smp); pos += smp.Length; }
+            for (int i = alphaData != null ? 2 : 1; i < items.Count; i++)
+            {
+                itemOffset[i] = pos;
+                chunks.Add(items[i].Payload);
+                pos += items[i].Payload.Length;
+            }
             if (sq.AlphaSamples != null)
             {
                 alphaChunk = pos;
                 foreach (var smp in sq.AlphaSamples) { chunks.Add(smp); pos += smp.Length; }
             }
+            colorChunk = pos;
+            foreach (var smp in sq.ColorSamples) { chunks.Add(smp); pos += smp.Length; }
         }
         bool layeredItems = x?.ColorLayerSizes != null || x?.AlphaLayerSizes != null;
         if (sq == null && !layeredItems)
@@ -450,11 +457,14 @@ internal static class Av1AvifWriter
                     pos += data.Length;
                 }
         }
+        else if (sq != null)
+        {
+            itemOffset[0] = colorChunk;
+            if (alphaData != null) itemOffset[1] = alphaChunk;
+        }
         else
         for (int i = 0; i < items.Count; i++)
         {
-            if (sq != null && i == 0) { itemOffset[i] = colorChunk; continue; }
-            if (sq != null && i == 1 && alphaData != null) { itemOffset[i] = alphaChunk; continue; }
             itemOffset[i] = pos;
             chunks.Add(items[i].Payload);
             pos += items[i].Payload.Length;
