@@ -10,6 +10,8 @@ internal sealed partial class AomComp
     /// <summary>cpi->scaled_ref_buf[ref - 1] when it differs from the reference itself (index by ref frame).</summary>
     public readonly AomFrameBuffer?[] ScaledRefBufs = new AomFrameBuffer?[REF_FRAMES];
     public bool IsScreenContentType;
+    /// <summary>oxcf->border_in_pixels (av1_get_enc_border_size: AOM_ENC_ALLINTRA_BORDER for all-intra, else sb width + 32).</summary>
+    public int BorderInPixels = 64;
     /// <summary>cpi->ref_frame_flags (AOM_LAST_FLAG ...).</summary>
     public int RefFrameFlags;
     /// <summary>TPL: av1_tpl_stats_ready for the frame; oxcf.algo_cfg.enable_tpl_model / arnr_max_frames.</summary>

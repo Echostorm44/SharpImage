@@ -273,6 +273,7 @@ internal static partial class AomEncodeFrame
         xd.LeftTxfmContextOffset = miRow & MAX_MIB_MASK;
 
         SetupDstPlanes(cpi, xd, bsize, miRow, miCol);
+        AomMotionSearch.SetMvLimits(cm, ref x.MvLimits, miRow, miCol, miHeight, miWidth, cpi.BorderInPixels);
 
         // set_plane_n4
         for (int i = 0; i < numPlanes; i++)
