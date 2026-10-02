@@ -103,6 +103,37 @@ internal sealed partial class AomGqEncoder
         _miRows = ((cfg.Height + 7) & ~7) >> 2;
         _miCols = ((cfg.Width + 7) & ~7) >> 2;
         _ssimFactors = new double[((_miRows + 3) / 4) * ((_miCols + 3) / 4)];
+
+        // av1_create_primary_compressor / av1_create_compressor / av1_change_config: rate control and look-ahead
+        int numLapBuffers = Math.Min(cfg.LagInFrames, Math.Min(48, cfg.KfMaxDist + SCENE_CUT_KEY_TEST_INTERVAL));
+        int lapLagInFrames = cfg.LagInFrames - numLapBuffers >= 17 ? 17 : 0;
+        _lapEnabled = numLapBuffers > 0;
+        _kfKeyFreqMax = cfg.KfMaxDist;
+        _kfKeyFreqMin = 0;
+        _kfAutoKey = cfg.KfMaxDist != 0;
+        _framesLeft = cfg.Limit;
+        _rc.WorstQuality = 255;
+        _rc.BestQuality = 0;
+        _cmWidth = cfg.Width;
+        _cmHeight = cfg.Height;
+        _pRc.EnableScenecutDetection = ENABLE_SCENECUT_MODE_2;
+        if (_lapEnabled)
+        {
+            if (numLapBuffers < MAX_GF_LENGTH_LAP + SCENE_CUT_KEY_TEST_INTERVAL + 1 && numLapBuffers >= MAX_GF_LENGTH_LAP + 3)
+                _pRc.EnableScenecutDetection = ENABLE_SCENECUT_MODE_1;
+            else if (numLapBuffers < MAX_GF_LENGTH_LAP + 3) _pRc.EnableScenecutDetection = DISABLE_SCENECUT;
+        }
+        RcInit();
+        NewFramerate(_initFramerate);
+        LookaheadInit(_lapEnabled ? lapLagInFrames : cfg.LagInFrames, numLapBuffers);
+        int statsBufSize = numLapBuffers > 0 ? Math.Max(numLapBuffers + 1, MAX_GF_LENGTH_LAP + 1) : 48;
+        _twopass.Buf = new AomFpStats[statsBufSize];
+        _twopass.InStart = _twopass.InEnd = _twopass.StatsIn = 0;
+        _twopass.InBufEnd = statsBufSize;
+        _twopass.TotalStats = AomFpStats.Zeroed();
+        _twopass.TotalLeftStats = AomFpStats.Zeroed();
+        _twopass.FirstpassInfo.Init();
+        if (_lapEnabled) InitSinglePassLap();
     }
 
     public AomSeqHeader Sequence => _seq;
