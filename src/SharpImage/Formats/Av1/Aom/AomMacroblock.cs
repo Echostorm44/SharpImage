@@ -152,6 +152,7 @@ internal sealed partial class AomPickModeContext
     {
         Mic.CopyFrom(src.Mic);
         MbmiExtBest.CopyFrom(src.MbmiExtBest);
+        MbmiExtBestInter.CopyFrom(src.MbmiExtBestInter);
         NumFourByFourBlk = src.NumFourByFourBlk;
         Skippable = src.Skippable;
         Array.Copy(src.TxTypeMap, TxTypeMap, src.NumFourByFourBlk);

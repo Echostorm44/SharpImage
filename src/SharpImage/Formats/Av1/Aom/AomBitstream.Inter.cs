@@ -68,6 +68,7 @@ internal static partial class AomBitstream
         AomRdoptInter.CollectNeighborsRefCountsPublic(xd);
         WriteRefFrames(t);
         int modeCtx = ModeContextAnalyzerW(ext.ModeContext, mbmi.RefFrame1);
+        AomTrace.Out?.Write($"wctx {xd.MiRow} {xd.MiCol} mode {mode} ctx {modeCtx} raw {ext.ModeContext} cnt {ext.RefMvCount}" + (char)10);
         if (mode >= NEAREST_NEARESTMV)   // is_inter_compound_mode
             w.WriteSymbol(mode - NEAREST_NEARESTMV, m.CompInterMode[modeCtx], INTER_COMPOUND_MODES);
         else

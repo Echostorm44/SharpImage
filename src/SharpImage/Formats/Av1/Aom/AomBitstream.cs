@@ -733,6 +733,7 @@ internal static partial class AomBitstream
         xd.AboveTxfmContextOffset = miCol;
         xd.LeftTxfmContextOffset = miRow & MAX_MIB_MASK;
 
+        w.Trace?.WriteLine($"# blk {miRow} {miCol} bs {bsize}");
         if (cm.FrameIsIntraOnly) WriteMbModesKf(t);
         else PackInterModeMvs(t);
 

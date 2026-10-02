@@ -1195,6 +1195,7 @@ internal static partial class AomTxSearch
                 hash = GetBlockResidueHash(x, bs);
                 rec = x.MbRdRecord;
                 int match = FindMbRdInfo(rec, refBestRd, hash);
+                AomTrace.Out?.Write($"mbu {miRow} {miCol} bs {bs} hash {hash:x8} ref {refBestRd} match {match} num {rec.Num}" + (char)10);
                 if (match != -1)
                 {
                     FetchMbRdInfo(numBlks, rec.Info[match], ref rdStats, x);

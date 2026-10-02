@@ -482,21 +482,25 @@ internal static partial class AomEncodeFrame
         if (sf.part_sf.ml_early_term_after_part_split_level != 0 && !cm.FrameIsIntraOnly && !s.TerminatePartitionSearch &&
             s.DoRectangularSplit && (s.PartitionRectAllowed[HORZ] || s.PartitionRectAllowed[VERT]))
         {
-            // av1_ml_early_term_after_split
-            Span<int> minBwBh = stackalloc int[8];
-            Span<uint> splitFeat = stackalloc uint[4];
-            for (int i = 0; i < 4; i++)
+            // av1_ml_early_term_after_split (the simple motion search features are computed after its early returns)
+            if (bestRdc.Rdcost > 0 && bestRdc.Rdcost != long.MaxValue && bsize != BLOCK_4X4)
             {
-                int minBw = MAX_SB_SIZE_LOG2 - MI_SIZE_LOG2, minBh = MAX_SB_SIZE_LOG2 - MI_SIZE_LOG2;
-                GetMinBsize(t!.Split[i], ref minBw, ref minBh);
-                minBwBh[2 * i] = minBw;
-                minBwBh[2 * i + 1] = minBh;
-                splitFeat[i] = t.Split[i]!.SmsNoneFeat[1];
+                Span<int> minBwBh = stackalloc int[8];
+                Span<uint> splitFeat = stackalloc uint[4];
+                for (int i = 0; i < 4; i++)
+                {
+                    int minBw = MAX_SB_SIZE_LOG2, minBh = MAX_SB_SIZE_LOG2;
+                    GetMinBsize(t!.Split[i], ref minBw, ref minBh);
+                    minBwBh[2 * i] = minBw;
+                    minBwBh[2 * i + 1] = minBh;
+                }
+                SimpleMotionSearchPrunePartFeatures(cpi, x, t!, miRow, miCol, bsize, Span<float>.Empty, FEATURE_SMS_PRUNE_PART_FLAG);
+                for (int i = 0; i < 4; i++) splitFeat[i] = t!.Split[i]!.SmsNoneFeat[1];
+                int dcQ = AomMl.DcQuantQtx(x.Qindex, x.E.Bd) >> (x.E.Bd - 8);
+                s.TerminatePartitionSearch = AomMl.EarlyTermAfterSplit(bsize, cm.Width, cm.Height, sf.part_sf.ml_early_term_after_part_split_level,
+                    dcQ, bestRdc.Rdcost, partNoneRd, partSplitRd, s.SplitRd, minBwBh, t!.SmsNoneFeat[1], splitFeat, t.SmsRectFeat,
+                    s.TerminatePartitionSearch);
             }
-            int dcQ = AomMl.DcQuantQtx(x.Qindex, x.E.Bd) >> (x.E.Bd - 8);
-            s.TerminatePartitionSearch = AomMl.EarlyTermAfterSplit(bsize, cm.Width, cm.Height, sf.part_sf.ml_early_term_after_part_split_level,
-                dcQ, bestRdc.Rdcost, partNoneRd, partSplitRd, s.SplitRd, minBwBh, t!.SmsNoneFeat[1], splitFeat, t.SmsRectFeat,
-                s.TerminatePartitionSearch);
         }
         if (sf.part_sf.ml_early_term_after_part_split_level == 0 && sf.part_sf.ml_prune_partition != 0 && !cm.FrameIsIntraOnly &&
             (s.PartitionRectAllowed[HORZ] || s.PartitionRectAllowed[VERT]) && !(s.PruneRectPart[HORZ] || s.PruneRectPart[VERT]) &&

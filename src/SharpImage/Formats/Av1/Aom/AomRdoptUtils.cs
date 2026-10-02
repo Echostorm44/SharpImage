@@ -141,6 +141,8 @@ internal static class AomRdoptUtils
                 break;
             default: throw new ArgumentOutOfRangeException(nameof(modeEvalType));
         }
+        // the mb rd record collected at one evaluation stage cannot be used at another
+        if (p.ModeEvalType != modeEvalType) x.MbRdRecord.Reset();
         p.ModeEvalType = modeEvalType;
     }
 

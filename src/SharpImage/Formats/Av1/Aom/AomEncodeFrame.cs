@@ -526,7 +526,11 @@ internal static partial class AomEncodeFrame
 
         miAddr.CopyFrom(mi);
         if (cm.FrameIsIntraOnly) ctx.MbmiExtBest.CopyTo(x.MbmiExt);   // copy_mbmi_ext_frame_to_mbmi_ext
-        else ctx.MbmiExtBestInter.CopyTo(x.MbmiExtInter, AomInter.RefFrameType(mi.RefFrame0, mi.RefFrame1));
+        else
+        {
+            ctx.MbmiExtBestInter.CopyTo(x.MbmiExtInter, AomInter.RefFrameType(mi.RefFrame0, mi.RefFrame1));
+            AomTrace.Out?.Write($"ust {miRow} {miCol} bs {bsize} dry {dryRun} mc {ctx.MbmiExtBestInter.ModeContext} rft {AomInter.RefFrameType(mi.RefFrame0, mi.RefFrame1)} xmc {x.MbmiExtInter.ModeContext[AomInter.RefFrameType(mi.RefFrame0, mi.RefFrame1)]}" + (char)10);
+        }
         x.TxfmSkip = ctx.RdStats.SkipTxfm;
 
         xd.TxTypeMap = ctx.TxTypeMap;
@@ -776,8 +780,11 @@ internal static partial class AomEncodeFrame
         }
         if (cm.FrameIsIntraOnly) extFrame?.CopyFrom(x.MbmiExt);   // av1_copy_mbmi_ext_to_mbmi_ext_frame
         else
+        {
             (cpi.MbmiExtFrameInterBase![miRow * cm.MiStride + miCol] ??= new AomMbmiExtFrameInter())
                 .CopyFrom(x.MbmiExtInter, AomInter.RefFrameType(xd.Mi0.RefFrame0, xd.Mi0.RefFrame1));
+            AomTrace.Out?.Write($"ebx {miRow} {miCol} bs {bsize} dry {dryRun} mc {cpi.MbmiExtFrameInterBase[miRow * cm.MiStride + miCol]!.ModeContext}" + (char)10);
+        }
         x.Rdmult = originMult;
     }
 

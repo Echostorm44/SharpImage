@@ -171,6 +171,7 @@ internal static partial class AomRdoptInter
         ctx.Skippable = skippable;
         ctx.Mic.CopyFrom(xd.Mi0);
         ctx.MbmiExtBestInter.CopyFrom(x.MbmiExtInter, AomInter.RefFrameType(xd.Mi0.RefFrame0, xd.Mi0.RefFrame1));
+        AomTrace.Out?.Write($"scc {xd.MiRow} {xd.MiCol} bs {xd.Mi0.Bsize} rft {AomInter.RefFrameType(xd.Mi0.RefFrame0, xd.Mi0.RefFrame1)} mc {ctx.MbmiExtBestInter.ModeContext} cnt {ctx.MbmiExtBestInter.RefMvCount}" + (char)10);
     }
 
     /// <summary>av1_setup_pred_block: the reference planes at the block position.</summary>
