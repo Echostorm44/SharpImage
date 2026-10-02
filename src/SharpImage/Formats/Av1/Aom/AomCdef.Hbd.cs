@@ -12,6 +12,17 @@ internal static partial class AomCdef
     private static void FilterBlock16(ushort[] dst, int dstOff, int dstride, ushort[] inb, int inOff, int priStrength, int secStrength, int dir,
         int priDamping, int secDamping, int coeffShift, int bw, int bh, bool enablePrimary, bool enableSecondary)
     {
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && (enablePrimary || enableSecondary)
+            && dstOff + (bh - 1) * dstride + bw <= dst.Length && inOff - 3 * BStride - 3 >= 0 && inOff + (bh + 3) * BStride + bw + 3 <= inb.Length)
+        {
+            unsafe
+            {
+                fixed (ushort* d = dst) fixed (ushort* ib = inb)
+                    FilterBlock16Avx2(d + dstOff, dstride, (short*)ib + inOff, priStrength, secStrength, dir, priDamping, secDamping, coeffShift, bw, bh,
+                        enablePrimary, enableSecondary);
+            }
+            return;
+        }
         bool clippingRequired = enablePrimary && enableSecondary;
         int tapSet = ((priStrength >> coeffShift) & 1) * 2;
         const int s = BStride;
