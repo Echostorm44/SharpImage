@@ -121,7 +121,7 @@ internal sealed class AomWinnerModeStats
 }
 
 /// <summary>PICK_MODE_CONTEXT (av1/encoder/context_tree.h), the intra fields.</summary>
-internal sealed class AomPickModeContext
+internal sealed partial class AomPickModeContext
 {
     public readonly AomMbModeInfo Mic = new();
     public readonly byte[]?[] ColorIndexMap = new byte[]?[2];

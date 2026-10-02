@@ -223,3 +223,28 @@ internal sealed class AomWarpSampleInfo
     public readonly int[] Pts = new int[SAMPLES_ARRAY_SIZE];
     public readonly int[] PtsInref = new int[SAMPLES_ARRAY_SIZE];
 }
+
+internal sealed partial class AomTileDataEnc
+{
+    /// <summary>tile_data->inter_mode_rd_models[BLOCK_SIZES_ALL].</summary>
+    public readonly AomInterModeRdModel[] InterModeRdModels = NewModels();
+
+    private static AomInterModeRdModel[] NewModels()
+    {
+        var a = new AomInterModeRdModel[BLOCK_SIZES_ALL];
+        for (int i = 0; i < a.Length; i++) a[i] = new AomInterModeRdModel();
+        return a;
+    }
+}
+
+internal sealed partial class AomMacroblock
+{
+    /// <summary>yv12_mb[REF_FRAMES][MAX_MB_PLANE] of av1_rd_pick_inter_mode.</summary>
+    public readonly AomBuf2d[,] Yv12Mb = new AomBuf2d[REF_FRAMES, 3];
+}
+
+internal sealed partial class AomPickModeContext
+{
+    /// <summary>ctx->mbmi_ext_best of an inter-frame block (every reference type).</summary>
+    public readonly AomMbmiExtFrameInter MbmiExtBestInter = new();
+}

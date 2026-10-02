@@ -1170,16 +1170,37 @@ internal static partial class AomTxSearch
         var mbmi = xd.Mi0;
         bool isInter = IsInterBlock(mbmi);
         rdStats.Init();
-        if (isInter && cpi.Sf.rd_sf.use_mb_rd_hash != 0) throw new NotSupportedException("use_mb_rd_hash (inter mb rd record)");
+        uint hash = 0;
+        AomMbRdRecord? rec = null;
+        int numBlks = BsizeToNumBlk(bs);
+        if (isInter && cpi.Sf.rd_sf.use_mb_rd_hash != 0)
+        {
+            int miRow = xd.MiRow, miCol = xd.MiCol;
+            bool withinBorder = miRow >= xd.TileMiRowStart && miRow + MiSizeHigh[bs] < xd.TileMiRowEnd && miCol >= xd.TileMiColStart &&
+                                miCol + MiSizeWide[bs] < xd.TileMiColEnd;
+            if (withinBorder)
+            {
+                hash = GetBlockResidueHash(x, bs);
+                rec = x.MbRdRecord;
+                int match = FindMbRdInfo(rec, refBestRd, hash);
+                if (match != -1)
+                {
+                    FetchMbRdInfo(numBlks, rec.Info[match], ref rdStats, x);
+                    return;
+                }
+            }
+        }
         if (x.TxfmSearchParams.SkipTxfmLevel != 0 && isInter && xd.Lossless[mbmi.SegmentId] == 0 &&
             PredictSkipTxfm(x, bs, out long skipDist, cpi.ReducedTxSetUsed != 0))
         {
             SetSkipTxfm(x, ref rdStats, bs, skipDist);
+            if (rec != null) SaveMbRdInfo(numBlks, hash, x, rdStats, rec);
             return;
         }
         if (xd.Lossless[mbmi.SegmentId] != 0) ChooseSmallestTxSize(cpi, x, ref rdStats, refBestRd, bs);
         else if (x.TxfmSearchParams.TxSizeSearchMethod == USE_LARGESTALL) ChooseLargestTxSize(cpi, x, ref rdStats, refBestRd, bs);
         else ChooseTxSizeTypeFromRd(cpi, x, ref rdStats, refBestRd, bs);
+        if (rec != null) SaveMbRdInfo(numBlks, hash, x, rdStats, rec);
         if (AomTrace.Out != null && !isInter)
             AomTrace.Out.Write($"yrd {xd.MiRow} {xd.MiCol} bs {bs} y {mbmi.Mode} ad {mbmi.AngleDelta[0]} fi {mbmi.UseFilterIntra} {mbmi.FilterIntraMode} ref {refBestRd} -> rate {rdStats.Rate} dist {rdStats.Dist} sse {rdStats.Sse} skip {rdStats.SkipTxfm} tx {mbmi.TxSize}\n");
     }

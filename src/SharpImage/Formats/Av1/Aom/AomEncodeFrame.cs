@@ -272,15 +272,7 @@ internal static partial class AomEncodeFrame
         xd.AboveTxfmContextOffset = miCol;
         xd.LeftTxfmContextOffset = miRow & MAX_MIB_MASK;
 
-        // av1_setup_dst_planes
-        var cur = cm.CurFrame;
-        for (int i = 0; i < numPlanes; i++)
-        {
-            int isUv = i > 0 ? 1 : 0;
-            var pd = xd.Plane[i];
-            SetupPredPlane(ref pd.Dst, bsize, cur.Buffers[i], cur.Offsets[i], cur.CropWidths[isUv], cur.CropHeights[isUv], cur.Strides[i],
-                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY, cur.Buffers16[i]);
-        }
+        SetupDstPlanes(cpi, xd, bsize, miRow, miCol);
 
         // set_plane_n4
         for (int i = 0; i < numPlanes; i++)
@@ -292,6 +284,20 @@ internal static partial class AomEncodeFrame
 
         SetMiRowCol(xd, cm, miRow, miHeight, miCol, miWidth);
         SetupSrcPlanes(cpi, x, miRow, miCol, numPlanes, bsize);
+    }
+
+    /// <summary>av1_setup_dst_planes on cm->cur_frame.</summary>
+    internal static void SetupDstPlanes(AomComp cpi, AomMacroblockD xd, int bsize, int miRow, int miCol)
+    {
+        var cm = cpi.Cm;
+        var cur = cm.CurFrame;
+        for (int i = 0; i < cm.NumPlanes; i++)
+        {
+            int isUv = i > 0 ? 1 : 0;
+            var pd = xd.Plane[i];
+            SetupPredPlane(ref pd.Dst, bsize, cur.Buffers[i], cur.Offsets[i], cur.CropWidths[isUv], cur.CropHeights[isUv], cur.Strides[i],
+                miRow, miCol, pd.SubsamplingX, pd.SubsamplingY, cur.Buffers16[i]);
+        }
     }
 
     /// <summary>set_mi_row_col.</summary>

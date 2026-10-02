@@ -12,6 +12,9 @@ internal sealed partial class AomComp
     public bool IsScreenContentType;
     /// <summary>cpi->ref_frame_flags (AOM_LAST_FLAG ...).</summary>
     public int RefFrameFlags;
+    /// <summary>TPL: av1_tpl_stats_ready for the frame; oxcf.algo_cfg.enable_tpl_model / arnr_max_frames.</summary>
+    public bool TplStatsReady, EnableTplModel = true;
+    public int ArnrMaxFrames = 7;
 
     /// <summary>av1_get_scaled_ref_frame.</summary>
     public AomFrameBuffer? GetScaledRefFrame(int refFrame) => ScaledRefBufs[refFrame];

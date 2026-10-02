@@ -33,7 +33,7 @@ internal sealed partial class AomMacroblock
 /// <summary>TileDataEnc (av1/encoder/encoder.h) for the all-intra frame: the tile, its CDFs (tctx: the tile's adaptive
 /// contexts on the single-threaded path, the row-MT rows' starting point), allow_update_cdf, and the tile's row-MT
 /// state (AV1EncRowMultiThreadSync, next_mi_row / num_threads_working, row_ctx) and palette token lists (tplist).</summary>
-internal sealed class AomTileDataEnc
+internal sealed partial class AomTileDataEnc
 {
     public readonly AomTileInfo Tile;
     public readonly Av1CdfContext Tctx = new();

@@ -145,7 +145,7 @@ internal static class AomRdoptUtils
     }
 
     /// <summary>bypass_winner_mode_processing (intra blocks: the best mode is never NEWMV).</summary>
-    private static bool BypassWinnerModeProcessing(AomMacroblock x, AomSpeedFeatures sf, bool useTxfmSkip, bool actualTxfmSkip)
+    private static bool BypassWinnerModeProcessing(AomMacroblock x, AomSpeedFeatures sf, bool useTxfmSkip, bool actualTxfmSkip, int bestMode)
     {
         int level = sf.winner_mode_sf.prune_winner_mode_eval_level;
         if (level == 1)
@@ -155,12 +155,12 @@ internal static class AomRdoptUtils
         }
         else if (level == 2)
         {
-            if (actualTxfmSkip) return true;
+            if (!AomInter.HaveNewmvInInterMode(bestMode) && actualTxfmSkip) return true;
         }
         else if (level == 3)
         {
             bool isTxfmSkip = x.Qindex > 127 ? actualTxfmSkip : actualTxfmSkip || useTxfmSkip;
-            if (isTxfmSkip) return true;
+            if (!AomInter.HaveNewmvInInterMode(bestMode) && isTxfmSkip) return true;
         }
         else if (level >= 4)
         {
@@ -170,12 +170,18 @@ internal static class AomRdoptUtils
         return false;
     }
 
-    /// <summary>is_winner_mode_processing_enabled (intra blocks).</summary>
+    /// <summary>is_winner_mode_processing_enabled.</summary>
     internal static bool IsWinnerModeProcessingEnabled(AomComp cpi, AomMacroblock x, AomMbModeInfo mbmi, bool actualTxfmSkip)
     {
         var sf = cpi.Sf;
-        if (BypassWinnerModeProcessing(x, sf, mbmi.SkipTxfm != 0, actualTxfmSkip)) return false;
-        if (sf.tx_sf.tx_type_search.fast_intra_tx_type_search != 0 && !cpi.UseIntraDefaultTxOnly && !cpi.UseIntraDctOnly) return true;
+        int bestMode = mbmi.Mode;
+        if (BypassWinnerModeProcessing(x, sf, mbmi.SkipTxfm != 0, actualTxfmSkip, bestMode)) return false;
+        if (mbmi.IsInterBlock)
+        {
+            if (AomInter.IsInterMode(bestMode) && sf.tx_sf.tx_type_search.fast_inter_tx_type_prob_thresh != int.MaxValue && !cpi.UseInterDctOnly)
+                return true;
+        }
+        else if (sf.tx_sf.tx_type_search.fast_intra_tx_type_search != 0 && !cpi.UseIntraDefaultTxOnly && !cpi.UseIntraDctOnly) return true;
         int opt = cpi.OptimizeSegArr[mbmi.SegmentId];
         if (sf.winner_mode_sf.enable_winner_mode_for_coeff_opt != 0 && opt != NO_TRELLIS_OPT && opt != FINAL_PASS_TRELLIS_OPT) return true;
         if (sf.winner_mode_sf.enable_winner_mode_for_tx_size_srch != 0) return true;
@@ -230,6 +236,54 @@ internal static class AomRdoptUtils
         st.Mbmi.CopyFrom(mbmi);
         st.Rd = thisRd;
         st.ModeIndex = 0;
+        if (colorMap != null)
+        {
+            GetBlockDimensions(bsize, 0, x.E, out int bw, out int bh, out _, out _);
+            Array.Copy(colorMap, st.ColorIndexMap, bw * bh);
+        }
+        x.WinnerModeCount = Math.Min(x.WinnerModeCount + 1, maxWinnerModeCount);
+    }
+
+    /// <summary>store_winner_mode_stats with the inter-frame rd stats (rd_cost / rate_y / rate_uv) and the mode index.</summary>
+    internal static void StoreWinnerModeStats(AomComp cpi, AomMacroblock x, AomMbModeInfo mbmi, AomRdStats? rdCost, AomRdStats? rdCostY,
+        AomRdStats? rdCostUv, int modeIndex, byte[]? colorMap, int bsize, long thisRd, int multiWinnerModeType, bool txfmSearchDone)
+    {
+        var stats = x.WinnerModeStats;
+        int modeIdx = 0;
+        bool isPaletteMode = mbmi.Palette.PaletteSize0 > 0;
+        if (multiWinnerModeType == MULTI_WINNER_MODE_OFF) return;
+        if (thisRd == long.MaxValue) return;
+        if (!cpi.FrameIsIntraOnly && isPaletteMode) return;
+        int maxWinnerModeCount = WinnerModeCountAllowed[multiWinnerModeType];
+        if (x.WinnerModeCount != 0)
+        {
+            for (modeIdx = 0; modeIdx < x.WinnerModeCount; modeIdx++)
+                if (stats[modeIdx].Rd > thisRd) break;
+            if (modeIdx == maxWinnerModeCount) return;
+            if (modeIdx < maxWinnerModeCount - 1)
+            {
+                var spare = stats[maxWinnerModeCount - 1];
+                for (int k = maxWinnerModeCount - 1; k > modeIdx; k--) stats[k] = stats[k - 1];
+                stats[modeIdx] = spare;
+                CopyStats(stats[modeIdx], stats[modeIdx + 1]);
+            }
+        }
+        var st = stats[modeIdx];
+        st.Mbmi.CopyFrom(mbmi);
+        st.Rd = thisRd;
+        st.ModeIndex = modeIndex;
+        if (!cpi.FrameIsIntraOnly && rdCost is AomRdStats rc && rdCostY is AomRdStats ry && rdCostUv is AomRdStats ru)
+        {
+            int skipCtx = AomTxSearch.SkipTxfmContext(x.E);
+            bool isIntraMode = ModeDefs[modeIndex * 3] < INTRA_MODE_END;
+            bool skipTxfm = mbmi.SkipTxfm != 0 && !isIntraMode;
+            st.RdCost = rc;
+            if (txfmSearchDone)
+            {
+                st.RateY = ry.Rate + x.ModeCosts.SkipTxfmCost[skipCtx * 2 + (rc.SkipTxfm != 0 || skipTxfm ? 1 : 0)];
+                st.RateUv = ru.Rate;
+            }
+        }
         if (colorMap != null)
         {
             GetBlockDimensions(bsize, 0, x.E, out int bw, out int bh, out _, out _);

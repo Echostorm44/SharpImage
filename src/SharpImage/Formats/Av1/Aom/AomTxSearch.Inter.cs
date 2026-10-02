@@ -13,6 +13,30 @@ internal sealed partial class AomComp
 // av1_txfm_search, av1_pick_recursive_tx_size_type_yrd (var-tx: select_tx_size_and_type, select_tx_block,
 // try_tx_block_no_split / try_tx_block_split, tx_type_rd, ml_predict_tx_split, inter_block_yrd / tx_block_yrd for
 // the refinement of the fast search), predict_skip_txfm / set_skip_txfm, and the tx partition context helpers.
+/// <summary>MB_RD_INFO.</summary>
+internal sealed class AomMbRdInfo
+{
+    public int TxSize;
+    public readonly byte[] InterTxSize = new byte[16];
+    public readonly byte[] TxTypeMap = new byte[32 * 32];
+    public AomRdStats RdStats;
+    public uint HashValue;
+}
+
+/// <summary>MB_RD_RECORD.</summary>
+internal sealed class AomMbRdRecord
+{
+    public const int Len = 8;   // RD_RECORD_BUFFER_LEN
+    public readonly AomMbRdInfo[] Info = { new(), new(), new(), new(), new(), new(), new(), new() };
+    public int IndexStart, Num;
+    public void Reset() { IndexStart = 0; Num = 0; }
+}
+
+internal sealed partial class AomMacroblock
+{
+    public readonly AomMbRdRecord MbRdRecord = new();
+}
+
 internal static partial class AomTxSearch
 {
     private const int MAX_VARTX_DEPTH_ = 2;
@@ -498,17 +522,108 @@ internal static partial class AomTxSearch
     internal static void PickRecursiveTxSizeTypeYrd(AomComp cpi, AomMacroblock x, ref AomRdStats rdStats, int bsize, long refBestRd)
     {
         var txfmParams = x.TxfmSearchParams;
+        var xd = x.E;
         rdStats.Invalidate();
         if (cpi.Sf.tx_sf.model_based_prune_tx_search_level != 0 && refBestRd != long.MaxValue)
-            throw new NotSupportedException("model_based_tx_search_prune (model_rd_sb_fn) is not ported");
-        if (cpi.Sf.rd_sf.use_mb_rd_hash != 0) throw new NotSupportedException("use_mb_rd_hash (inter mb rd record)");
+            if (ModelBasedTxSearchPrune(cpi, x, bsize, refBestRd)) return;
+        uint hash = 0;
+        int miRow = xd.MiRow, miCol = xd.MiCol;
+        bool withinBorder = miRow >= xd.TileMiRowStart && miRow + MiSizeHigh[bsize] < xd.TileMiRowEnd && miCol >= xd.TileMiColStart &&
+                            miCol + MiSizeWide[bsize] < xd.TileMiColEnd;
+        bool hashEnabled = withinBorder && cpi.Sf.rd_sf.use_mb_rd_hash != 0;
+        int n4 = BsizeToNumBlk(bsize);
+        var rec = x.MbRdRecord;
+        if (hashEnabled)
+        {
+            hash = GetBlockResidueHash(x, bsize);
+            int match = FindMbRdInfo(rec, refBestRd, hash);
+            if (match != -1)
+            {
+                FetchMbRdInfo(n4, rec.Info[match], ref rdStats, x);
+                return;
+            }
+        }
         if (txfmParams.SkipTxfmLevel != 0 && PredictSkipTxfm(x, bsize, out long dist, cpi.ReducedTxSetUsed != 0))
         {
             SetSkipTxfm(x, ref rdStats, bsize, dist);
+            if (hashEnabled) SaveMbRdInfo(n4, hash, x, rdStats, rec);
             return;
         }
         long rd = SelectTxSizeAndType(cpi, x, ref rdStats, bsize, refBestRd);
-        if (rd == long.MaxValue) rdStats.Invalidate();
+        if (rd == long.MaxValue)
+        {
+            rdStats.Invalidate();
+            return;
+        }
+        if (hashEnabled) SaveMbRdInfo(n4, hash, x, rdStats, rec);
+    }
+
+    /// <summary>model_based_tx_search_prune.</summary>
+    private static bool ModelBasedTxSearchPrune(AomComp cpi, AomMacroblock x, int bsize, long refBestRd)
+    {
+        int level = cpi.Sf.tx_sf.model_based_prune_tx_search_level;
+        AomModelRd.SbFn(AomModelRd.MODELRD_TYPE_TX_SEARCH_PRUNE, cpi, bsize, x, x.E, 0, 0, out int modelRate, out long modelDist, out byte modelSkip,
+            out _, null, null, null);
+        if (modelSkip != 0) return false;
+        long modelRd = AomRd.RdCost(x.Rdmult, modelRate, modelDist);
+        int factor = level == 1 ? 3 : 5;
+        return ((modelRd * factor) >> 3) > refBestRd;
+    }
+
+    /// <summary>get_block_residue_hash: CRC32C of the luma residual, then (hash &lt;&lt; 5) + bsize.</summary>
+    internal static uint GetBlockResidueHash(AomMacroblock x, int bsize)
+    {
+        int n = BlockSizeHigh[bsize] * BlockSizeWide[bsize];
+        var diff = System.Runtime.InteropServices.MemoryMarshal.AsBytes(x.Plane[0].SrcDiff.AsSpan(0, n));
+        uint crc = 0xffffffff;
+        int i = 0;
+        for (; i + 8 <= diff.Length; i += 8) crc = System.Numerics.BitOperations.Crc32C(crc, System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(diff.Slice(i)));
+        for (; i < diff.Length; i++) crc = System.Numerics.BitOperations.Crc32C(crc, diff[i]);
+        uint hash = crc ^ 0xffffffff;
+        return (hash << 5) + (uint)bsize;
+    }
+
+    private static int FindMbRdInfo(AomMbRdRecord rec, long refBestRd, uint hash)
+    {
+        if (refBestRd != long.MaxValue)
+            for (int i = 0; i < rec.Num; ++i)
+            {
+                int index = (rec.IndexStart + i) % AomMbRdRecord.Len;
+                if (rec.Info[index].HashValue == hash) return index;
+            }
+        return -1;
+    }
+
+    private static void FetchMbRdInfo(int n4, AomMbRdInfo info, ref AomRdStats rdStats, AomMacroblock x)
+    {
+        var xd = x.E;
+        var mbmi = xd.Mi0;
+        mbmi.TxSize = info.TxSize;
+        Array.Copy(info.InterTxSize, mbmi.InterTxSize, mbmi.InterTxSize.Length);
+        AomRdoptInter.CopyTxTypeMapFrom(xd, info.TxTypeMap, n4);
+        rdStats = info.RdStats;
+    }
+
+    private static void SaveMbRdInfo(int n4, uint hash, AomMacroblock x, in AomRdStats rdStats, AomMbRdRecord rec)
+    {
+        int index;
+        if (rec.Num < AomMbRdRecord.Len)
+        {
+            index = (rec.IndexStart + rec.Num) % AomMbRdRecord.Len;
+            ++rec.Num;
+        }
+        else
+        {
+            index = rec.IndexStart;
+            rec.IndexStart = (rec.IndexStart + 1) % AomMbRdRecord.Len;
+        }
+        var info = rec.Info[index];
+        var xd = x.E;
+        info.HashValue = hash;
+        info.TxSize = xd.Mi0.TxSize;
+        Array.Copy(xd.Mi0.InterTxSize, info.InterTxSize, info.InterTxSize.Length);
+        AomRdoptInter.CopyTxTypeMapTo(xd, info.TxTypeMap, n4);
+        info.RdStats = rdStats;
     }
 
     /// <summary>av1_txfm_search: the luma and chroma transform search of an inter (intrabc) block whose prediction is
