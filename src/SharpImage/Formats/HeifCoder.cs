@@ -1151,12 +1151,21 @@ public static partial class HeifCoder
         }
     }
 
+    [ThreadStatic] private static bool t_targetSizeSearch;
+
     private static byte[] EncodeAvifEntry(ImageFrame image, AvifEncodeOptions options)
     {
         options = AdoptSourceFormat(image, options);
         using var siting = new Av1.Av1ObuWriter.ChromaPositionScope(SourceChromaPosition(image, options));
         if (options.TargetSize is { } target)
-            return SearchTargetSize(options, target, o => EncodeAvif(image, o));
+        {
+            // avifenc --target-size encodes from its input cache, whose image views (avifImageSetViewRect) carry the pixels
+            // and CICP but no ICC / Exif / XMP
+            bool prev = t_targetSizeSearch;
+            t_targetSizeSearch = true;
+            try { return SearchTargetSize(options, target, o => EncodeAvif(image, o)); }
+            finally { t_targetSizeSearch = prev; }
+        }
         if (options.BitDepthExtension != AvifBitDepthExtension.None)
         {
             using var satoTiling = Av1.Av1ObuWriter.UseTiling(ResolveTiling(options, (int)image.Columns, (int)image.Rows));
@@ -1985,8 +1994,8 @@ public static partial class HeifCoder
         var x = new Av1.AvifContainerExtras
         {
             Icc = AvifIcc(image, o),
-            Exif = image.Metadata.ExifProfile is { } exif ? SharpImage.Metadata.ExifParser.SerializeForPngExif(exif) : null,
-            Xmp = image.Metadata.Xmp is { Length: > 0 } xmp ? Encoding.UTF8.GetBytes(xmp) : null,
+            Exif = !t_targetSizeSearch && image.Metadata.ExifProfile is { } exif ? SharpImage.Metadata.ExifParser.SerializeForPngExif(exif) : null,
+            Xmp = !t_targetSizeSearch && image.Metadata.Xmp is { Length: > 0 } xmp ? Encoding.UTF8.GetBytes(xmp) : null,
         };
         (int? irot, int? imir) = image.Orientation switch
         {
@@ -2061,6 +2070,7 @@ public static partial class HeifCoder
     // --ignore-icc would (the CICP then defaults to sRGB, as avifenc's does).
     private static byte[]? AvifIcc(ImageFrame image, AvifEncodeOptions o)
     {
+        if (t_targetSizeSearch) return null;
         byte[]? icc = image.Metadata.IccProfile?.Data ?? image.IccProfile;
         if (icc is not { Length: >= 20 }) return icc;
         bool grayIcc = icc[16] == 'G' && icc[17] == 'R' && icc[18] == 'A' && icc[19] == 'Y';   // header data colour space
@@ -2697,7 +2707,7 @@ public static partial class HeifCoder
                         Image = l.Image == null ? null : Crop(l.Image), Quality = l.Quality, QualityAlpha = l.QualityAlpha,
                         ScaleNumerator = l.ScaleNumerator, ScaleDenominator = l.ScaleDenominator,
                     }).ToList(), forceColor: !mono, forceAlpha: alpha)
-                    : EncodeAvifCore(cellImage, cellOpt, forceColor: !mono, forceAlpha: alpha);
+                    : EncodeAvifCellPadded(cellImage, cellOpt, cellW, cellH, !mono, alpha);
                 var c = HeifContainer.Parse(file);
                 int pid = c.PrimaryId;
                 cells.Color.Add(c.ItemData(pid)!);
@@ -2716,6 +2726,16 @@ public static partial class HeifCoder
         extras.Premultiplied = options.PremultiplyAlpha && alpha;
         if (options.GainMap != null) extras.GainMap = BuildGainMapItem(options.GainMap, options, extras);
         return Av1.Av1AvifWriter.BuildGridAvif(cells, w, h, bd, coded, color, extras);
+    }
+
+    // A grid cell through EncodeAvifCore, coded at the full cell size as libavif pads right / bottom cells (the port pads
+    // the converted planes).
+    private static byte[] EncodeAvifCellPadded(ImageFrame cell, AvifEncodeOptions o, int cellW, int cellH, bool forceColor, bool forceAlpha)
+    {
+        var prev = Av1.AomStill.t_padTo;
+        Av1.AomStill.t_padTo = (cellW, cellH);
+        try { return EncodeAvifCore(cell, o, forceColor: forceColor, forceAlpha: forceAlpha); }
+        finally { Av1.AomStill.t_padTo = prev; }
     }
 
     // avifGetBestCellSize (avifenc): ceil(pixels / cells), raised to MIAF's 64 minimum and to even along subsampled axes,

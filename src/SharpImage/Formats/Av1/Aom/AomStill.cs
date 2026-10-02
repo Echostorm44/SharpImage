@@ -22,6 +22,8 @@ internal static class AomStill
     /// identity matrix); alpha items (no colour description) keep tune=psnr, as libavif sets for alpha.</summary>
     [ThreadStatic] private static AomTune t_tune;
     /// <summary>The user's -a sharpness / -a enable-cdef (colour and alpha alike, as libavif's unprefixed options).</summary>
+    /// <summary>Grid cells: the size every cell is coded at (the first cell's); smaller edge cells are padded.</summary>
+    [ThreadStatic] internal static (int Width, int Height)? t_padTo;
     [ThreadStatic] private static int? t_sharpness;
     [ThreadStatic] private static bool? t_enableCdef;
     internal static int? SharpnessOverride => t_sharpness;
@@ -53,6 +55,41 @@ internal static class AomStill
     internal static (byte[] SeqObu, byte[] FrameObu) Encode(ReadOnlySpan<ushort> y, ReadOnlySpan<ushort> u, ReadOnlySpan<ushort> v,
         int width, int height, Av1PixelLayout layout, int qIdx, Av1ObuWriter.Av1ColorDesc? color, int bitDepth = 8)
     {
+        if (t_padTo is { } pad && (pad.Width > width || pad.Height > height))
+        {
+            // libavif avifImageCopyAndPad: a smaller right / bottom grid cell coded at the first cell's size, its planes
+            // extended with their last column / row
+            bool m = layout == Av1PixelLayout.I400;
+            int sx = layout == Av1PixelLayout.I444 ? 0 : 1, sy = layout == Av1PixelLayout.I420 ? 1 : 0;
+            ushort[] Pad(ReadOnlySpan<ushort> src, int w0, int h0, int w1, int h1)
+            {
+                var d = new ushort[w1 * h1];
+                for (int r = 0; r < h1; r++)
+                {
+                    var row = d.AsSpan(r * w1, w1);
+                    if (r < h0)
+                    {
+                        src.Slice(r * w0, w0).CopyTo(row);
+                        row.Slice(w0).Fill(src[r * w0 + w0 - 1]);
+                    }
+                    else d.AsSpan((h0 - 1) * w1, w1).CopyTo(row);
+                }
+                return d;
+            }
+            int pw = Math.Max(pad.Width, width), ph = Math.Max(pad.Height, height);
+            var py = Pad(y, width, height, pw, ph);
+            ushort[]? pu = null, pv = null;
+            if (!m)
+            {
+                int cw0 = (width + sx) >> sx, ch0 = (height + sy) >> sy, cw1 = (pw + sx) >> sx, ch1 = (ph + sy) >> sy;
+                pu = Pad(u, cw0, ch0, cw1, ch1);
+                pv = Pad(v, cw0, ch0, cw1, ch1);
+            }
+            var prev = t_padTo;
+            t_padTo = null;
+            try { return Encode(py, pu, pv, pw, ph, layout, qIdx, color, bitDepth); }
+            finally { t_padTo = prev; }
+        }
         bool mono = layout == Av1PixelLayout.I400;
         int ssX = layout == Av1PixelLayout.I444 ? 0 : 1, ssY = layout == Av1PixelLayout.I420 || mono ? 1 : 0;
         int cw = (width + ssX) >> ssX, ch = (height + ssY) >> ssY;
