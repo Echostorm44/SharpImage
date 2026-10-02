@@ -7,7 +7,7 @@ namespace SharpImage.Formats.Av1;
 /// (set_block_thresholds, the RD search's mode pruning).</summary>
 internal sealed class AomRdOpt
 {
-    public const int RD_THRESH_FAC_FRAC_BITS = 4, RD_THRESH_FAC_FRAC_VAL = 1 << RD_THRESH_FAC_FRAC_BITS;
+    public const int RD_THRESH_FAC_FRAC_BITS = 5, RD_THRESH_FAC_FRAC_VAL = 1 << RD_THRESH_FAC_FRAC_BITS;
     public const int RD_THRESH_MAX_FACT = 64, RD_THRESH_LOG_DEC_FACTOR = 4, RD_THRESH_INC = 1;
     private static readonly byte[] RdThreshBlockSizeFactor = { 2, 3, 3, 4, 6, 6, 8, 12, 12, 16, 24, 24, 32, 48, 48, 64, 4, 4, 8, 8, 16, 16 };
 

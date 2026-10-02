@@ -26,9 +26,9 @@ internal struct AomMv : IEquatable<AomMv>
     /// <summary>get_mv_from_fullmv: GET_MV_SUBPEL.</summary>
     public readonly AomMv ToMv() => new(Row * 8, Col * 8);
 
-    /// <summary>GET_MV_RAWPEL(x) = (x + 3 - (x >= 0)) >> 3.</summary>
+    /// <summary>GET_MV_RAWPEL(x) = (x + 3 + (x >= 0)) >> 3.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static int GetMvRawpel(int x) => (x + 3 - (x >= 0 ? 1 : 0)) >> 3;
+    public static int GetMvRawpel(int x) => (x + 3 + (x >= 0 ? 1 : 0)) >> 3;
 }
 
 /// <summary>CANDIDATE_MV.</summary>

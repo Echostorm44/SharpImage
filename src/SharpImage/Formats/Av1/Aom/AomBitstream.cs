@@ -495,6 +495,7 @@ internal static partial class AomBitstream
         // av1_finalize_encoded_frame: the tile contexts restart from cm->fc
         var fc = new Av1CdfContext();
         fc.CopyFrom(cm.Fc);
+        trace?.WriteLine("start");
         var w = new AomWriter { AllowUpdateCdf = !cpi.DisableCdfUpdate, Trace = trace };
         var xd = new AomMacroblockD();
         for (int p = 0; p < 3; p++)

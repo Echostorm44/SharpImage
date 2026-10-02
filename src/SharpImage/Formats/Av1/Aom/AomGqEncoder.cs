@@ -86,7 +86,7 @@ internal sealed partial class AomGqEncoder
     /// <summary>cm->remapped_ref_idx.</summary>
     private readonly int[] _remappedRefIdx = new int[REF_FRAMES];
     /// <summary>ppi->frame_probs (persistent across frames).</summary>
-    private readonly int[] _txTypeProbs = (int[])DefaultTxTypeProbs.Clone();
+    private readonly int[] _txTypeProbs = new int[DefaultTxTypeProbs.Length];   // ppi is zeroed: copy_frame_prob_info fills what the speed features use
     private int _frameNumber;       // cm->current_frame.frame_number
     private int _resizePendingW, _resizePendingH;
     private bool _pendingTu;          // a packet of the current temporal unit was output (no new TD)

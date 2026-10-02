@@ -568,18 +568,20 @@ internal static partial class AomRdoptInter
     }
 
     /// <summary>skip_inter_mode.</summary>
+    [ThreadStatic] private static int _skipReason;
+
     private static bool SkipInterMode(AomComp cpi, AomMacroblock x, int bsize, long[] refFrameRd, int midx, AomInterModeSfArgs args, bool isLowTempVar)
     {
         var sf = cpi.Sf;
         int modeEnum = DefaultModeOrder[midx];
         int thisMode = ModeDefMode(modeEnum), rf0 = ModeDefRef0(modeEnum), rf1 = ModeDefRef1(modeEnum);
         bool comp = rf1 > INTRA_FRAME;
-        if (rf0 == INTRA_FRAME) return true;
-        if (sf.inter_sf.skip_arf_compound != 0 && cpi.UpdateType == ARF_UPDATE && comp) return true;
-        if (isLowTempVar && !comp && rf0 != LAST_FRAME && thisMode != NEARESTMV) return true;
-        if (InterModeCompatibleSkip(cpi, x, bsize, thisMode, rf0, rf1)) return true;
+        if (rf0 == INTRA_FRAME) { _skipReason = 1; return true; }
+        if (sf.inter_sf.skip_arf_compound != 0 && cpi.UpdateType == ARF_UPDATE && comp) { _skipReason = 2; return true; }
+        if (isLowTempVar && !comp && rf0 != LAST_FRAME && thisMode != NEARESTMV) { _skipReason = 3; return true; }
+        if (InterModeCompatibleSkip(cpi, x, bsize, thisMode, rf0, rf1)) { _skipReason = 4; return true; }
         int ret = InterModeSearchOrderIndependentSkip(cpi, x, args.ModeSkipMask, args.SearchState, args.SkipRefFrameMask, thisMode, rf0, rf1);
-        if (ret == 1) return true;
+        if (ret == 1) { _skipReason = 5; return true; }
         x.InterArgs.SkipMotionMode = ret == 2 ? 1 : 0;
         if (sf.interp_sf.skip_interp_filter_search == 0 && sf.inter_sf.prune_comp_search_by_single_result > 0 && comp && !args.ReachFirstCompMode)
         {
@@ -588,9 +590,9 @@ internal static partial class AomRdoptInter
         }
         int mulFact = args.SearchState.BestModeSkippable != 0 ? args.ModeThreshMulFact : 1 << MODE_THRESH_QBITS;
         long modeThreshold = (args.SearchState.ModeThreshold[modeEnum] * mulFact) >> MODE_THRESH_QBITS;
-        if (args.SearchState.BestRd < modeThreshold) return true;
+        if (args.SearchState.BestRd < modeThreshold) { _skipReason = 6; return true; }
         if (sf.interp_sf.skip_interp_filter_search == 0 && sf.inter_sf.prune_comp_search_by_single_result > 0 && comp)
-            if (CompoundSkipBySingleStates(cpi, args.SearchState, thisMode, rf0, rf1, x)) return true;
+            if (CompoundSkipBySingleStates(cpi, args.SearchState, thisMode, rf0, rf1, x)) { _skipReason = 7; return true; }
         if (sf.inter_sf.prune_compound_using_single_ref != 0 && comp)
         {
             if (!args.PruneCpdUsingSrStatsReady && args.NumSingleModesProcessed == NUM_SINGLE_REF_MODES)
@@ -598,18 +600,18 @@ internal static partial class AomRdoptInter
                 FindTopRef(refFrameRd);
                 args.PruneCpdUsingSrStatsReady = true;
             }
-            if (args.PruneCpdUsingSrStatsReady && !InSingleRefCutoff(refFrameRd, rf0, rf1)) return true;
+            if (args.PruneCpdUsingSrStatsReady && !InSingleRefCutoff(refFrameRd, rf0, rf1)) { _skipReason = 8; return true; }
         }
-        if (sf.inter_sf.skip_ext_comp_nearmv_mode != 0 && (thisMode == NEW_NEARMV || thisMode == NEAR_NEWMV)) return true;
+        if (sf.inter_sf.skip_ext_comp_nearmv_mode != 0 && (thisMode == NEW_NEARMV || thisMode == NEAR_NEWMV)) { _skipReason = 9; return true; }
         if (sf.inter_sf.prune_ext_comp_using_neighbors != 0 && comp)
-            if (CompoundSkipUsingNeighborRefs(x.E, thisMode, rf0, rf1, sf.inter_sf.prune_ext_comp_using_neighbors)) return true;
+            if (CompoundSkipUsingNeighborRefs(x.E, thisMode, rf0, rf1, sf.inter_sf.prune_ext_comp_using_neighbors)) { _skipReason = 10; return true; }
         if (sf.inter_sf.prune_comp_using_best_single_mode_ref != 0 && comp)
             if (SkipCompoundUsingBestSingleModeRef(thisMode, rf0, rf1, args.SearchState.BestSingleMode, sf.inter_sf.prune_comp_using_best_single_mode_ref))
-                return true;
+                { _skipReason = 11; return true; }
         if (sf.inter_sf.prune_nearest_near_mv_using_refmv_weight != 0 && !comp)
         {
             int rft = AomInter.RefFrameType(rf0, rf1);
-            if (SkipNearestNearMvUsingRefmvWeight(x, thisMode, rft, args.SearchState.BestMbmode.Mode)) return true;
+            if (SkipNearestNearMvUsingRefmvWeight(x, thisMode, rft, args.SearchState.BestMbmode.Mode)) { _skipReason = 12; return true; }
         }
         if (sf.rt_sf.prune_inter_modes_with_golden_ref != 0 && rf0 == GOLDEN_FRAME && !comp)
             throw new NotImplementedException("prune_inter_modes_with_golden_ref");
@@ -802,7 +804,10 @@ internal static partial class AomRdoptInter
             bool compPred = rf1 > INTRA_FRAME;
             x.TxfmSkip = 0;
             if (isSinglePred) sfArgs.NumSingleModesProcessed++;
-            if (SkipInterMode(cpi, x, bsize, refFrameRd, midx, sfArgs, isLowTempVar)) continue;
+            bool isSkipInterMode = SkipInterMode(cpi, x, bsize, refFrameRd, midx, sfArgs, isLowTempVar);
+            if (AomTrace.Out != null && ModeDefMode(DefaultModeOrder[midx]) >= NEARESTMV)
+                AomTrace.Out.Write($"skm {xd.MiRow} {xd.MiCol} m {ModeDefMode(DefaultModeOrder[midx])} r {ModeDefRef0(DefaultModeOrder[midx])} {ModeDefRef1(DefaultModeOrder[midx])} skip {(isSkipInterMode ? 1 : 0)} why {(isSkipInterMode ? _skipReason : 0)} best {st.BestRd} th {st.ModeThreshold[DefaultModeOrder[midx]]} fact {x.ThreshFreqFact[bsize, DefaultModeOrder[midx]]}" + (char)10);
+            if (isSkipInterMode) continue;
             InitMbmi(mbmi, thisMode, rf0, rf1, cm);
             SetRefPtrs(cm, xd, rf0, rf1);
             for (int i = 0; i < numPlanes; i++)
@@ -826,8 +831,10 @@ internal static partial class AomRdoptInter
             args.SkipIfs = SkipInterpFilterSearch(cpi, isSinglePred);
             skipRd[0] = st.BestSkipRd[0];
             skipRd[1] = st.BestSkipRd[1];
+            AomTrace.Out?.Write($"hm {xd.MiRow} {xd.MiCol} bs {bsize} m {thisMode} r {rf0} {rf1} best {refBestRd}" + (char)10);
             long thisRd = HandleInterMode(cpi, x, bsize, ref rdStats, ref rdStatsY, ref rdStatsUv, args, refBestRd, ref bestEstRd, doTxSearch,
                 interModesInfo, motionModeCand, skipRd, out long thisYrd);
+            AomTrace.Out?.Write($"hmr {thisRd} rate {rdStats.Rate} dist {rdStats.Dist}" + (char)10);
             if (cm.ReferenceMode != SINGLE_REFERENCE)
             {
                 if (!args.SkipIfs && sf.inter_sf.prune_comp_search_by_single_result > 0 && AomInter.IsInterSinglerefMode(thisMode))

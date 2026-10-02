@@ -148,7 +148,7 @@ internal static class AomMotionSearch
         var cm = cpi.Cm;
         int numPlanes = cm.NumPlanes;
         var mbmi = xd.Mi0;
-        AomTrace.Out?.Write($"sms_in {xd.MiRow} {xd.MiCol} bs {bsize} ref {mbmi.RefFrame0} idx {mbmi.RefMvIdx} mode {mbmi.Mode} mm {mbmi.MotionMode} range {searchRange} mv {mbmi.Mv0.Row} {mbmi.Mv0.Col}" + (char)10);
+        AomTrace.Out?.Write($"sms_in {xd.MiRow} {xd.MiCol} bs {bsize} ref {mbmi.RefFrame0} idx {mbmi.RefMvIdx} mode {mbmi.Mode} mm {mbmi.MotionMode} range {searchRange} mv {mbmi.Mv0.Row} {mbmi.Mv0.Col} refmv {GetRefMv(x, refIdx).Row} {GetRefMv(x, refIdx).Col}" + (char)10);
         SingleMotionSearchCore(cpi, x, bsize, refIdx, out rateMv, searchRange, modeInfo, out bestMv, args);
         AomTrace.Out?.Write($"sms_out {bestMv.Row} {bestMv.Col} rate {rateMv}" + (char)10);
     }

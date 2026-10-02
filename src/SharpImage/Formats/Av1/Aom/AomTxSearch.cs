@@ -584,6 +584,7 @@ internal static partial class AomTxSearch
             txkAllowed = plane != 0 ? uvTxType : DCT_DCT;
             allowedTxMask = 1 << txkAllowed;
         }
+        AomTrace.Out?.Write($"txmask p {plane} ts {txSize} allowed {txkAllowed} mask {allowedTxMask:x} dth {txfmParams.DefaultInterTxTypeProbThresh} p2d {txfmParams.Prune2dTxfmMode} rdm {x.RdModel} ut {cpi.UpdateType}" + (char)10);
         allowedTxkTypes = txkAllowed;
         return (ushort)allowedTxMask;
     }
@@ -699,6 +700,17 @@ internal static partial class AomTxSearch
 
     /// <summary>search_tx_type: the best transform type for one tx block (intra or intrabc, luma or chroma).</summary>
     internal static void SearchTxType(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize,
+        AomTxbCtx txbCtx, int ftxsMode, long refBestRd, ref AomRdStats bestRdStats)
+    {
+        SearchTxTypeCore(cpi, x, plane, block, blkRow, blkCol, planeBsize, txSize, txbCtx, ftxsMode, refBestRd, ref bestRdStats);
+        if (AomTrace.Out != null)
+        {
+            var xd = x.E;
+            AomTrace.Out.Write($"stt {xd.MiRow} {xd.MiCol} {xd.Mi0.Bsize} p {plane} blk {blkRow} {blkCol} ts {txSize} ctx {txbCtx.TxbSkipCtx} {txbCtx.DcSignCtx} ftx {ftxsMode} ref {refBestRd} -> rate {bestRdStats.Rate} dist {bestRdStats.Dist} sse {bestRdStats.Sse} skip {bestRdStats.SkipTxfm} eob {x.Plane[plane].Eobs[block]} tt {(plane == 0 ? xd.TxTypeMap[xd.TxTypeMapOffset + blkRow * xd.TxTypeMapStride + blkCol] : -1)}" + (char)10);
+        }
+    }
+
+    private static void SearchTxTypeCore(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize,
         AomTxbCtx txbCtx, int ftxsMode, long refBestRd, ref AomRdStats bestRdStats)
     {
         var xd = x.E;

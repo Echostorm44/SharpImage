@@ -170,6 +170,23 @@ internal static partial class AomRdoptInter
                     if (rdStatsY.Rate == int.MaxValue && modeIndex == 0) return long.MaxValue;
                     continue;
                 }
+                if (AomTrace.Out != null)
+                {
+                    ulong hh = 1469598103934665603UL;
+                    for (int pl = 0; pl < cm.NumPlanes; pl++)
+                    {
+                        var pd = xd.Plane[pl];
+                        int bw = BlockSizeWide[bsize] >> pd.SubsamplingX, bh = BlockSizeHigh[bsize] >> pd.SubsamplingY;
+                        for (int r = 0; r < bh; r++)
+                            for (int c = 0; c < bw; c++)
+                            {
+                                int v = pd.Dst.Buf16 != null ? pd.Dst.Buf16[pd.Dst.Offset + r * pd.Dst.Stride + c] : pd.Dst.Buf[pd.Dst.Offset + r * pd.Dst.Stride + c];
+                                hh = (hh ^ (uint)v) * 1099511628211UL;
+                            }
+                    }
+                    AomTrace.Out.Write($"pred mv {mbmi.Mv0.Row} {mbmi.Mv0.Col} {mbmi.Mv1.Row} {mbmi.Mv1.Col} hash {hh:x16}" + (char)10);
+                }
+                AomTrace.Out?.Write($"mmt {modeIndex} mm {mbmi.MotionMode} ii {(mbmi.RefFrame1 == INTRA_FRAME ? 1 : 0)} if {mbmi.InterpFilters:x} mrate {modeRate} y {rdStatsY.Rate} {rdStatsY.Dist} uv {rdStatsUv.Rate} {rdStatsUv.Dist} tot {rdStats.Rate} {rdStats.Dist} skip {rdStats.SkipTxfm}" + (char)10);
                 int skipCtx = AomTxSearch.SkipTxfmContext(xd);
                 int yRate = rdStats.SkipTxfm != 0 ? x.ModeCosts.SkipTxfmCost[skipCtx * 2 + 1] : rdStatsY.Rate + x.ModeCosts.SkipTxfmCost[skipCtx * 2 + 0];
                 thisYrd = AomRd.RdCost(x.Rdmult, yRate + modeRate, rdStatsY.Dist);

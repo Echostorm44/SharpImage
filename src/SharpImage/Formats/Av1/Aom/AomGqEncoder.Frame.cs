@@ -15,6 +15,8 @@ internal sealed partial class AomGqEncoder
 
     /// <summary>A trace sink for frame-level decisions (test hook).</summary>
     public Action<AomComp, AomGqFrameHeader>? OnFrameEncoded;
+    /// <summary>Test hook: the symbol trace of the bitstream writer (AomWriter.Trace format).</summary>
+    public System.IO.TextWriter? BitstreamTrace;
 
     /// <summary>ppi->fb_of_context_type.</summary>
     private readonly int[] _fbOfContextType = { -1, -1, -1, -1, -1, -1, -1, -1 };
@@ -238,7 +240,7 @@ internal sealed partial class AomGqEncoder
         }
         for (int i = LAST_FRAME; i <= ALTREF_FRAME; i++) fh.GlobalMotion[i].CopyFrom(cm.GlobalMotion[i]);
         for (int i = 0; i < REF_FRAMES; i++) { fh.RemappedRefIdx[i] = _remappedRefIdx[i]; fh.RefFrameMap[i] = _refFrameMap[i]; }
-        byte[] data = AomBitstream.PackFrameGq(cpi, fh, out int largestTileId);
+        byte[] data = AomBitstream.PackFrameGq(cpi, fh, out int largestTileId, BitstreamTrace);
         OnFrameEncoded?.Invoke(cpi, fh);
 
         // post-encode: the reconstruction into every refreshed slot, with the frame context of the largest tile
