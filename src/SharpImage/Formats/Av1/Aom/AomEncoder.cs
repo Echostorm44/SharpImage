@@ -342,6 +342,7 @@ internal static partial class AomEncoder
         xd.SetTile(cpi.TileData[0].Tile);
         x.TileData = cpi.TileData[0];
         xd.Bd = input.BitDepth;
+        xd.GlobalMotion = cm.GlobalMotion;   // xd->global_motion
 
         // av1_initialize_rd_consts
         x.Errorperbit = AomRd.ErrorPerBit(cpi.RdRdmult);

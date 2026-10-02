@@ -186,5 +186,98 @@ internal static partial class AomRdoptInter
 
     /// <summary>rd_pick_skip_mode.</summary>
     private static void RdPickSkipMode(ref AomRdStats rdCost, AomInterModeSearchState st, AomComp cpi, AomMacroblock x, int bsize, AomBuf2d[,] yv12Mb)
-        => throw new NotImplementedException("rd_pick_skip_mode (compound skip mode)");
+    {
+        var cm = cpi.Cm;
+        int numPlanes = cm.NumPlanes;
+        var xd = x.E;
+        var mbmi = xd.Mi0;
+        x.CompoundIdx = 1;
+        var skipRd = new AomRdStats();
+        skipRd.Invalidate();
+        if (cm.SkipModeRefFrame0 == -1 || cm.SkipModeRefFrame1 == -1) return;
+        int refFrame = LAST_FRAME + cm.SkipModeRefFrame0, secondRefFrame = LAST_FRAME + cm.SkipModeRefFrame1;
+        const int thisMode = NEAREST_NEARESTMV;
+        int modeIndex = GetPredictionModeIdx(thisMode, refFrame, secondRefFrame);
+        if (modeIndex == THR_INVALID) return;
+        if ((!cpi.EnableOnesidedComp || cpi.Sf.inter_sf.disable_onesided_comp != 0) && cpi.AllOneSidedRefs) return;
+        mbmi.Mode = thisMode;
+        mbmi.UvMode = UV_DC_PRED;
+        mbmi.RefFrame0 = refFrame;
+        mbmi.RefFrame1 = secondRefFrame;
+        int refFrameType = AomInter.RefFrameType(refFrame, secondRefFrame);
+        var ext = x.MbmiExtInter;
+        if (ext.RefMvCount[refFrameType] == byte.MaxValue)
+        {
+            if (ext.RefMvCount[refFrame] == byte.MaxValue || ext.RefMvCount[secondRefFrame] == byte.MaxValue) return;
+            AomMvPred.FindMvRefs(cm, xd, mbmi, refFrameType, ext);
+            AomMvPred.CopyUsableRefMvStackAndWeight(xd, ext, refFrameType);
+        }
+        var curMv = new AomMv[2];
+        if (!BuildCurMv(curMv, thisMode, cm, x, false)) return;
+        mbmi.Mv0 = curMv[0];
+        mbmi.Mv1 = curMv[1];
+        mbmi.UseFilterIntra = 0;
+        mbmi.InterintraMode = II_DC_PRED - 1;
+        mbmi.CompGroupIdx = 0;
+        mbmi.CompoundIdx = (byte)x.CompoundIdx;
+        mbmi.InterinterComp.Type = COMPOUND_AVERAGE;
+        mbmi.MotionMode = SIMPLE_TRANSLATION;
+        mbmi.RefMvIdx = 0;
+        mbmi.SkipMode = 1;
+        mbmi.SkipTxfm = 1;
+        mbmi.Palette.PaletteSize0 = 0;
+        mbmi.Palette.PaletteSize1 = 0;
+        AomInterpSearch.SetDefaultInterpFilters(mbmi, cm.InterpFilter);
+        SetRefPtrs(cm, xd, mbmi.RefFrame0, mbmi.RefFrame1);
+        for (int i = 0; i < numPlanes; i++)
+        {
+            xd.Plane[i].Pre0 = yv12Mb[mbmi.RefFrame0, i];
+            xd.Plane[i].Pre1 = yv12Mb[mbmi.RefFrame1, i];
+        }
+        var origDst = AomBufferSet.FromDst(xd);
+        int skipModeCtx = AomPredCommon.SkipMode(xd);
+        long bestIntraInterModeCost = long.MaxValue;
+        if (rdCost.Dist < long.MaxValue && rdCost.Rate < int.MaxValue)
+        {
+            bestIntraInterModeCost = AomRd.RdCost(x.Rdmult, rdCost.Rate + x.ModeCosts.SkipModeCost[skipModeCtx * 2 + 0], rdCost.Dist);
+            rdCost.Rate += x.ModeCosts.SkipModeCost[skipModeCtx * 2 + 0];
+            if (rdCost.Rate < int.MaxValue && rdCost.Dist < long.MaxValue) rdCost.Rdcost = AomRd.RdCost(x.Rdmult, rdCost.Rate, rdCost.Dist);
+        }
+        // skip_mode_rd
+        {
+            long totalSse = 0, thisRd = long.MaxValue;
+            skipRd.Rate = x.ModeCosts.SkipModeCost[skipModeCtx * 2 + 1];
+            for (int plane = 0; plane < numPlanes; ++plane)
+            {
+                AomInterPred.EncBuildInterPredictor(cm, xd, xd.MiRow, xd.MiCol, origDst, bsize, plane, plane, cpi.EnableIntraEdgeFilter);
+                var pd = xd.Plane[plane];
+                int planeBsize = AomEncodeMb.PlaneBlockSize(bsize, pd.SubsamplingX, pd.SubsamplingY);
+                AomEncodeMb.SubtractPlane(x, planeBsize, plane);
+                long sse = AomTxSearch.PixelDiffDist(x, plane, 0, 0, planeBsize, planeBsize, out _);
+                if (xd.IsHbd) sse = (sse + ((1L << ((xd.Bd - 8) * 2)) >> 1)) >> ((xd.Bd - 8) * 2);
+                sse <<= 4;
+                totalSse += sse;
+                thisRd = AomRd.RdCost(x.Rdmult, skipRd.Rate, totalSse);
+                if (thisRd > bestIntraInterModeCost) break;
+            }
+            skipRd.Dist = skipRd.Sse = totalSse;
+            skipRd.Rdcost = thisRd;
+            AomInterpSearch.RestoreDstBuf(xd, origDst, numPlanes);
+        }
+        if (skipRd.Rdcost <= bestIntraInterModeCost && (xd.Lossless[mbmi.SegmentId] == 0 || skipRd.Dist == 0))
+        {
+            st.BestMbmode.CopyFrom(mbmi);
+            st.BestMbmode.SkipMode = 1;
+            Array.Fill(st.BestMbmode.InterTxSize, (byte)st.BestMbmode.TxSize);
+            AomBitstream.SetTxfmCtxs(xd, st.BestMbmode.TxSize, st.BestMbmode.SkipTxfm != 0 && mbmi.IsInterBlock);
+            st.BestModeIndex = modeIndex;
+            rdCost.Rate = skipRd.Rate;
+            rdCost.Dist = rdCost.Sse = skipRd.Dist;
+            rdCost.Rdcost = skipRd.Rdcost;
+            st.BestRd = rdCost.Rdcost;
+            st.BestSkip2 = 1;
+            st.BestModeSkippable = 1;
+            x.TxfmSkip = 1;
+        }
+    }
 }

@@ -1100,7 +1100,7 @@ internal static partial class AomBitstream
     }
 
     /// <summary>set_txfm_ctxs.</summary>
-    private static void SetTxfmCtxs(AomMacroblockD xd, int txSize, bool skip)
+    internal static void SetTxfmCtxs(AomMacroblockD xd, int txSize, bool skip)
     {
         byte bw = (byte)TxSizeWide[txSize], bh = (byte)TxSizeHigh[txSize];
         if (skip)
