@@ -346,6 +346,17 @@ internal static partial class AomInterPred
         }
     }
 
+    /// <summary>clamp_mv_to_umv_border_sb.</summary>
+    public static AomMv ClampMvToUmvBorderSb(AomMacroblockD xd, AomMv src, int bw, int bh, int ssX, int ssY)
+    {
+        int spelLeft = (AOM_INTERP_EXTEND + bw) << SUBPEL_BITS, spelRight = spelLeft - (1 << SUBPEL_BITS);
+        int spelTop = (AOM_INTERP_EXTEND + bh) << SUBPEL_BITS, spelBottom = spelTop - (1 << SUBPEL_BITS);
+        int r = (short)(src.Row * (1 << (1 - ssY))), c = (short)(src.Col * (1 << (1 - ssX)));
+        int colMin = xd.MbToLeftEdge * (1 << (1 - ssX)) - spelLeft, colMax = xd.MbToRightEdge * (1 << (1 - ssX)) + spelRight;
+        int rowMin = xd.MbToTopEdge * (1 << (1 - ssY)) - spelTop, rowMax = xd.MbToBottomEdge * (1 << (1 - ssY)) + spelBottom;
+        return new AomMv(Math.Clamp(r, rowMin, rowMax), Math.Clamp(c, colMin, colMax));
+    }
+
     /// <summary>av1_enc_build_inter_predictor.</summary>
     public static void EncBuildInterPredictor(AomCommon cm, AomMacroblockD xd, int miRow, int miCol, AomBufferSet? ctx, int bsize, int planeFrom,
         int planeTo, bool enableIntraEdgeFilter)

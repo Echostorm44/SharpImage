@@ -174,4 +174,14 @@ internal static class AomInter
         var res = new AomMv(ConvertToTransPrec(allowHp, yc), ConvertToTransPrec(allowHp, xc));
         return isInteger ? IntegerMvPrecision(res) : res;
     }
+
+    /// <summary>is_nontrans_global_motion.</summary>
+    public static bool IsNontransGlobalMotion(AomMacroblockD xd, AomMbModeInfo mbmi)
+    {
+        if (mbmi.Mode != GLOBALMV && mbmi.Mode != GLOBAL_GLOBALMV) return false;
+        if (Math.Min(MiSizeWide[mbmi.Bsize], MiSizeHigh[mbmi.Bsize]) < 2) return false;
+        if (xd.GlobalMotion[mbmi.RefFrame0].WmType == TRANSLATION) return false;
+        if (mbmi.HasSecondRef && xd.GlobalMotion[mbmi.RefFrame1].WmType == TRANSLATION) return false;
+        return true;
+    }
 }
