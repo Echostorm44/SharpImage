@@ -33,6 +33,14 @@ public static partial class HeifCoder
     private static byte[]? TryEncodeLayersAom(ImageFrame image, AvifEncodeOptions options, IReadOnlyList<AomLayerSpec> layers,
         bool reapplyCodecOptions)
     {
+        // a libaom path not ported yet falls back to SharpImage's own layered encoder
+        try { return TryEncodeLayersAomCore(image, options, layers, reapplyCodecOptions); }
+        catch (NotImplementedException) { return null; }
+    }
+
+    private static byte[]? TryEncodeLayersAomCore(ImageFrame image, AvifEncodeOptions options, IReadOnlyList<AomLayerSpec> layers,
+        bool reapplyCodecOptions)
+    {
         int speed = Math.Clamp(options.Speed, 0, 9);
         if (speed >= 7 || options.Lossless || options.FilmGrain != null || options.DenoiseNoiseLevel > 0 || options.GainMap != null ||
             options.PremultiplyAlpha || options.SharpYuv)

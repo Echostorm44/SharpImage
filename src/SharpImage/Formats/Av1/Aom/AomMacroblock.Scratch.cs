@@ -10,7 +10,7 @@ internal sealed partial class AomMacroblock
     public readonly int[] ScratchCoeff = new int[64 * 64];            // intra_model_rd's coefficients
     public readonly byte[] ScratchLevels = new byte[AomTxb.TxPad2d];  // av1_update_and_record_txb_context
     public readonly sbyte[] ScratchCoeffContexts = new sbyte[64 * 64];
-    public AomMbModeInfo? ScratchBestMbmi, ScratchBestUvMbmi;
+    public AomMbModeInfo? ScratchBestMbmi, ScratchBestUvMbmi, ScratchPaletteMbmi;
     public AomRdStats[]? ScratchCflU, ScratchCflV;
     public readonly byte[] ScratchTa = new byte[32], ScratchTl = new byte[32];
 }

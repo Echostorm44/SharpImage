@@ -47,7 +47,6 @@ internal static partial class AomEncoder
     private static void DetermineScToolsWithEncoding(AomComp cpi, AomEncodeInput input, AomSpeedFeatureInputs sfIn, AomSpeedFeatureSeqFlags seqFlags)
     {
         var cm = cpi.Cm;
-        if (cm.NumPlanes == 1) throw new NotImplementedException("screen content trial encodes of monochrome frames");
         bool origAllow = input.AllowScreenContentTools, origIbc = input.AllowIntrabc, origUse = input.UseScreenContentTools;
         bool origIsSc = input.IsScreenContentType;
         bool losslessRequested = sfIn.BestAllowedQ == 0 && sfIn.WorstAllowedQ == 0;
@@ -83,7 +82,7 @@ internal static partial class AomEncoder
                 sf.part_sf.fixed_partition_size = BLOCK_32X32;
             };
             var (tc, _) = EncodeFrame(t);
-            psnr[pass] = CalcPsnrTotal(tc.Source!, tc.Cm.CurFrame);
+            psnr[pass] = CalcPsnrTotal(tc.Source!, tc.Cm.CurFrame, cm.NumPlanes);
             if (pass == 1) { palettePixelNum = tc.PalettePixelNum; intrabcUsed = tc.IntrabcUsed; }
             tc.Cm.Release();
             AomBufferPool.Return(tc.ExtCbOffset);
@@ -129,7 +128,10 @@ internal static partial class AomEncoder
     }
 
     /// <summary>aom_calc_highbd_psnr / aom_calc_psnr's psnr[0] (all planes, peak at the stream bit depth).</summary>
-    private static double CalcPsnrTotal(AomFrameBuffer a, AomFrameBuffer b)
+    /// <remarks>aom_calc_psnr always sums three planes: a monochrome frame's chroma planes are never written by libaom
+    /// (the lookahead copy, the filters and the reconstruction skip them) and stay at their zeroed allocation, so they
+    /// add samples with no error.</remarks>
+    private static double CalcPsnrTotal(AomFrameBuffer a, AomFrameBuffer b, int numPlanes)
     {
         double peak = (1 << a.BitDepth) - 1;
         ulong totalSse = 0;
@@ -139,6 +141,7 @@ internal static partial class AomEncoder
             int isUv = p > 0 ? 1 : 0;
             int w = a.CropWidths[isUv], h = a.CropHeights[isUv];
             ulong sse = 0;
+            if (p >= numPlanes) h = 0;
             for (int r = 0; r < h; r++)
             {
                 int ao = a.Offsets[p] + r * a.Strides[p], bo = b.Offsets[p] + r * b.Strides[p];
@@ -148,7 +151,7 @@ internal static partial class AomEncoder
                     for (int c = 0; c < w; c++) { long d = a.Buffers[p][ao + c] - b.Buffers[p][bo + c]; sse += (ulong)(d * d); }
             }
             totalSse += sse;
-            totalSamples += (uint)(w * h);
+            totalSamples += (uint)(w * (p >= numPlanes ? a.CropHeights[isUv] : h));
         }
         return SseToPsnr(totalSamples, peak, totalSse);
     }

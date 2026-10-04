@@ -17,6 +17,15 @@ public static partial class HeifCoder
         List<(ushort[] Y, ushort[]? U, ushort[]? V, ushort[]? A, AvifFilmGrain? Grain)> coded, int w, int h, int bd, bool mono,
         Av1PixelLayout layout, Av1ObuWriter.Av1ColorDesc color, bool hasAlpha, bool lossless, int chromaPosition, AvifSequenceData sq)
     {
+        // a libaom path not ported yet falls back to SharpImage's own encoder (sq is only filled on success)
+        try { return TryEncodeSequenceAomCore(options, coded, w, h, bd, mono, layout, color, hasAlpha, lossless, chromaPosition, sq); }
+        catch (NotImplementedException) { return false; }
+    }
+
+    private static bool TryEncodeSequenceAomCore(AvifEncodeOptions options,
+        List<(ushort[] Y, ushort[]? U, ushort[]? V, ushort[]? A, AvifFilmGrain? Grain)> coded, int w, int h, int bd, bool mono,
+        Av1PixelLayout layout, Av1ObuWriter.Av1ColorDesc color, bool hasAlpha, bool lossless, int chromaPosition, AvifSequenceData sq)
+    {
         int speed = Math.Clamp(options.Speed, 0, 9);
         if (lossless || speed >= 7 || coded.Count == 0 || coded.Exists(c => c.Grain != null)) return false;
 

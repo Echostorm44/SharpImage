@@ -83,6 +83,7 @@ internal sealed partial class AomGqEncoder
     private readonly AomGqConfig _cfg;
     private readonly AomSeqHeader _seq;
     private readonly AomSpeedFeatureSeqFlags _seqFlags = new();
+    private bool _createSfApplied;
     private bool _seqParamsLocked;
     /// <summary>cm->ref_frame_map.</summary>
     private readonly AomRefBuffer?[] _refFrameMap = new AomRefBuffer?[REF_FRAMES];

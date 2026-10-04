@@ -890,7 +890,23 @@ internal static partial class AomRdoptInter
 
         bool tryPalette = cpi.EnablePalette && AomIntraModeSearch.AllowPalette(cpi.AllowScreenContentTools, mbmi.Bsize) &&
                           !AomInter.IsInterMode(st.BestMbmode.Mode) && rdCost.Rate != int.MaxValue;
-        if (tryPalette) throw new NotImplementedException("av1_search_palette_mode in inter frames");
+        if (tryPalette)
+        {
+            int thisSkippable = SearchPaletteMode(st.IntraSearchState, cpi, x, bsize, intraRefFrameCost, ctx, out var thisRdCost, st.BestRd);
+            if (thisRdCost.Rdcost < st.BestRd)
+            {
+                st.BestModeIndex = THR_DC;
+                mbmi.Mv0 = default;
+                rdCost.Rate = thisRdCost.Rate;
+                rdCost.Dist = thisRdCost.Dist;
+                rdCost.Rdcost = thisRdCost.Rdcost;
+                st.BestRd = rdCost.Rdcost;
+                st.BestMbmode.CopyFrom(mbmi);
+                st.BestSkip2 = 0;
+                st.BestModeSkippable = thisSkippable;
+                xd.TxTypeMap.AsSpan(xd.TxTypeMapOffset, ctx.NumFourByFourBlk).CopyTo(ctx.TxTypeMap);
+            }
+        }
 
         st.BestMbmode.SkipMode = 0;
         if (cm.SkipModeFlag && cpi.Sharpness != 3 && AomInter.IsCompRefAllowed(bsize))
@@ -912,7 +928,7 @@ internal static partial class AomRdoptInter
         x.TxfmSkip |= st.BestSkip2;
         x.TxfmSkip |= st.BestModeSkippable;
         StoreCodingContext(x, ctx, st.BestModeSkippable);
-        if (mbmi.Palette.PaletteSize1 > 0) throw new NotImplementedException("av1_restore_uv_color_map");
+        if (mbmi.Palette.PaletteSize1 > 0) AomPalette.RestoreUvColorMap(cpi, x);
     }
 
     /// <summary>evaluate_motion_mode_for_winner_candidates.</summary>
@@ -1192,5 +1208,86 @@ internal static partial class AomRdoptInter
                 }
             }
         }
+    }
+
+    /// <summary>av1_search_palette_mode.</summary>
+    private static int SearchPaletteMode(AomIntraModeSearchState iss, AomComp cpi, AomMacroblock x, int bsize, uint refFrameCost,
+        AomPickModeContext ctx, out AomRdStats thisRdCost, long bestRd)
+    {
+        var cm = cpi.Cm;
+        var xd = x.E;
+        var mbmi = xd.Mi0;
+        ref AomPaletteModeInfo pmi = ref mbmi.Palette;
+        int numPlanes = cm.NumPlanes;
+        long bestRdPalette = bestRd;
+        int skippable = 0;
+        byte[] bestPaletteColorMap = x.BestPaletteColorMap;
+        byte[] colorMap = xd.Plane[0].ColorIndexMap;
+        var bestMbmiPalette = x.ScratchPaletteMbmi ??= new AomMbModeInfo();
+        bestMbmiPalette.CopyFrom(mbmi);
+        var bestTxTypeMap = new byte[32 * 32];
+        var mc = x.ModeCosts;
+        int rows = BlockSizeHigh[bsize], cols = BlockSizeWide[bsize];
+        thisRdCost = default;
+
+        mbmi.Mode = DC_PRED;
+        mbmi.UvMode = UV_DC_PRED;
+        mbmi.RefFrame0 = INTRA_FRAME;
+        mbmi.RefFrame1 = NONE_FRAME;
+        pmi.PaletteSize0 = 0;
+        pmi.PaletteSize1 = 0;
+
+        int rateY = int.MaxValue, rateTok = 0;
+        long distY = long.MaxValue;
+        byte skipY = 0;
+        bool beat = false;
+        AomPalette.RdPickPaletteIntraSby(cpi, x, bsize, mc.MbmodeCost[SizeGroupLookup[bsize] * 13 + DC_PRED], bestMbmiPalette, bestPaletteColorMap,
+            ref bestRdPalette, ref rateY, ref rateTok, ref distY, ref skipY, ref beat, ctx, bestTxTypeMap);
+        if (rateY == int.MaxValue || pmi.PaletteSize0 == 0)
+        {
+            thisRdCost.Rdcost = long.MaxValue;
+            return skippable;
+        }
+
+        bestTxTypeMap.AsSpan(0, ctx.NumFourByFourBlk).CopyTo(xd.TxTypeMap.AsSpan(xd.TxTypeMapOffset));
+        Array.Copy(bestPaletteColorMap, colorMap, rows * cols);
+
+        skippable = skipY;
+        long distortion2 = distY;
+        int rate2 = rateY + (int)refFrameCost;
+        if (numPlanes > 1)
+        {
+            if (iss.RateUvIntra == int.MaxValue)
+            {
+                int uvTx = AomEncodeMb.GetTxSize(1, xd);
+                AomIntraModeSearch.RdPickIntraSbuvMode(cpi, x, ref iss.RateUvIntra, ref iss.RateUvTokenonly, ref iss.DistUvs, ref iss.SkipUvs, bsize, uvTx);
+                iss.ModeUv = mbmi.UvMode;
+                iss.PmiUv.PaletteSize0 = pmi.PaletteSize0;
+                iss.PmiUv.PaletteSize1 = pmi.PaletteSize1;
+                Array.Copy(pmi.PaletteColors, iss.PmiUv.PaletteColors, iss.PmiUv.PaletteColors.Length);
+                iss.UvAngleDelta = mbmi.AngleDelta[1];
+            }
+            mbmi.UvMode = iss.ModeUv;
+            pmi.PaletteSize1 = iss.PmiUv.PaletteSize1;
+            if (pmi.PaletteSize1 > 0)
+                Array.Copy(iss.PmiUv.PaletteColors, AomPaletteModeInfo.PaletteMaxSize, pmi.PaletteColors, AomPaletteModeInfo.PaletteMaxSize,
+                    2 * AomPaletteModeInfo.PaletteMaxSize);
+            mbmi.AngleDelta[1] = iss.UvAngleDelta;
+            skippable = skippable != 0 && iss.SkipUvs != 0 ? 1 : 0;
+            distortion2 += iss.DistUvs;
+            rate2 += iss.RateUvIntra;
+        }
+        int skipCtx = AomTxSearch.SkipTxfmContext(xd);
+        if (skippable != 0)
+        {
+            rate2 -= rateY;
+            if (numPlanes > 1) rate2 -= iss.RateUvTokenonly;
+            rate2 += mc.SkipTxfmCost[skipCtx * 2 + 1];
+        }
+        else rate2 += mc.SkipTxfmCost[skipCtx * 2 + 0];
+        thisRdCost.Rate = rate2;
+        thisRdCost.Dist = distortion2;
+        thisRdCost.Rdcost = AomRd.RdCost(x.Rdmult, rate2, distortion2);
+        return skippable;
     }
 }

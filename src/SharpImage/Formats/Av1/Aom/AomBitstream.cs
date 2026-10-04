@@ -499,7 +499,7 @@ internal static partial class AomBitstream
         fc.CopyFrom(cm.Fc);
         trace?.WriteLine("start");
         var w = new AomWriter { AllowUpdateCdf = !cpi.DisableCdfUpdate, Trace = trace };
-        var xd = new AomMacroblockD();
+        var xd = new AomMacroblockD { CurFrameForceIntegerMv = cm.CurFrameForceIntegerMv };
         for (int p = 0; p < 3; p++)
         {
             xd.Plane[p].PlaneType = p == 0 ? 0 : 1;

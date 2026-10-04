@@ -947,6 +947,22 @@ internal sealed partial class AomGqEncoder
         // starts the global motion statistics over
         if (_gfFrameIndex == 0) Array.Fill(_validGmModelFound, int.MaxValue);
         _seqFlags.SeqParamsLocked = _seqParamsLocked;
+        if (!_createSfApplied)
+        {
+            // av1_create_compressor: av1_set_speed_features_framesize_independent/dependent at the configured (full) frame
+            // size, before any frame; the unlocked sequence flags keep what they turn off (e.g. a scaled first layer)
+            _createSfApplied = true;
+            var csf = new AomSpeedFeatureInputs
+            {
+                Width = cfg.Width, Height = cfg.Height, UseHighBitDepth = cfg.BitDepth > 8, Mode = cfg.Usage, FrameType = KEY_FRAME, BaseQindex = 0,
+                LagInFrames = _lagInFrames, NumSpatialLayers = cfg.NumSpatialLayers,
+                Tuning = cfg.Tune switch { AomTune.Iq => AOM_TUNE_IQ, AomTune.Ssim => AOM_TUNE_SSIM, _ => AOM_TUNE_PSNR },
+            };
+            if (cfg.Sharpness is int csh) csf.Sharpness = csh;
+            var tmpSf = new AomSpeedFeatures();
+            tmpSf.SetFramesizeIndependent(csf, _seqFlags, new AomWinnerModeParams(), cfg.Speed);
+            tmpSf.SetFramesizeDependent(csf, _seqFlags, cfg.Speed);
+        }
         var (cpi, x) = AomEncoder.EncodeFrame(input);
         _lastCpi = cpi;
         // encode_with_recode_loop: reset the mv stats (an intra / overlay frame interrupts them), then gather them for

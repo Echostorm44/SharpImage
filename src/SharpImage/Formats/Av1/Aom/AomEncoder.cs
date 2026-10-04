@@ -585,6 +585,7 @@ internal static partial class AomEncoder
             if (rowMt != null && !rowMt.BeforeSb(cpi, x, miRow, miCol, sbRow, sbCol)) return;
             SetCostUpdFreq(cpi, x, miRow, miCol);
             if (cpi.AllIntra) x.IntraSbRdmultModifier = 128;
+            x.E.CurFrameForceIntegerMv = cm.CurFrameForceIntegerMv;
             x.SourceVariance = uint.MaxValue;
             x.CbCoefBuff = cpi.CbCoeffBuffers[(miRow >> cm.MibSizeLog2) * sbCols + (miCol >> cm.MibSizeLog2)];   // av1_get_cb_coeff_buffer
             x.ColorPaletteThresh = 64;
