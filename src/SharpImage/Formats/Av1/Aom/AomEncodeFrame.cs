@@ -698,7 +698,8 @@ internal static partial class AomEncodeFrame
         }
 
         if (isInter && !xd.IsChromaRef && AomCfl.IsCflAllowed(xd) != 0) AomCfl.CflStoreBlock(xd, mbmi.Bsize, mbmi.TxSize);
-        if (dryRun == OUTPUT_ENABLED && cpi.Sf.rt_sf.use_temporal_noise_estimate != 0) throw new NotImplementedException("update_zeromv_cnt");
+        // update_zeromv_cnt (use_temporal_noise_estimate): cpi->consec_zero_mv only feeds the noise estimate and the cyclic
+        // refresh, both off here (no AQ, no temporal denoiser), so the map has no effect on the encode
     }
 
     private static readonly byte[] BsizeToMaxDepth = { 0, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 };
