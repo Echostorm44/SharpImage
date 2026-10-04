@@ -46,6 +46,7 @@ internal static unsafe partial class AomReconIntra
     /// <summary>Zone 1 without upsampling.</summary>
     internal static void DrPredictionZ1Simd(byte* dst, nint stride, int bw, int bh, byte* above, int dx)
     {
+        if (bw == 32) { DrPredictionZ1_32Avx2(dst, stride, bh, above, dx); return; }
         int maxBaseX = bw + bh - 1;
         byte fill = above[maxBaseX];
         int x = dx;
@@ -65,6 +66,8 @@ internal static unsafe partial class AomReconIntra
     /// <summary>Zone 3 without upsampling: zone 1 down the left edge, one column per run, transposed.</summary>
     internal static void DrPredictionZ3Simd(byte* dst, nint stride, int bw, int bh, byte* left, int dy)
     {
+        if (bh <= 16) { DrPredictionZ3SmallAvx2(dst, stride, bw, bh, left, dy); return; }
+        if (bh == 32 && bw <= 32) { DrPredictionZ3Tall32Avx2(dst, stride, bw, left, dy); return; }
         int maxBaseY = bw + bh - 1;
         byte fill = left[maxBaseY];
         Unsafe.SkipInit(out StackArr4096<byte> tSA); byte* t = (byte*)Unsafe.AsPointer(ref tSA[0]);   // column c at t + c * 64
@@ -92,6 +95,7 @@ internal static unsafe partial class AomReconIntra
     /// <summary>Zone 2 without upsampling: each row's above-edge suffix as one run, the left-edge prefix per sample.</summary>
     internal static void DrPredictionZ2Simd(byte* dst, nint stride, int bw, int bh, byte* above, byte* left, int dx, int dy)
     {
+        if (bw >= 16) { DrPredictionZ2HxWAvx2(dst, stride, bw, bh, above, left, dx, dy); return; }
         for (int r = 0; r < bh; ++r, dst += stride)
         {
             int t = -(r + 1) * dx;
