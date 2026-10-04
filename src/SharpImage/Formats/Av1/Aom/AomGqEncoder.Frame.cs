@@ -321,6 +321,8 @@ internal sealed partial class AomGqEncoder
     }
 
     private int _curQindex, _curFrameType;
+    private int _tdRdmult;
+    private readonly AomPersistentFeatures _persistentFeatures = new();
     private bool _curShowExisting;
     private int _prevBaseQindex;
     private readonly AomForceIntMvInfo _forceIntpelInfo = new();   // cpi->force_intpel_info
@@ -418,12 +420,16 @@ internal sealed partial class AomGqEncoder
         // get_ref_frame_flags
         int flags = _extRefFrameFlags;
         for (int i = 1; i < INTER_REFS_PER_FRAME; ++i)
-            for (int j = 0; j < i; ++j)
+        {
+            // one-pass real-time: GOLDEN only drops out when it repeats LAST (or ALTREF when nonrd uses ALTREF)
+            int index = onePassRt && RefFramePriorityOrder[i] == GOLDEN_FRAME ? 1 + RtSf().use_nonrd_altref_frame : i;
+            for (int j = 0; j < index; ++j)
                 if (refBufsPrio[i] == refBufsPrio[j] && (flags & (1 << (RefFramePriorityOrder[j] - 1))) != 0)
                 {
                     flags &= ~(1 << (RefFramePriorityOrder[i] - 1));
                     break;
                 }
+        }
         fp.RefFrameFlags = flags;
         fp.PrimaryRefFrame = gf.IsFrameNonRef[idx] ? PRIMARY_REF_NONE : ChoosePrimaryRefFrame(fp);
         fp.OrderOffset = orderOffset;
@@ -1000,7 +1006,15 @@ internal sealed partial class AomGqEncoder
             tmpSf.SetFramesizeDependent(csf, _seqFlags, cfg.Speed);
         }
         if (IsOnePassRtParams) input.Rt = BuildRtFrameState(lastSrc?.Img);
+        input.InitialRdmult = _tdRdmult;
+        if (IsOnePassRtParams) input.PersistentFeatures = _persistentFeatures;
         var (cpi, x) = AomEncoder.EncodeFrame(input);
+        _tdRdmult = cpi.RdRdmult;
+        if (IsOnePassRtParams && !isKey)
+        {
+            _persistentFeatures.ReferenceMode = cpi.Cm.ReferenceMode;
+            _persistentFeatures.InterpFilter = cpi.Cm.InterpFilter;
+        }
         _lastCpi = cpi;
         if (IsOnePassRtParams) RtAfterEncodeFrame(cpi, x, fp, isKey);
         // encode_with_recode_loop: reset the mv stats (an intra / overlay frame interrupts them), then gather them for

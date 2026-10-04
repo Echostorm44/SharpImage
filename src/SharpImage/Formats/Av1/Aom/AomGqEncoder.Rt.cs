@@ -298,7 +298,7 @@ internal sealed partial class AomGqEncoder
             for (int c = 0; c < sbCols; ++c)
             {
                 int so = src.Offsets[0] + (r * 64) * sStride + c * 64, lo = last.Offsets[0] + (r * 64) * lStride + c * 64;
-                ulong tmpSad = src.Hbd ? AomHbd.Sad(src.Buffers16[0], so, sStride, last.Buffers16[0], lo, lStride, 64, 64)
+                ulong tmpSad = src.Hbd ? AomHbd.Sad(src.Buffers16[0], so, sStride, last.Buffers16[0], lo, lStride, 64, 64) >> (_cfg.BitDepth - 8)
                     : AomSad.Sad(src.Buffers[0], so, sStride, last.Buffers[0], lo, lStride, 64, 64);
                 _rt.SrcSadBlk64[c + r * sbCols] = tmpSad;
                 avgSad += tmpSad;

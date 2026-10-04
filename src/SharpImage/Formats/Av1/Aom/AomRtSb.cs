@@ -34,6 +34,8 @@ internal sealed partial class AomComp
 internal sealed partial class AomEncodeInput
 {
     public AomRtFrameState? Rt;
+    /// <summary>td->mb.rdmult at the frame start (the previous frame's cpi->rd.RDMULT, set by its loopfilter_frame).</summary>
+    public int InitialRdmult;
 }
 
 internal sealed partial class AomMacroblock

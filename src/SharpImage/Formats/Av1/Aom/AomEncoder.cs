@@ -368,6 +368,7 @@ internal static partial class AomEncoder
 
         // av1_initialize_rd_consts
         x.Errorperbit = AomRd.ErrorPerBit(cpi.RdRdmult);
+        x.Rdmult = input.InitialRdmult;   // td->mb.rdmult: loopfilter_frame of the previous frame left cpi->rd.RDMULT
         AomModeCostFill.Fill(x.ModeCosts, cm.Fc, cpi.EnableFilterIntra);
         AomModeCostFill.FillInter(x.ModeCosts, cm.Fc, cm.SkipModeFlag, cm.FrameIsIntraOnly);
         x.CoeffCosts.Fill(cm.Fc.Coef, cm.NumPlanes);

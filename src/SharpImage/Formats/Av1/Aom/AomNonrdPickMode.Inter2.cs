@@ -69,6 +69,7 @@ internal static partial class AomNonrdPickMode
         if ((cpi.RefFrameFlags & AOM_LAST_FLAG) != 0)
             FindPredictors(cpi, x, LAST_FRAME, st, bsize, forceSkipLowTempVar, x.ForceZeromvSkipForBlk != 0);
         GetRefFrameUseMask(cpi, x, mi, miRow, miCol, bsize, gfTemporalRef, st.UseRefFrameMask, ref forceSkipLowTempVar);
+        AomTrace.Out?.Write($"nrm {miRow} {miCol} bs {bsize} mask {st.UseRefFrameMask[1]} {st.UseRefFrameMask[4]} {st.UseRefFrameMask[7]} psad {x.PredMvSad[1]} {x.PredMvSad[4]} {x.PredMvSad[7]} fsl {forceSkipLowTempVar} cs {x.ColorSensitivity[0]} {x.ColorSensitivity[1]} csg {x.ColorSensitivitySbG[0]} {x.ColorSensitivitySbG[1]} var {x.SourceVariance} ssn {x.SourceSadNonrd}" + (char)10);
         bool skipPredMv = x.ForceZeromvSkipForBlk != 0 ||
                           (x.NonrdPruneRefFrameSearch > 2 && x.ColorSensitivity[0] != 2 && x.ColorSensitivity[1] != 2);
         for (int rf = LAST_FRAME + 1; rf <= ALTREF_FRAME; ++rf)
@@ -302,6 +303,7 @@ internal static partial class AomNonrdPickMode
             if (absMv < 2) checkGlobalmv = false;
         }
         if (x.SbMeBlock && refFrame == LAST_FRAME && st.FrameMv[thisBestMode, refFrame].AsInt == x.SbMeMv.AsInt) sbMeHasBeenTested = true;
+        AomTrace.Out?.Write($"nim {miRow} {miCol} bs {bsize} m {thisMode} r {refFrame} mv {thisMv.Row} {thisMv.Col} rate {st.ThisRdc.Rate} dist {st.ThisRdc.Dist} rd {st.ThisRdc.Rdcost} sse {st.ThisRdc.Sse} et {thisEarlyTerm} tx {mi.TxSize} f {mi.InterpFilters:x8}" + (char)10);
         if (st.ThisRdc.Rdcost < st.BestRdc.Rdcost)
         {
             st.BestRdc = st.ThisRdc;

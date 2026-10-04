@@ -98,6 +98,7 @@ internal static partial class AomVarBasedPart
 
         FillVarianceTreeLeaves(cpi, x, vt, forceSplit, avg16x16, maxvar16x16, minvar16x16, thresholds, src, dst, haveDst, isKeyFrame, isSmallSb);
 
+        AomTrace.Out?.Write($"vbp {miRow} {miCol} th {thresholds[0]} {thresholds[1]} {thresholds[2]} {thresholds[3]} ysad {ySad} var {x.SourceVariance} cs {x.ColorSensitivitySb[0]} {x.ColorSensitivitySb[1]} ssn {x.SourceSadNonrd} fs {forceSplit[0]} {forceSplit[1]} {forceSplit[5]} {forceSplit[6]} {forceSplit[21]} " + (char)10);
         int avg64x64 = 0;
         for (int blk64Idx = 0; blk64Idx < num64x64Blocks; ++blk64Idx)
         {

@@ -175,6 +175,7 @@ internal static partial class AomEncodeFrame
                 splitRdc.Rdcost = AomRd.RdCost(x.Rdmult, splitRdc.Rate, splitRdc.Dist);
             }
         }
+        AomTrace.Out?.Write($"tmerge {miRow} {miCol} bs {bsize} none {noneRdc.Rate} {noneRdc.Dist} {noneRdc.Rdcost} skip {noneRdc.SkipTxfm} mode {pcTree.None!.Mic.Mode} split {splitRdc.Rate} {splitRdc.Dist} {splitRdc.Rdcost} dosplit {(doSplit ? 1 : 0)}" + (char)10);
         var mib = cm.MiGridBase[miRow * cm.MiStride + miCol]!;
         if (noneRdc.Rdcost < splitRdc.Rdcost)
         {

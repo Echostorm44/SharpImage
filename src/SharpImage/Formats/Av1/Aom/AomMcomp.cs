@@ -219,7 +219,7 @@ internal static class AomMcomp
         FAST_DIAMOND => VFAST_DIAMOND, FAST_BIGDIA => FAST_BIGDIA, VFAST_DIAMOND => VFAST_DIAMOND, _ => DIAMOND,
     };
 
-    /// <summary>av1_get_default_mv_search_method (the content-state variant 4 is real-time only).</summary>
+    /// <summary>av1_get_default_mv_search_method.</summary>
     public static int GetDefaultMvSearchMethod(AomMacroblock x, AomMvSpeedFeatures mvSf, int bsize)
     {
         int searchMethod = mvSf.search_method;
@@ -228,7 +228,8 @@ internal static class AomMcomp
         ReadOnlySpan<int> minDimTh = stackalloc int[] { 128, 64, 32, 16 };
         bool useFaster = false;
         if (sfBlkSearchMethod >= 1 && sfBlkSearchMethod <= 3) useFaster = minDim >= minDimTh[sfBlkSearchMethod - 1];
-        else if (sfBlkSearchMethod == 4) throw new NotSupportedException("use_bsize_dependent_search_method 4 (real-time content state)");
+        else if (sfBlkSearchMethod == 4)
+            useFaster = minDim >= minDimTh[3] && x.SourceSadNonrd <= AomRtSb.kMedSad && (x.Qindex >> (QINDEX_BITS - 2)) < 3;
         if (useFaster) searchMethod = GetFasterSearchMethod(searchMethod);
         return searchMethod;
     }

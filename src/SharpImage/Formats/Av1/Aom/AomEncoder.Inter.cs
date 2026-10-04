@@ -27,7 +27,9 @@ internal sealed partial class AomEncodeInput
     public int FilterScaler = EIGHTTAP_SMOOTH, PhaseScaler;
     /// <summary>oxcf->gf_cfg.lag_in_frames, number of spatial layers.</summary>
     public int LagInFrames, NumSpatialLayers = 1;
-    public int KeyFreqMax = 9999;   // oxcf.kf_cfg.key_freq_max (the real-time speed features read it)
+    public int KeyFreqMax = 9999;
+    /// <summary>cm->features / reference mode carried across frames (one-pass real-time: av1_encode_frame does not reset them).</summary>
+    public AomPersistentFeatures? PersistentFeatures;   // oxcf.kf_cfg.key_freq_max (the real-time speed features read it)
     /// <summary>cpi->rc.is_src_frame_alt_ref.</summary>
     public bool IsSrcFrameAltRef;
     /// <summary>features->allow_screen_content_tools etc. of the last intra frame (inter frames keep them).</summary>
@@ -169,9 +171,20 @@ internal static partial class AomEncoder
         AomMvPred.SetupFrameSignBias(cm);
 
         // av1_encode_frame (frame_parameter_update): reference mode select, switchable interp filter / motion mode
-        cm.ReferenceMode = REFERENCE_MODE_SELECT;
-        cm.InterpFilter = SWITCHABLE;
-        cm.SwitchableMotionMode = cm.AllowWarpedMotion || cpi.EnableObmc;
+        if (input.PersistentFeatures == null || sf.hl_sf.frame_parameter_update != 0 || sf.rt_sf.use_comp_ref_nonrd != 0)
+        {
+            cm.ReferenceMode = REFERENCE_MODE_SELECT;
+            cm.InterpFilter = SWITCHABLE;
+            cm.SwitchableMotionMode = cm.AllowWarpedMotion || cpi.EnableObmc;
+        }
+        else
+        {
+            // cm->features / current_frame.reference_mode keep the previous frame's (a select becomes single)
+            var pf = input.PersistentFeatures;
+            cm.ReferenceMode = pf.ReferenceMode == REFERENCE_MODE_SELECT ? SINGLE_REFERENCE : pf.ReferenceMode;
+            cm.InterpFilter = SWITCHABLE;   // (libaom enters every frame with SWITCHABLE)
+            cm.SwitchableMotionMode = pf.SwitchableMotionMode;
+        }
 
         // encode_frame_internal: warped motion pruned by its frame probability
         if (cm.AllowWarpedMotion && sf.inter_sf.prune_warped_prob_thresh > 0)
@@ -612,4 +625,11 @@ internal static partial class AomEncoder
             AomTrace.Out.Write($"ttp ut {cpi.UpdateType} h {h:x} c {hc:x}" + (char)10);
         }
     }
+}
+
+/// <summary>The frame-to-frame AV1_COMMON features av1_encode_frame leaves alone without frame_parameter_update.</summary>
+internal sealed class AomPersistentFeatures
+{
+    public int ReferenceMode = SINGLE_REFERENCE, InterpFilter = SWITCHABLE;
+    public bool SwitchableMotionMode = true;
 }
