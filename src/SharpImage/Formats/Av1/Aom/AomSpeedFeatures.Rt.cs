@@ -358,8 +358,8 @@ internal sealed partial class AomSpeedFeatures
         if (cpi.KeyFreqMax != 0 && cpi.Width * cpi.Height > 640 * 480) rt.use_temporal_noise_estimate = 1;
         rt.skip_tx_no_split_var_based_partition = 1;
         rt.skip_newmv_mode_based_on_sse = 1;
-        rt.mode_search_skip_flags = cpi.FrameType == KEY_FRAME ? 0
-            : FLAG_SKIP_INTRA_DIRMISMATCH | FLAG_SKIP_INTRA_BESTINTER | FLAG_SKIP_COMP_BESTINTRA | FLAG_SKIP_INTRA_LOWVAR | FLAG_EARLY_TERMINATE;
+        rt.mode_search_skip_flags = cpi.FrameType == KEY_FRAME ? 0u
+            : (uint)(FLAG_SKIP_INTRA_DIRMISMATCH | FLAG_SKIP_INTRA_BESTINTER | FLAG_SKIP_COMP_BESTINTRA | FLAG_SKIP_INTRA_LOWVAR | FLAG_EARLY_TERMINATE);
         rt.var_part_split_threshold_shift = 5;
         if (!cpi.FrameIsIntraOnly) rt.var_part_based_on_qidx = 1;
         rt.use_fast_fixed_part = 0;
