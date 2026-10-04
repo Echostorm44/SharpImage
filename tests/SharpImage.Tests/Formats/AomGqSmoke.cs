@@ -34,7 +34,7 @@ public sealed class AomGqSmoke
         {
             Width = w, Height = h, SsX = is444 ? 0 : 1, SsY = is444 || is422 ? 0 : 1, Monochrome = mono, BitDepth = bd, Speed = speed, Tune = tune,
             Threads = int.Parse(Environment.GetEnvironmentVariable("GQ_THREADS") ?? "1"),
-            LagInFrames = layers > 1 || Environment.GetEnvironmentVariable("GQ_HASALPHA") == "1" || alpha ? 0 : 35,
+            LagInFrames = speed >= 7 || layers > 1 || Environment.GetEnvironmentVariable("GQ_HASALPHA") == "1" || alpha ? 0 : 35,
             Limit = layers > 1 ? layers : 0, NumSpatialLayers = layers, UseFixedQpOffsets = layers > 1 ? 2 : 0, EnableRestoration = bd != 12,
             Color = new AomSequenceConfig { ColorRange = 1 },
         };

@@ -27,6 +27,7 @@ internal sealed partial class AomEncodeInput
     public int FilterScaler = EIGHTTAP_SMOOTH, PhaseScaler;
     /// <summary>oxcf->gf_cfg.lag_in_frames, number of spatial layers.</summary>
     public int LagInFrames, NumSpatialLayers = 1;
+    public int KeyFreqMax = 9999;   // oxcf.kf_cfg.key_freq_max (the real-time speed features read it)
     /// <summary>cpi->rc.is_src_frame_alt_ref.</summary>
     public bool IsSrcFrameAltRef;
     /// <summary>features->allow_screen_content_tools etc. of the last intra frame (inter frames keep them).</summary>

@@ -169,6 +169,7 @@ internal sealed partial class AomGqEncoder
             if (_frameNumberPushed > 0 && (f.Quantizer != _prevQuantizer || _cfg.ReapplyCodecOptions)) ChangeConfig();
             _prevQuantizer = f.Quantizer;
             _cqLevel = QuantizerToQindex[f.Quantizer];
+            if (_cfg.Usage == REALTIME) RtConfigure(f.Quantizer);
             _losslessRequested = f.Quantizer == 0;
             if (f.ScaleModeH != 0 || f.ScaleModeV != 0)
             {
@@ -292,7 +293,8 @@ internal sealed partial class AomGqEncoder
         // av1_post_encode_updates
         if (_twopass.ThisFrame >= 0) _twopass.TotalLeftStats.Subtract(_twopass.Buf[_twopass.ThisFrame]);
         RefreshReferenceFrames();
-        RcPostencodeUpdate(_curQindex, _curFrameType, _lastShowFrame, res.Length, _curRefresh.RefreshGolden, _curRefresh.RefreshAlt);
+        if (IsOnePassRtParams) RtPostencodeUpdate(_curQindex, _curFrameType, _lastShowFrame, res.Length, _curRefresh.RefreshGolden);
+        else RcPostencodeUpdate(_curQindex, _curFrameType, _lastShowFrame, res.Length, _curRefresh.RefreshGolden, _curRefresh.RefreshAlt);
         if (popLookahead) LookaheadPopEntry(flush, EncodeStage);
         if (!HasNoStatsStage) TwopassPostencodeUpdate(_curQindex, _curFrameType);
         UpdateFbOfContextType();
@@ -337,6 +339,7 @@ internal sealed partial class AomGqEncoder
         popLookahead = false;
         if (!flush && LookaheadDepth(EncodeStage) < LookaheadPopSz(EncodeStage)) return null;
         if (LookaheadPeek(0, EncodeStage) == null) return null;
+        bool onePassRt = IsOnePassRtParams;
         if (HasNoStatsStage)
         {
             _gfMaxPyrHeight = Math.Min(_gfMaxPyrHeight, 1);   // USE_ALTREF_FOR_ONE_PASS
@@ -348,7 +351,7 @@ internal sealed partial class AomGqEncoder
         _twopass.ThisFrame = -1;
         int ft = fp.FrameType;
         bool sf = fp.ShowFrame;
-        GetSecondPassParams(ref ft, ref sf, _libFlags);
+        if (!onePassRt) GetSecondPassParams(ref ft, ref sf, _libFlags);
         fp.FrameType = ft;
         fp.ShowFrame = sf;
 
@@ -373,10 +376,18 @@ internal sealed partial class AomGqEncoder
         ApplyEncodingFlags(source.Flags);
         _libFlags = (source.Flags & AOM_EFLAG_FORCE_KF) != 0 ? FRAMEFLAGS_KEY : 0;
         if (fp.ShowFrame) AdjustFrameRate(source.TsStart, source.TsEnd);
+        if (onePassRt)
+        {
+            int rtFt = fp.FrameType;
+            GetOnePassRtParams(ref rtFt, source, lastSource, _libFlags);
+            fp.FrameType = rtFt;
+            if (UseRtcReferenceStructureOneLayer) SetRtcReferenceStructureOneLayer(_gfFrameIndex == 0);
+            idx = _gfFrameIndex;
+        }
 
         int frameUpdateType = gf.UpdateType[idx];
         if (fp.ShowExistingFrame && fp.FrameType != KEY_FRAME) fp.FrameType = INTER_FRAME;
-        if (HasNoStatsStage)
+        if (HasNoStatsStage && !onePassRt)
         {
             bool kfRequested = _frameNumber == 0 || _kfKeyFreqMax == 0 || (_libFlags & FRAMEFLAGS_KEY) != 0;
             if (kfRequested && frameUpdateType != OVERLAY_UPDATE && frameUpdateType != INTNL_OVERLAY_UPDATE) fp.FrameType = KEY_FRAME;
@@ -394,6 +405,8 @@ internal sealed partial class AomGqEncoder
         int orderOffset = gf.ArfSrcOffset[idx];
         int curFrameDisp = _frameNumber + orderOffset;
         if (!_extUpdatePending) GetRefFrames(dispOrder, pyrLevel, curFrameDisp);
+        else if (UseRtcReferenceStructureOneLayer)
+            for (int i = 0; i < INTER_REFS_PER_FRAME; i++) _remappedRefIdx[i] = _rt.RefIdx[i];
         var refBufsPrio = new AomRefBuffer?[INTER_REFS_PER_FRAME];
         bool hasRefFrames = false;
         for (int i = 0; i < INTER_REFS_PER_FRAME; i++)
@@ -559,6 +572,13 @@ internal sealed partial class AomGqEncoder
     {
         if (tsStart < _firstTsStart) { _firstTsStart = tsStart; _prevTsEnd = tsStart; }
         long thisDuration;
+        if (IsOnePassRtParams && tsEnd - tsStart > 0)
+        {
+            NewFramerate(10000000.0 / (tsEnd - tsStart));
+            _prevTsStart = tsStart;
+            _prevTsEnd = tsEnd;
+            return;
+        }
         int step = 0;
         if (tsStart == _firstTsStart)
         {
@@ -674,6 +694,7 @@ internal sealed partial class AomGqEncoder
         {
             // is_frame_droppable
             if (!(_extRefreshLast || _extRefreshGolden || _extRefreshAlt || _extRefreshBwd || _extRefreshAlt2)) return 0;
+            if (UseRtcReferenceStructureOneLayer) return RtcRefreshMask();
             int mask = 0;
             mask |= (_extRefreshLast ? 1 : 0) << _remappedRefIdx[LAST_FRAME - LAST_FRAME];
             mask |= (_extRefreshBwd ? 1 : 0) << _remappedRefIdx[BWDREF_FRAME - LAST_FRAME];
@@ -893,7 +914,22 @@ internal sealed partial class AomGqEncoder
         // av1_set_size_dependent_vars: the TPL frame statistics (r0, the gfu boost), q
         if (_enableTplModel && _tpl.StatsReady(_gfFrameIndex)) ProcessTplStatsFrame();
         int qindex;
-        if (cfg.UseFixedQpOffsets == 2 && _rcModeQ)
+        if (IsOnePassRtParams)
+        {
+            var lastRef = isKey ? null : _refFrameMap[_remappedRefIdx[0]];
+            var prevFrame = fp.PrimaryRefFrame != PRIMARY_REF_NONE ? _refFrameMap[_remappedRefIdx[fp.PrimaryRefFrame]] : null;
+            // set_size_independent_vars / av1_set_size_dependent_vars: this frame's speed features before the q pick
+            var rtSfIn = RtSfInputs(frameType, width, height);
+            rtSfIn.UpdateType = gf.UpdateType[_gfFrameIndex];
+            rtSfIn.GfFrameType = frameType;
+            var curSf = new AomSpeedFeatures();
+            curSf.SetFramesizeIndependent(rtSfIn, new AomSpeedFeatureSeqFlags(), new AomWinnerModeParams(), cfg.Speed);
+            curSf.SetFramesizeDependent(rtSfIn, new AomSpeedFeatureSeqFlags(), cfg.Speed);
+            _rtSfCache = curSf.rt_sf;
+            _rtHlAccurateBitEstimate = curSf.hl_sf.accurate_bit_estimate != 0;
+            qindex = RtPickQAndBounds(width, height, unscaled, lastRef, prevFrame, out _, out _);
+        }
+        else if (cfg.UseFixedQpOffsets == 2 && _rcModeQ)
         {
             qindex = _cqLevel;
             _pRc.ArfQ = qindex;
@@ -929,7 +965,7 @@ internal sealed partial class AomGqEncoder
             Seq = _seq, ShowFrame = fp.ShowFrame, OrderHint = orderHint, DisplayOrderHint = displayOrderHint,
             FrameNumber = _frameNumber, RefBufs = refBufs, RefFrameFlags = fp.RefFrameFlags, UseRefFrameMvs = _extUseRefFrameMvs,
             PrimaryRefBuf = primaryRefBuf, FrameProbs = _frameProbs, FilterScaler = filterScaler, PhaseScaler = phaseScaler,
-            LagInFrames = _lagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, RefreshGolden = fp.RefreshGolden,
+            LagInFrames = _lagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, KeyFreqMax = _kfKeyFreqMax, RefreshGolden = fp.RefreshGolden,
             PpiFilterLevel = _ppiFilterLevel, ResizeNeeded = _resizeModeFixed, IsSrcFrameAltRef = _rc.IsSrcFrameAltRef != 0,
             GfFrameIndex = _gfFrameIndex, GfArfIndex = gf.ArfIndex, CurPyramidLevel = pyramidLevel, ValidGmModelFound = _validGmModelFound,
             MvSearchState = _maxMvMagnitude, SetMvParamsEarly = _mvSearchParamsDue, PrevBaseQindex = _prevBaseQindex, MvStats = _mvStats,

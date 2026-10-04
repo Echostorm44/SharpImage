@@ -182,6 +182,8 @@ internal static partial class AomEncoder
             NumWorkers = cpi.NumWorkers, Mode = input.Mode, Sharpness = cpi.Sharpness, UpdateType = input.UpdateType, GfFrameType = input.GfFrameType, LapEnabled = input.IsStatConsumptionStage,
             FrameType = input.GfFrameType == KEY_FRAME ? KEY_FRAME : INTER_FRAME,
             Tuning = tune switch { AomTune.Iq => AOM_TUNE_IQ, AomTune.Ssim => AOM_TUNE_SSIM, _ => AOM_TUNE_PSNR },
+            RcMode = input.Mode == REALTIME ? AOM_CBR : AOM_Q, KeyFreqMax = input.KeyFreqMax, LagInFrames = input.LagInFrames,
+            NumSpatialLayers = input.NumSpatialLayers,
         };
         // avifenc --lossless / quality 100 (quantizer 0): libavif sets rc_min_quantizer = rc_max_quantizer = 0 and
         // AV1E_SET_LOSSLESS, so oxcf.rc_cfg.best_allowed_q = worst_allowed_q = 0 (is_lossless_requested)

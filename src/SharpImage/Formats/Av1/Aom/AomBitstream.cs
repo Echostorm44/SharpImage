@@ -147,7 +147,8 @@ internal static partial class AomBitstream
             var sf = cpi.Sf;
             int evalType = sf.winner_mode_sf.enable_winner_mode_for_tx_size_srch != 0 ? WINNER_MODE_EVAL : DEFAULT_EVAL;
             TxMode = AomRdoptUtils.SelectTxMode(CodedLossless, cpi.WinnerModeParams.tx_size_search_methods[evalType]);
-            if (TxMode == TX_MODE_SELECT && cpi.TxbSplitCount == 0) TxMode = TX_MODE_LARGEST;
+            if ((sf.hl_sf.frame_parameter_update != 0 || sf.rt_sf.use_comp_ref_nonrd != 0) && TxMode == TX_MODE_SELECT && cpi.TxbSplitCount == 0)
+                TxMode = TX_MODE_LARGEST;
             Lf = cpi.PostFilter!.LoopFilter;
             Rst = cpi.PostFilter.Restoration;
             for (int p = 0; p < 3; p++)
