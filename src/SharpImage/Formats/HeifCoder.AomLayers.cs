@@ -58,7 +58,7 @@ public static partial class HeifCoder
             AvifChromaSubsampling.Yuv444 => Av1PixelLayout.I444,
             AvifChromaSubsampling.Yuv420 => Av1PixelLayout.I420,
             AvifChromaSubsampling.Yuv400 => Av1PixelLayout.I400,
-            _ => color.Matrix == 0 ? Av1PixelLayout.I444 : Av1PixelLayout.I420,
+            _ => Av1PixelLayout.I444,   // Auto: avifenc's default (grey sources are coded 4:0:0 below)
         };
         if (color.Matrix == 0 && layout != Av1PixelLayout.I444)
             throw new ArgumentException("The identity matrix (MatrixCoefficients 0) requires 4:4:4 chroma.", nameof(options));
