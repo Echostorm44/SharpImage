@@ -61,7 +61,7 @@ public static partial class HeifCoder
         {
             ReadRgbPlanes(l.Source, bd, out var r, out var g, out var b, out var a, out bool colour, out bool nonOpaque);
             anyColour |= colour;
-            anyTranslucent |= nonOpaque && a != null;
+            anyTranslucent |= a != null;   // libavif: layered images code alpha whenever there is an alpha plane
             planes.Add((r, g, b, a));
         }
         bool mono = layout == Av1PixelLayout.I400 || (!anyColour && color.Matrix is not (0 or 16 or 17));
@@ -129,6 +129,10 @@ public static partial class HeifCoder
                 else if (mono)
                     y = anyColour ? MonoLumaLibavif(r, g, b, w, h, bd, color, l.Source.Depth is >= 1 and <= 16 ? l.Source.Depth : 16)
                         : GreyLumaLibavif(l.Source, bd, color.FullRange, SourceRgbDepth(l.Source), false);
+                else if (SourcePlanesFor(l.Source, bd, color, w, h) is { } sp && sp.Layout == coded)
+                {
+                    y = sp.Planes.Value[0].ToArray(); u = sp.Planes.Value[1].ToArray(); v = sp.Planes.Value[2].ToArray();   // kept JPEG / Y4M planes
+                }
                 else
                 {
                     RgbToYuvLibavif(l.Source, bd, coded, color, SourceRgbDepth(l.Source), false, r, g, b, out y, out var u0, out var v0);

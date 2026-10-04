@@ -321,6 +321,7 @@ internal sealed partial class AomGqEncoder
     private int _curQindex, _curFrameType;
     private bool _curShowExisting;
     private int _prevBaseQindex;
+    private readonly AomForceIntMvInfo _forceIntpelInfo = new();   // cpi->force_intpel_info
     private readonly AomMvStats _mvStats = new();   // ppi->mv_stats
     /// <summary>cm->current_frame.frame_type (av1_encode sets it; av1_tpl_preload_rc_estimate overwrites it).</summary>
     private int _cmFrameType = KEY_FRAME;
@@ -918,7 +919,7 @@ internal sealed partial class AomGqEncoder
         {
             Width = width, Height = height, SsX = cfg.Monochrome ? 1 : cfg.SsX, SsY = cfg.Monochrome ? 1 : cfg.SsY, Monochrome = cfg.Monochrome,
             BitDepth = cfg.BitDepth, Mode = cfg.Usage, Speed = cfg.Speed, Tune = tune, Threads = Math.Min(cfg.Threads, 64),
-            TileColumns = cfg.TileColumnsLog2, TileRows = cfg.TileRowsLog2, SourceFrame = source, UnfilteredSource = src.Img, Tpl = _lagInFrames > 1 ? _tpl : null, R0 = _r0,
+            TileColumns = cfg.TileColumnsLog2, TileRows = cfg.TileRowsLog2, SourceFrame = source, UnfilteredSource = src.Img, ForceIntMvSource = unscaled, UnscaledLastSource = lastSrc?.Img, ForceIntpelInfo = _forceIntpelInfo, Tpl = _lagInFrames > 1 ? _tpl : null, R0 = _r0,
             DeltaqObjective = cfg.Tune != AomTune.Iq && _enableTplModel,
             BaseQindex = qindex, UpdateType = updateType, GfFrameType = frameType, LayerDepth = gf.LayerDepth[_gfFrameIndex],
             IsStatConsumptionStage = IsStatConsumptionStage, BoostIndex = Math.Min(15, _pRc.GfuBoost / 100),

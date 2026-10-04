@@ -1528,7 +1528,8 @@ public static partial class HeifCoder
             anyTranslucent |= nonOpaque;
             frames.Add((r, g, b, a));
         }
-        bool hasAlpha = anyTranslucent;
+        // libavif: a sequence codes alpha whenever the first frame has an alpha plane (opaque or not)
+        bool hasAlpha = anyTranslucent || (frames.Count > 0 && frames[0].A != null);
         extras.Premultiplied = options.PremultiplyAlpha && hasAlpha;
         // Grey sequences are coded 4:0:0 like stills; identity / YCgCo-R keep the colour path (they carry exact RGB).
         bool forceMono = layout == Av1.Av1PixelLayout.I400;   // avifenc -y 400: luma from RGB, chroma dropped

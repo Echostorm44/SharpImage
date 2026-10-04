@@ -92,9 +92,10 @@ internal static partial class AomEncoder
         cm.AllowRefFrameMvs = input.UseRefFrameMvs && seq.EnableRefFrameMvs && seq.EnableOrderHint;
         cm.AllowWarpedMotion = cpi.AllowWarpedMotionCfg && seq.EnableWarpedMotion;
         // cur_frame_force_integer_mv (screen content inter frames: av1_is_integer_mv)
-        if (cpi.AllowScreenContentTools && cpi.Sf.rt_sf.use_nonrd_pick_mode == 0)
-            throw new NotImplementedException("av1_is_integer_mv (screen content inter frames)");
-        cm.CurFrameForceIntegerMv = false;
+        // (seq force_integer_mv 2: adaptive, from the previous source)
+        cm.CurFrameForceIntegerMv = cpi.AllowScreenContentTools && cpi.Sf.rt_sf.use_nonrd_pick_mode == 0 &&
+            input.UnscaledLastSource != null && input.ForceIntMvSource != null &&
+            AomForceIntMv.IsIntegerMv(input.ForceIntMvSource, input.UnscaledLastSource, input.ForceIntpelInfo!);
 
         // encode_without_recode: GOLDEN / ALTREF dropped from the flags when their size differs (one spatial layer)
         if (input.NumSpatialLayers == 1)
