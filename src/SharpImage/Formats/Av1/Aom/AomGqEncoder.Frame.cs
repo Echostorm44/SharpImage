@@ -934,6 +934,7 @@ internal sealed partial class AomGqEncoder
             _rtSfCache = curSf.rt_sf;
             _rtHlAccurateBitEstimate = curSf.hl_sf.accurate_bit_estimate != 0;
             qindex = RtPickQAndBounds(width, height, unscaled, lastRef, prevFrame, out _, out _);
+            if (curSf.rt_sf.overshoot_detection_cbr == FAST_DETECTION_MAXQ && _rt.HighSourceSad) qindex = EncodedframeOvershootCbr(qindex, width, height);
         }
         else if (cfg.UseFixedQpOffsets == 2 && _rcModeQ)
         {

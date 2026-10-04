@@ -736,4 +736,31 @@ internal sealed partial class AomGqEncoder
             fp.RefreshFrameFlags = RtcRefreshMask();
         }
     }
+
+    /// <summary>av1_encodedframe_overshoot_cbr (one layer, content default, no spatial variance).</summary>
+    private int EncodedframeOvershootCbr(int q, int width, int height)
+    {
+        double rateCorrectionFactor = _rt.RateCorrectionFactors[INTER_NORMAL];
+        int targetSize = _rc.AvgFrameBandwidth;
+        const ulong sadThr = 64 * 64 * 32;
+        if (width * height >= 1280 * 720 && _pRc.BufferLevel > (_rt.OptimalBufferLevel >> 1) && _rt.AvgSourceSad < sadThr)
+            q = (q + _rc.WorstQuality) >> 1;
+        else q = (3 * _rc.WorstQuality + q) >> 2;
+        _pRc.AvgFrameQindex[INTER_FRAME] = q;
+        _pRc.BufferLevel = _rt.OptimalBufferLevel;
+        _pRc.BitsOffTarget = _rt.OptimalBufferLevel;
+        _rt.Rc1Frame = 0;
+        _rt.Rc2Frame = 0;
+        int targetBitsPerMb = (int)(((ulong)(uint)targetSize << BPER_MB_NORMBITS) / (ulong)GetMbs(width, height));
+        double q2 = ConvertQindexToQ(q, _cfg.BitDepth);
+        int enumerator = _isScreenContentType ? 1000000 : 2000000;   // get_bpmb_enumerator(INTER_NORMAL == KEY_FRAME, ...)
+        double newCorrectionFactor = (double)targetBitsPerMb * q2 / enumerator;
+        if (newCorrectionFactor > rateCorrectionFactor)
+        {
+            rateCorrectionFactor = (newCorrectionFactor + rateCorrectionFactor) / 2.0;
+            if (rateCorrectionFactor > MAX_BPB_FACTOR) rateCorrectionFactor = MAX_BPB_FACTOR;
+            _rt.RateCorrectionFactors[INTER_NORMAL] = rateCorrectionFactor;
+        }
+        return q;
+    }
 }

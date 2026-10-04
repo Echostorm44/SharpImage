@@ -482,7 +482,7 @@ internal static partial class AomNonrdPickMode
                 bp.BestMode = thisMode;
                 bp.BestTxSize = mi.TxSize;
                 bp.BestRefFrame = INTRA_FRAME;
-                bp.BestSecondRefFrame = NONE_FRAME;
+                bp.BestSecondRefFrame = 0;   // (libaom assigns NONE, the ACTIVATION enum value 0)
                 bp.BestModeSkipTxfm = thisRdc.SkipTxfm;
                 mi.UvMode = thisMode;
                 mi.Mv0 = AomMv.Invalid;
@@ -731,7 +731,7 @@ internal static partial class AomNonrdPickMode
             mi.Mv0 = AomMv.Invalid;
             mi.Mv1 = AomMv.Invalid;
             bp.BestRefFrame = INTRA_FRAME;
-            bp.BestSecondRefFrame = NONE_FRAME;
+            bp.BestSecondRefFrame = 0;   // (libaom assigns NONE, the ACTIVATION enum value 0)
             st.BestRdc.Rate = st.ThisRdc.Rate;
             st.BestRdc.Dist = st.ThisRdc.Dist;
             st.BestRdc.Rdcost = st.ThisRdc.Rdcost;
