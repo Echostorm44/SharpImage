@@ -193,6 +193,7 @@ internal static partial class AomEncoder
         if (input.SfChain != null) input.SfChain(cpi.Sf, cpi.WinnerModeParams);
         else cpi.Sf.SetForFrame(sfIn, seqFlags, cpi.WinnerModeParams, input.Speed);
         cpi.EnableRestoration = seqFlags.enable_restoration != 0;
+        cpi.Rt = input.Rt;
         // encode_with_recode_loop: av1_determine_sc_tools_with_encoding (key frames)
         if (ScTrialWanted(cpi, input)) DetermineScToolsWithEncoding(cpi, input, sfIn, seqFlags);
         input.SfOverride?.Invoke(cpi.Sf);
@@ -204,6 +205,11 @@ internal static partial class AomEncoder
         // av1_set_quantizer: chroma delta q and the quantization matrix levels; av1_init_quantizer
         AomQuantSetup.SetQuantizer(cpi, input.BaseQindex);
         cpi.Quants = new AomQuants(bd, cm.YDcDeltaQ, cm.UDcDeltaQ, cm.UAcDeltaQ, cm.VDcDeltaQ, cm.VAcDeltaQ, cpi.Sharpness);
+        if (cpi.Rt != null)
+        {
+            AomVarBasedPart.SetVariancePartitionThresholds(cpi, input.BaseQindex);
+            AomRtSb.PopulateThreshToForceZeromvSkip(cpi);
+        }
 
         // the frame CDFs (key frame defaults for the qindex) and av1_initialize_rd_consts
         cm.Fc = new Av1CdfContext();
@@ -592,6 +598,11 @@ internal static partial class AomEncoder
             x.CbCoefBuff = cpi.CbCoeffBuffers[(miRow >> cm.MibSizeLog2) * sbCols + (miCol >> cm.MibSizeLog2)];   // av1_get_cb_coeff_buffer
             x.ColorPaletteThresh = 64;
             x.InitSrcVarInfo(cm.SbSize);
+            if (cpi.Rt != null)
+            {
+                AomRtSb.InitSb(cpi, x);
+                AomRtSb.GradeSourceContentSb(cpi, x, miRow, miCol);
+            }
             if (cpi.Sf.rt_sf.use_nonrd_pick_mode != 0) EncodeNonrdSb(cpi, x, miRow, miCol);
             else EncodeRdSb(cpi, x, miRow, miCol);
             // row-MT: the top-right context for the next row, and this superblock done
@@ -759,7 +770,16 @@ internal static partial class AomEncoder
         AomVarBasedPart.ChooseVarBasedPartitioning(cpi, x, miRow, miCol);
         x.CbOffset[0] = 0;
         x.CbOffset[1] = 0;
-        // (skip_cdef_sb is off in the all-intra mode)
+        if (cpi.Sf.rt_sf.skip_cdef_sb != 0)
+        {
+            int block64InSb = cm.SbSize == BLOCK_128X128 ? 2 : 1;
+            for (int r = 0; r < block64InSb; ++r)
+                for (int c = 0; c < block64InSb; ++c)
+                {
+                    int idx = (miRow + r * 16) * cm.MiStride + miCol + c * 16;
+                    if (idx < cm.MiGridBase.Length && cm.MiGridBase[idx] is { } m) m.CdefStrength = 1;
+                }
+        }
         AomEncodeFrame.NonrdUsePartition(cpi, x, miRow, miCol, cm.SbSize, x.NonrdPcRoot!);
     }
 

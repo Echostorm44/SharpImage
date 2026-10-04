@@ -12,7 +12,7 @@ namespace SharpImage.Formats.Av1;
 // av1_block_yrd dispatches in libaom's SIMD build (aom_hadamard_lp_8x8_sse2 / _8x8_dual_avx2 / _16x16_avx2,
 // aom_fdct4x4_lp_sse2, av1_quantize_lp_avx2, aom_satd_lp_avx2, av1_block_error_lp_avx2: the hadamards and the 4x4
 // transform are exactly their C references; quantize / satd / error follow the AVX2 16-bit lane arithmetic).
-internal static class AomNonrdPickMode
+internal static partial class AomNonrdPickMode
 {
     private const int RTC_INTRA_MODES = 4;
     private static readonly int[] IntraModeList = { DC_PRED, V_PRED, H_PRED, SMOOTH_PRED };
@@ -522,7 +522,8 @@ internal static class AomNonrdPickMode
         thisRdc.Invalidate();
         p.Src.Offset = srcBase.Offset + 4 * (blkRow * srcBase.Stride + blkCol);
         pd.Dst.Offset = dstBase.Offset + 4 * (blkRow * dstBase.Stride + blkCol);
-        BlockYrd(x, ref thisRdc, ref args.Skippable, bsizeTx, Math.Min(txSize, TX_16X16));
+        if (plane == 0) BlockYrd(x, ref thisRdc, ref args.Skippable, bsizeTx, Math.Min(txSize, TX_16X16));
+        else ModelRdForSbUv(cpi, bsizeTx, x, xd, ref thisRdc, plane, plane);
         p.Src = srcBase;
         pd.Dst = dstBase;
         rdc.Rate += thisRdc.Rate;

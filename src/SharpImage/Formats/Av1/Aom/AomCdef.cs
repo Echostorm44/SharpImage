@@ -669,7 +669,7 @@ internal static partial class AomCdef
         return bestTotMse;
     }
 
-    /// <summary>av1_pick_cdef_from_qp (8-bit, intra frame).</summary>
+    /// <summary>av1_pick_cdef_from_qp.</summary>
     private static void PickCdefFromQp(AomComp cpi, AomCdefInfo ci, bool skipCdef, bool isScreenContent, bool avoidUvCdef)
     {
         var cm = cpi.Cm;
@@ -685,6 +685,13 @@ internal static partial class AomCdef
             yF2 = Math.Clamp((int)(-7.79934857e-06 * q * q + 6.58957830e-03 * q + 8.81045025e-01), 0, 3);
             uvF1 = Math.Clamp((int)(-6.79500136e-06 * q * q + 1.02695586e-02 * q + 1.36126802e-01), 0, 15);
             uvF2 = Math.Clamp((int)(-9.99613695e-08 * q * q - 1.79361339e-05 * q + 1.17022324e+0), 0, 3);
+        }
+        else if (!cm.FrameIsIntraOnly)
+        {
+            yF1 = Math.Clamp((int)MathF.Round(q * q * -0.0000023593946f + q * 0.0068615186f + 0.02709886f, MidpointRounding.AwayFromZero), 0, 15);
+            yF2 = Math.Clamp((int)MathF.Round(q * q * -0.00000057629734f + q * 0.0013993345f + 0.03831067f, MidpointRounding.AwayFromZero), 0, 3);
+            uvF1 = Math.Clamp((int)MathF.Round(q * q * -0.0000007095069f + q * 0.0034628846f + 0.00887099f, MidpointRounding.AwayFromZero), 0, 15);
+            uvF2 = Math.Clamp((int)MathF.Round(q * q * 0.00000023874085f + q * 0.00028223585f + 0.05576307f, MidpointRounding.AwayFromZero), 0, 3);
         }
         else
         {

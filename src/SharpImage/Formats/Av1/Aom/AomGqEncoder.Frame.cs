@@ -999,8 +999,10 @@ internal sealed partial class AomGqEncoder
             tmpSf.SetFramesizeIndependent(csf, _seqFlags, new AomWinnerModeParams(), cfg.Speed);
             tmpSf.SetFramesizeDependent(csf, _seqFlags, cfg.Speed);
         }
+        if (IsOnePassRtParams) input.Rt = BuildRtFrameState(lastSrc?.Img);
         var (cpi, x) = AomEncoder.EncodeFrame(input);
         _lastCpi = cpi;
+        if (IsOnePassRtParams) RtAfterEncodeFrame(cpi, x, fp, isKey);
         // encode_with_recode_loop: reset the mv stats (an intra / overlay frame interrupts them), then gather them for
         // the next frame
         if (cpi.Sf.hl_sf.recode_loop != DISALLOW_RECODE)

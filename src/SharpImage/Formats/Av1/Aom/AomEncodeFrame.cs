@@ -750,13 +750,15 @@ internal static partial class AomEncodeFrame
             }
             // delta quant: the superblock's first coded block moves the running base qindex
             bool superBlockUpperLeft = (miRow & (cm.MibSize - 1)) == 0 && (miCol & (cm.MibSize - 1)) == 0;
-            if (!nonrd && mbmi.HasSecondRef)
+            if (mbmi.HasSecondRef)
+            {
                 mbmi.CompGroupIdx = (byte)(mbmi.CompoundIdx == 0 || mbmi.InterinterComp.Type == COMPOUND_AVERAGE ? 0 : 1);
+                if (nonrd) mbmi.CompoundIdx = 1;   // encode_b_nonrd
+            }
             if (!nonrd && cpi.DeltaQPresentFlag && (bsize != cm.SbSize || mbmi.SkipTxfm == 0) && superBlockUpperLeft)   // (encode_b only; encode_b_nonrd does not)
                 xd.CurrentBaseQindex = mbmi.CurrentQindex;
             if (!cm.FrameIsIntraOnly)
             {
-                if (nonrd) throw new NotImplementedException("encode_b_nonrd inter blocks");
                 if (mbmi.SkipMode != 0)
                 {
                     x.SkipModeUsedFlag = true;
@@ -771,7 +773,7 @@ internal static partial class AomEncodeFrame
                 }
             }
             if (cpi.AllowUpdateCdf) UpdateStats(cpi, x);
-            if (!cm.FrameIsIntraOnly &&
+            if (!nonrd && !cm.FrameIsIntraOnly &&
                 ((cpi.Sf.inter_sf.prune_obmc_prob_thresh > 0 && cpi.Sf.inter_sf.prune_obmc_prob_thresh < int.MaxValue) ||
                  (cm.AllowWarpedMotion && cpi.Sf.inter_sf.prune_warped_prob_thresh > 0)) && mbmi.IsInterBlock)
             {

@@ -682,4 +682,58 @@ internal sealed partial class AomGqEncoder
         _rc.PrevCodedHeight = _cmHeight;
         _rc.FrameNumberEncoded++;
     }
+
+    /// <summary>The frame state the block-level real-time search reads.</summary>
+    private AomRtFrameState BuildRtFrameState(AomFrameBuffer? lastSource)
+    {
+        _rtVbpThresholds ??= new long[5];
+        return new AomRtFrameState
+        {
+            HighSourceSad = _rt.HighSourceSad, FrameSourceSad = _rc.FrameSourceSad, AvgSourceSad = _rt.AvgSourceSad,
+            PercentBlocksWithMotion = _rt.PercentBlocksWithMotion, FramesSinceKey = _rc.FramesSinceKey, FramesSinceGolden = _rc.FramesSinceGolden,
+            AvgFrameLowMotion = _rt.AvgFrameLowMotion, AvgFrameQindexInter = _pRc.AvgFrameQindex[INTER_FRAME], SrcSadBlk64 = _rt.SrcSadBlk64,
+            LastSource = lastSource, VbpThresholds = _rtVbpThresholds, FrameNumber = _frameNumber,
+        };
+    }
+
+    private long[]? _rtVbpThresholds;
+
+    /// <summary>encode_without_recode after av1_encode_frame: update_motion_stat and av1_adjust_gf_refresh_qp_one_pass_rt.</summary>
+    private void RtAfterEncodeFrame(AomComp cpi, AomMacroblock x, FrameParams fp, bool isKey)
+    {
+        var cm = cpi.Cm;
+        if (isKey) return;
+        // update_motion_stat
+        int avgCntZeromv = 100 * x.CntZeromv / (cm.MiRows * cm.MiCols);
+        _rt.AvgFrameLowMotion = _rt.AvgFrameLowMotion == 0 ? avgCntZeromv : (3 * _rt.AvgFrameLowMotion + avgCntZeromv) / 4;
+        if (cpi.Sf.rt_sf.gf_refresh_based_on_qp != 0) AdjustGfRefreshQpOnePassRt(cpi, fp);
+    }
+
+    /// <summary>av1_adjust_gf_refresh_qp_one_pass_rt (no resize).</summary>
+    private void AdjustGfRefreshQpOnePassRt(AomComp cpi, FrameParams fp)
+    {
+        if (_rt.HighSourceSad) return;
+        int avgQp = _pRc.AvgFrameQindex[INTER_FRAME];
+        bool allowGfUpdate = _rc.FramesTillGfUpdateDue <= _pRc.BaselineGfInterval - 10;
+        bool changed = false;
+        const int thresh = 87;
+        int baseQindex = cpi.Cm.BaseQindex;
+        if (_frameNumber - _rc.FrameNumLastGfRefresh < FIXED_GF_INTERVAL_RT && _rc.FramesTillGfUpdateDue == 1 && baseQindex > avgQp)
+        {
+            _rt.Refresh[_rt.GldIdx1Layer] = 0;
+            changed = true;
+            fp.RefreshGolden = false;
+        }
+        else if (allowGfUpdate && (baseQindex < thresh * avgQp / 100 || (_rt.AvgFrameLowMotion != 0 && _rt.AvgFrameLowMotion < 20)))
+        {
+            _rt.Refresh[_rt.GldIdx1Layer] = 1;
+            changed = true;
+            fp.RefreshGolden = true;
+        }
+        if (changed)
+        {
+            SetBaselineGfInterval(INTER_FRAME);
+            fp.RefreshFrameFlags = RtcRefreshMask();
+        }
+    }
 }
