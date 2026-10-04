@@ -8,6 +8,8 @@ internal sealed partial class AomEncodeInput
     /// <summary>One of av1_determine_sc_tools_with_encoding's quick encodes: the speed features come from SfChain and
     /// no further trial runs.</summary>
     internal bool ScTrialPass;
+    /// <summary>is_lossless_requested (rc best/worst allowed q both 0); null: the frame q is 0.</summary>
+    internal bool? LosslessRequested;
     /// <summary>Replaces the speed-feature setup (cpi->sf persists across the trial encodes in libaom).</summary>
     internal Action<AomSpeedFeatures, AomWinnerModeParams>? SfChain;
     /// <summary>encode_with_recode_loop's copy_frame_prob_info already ran (before the first trial encode).</summary>
@@ -56,6 +58,7 @@ internal static partial class AomEncoder
         var psnr = new double[2];
         int palettePixelNum = 0;
         bool intrabcUsed = false;
+        bool trialDeltaQPresent = false;
         for (int pass = 0; pass < 2; pass++)
         {
             // set_encoding_params_for_screen_content
@@ -84,6 +87,7 @@ internal static partial class AomEncoder
             var (tc, _) = EncodeFrame(t);
             psnr[pass] = CalcPsnrTotal(tc.Source!, tc.Cm.CurFrame, cm.NumPlanes);
             if (pass == 1) { palettePixelNum = tc.PalettePixelNum; intrabcUsed = tc.IntrabcUsed; }
+            trialDeltaQPresent = tc.DeltaQPresentFlag;
             tc.Cm.Release();
             AomBufferPool.Return(tc.ExtCbOffset);
             foreach (var b in tc.CbCoeffBuffers) AomCbCoeffBuffer.Return(b);
@@ -114,7 +118,10 @@ internal static partial class AomEncoder
 
         // cpi->sf after the trial: the partition search restored, the qindex-dependent sf of the trial q's then the
         // frame's (encode_with_recode_loop's av1_set_speed_features_qindex_dependent)
+        // encode_with_recode_loop's av1_set_quantizer: base_qindex = max(delta_q_present_flag of the last trial, q)
+        if (trialDeltaQPresent && input.BaseQindex == 0) cm.BaseQindex = input.BaseQindex = 1;
         var fin = sfIn.Clone();
+        fin.BaseQindex = input.BaseQindex;
         fin.AllowScreenContentTools = input.AllowScreenContentTools;
         fin.UseScreenContentTools = input.UseScreenContentTools;
         fin.IsScreenContentType = input.IsScreenContentType;

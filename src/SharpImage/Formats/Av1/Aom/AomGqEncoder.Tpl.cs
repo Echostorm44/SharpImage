@@ -101,7 +101,9 @@ internal sealed partial class AomGqEncoder
     private int TplGetQIndex(int gfFrameIndex, int leafQindex, int bd)
     {
         double qstepRatio = _tpl.StatsReady(gfFrameIndex) ? Math.Sqrt(1 / GetFrameImportance(gfFrameIndex)) : 1;
-        return QIndexFromQstepRatio(leafQindex, qstepRatio, bd);
+        int tq = QIndexFromQstepRatio(leafQindex, qstepRatio, bd);
+        AomTrace.Out?.Write(FormattableString.Invariant($"tplq {gfFrameIndex} awq {leafQindex} ratio {qstepRatio:F9} q {tq}") + (char)10);
+        return tq;
     }
 
     /// <summary>av1_get_q_index_from_qstep_ratio.</summary>

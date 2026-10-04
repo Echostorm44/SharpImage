@@ -21,6 +21,7 @@ internal sealed partial class AomGqEncoder
     /// <summary>A trace sink for frame-level decisions (test hook).</summary>
     public Action<AomComp, AomGqFrameHeader>? OnFrameEncoded;
     public string? RcTraceLine;
+    private bool _deltaQPresentFlag;
     /// <summary>Test hook: the symbol trace of the bitstream writer (AomWriter.Trace format).</summary>
     public System.IO.TextWriter? BitstreamTrace;
 
@@ -954,6 +955,9 @@ internal sealed partial class AomGqEncoder
             if (cfg.UseFixedQpOffsets == 1 && _rcModeQ) throw new NotImplementedException("use_fixed_qp_offsets 1");
         }
 
+        // av1_set_quantizer: base_qindex = max(cm->delta_q_info.delta_q_present_flag, q), the flag as the last
+        // av1_encode_frame left it
+        qindex = Math.Max(_deltaQPresentFlag ? 1 : 0, qindex);
         var tune = f.Quantizer == 0 ? AomTune.Psnr : cfg.Tune;
         int updateType = gf.UpdateType[_gfFrameIndex];
         var refBufs = new AomRefBuffer?[REF_FRAMES];
@@ -964,7 +968,7 @@ internal sealed partial class AomGqEncoder
             Width = width, Height = height, SsX = cfg.Monochrome ? 1 : cfg.SsX, SsY = cfg.Monochrome ? 1 : cfg.SsY, Monochrome = cfg.Monochrome,
             BitDepth = cfg.BitDepth, Mode = cfg.Usage, Speed = cfg.Speed, Tune = tune, Threads = Math.Min(cfg.Threads, 64),
             TileColumns = cfg.TileColumnsLog2, TileRows = cfg.TileRowsLog2, SourceFrame = source, UnfilteredSource = src.Img, ForceIntMvSource = unscaled, UnscaledLastSource = lastSrc?.Img, ForceIntpelInfo = _forceIntpelInfo, Tpl = _lagInFrames > 1 ? _tpl : null, R0 = _r0,
-            DeltaqObjective = cfg.Tune != AomTune.Iq && _enableTplModel,
+            DeltaqObjective = cfg.Tune != AomTune.Iq && _enableTplModel, LosslessRequested = _losslessRequested,
             BaseQindex = qindex, UpdateType = updateType, GfFrameType = frameType, LayerDepth = gf.LayerDepth[_gfFrameIndex],
             IsStatConsumptionStage = IsStatConsumptionStage, BoostIndex = Math.Min(15, _pRc.GfuBoost / 100),
             SbSize = _seq.SbSize, SeqFlags = _seqFlags, TxTypeProbs = _txTypeProbs, EnableRestoration = cfg.EnableRestoration,
@@ -1011,6 +1015,8 @@ internal sealed partial class AomGqEncoder
         input.InitialRdmult = _tdRdmult;
         if (IsOnePassRtParams) input.PersistentFeatures = _persistentFeatures;
         var (cpi, x) = AomEncoder.EncodeFrame(input);
+        qindex = cpi.Cm.BaseQindex;   // (the key-frame screen content trial encodes can raise a q of 0 to 1)
+        _deltaQPresentFlag = cpi.DeltaQPresentFlag;
         _tdRdmult = cpi.RdRdmult;
         if (IsOnePassRtParams && !isKey)
         {
@@ -1077,7 +1083,7 @@ internal sealed partial class AomGqEncoder
             AomTrace.Out.Write(sb.ToString() + (char)10);
         }
         byte[] data = AomBitstream.PackFrameGq(cpi, fh, out int largestTileId, out var largestTileFc, BitstreamTrace);
-        if (OnFrameEncoded != null) RcTraceLine = FormattableString.Invariant($"rc tgt {_rc.ThisFrameTarget} afb {_rc.AvgFrameBandwidth} buf {_pRc.BufferLevel} bot {_pRc.BitsOffTarget} opt {_rt.OptimalBufferLevel} max {_rt.MaximumBufferSize} wq {_rc.WorstQuality} bq {_rc.BestQuality} aq {_pRc.AvgFrameQindex[0]} {_pRc.AvgFrameQindex[1]} lq {_pRc.LastQ[0]} {_pRc.LastQ[1]} rc1 {_rt.Rc1Frame} q1 {_rt.Q1Frame} fss {_rc.FrameSourceSad} ass {_rt.AvgSourceSad} hss {(_rt.HighSourceSad ? 1 : 0)} fsk {_rc.FramesSinceKey} rcf {_rt.RateCorrectionFactors[0]:F6} {_rt.RateCorrectionFactors[1]:F6} {_rt.RateCorrectionFactors[2]:F6}");
+        if (OnFrameEncoded != null) RcTraceLine = FormattableString.Invariant($"rc tgt {_rc.ThisFrameTarget} afb {_rc.AvgFrameBandwidth} buf {_pRc.BufferLevel} bot {_pRc.BitsOffTarget} opt {_rt.OptimalBufferLevel} max {_rt.MaximumBufferSize} wq {_rc.WorstQuality} bq {_rc.BestQuality} aq {_pRc.AvgFrameQindex[0]} {_pRc.AvgFrameQindex[1]} lq {_pRc.LastQ[0]} {_pRc.LastQ[1]} rc1 {_rt.Rc1Frame} q1 {_rt.Q1Frame} fss {_rc.FrameSourceSad} ass {_rt.AvgSourceSad} hss {(_rt.HighSourceSad ? 1 : 0)} fsk {_rc.FramesSinceKey} rcf {_rt.RateCorrectionFactors[0]:F6} {_rt.RateCorrectionFactors[1]:F6} {_rt.RateCorrectionFactors[2]:F6} kfb {_pRc.KfBoost} kzm {_twopass.KfZeromotionPct} lbq {_pRc.LastBoostedQindex}");
         OnFrameEncoded?.Invoke(cpi, fh);
         if (cpi.Sf.mv_sf.auto_mv_step_size != 0) _maxMvMagnitude[0] = Math.Max(_maxMvMagnitude[0], cpi.MaxMvMagnitudeTd);
 

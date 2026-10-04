@@ -79,7 +79,7 @@ internal static partial class AomEncoder
     internal static (AomComp cpi, AomMacroblock x) EncodeFrame(AomEncodeInput input)
     {
         // handle_tuning (av1_cx_iface.c) for AOM_TUNE_IQ (AOM_TUNE_SSIM only adds the SSIM rdmult scaling)
-        var tune = input.BaseQindex != 0 ? input.Tune : AomTune.Psnr;
+        var tune = (input.LosslessRequested ?? input.BaseQindex == 0) ? AomTune.Psnr : input.Tune;
         bool tuneIq = tune == AomTune.Iq;
         string off = tuneIq ? input.IqOff ?? "" : "";
         bool deltaqVarianceBoost = tuneIq && !off.Contains('d');
@@ -187,7 +187,7 @@ internal static partial class AomEncoder
         };
         // avifenc --lossless / quality 100 (quantizer 0): libavif sets rc_min_quantizer = rc_max_quantizer = 0 and
         // AV1E_SET_LOSSLESS, so oxcf.rc_cfg.best_allowed_q = worst_allowed_q = 0 (is_lossless_requested)
-        if (input.BaseQindex == 0) { sfIn.BestAllowedQ = 0; sfIn.WorstAllowedQ = 0; }
+        if (input.LosslessRequested ?? input.BaseQindex == 0) { sfIn.BestAllowedQ = 0; sfIn.WorstAllowedQ = 0; }
         sfIn.UseHighBitDepth = bd > 8;
         var seqFlags = input.SeqFlags ?? new AomSpeedFeatureSeqFlags { enable_restoration = input.EnableRestoration ? 1 : 0 };
         if (input.SfChain != null) input.SfChain(cpi.Sf, cpi.WinnerModeParams);
@@ -292,8 +292,8 @@ internal static partial class AomEncoder
         // cpi->td.mb
         var x = NewThreadData(cpi, input);
         if (cpi.DeltaQPresentFlag && cpi.DeltaqObjective) cpi.DeltaQPresentFlag = AllowDeltaqMode(cpi, x);
+        AomTrace.Out?.Write($"dqp {(cpi.DeltaQPresentFlag ? 1 : 0)} res {cpi.DeltaQRes}" + (char)10);   // (libaom trace point: before the base_qindex test)
         cpi.DeltaQPresentFlag &= input.BaseQindex > 0;
-        AomTrace.Out?.Write($"dqp {(cpi.DeltaQPresentFlag ? 1 : 0)} res {cpi.DeltaQRes}" + (char)10);
         x.PaletteTokens = cpi.PaletteTokens;
 
         if (cpi.NumWorkers > 1)
