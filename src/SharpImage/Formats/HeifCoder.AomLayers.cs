@@ -35,7 +35,7 @@ public static partial class HeifCoder
     {
         // a libaom path not ported yet falls back to SharpImage's own layered encoder
         try { return TryEncodeLayersAomCore(image, options, layers, reapplyCodecOptions); }
-        catch (NotImplementedException) { return null; }
+        catch (Exception e) when (e is not OutOfMemoryException and not OperationCanceledException) { return null; }   // any gap: the older encoder still produces the file
     }
 
     private static byte[]? TryEncodeLayersAomCore(ImageFrame image, AvifEncodeOptions options, IReadOnlyList<AomLayerSpec> layers,

@@ -19,7 +19,7 @@ public static partial class HeifCoder
     {
         // a libaom path not ported yet falls back to SharpImage's own encoder (sq is only filled on success)
         try { return TryEncodeSequenceAomCore(options, coded, w, h, bd, mono, layout, color, hasAlpha, lossless, chromaPosition, sq); }
-        catch (NotImplementedException) { return false; }
+        catch (Exception e) when (e is not OutOfMemoryException and not OperationCanceledException) { return false; }   // any gap: the older encoder still produces the file
     }
 
     private static bool TryEncodeSequenceAomCore(AvifEncodeOptions options,
