@@ -49,6 +49,13 @@ internal sealed class AomMbmiExtFrameInter
     public short ModeContext;
     public readonly ushort[] CbOffset = new ushort[2];
 
+    /// <summary>The zero state of a new one.</summary>
+    public void Reset()
+    {
+        Array.Clear(RefMvStack); Array.Clear(Weight); Array.Clear(GlobalMvs); Array.Clear(CbOffset);
+        RefMvCount = 0; ModeContext = 0;
+    }
+
     /// <summary>av1_copy_mbmi_ext_to_mbmi_ext_frame.</summary>
     public void CopyFrom(AomMbmiExtInter e, int refFrameType)
     {

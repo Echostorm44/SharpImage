@@ -87,7 +87,7 @@ internal static partial class AomVarBasedPart
         if (cm.MiCols > miCol && cm.MiRows > miRow)
         {
             int idx = miRow * cm.MiStride + miCol;
-            var mi = cm.MiGridBase[idx] = cm.MiAlloc[idx];
+            var mi = cm.MiGridBase[idx] = cm.MiAlloc(idx);
             mi.Bsize = bsize;
         }
     }

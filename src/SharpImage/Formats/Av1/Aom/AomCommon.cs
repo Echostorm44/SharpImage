@@ -54,7 +54,11 @@ internal sealed partial class AomCommon
     public readonly int Width, Height;
     public readonly int MiRows, MiCols, MiStride;
     public readonly AomMbModeInfo?[] MiGridBase;
-    public readonly AomMbModeInfo[] MiAlloc;
+    /// <summary>mi_alloc: one MB_MODE_INFO per mi position, created on first use (enc_setup_mi zeroes it per frame; a
+    /// fresh object is that state), so only block origins cost an allocation.</summary>
+    private readonly AomMbModeInfo?[] miAlloc;
+    public readonly int MiAllocLength;
+    public AomMbModeInfo MiAlloc(int idx) => miAlloc[idx] ??= new AomMbModeInfo();
     public readonly byte[] TxTypeMap;
     public readonly AomFrameBuffer CurFrame;
     public readonly int SsX, SsY;
@@ -92,8 +96,8 @@ internal sealed partial class AomCommon
         MiStride = (MiCols + 31) & ~31;   // calc_mi_size: aligned to MAX_MIB_SIZE
         int alignedRows = (MiRows + 31) & ~31;
         MiGridBase = AomBufferPool.Rent<AomMbModeInfo?>(MiStride * alignedRows);
-        MiAlloc = new AomMbModeInfo[MiStride * alignedRows];
-        for (int i = 0; i < MiAlloc.Length; i++) MiAlloc[i] = new AomMbModeInfo();
+        MiAllocLength = MiStride * alignedRows;
+        miAlloc = AomBufferPool.Rent<AomMbModeInfo?>(MiAllocLength);
         TxTypeMap = AomBufferPool.Rent<byte>(MiStride * alignedRows);
         CurFrame = new AomFrameBuffer(width, height, ssX, ssY, monochrome, bitDepth);
         SetTileInfo(0, 0);
@@ -103,6 +107,7 @@ internal sealed partial class AomCommon
     public void Release()
     {
         AomBufferPool.Return(MiGridBase);
+        AomBufferPool.Return(miAlloc);
         AomBufferPool.Return(TxTypeMap);
         CurFrame.Release();
     }

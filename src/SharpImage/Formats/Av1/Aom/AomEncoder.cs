@@ -710,7 +710,7 @@ internal static partial class AomEncoder
         AomSmsTree.ResetPartition(smsRoot, cm.SbSize);
         AomIntraModeSearch.ProduceGradientsForSb(cpi, x, cm.SbSize, miRow, miCol);
         AomEncodeFrame.SetMaxMinPartitionSize(cpi, x, cm.SbSize, miRow, miCol);
-        var pcRoot = new AomPcTree(cm.SbSize);
+        var pcRoot = x.RentPcTree(cm.SbSize);
         long noneRd = 0;
         AomEncodeFrame.RdPickPartition(cpi, x, miRow, miCol, cm.SbSize, ref dummyRdc, dummyRdc, pcRoot, smsRoot, ref noneRd, false, null);
         // update the inter rd model (single tile only)
@@ -742,8 +742,8 @@ internal static partial class AomEncoder
     private static void SetFixedMi(AomCommon cm, int row, int col, int bsize)
     {
         int idx = row * cm.MiStride + col;
-        if (idx >= cm.MiGridBase.Length || idx >= cm.MiAlloc.Length) return;   // beyond the allocation: never read
-        var mi = cm.MiGridBase[idx] = cm.MiAlloc[idx];
+        if (idx >= cm.MiGridBase.Length || idx >= cm.MiAllocLength) return;   // beyond the allocation: never read
+        var mi = cm.MiGridBase[idx] = cm.MiAlloc(idx);
         mi.Bsize = bsize;
     }
 

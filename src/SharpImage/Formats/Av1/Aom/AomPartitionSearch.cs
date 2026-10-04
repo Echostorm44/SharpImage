@@ -42,6 +42,26 @@ internal sealed class AomPartitionSearchState
     public void DisableAllSplits() { DisableSquareSplitPartition(); DisableRectPartitions(); }
     public void SetSquareSplitOnly() { PartitionNoneAllowed = false; DoSquareSplit = true; DisableRectPartitions(); }
     public bool HasRowsAndCols => BlkParams.HasRows && BlkParams.HasCols;
+
+    /// <summary>The zero state of a new one (a recursion depth's state reused).</summary>
+    public void Reset()
+    {
+        BlkParams = default;
+        foreach (var a in SplitPartRectWin) Array.Clear(a);
+        ThisRdc = default; SumRdc = default;
+        Array.Clear(TmpPartitionCost);
+        PartitionCost = null!; PartitionCostOffset = 0;
+        NoneRd = 0;
+        Array.Clear(SplitRd);
+        foreach (var a in RectPartRd) Array.Clear(a);
+        Array.Clear(IsSplitCtxIsReady); Array.Clear(IsRectCtxIsReady);
+        TerminatePartitionSearch = false; PartitionNoneAllowed = false;
+        Array.Clear(PartitionRectAllowed);
+        DoRectangularSplit = false; DoSquareSplit = false;
+        Array.Clear(PruneRectPart);
+        SsX = 0; SsY = 0; PlCtxIdx = 0;
+        FoundBestPartition = false;
+    }
 }
 
 internal sealed partial class AomComp
@@ -370,7 +390,7 @@ internal static partial class AomEncodeFrame
         return true;
     }
 
-    private static AomPickModeContext AllocPmc(AomComp cpi, int bsize) => new(bsize, cpi.AllowScreenContentTools);
+    private static AomPickModeContext AllocPmc(AomComp cpi, AomMacroblock x, int bsize) => x.RentPmc(bsize, cpi.AllowScreenContentTools);
 
     /// <summary>rd_pick_rect_partition.</summary>
     private static void RdPickRectPartition(AomComp cpi, AomMacroblock x, AomPickModeContext curCtx, AomPartitionSearchState s,
@@ -416,7 +436,7 @@ internal static partial class AomEncodeFrame
             bp.Subsize = PartitionSubsize(bp.Bsize, partitionType);
             s.SumRdc.Init();
             var ctxArr = i == HORZ ? pcTree.Horizontal : pcTree.Vertical;
-            for (int j = 0; j < 2; j++) ctxArr[j] ??= AllocPmc(cpi, bp.Subsize);
+            for (int j = 0; j < 2; j++) ctxArr[j] ??= AllocPmc(cpi, x, bp.Subsize);
             s.SumRdc.Rate = s.Cost(partitionType);
             s.SumRdc.Rdcost = AomRd.RdCost(x.Rdmult, s.SumRdc.Rate, 0);
 
@@ -583,7 +603,7 @@ internal static partial class AomEncodeFrame
             var curCtxs = abPartType switch { HORZ_A => pcTree.HorizontalA, HORZ_B => pcTree.HorizontalB, VERT_A => pcTree.VerticalA, _ => pcTree.VerticalB };
             for (int i = 0; i < 3; i++)
             {
-                curCtxs[i] = AllocPmc(cpi, abSubsize[abPartType * 3 + i]);
+                curCtxs[i] = AllocPmc(cpi, x, abSubsize[abPartType * 3 + i]);
                 curCtxs[i]!.RdModeIsReady = 0;
             }
             if (cpi.Sf.part_sf.reuse_prev_rd_results_for_part_ab != 0 && isCtxReady[abPartType * 2] != 0)
@@ -630,7 +650,7 @@ internal static partial class AomEncodeFrame
         int subsize = PartitionSubsize(bp.Bsize, partitionType);
         s.SumRdc.Rate = s.Cost(partitionType);
         s.SumRdc.Rdcost = AomRd.RdCost(x.Rdmult, s.SumRdc.Rate, 0);
-        for (int i = 0; i < 4; ++i) curPartCtx[i] = AllocPmc(cpi, subsize);
+        for (int i = 0; i < 4; ++i) curPartCtx[i] = AllocPmc(cpi, x, subsize);
 
         for (int i = 0; i < 4; ++i)
         {
@@ -742,7 +762,7 @@ internal static partial class AomEncodeFrame
         AomRdStats bestRemainRdcost = default;
         bestRemainRdcost.Invalidate();
         // set_none_partition_params
-        pcTree.None ??= AllocPmc(cpi, bp.Bsize);
+        pcTree.None ??= AllocPmc(cpi, x, bp.Bsize);
         if (s.PartitionNoneAllowed)
         {
             if (bp.BsizeAtLeast8x8) ptCost = s.Cost(PARTITION_NONE) < int.MaxValue ? s.Cost(PARTITION_NONE) : 0;
@@ -812,7 +832,7 @@ internal static partial class AomEncodeFrame
 
         for (int i = 0; i < 4; ++i)
         {
-            pcTree.Split[i] ??= new AomPcTree(subsize);
+            pcTree.Split[i] ??= x.RentPcTree(subsize);
             pcTree.Split[i]!.Index = i;
         }
         sumRdc.Init();
@@ -898,8 +918,10 @@ internal static partial class AomEncodeFrame
         int numPlanes = cm.NumPlanes;
         var xd = x.E;
         var sf = cpi.Sf;
-        var xCtx = new AomSearchMbContext();
-        var s = new AomPartitionSearchState();
+        // x_ctx and part_search_state: rd_pick_partition's stack variables, one per recursion depth
+        int depth = x.PartDepth++;
+        var xCtx = x.SearchCtxAt(depth);
+        var s = x.PartStateAt(depth);
 
         InitPartitionSearchStateParams(x, cpi, s, miRow, miCol, bsize);
         if (sms != null) sms.Partitioning = PARTITION_NONE;   // set_sms_tree_partitioning
@@ -907,6 +929,7 @@ internal static partial class AomEncodeFrame
         if (bestRdc.Rdcost < 0)
         {
             rdCost.Invalidate();
+            x.PartDepth--;
             return s.FoundBestPartition;
         }
         if (bsize == cm.SbSize) x.MustFindValidPartition = false;
@@ -1044,15 +1067,16 @@ internal static partial class AomEncodeFrame
             {
                 x.CbOffset[0] = 0; x.CbOffset[1] = 0;   // set_cb_offsets
                 EncodeSb(cpi, x, miRow, miCol, OUTPUT_ENABLED, bsize, pcTree);
-                AomPcTree.FreeRecursive(pcTree, false, false);
+                AomPcTree.FreeRecursive(pcTree, false, false, x);
                 pcTreeDealloc = true;
             }
             else if (ShouldDoDryRunEncode(cm.SbSize, x.MaxPartitionSize, pcTree.Index, bsize))
                 EncodeSb(cpi, x, miRow, miCol, DRY_RUN_NORMAL, bsize, pcTree);
         }
-        if (!pcTreeDealloc) AomPcTree.FreeRecursive(pcTree, true, true);
+        if (!pcTreeDealloc) AomPcTree.FreeRecursive(pcTree, true, true, x);
 
         x.Rdmult = origRdmult;
+        x.PartDepth--;
         return s.FoundBestPartition;
     }
 }

@@ -134,9 +134,15 @@ internal sealed partial class AomPickModeContext
     public int RdModeIsReady;
     public readonly AomMbmiExtFrame MbmiExtBest = new();
 
+    /// <summary>The block size and palette allowance it was allocated for (its buffers' sizes).</summary>
+    public readonly int Bsize;
+    public readonly bool AllowScreenContentTools;
+
     /// <summary>av1_alloc_pmc (the coefficient buffers are the shared per-plane ones in the MACROBLOCK).</summary>
     public AomPickModeContext(int bsize, bool allowScreenContentTools)
     {
+        Bsize = bsize;
+        AllowScreenContentTools = allowScreenContentTools;
         int numPix = BlockSizeWide[bsize] * BlockSizeHigh[bsize];
         int numBlk = numPix / 16;
         TxTypeMap = new byte[numBlk];
@@ -145,6 +151,22 @@ internal sealed partial class AomPickModeContext
         if (numPix <= 64 * 64 && allowScreenContentTools)
             for (int i = 0; i < 2; i++) ColorIndexMap[i] = new byte[numPix];
         RdStats.Invalidate();
+    }
+
+    /// <summary>A reused context back to the state of a new one.</summary>
+    public void Reset()
+    {
+        Mic.CopyFrom(AomMbModeInfo.Zero);
+        foreach (var m in ColorIndexMap) if (m != null) Array.Clear(m);
+        Array.Clear(TxTypeMap);
+        NumFourByFourBlk = TxTypeMap.Length;
+        for (int i = 0; i < 3; i++) { Array.Clear(Eobs[i]); Array.Clear(TxbEntropyCtx[i]); }
+        Skippable = 0;
+        RdStats = default;
+        RdStats.Invalidate();
+        RdModeIsReady = 0;
+        MbmiExtBest.Reset();
+        MbmiExtBestInter.Reset();
     }
 
     /// <summary>av1_copy_tree_context.</summary>
@@ -177,32 +199,54 @@ internal sealed class AomPcTree
     /// <summary>av1_alloc_pc_tree_node.</summary>
     public AomPcTree(int bsize) { BlockSize = bsize; }
 
-    /// <summary>av1_free_pc_tree_recursive (search types other than VAR_BASED_PARTITION).</summary>
-    public static void FreeRecursive(AomPcTree? t, bool keepBest, bool keepNone)
+    /// <summary>A reused node back to the state of a new one.</summary>
+    public void Reset(int bsize)
+    {
+        Partitioning = PARTITION_NONE;
+        BlockSize = bsize;
+        None = null;
+        Array.Clear(Horizontal); Array.Clear(Vertical);
+        Array.Clear(HorizontalA); Array.Clear(HorizontalB); Array.Clear(VerticalA); Array.Clear(VerticalB);
+        Array.Clear(Horizontal4); Array.Clear(Vertical4);
+        Array.Clear(Split);
+        Index = 0;
+    }
+
+    /// <summary>av1_free_pc_tree_recursive (search types other than VAR_BASED_PARTITION): the freed contexts and nodes
+    /// go back to the thread's pools.</summary>
+    public static void FreeRecursive(AomPcTree? t, bool keepBest, bool keepNone, AomMacroblock pool)
     {
         if (t == null) return;
         int partition = t.Partitioning;
-        if (!keepNone && (!keepBest || partition != PARTITION_NONE)) t.None = null;
+        if (!keepNone && (!keepBest || partition != PARTITION_NONE)) Free(ref t.None, pool);
         for (int i = 0; i < 2; ++i)
         {
-            if (!keepBest || partition != PARTITION_HORZ) t.Horizontal[i] = null;
-            if (!keepBest || partition != PARTITION_VERT) t.Vertical[i] = null;
+            if (!keepBest || partition != PARTITION_HORZ) Free(ref t.Horizontal[i], pool);
+            if (!keepBest || partition != PARTITION_VERT) Free(ref t.Vertical[i], pool);
         }
         for (int i = 0; i < 3; ++i)
         {
-            if (!keepBest || partition != PARTITION_HORZ_A) t.HorizontalA[i] = null;
-            if (!keepBest || partition != PARTITION_HORZ_B) t.HorizontalB[i] = null;
-            if (!keepBest || partition != PARTITION_VERT_A) t.VerticalA[i] = null;
-            if (!keepBest || partition != PARTITION_VERT_B) t.VerticalB[i] = null;
+            if (!keepBest || partition != PARTITION_HORZ_A) Free(ref t.HorizontalA[i], pool);
+            if (!keepBest || partition != PARTITION_HORZ_B) Free(ref t.HorizontalB[i], pool);
+            if (!keepBest || partition != PARTITION_VERT_A) Free(ref t.VerticalA[i], pool);
+            if (!keepBest || partition != PARTITION_VERT_B) Free(ref t.VerticalB[i], pool);
         }
         for (int i = 0; i < 4; ++i)
         {
-            if (!keepBest || partition != PARTITION_HORZ_4) t.Horizontal4[i] = null;
-            if (!keepBest || partition != PARTITION_VERT_4) t.Vertical4[i] = null;
+            if (!keepBest || partition != PARTITION_HORZ_4) Free(ref t.Horizontal4[i], pool);
+            if (!keepBest || partition != PARTITION_VERT_4) Free(ref t.Vertical4[i], pool);
         }
         if (!keepBest || partition != PARTITION_SPLIT)
             for (int i = 0; i < 4; ++i)
-                if (t.Split[i] != null) { FreeRecursive(t.Split[i], false, false); t.Split[i] = null; }
+                if (t.Split[i] != null) { FreeRecursive(t.Split[i], false, false, pool); t.Split[i] = null; }
+        if (!keepBest && !keepNone) pool.ReturnPcTree(t);   // aom_free(pc_tree)
+    }
+
+    private static void Free(ref AomPickModeContext? c, AomMacroblock pool)
+    {
+        if (c == null) return;
+        pool.ReturnPmc(c);
+        c = null;
     }
 }
 

@@ -69,11 +69,11 @@ internal static partial class AomEncodeFrame
         int miWidth = MiSizeWide[bsize], miHeight = MiSizeHigh[bsize];
         // set_mode_info_offsets
         int gridIdx = miRow * cm.MiStride + miCol;
-        cm.MiGridBase[gridIdx] = cm.MiAlloc[gridIdx];
+        cm.MiGridBase[gridIdx] = cm.MiAlloc(gridIdx);
         xd.MiGrid = cm.MiGridBase;
         xd.MiStride = cm.MiStride;
         xd.MiOffset = gridIdx;
-        xd.Mi0 = cm.MiAlloc[gridIdx];
+        xd.Mi0 = cm.MiAlloc(gridIdx);
         xd.TxTypeMap = cm.TxTypeMap;
         xd.TxTypeMapOffset = gridIdx;
         xd.TxTypeMapStride = cm.MiStride;

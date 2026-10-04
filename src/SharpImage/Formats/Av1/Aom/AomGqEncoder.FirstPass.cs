@@ -442,11 +442,11 @@ internal sealed partial class AomGqEncoder
         var cm = cpi.Cm;
         var xd = x.E;
         int gridIdx = miRow * cm.MiStride + miCol;
-        cm.MiGridBase[gridIdx] = cm.MiAlloc[gridIdx];
+        cm.MiGridBase[gridIdx] = cm.MiAlloc(gridIdx);
         xd.MiGrid = cm.MiGridBase;
         xd.MiStride = cm.MiStride;
         xd.MiOffset = gridIdx;
-        xd.Mi0 = cm.MiAlloc[gridIdx];
+        xd.Mi0 = cm.MiAlloc(gridIdx);
         xd.TxTypeMap = cm.TxTypeMap;
         xd.TxTypeMapOffset = gridIdx;
         xd.TxTypeMapStride = cm.MiStride;
