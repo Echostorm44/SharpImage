@@ -27,7 +27,7 @@ public static partial class HeifCoder
         Av1PixelLayout layout, Av1ObuWriter.Av1ColorDesc color, bool hasAlpha, bool lossless, int chromaPosition, AvifSequenceData sq)
     {
         int speed = Math.Clamp(options.Speed, 0, 9);
-        if (lossless || speed >= 7 || coded.Count == 0 || coded.Exists(c => c.Grain != null)) return false;
+        if (lossless || coded.Count == 0 || coded.Exists(c => c.Grain != null)) return false;
 
         var (tileCols, tileRows) = ResolveTiling(options, w, h);
         int threads = options.MaxThreads == 0 ? Environment.ProcessorCount : options.MaxThreads;
