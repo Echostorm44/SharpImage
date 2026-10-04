@@ -77,7 +77,31 @@ internal static unsafe class AomIntraPred
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Fill(byte* dst, nint stride, int bw, int bh, byte v)
     {
-        for (int r = 0; r < bh; r++, dst += stride) Unsafe.InitBlockUnaligned(dst, v, (uint)bw);
+        // one broadcast row stored per row (no memset call per row)
+        switch (bw)
+        {
+            case 4: { uint w = v * 0x01010101u; for (int r = 0; r < bh; r++, dst += stride) *(uint*)dst = w; break; }
+            case 8: { ulong w = v * 0x0101010101010101ul; for (int r = 0; r < bh; r++, dst += stride) *(ulong*)dst = w; break; }
+            case 16: { var w = Vector128.Create(v); for (int r = 0; r < bh; r++, dst += stride) w.Store(dst); break; }
+            default:
+            {
+                var w = Vector256.Create(v);
+                for (int r = 0; r < bh; r++, dst += stride)
+                    for (int c = 0; c < bw; c += 32) w.Store(dst + c);
+                break;
+            }
+        }
+    }
+
+    /// <summary>The sum of n (4, 8, 16, 32 or 64) bytes (psadbw against zero, as libaom's dc kernels).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int SumBytes(byte* p, int n)
+    {
+        if (n == 4) return p[0] + p[1] + p[2] + p[3];
+        if (n == 8) return (int)Sse2.SumAbsoluteDifferences(Vector128.CreateScalar(*(ulong*)p).AsByte(), Vector128<byte>.Zero).ToScalar();
+        var acc = Vector128<ushort>.Zero;
+        for (int i = 0; i < n; i += 16) acc += Sse2.SumAbsoluteDifferences(Vector128.Load(p + i), Vector128<byte>.Zero);
+        return acc.GetElement(0) + acc.GetElement(4);
     }
 
     public static void VPredictor(byte* dst, nint stride, int bw, int bh, byte* above) => ReplicateRow(above, dst, stride, bw, bh);
@@ -107,7 +131,19 @@ internal static unsafe class AomIntraPred
 
     public static void HPredictor(byte* dst, nint stride, int bw, int bh, byte* left)
     {
-        for (int r = 0; r < bh; r++, dst += stride) Unsafe.InitBlockUnaligned(dst, left[r], (uint)bw);
+        switch (bw)
+        {
+            case 4: for (int r = 0; r < bh; r++, dst += stride) *(uint*)dst = left[r] * 0x01010101u; break;
+            case 8: for (int r = 0; r < bh; r++, dst += stride) *(ulong*)dst = left[r] * 0x0101010101010101ul; break;
+            case 16: for (int r = 0; r < bh; r++, dst += stride) Vector128.Create(left[r]).Store(dst); break;
+            default:
+                for (int r = 0; r < bh; r++, dst += stride)
+                {
+                    var w = Vector256.Create(left[r]);
+                    for (int c = 0; c < bw; c += 32) w.Store(dst + c);
+                }
+                break;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -126,6 +162,25 @@ internal static unsafe class AomIntraPred
     public static void PaethPredictor(byte* dst, nint stride, int bw, int bh, byte* above, byte* left)
     {
         int ytopLeft = above[-1];
+        if (Avx2.IsSupported && bw >= 16)
+        {
+            var tl = Vector256.Create((short)ytopLeft);
+            for (int r = 0; r < bh; r++, dst += stride)
+            {
+                var l = Vector256.Create((short)left[r]);
+                var pTop = Vector256.Abs(l - tl);
+                for (int c = 0; c < bw; c += 16)
+                {
+                    var top = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(above + c));
+                    var pLeft = Vector256.Abs(top - tl);
+                    var pTopLeft = Vector256.Abs(top + l - tl - tl);
+                    var useLeft = Vector256.LessThanOrEqual(pLeft, pTop) & Vector256.LessThanOrEqual(pLeft, pTopLeft);
+                    var v = Vector256.ConditionalSelect(useLeft, l, Vector256.ConditionalSelect(Vector256.LessThanOrEqual(pTop, pTopLeft), top, tl));
+                    Sse2.Store(dst + c, Sse2.PackUnsignedSaturate(v.GetLower(), v.GetUpper()));
+                }
+            }
+            return;
+        }
         if (Avx2.IsSupported && bw >= 8)
         {
             // per lane: base = top + left - topleft; |base - left| = |top - topleft|, |base - top| = |left - topleft|
@@ -239,6 +294,22 @@ internal static unsafe class AomIntraPred
         ReadOnlySpan<byte> smWeights = SmoothWeights.Slice(bh - 4, bh);
         const int log2Scale = SMOOTH_WEIGHT_LOG2_SCALE;
         const int scale = 1 << SMOOTH_WEIGHT_LOG2_SCALE;
+        if (Avx2.IsSupported && bw >= 16)
+        {
+            // 16 lanes of uint16: w * above + (256 - w) * below + 128 is at most 65408
+            for (int r = 0; r < bh; r++, dst += stride)
+            {
+                int w = smWeights[r];
+                var wV = Vector256.Create((ushort)w);
+                var b = Vector256.Create((ushort)((scale - w) * belowPred + (1 << (log2Scale - 1))));
+                for (int c = 0; c < bw; c += 16)
+                {
+                    var v = Vector256.ShiftRightLogical(wV * Avx2.ConvertToVector256Int16(Sse2.LoadVector128(above + c)).AsUInt16() + b, log2Scale).AsInt16();
+                    Sse2.Store(dst + c, Sse2.PackUnsignedSaturate(v.GetLower(), v.GetUpper()));
+                }
+            }
+            return;
+        }
         if (Avx2.IsSupported && bw >= 8)
         {
             var rnd = Vector256.Create(1 << (log2Scale - 1));
@@ -282,6 +353,30 @@ internal static unsafe class AomIntraPred
         ReadOnlySpan<byte> smWeights = SmoothWeights.Slice(bw - 4, bw);
         const int log2Scale = SMOOTH_WEIGHT_LOG2_SCALE;
         const int scale = 1 << SMOOTH_WEIGHT_LOG2_SCALE;
+        if (Avx2.IsSupported && bw >= 16)
+        {
+            // 16 lanes of uint16: ww * left + (256 - ww) * right + 128 is at most 65408
+            fixed (byte* ws = SmoothWeights)
+            {
+                byte* wW = ws + bw - 4;
+                var rnd = Vector256.Create((ushort)(1 << (log2Scale - 1)));
+                var rightV = Vector256.Create((ushort)rightPred);
+                var sc = Vector256.Create((ushort)scale);
+                for (int c = 0; c < bw; c += 16)
+                {
+                    // the column weights and the right-edge term once per 16 columns
+                    var ww = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(wW + c)).AsUInt16();
+                    var rt = (sc - ww) * rightV + rnd;
+                    byte* d = dst + c;
+                    for (int r = 0; r < bh; r++, d += stride)
+                    {
+                        var v = Vector256.ShiftRightLogical(ww * Vector256.Create((ushort)left[r]) + rt, log2Scale).AsInt16();
+                        Sse2.Store(d, Sse2.PackUnsignedSaturate(v.GetLower(), v.GetUpper()));
+                    }
+                }
+            }
+            return;
+        }
         if (Avx2.IsSupported && bw >= 8)
         {
             fixed (byte* ws = SmoothWeights)
@@ -341,16 +436,14 @@ internal static unsafe class AomIntraPred
 
     public static void DcLeftPredictor(byte* dst, nint stride, int bw, int bh, byte* left)
     {
-        int sum = 0;
-        for (int i = 0; i < bh; i++) sum += left[i];
+        int sum = SumBytes(left, bh);
         int expectedDc = (sum + (bh >> 1)) / bh;
         Fill(dst, stride, bw, bh, (byte)expectedDc);
     }
 
     public static void DcTopPredictor(byte* dst, nint stride, int bw, int bh, byte* above)
     {
-        int sum = 0;
-        for (int i = 0; i < bw; i++) sum += above[i];
+        int sum = SumBytes(above, bw);
         int expectedDc = (sum + (bw >> 1)) / bw;
         Fill(dst, stride, bw, bh, (byte)expectedDc);
     }
@@ -371,9 +464,8 @@ internal static unsafe class AomIntraPred
 
     public static void DcPredictor(byte* dst, nint stride, int bw, int bh, byte* above, byte* left)
     {
-        int sum = 0, count = bw + bh;
-        for (int i = 0; i < bw; i++) sum += above[i];
-        for (int i = 0; i < bh; i++) sum += left[i];
+        int count = bw + bh;
+        int sum = SumBytes(above, bw) + SumBytes(left, bh);
         int expectedDc = (sum + (count >> 1)) / count;
         Fill(dst, stride, bw, bh, (byte)expectedDc);
     }
@@ -390,9 +482,7 @@ internal static unsafe class AomIntraPred
     public static void DcPredictorRect(byte* dst, nint stride, int bw, int bh, byte* above, byte* left, int shift1,
         int multiplier)
     {
-        int sum = 0;
-        for (int i = 0; i < bw; i++) sum += above[i];
-        for (int i = 0; i < bh; i++) sum += left[i];
+        int sum = SumBytes(above, bw) + SumBytes(left, bh);
         int expectedDc = DivideUsingMultiplyShift(sum + ((bw + bh) >> 1), shift1, multiplier, DC_SHIFT2);
         Fill(dst, stride, bw, bh, (byte)expectedDc);
     }

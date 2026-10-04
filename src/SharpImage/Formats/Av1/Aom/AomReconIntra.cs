@@ -343,6 +343,46 @@ internal static unsafe partial class AomReconIntra
     /// <summary>av1_filter_intra_predictor_c.</summary>
     public static void FilterIntraPredictor(byte* dst, nint stride, int txSize, byte* above, byte* left, int mode)
     {
+        if (System.Runtime.Intrinsics.X86.Ssse3.IsSupported)
+        {
+            // filter_4x2_sse4_1, predicting straight into dst: the 7 neighbours (and a zero-tap 8th) duplicated into
+            // both halves, maddubs against the taps of two outputs at a time, two hadds, round (arithmetic, as
+            // xx_roundn_epi16_unsigned) and packus
+            int w = TxSizeWide[txSize], h = TxSizeHigh[txSize];
+            fixed (sbyte* tp = FilterIntraTaps)
+            {
+                sbyte* t = tp + mode * 64;
+                var t01 = Vector128.Load(t); var t23 = Vector128.Load(t + 16);
+                var t45 = Vector128.Load(t + 32); var t67 = Vector128.Load(t + 48);
+                var rnd = Vector128.Create((short)8);
+                for (int r = 0; r < h; r += 2)
+                {
+                    byte* top = r == 0 ? above : dst + (r - 1) * stride;
+                    byte* row1 = dst + r * stride;
+                    byte* row2 = row1 + stride;
+                    ulong tl = r == 0 ? above[-1] : left[r - 1];
+                    ulong l1 = left[r], l2 = left[r + 1];
+                    for (int c = 0; c < w; c += 4)
+                    {
+                        ulong px = tl | (ulong)*(uint*)(top + c) << 8 | l1 << 40 | l2 << 48;
+                        var pv = Vector128.Create(px).AsByte();
+                        var o = System.Runtime.Intrinsics.X86.Ssse3.HorizontalAdd(
+                            System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(pv, t01), System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(pv, t23));
+                        var o1 = System.Runtime.Intrinsics.X86.Ssse3.HorizontalAdd(
+                            System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(pv, t45), System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(pv, t67));
+                        // lanes 0..3 = row 0, lanes 4..7 = row 1
+                        var sum = Vector128.ShiftRightArithmetic(System.Runtime.Intrinsics.X86.Ssse3.HorizontalAdd(o, o1) + rnd, FILTER_INTRA_SCALE_BITS);
+                        var b8 = System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(sum, sum).AsUInt32();
+                        uint lo = b8.ToScalar(), hi = b8.GetElement(1);
+                        *(uint*)(row1 + c) = lo;
+                        *(uint*)(row2 + c) = hi;
+                        tl = top[c + 3]; l1 = lo >> 24; l2 = hi >> 24;
+                    }
+                }
+            }
+            return;
+        }
+
         const int B = 33;
         Unsafe.SkipInit(out StackArr1089<byte> bufferBuf); byte* buffer = (byte*)Unsafe.AsPointer(ref bufferBuf[0]);
         int bw = TxSizeWide[txSize];
@@ -352,29 +392,6 @@ internal static unsafe partial class AomReconIntra
         Buffer.MemoryCopy(above - 1, buffer, bw + 1, bw + 1);
 
         ReadOnlySpan<sbyte> taps = FilterIntraTaps.Slice(mode * 64, 64);
-        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
-        {
-            // the 8 outputs of a 4x2 cell in 8 int lanes: sum over the 7 neighbours p_j of p_j * taps[k][j]
-            Unsafe.SkipInit(out StackArr7<Vector256<int>> tcBuf); Span<Vector256<int>> tc = tcBuf;
-            for (int j = 0; j < 7; j++)
-                tc[j] = Vector256.Create(taps[j], taps[8 + j], taps[16 + j], taps[24 + j], taps[32 + j], taps[40 + j], taps[48 + j], taps[56 + j]);
-            var rnd = Vector256.Create(1 << (FILTER_INTRA_SCALE_BITS - 1));
-            for (int r = 1; r < bh + 1; r += 2)
-                for (int c = 1; c < bw + 1; c += 4)
-                {
-                    byte* row0 = buffer + (r - 1) * B;
-                    var pr = Vector256.Create((int)row0[c - 1]) * tc[0] + Vector256.Create((int)row0[c]) * tc[1]
-                        + Vector256.Create((int)row0[c + 1]) * tc[2] + Vector256.Create((int)row0[c + 2]) * tc[3]
-                        + Vector256.Create((int)row0[c + 3]) * tc[4] + Vector256.Create((int)buffer[r * B + c - 1]) * tc[5]
-                        + Vector256.Create((int)buffer[(r + 1) * B + c - 1]) * tc[6];
-                    var v = Vector256.ShiftRightArithmetic(pr + rnd, FILTER_INTRA_SCALE_BITS);
-                    var w = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(v.GetLower(), v.GetUpper());
-                    var b8 = System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(w, w).AsUInt32();
-                    *(uint*)(buffer + r * B + c) = b8.GetElement(0);
-                    *(uint*)(buffer + (r + 1) * B + c) = b8.GetElement(1);
-                }
-        }
-        else
         for (int r = 1; r < bh + 1; r += 2)
             for (int c = 1; c < bw + 1; c += 4)
             {
@@ -555,6 +572,34 @@ internal static unsafe partial class AomReconIntra
         // Extend first/last samples (upper-left p[-1], last p[sz-1]) to support 4-tap filter
         p[-2] = p[-1];
         p[sz] = p[sz - 1];
+        if (System.Runtime.Intrinsics.X86.Ssse3.IsSupported)
+        {
+            // av1_upsample_intra_edge_sse4_1
+            var coef = Vector128.Create((sbyte)-1, 9, 9, -1, -1, 9, 9, -1, -1, 9, 9, -1, -1, 9, 9, -1);
+            var shuf0 = Vector128.Create((byte)0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6);
+            var shuf1 = Vector128.Create((byte)4, 5, 6, 7, 5, 6, 7, 8, 6, 7, 8, 9, 7, 8, 9, 10);
+            var eight = Vector128.Create((short)8);
+            byte* io = p - 2;
+            var in0 = Vector128.Load(io);
+            var in16 = Vector128.Load(io + 16);
+            for (int n = sz + 1; n > 0; n -= 16, io += 32)
+            {
+                var in8 = System.Runtime.Intrinsics.X86.Ssse3.AlignRight(in16, in0, 8);
+                var d0 = System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(System.Runtime.Intrinsics.X86.Ssse3.Shuffle(in0, shuf0), coef);
+                var d1 = System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(System.Runtime.Intrinsics.X86.Ssse3.Shuffle(in0, shuf1), coef);
+                var d2 = System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(System.Runtime.Intrinsics.X86.Ssse3.Shuffle(in8, shuf0), coef);
+                var d3 = System.Runtime.Intrinsics.X86.Ssse3.MultiplyAddAdjacent(System.Runtime.Intrinsics.X86.Ssse3.Shuffle(in8, shuf1), coef);
+                var e0 = Vector128.ShiftRightArithmetic(System.Runtime.Intrinsics.X86.Ssse3.HorizontalAdd(d0, d1) + eight, 4);
+                var e2 = Vector128.ShiftRightArithmetic(System.Runtime.Intrinsics.X86.Ssse3.HorizontalAdd(d2, d3) + eight, 4);
+                var o = System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(e0, e2);
+                var in1 = System.Runtime.Intrinsics.X86.Ssse3.AlignRight(in16, in0, 1);
+                System.Runtime.Intrinsics.X86.Sse2.UnpackLow(in1, o).Store(io);
+                System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(in1, o).Store(io + 16);
+                in0 = in16;
+                in16 = Vector128<byte>.Zero;
+            }
+            return;
+        }
         Unsafe.SkipInit(out StackArr48<byte> inpBuf); byte* inp = (byte*)Unsafe.AsPointer(ref inpBuf[0]);
         Buffer.MemoryCopy(p - 2, inp, 32, 32);
         Unsafe.InitBlockUnaligned(inp + 32, 0, 16);
