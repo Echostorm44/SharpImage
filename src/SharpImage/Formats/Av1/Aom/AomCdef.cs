@@ -343,7 +343,7 @@ internal static partial class AomCdef
     {
         var cm = cpi.Cm;
         var ci = new AomCdefInfo();
-        bool applyAdaptiveCdef = cpi.CdefControl == 3;   // CDEF_ADAPTIVE (AOM_Q)
+        bool applyAdaptiveCdef = cpi.CdefControl == 3 && cpi.Mode != REALTIME;   // CDEF_ADAPTIVE with AOM_Q (not CBR)
         int cqLevel = cm.BaseQindex;                      // rc_cfg.cq_level (the qindex of AOME_SET_CQ_LEVEL)
         if (applyAdaptiveCdef && cqLevel <= 32)
         {

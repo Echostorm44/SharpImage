@@ -476,6 +476,7 @@ internal static partial class AomNonrdPickMode
             thisRdc.Rate += intraCostPenalty;
             thisRdc.Rate += modeCost;
             thisRdc.Rdcost = AomRd.RdCost(x.Rdmult, thisRdc.Rate, thisRdc.Dist);
+            AomTrace.Out?.Write($"eim {xd.MiRow} {xd.MiCol} bs {bsize} m {thisMode} rate {thisRdc.Rate} dist {thisRdc.Dist} refc {refCostIntra} pen {intraCostPenalty} mc {modeCost}" + (char)10);
             if (thisRdc.Rdcost < bestRdc.Rdcost)
             {
                 bestRdc = thisRdc;

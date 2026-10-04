@@ -261,7 +261,7 @@ internal sealed partial class AomGqEncoder
     private void RcSetFrameTarget(int target, int width, int height)
     {
         _rc.ThisFrameTarget = target;
-        if ((width != _cfg.Width || height != _cfg.Height) && true)
+        if ((width != _cfg.Width || height != _cfg.Height) && _cfg.Usage != REALTIME)   // (not for AOM_CBR)
             _rc.ThisFrameTarget = SaturateToInt(_rc.ThisFrameTarget * ((double)(_cfg.Width * _cfg.Height) / (width * height)));
         long sb64 = ((long)_rc.ThisFrameTarget << 12) / (width * height);
         _rc.Sb64TargetRate = (int)Math.Min(sb64, int.MaxValue);

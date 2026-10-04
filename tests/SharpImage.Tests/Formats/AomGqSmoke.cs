@@ -48,7 +48,7 @@ public sealed class AomGqSmoke
         string outp = Environment.GetEnvironmentVariable("GQ_OUT")!;
         using var dump = new StreamWriter(outp + ".txt");
         int frameNo = 0;
-        enc.OnFrameEncoded = (cpi, fh) => Dump(dump, frameNo++, cpi, fh);
+        enc.OnFrameEncoded = (cpi, fh) => Dump(dump, frameNo++, cpi, fh, enc.RcTraceLine);
         var all = File.ReadAllBytes(yuvPath);
         int bps = bd > 8 ? 2 : 1;
         int frameBytes = (w * h + (mono ? 0 : 2 * cw * ch)) * bps;
@@ -91,11 +91,12 @@ public sealed class AomGqSmoke
         await Assert.That(frameNo).IsGreaterThan(0);
     }
 
-    private static void Dump(StreamWriter f, int frameNo, AomComp cpi, AomGqFrameHeader fh)
+    private static void Dump(StreamWriter f, int frameNo, AomComp cpi, AomGqFrameHeader fh, string? rcLine)
     {
         var cm = cpi.Cm;
         f.WriteLine($"frame {frameNo} type {fh.FrameType} show {(fh.ShowFrame ? 1 : 0)} w {cm.Width} h {cm.Height} order {fh.OrderHint} qindex {cm.BaseQindex} refresh {fh.RefreshFrameFlags:x2} primary {fh.PrimaryRefFrame} refsel {(fh.ReferenceSelect ? 1 : 0)} skipmode {(fh.SkipModeFlag ? 1 : 0)} interp {cm.InterpFilter} warp {(fh.AllowWarpedMotion ? 1 : 0)} hp {(cm.AllowHighPrecisionMv ? 1 : 0)} swf {(cm.SwitchableMotionMode ? 1 : 0)} split {cpi.TxbSplitCount}");
         f.WriteLine($"gf rdmult {cpi.RdRdmult} sb {cm.SbSize}");
+        if (rcLine != null) f.WriteLine(rcLine);
         {
             var src = cpi.Source;
             ulong hh = 1469598103934665603UL;

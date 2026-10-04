@@ -50,6 +50,7 @@ internal sealed partial class AomGqEncoder
         _rc.WorstQuality = QuantizerToQindex[maxQ];
         if (_rt.Initialized) return;
         _rt.Initialized = true;
+        _rc.FrameSourceSad = 0;   // the zeroed RATE_CONTROL (only the two-pass gf-group setup sets UINT64_MAX)
         long bandwidth = (long)_targetBandwidth;
         _pRc.StartingBufferLevel = BufInitialMs * bandwidth / 1000;
         _rt.OptimalBufferLevel = BufOptimalMs * bandwidth / 1000;
@@ -96,6 +97,7 @@ internal sealed partial class AomGqEncoder
             else _rt.SrcSadBlk64 = null;
         }
         // rc_spatial_act_onepass_rt needs max_intra_bitrate_pct > 0 (0 by default); no dynamic resize
+        if (IsFrameResizePending) ResizeResetRc(_resizePendingW, _resizePendingH, _cmWidth, _cmHeight);
         int gfUpdate = SetGfIntervalUpdateOnepassRt(frameType);
         _rtGfUpdate = gfUpdate != 0;
         int target = frameType == KEY_FRAME || frameType == INTRA_ONLY_FRAME ? CalcIframeTargetSizeOnePassCbr()
@@ -124,7 +126,7 @@ internal sealed partial class AomGqEncoder
     private AomSpeedFeatureInputs RtSfInputs(int frameType, int width, int height) => new()
     {
         Width = width, Height = height, UseHighBitDepth = _cfg.BitDepth > 8, Mode = REALTIME, FrameType = frameType,
-        BaseQindex = 0, RcMode = AOM_CBR, KeyFreqMax = _kfKeyFreqMax, LagInFrames = _lagInFrames, NumSpatialLayers = _cfg.NumSpatialLayers,
+        BaseQindex = 0, RcMode = AOM_CBR, KeyFreqMax = _kfKeyFreqMax, LagInFrames = _lagInFrames, NumSpatialLayers = 1 /* cpi->svc.number_spatial_layers */,
         Tuning = _cfg.Tune switch { AomTune.Iq => AOM_TUNE_IQ, AomTune.Ssim => AOM_TUNE_SSIM, _ => AOM_TUNE_PSNR },
     };
 
@@ -139,7 +141,7 @@ internal sealed partial class AomGqEncoder
     /// <summary>set_gf_interval_update_onepass_rt.</summary>
     private int SetGfIntervalUpdateOnepassRt(int frameType)
     {
-        if (_rt.HighSourceSad || _rc.FramesTillGfUpdateDue == 0)
+        if (IsFrameResizePending || _rt.HighSourceSad || _rc.FramesTillGfUpdateDue == 0)
         {
             SetBaselineGfInterval(frameType);
             return 1;
@@ -274,6 +276,9 @@ internal sealed partial class AomGqEncoder
     /// <summary>av1_rc_scene_detection_onepass_rt (no active map, content default, one spatial layer).</summary>
     private void RcSceneDetectionOnepassRt(AomFrameBuffer? src, AomFrameBuffer? last)
     {
+        // width/height (cm) != render size (the configured size): src_sad_blk_64x64 freed and not reallocated
+        bool renderSize = _cmWidth == _cfg.Width && _cmHeight == _cfg.Height;
+        if (!renderSize) _rt.SrcSadBlk64 = null;
         if (src == null || last == null) { _rt.SrcSadBlk64 = null; return; }
         if (src.CropWidths[0] != last.CropWidths[0] || src.CropHeights[0] != last.CropHeights[0]) { _rt.SrcSadBlk64 = null; return; }
         _rt.HighSourceSad = false;
@@ -292,7 +297,7 @@ internal sealed partial class AomGqEncoder
         int sbCols = (numMiCols + sbSizeByMb - 1) / sbSizeByMb;
         int sbRows = (numMiRows + sbSizeByMb - 1) / sbSizeByMb;
         const int border = 0;   // no dropped previous frame, one temporal layer
-        if (_rt.SrcSadBlk64 == null || _rt.SrcSadBlk64.Length != sbCols * sbRows) _rt.SrcSadBlk64 = new ulong[sbCols * sbRows];
+        if (renderSize && (_rt.SrcSadBlk64 == null || _rt.SrcSadBlk64.Length != sbCols * sbRows)) _rt.SrcSadBlk64 = new ulong[sbCols * sbRows];
         int sStride = src.Strides[0], lStride = last.Strides[0];
         for (int r = 0; r < sbRows - border; ++r)
             for (int c = 0; c < sbCols; ++c)
@@ -300,7 +305,7 @@ internal sealed partial class AomGqEncoder
                 int so = src.Offsets[0] + (r * 64) * sStride + c * 64, lo = last.Offsets[0] + (r * 64) * lStride + c * 64;
                 ulong tmpSad = src.Hbd ? AomHbd.Sad(src.Buffers16[0], so, sStride, last.Buffers16[0], lo, lStride, 64, 64) >> (_cfg.BitDepth - 8)
                     : AomSad.Sad(src.Buffers[0], so, sStride, last.Buffers[0], lo, lStride, 64, 64);
-                _rt.SrcSadBlk64[c + r * sbCols] = tmpSad;
+                if (_rt.SrcSadBlk64 != null) _rt.SrcSadBlk64[c + r * sbCols] = tmpSad;
                 avgSad += tmpSad;
                 numSamples++;
                 if (tmpSad == 0) numZeroTempSad++;
@@ -712,7 +717,7 @@ internal sealed partial class AomGqEncoder
     /// <summary>av1_adjust_gf_refresh_qp_one_pass_rt (no resize).</summary>
     private void AdjustGfRefreshQpOnePassRt(AomComp cpi, FrameParams fp)
     {
-        if (_rt.HighSourceSad) return;
+        if (IsFrameResizePending || _rt.HighSourceSad) return;
         int avgQp = _pRc.AvgFrameQindex[INTER_FRAME];
         bool allowGfUpdate = _rc.FramesTillGfUpdateDue <= _pRc.BaselineGfInterval - 10;
         bool changed = false;
@@ -763,4 +768,30 @@ internal sealed partial class AomGqEncoder
         }
         return q;
     }
+
+    /// <summary>is_frame_resize_pending.</summary>
+    private bool IsFrameResizePending => _resizePendingW != 0 && _resizePendingH != 0 && (_cmWidth != _resizePendingW || _cmHeight != _resizePendingH);
+
+    /// <summary>resize_reset_rc (one layer): the buffer and rate model reset for a resized frame (cm still holds the
+    /// previous frame's type and size).</summary>
+    private void ResizeResetRc(int resizeWidth, int resizeHeight, int prevWidth, int prevHeight)
+    {
+        double totScaleChange = (double)(resizeWidth * resizeHeight) / (prevWidth * prevHeight);
+        _pRc.BufferLevel = _rt.OptimalBufferLevel;
+        _pRc.BitsOffTarget = _rt.OptimalBufferLevel;
+        _rc.ThisFrameTarget = CalcPframeTargetSizeOnePassCbr(INTER_FRAME);
+        int targetBitsPerFrame = _rc.ThisFrameTarget;
+        if (totScaleChange > 4.0) _pRc.AvgFrameQindex[INTER_FRAME] = _rc.WorstQuality;
+        else if (totScaleChange > 1.0) _pRc.AvgFrameQindex[INTER_FRAME] = (_pRc.AvgFrameQindex[INTER_FRAME] + _rc.WorstQuality) >> 1;
+        int activeWorstQuality = CalcActiveWorstQualityNoStatsCbr();
+        int qindex = RtRegulateQ(targetBitsPerFrame, _rc.BestQuality, activeWorstQuality, resizeWidth, resizeHeight, _rtPrevFrameForResize);
+        if (totScaleChange < 1.0 && qindex > 90 * _rc.WorstQuality / 100) _rt.RateCorrectionFactors[INTER_NORMAL] *= 0.85;
+        if (totScaleChange >= 1.0)
+        {
+            if (totScaleChange < 4.0 && qindex > 130 * _pRc.LastQ[INTER_FRAME] / 100) _rt.RateCorrectionFactors[INTER_NORMAL] *= 0.8;
+            if (qindex <= 120 * _pRc.LastQ[INTER_FRAME] / 100) _rt.RateCorrectionFactors[INTER_NORMAL] *= 1.5;
+        }
+    }
+
+    private AomRefBuffer? _rtPrevFrameForResize;
 }

@@ -20,6 +20,7 @@ internal sealed partial class AomGqEncoder
 
     /// <summary>A trace sink for frame-level decisions (test hook).</summary>
     public Action<AomComp, AomGqFrameHeader>? OnFrameEncoded;
+    public string? RcTraceLine;
     /// <summary>Test hook: the symbol trace of the bitstream writer (AomWriter.Trace format).</summary>
     public System.IO.TextWriter? BitstreamTrace;
 
@@ -972,7 +973,7 @@ internal sealed partial class AomGqEncoder
             Seq = _seq, ShowFrame = fp.ShowFrame, OrderHint = orderHint, DisplayOrderHint = displayOrderHint,
             FrameNumber = _frameNumber, RefBufs = refBufs, RefFrameFlags = fp.RefFrameFlags, UseRefFrameMvs = _extUseRefFrameMvs,
             PrimaryRefBuf = primaryRefBuf, FrameProbs = _frameProbs, FilterScaler = filterScaler, PhaseScaler = phaseScaler,
-            LagInFrames = _lagInFrames, NumSpatialLayers = cfg.NumSpatialLayers, KeyFreqMax = _kfKeyFreqMax, RefreshGolden = fp.RefreshGolden,
+            LagInFrames = _lagInFrames, NumSpatialLayers = 1 /* cpi->svc.number_spatial_layers: no SVC params */, KeyFreqMax = _kfKeyFreqMax, RefreshGolden = fp.RefreshGolden,
             PpiFilterLevel = _ppiFilterLevel, ResizeNeeded = _resizeModeFixed, IsSrcFrameAltRef = _rc.IsSrcFrameAltRef != 0,
             GfFrameIndex = _gfFrameIndex, GfArfIndex = gf.ArfIndex, CurPyramidLevel = pyramidLevel, ValidGmModelFound = _validGmModelFound,
             MvSearchState = _maxMvMagnitude, SetMvParamsEarly = _mvSearchParamsDue, PrevBaseQindex = _prevBaseQindex, MvStats = _mvStats,
@@ -998,7 +999,7 @@ internal sealed partial class AomGqEncoder
             var csf = new AomSpeedFeatureInputs
             {
                 Width = cfg.Width, Height = cfg.Height, UseHighBitDepth = cfg.BitDepth > 8, Mode = cfg.Usage, FrameType = KEY_FRAME, BaseQindex = 0,
-                LagInFrames = _lagInFrames, NumSpatialLayers = cfg.NumSpatialLayers,
+                LagInFrames = _lagInFrames, NumSpatialLayers = 1 /* cpi->svc.number_spatial_layers: no SVC params */,
                 Tuning = cfg.Tune switch { AomTune.Iq => AOM_TUNE_IQ, AomTune.Ssim => AOM_TUNE_SSIM, _ => AOM_TUNE_PSNR },
             };
             if (cfg.Sharpness is int csh) csf.Sharpness = csh;
@@ -1076,6 +1077,7 @@ internal sealed partial class AomGqEncoder
             AomTrace.Out.Write(sb.ToString() + (char)10);
         }
         byte[] data = AomBitstream.PackFrameGq(cpi, fh, out int largestTileId, out var largestTileFc, BitstreamTrace);
+        if (OnFrameEncoded != null) RcTraceLine = FormattableString.Invariant($"rc tgt {_rc.ThisFrameTarget} afb {_rc.AvgFrameBandwidth} buf {_pRc.BufferLevel} bot {_pRc.BitsOffTarget} opt {_rt.OptimalBufferLevel} max {_rt.MaximumBufferSize} wq {_rc.WorstQuality} bq {_rc.BestQuality} aq {_pRc.AvgFrameQindex[0]} {_pRc.AvgFrameQindex[1]} lq {_pRc.LastQ[0]} {_pRc.LastQ[1]} rc1 {_rt.Rc1Frame} q1 {_rt.Q1Frame} fss {_rc.FrameSourceSad} ass {_rt.AvgSourceSad} hss {(_rt.HighSourceSad ? 1 : 0)} fsk {_rc.FramesSinceKey} rcf {_rt.RateCorrectionFactors[0]:F6} {_rt.RateCorrectionFactors[1]:F6} {_rt.RateCorrectionFactors[2]:F6}");
         OnFrameEncoded?.Invoke(cpi, fh);
         if (cpi.Sf.mv_sf.auto_mv_step_size != 0) _maxMvMagnitude[0] = Math.Max(_maxMvMagnitude[0], cpi.MaxMvMagnitudeTd);
 
@@ -1147,6 +1149,8 @@ internal sealed partial class AomGqEncoder
     {
         _miRows = ((_cfg.Height + 7) & ~7) >> 2;
         _miCols = ((_cfg.Width + 7) & ~7) >> 2;
+        _cmWidth = _cfg.Width;   // cm->width/height = frm_dim_cfg (a pending resize is then re-detected)
+        _cmHeight = _cfg.Height;
         const int FIXED_GF_INTERVAL = 16;
         bool isOnePassRtParams = HasNoStatsStage && _lagInFrames == 0 && _cfg.Usage == REALTIME;
         if (HasNoStatsStage && _rcModeQ) _pRc.BaselineGfInterval = FIXED_GF_INTERVAL;

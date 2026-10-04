@@ -165,6 +165,7 @@ internal static partial class AomEncodeFrame
                     var sub = AllocOrResetPmc(cpi, ref pcTree.Split[i]!.None, subsize);
                     pcTree.Split[i]!.Partitioning = PARTITION_NONE;
                     PickSbModesNonrd(cpi, x, miRow + yIdx, miCol + xIdx, ref blockRdc, subsize, sub);
+                    AomTrace.Out?.Write($"tmsub {miRow + yIdx} {miCol + xIdx} {blockRdc.Rate} {blockRdc.Dist} mode {sub.Mic.Mode} ref {sub.Mic.RefFrame0} skip {blockRdc.SkipTxfm}" + (char)10);
                     splitRdc.Rate += blockRdc.Rate;
                     splitRdc.Dist += blockRdc.Dist;
                     splitRdc.CostUpdate(x.Rdmult);

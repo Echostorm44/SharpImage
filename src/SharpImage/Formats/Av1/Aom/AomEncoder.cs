@@ -144,7 +144,7 @@ internal static partial class AomEncoder
         // av1_set_screen_content_options (anti-aliasing aware detection; the fast variant from speed 3)
         // (non-RD pick mode without the hybrid intra search, speed 9: screen content detection is disabled and the
         // tools stay off)
-        bool nonrdNoHybrid = input.Mode == ALLINTRA && input.Speed >= 9;
+        bool nonrdNoHybrid = (input.Mode == ALLINTRA && input.Speed >= 9) || input.Mode == REALTIME;   // REALTIME: tools off
         if (input.DetectScreenContent && nonrdNoHybrid)
         {
             input.AllowScreenContentTools = input.UseScreenContentTools = input.AllowIntrabc = input.IsScreenContentType = false;

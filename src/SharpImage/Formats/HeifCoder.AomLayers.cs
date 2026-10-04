@@ -42,7 +42,7 @@ public static partial class HeifCoder
         bool reapplyCodecOptions)
     {
         int speed = Math.Clamp(options.Speed, 0, 9);
-        if (speed >= 7 || options.Lossless || options.FilmGrain != null || options.DenoiseNoiseLevel > 0 || options.GainMap != null ||
+        if (options.Lossless || options.FilmGrain != null || options.DenoiseNoiseLevel > 0 || options.GainMap != null ||
             options.PremultiplyAlpha || options.SharpYuv)
             return null;
         if (layers.Any(l => l.Quality >= 100 || l.QualityAlpha >= 100)) return null;
