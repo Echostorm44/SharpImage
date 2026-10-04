@@ -447,7 +447,7 @@ internal sealed partial class AomSpeedFeatures
 // ---- the port
 
 /// <summary>The AV1_COMP / AV1EncoderConfig state the speed-feature functions read (all-intra encoder).</summary>
-internal sealed class AomSpeedFeatureInputs
+internal sealed partial class AomSpeedFeatureInputs
 {
     public AomSpeedFeatureInputs Clone() => (AomSpeedFeatureInputs)MemberwiseClone();
     public int Width, Height;                       // cm->width, cm->height

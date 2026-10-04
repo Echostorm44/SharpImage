@@ -715,11 +715,4 @@ internal sealed partial class AomSpeedFeatures
         }
     }
 
-    /// <summary>set_rt_speed_feature_framesize_dependent (not ported yet).</summary>
-    private static void SetRtFramesizeDependent(AomSpeedFeatureInputs cpi, AomSpeedFeatures sf, int speed)
-        => throw new NotImplementedException("libaom REALTIME speed features");
-
-    /// <summary>set_rt_speed_features_framesize_independent (not ported yet).</summary>
-    private static void SetRtFramesizeIndependent(AomSpeedFeatureInputs cpi, AomSpeedFeatures sf, int speed)
-        => throw new NotImplementedException("libaom REALTIME speed features");
 }
