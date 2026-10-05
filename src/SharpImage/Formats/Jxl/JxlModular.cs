@@ -81,31 +81,28 @@ internal sealed class WpState
     }
 
     private readonly int p1C, p2C, p3Ca, p3Cb, p3Cc, p3Cd, p3Ce;
-    private readonly int[] w;
+    private readonly int w0, w1, w2, w3;
     private readonly int xsize;
-    private readonly long[][] predErrors;
+    // the four sub-predictors' error rows (two rows each, current / previous by parity) and the prediction errors
+    private readonly long[] pe0, pe1, pe2, pe3;
     private readonly long[] error;
-    private readonly long[] prediction = new long[4];
+    private long pr0, pr1, pr2, pr3;   // the last pixel's sub-predictions (Update's inputs)
     private long pred;
 
     public WpState(WpHeader hdr, int xsize)
     {
         p1C = hdr.P1C; p2C = hdr.P2C; p3Ca = hdr.P3Ca; p3Cb = hdr.P3Cb; p3Cc = hdr.P3Cc; p3Cd = hdr.P3Cd; p3Ce = hdr.P3Ce;
-        w = hdr.W;
+        w0 = hdr.W[0]; w1 = hdr.W[1]; w2 = hdr.W[2]; w3 = hdr.W[3];
         this.xsize = xsize;
         int n = (xsize + 2) * 2;
-        predErrors = new long[4][];
-        for (int i = 0; i < 4; i++)
-        {
-            predErrors[i] = new long[n];
-        }
-
+        pe0 = new long[n]; pe1 = new long[n]; pe2 = new long[n]; pe3 = new long[n];
         error = new long[n];
     }
 
     private static int FloorLog2(long x) => 63 - System.Numerics.BitOperations.LeadingZeroCount((ulong)x);
 
-    private long ErrorWeight(long x, int maxw)
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static long ErrorWeight(long x, int maxw)
     {
         int shift = FloorLog2(x + 1) - 5;
         if (shift < 0)
@@ -116,38 +113,25 @@ internal sealed class WpState
         return 4 + ((maxw * DivLookup[x >> shift]) >> shift);
     }
 
-    private long WeightedAvg(long[] p, long[] wt)
+    public long Predict(int x, int y, long n, long ww, long ne, long nw, long nn, List<long>? props)
     {
-        long ws = wt[0] + wt[1] + wt[2] + wt[3];
-        int logw = FloorLog2(ws);
-        for (int i = 0; i < 4; i++)
-        {
-            wt[i] >>= logw - 4;
-        }
-
-        ws = wt[0] + wt[1] + wt[2] + wt[3];
-        long s = (ws >> 1) - 1;
-        for (int i = 0; i < 4; i++)
-        {
-            s += p[i] * wt[i];
-        }
-
-        return (s * DivLookup[ws - 1]) >> 24;
+        long r = Predict(x, y, n, ww, ne, nw, nn, out long maxError);
+        props?.Add(maxError);
+        return r;
     }
 
-    public long Predict(int x, int y, long n, long ww, long ne, long nw, long nn, List<long>? props)
+    /// <summary>The weighted prediction of (x, y); maxError: the largest-magnitude neighbouring error (property 15).</summary>
+    public long Predict(int x, int y, long n, long ww, long ne, long nw, long nn, out long maxError)
     {
         int cur = (y & 1) != 0 ? 0 : (xsize + 2);
         int prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
         int pN = prevRow + x;
         int pNE = x < xsize - 1 ? pN + 1 : pN;
         int pNW = x > 0 ? pN - 1 : pN;
-        var weights = new long[4];
-        for (int i = 0; i < 4; i++)
-        {
-            long wv = predErrors[i][pN] + predErrors[i][pNE] + predErrors[i][pNW];
-            weights[i] = ErrorWeight(wv, w[i]);
-        }
+        long wt0 = ErrorWeight(pe0[pN] + pe0[pNE] + pe0[pNW], w0);
+        long wt1 = ErrorWeight(pe1[pN] + pe1[pNE] + pe1[pNW], w1);
+        long wt2 = ErrorWeight(pe2[pN] + pe2[pNE] + pe2[pNW], w2);
+        long wt3 = ErrorWeight(pe3[pN] + pe3[pNE] + pe3[pNW], w3);
 
         n <<= PredExtraBits;
         ww <<= PredExtraBits;
@@ -159,20 +143,24 @@ internal sealed class WpState
         long teNW = error[pNW];
         long teNE = error[pNE];
         long sumWN = teN + teW;
-        if (props != null)
-        {
-            long pmax = teW;
-            if (Math.Abs(teN) > Math.Abs(pmax)) { pmax = teN; }
-            if (Math.Abs(teNW) > Math.Abs(pmax)) { pmax = teNW; }
-            if (Math.Abs(teNE) > Math.Abs(pmax)) { pmax = teNE; }
-            props.Add(pmax);
-        }
+        long pmax = teW;
+        if (Math.Abs(teN) > Math.Abs(pmax)) { pmax = teN; }
+        if (Math.Abs(teNW) > Math.Abs(pmax)) { pmax = teNW; }
+        if (Math.Abs(teNE) > Math.Abs(pmax)) { pmax = teNE; }
+        maxError = pmax;
 
-        prediction[0] = ww + ne - n;
-        prediction[1] = n - (((sumWN + teNE) * p1C) >> 5);
-        prediction[2] = ww - (((sumWN + teNW) * p2C) >> 5);
-        prediction[3] = n - (((teNW * p3Ca) + (teN * p3Cb) + (teNE * p3Cc) + ((nn - n) * p3Cd) + ((nw - ww) * p3Ce)) >> 5);
-        pred = WeightedAvg(prediction, weights);
+        pr0 = ww + ne - n;
+        pr1 = n - (((sumWN + teNE) * p1C) >> 5);
+        pr2 = ww - (((sumWN + teNW) * p2C) >> 5);
+        pr3 = n - (((teNW * p3Ca) + (teN * p3Cb) + (teNE * p3Cc) + ((nn - n) * p3Cd) + ((nw - ww) * p3Ce)) >> 5);
+
+        // weighted average (the weights renormalised to 5 bits, then the rounded division by their sum)
+        long ws = wt0 + wt1 + wt2 + wt3;
+        int sh = FloorLog2(ws) - 4;
+        wt0 >>= sh; wt1 >>= sh; wt2 >>= sh; wt3 >>= sh;
+        ws = wt0 + wt1 + wt2 + wt3;
+        long sum = (ws >> 1) - 1 + (pr0 * wt0) + (pr1 * wt1) + (pr2 * wt2) + (pr3 * wt3);
+        pred = (sum * DivLookup[ws - 1]) >> 24;
         if (((teN ^ teW) | (teN ^ teNW)) > 0)
         {
             return (pred + PredictionRound) >> PredExtraBits;
@@ -190,12 +178,14 @@ internal sealed class WpState
         int prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
         val <<= PredExtraBits;
         error[cur + x] = pred - val;
-        for (int i = 0; i < 4; i++)
-        {
-            long err = (Math.Abs(prediction[i] - val) + PredictionRound) >> PredExtraBits;
-            predErrors[i][cur + x] = err;
-            predErrors[i][prevRow + x + 1] += err;
-        }
+        long e0 = (Math.Abs(pr0 - val) + PredictionRound) >> PredExtraBits;
+        long e1 = (Math.Abs(pr1 - val) + PredictionRound) >> PredExtraBits;
+        long e2 = (Math.Abs(pr2 - val) + PredictionRound) >> PredExtraBits;
+        long e3 = (Math.Abs(pr3 - val) + PredictionRound) >> PredExtraBits;
+        pe0[cur + x] = e0; pe0[prevRow + x + 1] += e0;
+        pe1[cur + x] = e1; pe1[prevRow + x + 1] += e1;
+        pe2[cur + x] = e2; pe2[prevRow + x + 1] += e2;
+        pe3[cur + x] = e3; pe3[prevRow + x + 1] += e3;
     }
 }
 

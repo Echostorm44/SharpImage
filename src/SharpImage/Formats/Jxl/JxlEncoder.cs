@@ -6,6 +6,7 @@
 // tiled into groups. Verified by decoding the output with the reference decoders (libjxl / jxl-oxide),
 // not just round-tripping.
 using System;
+using System.Threading.Tasks;
 using System.Collections.Generic;
 using SharpImage.Core;
 using SharpImage.Image;
@@ -48,7 +49,32 @@ internal static partial class JxlEncoder
         return 8;
     }
 
-    public static byte[] EncodeLossless(ImageFrame image)
+    /// <summary>A lossless encode's search: the tree node thresholds tried, what the tree learn may use, and
+    /// which alternatives are trial-encoded (the estimated-vs-default weighted-predictor mode, the prefix+LZ77
+    /// coder next to ANS, the single-leaf tree). <see cref="Maximum"/> tries everything.</summary>
+    internal sealed class LosslessProfile
+    {
+        public required float[] NodeThresholds { get; init; }
+        public JxlLearnParams Learn { get; init; } = JxlLearnParams.Default;
+        public bool TryWpModes { get; init; } = true;
+        public bool TryPrefix { get; init; } = true;
+        public bool TrySingleLeaf { get; init; } = true;
+        /// <summary>Estimate the weighted-predictor parameter mode (else libjxl's default, mode 0).</summary>
+        public bool EstimateWpMode { get; init; } = true;
+        /// <summary>WP-mode estimate on every Nth 16-row band only (1: every row).</summary>
+        public int WpEstimateBandStep { get; init; } = 1;
+        /// <summary>The RCT types scored (null: all 42).</summary>
+        public int[]? RctCandidates { get; init; }
+
+        // libjxl's RCT try order (enc_modular.cc): Nothing, YCoCg, then the distinct permuted transforms
+        internal static readonly int[] LibjxlRctOrder = { 0, 6, 5, 10, 26, 40, 12, 19, 8, 4, 9, 15, 16, 17, 32, 33, 2, 1, 3 };
+
+        public static readonly LosslessProfile Maximum = new() { NodeThresholds = JxlTreeLearner.NodeThresholds };
+    }
+
+    public static byte[] EncodeLossless(ImageFrame image) => EncodeLossless(image, LosslessProfile.Maximum);
+
+    internal static byte[] EncodeLossless(ImageFrame image, LosslessProfile profile)
     {
         int w = (int)image.Columns;
         int h = (int)image.Rows;
@@ -111,13 +137,13 @@ internal static partial class JxlEncoder
         bool gray = alpha == null && IsGrayscale(r, g, b, w * h);
         if (!gray)
         {
-            return EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha, colorspace, icc);
+            return EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha, colorspace, icc, profile);
         }
 
-        byte[] grayCs = EncodeCore(r, g, b, w, h, nb, gray: true, bits, alpha, colorspace, icc);
+        byte[] grayCs = EncodeCore(r, g, b, w, h, nb, gray: true, bits, alpha, colorspace, icc, profile);
         if (w <= GroupDim && h <= GroupDim && alpha == null)
         {
-            byte[] rgbCs = EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha, colorspace, icc);
+            byte[] rgbCs = EncodeCore(r, g, b, w, h, nb, gray: false, bits, alpha, colorspace, icc, profile);
             if (rgbCs.Length < grayCs.Length)
             {
                 return rgbCs;
@@ -211,28 +237,29 @@ internal static partial class JxlEncoder
         return (r, g, b, alpha);
     }
 
-    private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8, int[]? alpha = null, Core.ColorspaceType colorspace = Core.ColorspaceType.SRGB, byte[]? icc = null)
+    private static byte[] EncodeCore(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8, int[]? alpha = null, Core.ColorspaceType colorspace = Core.ColorspaceType.SRGB, byte[]? icc = null, LosslessProfile? profile = null)
     {
-        var (sections, shift) = EncodeCoreSections(r, g, b, w, h, nb, gray, bits, alpha);
+        var (sections, shift) = EncodeCoreSections(r, g, b, w, h, nb, gray, bits, alpha, profile);
         return AssembleCodestream(w, h, shift, sections, gray, bits, alpha != null ? 1 : 0, colorspace, icc);
     }
 
     // Returns the frame's Modular sections + the group-size shift (the caller assembles them into a single-
     // image codestream or an animation frame body).
-    private static (byte[][] Sections, int Shift) EncodeCoreSections(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8, int[]? alpha = null)
+    private static (byte[][] Sections, int Shift) EncodeCoreSections(int[] r, int[] g, int[] b, int w, int h, int nb, bool gray, int bits = 8, int[]? alpha = null, LosslessProfile? profile = null)
     {
+        profile ??= LosslessProfile.Maximum;
         int numExtra = alpha != null ? 1 : 0;
         int nbCh = (gray ? 1 : nb) + numExtra;
 
         // Pick the reversible colour transform (none for grayscale), then the weighted-predictor parameter
         // mode. The WP-mode estimate (single-context) can mispredict once the tree/context model is
         // applied, so try the estimated-best mode and the default (mode 0) and keep the smaller.
-        int rctType = gray ? -1 : ChooseRct(r, g, b, w, h);
+        int rctType = gray ? -1 : ChooseRct(r, g, b, w, h, profile.RctCandidates);
         int[][] colorChan = gray ? new[] { r } : ForwardRct(r, g, b, w * h, rctType);
         // Append the alpha extra channel (untouched by the RCT, which only covers the 3 colour channels).
         int[][] chan = alpha == null ? colorChan : Append(colorChan, alpha);
-        int wpEst = ChooseWpMode(chan, w, h);
-        int[] wpModes = wpEst == 0 ? new[] { 0 } : new[] { wpEst, 0 };
+        int wpEst = profile.EstimateWpMode ? ChooseWpMode(chan, w, h, profile.WpEstimateBandStep) : 0;
+        int[] wpModes = wpEst == 0 || !profile.TryWpModes ? new[] { wpEst } : new[] { wpEst, 0 };
 
         // A single group can cover an image up to GroupDim on both sides; larger images are tiled.
         bool single = w <= GroupDim && h <= GroupDim;
@@ -245,7 +272,7 @@ internal static partial class JxlEncoder
                 int gd = 128 << gShift;
                 foreach (int m in wpModes)
                 {
-                    byte[][] secs = BuildMultiGroupSections(chan, w, h, nbCh, gd, rctType, m);
+                    byte[][] secs = BuildMultiGroupSections(chan, w, h, nbCh, gd, rctType, m, profile);
                     if (bestSecs == null || TotalLength(secs) < TotalLength(bestSecs))
                     {
                         bestSecs = secs;
@@ -270,7 +297,7 @@ internal static partial class JxlEncoder
         byte[] best = null!;
         foreach (int m in wpModes)
         {
-            byte[] sec = BuildSingleGroupSection(rctChannels, s => WriteRctTransform(s, rctType), m);
+            byte[] sec = BuildSingleGroupSection(rctChannels, s => WriteRctTransform(s, rctType), m, profile);
             if (best == null || sec.Length < best.Length)
             {
                 best = sec;
@@ -291,7 +318,7 @@ internal static partial class JxlEncoder
             foreach (int[] ordered in PaletteOrderings(colors, counts, r, g, b, w, h))
             {
                 List<EncChannel> palChannels = BuildPaletteChannels(ordered, r, g, b, w, h, gray);
-                byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors, gray ? 1 : 3), 0);
+                byte[] palSec = BuildSingleGroupSection(palChannels, s => WritePaletteTransform(s, nbColors, gray ? 1 : 3), 0, profile);
                 if (palSec.Length < best.Length)
                 {
                     best = palSec;
@@ -562,28 +589,40 @@ internal static partial class JxlEncoder
     // (DecodeGlobalModular). All channels are decoded through one entropy reader, so LZ77 spans them.
     // Builds the section with an error-context MA tree and with a plain single-leaf tree, keeping the
     // smaller — so context modelling is only used when it actually helps. ---
-    private static byte[] BuildSingleGroupSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, int wpMode)
+    private static byte[] BuildSingleGroupSection(List<EncChannel> channels, Action<JxlBitWriter> writeTransforms, int wpMode, LosslessProfile profile)
     {
         WpHeader wpHeader = WpMode(wpMode);
         List<EncChannelRef> refs = ToRefs(channels);
         byte[] best = null!;
         void Consider(LearnedTree tree)
         {
-            byte[] pfx = BuildSection(channels, writeTransforms, tree, wpMode, useAns: false);
-            if (best == null || pfx.Length < best.Length)
+            if (profile.TryPrefix)
             {
-                best = pfx;
+                byte[] pfx = BuildSection(channels, writeTransforms, tree, wpMode, useAns: false);
+                if (best == null || pfx.Length < best.Length)
+                {
+                    best = pfx;
+                }
             }
 
             byte[]? ansSec = BuildSection(channels, writeTransforms, tree, wpMode, useAns: true);
-            if (ansSec != null && ansSec.Length < best.Length)
+            if (ansSec != null && (best == null || ansSec.Length < best.Length))
             {
                 best = ansSec;
             }
+
+            if (best == null)
+            {
+                best = BuildSection(channels, writeTransforms, tree, wpMode, useAns: false); // ANS cannot code this alphabet
+            }
         }
 
-        Consider(SingleLeafTree);
-        foreach (MaTreeNode tree in JxlTreeLearner.LearnMulti(refs, wpHeader, JxlTreeLearner.NodeThresholds))
+        if (profile.TrySingleLeaf)
+        {
+            Consider(SingleLeafTree);
+        }
+
+        foreach (MaTreeNode tree in JxlTreeLearner.LearnMulti(refs, wpHeader, profile.NodeThresholds, profile.Learn))
         {
             Consider(new LearnedTree(tree));
         }
@@ -708,6 +747,128 @@ internal static partial class JxlEncoder
 
     private static int Pick(int[] r, int[] g, int[] b, int idx, int p) => idx == 0 ? r[p] : (idx == 1 ? g[p] : b[p]);
 
+    /// <summary>ChooseRct's cost of an RCT: the three channels' <see cref="GradientResidualBits"/> summed, with the
+    /// transform evaluated only at the sampled pixels and their neighbours, and flat histograms whose entropy is summed
+    /// in first-occurrence order (the dictionary's enumeration order), so the costs are bit-identical.</summary>
+    private sealed class RctScorer
+    {
+        private readonly int off;
+        private readonly int[][] hist;
+        private readonly List<int>[] seen = { new(), new(), new() };
+
+        public RctScorer(int maxV)
+        {
+            // channel values stay within [-2M, 2M] (differences, YCoCg), the clamped-gradient residuals within 4M
+            off = (8 * maxV) + 4;
+            hist = new[] { new int[(2 * off) + 1], new int[(2 * off) + 1], new int[(2 * off) + 1] };
+        }
+
+        private static void Rct(int[] r, int[] g, int[] b, int p, int perm, int custom, out int c0, out int c1, out int c2)
+        {
+            int oi0 = perm % 3, oi1 = (perm + 1 + (perm / 3)) % 3, oi2 = (perm + 2 - (perm / 3)) % 3;
+            int o0 = Pick(r, g, b, oi0, p), o1 = Pick(r, g, b, oi1, p), o2 = Pick(r, g, b, oi2, p);
+            if (custom == 6)
+            {
+                int co = o0 - o2;
+                int tmp = o2 + (co >> 1);
+                int cg = o1 - tmp;
+                c0 = tmp + (cg >> 1);
+                c1 = co;
+                c2 = cg;
+            }
+            else
+            {
+                int second = custom >> 1, third = custom & 1;
+                c0 = o0;
+                c1 = second == 1 ? o1 - o0 : (second == 2 ? o1 - ((o0 + o2) >> 1) : o1);
+                c2 = o2 - (third != 0 ? o0 : 0);
+            }
+        }
+
+        public double Cost(int[] r, int[] g, int[] b, int w, int h, int rctType)
+        {
+            int perm = rctType / 7, custom = rctType % 7;
+            int stride = Math.Max(1, (w * h) / (1 << 16));
+            long total = 0;
+            int cnt = 0;
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    if (cnt++ % stride != 0)
+                    {
+                        continue;
+                    }
+
+                    int p = (y * w) + x;
+                    Rct(r, g, b, p, perm, custom, out int v0, out int v1, out int v2);
+                    // the neighbours as GradientResidualBits picks them
+                    int pl = x > 0 ? p - 1 : (y > 0 ? p - w : -1);
+                    int pt = y > 0 ? p - w : pl;
+                    int ptl = (x > 0 && y > 0) ? p - w - 1 : pl;
+                    int l0 = 0, l1 = 0, l2 = 0, t0, t1, t2, tl0, tl1, tl2;
+                    if (pl >= 0)
+                    {
+                        Rct(r, g, b, pl, perm, custom, out l0, out l1, out l2);
+                    }
+
+                    if (pt == pl)
+                    {
+                        t0 = l0; t1 = l1; t2 = l2;
+                    }
+                    else
+                    {
+                        Rct(r, g, b, pt, perm, custom, out t0, out t1, out t2);
+                    }
+
+                    if (ptl == pl)
+                    {
+                        tl0 = l0; tl1 = l1; tl2 = l2;
+                    }
+                    else
+                    {
+                        Rct(r, g, b, ptl, perm, custom, out tl0, out tl1, out tl2);
+                    }
+
+                    Add(0, v0 - (int)JxlTreeLearner.ClampedGradient(l0, t0, tl0));
+                    Add(1, v1 - (int)JxlTreeLearner.ClampedGradient(l1, t1, tl1));
+                    Add(2, v2 - (int)JxlTreeLearner.ClampedGradient(l2, t2, tl2));
+                    total++;
+                }
+            }
+
+            double bits = 0;
+            for (int c = 0; c < 3; c++)
+            {
+                double cb = 0;
+                double invLog2 = 1.0 / Math.Log(2);
+                foreach (int v in seen[c])
+                {
+                    int k = hist[c][v + off];
+                    if (total > 0)
+                    {
+                        cb -= k * Math.Log((double)k / total) * invLog2;
+                    }
+
+                    hist[c][v + off] = 0;
+                }
+
+                seen[c].Clear();
+                bits += cb;
+            }
+
+            return bits;
+        }
+
+        private void Add(int c, int v)
+        {
+            if (hist[c][v + off]++ == 0)
+            {
+                seen[c].Add(v);
+            }
+        }
+    }
+
     // The five weighted-predictor parameter sets from libjxl (context_predict.h PredictorMode). Mode 0
     // equals WpHeader.Default().
     private static WpHeader WpMode(int m) => m switch
@@ -720,17 +881,42 @@ internal static partial class JxlEncoder
     };
 
     // Estimated bits for a WP mode: entropy of the weighted-predictor residuals over the channels.
-    private static double EstimateWpModeCost(int[][] chan, int w, int h, int wpMode)
+    private static double EstimateWpModeCost(int[][] chan, int w, int h, int wpMode, int bandStep = 1)
     {
         WpHeader hdr = WpMode(wpMode);
-        var hist = new Dictionary<int, int>();
+        // a flat histogram summed in first-occurrence order (a dictionary's enumeration order: the same bits)
+        int maxV = 0;
+        foreach (int[] px in chan)
+        {
+            foreach (int v in px)
+            {
+                maxV = Math.Max(maxV, Math.Abs(v));
+            }
+        }
+
+        int off = (4 * maxV) + 4;
+        var hist = new int[(2 * off) + 1];
+        var seen = new List<int>();
         long total = 0;
-        var buf = new List<long>(1);
         foreach (int[] px in chan)
         {
             var wp = new WpState(hdr, w);
             for (int y = 0; y < h; y++)
             {
+                if (bandStep > 1)
+                {
+                    // 16-row bands, one in bandStep, each from a fresh predictor state
+                    if (((y >> 4) % bandStep) != 0)
+                    {
+                        continue;
+                    }
+
+                    if ((y & 15) == 0)
+                    {
+                        wp = new WpState(hdr, w);
+                    }
+                }
+
                 for (int x = 0; x < w; x++)
                 {
                     long left = x > 0 ? px[(y * w) + x - 1] : (y > 0 ? px[((y - 1) * w) + x] : 0);
@@ -738,11 +924,14 @@ internal static partial class JxlEncoder
                     long topleft = (x > 0 && y > 0) ? px[((y - 1) * w) + x - 1] : left;
                     long topright = (x + 1 < w && y > 0) ? px[((y - 1) * w) + x + 1] : top;
                     long toptop = y > 1 ? px[((y - 2) * w) + x] : top;
-                    buf.Clear();
-                    long guess = wp.Predict(x, y, top, left, topright, topleft, toptop, buf);
+                    long guess = wp.Predict(x, y, top, left, topright, topleft, toptop, out _);
                     int pixel = px[(y * w) + x];
                     int resid = pixel - (int)guess;
-                    hist[resid] = hist.GetValueOrDefault(resid) + 1;
+                    if (hist[resid + off]++ == 0)
+                    {
+                        seen.Add(resid);
+                    }
+
                     total++;
                     wp.Update(pixel, x, y);
                 }
@@ -755,21 +944,24 @@ internal static partial class JxlEncoder
         }
 
         double bits = 0, invLog2 = 1.0 / Math.Log(2);
-        foreach (int c in hist.Values)
+        foreach (int v in seen)
         {
+            int c = hist[v + off];
             bits -= c * Math.Log((double)c / total) * invLog2;
         }
 
         return bits;
     }
 
-    private static int ChooseWpMode(int[][] chan, int w, int h)
+    private static int ChooseWpMode(int[][] chan, int w, int h, int bandStep = 1)
     {
         int best = 0;
         double bestCost = double.MaxValue;
+        var costs = new double[5];
+        Parallel.For(0, 5, m => costs[m] = EstimateWpModeCost(chan, w, h, m, bandStep));
         for (int m = 0; m < 5; m++)
         {
-            double c = EstimateWpModeCost(chan, w, h, m);
+            double c = costs[m];
             if (c < bestCost)
             {
                 bestCost = c;
@@ -808,15 +1000,28 @@ internal static partial class JxlEncoder
     // Chooses the RCT with the lowest estimated cost: the summed entropy of each channel's clamped-
     // gradient residuals (sampled), which tracks the achievable size well and is cheap. Mirrors libjxl
     // trying all 42 RCTs and keeping the cheapest.
-    private static int ChooseRct(int[] r, int[] g, int[] b, int w, int h)
+    private static int ChooseRct(int[] r, int[] g, int[] b, int w, int h, int[]? candidates = null)
     {
         int n = w * h;
         int bestType = 6;
         double bestCost = double.MaxValue;
-        for (int rctType = 0; rctType < 42; rctType++)
+        int nc = candidates?.Length ?? 42;
+        int maxV = 0;
+        for (int p = 0; p < n; p++)
         {
-            int[][] chan = ForwardRct(r, g, b, n, rctType);
-            double cost = GradientResidualBits(chan[0], w, h) + GradientResidualBits(chan[1], w, h) + GradientResidualBits(chan[2], w, h);
+            maxV = Math.Max(maxV, Math.Max(Math.Abs(r[p]), Math.Max(Math.Abs(g[p]), Math.Abs(b[p]))));
+        }
+
+        var costs = new double[nc];
+        Parallel.For(0, nc, () => new RctScorer(maxV), (ci, _, scorer) =>
+        {
+            costs[ci] = scorer.Cost(r, g, b, w, h, candidates != null ? candidates[ci] : ci);
+            return scorer;
+        }, _ => { });
+        for (int ci = 0; ci < nc; ci++)
+        {
+            int rctType = candidates != null ? candidates[ci] : ci;
+            double cost = costs[ci];
             if (cost < bestCost)
             {
                 bestCost = cost;
@@ -1145,7 +1350,7 @@ internal static partial class JxlEncoder
     // sections, then one Modular-AC section per spatial group. All groups share the global tree and
     // codes; each group has its own entropy reader/window, so LZ77 and prediction run per group. Built
     // with an error-context tree and with a single-leaf tree, keeping whichever total is smaller. ---
-    private static byte[][] BuildMultiGroupSections(int[][] chan, int w, int h, int nb, int groupDim, int rctType, int wpMode)
+    private static byte[][] BuildMultiGroupSections(int[][] chan, int w, int h, int nb, int groupDim, int rctType, int wpMode, LosslessProfile profile)
     {
         // Learn the tree from the actual tiles (per-tile prediction) so it matches the per-group encode.
         var tileRefs = new List<EncChannelRef>();
@@ -1175,23 +1380,31 @@ internal static partial class JxlEncoder
         void Consider(LearnedTree t, ref byte[][] bestSecs)
         {
             var streams = ComputeGroupStreams(chan, w, h, nb, groupDim, t, WpMode(wpMode));
-            byte[][] pfx = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, t, rctType, wpMode, useAns: false, streams);
-            if (bestSecs == null || TotalLength(pfx) < TotalLength(bestSecs))
+            if (profile.TryPrefix)
             {
-                bestSecs = pfx;
+                byte[][] pfx = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, t, rctType, wpMode, useAns: false, streams);
+                if (bestSecs == null || TotalLength(pfx) < TotalLength(bestSecs))
+                {
+                    bestSecs = pfx;
+                }
             }
 
             byte[][] ansSecs = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, t, rctType, wpMode, useAns: true, streams);
-            if (ansSecs != null && TotalLength(ansSecs) < TotalLength(bestSecs))
+            if (ansSecs != null && (bestSecs == null || TotalLength(ansSecs) < TotalLength(bestSecs)))
             {
                 bestSecs = ansSecs;
+            }
+
+            if (bestSecs == null)
+            {
+                bestSecs = BuildMultiGroupWithTree(chan, w, h, nb, groupDim, t, rctType, wpMode, useAns: false, streams); // ANS cannot code this alphabet
             }
         }
 
         // (no single-leaf candidate here: on multi-group images a learned tree always beats it by far, and a
         // learned tree with no profitable split is the single leaf anyway)
         byte[][] best = null!;
-        foreach (MaTreeNode tree in JxlTreeLearner.LearnMulti(tileRefs, WpMode(wpMode), JxlTreeLearner.NodeThresholds))
+        foreach (MaTreeNode tree in JxlTreeLearner.LearnMulti(tileRefs, WpMode(wpMode), profile.NodeThresholds, profile.Learn))
         {
             Consider(new LearnedTree(tree), ref best);
         }
@@ -1232,8 +1445,8 @@ internal static partial class JxlEncoder
         int lfDim = groupDim * 8;
         int numLf = CeilDiv(w, lfDim) * CeilDiv(h, lfDim);
 
-        var streams = new List<(int[] Stream, int[] Ctxs)>(numGroups);
-        for (int g = 0; g < numGroups; g++)
+        var res = new (int[] Stream, int[] Ctxs)[numGroups];
+        Parallel.For(0, numGroups, g =>
         {
             int rx = (g % gpr) * groupDim;
             int ry = (g / gpr) * groupDim;
@@ -1259,10 +1472,10 @@ internal static partial class JxlEncoder
                 off += rw * rh;
             }
 
-            streams.Add((stream, ctxs));
-        }
+            res[g] = (stream, ctxs);
+        });
 
-        return streams;
+        return new List<(int[] Stream, int[] Ctxs)>(res);
     }
 
     private static byte[][] BuildMultiGroupWithTree(int[][] chan, int w, int h, int nb, int groupDim, LearnedTree tree, int rctType, int wpMode, bool useAns = false, List<(int[] Stream, int[] Ctxs)>? precomputedStreams = null)
@@ -2237,9 +2450,9 @@ internal static partial class JxlEncoder
             prevGrad = 0;
             for (int x = 0; x < w; x++)
             {
-                JxlTreeLearner.ComputePixel(px, w, chan, groupId, x, y, wp, buf, props, ref prevGrad, guesses, refs);
+                JxlTreeLearner.ComputeProps(px, w, chan, groupId, x, y, wp, buf, props, ref prevGrad, refs, out JxlTreeLearner.Neighbors nbr);
                 MaTreeNode leaf = tree.Walk(props);
-                long guess = guesses[JxlTreeLearner.PredictorIndex(leaf.Predictor)];
+                long guess = JxlTreeLearner.Guess(leaf.Predictor, in nbr);
                 int pixel = px[(y * w) + x];
                 int residual = pixel - (int)guess;
                 int token = (int)(uint)((residual << 1) ^ (residual >> 31));
