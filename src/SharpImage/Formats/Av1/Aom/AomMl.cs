@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics.X86;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -220,6 +222,15 @@ internal static partial class AomMl
         int totNumInputs, bool isOutputLayer, int numOutputs, Span<float> output)
     {
         bool clip = !isOutputLayer && numInputsToProcess == totNumInputs;
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && input.Length >= numInputsToProcess && output.Length >= numOutputs
+            && w.Length >= (numOutputs - 1) * totNumInputs + numInputsToProcess && bias.Length >= numOutputs)
+        {
+            PropagateInputMultipleOf8Avx(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(input),
+                ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(w),
+                ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(bias), numInputsToProcess, totNumInputs, clip,
+                numOutputs, ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output));
+            return;
+        }
         if (numOutputs % 4 == 0)
         {
             // nn_propagate_8to8 / 8to4: per output, the 8 products of each input chunk reduce through the hadd
@@ -253,6 +264,68 @@ internal static partial class AomMl
                 float s0 = lane[0] + lane[4], s1 = lane[1] + lane[5], s2 = lane[2] + lane[6], s3 = lane[3] + lane[7];
                 float v = bias[o] + ((s2 + s3) + (s0 + s1));
                 output[o] = clip ? Relu(v) : v;
+            }
+        }
+    }
+
+    // nn_propagate_8to8 / 8to4 / 8to1 (ml_avx2.c) with libaom's own reductions (_mm256_hadd_ps trees, the lane folds),
+    // so every float sum is formed in the same order
+    private static void PropagateInputMultipleOf8Avx(ref float input, ref float w, ref float bias, int numInputsToProcess,
+        int totNumInputs, bool clip, int numOutputs, ref float output)
+    {
+        if (numOutputs % 8 == 0)
+        {
+            for (int o = 0; o < numOutputs; o += 8)
+            {
+                var acc = Vector256<float>.Zero;
+                for (int i = 0; i < numInputsToProcess; i += 8)
+                {
+                    var x = Vector256.LoadUnsafe(ref input, (nuint)i);
+                    ref float wr = ref Unsafe.Add(ref w, i + o * totNumInputs);
+                    var h0 = Avx.HorizontalAdd(x * Vector256.LoadUnsafe(ref wr), x * Vector256.LoadUnsafe(ref wr, (nuint)totNumInputs));
+                    var h1 = Avx.HorizontalAdd(x * Vector256.LoadUnsafe(ref wr, (nuint)(2 * totNumInputs)), x * Vector256.LoadUnsafe(ref wr, (nuint)(3 * totNumInputs)));
+                    var h2 = Avx.HorizontalAdd(x * Vector256.LoadUnsafe(ref wr, (nuint)(4 * totNumInputs)), x * Vector256.LoadUnsafe(ref wr, (nuint)(5 * totNumInputs)));
+                    var h3 = Avx.HorizontalAdd(x * Vector256.LoadUnsafe(ref wr, (nuint)(6 * totNumInputs)), x * Vector256.LoadUnsafe(ref wr, (nuint)(7 * totNumInputs)));
+                    var hh0 = Avx.HorizontalAdd(h0, h1);
+                    var hh1 = Avx.HorizontalAdd(h2, h3);
+                    acc += Avx.Permute2x128(hh0, hh1, 0x20) + Avx.Permute2x128(hh0, hh1, 0x31);
+                }
+                acc += Vector256.LoadUnsafe(ref bias, (nuint)o);
+                if (clip) acc = Avx.Max(acc, Vector256<float>.Zero);
+                acc.StoreUnsafe(ref output, (nuint)o);
+            }
+        }
+        else if (numOutputs % 4 == 0)
+        {
+            for (int o = 0; o < numOutputs; o += 4)
+            {
+                var acc = Vector128<float>.Zero;
+                for (int i = 0; i < numInputsToProcess; i += 8)
+                {
+                    var x = Vector256.LoadUnsafe(ref input, (nuint)i);
+                    ref float wr = ref Unsafe.Add(ref w, i + o * totNumInputs);
+                    var h0 = Avx.HorizontalAdd(x * Vector256.LoadUnsafe(ref wr), x * Vector256.LoadUnsafe(ref wr, (nuint)totNumInputs));
+                    var h1 = Avx.HorizontalAdd(x * Vector256.LoadUnsafe(ref wr, (nuint)(2 * totNumInputs)), x * Vector256.LoadUnsafe(ref wr, (nuint)(3 * totNumInputs)));
+                    var sum = Avx.HorizontalAdd(h0, h1);
+                    acc += sum.GetLower() + sum.GetUpper();
+                }
+                acc += Vector128.LoadUnsafe(ref bias, (nuint)o);
+                if (clip) acc = Sse.Max(acc, Vector128<float>.Zero);
+                acc.StoreUnsafe(ref output, (nuint)o);
+            }
+        }
+        else
+        {
+            for (int o = 0; o < numOutputs; o++)
+            {
+                var acc = Vector256<float>.Zero;
+                for (int i = 0; i < numInputsToProcess; i += 8)
+                    acc += Vector256.LoadUnsafe(ref input, (nuint)i) * Vector256.LoadUnsafe(ref w, (nuint)(i + o * totNumInputs));
+                var s0 = acc.GetLower() + acc.GetUpper();
+                var s1 = Sse3.HorizontalAdd(s0, s0);
+                var tot = Sse.Shuffle(s1, s1, 0x99) + s1;
+                float v = Unsafe.Add(ref bias, o) + tot.ToScalar();
+                Unsafe.Add(ref output, o) = clip ? Relu(v) : v;
             }
         }
     }
