@@ -21,6 +21,24 @@ using System.Buffers.Binary;
 
 namespace SharpImage.Formats;
 
+/// <summary>Speed vs size presets for lossless JPEG XL encoding. Every level is lossless; higher levels search more
+/// coding choices for a smaller file. <see cref="Balanced"/> (the default) matches libjxl's default effort (7) for size
+/// and speed; <see cref="Maximum"/> searches exhaustively.</summary>
+public enum JxlLosslessEffort
+{
+    /// <summary>A fixed context tree, no search: roughly libjxl effort 3.</summary>
+    Turbo,
+
+    /// <summary>A small learned tree: roughly libjxl effort 5.</summary>
+    Fast,
+
+    /// <summary>The recommended default: a learned tree over libjxl effort 7's choices.</summary>
+    Balanced,
+
+    /// <summary>Exhaustive: several trees, weighted-predictor modes, predictors and both entropy coders.</summary>
+    Maximum,
+}
+
 public static class JxlCoder
 {
     // Container signature (ISOBMFF-style).
@@ -57,7 +75,13 @@ public static class JxlCoder
     /// Encodes an image as a lossless JPEG XL codestream (Modular mode: clamped-gradient prediction +
     /// prefix entropy coding). Produces a standard bare codestream that libjxl / jxl-oxide decode.
     /// </summary>
-    public static byte[] Encode(ImageFrame image) => Jxl.JxlEncoder.EncodeLossless(image);
+    public static byte[] Encode(ImageFrame image) => Jxl.JxlEncoder.EncodeLossless(image, JxlLosslessEffort.Balanced);
+
+    /// <summary>
+    /// Encodes an image as a lossless JPEG XL codestream at the given effort (every level is lossless; higher levels
+    /// search more for a smaller file).
+    /// </summary>
+    public static byte[] Encode(ImageFrame image, JxlLosslessEffort effort) => Jxl.JxlEncoder.EncodeLossless(image, effort);
 
     /// <summary>
     /// Encodes an animated image sequence as a single multi-frame lossless JPEG XL codestream. Each frame

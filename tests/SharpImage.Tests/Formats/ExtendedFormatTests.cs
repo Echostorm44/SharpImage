@@ -1219,6 +1219,44 @@ public class ExtendedFormatTests
         await AssertLossless(frame, decoded);
     }
 
+    [Test]
+    [Arguments(JxlLosslessEffort.Turbo, 300, 200)]
+    [Arguments(JxlLosslessEffort.Fast, 300, 200)]
+    [Arguments(JxlLosslessEffort.Balanced, 300, 200)]
+    [Arguments(JxlLosslessEffort.Maximum, 120, 90)]
+    [Arguments(JxlLosslessEffort.Turbo, 1300, 1100)]
+    [Arguments(JxlLosslessEffort.Fast, 1300, 1100)]
+    [Arguments(JxlLosslessEffort.Balanced, 1300, 1100)]
+    public async Task Jxl_Encode_Efforts_RoundTrip_Lossless(JxlLosslessEffort effort, int width, int height)
+    {
+        // every effort level (fixed tree, small / e7-style learned trees, the exhaustive search), one group and tiled
+        using var frame = CreateNoisyGradientFrame(width, height);
+        byte[] jxl = JxlCoder.Encode(frame, effort);
+        using var decoded = JxlCoder.Decode(jxl);
+        await Assert.That((int)decoded.Columns).IsEqualTo(width);
+        await Assert.That((int)decoded.Rows).IsEqualTo(height);
+        await AssertLossless(frame, decoded);
+    }
+
+    // A gradient with deterministic noise, so the learned trees have something to split on.
+    private static ImageFrame CreateNoisyGradientFrame(int width, int height)
+    {
+        var frame = CreateGradientFrame(width, height);
+        var rng = new Random(7);
+        int ch = frame.NumberOfChannels;
+        for (int y = 0; y < height; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int i = 0; i < width * ch; i++)
+            {
+                int v = Quantum.ScaleToByte(row[i]) + rng.Next(-6, 7);
+                row[i] = Quantum.ScaleFromByte((byte)Math.Clamp(v, 0, 255));
+            }
+        }
+
+        return frame;
+    }
+
     private static async Task AssertLossless(ImageFrame original, ImageFrame decoded)
     {
         int oc = original.NumberOfChannels;

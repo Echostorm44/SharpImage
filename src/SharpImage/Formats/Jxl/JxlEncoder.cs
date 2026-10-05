@@ -59,6 +59,8 @@ internal static partial class JxlEncoder
         public bool TryWpModes { get; init; } = true;
         public bool TryPrefix { get; init; } = true;
         public bool TrySingleLeaf { get; init; } = true;
+        /// <summary>libjxl's fixed weighted-predictor tree (kWPFixedDC) instead of a learned one.</summary>
+        public bool FixedWpTree { get; init; }
         /// <summary>Estimate the weighted-predictor parameter mode (else libjxl's default, mode 0).</summary>
         public bool EstimateWpMode { get; init; } = true;
         /// <summary>WP-mode estimate on every Nth 16-row band only (1: every row).</summary>
@@ -70,9 +72,88 @@ internal static partial class JxlEncoder
         internal static readonly int[] LibjxlRctOrder = { 0, 6, 5, 10, 26, 40, 12, 19, 8, 4, 9, 15, 16, 17, 32, 33, 2, 1, 3 };
 
         public static readonly LosslessProfile Maximum = new() { NodeThresholds = JxlTreeLearner.NodeThresholds };
+
+        // libjxl effort 7's search (kSquirrel: node threshold 82 + 14 * 3, the gradient + weighted predictors, the
+        // first properties of its order) widened by two properties and every RCT; default WP mode candidates are
+        // estimated on row bands; ANS only. Small images (one group) also try the second threshold.
+        private static readonly JxlLearnParams BalancedLearn = new() { PropIdx = new[] { 0, 2, 3, 4, 5, 6, 7, 8, 9 }, PredIdx = new[] { 0, 1 } };
+
+        private static readonly LosslessProfile BalancedLarge = new()
+        {
+            NodeThresholds = new[] { 124f }, Learn = BalancedLearn, TryWpModes = false, TryPrefix = false, WpEstimateBandStep = 8,
+        };
+
+        private static readonly LosslessProfile BalancedSmall = new()
+        {
+            NodeThresholds = new[] { 96f, 160f }, Learn = BalancedLearn, TryWpModes = false, TryPrefix = false, WpEstimateBandStep = 8,
+        };
+
+        // libjxl effort 5 (kHare: node threshold 82 + 14 * 5, four properties, four RCTs, the default WP mode)
+        private static readonly LosslessProfile Fast = new()
+        {
+            NodeThresholds = new[] { 152f },
+            Learn = new JxlLearnParams { PropIdx = new[] { 0, 2, 3, 4 }, PredIdx = new[] { 0, 1 }, MaxSamples = 1 << 20 },
+            TryWpModes = false, TryPrefix = false, TrySingleLeaf = false, EstimateWpMode = false, RctCandidates = LibjxlRctOrder[..4],
+        };
+
+        // libjxl effort 3 (kFalcon: the fixed weighted-predictor tree, YCoCg, the default WP mode)
+        private static readonly LosslessProfile Turbo = new()
+        {
+            NodeThresholds = Array.Empty<float>(), FixedWpTree = true, TryWpModes = false, TryPrefix = false, TrySingleLeaf = false,
+            EstimateWpMode = false, RctCandidates = new[] { 6 },
+        };
+
+        /// <summary>The search for an effort level and image size (images of at most 32K pixels always get the full
+        /// search: it costs little there and the headers dominate).</summary>
+        public static LosslessProfile For(JxlLosslessEffort effort, int w, int h)
+        {
+            long px = (long)w * h;
+            return effort switch
+            {
+                JxlLosslessEffort.Turbo => Turbo,
+                JxlLosslessEffort.Fast => px <= (1 << 15) ? Maximum : Fast,
+                JxlLosslessEffort.Maximum => Maximum,
+                _ => px <= (1 << 15) ? Maximum : (w <= GroupDim && h <= GroupDim ? BalancedSmall : BalancedLarge),
+            };
+        }
     }
 
-    public static byte[] EncodeLossless(ImageFrame image) => EncodeLossless(image, LosslessProfile.Maximum);
+    /// <summary>libjxl's kWPFixedDC tree (enc_encoding.cc MakeFixedTree): a balanced split on the weighted predictor's
+    /// error property over fixed cutoffs, the weighted predictor in every leaf; shallower for small images.</summary>
+    private static MaTreeNode FixedWpTree(long numPixels, int bitdepth)
+    {
+        int[] cutoffs = { -500, -392, -255, -191, -127, -95, -63, -47, -31, -23, -15, -11, -7, -4, -3, -1, 0, 1, 3, 5, 7, 11, 15, 23, 31,
+            47, 63, 95, 127, 191, 255, 392, 500 };
+        int logPx = JxlBits.CeilLog2(Math.Max(1, (int)Math.Min(numPixels, int.MaxValue)));
+        int minGap = logPx < 14 ? 8 * (14 - logPx) : 0;
+        int mul = 1 << (bitdepth > 11 ? Math.Min(4, bitdepth - 11) : 0);
+        var root = new MaTreeNode { Property = -1, Predictor = WeightedPredictor };
+        var q = new Queue<(int Begin, int End, MaTreeNode Node)>();
+        q.Enqueue((0, cutoffs.Length, root));
+        while (q.Count > 0)
+        {
+            var (begin, end, node) = q.Dequeue();
+            if (begin + minGap >= end)
+            {
+                continue;
+            }
+
+            int split = (begin + end) / 2;
+            node.Property = 15;
+            node.SplitVal = cutoffs[split] * mul;
+            node.Left = new MaTreeNode { Property = -1, Predictor = WeightedPredictor };   // > cutoff
+            node.Right = new MaTreeNode { Property = -1, Predictor = WeightedPredictor };  // <= cutoff
+            q.Enqueue((split + 1, end, node.Left));
+            q.Enqueue((begin, split, node.Right));
+        }
+
+        return root;
+    }
+
+    public static byte[] EncodeLossless(ImageFrame image) => EncodeLossless(image, JxlLosslessEffort.Balanced);
+
+    public static byte[] EncodeLossless(ImageFrame image, JxlLosslessEffort effort) =>
+        EncodeLossless(image, LosslessProfile.For(effort, (int)image.Columns, (int)image.Rows));
 
     internal static byte[] EncodeLossless(ImageFrame image, LosslessProfile profile)
     {
@@ -615,6 +696,18 @@ internal static partial class JxlEncoder
             {
                 best = BuildSection(channels, writeTransforms, tree, wpMode, useAns: false); // ANS cannot code this alphabet
             }
+        }
+
+        if (profile.FixedWpTree)
+        {
+            long px = 0;
+            foreach (EncChannel ch in channels)
+            {
+                px += (long)ch.W * ch.H;
+            }
+
+            Consider(new LearnedTree(FixedWpTree(px, 8)));
+            return best;
         }
 
         if (profile.TrySingleLeaf)
@@ -1404,6 +1497,12 @@ internal static partial class JxlEncoder
         // (no single-leaf candidate here: on multi-group images a learned tree always beats it by far, and a
         // learned tree with no profitable split is the single leaf anyway)
         byte[][] best = null!;
+        if (profile.FixedWpTree)
+        {
+            Consider(new LearnedTree(FixedWpTree((long)w * h * nb, 8)), ref best);
+            return best;
+        }
+
         foreach (MaTreeNode tree in JxlTreeLearner.LearnMulti(tileRefs, WpMode(wpMode), profile.NodeThresholds, profile.Learn))
         {
             Consider(new LearnedTree(tree), ref best);
