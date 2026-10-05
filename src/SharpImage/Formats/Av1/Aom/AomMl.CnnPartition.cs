@@ -159,54 +159,80 @@ internal static partial class AomMl
         var wm1 = Vector256.Create(2, 3, 2, 3, 2, 3, 2, 3);
         ref float in0 = ref MemoryMarshal.GetArrayDataReference(input);
         ref float out0 = ref MemoryMarshal.GetArrayDataReference(output);
-        Span<Vector256<float>> acc = stackalloc Vector256<float>[8];
-        int nAcc = inSize == 16 ? 8 : 2;
+        // the accumulators as locals (registers), as libaom's __m256 out[8]
         for (int i = 0; i < outChannels; i++)
         {
             var biasReg = Vector256.Create(bias[i]);
-            for (int j = 0; j < nAcc; j++) acc[j] = biasReg;
-            for (int k = 0; k < inChannels; k++)
-            {
-                int off = k * outChannels + i;
-                var wv = Vector256.Create(weights[off], weights[off + cstep], weights[off + 2 * cstep], weights[off + 3 * cstep], 0, 0, 0, 0);
-                var w0 = Avx2.PermuteVar8x32(wv, wm0);
-                var w1 = Avx2.PermuteVar8x32(wv, wm1);
-                int plane = k * inSize * inSize;
-                if (inSize == 16)
-                {
-                    // perform_convolve_for_8h_2x2_blocks
-                    for (int h = 0, u = 0; h < 15; h += 2, ++u)
-                    {
-                        int p = plane + h * 16;
-                        var l0 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)p), w0);
-                        var l1 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 8)), w0);
-                        var l2 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 16)), w1);
-                        var l3 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 24)), w1);
-                        l0 = Avx.Add(l0, l2);
-                        l1 = Avx.Add(l1, l3);
-                        acc[u] = Avx.Add(acc[u], Avx2.PermuteVar8x32(Avx.HorizontalAdd(l0, l1), outMask));
-                    }
-                }
-                else
-                {
-                    // perform_convolve_for_4hx2v_2x2_blocks
-                    for (int h = 0, u = 0; h < 7; h += 4, ++u)
-                    {
-                        int p = plane + h * 8;
-                        var l0 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)p), w0);
-                        var l1 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 8)), w1);
-                        var l2 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 16)), w0);
-                        var l3 = Avx.Multiply(Vector256.LoadUnsafe(ref in0, (nuint)(p + 24)), w1);
-                        l0 = Avx.Add(l0, l1);
-                        l2 = Avx.Add(l2, l3);
-                        acc[u] = Avx.Add(acc[u], Avx2.PermuteVar8x32(Avx.HorizontalAdd(l0, l2), outMask));
-                    }
-                }
-            }
             int ob = outBase + i * outStride * outStride;
-            if (inSize == 16) for (int j = 0; j < 8; j++) acc[j].StoreUnsafe(ref out0, (nuint)(ob + j * outStride));
-            else for (int j = 0; j < 2; j++) acc[j].StoreUnsafe(ref out0, (nuint)(ob + j * outStride * 2));
+            if (inSize == 16)
+            {
+                Vector256<float> a0 = biasReg, a1 = biasReg, a2 = biasReg, a3 = biasReg, a4 = biasReg, a5 = biasReg, a6 = biasReg, a7 = biasReg;
+                for (int k = 0; k < inChannels; k++)
+                {
+                    int off = k * outChannels + i;
+                    var wv = Vector256.Create(weights[off], weights[off + cstep], weights[off + 2 * cstep], weights[off + 3 * cstep], 0, 0, 0, 0);
+                    var w0 = Avx2.PermuteVar8x32(wv, wm0);
+                    var w1 = Avx2.PermuteVar8x32(wv, wm1);
+                    ref float pl = ref Unsafe.Add(ref in0, k * 256);
+                    // perform_convolve_for_8h_2x2_blocks, rows h = 0, 2, .. 14 into a0 .. a7
+                    a0 = Avx.Add(a0, Row2x2(ref pl, 0, w0, w1, outMask));
+                    a1 = Avx.Add(a1, Row2x2(ref pl, 32, w0, w1, outMask));
+                    a2 = Avx.Add(a2, Row2x2(ref pl, 64, w0, w1, outMask));
+                    a3 = Avx.Add(a3, Row2x2(ref pl, 96, w0, w1, outMask));
+                    a4 = Avx.Add(a4, Row2x2(ref pl, 128, w0, w1, outMask));
+                    a5 = Avx.Add(a5, Row2x2(ref pl, 160, w0, w1, outMask));
+                    a6 = Avx.Add(a6, Row2x2(ref pl, 192, w0, w1, outMask));
+                    a7 = Avx.Add(a7, Row2x2(ref pl, 224, w0, w1, outMask));
+                }
+                a0.StoreUnsafe(ref out0, (nuint)ob); a1.StoreUnsafe(ref out0, (nuint)(ob + outStride));
+                a2.StoreUnsafe(ref out0, (nuint)(ob + 2 * outStride)); a3.StoreUnsafe(ref out0, (nuint)(ob + 3 * outStride));
+                a4.StoreUnsafe(ref out0, (nuint)(ob + 4 * outStride)); a5.StoreUnsafe(ref out0, (nuint)(ob + 5 * outStride));
+                a6.StoreUnsafe(ref out0, (nuint)(ob + 6 * outStride)); a7.StoreUnsafe(ref out0, (nuint)(ob + 7 * outStride));
+            }
+            else
+            {
+                Vector256<float> a0 = biasReg, a1 = biasReg;
+                for (int k = 0; k < inChannels; k++)
+                {
+                    int off = k * outChannels + i;
+                    var wv = Vector256.Create(weights[off], weights[off + cstep], weights[off + 2 * cstep], weights[off + 3 * cstep], 0, 0, 0, 0);
+                    var w0 = Avx2.PermuteVar8x32(wv, wm0);
+                    var w1 = Avx2.PermuteVar8x32(wv, wm1);
+                    ref float pl = ref Unsafe.Add(ref in0, k * 64);
+                    // perform_convolve_for_4hx2v_2x2_blocks, rows h = 0 and 4
+                    a0 = Avx.Add(a0, Rows4x2(ref pl, 0, w0, w1, outMask));
+                    a1 = Avx.Add(a1, Rows4x2(ref pl, 32, w0, w1, outMask));
+                }
+                a0.StoreUnsafe(ref out0, (nuint)ob);
+                a1.StoreUnsafe(ref out0, (nuint)(ob + outStride * 2));
+            }
         }
+    }
+
+    // perform_convolve_for_8h_2x2_blocks: the 2x2 blocks of rows (h, h + 1) of a 16-wide plane at p
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> Row2x2(ref float pl, int p, Vector256<float> w0, Vector256<float> w1, Vector256<int> outMask)
+    {
+        var l0 = Avx.Multiply(Vector256.LoadUnsafe(ref pl, (nuint)p), w0);
+        var l1 = Avx.Multiply(Vector256.LoadUnsafe(ref pl, (nuint)(p + 8)), w0);
+        var l2 = Avx.Multiply(Vector256.LoadUnsafe(ref pl, (nuint)(p + 16)), w1);
+        var l3 = Avx.Multiply(Vector256.LoadUnsafe(ref pl, (nuint)(p + 24)), w1);
+        l0 = Avx.Add(l0, l2);
+        l1 = Avx.Add(l1, l3);
+        return Avx2.PermuteVar8x32(Avx.HorizontalAdd(l0, l1), outMask);
+    }
+
+    // perform_convolve_for_4hx2v_2x2_blocks: the 2x2 blocks of rows (h .. h + 3) of an 8-wide plane at p
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> Rows4x2(ref float pl, int p, Vector256<float> w0, Vector256<float> w1, Vector256<int> outMask)
+    {
+        var l0 = Avx.Multiply(Vector256.LoadUnsafe(ref pl, (nuint)p), w0);
+        var l1 = Avx.Multiply(Vector256.LoadUnsafe(ref pl, (nuint)(p + 8)), w1);
+        var l2 = Avx.Multiply(Vector256.LoadUnsafe(ref pl, (nuint)(p + 16)), w0);
+        var l3 = Avx.Multiply(Vector256.LoadUnsafe(ref pl, (nuint)(p + 24)), w1);
+        l0 = Avx.Add(l0, l1);
+        l2 = Avx.Add(l2, l3);
+        return Avx2.PermuteVar8x32(Avx.HorizontalAdd(l0, l2), outMask);
     }
 
     // the scalar emulation of the AVX2 kernels (no AVX2)
