@@ -606,13 +606,91 @@ internal static class AomTxb
     /// <summary>av1_optimize_txb: libaom's trellis on one tx block's levels (qcoeff / dqcoeff updated in place, tcoeff
     /// the transform coefficients). rdmult: x->rdmult; txTypeCost: get_tx_type_cost. Returns the new eob; rate: the
     /// block's coded bits (1/512).</summary>
-    [SkipLocalsInit]   // libaom's levels_buf / coeff_contexts are uninitialized stack arrays filled before use
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int OptimizeTxb(AomCoeffCosts costs, int txSize, int txType, int planeType, bool isInter, AomTxbCtx txbCtx,
         ReadOnlySpan<int> tcoeff, Span<int> qcoeff, Span<int> dqcoeff, int eob, short dequant0, short dequant1,
         int rdmultIn, int bitDepth, int sharpness, bool useChromaTrellisRdMult, bool tuneIq, int txTypeCost,
         ReadOnlySpan<ushort> scan, out int rateCost, byte[]? iqmatrix = null, byte[]? qmatrix = null)
     {
+        var a = new ExplicitTrellisArgs
+        {
+            Costs = costs, TxSize = txSize, TxType = txType, PlaneType = planeType, IsInter = isInter, TxbCtx = txbCtx,
+            Tcoeff = tcoeff, Qcoeff = qcoeff, Dqcoeff = dqcoeff, Eob = eob, Dequant0 = dequant0, Dequant1 = dequant1,
+            RdmultIn = rdmultIn, BitDepth = bitDepth, Sharpness = sharpness, UseChromaTrellisRdMult = useChromaTrellisRdMult,
+            TuneIq = tuneIq, TxTypeCost = txTypeCost, Scan = scan, Iqmatrix = iqmatrix, Qmatrix = qmatrix,
+        };
+        return OptimizeTxbCore(ref a, out rateCost);
+    }
+
+    /// <summary>av1_optimize_txb's arguments. The encoder passes a view of the MACROBLOCK whose members compute each
+    /// argument where the trellis reads it (a 22-argument call spilled and copied its spans on every block); the
+    /// explicit form serves the twin tests.</summary>
+    internal interface ITrellisArgs
+    {
+        AomCoeffCosts Costs { get; }
+        int TxSize { get; }
+        int TxType { get; }
+        int PlaneType { get; }
+        bool IsInter { get; }
+        AomTxbCtx TxbCtx { get; }
+        ReadOnlySpan<int> Tcoeff { get; }
+        Span<int> Qcoeff { get; }
+        Span<int> Dqcoeff { get; }
+        int Eob { get; }
+        short Dequant0 { get; }
+        short Dequant1 { get; }
+        int RdmultIn { get; }
+        int BitDepth { get; }
+        int Sharpness { get; }
+        bool UseChromaTrellisRdMult { get; }
+        bool TuneIq { get; }
+        int TxTypeCost { get; }
+        ReadOnlySpan<ushort> Scan { get; }
+        byte[]? Iqmatrix { get; }
+        byte[]? Qmatrix { get; }
+    }
+
+    internal ref struct ExplicitTrellisArgs : ITrellisArgs
+    {
+        public AomCoeffCosts Costs { get; set; }
+        public int TxSize { get; set; }
+        public int TxType { get; set; }
+        public int PlaneType { get; set; }
+        public bool IsInter { get; set; }
+        public AomTxbCtx TxbCtx { get; set; }
+        public ReadOnlySpan<int> Tcoeff { get; set; }
+        public Span<int> Qcoeff { get; set; }
+        public Span<int> Dqcoeff { get; set; }
+        public int Eob { get; set; }
+        public short Dequant0 { get; set; }
+        public short Dequant1 { get; set; }
+        public int RdmultIn { get; set; }
+        public int BitDepth { get; set; }
+        public int Sharpness { get; set; }
+        public bool UseChromaTrellisRdMult { get; set; }
+        public bool TuneIq { get; set; }
+        public int TxTypeCost { get; set; }
+        public ReadOnlySpan<ushort> Scan { get; set; }
+        public byte[]? Iqmatrix { get; set; }
+        public byte[]? Qmatrix { get; set; }
+    }
+
+    [SkipLocalsInit]   // libaom's levels_buf / coeff_contexts are uninitialized stack arrays filled before use
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int OptimizeTxbCore<TA>(scoped ref TA a, out int rateCost) where TA : ITrellisArgs, allows ref struct
+    {
+        var costs = a.Costs;
+        int txSize = a.TxSize, txType = a.TxType, planeType = a.PlaneType;
+        bool isInter = a.IsInter;
+        var txbCtx = a.TxbCtx;
+        ReadOnlySpan<int> tcoeff = a.Tcoeff;
+        Span<int> qcoeff = a.Qcoeff, dqcoeff = a.Dqcoeff;
+        int eob = a.Eob;
+        short dequant0 = a.Dequant0, dequant1 = a.Dequant1;
+        int rdmultIn = a.RdmultIn, bitDepth = a.BitDepth, sharpness = a.Sharpness;
+        bool useChromaTrellisRdMult = a.UseChromaTrellisRdMult, tuneIq = a.TuneIq;
+        int txTypeCost = a.TxTypeCost;
+        ReadOnlySpan<ushort> scan = a.Scan;
+        byte[]? iqmatrix = a.Iqmatrix, qmatrix = a.Qmatrix;
         int shift = AomQuantize.TxScale(txSize);
         int txsCtx = TxsizeEntropyCtx(txSize);
         int txClass = TxTypeToClass[txType];

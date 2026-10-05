@@ -608,6 +608,7 @@ internal static partial class AomEncodeMb
         => costs.Get(AomTxb.TxsizeEntropyCtx(txSize), plane == 0 ? 0 : 1).TxbSkip[ctx.TxbSkipCtx * 2 + 1];
 
     /// <summary>av1_optimize_b: the trellis (or the skip cost when there is nothing to optimise). Returns the eob.</summary>
+    [SkipLocalsInit]   // as the trellis / cost kernels it inlines (a localsinit mismatch blocks the inlining)
     internal static int OptimizeB(AomComp cpi, AomMacroblock x, int plane, int block, int txSize, int txType, AomTxbCtx txbCtx, out int rateCost)
     {
         var xd = x.E;
@@ -622,17 +623,42 @@ internal static partial class AomEncodeMb
         int off = BlockOffset(block), n = MaxEob(txSize);
         var scan = ScanOf(txSize, txType);
         var q = p.Qcoeff.AsSpan(off, n);
-        eob = AomTxb.OptimizeTxb(x.CoeffCosts, txSize, txType, plane == 0 ? 0 : 1, IsInterBlock(xd.Mi0), txbCtx, p.Coeff.AsSpan(off, n), q,
-            p.Dqcoeff.AsSpan(off, n), eob, p.Dequant0, p.Dequant1, x.Rdmult, xd.Bd, cpi.Sharpness, cpi.Sf.tx_sf.use_chroma_trellis_rd_mult != 0,
-            cpi.TuneIq, TxTypeCost(x, plane, txSize, txType, cpi.ReducedTxSetUsed), scan, out rateCost,
-            AomQm.Iqmatrix(xd.Plane[plane].QmLevel, plane, txSize, txType),
-            cpi.QmPsnrDistMetric ? AomQm.Qmatrix(xd.Plane[plane].QmLevel, plane, txSize, txType) : null);
+        var args = new MbTrellisArgs(cpi, x, p, plane, block, txSize, txType, txbCtx, eob, off, n);
+        eob = AomTxb.OptimizeTxbCore(ref args, out rateCost);
         p.Eobs[block] = (ushort)eob;
         p.TxbEntropyCtx[block] = AomTxb.TxbEntropyContext(q, scan, eob);
         return eob;
     }
 
+    /// <summary>av1_optimize_b's arguments to av1_optimize_txb, read from the MACROBLOCK where the trellis uses them.</summary>
+    private readonly ref struct MbTrellisArgs(AomComp cpi, AomMacroblock x, AomMbPlane p, int plane, int block, int txSize, int txType,
+        AomTxbCtx txbCtx, int eob, int off, int n) : AomTxb.ITrellisArgs
+    {
+        public AomCoeffCosts Costs => x.CoeffCosts;
+        public int TxSize => txSize;
+        public int TxType => txType;
+        public int PlaneType => plane == 0 ? 0 : 1;
+        public bool IsInter => IsInterBlock(x.E.Mi0);
+        public AomTxbCtx TxbCtx => txbCtx;
+        public ReadOnlySpan<int> Tcoeff => p.Coeff.AsSpan(off, n);
+        public Span<int> Qcoeff => p.Qcoeff.AsSpan(off, n);
+        public Span<int> Dqcoeff => p.Dqcoeff.AsSpan(off, n);
+        public int Eob => eob;
+        public short Dequant0 => p.Dequant0;
+        public short Dequant1 => p.Dequant1;
+        public int RdmultIn => x.Rdmult;
+        public int BitDepth => x.E.Bd;
+        public int Sharpness => cpi.Sharpness;
+        public bool UseChromaTrellisRdMult => cpi.Sf.tx_sf.use_chroma_trellis_rd_mult != 0;
+        public bool TuneIq => cpi.TuneIq;
+        public int TxTypeCost => AomEncodeMb.TxTypeCost(x, plane, txSize, txType, cpi.ReducedTxSetUsed);
+        public ReadOnlySpan<ushort> Scan => ScanOf(txSize, txType);
+        public byte[]? Iqmatrix => AomQm.Iqmatrix(x.E.Plane[plane].QmLevel, plane, txSize, txType);
+        public byte[]? Qmatrix => cpi.QmPsnrDistMetric ? AomQm.Qmatrix(x.E.Plane[plane].QmLevel, plane, txSize, txType) : null;
+    }
+
     /// <summary>cost_coeffs / av1_cost_coeffs_txb.</summary>
+    [SkipLocalsInit]   // as the trellis / cost kernels it inlines (a localsinit mismatch blocks the inlining)
     internal static int CostCoeffs(AomMacroblock x, int plane, int block, int txSize, int txType, AomTxbCtx txbCtx, int reducedTxSetUsed)
     {
         var p = x.Plane[plane];
