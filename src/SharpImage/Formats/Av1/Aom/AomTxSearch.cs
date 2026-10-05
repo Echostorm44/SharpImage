@@ -479,6 +479,7 @@ internal static partial class AomTxSearch
     private static readonly int[,] ThreshArr = { { 10, 15, 15, 10, 15, 15, 15 }, { 10, 17, 17, 10, 17, 17, 17 } };
 
     /// <summary>get_tx_mask.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ushort GetTxMask(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize,
         AomTxbCtx txbCtx, int ftxsMode, long refBestRd, out int allowedTxkTypes, Span<int> txkMap)
     {
@@ -547,57 +548,8 @@ internal static partial class AomTxSearch
             allowedTxMask = DerivedIntraTxUsedFlag[intraDir];
             allowedTxMask &= extTxUsedFlag;
         }
-        else
-        {
-            allowedTxMask = extTxUsedFlag;
-            int numAllowed = 0;
-            ushort allowedTxMaskU;
-            if (sf.tx_sf.tx_type_search.prune_tx_type_using_stats != 0)
-            {
-                int thresh = ThreshArr[sf.tx_sf.tx_type_search.prune_tx_type_using_stats - 1, cpi.UpdateType];
-                int prune = 0, maxProb = -1, maxIdx = 0;
-                for (int i = 0; i < TX_TYPES; i++)
-                {
-                    int prob = cpi.TxTypeProbs[probsOff + i];
-                    if (prob > maxProb && (allowedTxMask & (1 << i)) != 0) { maxProb = prob; maxIdx = i; }
-                    if (prob < thresh) prune |= 1 << i;
-                }
-                if (((prune >> maxIdx) & 1) != 0) prune &= ~(1 << maxIdx);
-                allowedTxMask &= ~prune;
-            }
-            for (int i = 0; i < TX_TYPES; i++)
-                if ((allowedTxMask & (1 << i)) != 0) numAllowed++;
-            allowedTxMaskU = (ushort)allowedTxMask;
-
-            if (numAllowed > 2 && sf.tx_sf.tx_type_search.prune_tx_type_est_rd != 0)
-            {
-                int pf = PruneFactors[txfmParams.Prune2dTxfmMode];
-                int mf = MulFactors[txfmParams.Prune2dTxfmMode];
-                if (numAllowed <= 7)
-                {
-                    ushort prune = PruneTxkType(cpi, x, plane, block, txSize, blkRow, blkCol, planeBsize, txkMap, allowedTxMask, pf, txbCtx);
-                    allowedTxMask &= ~prune;
-                }
-                else
-                {
-                    int numSel = (numAllowed * mf + 50) / 100;
-                    ushort prune = PruneTxkTypeSepar(cpi, x, plane, block, txSize, blkRow, blkCol, planeBsize, txkMap, allowedTxMask, pf,
-                        txbCtx, refBestRd, numSel);
-                    allowedTxMask &= ~prune;
-                }
-            }
-            else
-            {
-                int allowedTxCount = txfmParams.Prune2dTxfmMode >= TX_TYPE_PRUNE_4 ? 1 : 5;
-                if (txfmParams.Prune2dTxfmMode >= TX_TYPE_PRUNE_1 && isInter && numAllowed > allowedTxCount)
-                {
-                    int diffStride = BlockSizeWide[planeBsize];
-                    AomMl.PruneTx2D(x.Plane[0].SrcDiff.AsSpan(4 * blkRow * diffStride + 4 * blkCol), diffStride, txSize, txSetType,
-                        txfmParams.Prune2dTxfmMode, txkMap, ref allowedTxMaskU);
-                    allowedTxMask = allowedTxMaskU;
-                }
-            }
-        }
+        else allowedTxMask = GetTxMaskPruned(cpi, x, plane, block, blkRow, blkCol, planeBsize, txSize, txbCtx, refBestRd, txkMap,
+            extTxUsedFlag, probsOff, txSetType, isInter);
 
         // Need to have at least one transform type allowed.
         if (allowedTxMask == 0)
@@ -609,6 +561,66 @@ internal static partial class AomTxSearch
         AomTrace.Out?.Write($"txmask p {plane} ts {txSize} allowed {txkAllowed} mask {allowedTxMask:x} dth {txfmParams.DefaultInterTxTypeProbThresh} p2d {txfmParams.Prune2dTxfmMode} rdm {x.RdModel} ut {cpi.UpdateType}" + (char)10);
         allowedTxkTypes = txkAllowed;
         return (ushort)allowedTxMask;
+    }
+
+    /// <summary>get_tx_mask's search of the allowed types (the transform-type statistics, prune_tx_type_est_rd /
+    /// prune_txk_type(_separ) and prune_tx_2D), out of line so the common masks inline into search_tx_type.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int GetTxMaskPruned(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize,
+        AomTxbCtx txbCtx, long refBestRd, Span<int> txkMap, int extTxUsedFlag, int probsOff, int txSetType, bool isInter)
+    {
+        var sf = cpi.Sf;
+        var txfmParams = x.TxfmSearchParams;
+        int allowedTxMask;
+        allowedTxMask = extTxUsedFlag;
+        int numAllowed = 0;
+        ushort allowedTxMaskU;
+        if (sf.tx_sf.tx_type_search.prune_tx_type_using_stats != 0)
+        {
+            int thresh = ThreshArr[sf.tx_sf.tx_type_search.prune_tx_type_using_stats - 1, cpi.UpdateType];
+            int prune = 0, maxProb = -1, maxIdx = 0;
+            for (int i = 0; i < TX_TYPES; i++)
+            {
+                int prob = cpi.TxTypeProbs[probsOff + i];
+                if (prob > maxProb && (allowedTxMask & (1 << i)) != 0) { maxProb = prob; maxIdx = i; }
+                if (prob < thresh) prune |= 1 << i;
+            }
+            if (((prune >> maxIdx) & 1) != 0) prune &= ~(1 << maxIdx);
+            allowedTxMask &= ~prune;
+        }
+        for (int i = 0; i < TX_TYPES; i++)
+            if ((allowedTxMask & (1 << i)) != 0) numAllowed++;
+        allowedTxMaskU = (ushort)allowedTxMask;
+
+        if (numAllowed > 2 && sf.tx_sf.tx_type_search.prune_tx_type_est_rd != 0)
+        {
+            int pf = PruneFactors[txfmParams.Prune2dTxfmMode];
+            int mf = MulFactors[txfmParams.Prune2dTxfmMode];
+            if (numAllowed <= 7)
+            {
+                ushort prune = PruneTxkType(cpi, x, plane, block, txSize, blkRow, blkCol, planeBsize, txkMap, allowedTxMask, pf, txbCtx);
+                allowedTxMask &= ~prune;
+            }
+            else
+            {
+                int numSel = (numAllowed * mf + 50) / 100;
+                ushort prune = PruneTxkTypeSepar(cpi, x, plane, block, txSize, blkRow, blkCol, planeBsize, txkMap, allowedTxMask, pf,
+                    txbCtx, refBestRd, numSel);
+                allowedTxMask &= ~prune;
+            }
+        }
+        else
+        {
+            int allowedTxCount = txfmParams.Prune2dTxfmMode >= TX_TYPE_PRUNE_4 ? 1 : 5;
+            if (txfmParams.Prune2dTxfmMode >= TX_TYPE_PRUNE_1 && isInter && numAllowed > allowedTxCount)
+            {
+                int diffStride = BlockSizeWide[planeBsize];
+                AomMl.PruneTx2D(x.Plane[0].SrcDiff.AsSpan(4 * blkRow * diffStride + 4 * blkCol), diffStride, txSize, txSetType,
+                    txfmParams.Prune2dTxfmMode, txkMap, ref allowedTxMaskU);
+                allowedTxMask = allowedTxMaskU;
+            }
+        }
+        return allowedTxMask;
     }
 
     /// <summary>skip_trellis_opt_based_on_satd.</summary>
