@@ -14,13 +14,18 @@ internal sealed partial class AomMacroblockD
 {
     /// <summary>xd->block_ref_scale_factors.</summary>
     public readonly AomScaleFactors?[] BlockRefScaleFactors = new AomScaleFactors?[2];
+    // the inter prediction buffers are created on first use (an all-intra encode never touches them)
+    private ushort[]? _tmpConvDst;
+    private byte[]? _segMask;
+    private byte[][]? _tmpObmcBufs;
+    private ushort[][]? _tmpObmcBufs16;
     /// <summary>xd->tmp_conv_dst [MAX_SB_SIZE * MAX_SB_SIZE] (CONV_BUF_TYPE).</summary>
-    public readonly ushort[] TmpConvDst = new ushort[128 * 128];
+    public ushort[] TmpConvDst => _tmpConvDst ??= new ushort[128 * 128];
     /// <summary>xd->seg_mask [2 * MAX_SB_SQUARE].</summary>
-    public readonly byte[] SegMask = new byte[2 * 128 * 128];
+    public byte[] SegMask => _segMask ??= new byte[2 * 128 * 128];
     /// <summary>xd->tmp_obmc_bufs[2] (3 planes of MAX_SB_SQUARE each).</summary>
-    public readonly byte[][] TmpObmcBufs = { new byte[3 * 128 * 128], new byte[3 * 128 * 128] };
-    public readonly ushort[][] TmpObmcBufs16 = { new ushort[3 * 128 * 128], new ushort[3 * 128 * 128] };
+    public byte[][] TmpObmcBufs => _tmpObmcBufs ??= new[] { new byte[3 * 128 * 128], new byte[3 * 128 * 128] };
+    public ushort[][] TmpObmcBufs16 => _tmpObmcBufs16 ??= new[] { new ushort[3 * 128 * 128], new ushort[3 * 128 * 128] };
     /// <summary>xd->global_motion (cm->global_motion).</summary>
     public AomWarpedMotionParams[] GlobalMotion = AomWarpedMotionParams.NewIdentitySet();
     public bool IsHbd => Bd > 8;

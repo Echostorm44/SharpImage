@@ -197,11 +197,16 @@ internal sealed partial class AomMacroblock
     /// <summary>x->thresh_freq_fact [BLOCK_SIZES_ALL][MAX_MODES].</summary>
     public readonly int[,] ThreshFreqFact = new int[BLOCK_SIZES_ALL, MAX_MODES];
     public AomFullMvLimits MvLimits;
-    public AomInterModesInfo InterModesInfo = new();
-    public readonly AomObmcBuffer ObmcBuffer = new();
+    private AomInterModesInfo? _interModesInfo;
+    private AomObmcBuffer? _obmcBuffer;
+    /// <summary>Created on first use (inter frames).</summary>
+    public AomInterModesInfo InterModesInfo { get => _interModesInfo ??= new(); set => _interModesInfo = value; }
+    public AomObmcBuffer ObmcBuffer => _obmcBuffer ??= new();
     /// <summary>x->tmp_pred_bufs[2] (three planes of MAX_SB_SQUARE each).</summary>
-    public readonly byte[][] TmpPredBufs = { new byte[3 * 128 * 128], new byte[3 * 128 * 128] };
-    public readonly ushort[][] TmpPredBufs16 = { new ushort[3 * 128 * 128], new ushort[3 * 128 * 128] };
+    private byte[][]? _tmpPredBufs;
+    private ushort[][]? _tmpPredBufs16;
+    public byte[][] TmpPredBufs => _tmpPredBufs ??= new[] { new byte[3 * 128 * 128], new byte[3 * 128 * 128] };
+    public ushort[][] TmpPredBufs16 => _tmpPredBufs16 ??= new[] { new ushort[3 * 128 * 128], new ushort[3 * 128 * 128] };
     public readonly int[] PickedRefFramesMask = new int[32 * 32];
     public readonly long[,] TopInterTxNoSplitRd = new long[MAX_TX_BLOCKS_IN_MAX_SB, TOP_INTER_TX_NO_SPLIT_COUNT];
     public readonly long[] TopCompAvgEstRd = new long[TOP_COMP_AVG_EST_RD_COUNT];

@@ -47,7 +47,9 @@ internal sealed class AomMvCosts
 
 internal sealed partial class AomMacroblock
 {
-    public AomMvCosts MvCosts = new();
+    private AomMvCosts? _mvCosts;
+    /// <summary>Created on first use (inter frames).</summary>
+    public AomMvCosts MvCosts { get => _mvCosts ??= new(); set => _mvCosts = value; }
     public readonly int[] PredMv0Sad = new int[REF_FRAMES];
     public readonly int[] PredMv1Sad = new int[REF_FRAMES];
 }

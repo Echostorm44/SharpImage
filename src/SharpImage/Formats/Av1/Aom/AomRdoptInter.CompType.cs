@@ -32,7 +32,9 @@ internal sealed partial class AomMacroblock
 {
     /// <summary>x->comp_rd_stats[MAX_COMP_RD_STATS].</summary>
     public readonly AomCompRdStats[] CompRdStats = NewCompRdStats();
-    public readonly AomCompoundTypeRdBuffers CompTypeRdBuffers = new();
+    private AomCompoundTypeRdBuffers? _compTypeRdBuffers;
+    /// <summary>Created on first use (inter frames).</summary>
+    public AomCompoundTypeRdBuffers CompTypeRdBuffers => _compTypeRdBuffers ??= new();
 
     private static AomCompRdStats[] NewCompRdStats()
     {
