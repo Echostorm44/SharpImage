@@ -550,11 +550,9 @@ internal static unsafe partial class AomReconIntra
             // sums at a time; the stores past p[sz - 1] are overwritten by the extension below
             Unsafe.SkipInit(out StackArr163<byte> bufBuf); byte* buf = (byte*)Unsafe.AsPointer(ref bufBuf[0]);
             byte* e = buf + 2;
-            // p points into a 160-byte edge array at offset 15 or 16: 128 bytes are readable whatever sz is
-            System.Runtime.Intrinsics.Vector256.Load(p).Store(e);
-            System.Runtime.Intrinsics.Vector256.Load(p + 32).Store(e + 32);
-            System.Runtime.Intrinsics.Vector256.Load(p + 64).Store(e + 64);
-            System.Runtime.Intrinsics.Vector256.Load(p + 96).Store(e + 96);
+            // p points into a 160-byte edge array at offset 15 or 16: 128 bytes are readable whatever sz is; copy the
+            // 32-byte groups the edge covers
+            for (int k = 0; k < sz && k < 128; k += 32) System.Runtime.Intrinsics.Vector256.Load(p + k).Store(e + k);
             if (sz > 128) e[128] = p[128];
             byte first = e[0], last = e[sz - 1];
             e[-2] = first; e[-1] = first;
@@ -1039,6 +1037,31 @@ internal static unsafe partial class AomReconIntra
 
     /// <summary>av1_predict_intra_block_facade: predicts the transform block at (blk_row, blk_col) (4x4 units within
     /// the plane block) into xd->plane[plane].dst. <paramref name="sbSize"/> / <paramref name="enableIntraEdgeFilter"/>
+    /// <summary>av1_predict_intra_block_facade's CfL branch (the DC prediction, cached per plane, plus alpha times the
+    /// luma AC), out of line so the common path stays small.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void PredictCflBlock(AomMacroblockD xd, int sbSize, bool enableIntraEdgeFilter, AomMbdPlane pd, int txSize, int mode,
+        int angleDelta, bool usePalette, int filterIntraMode, byte* dst, int dstStride, int blkCol, int blkRow, int plane)
+    {
+        AomCflCtx cfl = xd.Cfl;
+        int predPlane = AomCfl.GetCflPredType(plane);
+        if (!cfl.DcPredIsCached[predPlane])
+        {
+            PredictIntraBlock(xd, sbSize, enableIntraEdgeFilter, pd.Width, pd.Height, txSize, mode, angleDelta,
+                usePalette, filterIntraMode, dst, dstStride, dst, dstStride, blkCol, blkRow, plane);
+            if (cfl.UseDcPredCache)
+            {
+                AomCfl.CflStoreDcPred(xd, dst, predPlane, TxSizeWide[txSize]);
+                cfl.DcPredIsCached[predPlane] = true;
+            }
+        }
+        else
+        {
+            AomCfl.CflLoadDcPred(xd, dst, dstStride, txSize, predPlane);
+        }
+        AomCfl.CflPredictBlock(xd, dst, dstStride, txSize, plane);
+    }
+
     /// are cm->seq_params->sb_size / enable_intra_edge_filter.</summary>
     public static void PredictIntraBlockFacade(AomMacroblockD xd, int sbSize, bool enableIntraEdgeFilter, int plane,
         int blkCol, int blkRow, int txSize)
@@ -1061,23 +1084,8 @@ internal static unsafe partial class AomReconIntra
             byte* dst = buf + pd.Dst.Offset + ((blkRow * dstStride + blkCol) << MI_SIZE_LOG2);
             if (plane != 0 && mbmi.UvMode == UV_CFL_PRED)
             {
-                AomCflCtx cfl = xd.Cfl;
-                int predPlane = AomCfl.GetCflPredType(plane);
-                if (!cfl.DcPredIsCached[predPlane])
-                {
-                    PredictIntraBlock(xd, sbSize, enableIntraEdgeFilter, pd.Width, pd.Height, txSize, mode, angleDelta,
-                        usePalette, filterIntraMode, dst, dstStride, dst, dstStride, blkCol, blkRow, plane);
-                    if (cfl.UseDcPredCache)
-                    {
-                        AomCfl.CflStoreDcPred(xd, dst, predPlane, TxSizeWide[txSize]);
-                        cfl.DcPredIsCached[predPlane] = true;
-                    }
-                }
-                else
-                {
-                    AomCfl.CflLoadDcPred(xd, dst, dstStride, txSize, predPlane);
-                }
-                AomCfl.CflPredictBlock(xd, dst, dstStride, txSize, plane);
+                PredictCflBlock(xd, sbSize, enableIntraEdgeFilter, pd, txSize, mode, angleDelta, usePalette, filterIntraMode, dst, dstStride,
+                    blkCol, blkRow, plane);
                 return;
             }
             PredictIntraBlock(xd, sbSize, enableIntraEdgeFilter, pd.Width, pd.Height, txSize, mode, angleDelta,
