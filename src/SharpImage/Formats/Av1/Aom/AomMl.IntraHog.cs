@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -122,6 +124,12 @@ internal static partial class AomMl
     /// <summary>lowbd_compute_gradient_info_sb over rows / cols [1, vis - 1) of a superblock (row stride sbW in the cache).</summary>
     internal static void ComputeGradientInfoSb(ReadOnlySpan<byte> src, int stride, int sbW, int visW, int visH, ushort[] absSum, sbyte[] bin, int baseOff)
     {
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && visW > 2 && visH > 2 && src.Length >= (visH - 1) * stride + visW + 1
+            && baseOff >= 0 && baseOff + (visH - 1) * sbW + visW <= Math.Min(absSum.Length, bin.Length))
+        {
+            ComputeGradientInfoSbAvx2(src, stride, sbW, visW, visH, absSum, bin, baseOff);
+            return;
+        }
         for (int r = 1; r < visH - 1; ++r)
         {
             int o = r * stride;
@@ -138,6 +146,68 @@ internal static partial class AomMl
             }
         }
     }
+
+    /// <summary>lowbd_compute_gradient_info_sb, eight samples at a time: the Sobel sums in int16 lanes, get_hist_bin_idx's
+    /// ratio (dy &lt;&lt; 16) / dx through a double division truncated to int (|dy &lt;&lt; 16| &lt; 2^27, |dx| &lt;= 1020: the true
+    /// quotient is at least 1/1020 from any integer, far beyond the division's rounding, so the truncation is exact), the
+    /// bin as the count of thresholds below it; the columns past the last full group of eight one by one.</summary>
+    private static void ComputeGradientInfoSbAvx2(ReadOnlySpan<byte> src, int stride, int sbW, int visW, int visH, ushort[] absSum, sbyte[] bin, int baseOff)
+    {
+        ref byte s0 = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src);
+        ref int thr = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(HistBinThresholds);
+        ref ushort a0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(absSum);
+        ref sbyte b0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(bin);
+        for (int r = 1; r < visH - 1; ++r)
+        {
+            int o = r * stride;
+            int c = 1;
+            for (; c + 8 <= visW - 1; c += 8)
+            {
+                int p = o + c;
+                var um = L8(ref s0, p - stride - 1); var u0 = L8(ref s0, p - stride); var up = L8(ref s0, p - stride + 1);
+                var mm = L8(ref s0, p - 1); var mp = L8(ref s0, p + 1);
+                var dm = L8(ref s0, p + stride - 1); var d0 = L8(ref s0, p + stride); var dp = L8(ref s0, p + stride + 1);
+                var dx = (up + mp + mp + dp) - (um + mm + mm + dm);
+                var dy = (dm + d0 + d0 + dp) - (um + u0 + u0 + up);
+                int i = baseOff + r * sbW + c;
+                (System.Runtime.Intrinsics.Vector128.Abs(dx) + System.Runtime.Intrinsics.Vector128.Abs(dy)).AsUInt16()
+                    .StoreUnsafe(ref a0, (nuint)i);
+                var dx32 = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(dx);
+                var num = System.Runtime.Intrinsics.Vector256.ShiftLeft(System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(dy), 16);
+                var qLo = System.Runtime.Intrinsics.X86.Avx.ConvertToVector128Int32WithTruncation(System.Runtime.Intrinsics.X86.Avx.Divide(
+                    System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(num.GetLower()), System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(dx32.GetLower())));
+                var qHi = System.Runtime.Intrinsics.X86.Avx.ConvertToVector128Int32WithTruncation(System.Runtime.Intrinsics.X86.Avx.Divide(
+                    System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(num.GetUpper()), System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(dx32.GetUpper())));
+                var ratio = System.Runtime.Intrinsics.Vector256.Create(qLo, qHi);
+                var cnt = System.Runtime.Intrinsics.Vector256<int>.Zero;
+                for (int k = 0; k < HogBins; k++)
+                    cnt -= System.Runtime.Intrinsics.Vector256.LessThan(System.Runtime.Intrinsics.Vector256.Create(Unsafe.Add(ref thr, k)), ratio);
+                var res = System.Runtime.Intrinsics.Vector256.ConditionalSelect(
+                    System.Runtime.Intrinsics.Vector256.Equals(dx32, System.Runtime.Intrinsics.Vector256<int>.Zero),
+                    System.Runtime.Intrinsics.Vector256.Create(-1), cnt);
+                var w = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(res.GetLower(), res.GetUpper());
+                Unsafe.WriteUnaligned(ref Unsafe.As<sbyte, byte>(ref Unsafe.Add(ref b0, i)),
+                    System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(w, w).AsUInt64().ToScalar());
+            }
+            for (; c < visW - 1; ++c)
+            {
+                int p = o + c;
+                int dx = (src[p + 1 - stride] + 2 * src[p + 1] + src[p + 1 + stride]) -
+                         (src[p - 1 - stride] + 2 * src[p - 1] + src[p - 1 + stride]);
+                int dy = (src[p + stride - 1] + 2 * src[p + stride] + src[p + stride + 1]) -
+                         (src[p - stride - 1] + 2 * src[p - stride] + src[p - stride + 1]);
+                int i = baseOff + r * sbW + c;
+                absSum[i] = (ushort)(AbsI(dx) + AbsI(dy));
+                bin[i] = (sbyte)(dx != 0 ? GetHistBinIdx(dx, dy) : -1);
+            }
+        }
+    }
+
+    // 8 samples zero-extended to int16 lanes
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static System.Runtime.Intrinsics.Vector128<short> L8(ref byte s, int off) =>
+        System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int16(
+            System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref s, off))).AsByte());
 
     /// <summary>highbd_compute_gradient_info_sb.</summary>
     internal static void ComputeGradientInfoSb(ReadOnlySpan<ushort> src, int stride, int sbW, int visW, int visH, ushort[] absSum, sbyte[] bin, int baseOff)
