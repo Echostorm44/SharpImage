@@ -73,6 +73,7 @@ internal static partial class AomTxSearch
     private static long RightSignedShift(long value, int n) => n < 0 ? value << -n : value >> n;
 
     /// <summary>av1_get_entropy_contexts: copies the plane block's above / left entropy contexts.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void GetEntropyContexts(int planeBsize, AomMbdPlane pd, Span<byte> tAbove, Span<byte> tLeft)
     {
         CopyCtx(pd.AboveEntropyContext.AsSpan(pd.AboveEntropyOffset, MiSizeWide[planeBsize]), tAbove);
@@ -212,6 +213,7 @@ internal static partial class AomTxSearch
     }
 
     /// <summary>pixel_diff_stats.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static long PixelDiffStats(AomMacroblock x, int plane, int blkRow, int blkCol, int planeBsize, int txBsize,
         out uint blockMseQ8, ref long perPxMean, out ulong blockVar)
     {
@@ -287,6 +289,7 @@ internal static partial class AomTxSearch
     }
 
     /// <summary>dist_block_tx_domain: av1_block_error, or the QM-weighted av1_block_error_qm with the QM-PSNR metric.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void DistBlockTxDomain(AomMacroblock x, int plane, int block, int txSize, byte[]? qmatrix, int txType,
         out long outDist, out long outSse)
     {
@@ -623,6 +626,7 @@ internal static partial class AomTxSearch
     }
 
     /// <summary>skip_trellis_opt_based_on_satd.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool SkipTrellisOptBasedOnSatd(AomMacroblock x, ref AomQuantParam qp, int plane, int block, int txSize, int quantBAdapt,
         int qstep, uint coeffOptSatdThreshold, bool skipTrellis, bool dcOnlyBlk)
     {

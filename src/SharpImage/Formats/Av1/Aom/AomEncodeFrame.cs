@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -107,6 +108,7 @@ internal static partial class AomEncodeFrame
     };
 
     /// <summary>get_partition_subsize.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int PartitionSubsize(int bsize, int partition)
     {
         int sqrBsizeIdx = SqrBsizeIdx(bsize);
@@ -209,6 +211,7 @@ internal static partial class AomEncodeFrame
     }
 
     /// <summary>setup_pred_plane: the block's sample offset in a plane (4-wide / high chroma blocks at odd mi use the pair's origin).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void SetupPredPlane(ref AomBuf2d dst, int bsize, byte[] buf, int planeOffset, int width, int height, int stride,
         int miRow, int miCol, int ssX, int ssY, ushort[]? buf16 = null)
     {
@@ -224,6 +227,7 @@ internal static partial class AomEncodeFrame
     }
 
     /// <summary>av1_setup_src_planes.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SetupSrcPlanes(AomComp cpi, AomMacroblock x, int miRow, int miCol, int numPlanes, int bsize)
     {
         var src = cpi.Source;
@@ -288,6 +292,7 @@ internal static partial class AomEncodeFrame
     }
 
     /// <summary>av1_setup_dst_planes on cm->cur_frame.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SetupDstPlanes(AomComp cpi, AomMacroblockD xd, int bsize, int miRow, int miCol)
     {
         var cm = cpi.Cm;

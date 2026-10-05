@@ -20,6 +20,7 @@ internal static class AomRd
     internal static long CalculateRdCost(int mult, int rate, long dist)
         => rate >= 0 ? RdCost(mult, rate, dist) : dist * (1 << RdDivBits) - ((((long)-rate * mult) + 256) >> AomCost.ProbCostShift);
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static long RdCost64(long rdmult, long rate, long dist) => ((rate * rdmult + 256) >> AomCost.ProbCostShift) + dist * (1 << RdDivBits);
 
     /// <summary>av1_compute_rd_mult_based_on_qindex for a key frame (KF_UPDATE) with tune=psnr: q = the DC dequantizer,

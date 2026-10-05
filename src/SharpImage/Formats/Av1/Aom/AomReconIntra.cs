@@ -55,6 +55,7 @@ internal static unsafe partial class AomReconIntra
     }
 
     /// <summary>av1_use_intra_edge_upsample.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int UseIntraEdgeUpsample(int bs0, int bs1, int delta, int type)
     {
         int d = AbsI(delta);
@@ -428,6 +429,7 @@ internal static unsafe partial class AomReconIntra
     // ---------------------------------------------------------------------------------------------------------------
 
     /// <summary>is_smooth (reconintra.c, static).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsSmooth(AomMbModeInfo mbmi, int plane)
     {
         if (plane == 0)
@@ -442,6 +444,7 @@ internal static unsafe partial class AomReconIntra
     }
 
     /// <summary>get_intra_edge_filter_type (reconintra.c, static).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int GetIntraEdgeFilterType(AomMacroblockD xd, int plane)
     {
         AomMbModeInfo? above, left;

@@ -47,6 +47,7 @@ internal static partial class AomEncodeMb
     internal static int PlaneBlockSize(int bsize, int ssX, int ssY) => SsSizeLookup[(bsize * 2 + ssX) * 2 + ssY];
 
     /// <summary>av1_get_ext_tx_set_type.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int ExtTxSetType(int txSize, bool isInter, bool useReducedSet)
     {
         int sqrUp = TxsizeSqrUpMap[txSize];
@@ -58,6 +59,7 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>av1_get_tx_size.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int GetTxSize(int plane, AomMacroblockD xd)
     {
         var mbmi = xd.Mi0;
@@ -82,6 +84,7 @@ internal static partial class AomEncodeMb
     internal static bool IsInterBlock(AomMbModeInfo mbmi) => mbmi.UseIntrabc != 0 || mbmi.RefFrame0 > 0;
 
     /// <summary>av1_get_tx_type.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int GetTxType(AomMacroblockD xd, int planeType, int blkRow, int blkCol, int txSize, bool reducedTxSet)
     {
         var mbmi = xd.Mi0;
@@ -122,12 +125,14 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>max_block_wide / max_block_high (in 4x4 units, cropped at the frame edge).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int MaxBlockWide(AomMacroblockD xd, int bsize, int plane)
     {
         int w = BlockSizeWide[bsize];
         if (xd.MbToRightEdge < 0) w += xd.MbToRightEdge >> (3 + xd.Plane[plane].SubsamplingX);
         return w >> 2;
     }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int MaxBlockHigh(AomMacroblockD xd, int bsize, int plane)
     {
         int h = BlockSizeHigh[bsize];
@@ -136,6 +141,7 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>get_txb_dimensions (rdopt_utils.h): the tx block's visible width / height inside the frame.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void TxbDimensions(AomMacroblockD xd, int plane, int planeBsize, int blkRow, int blkCol, int txBsize,
         out int width, out int height, out int visibleWidth, out int visibleHeight)
     {
@@ -263,6 +269,7 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>av1_subtract_txb.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SubtractTxb(AomMacroblock x, int plane, int planeBsize, int blkCol, int blkRow, int txSize)
     {
         var p = x.Plane[plane];
@@ -327,6 +334,7 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>av1_xform: the forward transform of the tx block's residual into x->plane[plane].coeff.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void Xform(AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize, int txType)
     {
         var p = x.Plane[plane];
@@ -464,6 +472,7 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>av1_setup_quant (the matrices are reset to none).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static AomQuantParam SetupQuant(int txSize, bool useOptimizeB, int xformQuantIdx, int useQuantBAdapt)
         => new() { LogScale = AomQuantize.TxScale(txSize), TxSize = txSize, UseQuantBAdapt = useQuantBAdapt, UseOptimizeB = useOptimizeB, XformQuantIdx = xformQuantIdx };
 
@@ -579,6 +588,7 @@ internal static partial class AomEncodeMb
     internal static short[] IScanOf(int txSize, int txType) => IScans[ScanOrderIdx[txSize * 16 + txType]];
 
     /// <summary>get_tx_type_cost (txb_rdopt.c): the tx type's symbol cost for luma (0 for chroma).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int TxTypeCost(AomMacroblock x, int plane, int txSize, int txType, int reducedTxSetUsed)
     {
         if (plane > 0) return 0;
@@ -669,6 +679,7 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>av1_set_txb_context.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SetTxbContext(AomMacroblock x, int plane, int block, int txSize, Span<byte> a, Span<byte> l)
     {
         byte ctx = x.Plane[plane].TxbEntropyCtx[block];
@@ -938,6 +949,7 @@ internal static partial class AomEncodeMb
     }
 
     /// <summary>aom_satd.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int Satd(ReadOnlySpan<int> coeff, int length)
     {
         int satd = 0, i = 0;

@@ -462,6 +462,7 @@ internal static unsafe class AomIntraPred
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void DcPredictor(byte* dst, nint stride, int bw, int bh, byte* above, byte* left)
     {
         int count = bw + bh;

@@ -403,6 +403,7 @@ internal static class AomIntraModeSearch
     }
 
     /// <summary>set_y_mode_and_delta_angle.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SetYModeAndDeltaAngle(int modeIdx, AomMbModeInfo mbmi, bool reorderDeltaAngleEval)
     {
         if (modeIdx < INTRA_MODE_END)
@@ -421,6 +422,7 @@ internal static class AomIntraModeSearch
     }
 
     /// <summary>get_model_rd_index_for_pruning.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int GetModelRdIndexForPruning(AomMacroblock x, AomSpeedFeatures sf)
     {
         int topAllowed = sf.intra_sf.top_intra_model_count_allowed;

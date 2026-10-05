@@ -42,6 +42,7 @@ internal static partial class Av1FwdTxfmAom
 
     /// <summary>8 lanes: fdct8x4 / fadst8x4 / fidentity8x4 (n 4), fdct8x8 / fadst8x8 / fidentity8x8 (8), fdct8x16 /
     /// fadst8x16 / fidentity8x16 (16) _new_sse2.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Tx8(int kind, int n, ref W8 buf, int cosBit)
     {
         if (kind == Av1InvTransform.Type1dIdentity)
@@ -63,6 +64,7 @@ internal static partial class Av1FwdTxfmAom
     }
 
     /// <summary>16 lanes: fdct8x8 / fadst8x8 / fidentity8x8 (n 8) and fdct16x16 / fadst16x16 / fidentity16x16 (16) _new_avx2.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Tx16(int kind, int n, ref W16 buf, int cosBit)
     {
         if (kind == Av1InvTransform.Type1dIdentity)

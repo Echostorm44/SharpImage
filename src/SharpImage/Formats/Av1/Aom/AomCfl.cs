@@ -310,6 +310,7 @@ internal static unsafe partial class AomCfl
     }
 
     /// <summary>av1_cfl_predict_block: dst holds the DC_PRED; adds alpha * AC.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void CflPredictBlock(AomMacroblockD xd, byte* dst, int dstStride, int txSize, int plane)
     {
         AomCflCtx cfl = xd.Cfl;
@@ -321,6 +322,7 @@ internal static unsafe partial class AomCfl
     }
 
     /// <summary>av1_cfl_predict_block (array form).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void CflPredictBlock(AomMacroblockD xd, byte[] dstBuf, int dstOffset, int dstStride, int txSize, int plane)
     {
         fixed (byte* d = dstBuf) CflPredictBlock(xd, d + dstOffset, dstStride, txSize, plane);
@@ -464,6 +466,7 @@ internal static unsafe partial class AomCfl
     }
 
     /// <summary>max_block_wide (av1_common_int.h), in 4x4 units.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int MaxBlockWide(AomMacroblockD xd, int bsize, int plane)
     {
         int maxBlocksWide = BlockSizeWide[bsize];
@@ -473,6 +476,7 @@ internal static unsafe partial class AomCfl
     }
 
     /// <summary>max_block_high (av1_common_int.h), in 4x4 units.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int MaxBlockHigh(AomMacroblockD xd, int bsize, int plane)
     {
         int maxBlocksHigh = BlockSizeHigh[bsize];

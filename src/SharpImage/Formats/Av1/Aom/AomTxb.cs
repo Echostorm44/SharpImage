@@ -254,6 +254,7 @@ internal static class AomTxb
     }
 
     /// <summary>av1_get_eob_pos_token.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int EobPosToken(int eob, out int extra)
     {
         int t = eob < 33 ? EobToPosSmall[eob] : EobToPosLarge[Math.Min((eob - 1) >> 5, 16)];
@@ -371,6 +372,7 @@ internal static class AomTxb
     }
 
     /// <summary>get_eob_cost.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int EobCost(int eob, int[] txbEobCosts, AomLvMapCoeffCost txbCosts, int txClass)
     {
         int eobPt = EobPosToken(eob, out int eobExtra);
@@ -1422,6 +1424,7 @@ internal static class AomTxb
 
     /// <summary>get_entropy_context (av1/common/entropy.h): whether any above / left entropy byte of the tx is nonzero,
     /// summed (combine_entropy_contexts).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int EntropyContext(int txSize, ReadOnlySpan<byte> a, ReadOnlySpan<byte> l)
     {
         int above = 0, left = 0;
