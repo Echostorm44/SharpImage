@@ -511,7 +511,7 @@ internal static class AomIntraModeSearch
         var mbmi = xd.Mi0;
         var sf = cpi.Sf;
         long bestModelRd = long.MaxValue;
-        var directionalModeSkipMaskBuf16 = new StackArr13<byte>(); Span<byte> directionalModeSkipMask = directionalModeSkipMaskBuf16;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr13<byte> directionalModeSkipMaskBuf16); Span<byte> directionalModeSkipMask = directionalModeSkipMaskBuf16;
         directionalModeSkipMask.Clear();
         bool beatBestRd = false;
         bool tryPalette = cpi.EnablePalette && AllowPalette(cpi.AllowScreenContentTools, mbmi.Bsize);
@@ -538,9 +538,9 @@ internal static class AomIntraModeSearch
         AomRdoptUtils.ZeroWinnerModeStats(bsize, maxWinnerModeCount, x.WinnerModeStats);
         x.WinnerModeCount = 0;
 
-        var topIntraModelRdBuf17 = new StackArr4<long>(); Span<long> topIntraModelRd = topIntraModelRdBuf17;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr4<long> topIntraModelRdBuf17); Span<long> topIntraModelRd = topIntraModelRdBuf17;
         topIntraModelRd.Fill(long.MaxValue);
-        var intraModesRdCostBuf18 = new StackArr117<long>(); Span<long> intraModesRdCost = intraModesRdCostBuf18;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr117<long> intraModesRdCostBuf18); Span<long> intraModesRdCost = intraModesRdCostBuf18;   // filled below
         intraModesRdCost.Fill(long.MaxValue);
 
         const int LumaModeCount = INTRA_MODE_END + 8 * 2 * MAX_ANGLE_DELTA;   // LUMA_MODE_COUNT: 13 + 48
@@ -992,7 +992,7 @@ internal static class AomIntraModeSearch
             xd.Cfl.StoreY = 0;
         }
         bool dirModeSkipMaskReady = false;
-        var directionalModeSkipMaskBuf20 = new StackArr14<byte>(); Span<byte> directionalModeSkipMask = directionalModeSkipMaskBuf20;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr14<byte> directionalModeSkipMaskBuf20); Span<byte> directionalModeSkipMask = directionalModeSkipMaskBuf20;
         directionalModeSkipMask.Clear();
         int cflAllowed = AomCfl.IsCflAllowed(xd);
 

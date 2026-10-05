@@ -362,10 +362,10 @@ internal static partial class AomTxSearch
     {
         var rdsVBuf1 = new StackArr4<long>(); Span<long> rdsV = rdsVBuf1;
         var rdsHBuf2 = new StackArr4<long>(); Span<long> rdsH = rdsHBuf2;
-        var idxVBuf3 = new StackArr4<int>(); Span<int> idxV = idxVBuf3; for (int q = 0; q < 4; q++) idxV[q] = q;
-        var idxHBuf4 = new StackArr4<int>(); Span<int> idxH = idxHBuf4; for (int q = 0; q < 4; q++) idxH[q] = q;
-        var skipVBuf5 = new StackArr4<int>(); Span<int> skipV = skipVBuf5;
-        var skipHBuf6 = new StackArr4<int>(); Span<int> skipH = skipHBuf6;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr4<int> idxVBuf3); Span<int> idxV = idxVBuf3; for (int q = 0; q < 4; q++) idxV[q] = q;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr4<int> idxHBuf4); Span<int> idxH = idxHBuf4; for (int q = 0; q < 4; q++) idxH[q] = q;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr4<int> skipVBuf5); Span<int> skipV = skipVBuf5;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr4<int> skipHBuf6); Span<int> skipH = skipHBuf6;
         skipV.Clear(); skipH.Clear();
         var qp = AomEncodeMb.SetupQuant(txSize, true, AomXformQuant.B, cpi.QuantBAdapt);
         int rateCost;
@@ -1140,7 +1140,7 @@ internal static partial class AomTxSearch
         long bestRd = long.MaxValue;
         int numBlks = BsizeToNumBlk(bs);
         x.RdModel = FULL_TXFM_RD;
-        var rdBuf14 = new StackArr3<long>(); Span<long> rd = rdBuf14; rd.Fill(long.MaxValue);
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr3<long> rdBuf14); Span<long> rd = rdBuf14; rd.Fill(long.MaxValue);
         var map = xd.TxTypeMap.AsSpan(xd.TxTypeMapOffset, numBlks);
         for (int txSize = startTx, depth = initDepth; depth <= MAX_TX_DEPTH; depth++, txSize = SubTxSizeMap[txSize])
         {
