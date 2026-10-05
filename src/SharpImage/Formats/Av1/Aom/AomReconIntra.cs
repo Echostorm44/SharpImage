@@ -805,7 +805,8 @@ internal static unsafe partial class AomReconIntra
     }
 
     /// <summary>dst[i] = src[i * stride] for i &lt; n (the left edge column), four at a time.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    // out of line: inlined into the large predict_intra_block its packing spilled through the stack
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private static void GatherColumn(byte* dst, byte* src, nint stride, int n)
     {
         int i = 0;
@@ -847,31 +848,31 @@ internal static unsafe partial class AomReconIntra
 
         if (needLeft != 0)
         {
-            Unsafe.InitBlockUnaligned(leftData, 129, NUM_INTRA_NEIGHBOUR_PIXELS);
+            FillSmall(leftData, 129, NUM_INTRA_NEIGHBOUR_PIXELS);
             if (nLeftPx > 0)
             {
                 GatherColumn(leftCol, leftRef, refStride, nLeftPx);
                 i = nLeftPx;
-                if (i < txhpx) Unsafe.InitBlockUnaligned(leftCol + i, leftCol[i - 1], (uint)(txhpx - i));
+                if (i < txhpx) FillSmall(leftCol + i, leftCol[i - 1], txhpx - i);
             }
             else if (nTopPx > 0)
             {
-                Unsafe.InitBlockUnaligned(leftCol, aboveRef[0], (uint)txhpx);
+                FillSmall(leftCol, aboveRef[0], txhpx);
             }
         }
 
         if (needAbove != 0)
         {
-            Unsafe.InitBlockUnaligned(aboveData, 127, NUM_INTRA_NEIGHBOUR_PIXELS);
+            FillSmall(aboveData, 127, NUM_INTRA_NEIGHBOUR_PIXELS);
             if (nTopPx > 0)
             {
-                Buffer.MemoryCopy(aboveRef, aboveRow, nTopPx, nTopPx);
+                CopySmall(aboveRow, aboveRef, nTopPx);
                 i = nTopPx;
-                if (i < txwpx) Unsafe.InitBlockUnaligned(aboveRow + i, aboveRow[i - 1], (uint)(txwpx - i));
+                if (i < txwpx) FillSmall(aboveRow + i, aboveRow[i - 1], txwpx - i);
             }
             else if (nLeftPx > 0)
             {
-                Unsafe.InitBlockUnaligned(aboveRow, leftRef[0], (uint)txwpx);
+                FillSmall(aboveRow, leftRef[0], txwpx);
             }
         }
 
