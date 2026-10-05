@@ -118,6 +118,11 @@ internal struct AomTxbCtx
 [System.Runtime.CompilerServices.SkipLocalsInit]
 internal static class AomTxb
 {
+    internal interface ITxClassConst { static abstract int Cls { get; } }
+    internal struct TxClass2D : ITxClassConst { public static int Cls => TX_CLASS_2D; }
+    internal struct TxClassHoriz : ITxClassConst { public static int Cls => TX_CLASS_HORIZ; }
+    internal struct TxClassVert : ITxClassConst { public static int Cls => TX_CLASS_VERT; }
+
     internal const int NumBaseLevels = 2, CoeffBaseRange = 12, MaxBaseBrRange = CoeffBaseRange + NumBaseLevels + 1;
     internal const int CoeffContextBits = 3, CoeffContextMask = 7;
     internal const int TxPadHorLog2 = 2, TxPadHor = 4, TxPadTop = 0, TxPadBottom = 4, TxPadEnd = 16;
@@ -167,7 +172,7 @@ internal static class AomTxb
     private const int LogePar = ((14427 << AomCost.ProbCostShift) + 5000) / 10000;
 
     // clip_max3
-    [MethodImpl(MethodImplOptions.AggressiveInlining)] private static int ClipMax3(int v) => v > 3 ? 3 : v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] private static int ClipMax3(int v) { int d = v - 3; return v - (d & ~(d >> 31)); }
 
     /// <summary>av1_get_adjusted_tx_size: 64-point axes as 32.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -781,7 +786,14 @@ internal static class AomTxb
 
     /// <summary>update_coeff_simple_facade's loop: update_coeff_simple for si down to 1 (returns 0). The trellis state is
     /// read into locals once, so the per-coefficient body works on registers rather than on the address-taken struct.</summary>
-    private static int UpdateCoeffSimpleLoop(ref Trellis t, ref int accuRateRef, int si)
+    private static int UpdateCoeffSimpleLoop(ref Trellis t, ref int accuRateRef, int si) => t.TxClass switch
+    {
+        TX_CLASS_2D => UpdateCoeffSimpleLoopT<TxClass2D>(ref t, ref accuRateRef, si),
+        TX_CLASS_HORIZ => UpdateCoeffSimpleLoopT<TxClassHoriz>(ref t, ref accuRateRef, si),
+        _ => UpdateCoeffSimpleLoopT<TxClassVert>(ref t, ref accuRateRef, si),
+    };
+
+    private static int UpdateCoeffSimpleLoopT<TC>(ref Trellis t, ref int accuRateRef, int si) where TC : struct, ITxClassConst
     {
         ref ushort scan = ref t.Scan;
         ref int qcoeff = ref t.Qcoeff, tcoeff = ref t.Tcoeff, dqcoeff = ref t.Dqcoeff;
@@ -791,7 +803,7 @@ internal static class AomTxb
         ref int off1d = ref MemoryMarshal.GetArrayDataReference(NzMapCtxOffset1d);
         ref int golBits = ref MemoryMarshal.GetArrayDataReference(GolombBitsCost);
         ref int golDiff = ref MemoryMarshal.GetArrayDataReference(GolombCostDiff);
-        int bhl = t.Bhl, txClass = t.TxClass, shift = t.Shift, sharpness = t.Sharpness;
+        int bhl = t.Bhl, txClass = TC.Cls, shift = t.Shift, sharpness = t.Sharpness;
         int stride = (1 << bhl) + TxPadHor;
         long rdmult = t.Rdmult;
         bool plain = t.Iqm == null && t.Qm == null;
@@ -935,13 +947,24 @@ internal static class AomTxb
             accuRate = ar0; accuDist = ad0; eob = e0; nzNum = nn0;
             return si;
         }
+        return t.TxClass switch
+        {
+            TX_CLASS_2D => UpdateCoeffEobLoopT<TxClass2D>(ref t, ref accuRate, ref accuDist, ref eob, ref nzNum, ref nzCi, si, maxNzNum),
+            TX_CLASS_HORIZ => UpdateCoeffEobLoopT<TxClassHoriz>(ref t, ref accuRate, ref accuDist, ref eob, ref nzNum, ref nzCi, si, maxNzNum),
+            _ => UpdateCoeffEobLoopT<TxClassVert>(ref t, ref accuRate, ref accuDist, ref eob, ref nzNum, ref nzCi, si, maxNzNum),
+        };
+    }
+
+    private static int UpdateCoeffEobLoopT<TC>(ref Trellis t, ref int accuRate, ref long accuDist, ref int eob, ref int nzNum, ref int nzCi, int si,
+        int maxNzNum) where TC : struct, ITxClassConst
+    {
         ref ushort scan = ref t.Scan;
         ref int qcoeff = ref t.Qcoeff, tcoeff = ref t.Tcoeff, dqcoeff = ref t.Dqcoeff;
         ref byte levels = ref t.Levels;
         ref int baseCost = ref t.Base, baseEob = ref t.BaseEob, lps = ref t.Lps;
         ref sbyte nzOffset = ref t.NzOffset;
         ref int off1d = ref MemoryMarshal.GetArrayDataReference(NzMapCtxOffset1d);
-        int bhl = t.Bhl, txClass = t.TxClass, shift = t.Shift, sharpness = t.Sharpness, width = t.Width;
+        int bhl = t.Bhl, txClass = TC.Cls, shift = t.Shift, sharpness = t.Sharpness, width = t.Width;
         int stride = (1 << bhl) + TxPadHor;
         long rdmult = t.Rdmult;
         int dq0 = t.Dq0, dq1 = t.Dq1;
