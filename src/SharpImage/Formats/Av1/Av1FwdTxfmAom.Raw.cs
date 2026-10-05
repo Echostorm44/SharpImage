@@ -76,6 +76,11 @@ internal static partial class Av1FwdTxfmAom
         }
     }
 
+    // 8 int16 lanes sign-extended to int32
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static V Widen8(Vector128<short> v)
+        => Avx2.IsSupported ? Avx2.ConvertToVector256Int32(v) : Vector256.Create(Vector128.WidenLower(v), Vector128.WidenUpper(v));
+
     /// <summary>ForwardRaw in 32-bit lanes (fwd_txfm2d_c's arithmetic), every size.</summary>
     [SkipLocalsInit]
     internal static void ForwardRawRef(ReadOnlySpan<short> diff, int diffStride, int w, int h, int txSize, int hKind, int vKind,
@@ -115,14 +120,14 @@ internal static partial class Av1FwdTxfmAom
                     Vector128<short> raw = flipLr
                         ? Vector128.Shuffle(Vector128.LoadUnsafe(ref row, (nuint)(w - 8 - g * 8)), reverse8)
                         : Vector128.LoadUnsafe(ref row, (nuint)(g * 8));
-                    v = Avx2.ConvertToVector256Int32(raw);
+                    v = Widen8(raw);
                 }
                 else
                 {
                     // the 4 residuals (upper lanes zero)
                     var raw = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(ref Unsafe.As<short, byte>(ref row))).AsInt16();
                     if (flipLr) raw = Vector128.Shuffle(raw, reverse4);
-                    v = Avx2.ConvertToVector256Int32(raw);
+                    v = Widen8(raw);
                 }
                 Unsafe.Add(ref tmp, r) = Vector256.ShiftLeft(v, sh0);
             }

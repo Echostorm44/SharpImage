@@ -383,7 +383,9 @@ internal static partial class Av1StillImageEncoder
         int k = 0;
         for (; k + 4 <= n; k += 4)
         {
-            var e = (Vector256.LoadUnsafe(ref q0, (nuint)k) - Avx.ConvertToVector256Double(Vector128.LoadUnsafe(ref l0, (nuint)k))) * (k == 0 ? dq : ac);
+            var lvd = Avx.IsSupported ? Avx.ConvertToVector256Double(Vector128.LoadUnsafe(ref l0, (nuint)k))
+                : Vector256.Create((double)Unsafe.Add(ref l0, k), Unsafe.Add(ref l0, k + 1), Unsafe.Add(ref l0, k + 2), Unsafe.Add(ref l0, k + 3));
+            var e = (Vector256.LoadUnsafe(ref q0, (nuint)k) - lvd) * (k == 0 ? dq : ac);
             acc += e * e;
         }
         double d = Vector256.Sum(acc);

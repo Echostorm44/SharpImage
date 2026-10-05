@@ -106,14 +106,17 @@ internal static class AomHadamard
         Transpose8(ref t0, ref t1, ref t2, ref t3, ref t4, ref t5, ref t6, ref t7);
         Col8V(t0, t1, t2, t3, t4, t5, t6, t7, out var u0, out var u1, out var u2, out var u3, out var u4, out var u5, out var u6, out var u7);
         ref int c = ref MemoryMarshal.GetReference(coeff);
-        Avx2.ConvertToVector256Int32(u0).StoreUnsafe(ref c, 0);
-        Avx2.ConvertToVector256Int32(u1).StoreUnsafe(ref c, 8);
-        Avx2.ConvertToVector256Int32(u2).StoreUnsafe(ref c, 16);
-        Avx2.ConvertToVector256Int32(u3).StoreUnsafe(ref c, 24);
-        Avx2.ConvertToVector256Int32(u4).StoreUnsafe(ref c, 32);
-        Avx2.ConvertToVector256Int32(u5).StoreUnsafe(ref c, 40);
-        Avx2.ConvertToVector256Int32(u6).StoreUnsafe(ref c, 48);
-        Avx2.ConvertToVector256Int32(u7).StoreUnsafe(ref c, 56);
+        StoreTranLow8(u0, ref c, 0); StoreTranLow8(u1, ref c, 8); StoreTranLow8(u2, ref c, 16); StoreTranLow8(u3, ref c, 24);
+        StoreTranLow8(u4, ref c, 32); StoreTranLow8(u5, ref c, 40); StoreTranLow8(u6, ref c, 48); StoreTranLow8(u7, ref c, 56);
+    }
+
+    // 8 int16 lanes sign-extended to tran_low_t at c[off]
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StoreTranLow8(Vector128<short> u, ref int c, nuint off)
+    {
+        if (Avx2.IsSupported) { Avx2.ConvertToVector256Int32(u).StoreUnsafe(ref c, off); return; }
+        Vector128.WidenLower(u).StoreUnsafe(ref c, off);
+        Vector128.WidenUpper(u).StoreUnsafe(ref c, off + 4);
     }
 
     /// <summary>aom_hadamard_lp_8x8 (SSE2 kernel / the C reference's transposed output): <see cref="H8x8"/>'s values

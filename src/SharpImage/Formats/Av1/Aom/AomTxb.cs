@@ -228,6 +228,19 @@ internal static class AomTxb
         }
         // height 4: two columns (8 coefficients) per vector, each column's 4 levels followed by its 4 pad zeros
         if ((uint)(width * 4) > (uint)coeff.Length || (uint)(width * 8) > (uint)levels.Length) throw new ArgumentException("levels buffer");
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            for (int i = 0; i < width; i++)
+            {
+                for (int j = 0; j < 4; j++)
+                {
+                    int c = Unsafe.Add(ref c0, i * 4 + j);
+                    Unsafe.Add(ref l0, i * 8 + j) = (byte)Math.Min(c < 0 ? -c : c, 127);
+                }
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref l0, i * 8 + 4), 0u);
+            }
+            return;
+        }
         var zero = Vector256<int>.Zero;
         for (int i = 0; i < width; i += 2)
         {

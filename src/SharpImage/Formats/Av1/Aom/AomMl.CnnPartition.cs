@@ -424,6 +424,13 @@ internal static partial class AomMl
         if (src.Length < 64 * stride + 65) throw new ArgumentOutOfRangeException(nameof(src));
         ref byte s0 = ref MemoryMarshal.GetReference(src);
         ref float d0 = ref MemoryMarshal.GetArrayDataReference(input);
+        if (!Avx2.IsSupported)
+        {
+            for (int i = 0; i < 65; i++)
+                for (int j = 0; j < 65; j++) Unsafe.Add(ref d0, i * 65 + j) = (float)Unsafe.Add(ref s0, i * stride + j) / maxVal;
+            CnnPartitionPredict(input, cnnBuffer);
+            return;
+        }
         var mv = Vector256.Create(maxVal);
         for (int i = 0; i < 65; i++)
         {

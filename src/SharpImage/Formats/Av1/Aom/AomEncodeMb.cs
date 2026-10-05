@@ -712,6 +712,13 @@ internal static partial class AomEncodeMb
         if (width <= 0 || height <= 0) return 0;
         if (off < 0 || (long)off + (long)(height - 1) * stride + width > src.Length) throw new ArgumentOutOfRangeException(nameof(height));
         ref short s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), off);
+        if (!Avx2.IsSupported)
+        {
+            ulong ss = 0;
+            for (int r = 0; r < height; r++)
+                for (int c = 0; c < width; c++) { int v = Unsafe.Add(ref s0, r * stride + c); ss += (ulong)(v * v); }
+            return ss;
+        }
         var acc = Vector256<ulong>.Zero;
         ulong tail = 0;
         if (width == 4)
@@ -763,6 +770,12 @@ internal static partial class AomEncodeMb
         if (width <= 0 || height <= 0) return 0;
         if (off < 0 || (long)off + (long)(height - 1) * stride + width > src.Length) throw new ArgumentOutOfRangeException(nameof(height));
         ref short s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), off);
+        if (!Avx2.IsSupported)
+        {
+            for (int r = 0; r < height; r++)
+                for (int c = 0; c < width; c++) { int v = Unsafe.Add(ref s0, r * stride + c); ss += v * v; sum += v; }
+            return (ulong)ss;
+        }
         var one = Vector256.Create((short)1);
         var sumV = Vector256<int>.Zero;
         for (int r = 0; r < height; r++)
@@ -943,6 +956,21 @@ internal static partial class AomEncodeMb
     /// the difference in 16-bit lanes, madd pairs zero-extended to 64 bits. Returns the error; ssz: the coefficients'.</summary>
     internal static long BlockErrorAvx2(ReadOnlySpan<int> coeff, ReadOnlySpan<int> dqcoeff, int blockSize, out long ssz)
     {
+        if (!Avx2.IsSupported)
+        {
+            // the kernel lane by lane: int16-saturated values, the difference wrapping in 16 bits (madd pair sums
+            // zero-extended: the exact sums of squares)
+            long e = 0, z = 0;
+            for (int i = 0; i < blockSize; i++)
+            {
+                short cs = (short)Math.Clamp(coeff[i], short.MinValue, short.MaxValue);
+                short ds = (short)Math.Clamp(dqcoeff[i], short.MinValue, short.MaxValue);
+                int df = (short)(ds - cs);
+                e += df * df; z += cs * cs;
+            }
+            ssz = z;
+            return e;
+        }
         var sse = Vector256<long>.Zero;
         var sz = Vector256<long>.Zero;
         ref int c0 = ref MemoryMarshal.GetReference(coeff);

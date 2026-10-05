@@ -8,6 +8,7 @@ public sealed class AomFwdLbdTests
     [Test]
     public async Task LowbdForwardMatchesReference()
     {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
         var rng = new Random(11);
         int mismatches = 0, cases = 0;
         for (int txSize = 0; txSize < AomTables.TxSizeWide.Length; txSize++)

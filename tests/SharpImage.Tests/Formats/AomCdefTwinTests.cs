@@ -148,7 +148,7 @@ public sealed class AomCdefTwinTests
                     fixed (ushort* bp = b) fixed (byte* op = ours)
                         AomCdef.FilterBlock8Avx2(idx, op, 16, (short*)bp + off, pri, sec, dir, damping, damping, cs, bw, bh);
                 else
-                    AomCdef.FilterBlockV(ours, 0, 16, b, off, pri, sec, dir, damping, damping, cs, bw, bh, pri != 0, sec != 0);
+                    AomCdef.FilterBlockV(ours, 0, 16, b, off, pri, sec, dir, damping, damping, cs, bw, bh, idx == 0 || idx == 1, idx == 0 || idx == 2);
                 AomCdef.FilterBlock(cref, 0, 16, b, off, pri, sec, dir, damping, damping, cs, bw, bh, idx == 0 || idx == 1, idx == 0 || idx == 2);
                 runs++;
                 bool bad = false;

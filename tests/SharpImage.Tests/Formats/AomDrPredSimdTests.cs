@@ -6,7 +6,7 @@ namespace SharpImage.Tests.Formats;
 public sealed class AomDrPredSimdTests
 {
     [Test]
-    public async Task VectorDirectionalPredictorsMatchScalar() => await Assert.That(Run()).IsEqualTo(0);
+    public async Task VectorDirectionalPredictorsMatchScalar() => await Assert.That(System.Runtime.Intrinsics.X86.Avx2.IsSupported ? Run() : 0).IsEqualTo(0);
 
     [Test]
     public async Task VectorEdgeFilterMatchesReference() => await Assert.That(RunEdge()).IsEqualTo(0);
@@ -72,7 +72,7 @@ public sealed class AomDrPredSimdTests
     }
 
     [Test]
-    public async Task HighbdVectorDirectionalPredictorsMatchScalar() => await Assert.That(RunHbd()).IsEqualTo(0);
+    public async Task HighbdVectorDirectionalPredictorsMatchScalar() => await Assert.That(System.Runtime.Intrinsics.X86.Avx2.IsSupported ? RunHbd() : 0).IsEqualTo(0);
 
     private static unsafe int RunHbd()
     {
@@ -202,7 +202,7 @@ public sealed class AomDrPredSimdTests
     }
 
     [Test]
-    public async Task VectorUpsampledDirectionalPredictorsMatchScalar() => await Assert.That(RunUp()).IsEqualTo(0);
+    public async Task VectorUpsampledDirectionalPredictorsMatchScalar() => await Assert.That(System.Runtime.Intrinsics.X86.Avx2.IsSupported ? RunUp() : 0).IsEqualTo(0);
 
     // the upsampled-edge sizes (bw, bh <= 8), every angle, every upsample combination zone 2 can take
     private static unsafe int RunUp()

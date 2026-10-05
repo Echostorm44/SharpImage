@@ -110,6 +110,8 @@ internal static class AomQuantize
     internal static int QuantizeFpAvx2(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short round0, short round1,
         short quant0, short quant1, short dequant0, short dequant1, int logScale, Span<int> qcoeff, Span<int> dqcoeff)
     {
+        if (!Avx2.IsSupported)
+            return QuantizeFpAvx2Emu(coeff, nCoeffs, iscan, round0, round1, quant0, quant1, dequant0, dequant1, logScale, qcoeff, dqcoeff);
         // init_qp: lane 0 of the first group the DC values, every other lane AC
         short rnd0 = round0, rnd1 = round1;
         if (logScale > 0)
@@ -212,6 +214,9 @@ internal static class AomQuantize
         short round0, short round1, short quant0, short quant1, short shift0, short shift1, short dequant0, short dequant1,
         int logScale, Span<int> qcoeff, Span<int> dqcoeff)
     {
+        if (!Avx2.IsSupported)
+            return QuantizeBAvx2Emu(coeff, nCoeffs, iscan, zbin0, zbin1, round0, round1, quant0, quant1, shift0, shift1, dequant0, dequant1,
+                logScale, qcoeff, dqcoeff);
         // load_b_values_avx2: lane 0 the DC values
         static Vector256<short> Dc(short dc, short ac) => DcAc(dc, ac);
         short zb0 = zbin0, zb1 = zbin1, rn0 = round0, rn1 = round1;
@@ -275,5 +280,141 @@ internal static class AomQuantize
             }
         }
         return MaxU16(Sse2.Max(eob.GetLower(), eob.GetUpper()).AsUInt16());
+    }
+
+    // ---- the AVX2 kernels' int16 lane arithmetic, one lane at a time (no AVX2: the same levels and eob) ----
+
+    private static short Sat16(int v) => (short)Math.Clamp(v, short.MinValue, short.MaxValue);
+    private static short AddSat(short a, short b) => Sat16(a + b);
+    private static short MulHi(short a, short b) => (short)((a * b) >> 16);
+    private static ushort MulHiU(ushort a, ushort b) => (ushort)(((uint)a * b) >> 16);
+    private static short MulLo(short a, short b) => (short)(a * b);
+    // _mm256_sign_epi16
+    private static short Sign(short a, short b) => b < 0 ? (short)-a : b == 0 ? (short)0 : a;
+
+    /// <summary><see cref="QuantizeFpAvx2"/> lane by lane: a group of 16 quantised only when a magnitude exceeds the
+    /// threshold, the lanes' int16 saturation / wrap-around as the kernel's.</summary>
+    internal static int QuantizeFpAvx2Emu(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short round0, short round1,
+        short quant0, short quant1, short dequant0, short dequant1, int logScale, Span<int> qcoeff, Span<int> dqcoeff)
+    {
+        short rnd0 = round0, rnd1 = round1;
+        if (logScale > 0)
+        {
+            short r = (short)(1 << (logScale - 1));
+            rnd0 = (short)((short)(rnd0 + r) >> logScale); rnd1 = (short)((short)(rnd1 + r) >> logScale);
+        }
+        short q0 = quant0, q1 = quant1;
+        if (logScale == 1) { q0 = (short)(q0 << 1); q1 = (short)(q1 << 1); }
+        int eob = 0;
+        for (int k = 0; k < nCoeffs; k += 16)
+        {
+            bool any = false;
+            for (int i = k; i < k + 16; i++)
+            {
+                short dqv = i == 0 ? dequant0 : dequant1;
+                short abs = (short)Math.Abs((int)Sat16(coeff[i]));
+                if (abs > (short)((dqv >> (1 + logScale)) - 1)) any = true;
+            }
+            if (!any)
+            {
+                for (int i = k; i < k + 16; i++) { qcoeff[i] = 0; dqcoeff[i] = 0; }
+                continue;
+            }
+            for (int i = k; i < k + 16; i++)
+            {
+                bool dcLane = i == 0;
+                short rnd = dcLane ? rnd0 : rnd1, qv = dcLane ? q0 : q1, dqv = dcLane ? dequant0 : dequant1;
+                short coef = Sat16(coeff[i]);
+                short abs = (short)Math.Abs((int)coef);
+                short thr = (short)((dqv >> (1 + logScale)) - 1);
+                short absQ, q, dq; bool nz;
+                if (logScale == 0)
+                {
+                    absQ = MulHi(AddSat(abs, rnd), qv);
+                    q = Sign(absQ, coef);
+                    dq = MulLo(q, dqv);
+                    nz = absQ > 0;
+                }
+                else if (logScale == 1)
+                {
+                    absQ = (short)MulHiU((ushort)AddSat(abs, rnd), (ushort)qv);
+                    q = Sign(absQ, coef);
+                    short absDq = (short)((ushort)MulLo(absQ, dqv) >> 1);
+                    nz = absQ > 0;
+                    dq = Sign(absDq, coef);
+                }
+                else
+                {
+                    short tmpRnd = abs > thr ? AddSat(abs, rnd) : (short)0;
+                    short qh = (short)(MulHi(tmpRnd, qv) << 2);
+                    short ql = (short)((ushort)MulLo(tmpRnd, qv) >> 14);
+                    absQ = (short)(qh | ql);
+                    short dqh = (short)(MulHi(absQ, dqv) << 14);
+                    short dql = (short)((ushort)MulLo(absQ, dqv) >> 2);
+                    q = Sign(absQ, coef);
+                    dq = Sign((short)(dqh | dql), coef);
+                    nz = dq != 0;
+                }
+                qcoeff[i] = q;
+                dqcoeff[i] = dq;
+                if (nz) eob = Math.Max(eob, (ushort)(iscan[i] + 1));
+            }
+        }
+        return eob;
+    }
+
+    /// <summary><see cref="QuantizeBAvx2"/> lane by lane (see <see cref="QuantizeFpAvx2Emu"/>).</summary>
+    internal static int QuantizeBAvx2Emu(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short zbin0, short zbin1,
+        short round0, short round1, short quant0, short quant1, short shift0, short shift1, short dequant0, short dequant1,
+        int logScale, Span<int> qcoeff, Span<int> dqcoeff)
+    {
+        short zb0 = zbin0, zb1 = zbin1, rn0 = round0, rn1 = round1;
+        if (logScale > 0)
+        {
+            short r = (short)(1 << (logScale - 1));
+            zb0 = (short)((short)(zb0 + r) >> logScale); zb1 = (short)((short)(zb1 + r) >> logScale);
+            rn0 = (short)((short)(rn0 + r) >> logScale); rn1 = (short)((short)(rn1 + r) >> logScale);
+        }
+        int eob = 0;
+        for (int k = 0; k < nCoeffs; k += 16)
+        {
+            bool any = false;
+            for (int i = k; i < k + 16; i++)
+                if ((short)Math.Abs((int)Sat16(coeff[i])) > (short)((i == 0 ? zb0 : zb1) - 1)) any = true;
+            if (!any)
+            {
+                for (int i = k; i < k + 16; i++) { qcoeff[i] = 0; dqcoeff[i] = 0; }
+                continue;
+            }
+            for (int i = k; i < k + 16; i++)
+            {
+                bool dcLane = i == 0;
+                short zb = (short)((dcLane ? zb0 : zb1) - 1), rnd = dcLane ? rn0 : rn1, qv = dcLane ? quant0 : quant1;
+                short dqv = dcLane ? dequant0 : dequant1, shv = dcLane ? shift0 : shift1;
+                short coef = Sat16(coeff[i]);
+                short abs = (short)Math.Abs((int)coef);
+                short tmpRnd = abs > zb ? AddSat(abs, rnd) : (short)0;
+                short tmp32b = (short)(MulHi(tmpRnd, qv) + tmpRnd);
+                short tmp32, dqc;
+                if (logScale == 0)
+                {
+                    tmp32 = MulHi(tmp32b, shv);
+                    dqc = MulLo(Sign(tmp32, coef), dqv);
+                }
+                else
+                {
+                    short hi = (short)(MulHi(tmp32b, shv) << logScale);
+                    short lo = (short)((ushort)MulLo(tmp32b, shv) >> (16 - logScale));
+                    tmp32 = (short)(hi | lo);
+                    short dh = (short)(MulHi(tmp32, dqv) << (16 - logScale));
+                    short dl = (short)((ushort)MulLo(tmp32, dqv) >> logScale);
+                    dqc = Sign((short)(dh | dl), coef);
+                }
+                qcoeff[i] = Sign(tmp32, coef);
+                dqcoeff[i] = dqc;
+                if (tmp32 > 0) eob = Math.Max(eob, (ushort)(iscan[i] + 1));
+            }
+        }
+        return eob;
     }
 }

@@ -190,9 +190,16 @@ internal static class Px
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector256<int> Load8x32<TP>(ref TP r) where TP : unmanaged
     {
-        if (typeof(TP) == typeof(byte))
-            return Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.As<TP, byte>(ref r))).AsByte());
-        return Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref Unsafe.As<TP, ushort>(ref r)));
+        if (Avx2.IsSupported)
+        {
+            if (typeof(TP) == typeof(byte))
+                return Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.As<TP, byte>(ref r))).AsByte());
+            return Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref Unsafe.As<TP, ushort>(ref r)));
+        }
+        Vector128<ushort> w = typeof(TP) == typeof(byte)
+            ? Vector128.WidenLower(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.As<TP, byte>(ref r))).AsByte())
+            : Vector128.LoadUnsafe(ref Unsafe.As<TP, ushort>(ref r));
+        return Vector256.Create(Vector128.WidenLower(w), Vector128.WidenUpper(w)).AsInt32();
     }
 
     /// <summary>Stores 8 int lanes (each within the sample range) at r.</summary>

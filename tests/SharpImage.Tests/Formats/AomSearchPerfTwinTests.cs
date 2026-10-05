@@ -205,6 +205,7 @@ public sealed class AomSearchPerfTwinTests
     [Test]
     public async Task QmQuantizers_Vector_MatchScalar()
     {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
         var rng = new Random(31);
         var quants = new AomQuants(8, 0, 0, 0, 0, 0, 0);
         int cases = 0, bad = 0;
@@ -250,6 +251,7 @@ public sealed class AomSearchPerfTwinTests
     [Test]
     public async Task HbdQuantizers_Vector_MatchScalar()
     {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
         var rng = new Random(37);
         int cases = 0, bad = 0;
         foreach (int bd in new[] { 10, 12 })
@@ -290,6 +292,7 @@ public sealed class AomSearchPerfTwinTests
     [Test]
     public async Task HbdComputeStats_Vector_MatchScalar()
     {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
         var rng = new Random(41);
         int cases = 0, bad = 0;
         foreach (int bd in new[] { 10, 12 })
@@ -346,7 +349,8 @@ public sealed class AomSearchPerfTwinTests
             for (int k = 0; k < diff.Length; k++) diff[k] = (short)(trial % 3 == 0 ? (rng.Next(2) == 0 ? -max : max) : rng.Next(-max, max + 1));
             var h1 = new int[64]; var h2 = new int[64];
             AomHbd.Hadamard8x8(diff, 72, h1); AomHbd.Hadamard8x8Scalar(diff, 72, h2);
-            for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++) if (h1[c * 8 + r] != h2[r * 8 + c]) { bad++; r = 9; break; }
+            bool tr = System.Runtime.Intrinsics.X86.Avx2.IsSupported;
+            for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++) if (h1[tr ? c * 8 + r : r * 8 + c] != h2[r * 8 + c]) { bad++; r = 9; break; }
             cases++;
         }
         Console.WriteLine($"hbd dsp: {cases} cases, {bad} mismatches");
@@ -355,6 +359,7 @@ public sealed class AomSearchPerfTwinTests
     [Test]
     public async Task HbdQmQuantizers_Vector_MatchScalar()
     {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
         var rng = new Random(47);
         int cases = 0, bad = 0;
         foreach (int bd in new[] { 10, 12 })

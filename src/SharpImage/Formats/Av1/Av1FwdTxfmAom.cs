@@ -26,10 +26,20 @@ internal static partial class Av1FwdTxfmAom
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static V MulRound(V x, int m, int bit)
     {
+        if (!Avx.IsSupported) return MulRoundScalar(x, m, bit);
         var dm = Vector256.Create((double)m); var r = Vector256.Create((double)(1 << (bit - 1))); var inv = Vector256.Create(1.0 / (1 << bit));
         var lo = Vector256.Floor((Avx.ConvertToVector256Double(x.GetLower()) * dm + r) * inv);
         var hi = Vector256.Floor((Avx.ConvertToVector256Double(x.GetUpper()) * dm + r) * inv);
         return Vector256.Create(Avx.ConvertToVector128Int32WithTruncation(lo), Avx.ConvertToVector128Int32WithTruncation(hi));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static V MulRoundScalar(V x, int m, int bit)
+    {
+        long r = 1L << (bit - 1);
+        Unsafe.SkipInit(out V res);
+        for (int i = 0; i < 8; i++) Unsafe.Add(ref Unsafe.As<V, int>(ref res), i) = (int)(((long)x.GetElement(i) * m + r) >> bit);
+        return res;
     }
 
     private static void Fdct4(ref V input, ref V output, int cosBit)
@@ -1340,6 +1350,19 @@ internal static partial class Av1FwdTxfmAom
         }
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Transpose8Scalar(ref V r)
+    {
+        ref int m = ref Unsafe.As<V, int>(ref r);
+        for (int i = 0; i < 8; i++)
+            for (int j = i + 1; j < 8; j++)
+            {
+                int t = Unsafe.Add(ref m, i * 8 + j);
+                Unsafe.Add(ref m, i * 8 + j) = Unsafe.Add(ref m, j * 8 + i);
+                Unsafe.Add(ref m, j * 8 + i) = t;
+            }
+    }
+
     // av1_fwd_txfm_shift_ls / av1_fwd_cos_bit_col / _row (tx size order = Av1TxSize)
     private static readonly sbyte[] Shift = { 2, 0, 0, 2, -1, 0, 2, -2, 0, 2, -4, 0, 0, -2, -2, 2, -1, 0, 2, -1, 0, 2, -2, 0, 2, -2, 0,
         2, -4, 0, 2, -4, 0, 0, -2, -2, 2, -4, -2, 2, -1, 0, 2, -1, 0, 2, -2, 0, 2, -2, 0, 0, -2, 0, 2, -4, 0 };
@@ -1350,6 +1373,7 @@ internal static partial class Av1FwdTxfmAom
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Transpose8(ref V r)
     {
+        if (!Avx2.IsSupported) { Transpose8Scalar(ref r); return; }
         V a0 = r, a1 = Unsafe.Add(ref r, 1), a2 = Unsafe.Add(ref r, 2), a3 = Unsafe.Add(ref r, 3);
         V a4 = Unsafe.Add(ref r, 4), a5 = Unsafe.Add(ref r, 5), a6 = Unsafe.Add(ref r, 6), a7 = Unsafe.Add(ref r, 7);
         V t0 = Avx2.UnpackLow(a0, a1), t1 = Avx2.UnpackHigh(a0, a1), t2 = Avx2.UnpackLow(a2, a3), t3 = Avx2.UnpackHigh(a2, a3);
@@ -1458,12 +1482,32 @@ internal static partial class Av1FwdTxfmAom
 
     private static ref int MemoryArrayRef(int[] a) => ref MemoryMarshal.GetArrayDataReference(a);
 
+    // Quant4 lane by lane (cvttpd2dq: out-of-range magnitudes give int.MinValue; psignd)
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Vector128<int> Quant4Scalar(Vector128<int> c, Vector256<double> mul, Vector256<double> half,
+        Vector256<double> bias, ref int dst, double[]? qfOut, int at)
+    {
+        Unsafe.SkipInit(out Vector128<int> li);
+        for (int i = 0; i < 4; i++)
+        {
+            int ci = c.GetElement(i);
+            double qf = ci * mul.GetElement(i);
+            if (qfOut != null) qfOut[at + i] = qf;
+            double t = Math.Abs(qf) + half.GetElement(i) - bias.GetElement(i);
+            int l = t >= 2147483648.0 || t <= -2147483649.0 || double.IsNaN(t) ? int.MinValue : (int)t;
+            Unsafe.Add(ref Unsafe.As<Vector128<int>, int>(ref li), i) = ci < 0 ? -l : ci == 0 ? 0 : l;
+        }
+        li.StoreUnsafe(ref dst);
+        return li;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     // level = sign(c) * floor(|qf| + 0.5 - bias), 0 when that is below 1: the magnitude is truncated (the floor for it >= 0,
     // and 0 for it in (-1, 1), so any bias below 1.5) and the coefficient's sign applied in integers
     private static Vector128<int> Quant4(Vector128<int> c, Vector256<double> mul, Vector256<double> half,
         Vector256<double> bias, ref int dst, double[]? qfOut, int at)
     {
+        if (!Avx.IsSupported) return Quant4Scalar(c, mul, half, bias, ref dst, qfOut, at);
         var qf = Avx.ConvertToVector256Double(c) * mul;   // c * 2^tx_scale / dq
         if (qfOut != null) qf.StoreUnsafe(ref MemoryMarshal.GetArrayDataReference(qfOut), (nuint)at);
         var li = Ssse3.Sign(Avx.ConvertToVector128Int32WithTruncation(Vector256.Abs(qf) + half - bias), c);
