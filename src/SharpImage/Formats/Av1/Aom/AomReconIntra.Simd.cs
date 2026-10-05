@@ -117,8 +117,15 @@ internal static unsafe partial class AomReconIntra
                 var w16 = Sse2.PackSignedSaturate(v.GetLower(), v.GetUpper());
                 var b8 = Sse2.PackUnsignedSaturate(w16, w16);
                 int cnt = Math.Min(8, nl - c);
-                if (cnt == 8) *(ulong*)(dst + c) = b8.AsUInt64().ToScalar();
-                else Unsafe.CopyBlockUnaligned(dst + c, &b8, (uint)cnt);
+                ulong q = b8.AsUInt64().ToScalar();
+                if (cnt == 8) *(ulong*)(dst + c) = q;
+                else if (cnt >= 4)
+                {
+                    // two overlapping 4-byte stores (no memmove call for the short tail)
+                    *(uint*)(dst + c) = (uint)q;
+                    *(uint*)(dst + c + cnt - 4) = (uint)(q >> ((cnt - 4) * 8));
+                }
+                else for (int k = 0; k < cnt; k++) dst[c + k] = (byte)(q >> (k * 8));
             }
             if (c0 < bw) DrRun(dst + c0, above + baseOff + c0, bw - c0, bw - c0, (t & 0x3F) >> 1, 0);
         }

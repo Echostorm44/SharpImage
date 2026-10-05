@@ -192,7 +192,14 @@ internal static class AomTxb
     internal static void InitLevels(ReadOnlySpan<int> coeff, int width, int height, Span<byte> levels)
     {
         int stride = height + TxPadHor;
-        levels.Slice(stride * width, TxPadBottom * stride + TxPadEnd).Clear();
+        {
+            // the padding past the last column (48..160 bytes): overlapping vector stores, not a Clear call
+            var tail = levels.Slice(stride * width, TxPadBottom * stride + TxPadEnd);
+            ref byte t0 = ref MemoryMarshal.GetReference(tail);
+            int n = tail.Length;
+            for (int k = 0; k + 32 < n; k += 32) Vector256<byte>.Zero.StoreUnsafe(ref t0, (nuint)k);
+            Vector256<byte>.Zero.StoreUnsafe(ref t0, (nuint)(n - 32));
+        }
         ref int c0 = ref MemoryMarshal.GetReference(coeff);
         ref byte l0 = ref MemoryMarshal.GetReference(levels);
         var max = Vector256.Create(127);

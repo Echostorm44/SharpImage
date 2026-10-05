@@ -1,5 +1,7 @@
 using System.Runtime.CompilerServices;
 using System;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -73,8 +75,27 @@ internal static partial class AomTxSearch
     /// <summary>av1_get_entropy_contexts: copies the plane block's above / left entropy contexts.</summary>
     internal static void GetEntropyContexts(int planeBsize, AomMbdPlane pd, Span<byte> tAbove, Span<byte> tLeft)
     {
-        pd.AboveEntropyContext.AsSpan(pd.AboveEntropyOffset, MiSizeWide[planeBsize]).CopyTo(tAbove);
-        pd.LeftEntropyContext.AsSpan(pd.LeftEntropyOffset, MiSizeHigh[planeBsize]).CopyTo(tLeft);
+        CopyCtx(pd.AboveEntropyContext.AsSpan(pd.AboveEntropyOffset, MiSizeWide[planeBsize]), tAbove);
+        CopyCtx(pd.LeftEntropyContext.AsSpan(pd.LeftEntropyOffset, MiSizeHigh[planeBsize]), tLeft);
+    }
+
+    // a context run of 1 / 2 / 4 / 8 / 16 / 32 entries as one move (no memmove call)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void CopyCtx(ReadOnlySpan<byte> src, Span<byte> dst)
+    {
+        if (dst.Length < src.Length) throw new ArgumentException("context buffer too small");
+        ref byte s = ref MemoryMarshal.GetReference(src);
+        ref byte d = ref MemoryMarshal.GetReference(dst);
+        switch (src.Length)
+        {
+            case 1: d = s; break;
+            case 2: Unsafe.WriteUnaligned(ref d, Unsafe.ReadUnaligned<ushort>(ref s)); break;
+            case 4: Unsafe.WriteUnaligned(ref d, Unsafe.ReadUnaligned<uint>(ref s)); break;
+            case 8: Unsafe.WriteUnaligned(ref d, Unsafe.ReadUnaligned<ulong>(ref s)); break;
+            case 16: Vector128.LoadUnsafe(ref s).StoreUnsafe(ref d); break;
+            case 32: Vector256.LoadUnsafe(ref s).StoreUnsafe(ref d); break;
+            default: src.CopyTo(dst); break;
+        }
     }
 
     /// <summary>av1_get_skip_txfm_context.</summary>
