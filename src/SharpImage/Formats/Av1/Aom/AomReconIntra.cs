@@ -940,8 +940,41 @@ internal static unsafe partial class AomReconIntra
     }
 
     /// <summary>av1_predict_intra_block.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     public static void PredictIntraBlock(AomMacroblockD xd, int sbSize, bool enableIntraEdgeFilter, int wpx, int hpx,
         int txSize, int mode, int angleDelta, bool usePalette, int filterIntraMode, byte* refp, int refStride,
+        byte* dst, int dstStride, int colOff, int rowOff, int plane)
+    {
+        if (usePalette) PredictPaletteBlock(xd, wpx, txSize, dst, dstStride, colOff, rowOff, plane);
+        else PredictIntraBlockInl(xd, sbSize, enableIntraEdgeFilter, wpx, hpx, txSize, mode, angleDelta, filterIntraMode,
+            refp, refStride, dst, dstStride, colOff, rowOff, plane);
+    }
+
+    /// <summary>av1_predict_intra_block's palette branch: the colours of the block's colour index map.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void PredictPaletteBlock(AomMacroblockD xd, int wpx, int txSize, byte* dst, int dstStride, int colOff, int rowOff, int plane)
+    {
+        int txwpx = TxSizeWide[txSize];
+        int txhpx = TxSizeHigh[txSize];
+        int x = colOff << MI_SIZE_LOG2;
+        int y = rowOff << MI_SIZE_LOG2;
+        int p1 = plane != 0 ? 1 : 0;
+        byte[] mapArr = xd.Plane[p1].ColorIndexMap;
+        int mapOff = xd.ColorIndexMapOffset[p1];
+        ushort[] palette = xd.Mi0.Palette.PaletteColors;
+        int palOff = plane * AomPaletteModeInfo.PaletteMaxSize;
+        for (int r = 0; r < txhpx; ++r)
+        {
+            int m = mapOff + (r + y) * wpx + x;
+            byte* d = dst + r * dstStride;
+            for (int c = 0; c < txwpx; ++c) d[c] = (byte)palette[palOff + mapArr[m + c]];
+        }
+    }
+
+    // av1_predict_intra_block's non-palette body (16 arguments: the JIT's inlining limit), inlined into the facade
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void PredictIntraBlockInl(AomMacroblockD xd, int sbSize, bool enableIntraEdgeFilter, int wpx, int hpx,
+        int txSize, int mode, int angleDelta, int filterIntraMode, byte* refp, int refStride,
         byte* dst, int dstStride, int colOff, int rowOff, int plane)
     {
         AomMbModeInfo mbmi = xd.Mi0;
@@ -949,22 +982,6 @@ internal static unsafe partial class AomReconIntra
         int txhpx = TxSizeHigh[txSize];
         int x = colOff << MI_SIZE_LOG2;
         int y = rowOff << MI_SIZE_LOG2;
-
-        if (usePalette)
-        {
-            int p1 = plane != 0 ? 1 : 0;
-            byte[] mapArr = xd.Plane[p1].ColorIndexMap;
-            int mapOff = xd.ColorIndexMapOffset[p1];
-            ushort[] palette = mbmi.Palette.PaletteColors;
-            int palOff = plane * AomPaletteModeInfo.PaletteMaxSize;
-            for (int r = 0; r < txhpx; ++r)
-            {
-                int m = mapOff + (r + y) * wpx + x;
-                byte* d = dst + r * dstStride;
-                for (int c = 0; c < txwpx; ++c) d[c] = (byte)palette[palOff + mapArr[m + c]];
-            }
-            return;
-        }
 
         AomMbdPlane pd = xd.Plane[plane];
         int ssX = pd.SubsamplingX;
@@ -1088,8 +1105,9 @@ internal static unsafe partial class AomReconIntra
                     blkCol, blkRow, plane);
                 return;
             }
-            PredictIntraBlock(xd, sbSize, enableIntraEdgeFilter, pd.Width, pd.Height, txSize, mode, angleDelta,
-                usePalette, filterIntraMode, dst, dstStride, dst, dstStride, blkCol, blkRow, plane);
+            if (usePalette) PredictPaletteBlock(xd, pd.Width, txSize, dst, dstStride, blkCol, blkRow, plane);
+            else PredictIntraBlockInl(xd, sbSize, enableIntraEdgeFilter, pd.Width, pd.Height, txSize, mode, angleDelta,
+                filterIntraMode, dst, dstStride, dst, dstStride, blkCol, blkRow, plane);
         }
     }
 }
