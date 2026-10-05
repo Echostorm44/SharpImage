@@ -608,7 +608,8 @@ internal static partial class AomEncodeMb
         => costs.Get(AomTxb.TxsizeEntropyCtx(txSize), plane == 0 ? 0 : 1).TxbSkip[ctx.TxbSkipCtx * 2 + 1];
 
     /// <summary>av1_optimize_b: the trellis (or the skip cost when there is nothing to optimise). Returns the eob.</summary>
-    [SkipLocalsInit]   // as the trellis / cost kernels it inlines (a localsinit mismatch blocks the inlining)
+    // out of line: inlined into search_tx_type its argument view's GC slots grew that frame's per-call zeroing
+    [MethodImpl(MethodImplOptions.NoInlining)]
     internal static int OptimizeB(AomComp cpi, AomMacroblock x, int plane, int block, int txSize, int txType, AomTxbCtx txbCtx, out int rateCost)
     {
         var xd = x.E;

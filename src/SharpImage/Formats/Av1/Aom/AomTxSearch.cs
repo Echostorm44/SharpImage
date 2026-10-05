@@ -479,7 +479,6 @@ internal static partial class AomTxSearch
     private static readonly int[,] ThreshArr = { { 10, 15, 15, 10, 15, 15, 15 }, { 10, 17, 17, 10, 17, 17, 17 } };
 
     /// <summary>get_tx_mask.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ushort GetTxMask(AomComp cpi, AomMacroblock x, int plane, int block, int blkRow, int blkCol, int planeBsize, int txSize,
         AomTxbCtx txbCtx, int ftxsMode, long refBestRd, out int allowedTxkTypes, Span<int> txkMap)
     {
