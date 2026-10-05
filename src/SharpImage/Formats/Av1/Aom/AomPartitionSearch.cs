@@ -1,4 +1,8 @@
 using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics.X86;
+using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -235,6 +239,51 @@ internal static partial class AomEncodeFrame
         int bw = 4 * MiSizeWide[bs] - rightOverflow, bh = 4 * MiSizeHigh[bs] - bottomOverflow;
         double minVar4x4 = int.MaxValue, maxVar4x4 = 0.0;
         var src = x.Plane[0].Src;
+        if (src.Buf16 == null && Avx2.IsSupported && src.Offset >= 0 && src.Offset + (long)(bh - 1) * src.Stride + bw <= src.Buf.Length)
+        {
+            // aom_variance4x4 against zeros (sse - (sum^2 >> 4)) of four horizontally adjacent 4x4 blocks per pass:
+            // each row's 16 samples widened, pmaddwd against themselves (squares) and ones (sums), one hadd per block
+            ref byte s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src.Buf), src.Offset);
+            var ones = Vector256.Create((short)1);
+            uint vmin = int.MaxValue, vmax = 0;
+            for (int i = 0; i < bh; i += 4)
+            {
+                ref byte r0 = ref Unsafe.Add(ref s0, i * src.Stride);
+                int j = 0;
+                for (; j + 16 <= bw; j += 16)
+                {
+                    var sum = Vector256<int>.Zero;
+                    var sq = Vector256<int>.Zero;
+                    for (int r = 0; r < 4; r++)
+                    {
+                        var v = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref Unsafe.Add(ref r0, r * src.Stride + j)));
+                        sum += Avx2.MultiplyAddAdjacent(v, ones);
+                        sq += Avx2.MultiplyAddAdjacent(v, v);
+                    }
+                    // lanes: [sum b0, sum b1, sse b0, sse b1 | sum b2, sum b3, sse b2, sse b3]
+                    var h = Avx2.HorizontalAdd(sum, sq);
+                    for (int k = 0; k < 4; k++)
+                    {
+                        int lane = (k >> 1) * 4 + (k & 1);
+                        int sm = h.GetElement(lane);
+                        uint var = (uint)h.GetElement(lane + 2) - (uint)(((long)sm * sm) >> 4);
+                        if (var < vmin) vmin = var;
+                        if (var > vmax) vmax = var;
+                    }
+                }
+                for (; j < bw; j += 4)
+                {
+                    uint var = AomIntraModeSearch.VarianceVsZero(src.Buf, src.Offset + i * src.Stride + j, src.Stride, 4, 4, out _);
+                    if (var < vmin) vmin = var;
+                    if (var > vmax) vmax = var;
+                }
+            }
+            minVar4x4 = Math.Min(minVar4x4, (int)vmin);
+            maxVar4x4 = Math.Max(maxVar4x4, (int)vmax);
+            varMin = Math.Log(1 + minVar4x4 / 16.0);
+            varMax = Math.Log(1 + maxVar4x4 / 16.0);
+            return;
+        }
         for (int i = 0; i < bh; i += 4)
             for (int j = 0; j < bw; j += 4)
             {

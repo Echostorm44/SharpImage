@@ -147,6 +147,11 @@ internal static class AomHadamard
     /// <summary>aom_hadamard_16x16 (in the AVX2 kernel's output order).</summary>
     internal static void H16x16(ReadOnlySpan<short> srcDiff, int srcStride, Span<int> coeff)
     {
+        if (Avx2.IsSupported && coeff.Length >= 256 && srcDiff.Length >= 15 * srcStride + 16)
+        {
+            H16x16Avx2(ref MemoryMarshal.GetReference(srcDiff), srcStride, ref MemoryMarshal.GetReference(coeff));
+            return;
+        }
         for (int idx = 0; idx < 4; ++idx)
             H8x8(srcDiff.Slice((idx >> 1) * 8 * srcStride + (idx & 1) * 8), srcStride, coeff.Slice(idx * 64));
         if (Avx2.IsSupported && coeff.Length >= 256)
@@ -186,6 +191,90 @@ internal static class AomHadamard
                 coeff[i * 16 + 4 + j] = coeff[i * 16 + 8 + j];
                 coeff[i * 16 + 8 + j] = temp;
             }
+    }
+
+    /// <summary>hadamard_16x16_avx2 (is_final): two aom_hadamard_lp_8x8_dual_avx2 into an int16 temp, the combining
+    /// butterfly in int16 lanes, store_tran_low's lane order.</summary>
+    [SkipLocalsInit]
+    private static void H16x16Avx2(ref short src, int stride, ref int coeff)
+    {
+        Unsafe.SkipInit(out StackArr16<Vector256<short>> tBuf);
+        ref Vector256<short> t = ref tBuf[0];
+        Lp8x8DualAvx2(ref src, stride, ref t);
+        Lp8x8DualAvx2(ref Unsafe.Add(ref src, 8 * stride), stride, ref Unsafe.Add(ref t, 8));
+        ref short t16 = ref Unsafe.As<Vector256<short>, short>(ref t);
+        var one = Vector256.Create((short)1);
+        for (int idx = 0; idx < 64; idx += 16)
+        {
+            var c0 = Vector256.LoadUnsafe(ref t16, (nuint)idx);
+            var c1 = Vector256.LoadUnsafe(ref t16, (nuint)(idx + 64));
+            var c2 = Vector256.LoadUnsafe(ref t16, (nuint)(idx + 128));
+            var c3 = Vector256.LoadUnsafe(ref t16, (nuint)(idx + 192));
+            var b0 = Vector256.ShiftRightArithmetic(c0 + c1, 1);
+            var b1 = Vector256.ShiftRightArithmetic(c0 - c1, 1);
+            var b2 = Vector256.ShiftRightArithmetic(c2 + c3, 1);
+            var b3 = Vector256.ShiftRightArithmetic(c2 - c3, 1);
+            StoreTranLow(b0 + b2, ref Unsafe.Add(ref coeff, idx));
+            StoreTranLow(b1 + b3, ref Unsafe.Add(ref coeff, idx + 64));
+            StoreTranLow(b0 - b2, ref Unsafe.Add(ref coeff, idx + 128));
+            StoreTranLow(b1 - b3, ref Unsafe.Add(ref coeff, idx + 192));
+        }
+    }
+
+    // store_tran_low: the 16 int16 lanes sign-extended as [0..3, 8..11], [4..7, 12..15]
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StoreTranLow(Vector256<short> a, ref int dst)
+    {
+        var sign = Vector256.ShiftRightArithmetic(a, 15);
+        Avx2.UnpackLow(a, sign).AsInt32().StoreUnsafe(ref dst);
+        Avx2.UnpackHigh(a, sign).AsInt32().StoreUnsafe(ref dst, 8);
+    }
+
+    /// <summary>aom_hadamard_lp_8x8_dual_avx2: two 8x8 blocks side by side (16 columns), output as 8 vectors.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Lp8x8DualAvx2(ref short src, int stride, ref Vector256<short> outp)
+    {
+        var a0 = Vector256.LoadUnsafe(ref src);
+        var a1 = Vector256.LoadUnsafe(ref src, (nuint)stride);
+        var a2 = Vector256.LoadUnsafe(ref src, (nuint)(2 * stride));
+        var a3 = Vector256.LoadUnsafe(ref src, (nuint)(3 * stride));
+        var a4 = Vector256.LoadUnsafe(ref src, (nuint)(4 * stride));
+        var a5 = Vector256.LoadUnsafe(ref src, (nuint)(5 * stride));
+        var a6 = Vector256.LoadUnsafe(ref src, (nuint)(6 * stride));
+        var a7 = Vector256.LoadUnsafe(ref src, (nuint)(7 * stride));
+        // hadamard_col8x2_avx2, iter 0 (with the transpose)
+        var b0 = a0 + a1; var b1 = a0 - a1; var b2 = a2 + a3; var b3 = a2 - a3;
+        var b4 = a4 + a5; var b5 = a4 - a5; var b6 = a6 + a7; var b7 = a6 - a7;
+        a0 = b0 + b2; a1 = b1 + b3; a2 = b0 - b2; a3 = b1 - b3;
+        a4 = b4 + b6; a5 = b5 + b7; a6 = b4 - b6; a7 = b5 - b7;
+        b0 = a0 + a4; b7 = a1 + a5; b3 = a2 + a6; b4 = a3 + a7;
+        b2 = a0 - a4; b6 = a1 - a5; b1 = a2 - a6; b5 = a3 - a7;
+        a0 = Avx2.UnpackLow(b0, b1); a1 = Avx2.UnpackLow(b2, b3); a2 = Avx2.UnpackHigh(b0, b1); a3 = Avx2.UnpackHigh(b2, b3);
+        a4 = Avx2.UnpackLow(b4, b5); a5 = Avx2.UnpackLow(b6, b7); a6 = Avx2.UnpackHigh(b4, b5); a7 = Avx2.UnpackHigh(b6, b7);
+        var d0 = Avx2.UnpackLow(a0.AsInt32(), a1.AsInt32()); var d1 = Avx2.UnpackLow(a4.AsInt32(), a5.AsInt32());
+        var d2 = Avx2.UnpackHigh(a0.AsInt32(), a1.AsInt32()); var d3 = Avx2.UnpackHigh(a4.AsInt32(), a5.AsInt32());
+        var d4 = Avx2.UnpackLow(a2.AsInt32(), a3.AsInt32()); var d5 = Avx2.UnpackLow(a6.AsInt32(), a7.AsInt32());
+        var d6 = Avx2.UnpackHigh(a2.AsInt32(), a3.AsInt32()); var d7 = Avx2.UnpackHigh(a6.AsInt32(), a7.AsInt32());
+        a0 = Avx2.UnpackLow(d0.AsInt64(), d1.AsInt64()).AsInt16(); a1 = Avx2.UnpackHigh(d0.AsInt64(), d1.AsInt64()).AsInt16();
+        a2 = Avx2.UnpackLow(d2.AsInt64(), d3.AsInt64()).AsInt16(); a3 = Avx2.UnpackHigh(d2.AsInt64(), d3.AsInt64()).AsInt16();
+        a4 = Avx2.UnpackLow(d4.AsInt64(), d5.AsInt64()).AsInt16(); a5 = Avx2.UnpackHigh(d4.AsInt64(), d5.AsInt64()).AsInt16();
+        a6 = Avx2.UnpackLow(d6.AsInt64(), d7.AsInt64()).AsInt16(); a7 = Avx2.UnpackHigh(d6.AsInt64(), d7.AsInt64()).AsInt16();
+        // iter 1
+        b0 = a0 + a1; b1 = a0 - a1; b2 = a2 + a3; b3 = a2 - a3;
+        b4 = a4 + a5; b5 = a4 - a5; b6 = a6 + a7; b7 = a6 - a7;
+        a0 = b0 + b2; a1 = b1 + b3; a2 = b0 - b2; a3 = b1 - b3;
+        a4 = b4 + b6; a5 = b5 + b7; a6 = b4 - b6; a7 = b5 - b7;
+        var i0 = a0 + a4; var i7 = a1 + a5; var i3 = a2 + a6; var i4 = a3 + a7;
+        var i2 = a0 - a4; var i6 = a1 - a5; var i1 = a2 - a6; var i5 = a3 - a7;
+        // the stores of aom_hadamard_lp_8x8_dual_avx2 (permute2x128 0x20 then 0x31 pairs)
+        outp = Avx2.Permute2x128(i0, i1, 0x20);
+        Unsafe.Add(ref outp, 1) = Avx2.Permute2x128(i2, i3, 0x20);
+        Unsafe.Add(ref outp, 2) = Avx2.Permute2x128(i4, i5, 0x20);
+        Unsafe.Add(ref outp, 3) = Avx2.Permute2x128(i6, i7, 0x20);
+        Unsafe.Add(ref outp, 4) = Avx2.Permute2x128(i0, i1, 0x31);
+        Unsafe.Add(ref outp, 5) = Avx2.Permute2x128(i2, i3, 0x31);
+        Unsafe.Add(ref outp, 6) = Avx2.Permute2x128(i4, i5, 0x31);
+        Unsafe.Add(ref outp, 7) = Avx2.Permute2x128(i6, i7, 0x31);
     }
 
     /// <summary>aom_hadamard_32x32.</summary>
