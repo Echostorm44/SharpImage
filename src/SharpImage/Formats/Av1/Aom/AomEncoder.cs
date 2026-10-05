@@ -341,7 +341,9 @@ internal static partial class AomEncoder
     private static AomMacroblock NewThreadData(AomComp cpi, AomEncodeInput input)
     {
         var cm = cpi.Cm;
-        var x = new AomMacroblock();
+        // the plane buffers sized as av1_setup_shared_coeff_buffer / av1_alloc_src_diff size them
+        int sbSquare = 1 << NumPelsLog2Lookup[cm.SbSize];
+        var x = new AomMacroblock(sbSquare, sbSquare >> (cm.SsX + cm.SsY));
         var xd = x.E;
         bool lossless = input.BaseQindex == 0;
         for (int i = 0; i < 8; ++i)

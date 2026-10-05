@@ -117,12 +117,26 @@ internal struct AomBuf2d
 internal sealed partial class AomMbPlane
 {
     public const int MaxSbSquare = 128 * 128;
-    public readonly short[] SrcDiff = new short[MaxSbSquare];
-    public int[] Coeff = new int[MaxSbSquare];
-    public int[] Qcoeff = new int[MaxSbSquare];
-    public int[] Dqcoeff = new int[MaxSbSquare];
-    public ushort[] Eobs = new ushort[MaxSbSquare / 16];
-    public byte[] TxbEntropyCtx = new byte[MaxSbSquare / 16];
+    public readonly short[] SrcDiff;
+    public int[] Coeff;
+    public int[] Qcoeff;
+    public int[] Dqcoeff;
+    public ushort[] Eobs;
+    public byte[] TxbEntropyCtx;
+
+    public AomMbPlane() : this(MaxSbSquare) { }
+
+    /// <summary>The plane's buffers for blocks of up to square samples (av1_setup_shared_coeff_buffer /
+    /// av1_alloc_src_diff: the superblock's pixels, shifted down by the plane's subsampling).</summary>
+    public AomMbPlane(int square)
+    {
+        SrcDiff = new short[square];
+        Coeff = new int[square];
+        Qcoeff = new int[square];
+        Dqcoeff = new int[square];
+        Eobs = new ushort[square / 16];
+        TxbEntropyCtx = new byte[square / 16];
+    }
     public AomBuf2d Src;
     // quantizer / dequantizer [dc, ac] for the block's qindex (x->plane[p].*_QTX)
     public short QuantFp0, QuantFp1, RoundFp0, RoundFp1, Quant0, Quant1, QuantShift0, QuantShift1,

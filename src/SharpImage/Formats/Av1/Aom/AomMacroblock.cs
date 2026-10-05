@@ -254,7 +254,16 @@ internal sealed class AomPcTree
 /// add the fields their functions use).</summary>
 internal sealed partial class AomMacroblock
 {
-    public readonly AomMbPlane[] Plane = { new(), new(), new() };
+    public readonly AomMbPlane[] Plane;
+
+    public AomMacroblock() : this(AomMbPlane.MaxSbSquare, AomMbPlane.MaxSbSquare) { }
+
+    /// <summary>A MACROBLOCK whose plane buffers hold lumaSquare / chromaSquare samples (the superblock and its
+    /// subsampled chroma).</summary>
+    public AomMacroblock(int lumaSquare, int chromaSquare)
+    {
+        Plane = new[] { new AomMbPlane(lumaSquare), new AomMbPlane(chromaSquare), new AomMbPlane(chromaSquare) };
+    }
     public readonly AomMacroblockD E = new();
     public int Qindex;
     public int DeltaQindex;
