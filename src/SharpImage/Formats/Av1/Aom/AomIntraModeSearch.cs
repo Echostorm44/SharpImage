@@ -1,6 +1,8 @@
 using System.Runtime.Intrinsics;
 using System.Runtime.CompilerServices;
 using System;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics.X86;
 using static SharpImage.Formats.Av1.AomTables;
 
 namespace SharpImage.Formats.Av1;
@@ -226,6 +228,11 @@ internal static class AomIntraModeSearch
         avgLogSrcVariance = 0; avgLogReconVariance = 0;
         var src = x.Plane[0].Src;
         var dst = xd.Plane[0].Dst;
+        Unsafe.SkipInit(out StackArr4<uint> fourBuf);
+        ref uint four0 = ref fourBuf[0];
+        bool fourValid = false;
+        bool fourOk = dst.Buf16 == null && Avx2.IsSupported && dst.Offset >= 0
+            && dst.Offset + (long)(bh - 1) * dst.Stride + bw <= dst.Buf.Length;
         for (int i = 0; i < bh; i += 4)
         {
             int r = miRowInSb + (i >> 2);
@@ -249,14 +256,52 @@ internal static class AomIntraModeSearch
                     x.SrcLogVar4x4[miOffset] = logSrcVar;
                 }
                 avgLogSrcVariance += logSrcVar;
-                int reconVar = dst.Buf16 != null ? (int)AomHbd.Variance(dst.Buf16, dst.Offset + i * dst.Stride + j, dst.Stride, null, 0, 0, 0, 4, 4, xd.Bd, out _)
-                    : (int)VarianceVsZero(dst.Buf, dst.Offset + i * dst.Stride + j, dst.Stride, 4, 4, out _);
+                int reconVar;
+                if (dst.Buf16 != null)
+                    reconVar = (int)AomHbd.Variance(dst.Buf16, dst.Offset + i * dst.Stride + j, dst.Stride, null, 0, 0, 0, 4, 4, xd.Bd, out _);
+                else
+                {
+                    // the recon variances four 4x4 blocks at a time (one pass), consumed in order
+                    if ((j & 15) == 0 && j + 16 <= bw && fourOk)
+                    {
+                        Var4x4x4(dst.Buf, dst.Offset + i * dst.Stride + j, dst.Stride, ref four0);
+                        fourValid = true;
+                    }
+                    if (fourValid) reconVar = (int)Unsafe.Add(ref four0, (j >> 2) & 3);
+                    else reconVar = (int)VarianceVsZero(dst.Buf, dst.Offset + i * dst.Stride + j, dst.Stride, 4, 4, out _);
+                    if (((j >> 2) & 3) == 3) fourValid = false;
+                }
                 avgLogReconVariance += Log1p(reconVar / 16.0);
             }
+            fourValid = false;
         }
         int blocks = (bw * bh) / 16;
         avgLogSrcVariance /= blocks;
         avgLogReconVariance /= blocks;
+    }
+
+    /// <summary>aom_variance4x4 against zeros (sse - (sum^2 &gt;&gt; 4)) of the four 4x4 blocks at buf[off .. off + 16) x 4 rows:
+    /// each row's 16 samples widened, pmaddwd against themselves (squares) and ones (sums), one hadd per block.</summary>
+    internal static void Var4x4x4(byte[] buf, int off, int stride, ref uint var4)
+    {
+        ref byte r0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(buf), off);
+        var ones = Vector256.Create((short)1);
+        var sum = Vector256<int>.Zero;
+        var sq = Vector256<int>.Zero;
+        for (int r = 0; r < 4; r++)
+        {
+            var v = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref Unsafe.Add(ref r0, r * stride)));
+            sum += Avx2.MultiplyAddAdjacent(v, ones);
+            sq += Avx2.MultiplyAddAdjacent(v, v);
+        }
+        // lanes: [sum b0, sum b1, sse b0, sse b1 | sum b2, sum b3, sse b2, sse b3]
+        var h = Avx2.HorizontalAdd(sum, sq);
+        for (int k = 0; k < 4; k++)
+        {
+            int lane = (k >> 1) * 4 + (k & 1);
+            int sm = h.GetElement(lane);
+            Unsafe.Add(ref var4, k) = (uint)h.GetElement(lane + 2) - (uint)(((long)sm * sm) >> 4);
+        }
     }
 
     // libaom's log1p is mingw-w64's x87 fyl2xp1 / fyl2x at 64-bit precision; log(1 + x) with 1 + x exact (x = k / 16)
