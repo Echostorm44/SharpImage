@@ -753,7 +753,10 @@ internal static partial class AomTxSearch
 
         byte bestTxbCtx = 0;
         int txkAllowed = TX_TYPES;
-        var txkMapBuf11 = new StackArr16<int>(); Span<int> txkMap = txkMapBuf11; for (int q = 0; q < 16; q++) txkMap[q] = q;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr16<int> txkMapBuf11); Span<int> txkMap = txkMapBuf11;
+        // the identity map 0..15 as two vector stores
+        Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7).StoreUnsafe(ref MemoryMarshal.GetReference(txkMap));
+        Vector256.Create(8, 9, 10, 11, 12, 13, 14, 15).StoreUnsafe(ref MemoryMarshal.GetReference(txkMap), 8);
         int dequantShift = xd.Bd > 8 ? xd.Bd - 5 : 3;
         int qstep = p.Dequant1 >> dequantShift;
 
@@ -804,8 +807,8 @@ internal static partial class AomTxSearch
         if (calcPixelDomainDistortionFinal && (txkAllowed < TX_TYPES || allowedTxMask == 0x0001))
             calcPixelDomainDistortionFinal = useTransformDomainDistortion = false;
 
-        var skipTrellisBasedOnSatdBuf12 = new StackArr16<bool>(); Span<bool> skipTrellisBasedOnSatd = skipTrellisBasedOnSatdBuf12;
-        skipTrellisBasedOnSatd.Clear();
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out StackArr16<bool> skipTrellisBasedOnSatdBuf12); Span<bool> skipTrellisBasedOnSatd = skipTrellisBasedOnSatdBuf12;
+        Vector128<byte>.Zero.StoreUnsafe(ref System.Runtime.CompilerServices.Unsafe.As<bool, byte>(ref MemoryMarshal.GetReference(skipTrellisBasedOnSatd)));
         var qp = AomEncodeMb.SetupQuant(txSize, !skipTrellis,
             skipTrellis ? (UseBQuantNoTrellis ? AomXformQuant.B : AomXformQuant.Fp) : AomXformQuant.Fp, cpi.QuantBAdapt);
 
