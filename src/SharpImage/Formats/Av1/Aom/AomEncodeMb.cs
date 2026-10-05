@@ -191,29 +191,49 @@ internal static partial class AomEncodeMb
     internal static void SubtractBlock(int rows, int cols, short[] diff, int diffOff, int diffStride,
         byte[] src, int srcOff, int srcStride, byte[] pred, int predOff, int predStride)
     {
-        if (cols >= 8 && Avx2.IsSupported)
+        if (cols >= 8 && Avx2.IsSupported && rows > 0 && diffOff >= 0 && srcOff >= 0 && predOff >= 0
+            && diffOff + (long)(rows - 1) * diffStride + cols <= diff.Length && srcOff + (long)(rows - 1) * srcStride + cols <= src.Length
+            && predOff + (long)(rows - 1) * predStride + cols <= pred.Length)
         {
-            ref byte sr = ref MemoryMarshal.GetArrayDataReference(src);
-            ref byte pr = ref MemoryMarshal.GetArrayDataReference(pred);
-            ref short dr = ref MemoryMarshal.GetArrayDataReference(diff);
+            // running row references (no per-row stride products); 8-wide blocks two rows per 256-bit subtract
+            ref byte s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), srcOff);
+            ref byte p0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(pred), predOff);
+            ref short d0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(diff), diffOff);
+            if (cols == 8)
+            {
+                int r = 0;
+                for (; r + 2 <= rows; r += 2)
+                {
+                    var a = Avx2.ConvertToVector256Int16(Vector128.Create(Unsafe.ReadUnaligned<ulong>(ref s0),
+                        Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref s0, srcStride))).AsByte());
+                    var b = Avx2.ConvertToVector256Int16(Vector128.Create(Unsafe.ReadUnaligned<ulong>(ref p0),
+                        Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref p0, predStride))).AsByte());
+                    var dv = a - b;
+                    dv.GetLower().StoreUnsafe(ref d0);
+                    dv.GetUpper().StoreUnsafe(ref Unsafe.Add(ref d0, diffStride));
+                    s0 = ref Unsafe.Add(ref s0, 2 * srcStride);
+                    p0 = ref Unsafe.Add(ref p0, 2 * predStride);
+                    d0 = ref Unsafe.Add(ref d0, 2 * diffStride);
+                }
+                if (r < rows)
+                {
+                    var a = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref s0)).AsByte());
+                    var b = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref p0)).AsByte());
+                    (a - b).StoreUnsafe(ref d0);
+                }
+                return;
+            }
             for (int r = 0; r < rows; r++)
             {
-                int d = diffOff + r * diffStride, s = srcOff + r * srcStride, p = predOff + r * predStride;
-                if (cols >= 16)
+                for (int c = 0; c < cols; c += 16)
                 {
-                    for (int c = 0; c < cols; c += 16)
-                    {
-                        var a = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref sr, (nuint)(s + c)));
-                        var b = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref pr, (nuint)(p + c)));
-                        (a - b).StoreUnsafe(ref dr, (nuint)(d + c));
-                    }
+                    var a = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref s0, (nuint)c));
+                    var b = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref p0, (nuint)c));
+                    (a - b).StoreUnsafe(ref d0, (nuint)c);
                 }
-                else
-                {
-                    var a = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref sr, s))).AsByte());
-                    var b = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref pr, p))).AsByte());
-                    (a - b).StoreUnsafe(ref dr, (nuint)d);
-                }
+                s0 = ref Unsafe.Add(ref s0, srcStride);
+                p0 = ref Unsafe.Add(ref p0, predStride);
+                d0 = ref Unsafe.Add(ref d0, diffStride);
             }
             return;
         }
@@ -221,14 +241,17 @@ internal static partial class AomEncodeMb
             && diffOff + (long)(rows - 1) * diffStride + 4 <= diff.Length && srcOff + (long)(rows - 1) * srcStride + 4 <= src.Length
             && predOff + (long)(rows - 1) * predStride + 4 <= pred.Length)
         {
-            ref byte sr = ref MemoryMarshal.GetArrayDataReference(src);
-            ref byte pr = ref MemoryMarshal.GetArrayDataReference(pred);
-            ref short dr = ref MemoryMarshal.GetArrayDataReference(diff);
+            ref byte s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), srcOff);
+            ref byte p0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(pred), predOff);
+            ref short d0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(diff), diffOff);
             for (int r = 0; r < rows; r++)
             {
-                var a = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref sr, srcOff + r * srcStride))).AsByte());
-                var b = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref pr, predOff + r * predStride))).AsByte());
-                Unsafe.WriteUnaligned(ref Unsafe.As<short, byte>(ref Unsafe.Add(ref dr, diffOff + r * diffStride)), (a - b).AsUInt64().ToScalar());
+                var a = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref s0)).AsByte());
+                var b = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref p0)).AsByte());
+                Unsafe.WriteUnaligned(ref Unsafe.As<short, byte>(ref d0), (a - b).AsUInt64().ToScalar());
+                s0 = ref Unsafe.Add(ref s0, srcStride);
+                p0 = ref Unsafe.Add(ref p0, predStride);
+                d0 = ref Unsafe.Add(ref d0, diffStride);
             }
             return;
         }

@@ -22,6 +22,14 @@ internal struct AomRdStats
         Rate = 0; Dist = 0; Rdcost = 0; Sse = 0; SkipTxfm = 1; ZeroRate = 0;
     }
 
+    /// <summary>A field-by-field copy: the stats are copied right after field-wise updates, where a whole-struct
+    /// (32-byte vector) load cannot be store-forwarded and stalls.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public void CopyFrom(in AomRdStats s)
+    {
+        Rate = s.Rate; ZeroRate = s.ZeroRate; Dist = s.Dist; Rdcost = s.Rdcost; Sse = s.Sse; SkipTxfm = s.SkipTxfm;
+    }
+
     /// <summary>av1_invalid_rd_stats.</summary>
     public void Invalidate()
     {

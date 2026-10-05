@@ -884,7 +884,7 @@ internal static partial class AomTxSearch
             if (rd < bestRd)
             {
                 bestRd = rd;
-                bestRdStats = thisRdStats;
+                bestRdStats.CopyFrom(thisRdStats);
                 bestTxType = txType;
                 bestTxbCtx = p.TxbEntropyCtx[block];
                 bestEob = p.Eobs[block];
@@ -1015,7 +1015,7 @@ internal static partial class AomTxSearch
         bool isInter = IsInterBlock(xd.Mi0);
         bool invalidRd = isInter ? args.IncompleteExit : args.ExitEarly;
         if (invalidRd) rdStats.Invalidate();
-        else rdStats = args.RdStats;
+        else rdStats.CopyFrom(args.RdStats);
         args.X = null!;
     }
 
@@ -1146,7 +1146,7 @@ internal static partial class AomTxSearch
                 map.CopyTo(bestTxkTypeMap);
                 bestTxSize = txSize;
                 bestRd = rd[depth];
-                rdStats = thisRdStats;
+                rdStats.CopyFrom(thisRdStats);
             }
             if (txSize == TX_4X4) break;
             // with three depths, prune the smallest on the first two's results for low contrast blocks
