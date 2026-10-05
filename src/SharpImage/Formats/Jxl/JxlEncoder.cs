@@ -59,6 +59,8 @@ internal static partial class JxlEncoder
         public bool TryWpModes { get; init; } = true;
         public bool TryPrefix { get; init; } = true;
         public bool TrySingleLeaf { get; init; } = true;
+        /// <summary>The tiled (multi-group) layout's group size: 128 &lt;&lt; GroupShift pixels.</summary>
+        public int GroupShift { get; init; } = 3;
         /// <summary>libjxl's fixed weighted-predictor tree (kWPFixedDC) instead of a learned one.</summary>
         public bool FixedWpTree { get; init; }
         /// <summary>Estimate the weighted-predictor parameter mode (else libjxl's default, mode 0).</summary>
@@ -75,12 +77,14 @@ internal static partial class JxlEncoder
 
         // libjxl effort 7's search (kSquirrel: node threshold 82 + 14 * 3, the gradient + weighted predictors, the
         // first properties of its order) widened by two properties and every RCT; default WP mode candidates are
-        // estimated on row bands; ANS only. Small images (one group) also try the second threshold.
+        // estimated on row bands; ANS only; 512-pixel groups (four times the parallelism of 1024 for ~0.2%). Small
+        // images (one group) also try the second threshold.
         private static readonly JxlLearnParams BalancedLearn = new() { PropIdx = new[] { 0, 2, 3, 4, 5, 6, 7, 8, 9 }, PredIdx = new[] { 0, 1 } };
 
         private static readonly LosslessProfile BalancedLarge = new()
         {
             NodeThresholds = new[] { 124f }, Learn = BalancedLearn, TryWpModes = false, TryPrefix = false, WpEstimateBandStep = 8,
+            GroupShift = 2,
         };
 
         private static readonly LosslessProfile BalancedSmall = new()
@@ -94,6 +98,7 @@ internal static partial class JxlEncoder
             NodeThresholds = new[] { 152f },
             Learn = new JxlLearnParams { PropIdx = new[] { 0, 2, 3, 4 }, PredIdx = new[] { 0, 1 }, MaxSamples = 1 << 20 },
             TryWpModes = false, TryPrefix = false, TrySingleLeaf = false, EstimateWpMode = false, RctCandidates = LibjxlRctOrder[..4],
+            GroupShift = 2,
         };
 
         // libjxl effort 3 (kFalcon: the fixed weighted-predictor tree, YCoCg, the default WP mode)
@@ -101,6 +106,7 @@ internal static partial class JxlEncoder
         {
             NodeThresholds = Array.Empty<float>(), FixedWpTree = true, TryWpModes = false, TryPrefix = false, TrySingleLeaf = false,
             EstimateWpMode = false, RctCandidates = new[] { 6 },
+            GroupShift = 2,
         };
 
         /// <summary>The search for an effort level and image size (images of at most 32K pixels always get the full
@@ -348,7 +354,7 @@ internal static partial class JxlEncoder
         {
             byte[][] bestSecs = null!;
             int bestShift = GroupSizeShift;
-            foreach (int gShift in GroupShiftCandidates(w, h))
+            foreach (int gShift in new[] { profile.GroupShift })
             {
                 int gd = 128 << gShift;
                 foreach (int m in wpModes)
@@ -468,7 +474,6 @@ internal static partial class JxlEncoder
 
     // Group-size shifts to try for a tiled image: 1024px (shift 3, low per-group overhead) and 256px
     // (shift 1, many groups so the global tree can adapt per region via the group property).
-    private static int[] GroupShiftCandidates(int w, int h) => new[] { 3 };
 
     private static int SmallestShift(int side)
     {
