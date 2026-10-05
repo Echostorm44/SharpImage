@@ -18,6 +18,7 @@ internal sealed class MaTreeNode
     public int Ctx;             // leaf context index (assigned when serialised)
     public MaTreeNode? Left;    // property > SplitVal
     public MaTreeNode? Right;   // property <= SplitVal
+    public double SplitCost, SplitBase; // the learned split's cost and the node's unsplit cost (bits)
 }
 
 /// <summary>A residual channel to learn/encode from: pixel data, dimensions, channel and group ids,
@@ -51,6 +52,57 @@ internal static class JxlTreeLearner
     public static readonly float[] NodeThresholds = { 96f, 160f };
 
     /// <summary>Learns a global MA tree for the given residual channels at the given split threshold.</summary>
+    /// <summary><see cref="Learn"/> at every node threshold (ascending) from one sample collection: the lowest
+    /// threshold's tree is learned and each higher one is that tree with the splits whose gain does not clear it cut
+    /// back to leaves (every node's split choice is independent of the threshold, so this is the tree a separate
+    /// learn finds), unless the leaf cap cut the low tree short, in which case the higher threshold is learned.</summary>
+    public static MaTreeNode[] LearnMulti(List<EncChannelRef> channels, WpHeader wpHeader, float[] nodeThresholds)
+    {
+        int[][] thresholds = BuildThresholds(channels);
+        var samples = CollectSamples(channels, thresholds, wpHeader);
+        var trees = new MaTreeNode[nodeThresholds.Length];
+        var root = new MaTreeNode { Property = -1, Predictor = WeightedPredictor };
+        int leaves = samples.Count > 1 ? FindBestSplit(samples, thresholds, root, nodeThresholds[0]) : 1;
+        trees[0] = root;
+        for (int t = 1; t < nodeThresholds.Length; t++)
+        {
+            if (leaves < MaxLeaves)
+            {
+                trees[t] = Prune(root, nodeThresholds[t]);
+            }
+            else
+            {
+                var r = new MaTreeNode { Property = -1, Predictor = WeightedPredictor };
+                if (samples.Count > 1)
+                {
+                    FindBestSplit(samples, thresholds, r, nodeThresholds[t]);
+                }
+
+                trees[t] = r;
+            }
+        }
+
+        return trees;
+    }
+
+    // The tree a learn at nodeThreshold keeps: a split survives when its cost plus the threshold is below the
+    // node's unsplit cost (FindBestSplit's test, evaluated identically).
+    private static MaTreeNode Prune(MaTreeNode n, double nodeThreshold)
+    {
+        var c = new MaTreeNode { Property = -1, Predictor = n.Predictor };
+        if (n.Property >= 0 && n.SplitCost + nodeThreshold < n.SplitBase)
+        {
+            c.Property = n.Property;
+            c.SplitVal = n.SplitVal;
+            c.SplitCost = n.SplitCost;
+            c.SplitBase = n.SplitBase;
+            c.Left = Prune(n.Left!, nodeThreshold);
+            c.Right = Prune(n.Right!, nodeThreshold);
+        }
+
+        return c;
+    }
+
     public static MaTreeNode Learn(List<EncChannelRef> channels, WpHeader wpHeader, float nodeThreshold)
     {
         int[][] thresholds = BuildThresholds(channels);
@@ -532,7 +584,8 @@ internal static class JxlTreeLearner
 
     // ─── Greedy split search (libjxl FindBestSplit, simplified: no static-multiplier forcing) ────────
 
-    private static void FindBestSplit(Samples s, int[][] thresholds, MaTreeNode root, double nodeThreshold)
+    // Returns the leaf count (MaxLeaves when the cap stopped the growth).
+    private static int FindBestSplit(Samples s, int[][] thresholds, MaTreeNode root, double nodeThreshold)
     {
         var stack = new Stack<(int Begin, int End, MaTreeNode Node)>();
         stack.Push((0, s.Count, root));
@@ -696,6 +749,8 @@ internal static class JxlTreeLearner
 
                 cur.Property = UsedProperties[bestPropIdx];
                 cur.SplitVal = thresholds[bestPropIdx][bestBucket];
+                cur.SplitCost = bestCost;
+                cur.SplitBase = baseBits;
                 cur.Left = new MaTreeNode { Property = -1, Predictor = bestLPred };
                 cur.Right = new MaTreeNode { Property = -1, Predictor = bestRPred };
                 leaves++; // one leaf becomes two
@@ -703,6 +758,8 @@ internal static class JxlTreeLearner
                 stack.Push((b, splitPos, cur.Right));  // property <= SplitVal
             }
         }
+
+        return leaves;
     }
 
     // Partition [b,e) so buckets <= bestBucket (property <= threshold) come first, the rest after.

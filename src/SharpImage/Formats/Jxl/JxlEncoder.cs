@@ -583,9 +583,9 @@ internal static partial class JxlEncoder
         }
 
         Consider(SingleLeafTree);
-        foreach (float threshold in JxlTreeLearner.NodeThresholds)
+        foreach (MaTreeNode tree in JxlTreeLearner.LearnMulti(refs, wpHeader, JxlTreeLearner.NodeThresholds))
         {
-            Consider(new LearnedTree(JxlTreeLearner.Learn(refs, wpHeader, threshold)));
+            Consider(new LearnedTree(tree));
         }
 
         return best;
@@ -1188,12 +1188,12 @@ internal static partial class JxlEncoder
             }
         }
 
+        // (no single-leaf candidate here: on multi-group images a learned tree always beats it by far, and a
+        // learned tree with no profitable split is the single leaf anyway)
         byte[][] best = null!;
-        Consider(SingleLeafTree, ref best);
-        foreach (float threshold in JxlTreeLearner.NodeThresholds)
+        foreach (MaTreeNode tree in JxlTreeLearner.LearnMulti(tileRefs, WpMode(wpMode), JxlTreeLearner.NodeThresholds))
         {
-            var learned = new LearnedTree(JxlTreeLearner.Learn(tileRefs, WpMode(wpMode), threshold));
-            Consider(learned, ref best);
+            Consider(new LearnedTree(tree), ref best);
         }
 
         return best;
@@ -1403,8 +1403,21 @@ internal static partial class JxlEncoder
         }
 
         const int WindowMask = (1 << 20) - 1;
-        var head = new Dictionary<int, int>();
+        // head: the latest position per full 31-bit hash (an open-addressing table keyed by the whole hash, so the
+        // chains are exactly a dictionary's: no bucket sharing between different hashes)
+        int cap = 1024;
+        while (cap < 2 * n) cap <<= 1;
+        int tmask = cap - 1;
+        int[] keys = new int[cap], vals = new int[cap];
+        Array.Fill(keys, -1);
         int[] prev = new int[Math.Max(1, n)];
+
+        int Slot(int hh)
+        {
+            int s0 = (int)(((uint)hh * 0x9E3779B1u) >> 7) & tmask;
+            while (keys[s0] != hh && keys[s0] != -1) s0 = (s0 + 1) & tmask;
+            return s0;
+        }
 
         int Hash(int i)
         {
@@ -1426,15 +1439,23 @@ internal static partial class JxlEncoder
             }
 
             int hh = Hash(i);
-            prev[i] = head.TryGetValue(hh, out int p) ? p : -1;
-            head[hh] = i;
+            int sl = Slot(hh);
+            prev[i] = keys[sl] == hh ? vals[sl] : -1;
+            keys[sl] = hh;
+            vals[sl] = i;
         }
 
         int idx = 0;
         while (idx < n)
         {
             int bestLen = 0, bestDist = 0;
-            if (idx + 4 <= n && head.TryGetValue(Hash(idx), out int p))
+            int p = -1;
+            if (idx + 4 <= n)
+            {
+                int hq = Hash(idx), sq = Slot(hq);
+                if (keys[sq] == hq) p = vals[sq];
+            }
+            if (p >= 0)
             {
                 int tries = 96;
                 while (p >= 0 && tries-- > 0)
@@ -1446,6 +1467,14 @@ internal static partial class JxlEncoder
                     }
 
                     int maxl = n - idx;
+                    // only a match that also agrees at bestLen can be longer (zlib's check; the candidate still counts
+                    // as a try, so the result is the same)
+                    if (bestLen >= maxl || v[p + bestLen] != v[idx + bestLen])
+                    {
+                        p = prev[p];
+                        continue;
+                    }
+
                     int l = 0;
                     while (l < maxl && v[p + l] == v[idx + l])
                     {
