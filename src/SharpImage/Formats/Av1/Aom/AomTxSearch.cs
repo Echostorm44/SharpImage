@@ -821,7 +821,7 @@ internal static partial class AomTxSearch
             // av1_setup_quant may reset them before the quantizer runs, as in libaom)
             if (cpi.Cm.UsingQmatrix && xd.Lossless[xd.Mi0.SegmentId] == 0) AomEncodeMb.SetupQmatrix(x, plane, txSize, txType, ref qp);
             if (plane == 0) xd.TxTypeMap[xd.TxTypeMapOffset + txTypeMapIdx] = (byte)txType;
-            AomRdStats thisRdStats = default;
+            System.Runtime.CompilerServices.Unsafe.SkipInit(out AomRdStats thisRdStats);   // Invalidate sets every field
             thisRdStats.Invalidate();
 
             if (!dcOnlyBlk) AomEncodeMb.Xform(x, plane, block, blkRow, blkCol, planeBsize, txSize, txType);
@@ -937,7 +937,7 @@ internal static partial class AomTxSearch
         var xd = x.E;
         var cpi = args.Cpi;
         bool isInter = IsInterBlock(xd.Mi0);
-        AomRdStats thisRdStats = default;
+        System.Runtime.CompilerServices.Unsafe.SkipInit(out AomRdStats thisRdStats);   // Init sets every field
         thisRdStats.Init();
 
         if (!isInter)

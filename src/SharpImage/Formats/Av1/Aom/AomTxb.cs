@@ -393,8 +393,96 @@ internal static class AomTxb
 
     /// <summary>av1_cost_coeffs_txb (warehouse_efficients_txb): the coded bits (1/512) of a tx block's levels with the
     /// given contexts; txTypeCost = get_tx_type_cost's value for this block.</summary>
-    [SkipLocalsInit]   // libaom's levels_buf / coeff_contexts are uninitialized stack arrays filled before use
     internal static int CostCoeffsTxb(AomCoeffCosts costs, int txSize, int txType, int planeType, AomTxbCtx txbCtx,
+        ReadOnlySpan<int> qcoeff, int eob, int txTypeCost, ReadOnlySpan<ushort> scan)
+    {
+        int bhl0 = TxbBhl(txSize), width0 = TxbWide(txSize), height0 = TxbHigh(txSize);
+        if (eob == 0 || qcoeff.Length < width0 * height0 || scan.Length < width0 * height0 || (uint)eob > (uint)(width0 * height0))
+            return CostCoeffsTxbRef(costs, txSize, txType, planeType, txbCtx, qcoeff, eob, txTypeCost, scan);
+        return TxTypeToClass[txType] switch
+        {
+            TX_CLASS_2D => CostCoeffsTxbT<TxClass2D>(costs, txSize, txType, planeType, txbCtx, qcoeff, eob, txTypeCost, scan),
+            TX_CLASS_HORIZ => CostCoeffsTxbT<TxClassHoriz>(costs, txSize, txType, planeType, txbCtx, qcoeff, eob, txTypeCost, scan),
+            _ => CostCoeffsTxbT<TxClassVert>(costs, txSize, txType, planeType, txbCtx, qcoeff, eob, txTypeCost, scan),
+        };
+    }
+
+    /// <summary>warehouse_efficients_txb specialised per tx class: the nz-map contexts computed where they are used (the
+    /// levels are fixed while costing, so av1_get_nz_map_contexts' array is not needed), unchecked reads (the caller
+    /// checked eob and the buffers against the tx size).</summary>
+    [SkipLocalsInit]
+    private static int CostCoeffsTxbT<TC>(AomCoeffCosts costs, int txSize, int txType, int planeType, AomTxbCtx txbCtx,
+        ReadOnlySpan<int> qcoeff, int eob, int txTypeCost, ReadOnlySpan<ushort> scan) where TC : struct, ITxClassConst
+    {
+        int txClass = TC.Cls;
+        var coeffCosts = costs.Get(TxsizeEntropyCtx(txSize), planeType);
+        int bhl = TxbBhl(txSize), width = TxbWide(txSize), height = TxbHigh(txSize);
+        Unsafe.SkipInit(out LevelsBuf levelsBuf);
+        Span<byte> levels = levelsBuf;
+        var eobCosts = costs.GetEob(TxsizeLog2Minus4[txSize], planeType);
+        int cost = coeffCosts.TxbSkip[txbCtx.TxbSkipCtx * 2 + 0];
+        if (eob > 1) InitLevels(qcoeff, width, height, levels);
+        cost += txTypeCost;
+        cost += EobCost(eob, eobCosts, coeffCosts, txClass);
+        ref ushort sc = ref MemoryMarshal.GetReference(scan);
+        ref int q = ref MemoryMarshal.GetReference(qcoeff);
+        ref int baseC = ref MemoryMarshal.GetArrayDataReference(coeffCosts.Base);
+        ref int lps = ref MemoryMarshal.GetArrayDataReference(coeffCosts.Lps);
+        ref byte lv = ref MemoryMarshal.GetReference(levels);
+        const int lpsStride = AomLvMapCoeffCost.LpsStride;
+        int c = eob - 1;
+        {
+            int pos = Unsafe.Add(ref sc, c);
+            int v = Unsafe.Add(ref q, pos);
+            if (v != 0)
+            {
+                int sign = v >> 31, level = (v ^ sign) - sign;
+                int coeffCtx = LowerLevelsCtxEob(bhl, width, c);
+                cost += coeffCosts.BaseEob[coeffCtx * 3 + Math.Min(level, 3) - 1];
+                if (level > NumBaseLevels)
+                    cost += Unsafe.Add(ref lps, BrCtxEob(pos, bhl, txClass) * lpsStride + Math.Min(level - 1 - NumBaseLevels, CoeffBaseRange)) + GolombCost(level);
+                if (c != 0) cost += AomCost.CostLiteral(1);
+                else
+                {
+                    int sign01 = (sign ^ sign) - sign;
+                    cost += coeffCosts.DcSign[txbCtx.DcSignCtx * 2 + sign01];
+                    return cost;
+                }
+            }
+        }
+        for (c = eob - 2; c >= 1; --c)
+        {
+            int pos = Unsafe.Add(ref sc, c);
+            int coeffCtx = LowerLevelsCtx(levels, pos, bhl, txSize, txClass);
+            int v = Unsafe.Add(ref q, pos);
+            if (v == 0) { cost += Unsafe.Add(ref baseC, coeffCtx * 8); continue; }
+            int level = AbsI(v);
+            cost += Unsafe.Add(ref baseC, coeffCtx * 8 + Math.Min(level, 3));
+            cost += AomCost.CostLiteral(1);
+            if (level > NumBaseLevels)
+                cost += Unsafe.Add(ref lps, BrCtx(ref lv, pos, bhl, txClass) * lpsStride + Math.Min(level - 1 - NumBaseLevels, CoeffBaseRange)) + GolombCost(level);
+        }
+        {
+            int pos = Unsafe.Add(ref sc, c);
+            int v = Unsafe.Add(ref q, pos);
+            int coeffCtx = c == eob - 1 ? LowerLevelsCtxEob(bhl, width, c) : LowerLevelsCtx(levels, pos, bhl, txSize, txClass);
+            if (v == 0) cost += Unsafe.Add(ref baseC, coeffCtx * 8);
+            else
+            {
+                int sign = v >> 31, level = (v ^ sign) - sign;
+                cost += Unsafe.Add(ref baseC, coeffCtx * 8 + Math.Min(level, 3));
+                int sign01 = (sign ^ sign) - sign;
+                cost += coeffCosts.DcSign[txbCtx.DcSignCtx * 2 + sign01];
+                if (level > NumBaseLevels)
+                    cost += Unsafe.Add(ref lps, BrCtx(ref lv, pos, bhl, txClass) * lpsStride + Math.Min(level - 1 - NumBaseLevels, CoeffBaseRange)) + GolombCost(level);
+            }
+        }
+        return cost;
+    }
+
+    /// <summary>The reference warehouse_efficients_txb (eob 0, or buffers not checked by the fast path).</summary>
+    [SkipLocalsInit]   // libaom's levels_buf / coeff_contexts are uninitialized stack arrays filled before use
+    private static int CostCoeffsTxbRef(AomCoeffCosts costs, int txSize, int txType, int planeType, AomTxbCtx txbCtx,
         ReadOnlySpan<int> qcoeff, int eob, int txTypeCost, ReadOnlySpan<ushort> scan)
     {
         int txsCtx = TxsizeEntropyCtx(txSize);
