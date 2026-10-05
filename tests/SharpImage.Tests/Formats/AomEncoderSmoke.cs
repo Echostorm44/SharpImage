@@ -34,6 +34,10 @@ public sealed class AomEncoderSmoke
         }
         else
         {
+            // a missing AOM_SMOKE_YUV is an error (the test runner's working directory is not the caller's: a relative
+            // path silently encoding the synthetic frame invalidates any comparison); AOM_SMOKE_SYNTH=1 writes it there
+            if (yuvPath != null && Environment.GetEnvironmentVariable("AOM_SMOKE_SYNTH") != "1")
+                throw new FileNotFoundException("AOM_SMOKE_YUV not found (use an absolute path; AOM_SMOKE_SYNTH=1 creates the synthetic frame)", yuvPath);
             var rng = new Random(3);
             for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) y[r * w + c] = (byte)Math.Clamp((r * 2 + c) / 2 + (((r / 16) + (c / 16)) & 1) * 60 + rng.Next(-8, 9), 0, 255);
             for (int i = 0; i < u.Length; i++) { u[i] = (byte)(100 + (i % 37)); v[i] = (byte)(140 - (i % 23)); }
