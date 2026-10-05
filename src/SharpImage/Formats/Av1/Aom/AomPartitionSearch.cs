@@ -35,6 +35,9 @@ internal sealed class AomPartitionSearchState
     public readonly bool[] PartitionRectAllowed = new bool[2];
     public bool DoRectangularSplit, DoSquareSplit;
     public readonly bool[] PruneRectPart = new bool[2];
+    // ab_partitions_search's scratch (rewritten in full by every call; one state per recursion depth)
+    public readonly AomPickModeContext?[] ModeSrchCtx0 = new AomPickModeContext?[4], ModeSrchCtx1 = new AomPickModeContext?[4];
+    public readonly AomMbModeInfo?[] ModeCache = new AomMbModeInfo?[3];
     public int SsX, SsY;
     public int PlCtxIdx;
     public bool FoundBestPartition;
@@ -624,9 +627,11 @@ internal static partial class AomEncodeFrame
             s.IsRectCtxIsReady[VERT], 0,
         };
         // set_mode_search_ctx: the contexts whose results can be reused
-        AomPickModeContext?[] modeSrchCtx0 = { s.IsSplitCtxIsReady[0] != 0 ? pcTree.Split[0]?.None : null, pcTree.Horizontal[0],
-            isCtxReady[4] != 0 ? pcTree.Split[0]?.None : null, pcTree.Vertical[0] };
-        AomPickModeContext?[] modeSrchCtx1 = { isCtxReady[1] != 0 ? pcTree.Split[1]?.None : null, null, null, null };
+        var modeSrchCtx0 = s.ModeSrchCtx0;
+        modeSrchCtx0[0] = s.IsSplitCtxIsReady[0] != 0 ? pcTree.Split[0]?.None : null; modeSrchCtx0[1] = pcTree.Horizontal[0];
+        modeSrchCtx0[2] = isCtxReady[4] != 0 ? pcTree.Split[0]?.None : null; modeSrchCtx0[3] = pcTree.Vertical[0];
+        var modeSrchCtx1 = s.ModeSrchCtx1;
+        modeSrchCtx1[0] = isCtxReady[1] != 0 ? pcTree.Split[1]?.None : null; modeSrchCtx1[1] = null; modeSrchCtx1[2] = null; modeSrchCtx1[3] = null;
 
         int split2 = bp.SplitBsize2;
         Span<int> abSubsize = stackalloc int[]
@@ -643,7 +648,8 @@ internal static partial class AomEncodeFrame
             miRow, miCol, bp.MiRowEdge, miCol, miRow, bp.MiColEdge,
             miRow, miCol, miRow, bp.MiColEdge, bp.MiRowEdge, bp.MiColEdge,
         };
-        var modeCache = new AomMbModeInfo?[3];
+        var modeCache = s.ModeCache;
+        Array.Clear(modeCache);
 
         for (int abPartType = HORZ_A; abPartType <= VERT_B; abPartType++)
         {

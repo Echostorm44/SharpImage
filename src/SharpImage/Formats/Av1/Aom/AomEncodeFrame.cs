@@ -580,6 +580,11 @@ internal static partial class AomEncodeFrame
         if (cm.EnableRefFrameMvs) AomMvPred.CopyFrameMvs(cm, mi, miRow, miCol, xMis, yMis);
     }
 
+    /// <summary>The OBMC prediction of encode_superblock (its own method: a lambda in encode_superblock captured that
+    /// method's parameters, so every call allocated the closure).</summary>
+    private static void BuildObmcPredictors(AomComp cpi, AomCommon cm, AomMacroblockD xd, int bsize, int miRow, int miCol)
+        => AomInterPred.BuildObmcInterPredictorsSb(cm, xd, () => SetupDstPlanes(cpi, xd, bsize, miRow, miCol));
+
     /// <summary>encode_superblock.</summary>
     internal static void EncodeSuperblock(AomComp cpi, AomMacroblock x, int dryRun, int bsize)
     {
@@ -639,7 +644,7 @@ internal static partial class AomEncodeFrame
                 int startPlane = x.ReuseInterPred && cpi.Sf.rt_sf.nonrd_check_partition_split == 0 && cm.BitDepth == 8 ? 1 : 0;
                 AomInterPred.EncBuildInterPredictor(cm, xd, miRow, miCol, null, bsize, startPlane, numPlanes - 1, cpi.EnableIntraEdgeFilter);
                 if (mbmi.MotionMode == OBMC_CAUSAL)
-                    AomInterPred.BuildObmcInterPredictorsSb(cm, xd, () => SetupDstPlanes(cpi, xd, mbmi.Bsize, miRow, miCol));
+                    BuildObmcPredictors(cpi, cm, xd, mbmi.Bsize, miRow, miCol);
             }
             EncodeSbInter(cpi, x, bsize, dryRun);
             TokenizeSbVartx(cpi, x, dryRun, bsize, cpi.AllowUpdateCdf);
