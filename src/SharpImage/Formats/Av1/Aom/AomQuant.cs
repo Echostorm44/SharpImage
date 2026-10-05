@@ -97,6 +97,15 @@ internal static class AomQuantize
     /// <summary>av1_quantize_fp / _32x32 / _64x64 as libaom runs them on AVX2 (av1_quantize_avx2.c): coefficients
     /// saturated to int16, 16 at a time in memory order, a group quantised only when one of its magnitudes exceeds
     /// (dequant >> (1 + log_scale)) - 1, the level mulhi((|c| + round) sat, quant) (unsigned for 32x32, split for 64x64),
+    /// <summary>(dc, ac, ac, ... ac): a broadcast with lane 0 replaced (a 16-argument Vector256.Create is a long chain of
+    /// inserts per call).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<short> DcAc(short dc, short ac)
+    {
+        var a = Vector128.Create(ac);
+        return Vector256.Create(a.WithElement(0, dc), a);
+    }
+
     /// the dequantised value in 16-bit lanes. round / quant / dequant: [dc, ac]. Returns the eob.</summary>
     internal static int QuantizeFpAvx2(ReadOnlySpan<int> coeff, int nCoeffs, short[] iscan, short round0, short round1,
         short quant0, short quant1, short dequant0, short dequant1, int logScale, Span<int> qcoeff, Span<int> dqcoeff)
@@ -110,10 +119,9 @@ internal static class AomQuantize
         }
         short q0 = quant0, q1 = quant1;
         if (logScale == 1) { q0 = (short)(q0 << 1); q1 = (short)(q1 << 1); }
-        var vRnd = Vector256.Create(rnd0, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1, rnd1);
-        var vQ = Vector256.Create(q0, q1, q1, q1, q1, q1, q1, q1, q1, q1, q1, q1, q1, q1, q1, q1);
-        var vDq = Vector256.Create(dequant0, dequant1, dequant1, dequant1, dequant1, dequant1, dequant1, dequant1,
-            dequant1, dequant1, dequant1, dequant1, dequant1, dequant1, dequant1, dequant1);
+        var vRnd = DcAc(rnd0, rnd1);
+        var vQ = DcAc(q0, q1);
+        var vDq = DcAc(dequant0, dequant1);
         var vThr = Vector256.ShiftRightArithmetic(vDq, 1 + logScale) - Vector256<short>.One;
         var eob = Vector256<short>.Zero;
         ref int c0 = ref MemoryMarshal.GetReference(coeff);
@@ -205,7 +213,7 @@ internal static class AomQuantize
         int logScale, Span<int> qcoeff, Span<int> dqcoeff)
     {
         // load_b_values_avx2: lane 0 the DC values
-        static Vector256<short> Dc(short dc, short ac) => Vector256.Create(dc, ac, ac, ac, ac, ac, ac, ac, ac, ac, ac, ac, ac, ac, ac, ac);
+        static Vector256<short> Dc(short dc, short ac) => DcAc(dc, ac);
         short zb0 = zbin0, zb1 = zbin1, rn0 = round0, rn1 = round1;
         if (logScale > 0)
         {
