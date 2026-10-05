@@ -471,6 +471,31 @@ internal static partial class AomEncodeMb
     /// without the trellis to follow, txb_entropy_ctx[block].</summary>
     internal static void Quant(AomMacroblock x, int plane, int block, int txSize, int txType, in AomQuantParam qp)
     {
+        // the 8-bit, matrix-free fp / b quantizers inline; the high bit depth, QM and skip paths out of line (their
+        // locals made every call pay a 760-byte frame and ten saved vector registers)
+        int idx = qp.XformQuantIdx;
+        if ((idx == AomXformQuant.Fp || idx == AomXformQuant.B) && x.E.Bd == 8 && (qp.Qmatrix == null || qp.Iqmatrix == null))
+        {
+            var p8 = x.Plane[plane];
+            int off8 = BlockOffset(block), n8 = MaxEob(txSize);
+            short[] iscan8 = IScanOf(txSize, txType);
+            var q8 = p8.Qcoeff.AsSpan(off8, n8);
+            int eob8 = idx == AomXformQuant.Fp
+                ? AomQuantize.QuantizeFpAvx2(p8.Coeff.AsSpan(off8, n8), n8, iscan8, p8.RoundFp0, p8.RoundFp1, p8.QuantFp0, p8.QuantFp1,
+                    p8.Dequant0, p8.Dequant1, qp.LogScale, q8, p8.Dqcoeff.AsSpan(off8, n8))
+                : AomQuantize.QuantizeBAvx2(p8.Coeff.AsSpan(off8, n8), n8, iscan8, p8.Zbin0, p8.Zbin1, p8.Round0, p8.Round1, p8.Quant0, p8.Quant1,
+                    p8.QuantShift0, p8.QuantShift1, p8.Dequant0, p8.Dequant1, qp.LogScale, q8, p8.Dqcoeff.AsSpan(off8, n8));
+            p8.Eobs[block] = (ushort)eob8;
+            p8.TxbEntropyCtx[block] = qp.UseOptimizeB ? (byte)0 : AomTxb.TxbEntropyContext(q8, ScanOf(txSize, txType), eob8);
+            return;
+        }
+        QuantGeneral(x, plane, block, txSize, txType, qp);
+    }
+
+    /// <summary>Quant's high bit depth, quantization matrix and skip-quant paths.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void QuantGeneral(AomMacroblock x, int plane, int block, int txSize, int txType, in AomQuantParam qp)
+    {
         var p = x.Plane[plane];
         int off = BlockOffset(block), n = MaxEob(txSize);
         var scan = ScanOf(txSize, txType);
@@ -535,19 +560,23 @@ internal static partial class AomEncodeMb
     }
 
     // scans per (tx size, tx type) (get_scan) and their inverses
-    private static readonly short[]?[] IScanCache = new short[]?[ScanArrays.Length];
+    private static readonly short[][] IScans = BuildIScans();
+    private static short[][] BuildIScans()
+    {
+        var all = new short[ScanArrays.Length][];
+        for (int k = 0; k < all.Length; k++)
+        {
+            var scan = ScanArrays[k];
+            var a = new short[scan.Length];
+            for (int i = 0; i < scan.Length; i++) a[scan[i]] = (short)i;
+            all[k] = a;
+        }
+        return all;
+    }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static ushort[] ScanOf(int txSize, int txType) => ScanArrays[ScanOrderIdx[txSize * 16 + txType]];
-    internal static short[] IScanOf(int txSize, int txType)
-    {
-        int k = ScanOrderIdx[txSize * 16 + txType];
-        var a = IScanCache[k];
-        if (a != null) return a;
-        var scan = ScanArrays[k];
-        a = new short[scan.Length];
-        for (int i = 0; i < scan.Length; i++) a[scan[i]] = (short)i;
-        return IScanCache[k] = a;
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static short[] IScanOf(int txSize, int txType) => IScans[ScanOrderIdx[txSize * 16 + txType]];
 
     /// <summary>get_tx_type_cost (txb_rdopt.c): the tx type's symbol cost for luma (0 for chroma).</summary>
     internal static int TxTypeCost(AomMacroblock x, int plane, int txSize, int txType, int reducedTxSetUsed)
