@@ -499,6 +499,45 @@ internal static unsafe partial class AomReconIntra
     /// <summary>av1_filter_intra_edge as libaom's dispatched SSE4.1 kernel runs it: the filtered samples equal
     /// av1_filter_intra_edge_c, and the kernel also writes p[-1] = p[0] and p[sz .. sz + 15] = p[sz - 1] (its edge
     /// extension). The side effects are reproduced so the edge buffers hold exactly what libaom's do (the twins find no
+    /// <summary>A copy of n (0..64) bytes: overlapping head / tail vector moves (the edge copies are too small and too
+    /// frequent for the memmove call Buffer.MemoryCopy makes).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void CopySmall(byte* dst, byte* src, int n)
+    {
+        if (n >= 32)
+        {
+            var a = System.Runtime.Intrinsics.Vector256.Load(src);
+            var b = System.Runtime.Intrinsics.Vector256.Load(src + n - 32);
+            a.Store(dst); b.Store(dst + n - 32);
+            if (n > 64) Buffer.MemoryCopy(src + 32, dst + 32, n - 32, n - 32);
+        }
+        else if (n >= 16)
+        {
+            var a = System.Runtime.Intrinsics.Vector128.Load(src);
+            var b = System.Runtime.Intrinsics.Vector128.Load(src + n - 16);
+            a.Store(dst); b.Store(dst + n - 16);
+        }
+        else if (n >= 8) { ulong a = *(ulong*)src, b = *(ulong*)(src + n - 8); *(ulong*)dst = a; *(ulong*)(dst + n - 8) = b; }
+        else if (n >= 4) { uint a = *(uint*)src, b = *(uint*)(src + n - 4); *(uint*)dst = a; *(uint*)(dst + n - 4) = b; }
+        else for (int k = 0; k < n; k++) dst[k] = src[k];
+    }
+
+    /// <summary>n (0..160) bytes of v: overlapping vector stores.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FillSmall(byte* dst, byte v, int n)
+    {
+        if (n >= 32)
+        {
+            var w = System.Runtime.Intrinsics.Vector256.Create(v);
+            for (int k = 0; k + 32 < n; k += 32) w.Store(dst + k);
+            w.Store(dst + n - 32);
+        }
+        else if (n >= 16) { var w = System.Runtime.Intrinsics.Vector128.Create(v); w.Store(dst); w.Store(dst + n - 16); }
+        else if (n >= 8) { ulong w = v * 0x0101010101010101ul; *(ulong*)dst = w; *(ulong*)(dst + n - 8) = w; }
+        else if (n >= 4) { uint w = v * 0x01010101u; *(uint*)dst = w; *(uint*)(dst + n - 4) = w; }
+        else for (int k = 0; k < n; k++) dst[k] = v;
+    }
+
     /// prediction that depends on them, but later stages read these buffers).</summary>
     public static void FilterIntraEdge(byte* p, int sz, int strength)
     {
@@ -511,7 +550,12 @@ internal static unsafe partial class AomReconIntra
             // sums at a time; the stores past p[sz - 1] are overwritten by the extension below
             Unsafe.SkipInit(out StackArr163<byte> bufBuf); byte* buf = (byte*)Unsafe.AsPointer(ref bufBuf[0]);
             byte* e = buf + 2;
-            Buffer.MemoryCopy(p, e, 129, sz);
+            // p points into a 160-byte edge array at offset 15 or 16: 128 bytes are readable whatever sz is
+            System.Runtime.Intrinsics.Vector256.Load(p).Store(e);
+            System.Runtime.Intrinsics.Vector256.Load(p + 32).Store(e + 32);
+            System.Runtime.Intrinsics.Vector256.Load(p + 64).Store(e + 64);
+            System.Runtime.Intrinsics.Vector256.Load(p + 96).Store(e + 96);
+            if (sz > 128) e[128] = p[128];
             byte first = e[0], last = e[sz - 1];
             e[-2] = first; e[-1] = first;
             Unsafe.InitBlockUnaligned(e + sz, last, 32);
@@ -635,8 +679,8 @@ internal static unsafe partial class AomReconIntra
         int needAboveLeft = ExtendModes[mode] & NEED_ABOVELEFT;
         bool isDrMode = IsDirectionalMode(mode);
         bool useFilterIntra = filterIntraMode != FILTER_INTRA_MODES;
-        Unsafe.InitBlockUnaligned(leftData, 129, NUM_INTRA_NEIGHBOUR_PIXELS);
-        Unsafe.InitBlockUnaligned(aboveData, 127, NUM_INTRA_NEIGHBOUR_PIXELS);
+        FillSmall(leftData, 129, NUM_INTRA_NEIGHBOUR_PIXELS);
+        FillSmall(aboveData, 127, NUM_INTRA_NEIGHBOUR_PIXELS);
 
         // The default values if ref pixels are not available:
         // 128 127 127 .. 127 127 127 127 127 127
@@ -675,11 +719,11 @@ internal static unsafe partial class AomReconIntra
                 GatherColumn(leftCol, leftRef, refStride, nBottomLeftPx > 0 ? txhpx + nBottomLeftPx : nLeftPx);
                 i = nBottomLeftPx > 0 ? txhpx + nBottomLeftPx : nLeftPx;
                 if (i < numLeftPixelsNeeded)
-                    Unsafe.InitBlockUnaligned(leftCol + i, leftCol[i - 1], (uint)(numLeftPixelsNeeded - i));
+                    FillSmall(leftCol + i, leftCol[i - 1], numLeftPixelsNeeded - i);
             }
             else if (nTopPx > 0)
             {
-                Unsafe.InitBlockUnaligned(leftCol, aboveRef[0], (uint)numLeftPixelsNeeded);
+                FillSmall(leftCol, aboveRef[0], numLeftPixelsNeeded);
             }
         }
 
@@ -689,19 +733,19 @@ internal static unsafe partial class AomReconIntra
             int numTopPixelsNeeded = txwpx + (nTopRightPx >= 0 ? txhpx : 0);
             if (nTopPx > 0)
             {
-                Buffer.MemoryCopy(aboveRef, aboveRow, nTopPx, nTopPx);
+                CopySmall(aboveRow, aboveRef, nTopPx);
                 i = nTopPx;
                 if (nTopRightPx > 0)
                 {
-                    Buffer.MemoryCopy(aboveRef + txwpx, aboveRow + txwpx, nTopRightPx, nTopRightPx);
+                    CopySmall(aboveRow + txwpx, aboveRef + txwpx, nTopRightPx);
                     i += nTopRightPx;
                 }
                 if (i < numTopPixelsNeeded)
-                    Unsafe.InitBlockUnaligned(aboveRow + i, aboveRow[i - 1], (uint)(numTopPixelsNeeded - i));
+                    FillSmall(aboveRow + i, aboveRow[i - 1], numTopPixelsNeeded - i);
             }
             else if (nLeftPx > 0)
             {
-                Unsafe.InitBlockUnaligned(aboveRow, leftRef[0], (uint)numTopPixelsNeeded);
+                FillSmall(aboveRow, leftRef[0], numTopPixelsNeeded);
             }
         }
 
