@@ -202,13 +202,27 @@ internal static unsafe partial class AomCfl
         int roundOffset = (width * height) >> 1;
         int sum = roundOffset;
         ushort* recon = src;
-        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && width >= 8)
+        if (System.Runtime.Intrinsics.X86.Sse41.IsSupported && width >= 8)
         {
-            var acc = System.Runtime.Intrinsics.Vector256<int>.Zero;
-            for (int j = 0; j < height; j++, recon += CFL_BUF_LINE)
-                for (int i = 0; i < width; i += 8)
-                    acc += System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(System.Runtime.Intrinsics.Vector128.Load(recon + i));
-            int avgV = (sum + System.Runtime.Intrinsics.Vector256.Sum(acc)) >> numPelLog2;
+            int avgV;
+            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+            {
+                var acc = System.Runtime.Intrinsics.Vector256<int>.Zero;
+                for (int j = 0; j < height; j++, recon += CFL_BUF_LINE)
+                    for (int i = 0; i < width; i += 8)
+                        acc += System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(System.Runtime.Intrinsics.Vector128.Load(recon + i));
+                avgV = (sum + System.Runtime.Intrinsics.Vector256.Sum(acc)) >> numPelLog2;
+            }
+            else
+            {
+                // SSE4.1: the same integer sum in 4 lanes
+                var acc = System.Runtime.Intrinsics.Vector128<int>.Zero;
+                for (int j = 0; j < height; j++, recon += CFL_BUF_LINE)
+                    for (int i = 0; i < width; i += 8)
+                        acc += System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int32(recon + i).AsInt32()
+                            + System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int32(recon + i + 4).AsInt32();
+                avgV = (sum + System.Runtime.Intrinsics.Vector128.Sum(acc)) >> numPelLog2;
+            }
             var a16 = System.Runtime.Intrinsics.Vector128.Create((short)avgV);
             for (int j = 0; j < height; j++, src += CFL_BUF_LINE, dst += CFL_BUF_LINE)
                 for (int i = 0; i < width; i += 8)
@@ -252,7 +266,7 @@ internal static unsafe partial class AomCfl
     public static void CflPredictLbd(short* acBufQ3, byte* dst, int dstStride, int alphaQ3, int width, int height)
     {
         int dc = dst[0];
-        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && width >= 8)
+        if (System.Runtime.Intrinsics.X86.Ssse3.IsSupported && width >= 8)
         {
             // libaom's kernel: mulhrs(|ac|, |alpha| << 9) = (|alpha * ac| + 32) >> 6, the sign of alpha * ac put back,
             // dc added, packed with unsigned saturation (the clip)

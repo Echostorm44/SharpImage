@@ -549,7 +549,7 @@ internal static unsafe partial class AomReconIntra
         if (strength == 0) return;
 
         ReadOnlySpan<byte> kernel = EdgeKernel.Slice((strength - 1) * INTRA_EDGE_TAPS, INTRA_EDGE_TAPS);
-        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        if (System.Runtime.Intrinsics.X86.Sse41.IsSupported)
         {
             // the edge with its clamped neighbours materialised (e[-2], e[-1] = p[0]; e[sz ..] = p[sz - 1]), then 16 taps
             // sums at a time; the stores past p[sz - 1] are overwritten by the extension below
@@ -557,11 +557,28 @@ internal static unsafe partial class AomReconIntra
             byte* e = buf + 2;
             // p points into a 160-byte edge array at offset 15 or 16: 128 bytes are readable whatever sz is; copy the
             // 32-byte groups the edge covers
-            for (int k = 0; k < sz && k < 128; k += 32) System.Runtime.Intrinsics.Vector256.Load(p + k).Store(e + k);
+            for (int k = 0; k < sz && k < 128; k += 16) System.Runtime.Intrinsics.Vector128.Load(p + k).Store(e + k);
             if (sz > 128) e[128] = p[128];
             byte first = e[0], last = e[sz - 1];
             e[-2] = first; e[-1] = first;
             Unsafe.InitBlockUnaligned(e + sz, last, 32);
+            if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+            {
+                // SSE4.1: each 16 sums as two 8-lane halves
+                var q0 = System.Runtime.Intrinsics.Vector128.Create((short)kernel[0]);
+                var q1 = System.Runtime.Intrinsics.Vector128.Create((short)kernel[1]);
+                var q2 = System.Runtime.Intrinsics.Vector128.Create((short)kernel[2]);
+                var q8 = System.Runtime.Intrinsics.Vector128.Create((short)8);
+                for (int i = 1; i < sz; i += 16)
+                {
+                    var lo = EdgeTaps8(e + i, q0, q1, q2, q8);
+                    var hi = EdgeTaps8(e + i + 8, q0, q1, q2, q8);
+                    System.Runtime.Intrinsics.X86.Sse2.Store(p + i, System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(lo, hi));
+                }
+                p[-1] = first;
+                Unsafe.InitBlockUnaligned(p + sz, last, 16);
+                return;
+            }
             var k0 = System.Runtime.Intrinsics.Vector256.Create((short)kernel[0]);
             var k1 = System.Runtime.Intrinsics.Vector256.Create((short)kernel[1]);
             var k2 = System.Runtime.Intrinsics.Vector256.Create((short)kernel[2]);
@@ -599,6 +616,17 @@ internal static unsafe partial class AomReconIntra
         // av1_filter_intra_edge_sse4_1's first / last sample extension
         p[-1] = edge[0];
         Unsafe.InitBlockUnaligned(p + sz, edge[sz - 1], 16);
+    }
+
+    /// <summary>8 symmetric 5-tap edge sums centred on e[0..8), as int16 lanes.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static System.Runtime.Intrinsics.Vector128<short> EdgeTaps8(byte* e, System.Runtime.Intrinsics.Vector128<short> k0,
+        System.Runtime.Intrinsics.Vector128<short> k1, System.Runtime.Intrinsics.Vector128<short> k2, System.Runtime.Intrinsics.Vector128<short> eight)
+    {
+        static System.Runtime.Intrinsics.Vector128<short> L(byte* q) => System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int16(
+            System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(*(ulong*)q).AsByte());
+        var a0 = L(e - 2); var a1 = L(e - 1); var a2 = L(e); var a3 = L(e + 1); var a4 = L(e + 2);
+        return System.Runtime.Intrinsics.Vector128.ShiftRightLogical((a0 + a4) * k0 + (a1 + a3) * k1 + a2 * k2 + eight, 4);
     }
 
     /// <summary>filter_intra_edge_corner (reconintra.c, static).</summary>
