@@ -23,6 +23,12 @@ internal static partial class Av1FwdTxfmAom
             if (!ForwardLbdSized(ref MemoryMarshal.GetReference(diff), diffStride, txSize, hKind, vKind, flipUd, flipLr, ref MemoryMarshal.GetReference(coeff)))
                 ForwardRawLbd(diff, diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
         }
+        else if (w <= 32 && h <= 32 && Sse41.IsSupported)
+        {
+            // no AVX2 (the default Native AOT instruction set): the same 16-bit transforms in 8-lane vectors
+            if (diff.Length < (h - 1) * diffStride + w || coeff.Length < w * h) throw new ArgumentException("tx block buffers smaller than the tx size");
+            ForwardRawLbdSse(diff, diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
+        }
         else ForwardRawRef(diff, diffStride, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
     }
 

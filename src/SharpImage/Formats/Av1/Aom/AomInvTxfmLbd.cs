@@ -15,7 +15,13 @@ namespace SharpImage.Formats.Av1;
 [SkipLocalsInit]
 internal static unsafe partial class AomInvTxfmLbd
 {
-    internal static readonly bool Supported = Avx2.IsSupported && Ssse3.IsSupported;
+    // libaom's lowbd inverse: av1_lowbd_inv_txfm2d_add_avx2 with AVX2, else av1_lowbd_inv_txfm2d_add_ssse3 for every size
+    // (the inverse transform is normative: both give the C's reconstruction)
+    internal static readonly bool Supported = Ssse3.IsSupported;
+
+    /// <summary>Whether <see cref="InvTxfm2dAdd"/> takes this size: every one with AVX2; without it the SSSE3 kernels,
+    /// which have no 64-point transforms ported (the generic inverse takes those).</summary>
+    internal static bool SupportsSize(int txSize) => Avx2.IsSupported || (TxW[txSize] < 64 && TxH[txSize] < 64);
 
     private const int NewSqrt2Bits = 12, NewSqrt2 = 5793, NewInvSqrt2 = 2896;
     private const int TX_4X4 = 0, TX_8X8 = 1, TX_4X8 = 5, TX_8X4 = 6, TX_8X16 = 7, TX_16X8 = 8, TX_4X16 = 13, TX_16X4 = 14,
@@ -394,6 +400,11 @@ internal static unsafe partial class AomInvTxfmLbd
     /// tx_size, eob). The coefficients (libaom's tran_low_t layout for the tx block) are only read.</summary>
     internal static void InvTxfm2dAdd(int* input, byte* output, int stride, int txType, int txSize, int eob)
     {
+        if (!Avx2.IsSupported)
+        {
+            InvTxfm2dAddSsse3(input, output, stride, txType, txSize, eob);
+            return;
+        }
         switch (txSize)
         {
             case TX_4X4: case TX_4X8: case TX_8X4: case TX_8X16: case TX_16X8: case TX_4X16: case TX_16X4: case TX_8X32:
@@ -1482,7 +1493,7 @@ internal static unsafe partial class AomInvTxfmLbd
     }
 
     /// <summary>av1_lowbd_inv_txfm2d_add_ssse3.</summary>
-    private static void InvTxfm2dAddSsse3(int* input, byte* output, int stride, int txType, int txSize, int eob)
+    internal static void InvTxfm2dAddSsse3(int* input, byte* output, int stride, int txType, int txSize, int eob)
     {
         switch (txSize)
         {

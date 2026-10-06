@@ -63,6 +63,13 @@ internal static partial class Av1FwdTxfmAom
     [SkipLocalsInit]
     private static void Fadst4W8(ref W8 input, ref W8 output, int cosBit)
     {
+        if (!Avx2.IsSupported)
+        {
+            // libaom's fadst8x4_new_sse2 (the same values in the 16-bit range)
+            for (int i = 0; i < 4; i++) Unsafe.Add(ref output, i) = Unsafe.Add(ref input, i);
+            FadstMadd4W8(ref output, cosBit);
+            return;
+        }
         Span<V> t = stackalloc V[8];
         for (int i = 0; i < 4; i++) t[i] = Avx2.ConvertToVector256Int32(Unsafe.Add(ref input, i));
         Fadst4(ref t[0], ref t[4], cosBit);

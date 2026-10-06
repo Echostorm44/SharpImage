@@ -1408,7 +1408,7 @@ internal static partial class Av1FwdTxfmAom
     internal static int ForwardQuant(ReadOnlySpan<int> residual, int w, int h, int txSize, int hKind, int vKind,
         double dcDq, double acDq, double bias, int[] levels, double[]? qfOut)
     {
-        if (Lowbd && LowbdOn && w is 16 or 32 && h is 16 or 32) return ForwardQuantLbd(residual, w, h, txSize, hKind, vKind, dcDq, acDq, bias, levels, qfOut);
+        if (Lowbd && LowbdOn && Avx2.IsSupported && w is 16 or 32 && h is 16 or 32) return ForwardQuantLbd(residual, w, h, txSize, hKind, vKind, dcDq, acDq, bias, levels, qfOut);
         ref int inv0 = ref MemoryMarshal.GetArrayDataReference(InvScan(txSize));
         var eobV = Vector128.Create(-1);   // per lane: the largest scan index of a nonzero level seen
         int lw = System.Numerics.BitOperations.Log2((uint)w) - 2, lh = System.Numerics.BitOperations.Log2((uint)h) - 2;

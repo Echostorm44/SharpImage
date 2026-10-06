@@ -435,7 +435,7 @@ internal static partial class AomRestoration
     }
 
     private static void CalculateIntermediateResult(int[] dgd, int dgdIdx, int width, int height, int dgdStride,
-        int sgrParamsIdx, int radiusIdx, int pass, int[] A, int[] B)
+        int sgrParamsIdx, int radiusIdx, int pass, int[] A, int[] B, int bitDepth = 8)
     {
         int r = radiusIdx == 0 ? SgrR0[sgrParamsIdx] : SgrR1[sgrParamsIdx];
         uint s = (uint)(radiusIdx == 0 ? SgrS0[sgrParamsIdx] : SgrS1[sgrParamsIdx]);
@@ -460,8 +460,10 @@ internal static partial class AomRestoration
             for (int j = -1; j < width + 1; ++j)
             {
                 int k = o + i * bufStride + j;
-                uint a = (uint)A[k];   // 8-bit: ROUND_POWER_OF_TWO(A[k], 0)
-                uint b = (uint)B[k];
+                // ROUND_POWER_OF_TWO(A[k], 2 * (bd - 8)), ROUND_POWER_OF_TWO(B[k], bd - 8)
+                int sa = 2 * (bitDepth - 8), sb = bitDepth - 8;
+                uint a = sa == 0 ? (uint)A[k] : ((uint)A[k] + (1u << (sa - 1))) >> sa;
+                uint b = sb == 0 ? (uint)B[k] : ((uint)B[k] + (1u << (sb - 1))) >> sb;
                 uint p = a * n < b * b ? 0 : a * n - b * b;
                 uint z = (p * s + (1u << (SgrprojMtableBits - 1))) >> SgrprojMtableBits;
                 A[k] = XByXplus1[Math.Min(z, 255u)];
@@ -471,12 +473,12 @@ internal static partial class AomRestoration
     }
 
     private static void SelfguidedFastInternal(int[] dgd, int dgdIdx, int width, int height, int dgdStride, int[] dst,
-        int dst0, int dstStride, int sgrParamsIdx, SgrScratch sc)
+        int dst0, int dstStride, int sgrParamsIdx, SgrScratch sc, int bitDepth = 8)
     {
         int widthExt = width + 2 * SgrprojBorderHorz;
         int bufStride = ((widthExt + 3) & ~3) + 16;
         int[] A = sc.A, B = sc.B;
-        CalculateIntermediateResult(dgd, dgdIdx, width, height, dgdStride, sgrParamsIdx, 0, 1, A, B);
+        CalculateIntermediateResult(dgd, dgdIdx, width, height, dgdStride, sgrParamsIdx, 0, 1, A, B, bitDepth);
         int o = SgrprojBorderVert * bufStride + SgrprojBorderHorz;
         for (int i = 0; i < height; ++i)
         {
@@ -514,12 +516,12 @@ internal static partial class AomRestoration
     }
 
     private static void SelfguidedInternal(int[] dgd, int dgdIdx, int width, int height, int dgdStride, int[] dst,
-        int dst0, int dstStride, int sgrParamsIdx, SgrScratch sc)
+        int dst0, int dstStride, int sgrParamsIdx, SgrScratch sc, int bitDepth = 8)
     {
         int widthExt = width + 2 * SgrprojBorderHorz;
         int bufStride = ((widthExt + 3) & ~3) + 16;
         int[] A = sc.A, B = sc.B;
-        CalculateIntermediateResult(dgd, dgdIdx, width, height, dgdStride, sgrParamsIdx, 1, 0, A, B);
+        CalculateIntermediateResult(dgd, dgdIdx, width, height, dgdStride, sgrParamsIdx, 1, 0, A, B, bitDepth);
         int o = SgrprojBorderVert * bufStride + SgrprojBorderHorz;
         for (int i = 0; i < height; ++i)
             for (int j = 0; j < width; ++j)
@@ -553,6 +555,24 @@ internal static partial class AomRestoration
             SelfguidedFastInternal(buf, dgd32, width, height, dgd32Stride, flt0, f0, fltStride, sgrParamsIdx, sc);
         if (SgrR1[sgrParamsIdx] > 0)
             SelfguidedInternal(buf, dgd32, width, height, dgd32Stride, flt1, f1, fltStride, sgrParamsIdx, sc);
+    }
+
+    /// <summary>av1_selfguided_restoration_c (high bit depth): <see cref="SelfguidedRestorationC"/> on 16-bit samples.</summary>
+    public static void SelfguidedRestorationCHbd(ushort[] dgd16, int d0, int width, int height, int dgdStride, int[] flt0,
+        int f0, int[] flt1, int f1, int fltStride, int sgrParamsIdx, SgrScratch sc, int bitDepth)
+    {
+        int dgd32Stride = width + 2 * SgrprojBorderHorz;
+        int dgd32 = dgd32Stride * SgrprojBorderVert + SgrprojBorderHorz;
+        int[] buf = sc.Dgd32;
+        for (int i = -SgrprojBorderVert; i < height + SgrprojBorderVert; ++i)
+        {
+            int srow = d0 + i * dgdStride, drow = dgd32 + i * dgd32Stride;
+            for (int j = -SgrprojBorderHorz; j < width + SgrprojBorderHorz; ++j) buf[drow + j] = dgd16[srow + j];
+        }
+        if (SgrR0[sgrParamsIdx] > 0)
+            SelfguidedFastInternal(buf, dgd32, width, height, dgd32Stride, flt0, f0, fltStride, sgrParamsIdx, sc, bitDepth);
+        if (SgrR1[sgrParamsIdx] > 0)
+            SelfguidedInternal(buf, dgd32, width, height, dgd32Stride, flt1, f1, fltStride, sgrParamsIdx, sc, bitDepth);
     }
 
     /// <summary>av1_decode_xq.</summary>

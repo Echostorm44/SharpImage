@@ -71,7 +71,7 @@ internal sealed class AomQuants
     }
 }
 
-internal static class AomQuantize
+internal static partial class AomQuantize
 {
     /// <summary>av1_get_tx_scale: 1 for 32x32-class (pels > 256), 2 for 64x64-class (pels > 1024), else 0.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -111,7 +111,9 @@ internal static class AomQuantize
         short quant0, short quant1, short dequant0, short dequant1, int logScale, Span<int> qcoeff, Span<int> dqcoeff)
     {
         if (!Avx2.IsSupported)
-            return QuantizeFpAvx2Emu(coeff, nCoeffs, iscan, round0, round1, quant0, quant1, dequant0, dequant1, logScale, qcoeff, dqcoeff);
+            return Sse41.IsSupported
+                ? QuantizeFpSse41(coeff, nCoeffs, iscan, round0, round1, quant0, quant1, dequant0, dequant1, logScale, qcoeff, dqcoeff)
+                : QuantizeFpAvx2Emu(coeff, nCoeffs, iscan, round0, round1, quant0, quant1, dequant0, dequant1, logScale, qcoeff, dqcoeff);
         // init_qp: lane 0 of the first group the DC values, every other lane AC
         short rnd0 = round0, rnd1 = round1;
         if (logScale > 0)
@@ -215,8 +217,11 @@ internal static class AomQuantize
         int logScale, Span<int> qcoeff, Span<int> dqcoeff)
     {
         if (!Avx2.IsSupported)
-            return QuantizeBAvx2Emu(coeff, nCoeffs, iscan, zbin0, zbin1, round0, round1, quant0, quant1, shift0, shift1, dequant0, dequant1,
-                logScale, qcoeff, dqcoeff);
+            return Sse41.IsSupported
+                ? QuantizeBSse41(coeff, nCoeffs, iscan, zbin0, zbin1, round0, round1, quant0, quant1, shift0, shift1, dequant0, dequant1,
+                    logScale, qcoeff, dqcoeff)
+                : QuantizeBAvx2Emu(coeff, nCoeffs, iscan, zbin0, zbin1, round0, round1, quant0, quant1, shift0, shift1, dequant0, dequant1,
+                    logScale, qcoeff, dqcoeff);
         // load_b_values_avx2: lane 0 the DC values
         static Vector256<short> Dc(short dc, short ac) => DcAc(dc, ac);
         short zb0 = zbin0, zb1 = zbin1, rn0 = round0, rn1 = round1;

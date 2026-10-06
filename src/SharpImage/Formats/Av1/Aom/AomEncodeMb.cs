@@ -696,7 +696,7 @@ internal static partial class AomEncodeMb
         if (eob == 0) return;
         // av1_inv_txfm_add (lossless -> av1_inv_txfm_add_c -> highbd_inv_txfm_add_4x4_c -> av1_highbd_iwht4x4_add)
         if (lossless && txSize == TX_4X4) { IwhtAdd4x4(dqcoeff, dqOff, dst, dstOff, dstStride, eob); return; }
-        if (AomInvTxfmLbd.Supported)
+        if (AomInvTxfmLbd.Supported && AomInvTxfmLbd.SupportsSize(txSize))
         {
             // av1_lowbd_inv_txfm2d_add_avx2: reads at most the tx block's min(w, 32) x min(h, 32) coefficients and
             // writes its w x h pixels (rows of exactly w bytes)

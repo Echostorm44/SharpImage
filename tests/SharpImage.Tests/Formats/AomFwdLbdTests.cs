@@ -8,7 +8,7 @@ public sealed class AomFwdLbdTests
     [Test]
     public async Task LowbdForwardMatchesReference()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
+        bool avx2 = System.Runtime.Intrinsics.X86.Avx2.IsSupported;   // without it: the SSE driver against the reference only
         var rng = new Random(11);
         int mismatches = 0, cases = 0;
         for (int txSize = 0; txSize < AomTables.TxSizeWide.Length; txSize++)
@@ -37,8 +37,12 @@ public sealed class AomFwdLbdTests
                     var a = new int[w * h];
                     var b = new int[w * h];
                     Av1FwdTxfmAom.ForwardRawRef(diff, stride, w, h, txSize, hKind, vKind, flipUd, flipLr, a);
-                    Av1FwdTxfmAom.ForwardRawLbd(diff, stride, w, h, txSize, hKind, vKind, flipUd, flipLr, b);
+                    if (avx2) Av1FwdTxfmAom.ForwardRawLbd(diff, stride, w, h, txSize, hKind, vKind, flipUd, flipLr, b);
+                    else a.AsSpan().CopyTo(b);
+                    var sse = new int[w * h];
+                    Av1FwdTxfmAom.ForwardRawLbdSse(diff, stride, w, h, txSize, hKind, vKind, flipUd, flipLr, sse);
                     cases++;
+                    if (!a.AsSpan().SequenceEqual(sse) && mismatches++ < 10) Console.WriteLine($"txSize {txSize} ({w}x{h}) type {txType}: SSE driver differs");
                     if (!a.AsSpan().SequenceEqual(b))
                     {
                         if (mismatches++ < 10)

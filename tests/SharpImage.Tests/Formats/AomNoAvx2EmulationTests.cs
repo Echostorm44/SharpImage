@@ -8,7 +8,7 @@ namespace SharpImage.Tests.Formats;
 public sealed class AomNoAvx2EmulationTests
 {
     [Test]
-    public async Task QuantizerEmulations_MatchAvx2Kernels()
+    public async Task QuantizerEmulationsAndSse41_MatchAvx2Kernels()
     {
         if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // nothing to compare against
         var rng = new Random(5);
@@ -40,6 +40,13 @@ public sealed class AomNoAvx2EmulationTests
                     if (ea != ee || !qa.AsSpan().SequenceEqual(qe) || !da.AsSpan().SequenceEqual(de)) bad++;
                     ea = AomQuantize.QuantizeBAvx2(c, n, iscan, zb0, zb1, rnd0, rnd1, q0, q1, sh0, sh1, dq0, dq1, logScale, qa, da);
                     ee = AomQuantize.QuantizeBAvx2Emu(c, n, iscan, zb0, zb1, rnd0, rnd1, q0, q1, sh0, sh1, dq0, dq1, logScale, qe, de);
+                    cases++;
+                    if (ea != ee || !qa.AsSpan().SequenceEqual(qe) || !da.AsSpan().SequenceEqual(de)) bad++;
+                    ee = AomQuantize.QuantizeBSse41(c, n, iscan, zb0, zb1, rnd0, rnd1, q0, q1, sh0, sh1, dq0, dq1, logScale, qe, de);
+                    cases++;
+                    if (ea != ee || !qa.AsSpan().SequenceEqual(qe) || !da.AsSpan().SequenceEqual(de)) bad++;
+                    ea = AomQuantize.QuantizeFpAvx2(c, n, iscan, rnd0, rnd1, q0, q1, dq0, dq1, logScale, qa, da);
+                    ee = AomQuantize.QuantizeFpSse41(c, n, iscan, rnd0, rnd1, q0, q1, dq0, dq1, logScale, qe, de);
                     cases++;
                     if (ea != ee || !qa.AsSpan().SequenceEqual(qe) || !da.AsSpan().SequenceEqual(de)) bad++;
                 }

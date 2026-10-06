@@ -194,6 +194,41 @@ internal static class AomTxb
 
     /// <summary>av1_txb_init_levels: |coeff| clipped to 127 into the column-padded map (stride height + 4), the rows
     /// past the last column and the tail zeroed.</summary>
+    // min(|c|, 127) of 8 coefficients as bytes (the AVX2 path's values: int.MinValue gives 0 in both)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<byte> Levels8Sse41(ref int c, int k)
+    {
+        var max = Vector128.Create(127);
+        var a = System.Runtime.Intrinsics.X86.Sse41.Min(System.Runtime.Intrinsics.X86.Ssse3.Abs(Vector128.LoadUnsafe(ref c, (nuint)k)).AsInt32(), max);
+        var b = System.Runtime.Intrinsics.X86.Sse41.Min(System.Runtime.Intrinsics.X86.Ssse3.Abs(Vector128.LoadUnsafe(ref c, (nuint)(k + 4))).AsInt32(), max);
+        var s16 = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(a, b);
+        return System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(s16, s16);
+    }
+
+    // InitLevels without AVX2 (the default Native AOT instruction set): 8 coefficients per step in SSE4.1
+    private static void InitLevelsSse41(ref int c0, ref byte l0, int width, int height, int stride)
+    {
+        if (height >= 8)
+        {
+            for (int i = 0; i < width; i++)
+            {
+                ref int ci = ref Unsafe.Add(ref c0, i * height);
+                ref byte li = ref Unsafe.Add(ref l0, i * stride);
+                for (int j = 0; j < height; j += 8)
+                    Unsafe.WriteUnaligned(ref Unsafe.Add(ref li, j), Levels8Sse41(ref ci, j).AsUInt64().ToScalar());
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref li, height), 0u);   // TX_PAD_HOR
+            }
+            return;
+        }
+        // height 4: two columns per step, each column's 4 levels then its 4 pad zeros
+        for (int i = 0; i < width; i += 2)
+        {
+            var b = Levels8Sse41(ref c0, i * 4).AsUInt32();
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref l0, i * 8), (ulong)b.ToScalar());
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref l0, i * 8 + 8), (ulong)b.GetElement(1));
+        }
+    }
+
     internal static void InitLevels(ReadOnlySpan<int> coeff, int width, int height, Span<byte> levels)
     {
         int stride = height + TxPadHor;
@@ -202,11 +237,24 @@ internal static class AomTxb
             var tail = levels.Slice(stride * width, TxPadBottom * stride + TxPadEnd);
             ref byte t0 = ref MemoryMarshal.GetReference(tail);
             int n = tail.Length;
-            for (int k = 0; k + 32 < n; k += 32) Vector256<byte>.Zero.StoreUnsafe(ref t0, (nuint)k);
-            Vector256<byte>.Zero.StoreUnsafe(ref t0, (nuint)(n - 32));
+            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+            {
+                for (int k = 0; k + 32 < n; k += 32) Vector256<byte>.Zero.StoreUnsafe(ref t0, (nuint)k);
+                Vector256<byte>.Zero.StoreUnsafe(ref t0, (nuint)(n - 32));
+            }
+            else
+            {
+                for (int k = 0; k + 16 < n; k += 16) Vector128<byte>.Zero.StoreUnsafe(ref t0, (nuint)k);
+                Vector128<byte>.Zero.StoreUnsafe(ref t0, (nuint)(n - 16));
+            }
         }
         ref int c0 = ref MemoryMarshal.GetReference(coeff);
         ref byte l0 = ref MemoryMarshal.GetReference(levels);
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Sse41.IsSupported)
+        {
+            InitLevelsSse41(ref c0, ref l0, width, height, stride);
+            return;
+        }
         var max = Vector256.Create(127);
         if (height >= 8)
         {

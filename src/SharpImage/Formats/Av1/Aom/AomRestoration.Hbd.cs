@@ -400,6 +400,12 @@ internal static partial class AomRestoration
     public static unsafe void SelfguidedRestorationHbd(ushort[] dgd16, int d0, int width, int height, int dgdStride,
         int[] flt0, int f0, int[] flt1, int f1, int fltStride, int sgrParamsIdx, SgrScratch sc, int bd)
     {
+        if (!Avx2.IsSupported)
+        {
+            // the C filter (libaom's AVX2 kernel reproduces it exactly)
+            SelfguidedRestorationCHbd(dgd16, d0, width, height, dgdStride, flt0, f0, flt1, f1, fltStride, sgrParamsIdx, sc, bd);
+            return;
+        }
         int widthExt = width + 2 * SgrprojBorderHorz, heightExt = height + 2 * SgrprojBorderVert;
         int bufStride = (widthExt + 16 + 7) & ~7;
         fixed (int* buf = sc.Ii)
