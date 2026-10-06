@@ -19,6 +19,7 @@ internal static unsafe partial class AomReconIntra
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void DrRun(byte* dst, byte* src, int count, int n, int shift, byte fill)
     {
+        if (!Avx2.IsSupported) { DrRunSse(dst, src, count, n, shift, fill); return; }
         var w0 = Vector256.Create((short)(32 - shift));
         var w1 = Vector256.Create((short)shift);
         var r16 = Vector256.Create((short)16);
@@ -43,10 +44,40 @@ internal static unsafe partial class AomReconIntra
         }
     }
 
+    /// <summary><see cref="DrRun"/> in SSE4.1 (no AVX2): two 8-sample halves, the same reads and values.</summary>
+    private static void DrRunSse(byte* dst, byte* src, int count, int n, int shift, byte fill)
+    {
+        var w0 = Vector128.Create((short)(32 - shift));
+        var w1 = Vector128.Create((short)shift);
+        var r16 = Vector128.Create((short)16);
+        var fillV = Vector128.Create(fill);
+        for (int c = 0; c < count; c += 16)
+        {
+            Vector128<byte> res;
+            if (c >= n) res = fillV;
+            else
+            {
+                var al = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(*(ulong*)(src + c)).AsByte());
+                var ah = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(*(ulong*)(src + c + 8)).AsByte());
+                var bl = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(*(ulong*)(src + c + 1)).AsByte());
+                var bh = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(*(ulong*)(src + c + 9)).AsByte());
+                var vl = Vector128.ShiftRightLogical(al * w0 + bl * w1 + r16, 5);
+                var vh = Vector128.ShiftRightLogical(ah * w0 + bh * w1 + r16, 5);
+                res = Sse2.PackUnsignedSaturate(vl, vh);
+                if (n - c < 16) res = Vector128.ConditionalSelect(Vector128.LessThan(Iota16, Vector128.Create((byte)(n - c))), res, fillV);
+            }
+            int rem = count - c;
+            if (rem >= 16) Sse2.Store(dst + c, res);
+            else if (rem == 8) *(ulong*)(dst + c) = res.AsUInt64().ToScalar();
+            else if (rem == 4) *(uint*)(dst + c) = res.AsUInt32().ToScalar();
+            else Unsafe.CopyBlockUnaligned(dst + c, &res, (uint)rem);
+        }
+    }
+
     /// <summary>Zone 1 without upsampling.</summary>
     internal static void DrPredictionZ1Simd(byte* dst, nint stride, int bw, int bh, byte* above, int dx)
     {
-        if (bw == 32) { DrPredictionZ1_32Avx2(dst, stride, bh, above, dx); return; }
+        if (bw == 32 && Avx2.IsSupported) { DrPredictionZ1_32Avx2(dst, stride, bh, above, dx); return; }
         int maxBaseX = bw + bh - 1;
         byte fill = above[maxBaseX];
         int x = dx;
@@ -66,8 +97,8 @@ internal static unsafe partial class AomReconIntra
     /// <summary>Zone 3 without upsampling: zone 1 down the left edge, one column per run, transposed.</summary>
     internal static void DrPredictionZ3Simd(byte* dst, nint stride, int bw, int bh, byte* left, int dy)
     {
-        if (bh <= 16) { DrPredictionZ3SmallAvx2(dst, stride, bw, bh, left, dy); return; }
-        if (bh == 32 && bw <= 32) { DrPredictionZ3Tall32Avx2(dst, stride, bw, left, dy); return; }
+        if (bh <= 16 && Avx2.IsSupported) { DrPredictionZ3SmallAvx2(dst, stride, bw, bh, left, dy); return; }
+        if (bh == 32 && bw <= 32 && Avx2.IsSupported) { DrPredictionZ3Tall32Avx2(dst, stride, bw, left, dy); return; }
         int maxBaseY = bw + bh - 1;
         byte fill = left[maxBaseY];
         Unsafe.SkipInit(out StackArr4096<byte> tSA); byte* t = (byte*)Unsafe.AsPointer(ref tSA[0]);   // column c at t + c * 64
@@ -95,7 +126,7 @@ internal static unsafe partial class AomReconIntra
     /// <summary>Zone 2 without upsampling: each row's above-edge suffix as one run, the left-edge prefix per sample.</summary>
     internal static void DrPredictionZ2Simd(byte* dst, nint stride, int bw, int bh, byte* above, byte* left, int dx, int dy)
     {
-        if (bw >= 16) { DrPredictionZ2HxWAvx2(dst, stride, bw, bh, above, left, dx, dy); return; }
+        if (bw >= 16 && Avx2.IsSupported) { DrPredictionZ2HxWAvx2(dst, stride, bw, bh, above, left, dx, dy); return; }
         for (int r = 0; r < bh; ++r, dst += stride)
         {
             int t = -(r + 1) * dx;
@@ -103,6 +134,19 @@ internal static unsafe partial class AomReconIntra
             // base_x = c + baseOff >= min_base_x (-1) from column c0 on
             int c0 = Math.Max(0, -1 - baseOff);
             int nl = Math.Min(c0, bw);
+            if (!Avx2.IsSupported)
+            {
+                // the left-edge prefix sample by sample (no gather)
+                for (int c = 0; c < nl; c++)
+                {
+                    int y = (r << 6) - (c + 1) * dy;
+                    int baseY = y >> 6;
+                    int sh = (y & 0x3F) >> 1;
+                    dst[c] = (byte)((left[baseY] * (32 - sh) + left[baseY + 1] * sh + 16) >> 5);
+                }
+                if (c0 < bw) DrRun(dst + c0, above + baseOff + c0, bw - c0, bw - c0, (t & 0x3F) >> 1, 0);
+                continue;
+            }
             for (int c = 0; c < nl; c += 8)
             {
                 // columns c .. c + 7: y = (r << 6) - (c + 1) * dy, two left samples gathered per lane (lanes past the

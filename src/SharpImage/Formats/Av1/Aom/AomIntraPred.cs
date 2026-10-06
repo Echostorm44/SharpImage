@@ -181,7 +181,7 @@ internal static unsafe class AomIntraPred
             }
             return;
         }
-        if (Avx2.IsSupported && bw >= 8)
+        if (Sse41.IsSupported && bw >= 8)
         {
             // per lane: base = top + left - topleft; |base - left| = |top - topleft|, |base - top| = |left - topleft|
             var tl = Vector128.Create((short)ytopLeft);
@@ -258,6 +258,36 @@ internal static unsafe class AomIntraPred
             }
             return;
         }
+        if (Sse41.IsSupported && bw >= 8)
+        {
+            // no AVX2: 4 int32 lanes per step (the sum needs more than 16 bits)
+            fixed (byte* ws = SmoothWeights)
+            {
+                byte* wW = ws + bw - 4;
+                var rnd = Vector128.Create(1 << (log2Scale - 1));
+                var sc = Vector128.Create(scale);
+                var right = Vector128.Create(rightPred);
+                for (int r = 0; r < bh; ++r, dst += stride)
+                {
+                    int wh = smWeightsH[r];
+                    var whV = Vector128.Create(wh);
+                    var rowPart = Vector128.Create((scale - wh) * belowPred);
+                    var l = Vector128.Create((int)left[r]);
+                    for (int c = 0; c < bw; c += 8)
+                    {
+                        var a0 = Sse41.ConvertToVector128Int32(above + c);
+                        var a1 = Sse41.ConvertToVector128Int32(above + c + 4);
+                        var w0 = Sse41.ConvertToVector128Int32(wW + c);
+                        var w1 = Sse41.ConvertToVector128Int32(wW + c + 4);
+                        var v0 = Vector128.ShiftRightLogical(whV * a0 + rowPart + w0 * l + (sc - w0) * right + rnd, log2Scale);
+                        var v1 = Vector128.ShiftRightLogical(whV * a1 + rowPart + w1 * l + (sc - w1) * right + rnd, log2Scale);
+                        var w16 = Sse2.PackSignedSaturate(v0, v1);
+                        *(ulong*)(dst + c) = Sse2.PackUnsignedSaturate(w16, w16).AsUInt64().ToScalar();
+                    }
+                }
+            }
+            return;
+        }
         if (Sse41.IsSupported && bw == 4)
         {
             fixed (byte* ws = SmoothWeights)
@@ -320,6 +350,23 @@ internal static unsafe class AomIntraPred
                 var b = Vector256.Create((scale - w) * belowPred) + rnd;
                 for (int c = 0; c < bw; c += 8)
                     StoreInt8(dst + c, Vector256.ShiftRightLogical(wV * Avx2.ConvertToVector256Int32(above + c) + b, log2Scale));
+            }
+            return;
+        }
+        if (Sse41.IsSupported && bw >= 8)
+        {
+            // no AVX2: 8 uint16 lanes (the sum is at most 65408)
+            for (int r = 0; r < bh; r++, dst += stride)
+            {
+                int w = smWeights[r];
+                var wV = Vector128.Create((ushort)w);
+                var b = Vector128.Create((ushort)((scale - w) * belowPred + (1 << (log2Scale - 1))));
+                for (int c = 0; c < bw; c += 8)
+                {
+                    var a8 = Sse41.ConvertToVector128Int16(Vector128.CreateScalar(*(ulong*)(above + c)).AsByte()).AsUInt16();
+                    var v = Vector128.ShiftRightLogical(wV * a8 + b, log2Scale).AsInt16();
+                    *(ulong*)(dst + c) = Sse2.PackUnsignedSaturate(v, v).AsUInt64().ToScalar();
+                }
             }
             return;
         }
@@ -392,6 +439,29 @@ internal static unsafe class AomIntraPred
                     {
                         var ww = Avx2.ConvertToVector256Int32(wW + c);
                         StoreInt8(dst + c, Vector256.ShiftRightLogical(ww * l + (sc - ww) * right + rnd, log2Scale));
+                    }
+                }
+            }
+            return;
+        }
+        if (Sse41.IsSupported && bw >= 8)
+        {
+            // no AVX2: 8 uint16 lanes (ww * left + (256 - ww) * right + 128 is at most 65408)
+            fixed (byte* ws = SmoothWeights)
+            {
+                byte* wW = ws + bw - 4;
+                var rnd = Vector128.Create((ushort)(1 << (log2Scale - 1)));
+                var rightV = Vector128.Create((ushort)rightPred);
+                var sc = Vector128.Create((ushort)scale);
+                for (int c = 0; c < bw; c += 8)
+                {
+                    var ww = Sse41.ConvertToVector128Int16(Vector128.CreateScalar(*(ulong*)(wW + c)).AsByte()).AsUInt16();
+                    var rt = (sc - ww) * rightV + rnd;
+                    byte* d = dst + c;
+                    for (int r = 0; r < bh; r++, d += stride)
+                    {
+                        var v = Vector128.ShiftRightLogical(ww * Vector128.Create((ushort)left[r]) + rt, log2Scale).AsInt16();
+                        *(ulong*)d = Sse2.PackUnsignedSaturate(v, v).AsUInt64().ToScalar();
                     }
                 }
             }
