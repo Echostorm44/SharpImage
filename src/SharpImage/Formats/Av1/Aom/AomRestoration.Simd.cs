@@ -26,6 +26,7 @@ internal static partial class AomRestoration
         int f0, int[] flt1, int f1, int fltStride, int sgrParamsIdx, SgrScratch sc)
     {
         if (Avx2.IsSupported) SelfguidedRestorationAvx2(dgd8, d0, width, height, dgdStride, flt0, f0, flt1, f1, fltStride, sgrParamsIdx, sc);
+        else if (Sse41.IsSupported) SelfguidedRestorationSse(dgd8, d0, width, height, dgdStride, flt0, f0, flt1, f1, fltStride, sgrParamsIdx, sc);
         else SelfguidedRestorationC(dgd8, d0, width, height, dgdStride, flt0, f0, flt1, f1, fltStride, sgrParamsIdx, sc);
     }
 
@@ -34,6 +35,7 @@ internal static partial class AomRestoration
         byte[] dst, int dst0, int dstStride, int[] flt0, int[] flt1, SgrScratch sc)
     {
         if (Avx2.IsSupported) ApplySelfguidedAvx2(dat, d0, width, height, stride, ep, xqd0, xqd1, dst, dst0, dstStride, flt0, flt1, sc);
+        else if (Sse41.IsSupported) ApplySelfguidedSse(dat, d0, width, height, stride, ep, xqd0, xqd1, dst, dst0, dstStride, flt0, flt1, sc);
         else ApplySelfguidedC(dat, d0, width, height, stride, ep, xqd0, xqd1, dst, dst0, dstStride, flt0, flt1, sc);
     }
 
