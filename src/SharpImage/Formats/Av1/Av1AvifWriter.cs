@@ -898,7 +898,40 @@ internal static class Av1AvifWriter
         for (int i = 0; i + 4 <= exif.Length; i++)
             if ((exif[i] == 'I' && exif[i + 1] == 'I' && exif[i + 2] == 42 && exif[i + 3] == 0) ||
                 (exif[i] == 'M' && exif[i + 1] == 'M' && exif[i + 2] == 0 && exif[i + 3] == 42)) { off = i; break; }
+        exif = (byte[])exif.Clone();
+        int o = ExifOrientationOffset(exif);
+        if (o >= 0) exif[o] = 1;
         return Concat(U32((uint)off), exif);
+    }
+
+    /// <summary>avifGetExifOrientationOffset (libavif src/exif.c): the offset of the 8-bit value of IFD0's Orientation
+    /// tag (SHORT, count 1, value 1..8), or -1 when there is none or the payload is malformed. avifenc sets it to 1 on
+    /// every JPEG / PNG input once the orientation lives in irot / imir (MIAF 7.3.10.1: no transforms in the Exif).</summary>
+    internal static int ExifOrientationOffset(byte[] exif)
+    {
+        int t = -1;
+        for (int i = 0; i + 4 < exif.Length; i++)
+            if ((exif[i] == 'M' && exif[i + 1] == 'M' && exif[i + 2] == 0 && exif[i + 3] == 42) ||
+                (exif[i] == 'I' && exif[i + 1] == 'I' && exif[i + 2] == 42 && exif[i + 3] == 0)) { t = i; break; }
+        if (t < 0) return -1;
+        bool le = exif[t] == 'I';
+        int n = exif.Length - t;
+        uint U16At(long p) => le ? (uint)(exif[t + p] | exif[t + p + 1] << 8) : (uint)(exif[t + p] << 8 | exif[t + p + 1]);
+        uint U32At(long p) => le ? (uint)(exif[t + p] | exif[t + p + 1] << 8 | exif[t + p + 2] << 16 | exif[t + p + 3] << 24)
+            : (uint)(exif[t + p] << 24 | exif[t + p + 1] << 16 | exif[t + p + 2] << 8 | exif[t + p + 3]);
+        if (n < 8) return -1;
+        long pos = U32At(4);
+        if (pos + 2 > n) return -1;
+        uint fields = U16At(pos);
+        pos += 2;
+        for (uint f = 0; f < fields; f++, pos += 12)
+        {
+            if (pos + 12 > n) return -1;
+            uint value = U16At(pos + 8);
+            if (U16At(pos) == 0x0112 && U16At(pos + 2) == 3 && U32At(pos + 4) == 1 && value >= 1 && value <= 8)
+                return (int)(t + pos + 8 + (le ? 0 : 1));
+        }
+        return -1;
     }
 
     internal static byte[] Box(string type, byte[] payload) => Concat(U32((uint)(payload.Length + 8)), Fourcc(type), payload);
