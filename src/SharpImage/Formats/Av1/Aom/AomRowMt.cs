@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Threading;
 using static SharpImage.Formats.Av1.AomTables;
@@ -411,26 +410,8 @@ internal sealed class AomRowMt
         {
             Ctx = ctx;
             var list = new List<ushort[]>();
-            Collect(ctx, list);
+            ctx.CollectArrays(list);   // declaration order, no reflection (Native AOT trims / reorders field metadata)
             _arrays = list.ToArray();
-        }
-
-        private static void Collect(object o, List<ushort[]> list)
-        {
-            var fields = o.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public);
-            Array.Sort(fields, (a, b) => a.MetadataToken.CompareTo(b.MetadataToken));
-            foreach (var f in fields)
-            {
-                object? v = f.GetValue(o);
-                switch (v)
-                {
-                    case ushort[] a: list.Add(a); break;
-                    case ushort[][] aa: list.AddRange(aa); break;
-                    case Av1CdfCoefContext or Av1CdfModeContext or Av1CdfMvContext or Av1CdfMvComponent: Collect(v, list); break;
-                    case null: break;
-                    default: throw new InvalidOperationException($"unexpected CDF context field {f.Name}");
-                }
-            }
         }
 
         public void CopyFrom(CdfArrays src)

@@ -2,6 +2,7 @@
 // Port of dav1d CDF context types from src/cdf.h (VideoLAN dav1d, BSD-2-Clause)
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -87,6 +88,122 @@ public sealed class Av1CdfModeContext
             arr[i] = new ushort[cols];
         return arr;
     }
+
+    /// <summary>The CDF arrays in declaration order, recursing into the sub-contexts (no reflection: Native AOT).</summary>
+    internal void CollectArrays(List<ushort[]> into)
+    {
+        into.AddRange(UvMode);
+        into.AddRange(Partition);
+        into.AddRange(CflAlpha);
+        into.AddRange(TxtpInter1);
+        into.Add(TxtpInter2);
+        into.AddRange(TxtpIntra1);
+        into.AddRange(TxtpIntra2);
+        into.Add(CflSign);
+        into.AddRange(AngleDelta);
+        into.Add(FilterIntra);
+        into.AddRange(SegId);
+        into.AddRange(PalSz);
+        into.AddRange(ColorMap);
+        into.AddRange(Txsz);
+        into.Add(DeltaQ);
+        into.AddRange(DeltaLf);
+        into.Add(RestoreSwitchable);
+        into.Add(RestoreWiener);
+        into.Add(RestoreSgrproj);
+        into.AddRange(TxtpInter3);
+        into.AddRange(UseFilterIntra);
+        into.AddRange(Txpart);
+        into.AddRange(Skip);
+        into.AddRange(PalY);
+        into.AddRange(PalUv);
+        into.Add(Intrabc);
+        into.Add(PalColor);
+        into.AddRange(PalIdx);
+        into.AddRange(YMode);
+        into.AddRange(WedgeIdx);
+        into.AddRange(CompInterMode);
+        into.AddRange(Filter);
+        into.AddRange(InterintraMode);
+        into.AddRange(MotionMode);
+        into.AddRange(SkipMode);
+        into.AddRange(NewmvMode);
+        into.AddRange(GlobalmvMode);
+        into.AddRange(RefmvMode);
+        into.AddRange(DrlBit);
+        into.AddRange(Intra);
+        into.AddRange(Comp);
+        into.AddRange(CompDir);
+        into.AddRange(JntComp);
+        into.AddRange(MaskComp);
+        into.AddRange(WedgeComp);
+        into.AddRange(Ref);
+        into.AddRange(CompFwdRef);
+        into.AddRange(CompBwdRef);
+        into.AddRange(CompUniRef);
+        into.AddRange(SegPred);
+        into.AddRange(Interintra);
+        into.AddRange(InterintraWedge);
+        into.AddRange(Obmc);
+    }
+
+    /// <summary>Replaces every CDF array with a pinned one of the same size (values not kept).</summary>
+    internal void PinArrays()
+    {
+        for (int i = 0; i < UvMode.Length; i++) UvMode[i] = GC.AllocateArray<ushort>(UvMode[i].Length, pinned: true);
+        for (int i = 0; i < Partition.Length; i++) Partition[i] = GC.AllocateArray<ushort>(Partition[i].Length, pinned: true);
+        for (int i = 0; i < CflAlpha.Length; i++) CflAlpha[i] = GC.AllocateArray<ushort>(CflAlpha[i].Length, pinned: true);
+        for (int i = 0; i < TxtpInter1.Length; i++) TxtpInter1[i] = GC.AllocateArray<ushort>(TxtpInter1[i].Length, pinned: true);
+        TxtpInter2 = GC.AllocateArray<ushort>(TxtpInter2.Length, pinned: true);
+        for (int i = 0; i < TxtpIntra1.Length; i++) TxtpIntra1[i] = GC.AllocateArray<ushort>(TxtpIntra1[i].Length, pinned: true);
+        for (int i = 0; i < TxtpIntra2.Length; i++) TxtpIntra2[i] = GC.AllocateArray<ushort>(TxtpIntra2[i].Length, pinned: true);
+        CflSign = GC.AllocateArray<ushort>(CflSign.Length, pinned: true);
+        for (int i = 0; i < AngleDelta.Length; i++) AngleDelta[i] = GC.AllocateArray<ushort>(AngleDelta[i].Length, pinned: true);
+        FilterIntra = GC.AllocateArray<ushort>(FilterIntra.Length, pinned: true);
+        for (int i = 0; i < SegId.Length; i++) SegId[i] = GC.AllocateArray<ushort>(SegId[i].Length, pinned: true);
+        for (int i = 0; i < PalSz.Length; i++) PalSz[i] = GC.AllocateArray<ushort>(PalSz[i].Length, pinned: true);
+        for (int i = 0; i < ColorMap.Length; i++) ColorMap[i] = GC.AllocateArray<ushort>(ColorMap[i].Length, pinned: true);
+        for (int i = 0; i < Txsz.Length; i++) Txsz[i] = GC.AllocateArray<ushort>(Txsz[i].Length, pinned: true);
+        DeltaQ = GC.AllocateArray<ushort>(DeltaQ.Length, pinned: true);
+        for (int i = 0; i < DeltaLf.Length; i++) DeltaLf[i] = GC.AllocateArray<ushort>(DeltaLf[i].Length, pinned: true);
+        RestoreSwitchable = GC.AllocateArray<ushort>(RestoreSwitchable.Length, pinned: true);
+        RestoreWiener = GC.AllocateArray<ushort>(RestoreWiener.Length, pinned: true);
+        RestoreSgrproj = GC.AllocateArray<ushort>(RestoreSgrproj.Length, pinned: true);
+        for (int i = 0; i < TxtpInter3.Length; i++) TxtpInter3[i] = GC.AllocateArray<ushort>(TxtpInter3[i].Length, pinned: true);
+        for (int i = 0; i < UseFilterIntra.Length; i++) UseFilterIntra[i] = GC.AllocateArray<ushort>(UseFilterIntra[i].Length, pinned: true);
+        for (int i = 0; i < Txpart.Length; i++) Txpart[i] = GC.AllocateArray<ushort>(Txpart[i].Length, pinned: true);
+        for (int i = 0; i < Skip.Length; i++) Skip[i] = GC.AllocateArray<ushort>(Skip[i].Length, pinned: true);
+        for (int i = 0; i < PalY.Length; i++) PalY[i] = GC.AllocateArray<ushort>(PalY[i].Length, pinned: true);
+        for (int i = 0; i < PalUv.Length; i++) PalUv[i] = GC.AllocateArray<ushort>(PalUv[i].Length, pinned: true);
+        Intrabc = GC.AllocateArray<ushort>(Intrabc.Length, pinned: true);
+        PalColor = GC.AllocateArray<ushort>(PalColor.Length, pinned: true);
+        for (int i = 0; i < PalIdx.Length; i++) PalIdx[i] = GC.AllocateArray<ushort>(PalIdx[i].Length, pinned: true);
+        for (int i = 0; i < YMode.Length; i++) YMode[i] = GC.AllocateArray<ushort>(YMode[i].Length, pinned: true);
+        for (int i = 0; i < WedgeIdx.Length; i++) WedgeIdx[i] = GC.AllocateArray<ushort>(WedgeIdx[i].Length, pinned: true);
+        for (int i = 0; i < CompInterMode.Length; i++) CompInterMode[i] = GC.AllocateArray<ushort>(CompInterMode[i].Length, pinned: true);
+        for (int i = 0; i < Filter.Length; i++) Filter[i] = GC.AllocateArray<ushort>(Filter[i].Length, pinned: true);
+        for (int i = 0; i < InterintraMode.Length; i++) InterintraMode[i] = GC.AllocateArray<ushort>(InterintraMode[i].Length, pinned: true);
+        for (int i = 0; i < MotionMode.Length; i++) MotionMode[i] = GC.AllocateArray<ushort>(MotionMode[i].Length, pinned: true);
+        for (int i = 0; i < SkipMode.Length; i++) SkipMode[i] = GC.AllocateArray<ushort>(SkipMode[i].Length, pinned: true);
+        for (int i = 0; i < NewmvMode.Length; i++) NewmvMode[i] = GC.AllocateArray<ushort>(NewmvMode[i].Length, pinned: true);
+        for (int i = 0; i < GlobalmvMode.Length; i++) GlobalmvMode[i] = GC.AllocateArray<ushort>(GlobalmvMode[i].Length, pinned: true);
+        for (int i = 0; i < RefmvMode.Length; i++) RefmvMode[i] = GC.AllocateArray<ushort>(RefmvMode[i].Length, pinned: true);
+        for (int i = 0; i < DrlBit.Length; i++) DrlBit[i] = GC.AllocateArray<ushort>(DrlBit[i].Length, pinned: true);
+        for (int i = 0; i < Intra.Length; i++) Intra[i] = GC.AllocateArray<ushort>(Intra[i].Length, pinned: true);
+        for (int i = 0; i < Comp.Length; i++) Comp[i] = GC.AllocateArray<ushort>(Comp[i].Length, pinned: true);
+        for (int i = 0; i < CompDir.Length; i++) CompDir[i] = GC.AllocateArray<ushort>(CompDir[i].Length, pinned: true);
+        for (int i = 0; i < JntComp.Length; i++) JntComp[i] = GC.AllocateArray<ushort>(JntComp[i].Length, pinned: true);
+        for (int i = 0; i < MaskComp.Length; i++) MaskComp[i] = GC.AllocateArray<ushort>(MaskComp[i].Length, pinned: true);
+        for (int i = 0; i < WedgeComp.Length; i++) WedgeComp[i] = GC.AllocateArray<ushort>(WedgeComp[i].Length, pinned: true);
+        for (int i = 0; i < Ref.Length; i++) Ref[i] = GC.AllocateArray<ushort>(Ref[i].Length, pinned: true);
+        for (int i = 0; i < CompFwdRef.Length; i++) CompFwdRef[i] = GC.AllocateArray<ushort>(CompFwdRef[i].Length, pinned: true);
+        for (int i = 0; i < CompBwdRef.Length; i++) CompBwdRef[i] = GC.AllocateArray<ushort>(CompBwdRef[i].Length, pinned: true);
+        for (int i = 0; i < CompUniRef.Length; i++) CompUniRef[i] = GC.AllocateArray<ushort>(CompUniRef[i].Length, pinned: true);
+        for (int i = 0; i < SegPred.Length; i++) SegPred[i] = GC.AllocateArray<ushort>(SegPred[i].Length, pinned: true);
+        for (int i = 0; i < Interintra.Length; i++) Interintra[i] = GC.AllocateArray<ushort>(Interintra[i].Length, pinned: true);
+        for (int i = 0; i < InterintraWedge.Length; i++) InterintraWedge[i] = GC.AllocateArray<ushort>(InterintraWedge[i].Length, pinned: true);
+        for (int i = 0; i < Obmc.Length; i++) Obmc[i] = GC.AllocateArray<ushort>(Obmc[i].Length, pinned: true);
+    }
 }
 
 /// <summary>
@@ -118,6 +235,42 @@ public sealed class Av1CdfCoefContext
             arr[i] = new ushort[cols];
         return arr;
     }
+
+    /// <summary>The CDF arrays in declaration order, recursing into the sub-contexts (no reflection: Native AOT).</summary>
+    internal void CollectArrays(List<ushort[]> into)
+    {
+        into.AddRange(EobBin16);
+        into.AddRange(EobBin32);
+        into.AddRange(EobBin64);
+        into.AddRange(EobBin128);
+        into.AddRange(EobBin256);
+        into.AddRange(EobBin512);
+        into.AddRange(EobBin1024);
+        into.AddRange(EobBaseTok);
+        into.AddRange(BaseTok);
+        into.AddRange(BrTok);
+        into.AddRange(EobHiBit);
+        into.AddRange(CoefSkip);
+        into.AddRange(DcSign);
+    }
+
+    /// <summary>Replaces every CDF array with a pinned one of the same size (values not kept).</summary>
+    internal void PinArrays()
+    {
+        for (int i = 0; i < EobBin16.Length; i++) EobBin16[i] = GC.AllocateArray<ushort>(EobBin16[i].Length, pinned: true);
+        for (int i = 0; i < EobBin32.Length; i++) EobBin32[i] = GC.AllocateArray<ushort>(EobBin32[i].Length, pinned: true);
+        for (int i = 0; i < EobBin64.Length; i++) EobBin64[i] = GC.AllocateArray<ushort>(EobBin64[i].Length, pinned: true);
+        for (int i = 0; i < EobBin128.Length; i++) EobBin128[i] = GC.AllocateArray<ushort>(EobBin128[i].Length, pinned: true);
+        for (int i = 0; i < EobBin256.Length; i++) EobBin256[i] = GC.AllocateArray<ushort>(EobBin256[i].Length, pinned: true);
+        for (int i = 0; i < EobBin512.Length; i++) EobBin512[i] = GC.AllocateArray<ushort>(EobBin512[i].Length, pinned: true);
+        for (int i = 0; i < EobBin1024.Length; i++) EobBin1024[i] = GC.AllocateArray<ushort>(EobBin1024[i].Length, pinned: true);
+        for (int i = 0; i < EobBaseTok.Length; i++) EobBaseTok[i] = GC.AllocateArray<ushort>(EobBaseTok[i].Length, pinned: true);
+        for (int i = 0; i < BaseTok.Length; i++) BaseTok[i] = GC.AllocateArray<ushort>(BaseTok[i].Length, pinned: true);
+        for (int i = 0; i < BrTok.Length; i++) BrTok[i] = GC.AllocateArray<ushort>(BrTok[i].Length, pinned: true);
+        for (int i = 0; i < EobHiBit.Length; i++) EobHiBit[i] = GC.AllocateArray<ushort>(EobHiBit[i].Length, pinned: true);
+        for (int i = 0; i < CoefSkip.Length; i++) CoefSkip[i] = GC.AllocateArray<ushort>(CoefSkip[i].Length, pinned: true);
+        for (int i = 0; i < DcSign.Length; i++) DcSign[i] = GC.AllocateArray<ushort>(DcSign[i].Length, pinned: true);
+    }
 }
 
 /// <summary>
@@ -141,6 +294,32 @@ public sealed class Av1CdfMvComponent
             arr[i] = new ushort[cols];
         return arr;
     }
+
+    /// <summary>The CDF arrays in declaration order, recursing into the sub-contexts (no reflection: Native AOT).</summary>
+    internal void CollectArrays(List<ushort[]> into)
+    {
+        into.Add(Classes);
+        into.Add(Sign);
+        into.Add(Class0);
+        into.AddRange(Class0Fp);
+        into.Add(Class0Hp);
+        into.AddRange(ClassN);
+        into.Add(ClassNFp);
+        into.Add(ClassNHp);
+    }
+
+    /// <summary>Replaces every CDF array with a pinned one of the same size (values not kept).</summary>
+    internal void PinArrays()
+    {
+        Classes = GC.AllocateArray<ushort>(Classes.Length, pinned: true);
+        Sign = GC.AllocateArray<ushort>(Sign.Length, pinned: true);
+        Class0 = GC.AllocateArray<ushort>(Class0.Length, pinned: true);
+        for (int i = 0; i < Class0Fp.Length; i++) Class0Fp[i] = GC.AllocateArray<ushort>(Class0Fp[i].Length, pinned: true);
+        Class0Hp = GC.AllocateArray<ushort>(Class0Hp.Length, pinned: true);
+        for (int i = 0; i < ClassN.Length; i++) ClassN[i] = GC.AllocateArray<ushort>(ClassN[i].Length, pinned: true);
+        ClassNFp = GC.AllocateArray<ushort>(ClassNFp.Length, pinned: true);
+        ClassNHp = GC.AllocateArray<ushort>(ClassNHp.Length, pinned: true);
+    }
 }
 
 /// <summary>
@@ -151,6 +330,22 @@ public sealed class Av1CdfMvContext
     public Av1CdfMvComponent Comp0 = new();
     public Av1CdfMvComponent Comp1 = new();
     public ushort[] Joint = new ushort[8]; // [N_MV_JOINTS] padded to 8
+
+    /// <summary>The CDF arrays in declaration order, recursing into the sub-contexts (no reflection: Native AOT).</summary>
+    internal void CollectArrays(List<ushort[]> into)
+    {
+        Comp0.CollectArrays(into);
+        Comp1.CollectArrays(into);
+        into.Add(Joint);
+    }
+
+    /// <summary>Replaces every CDF array with a pinned one of the same size (values not kept).</summary>
+    internal void PinArrays()
+    {
+        Comp0.PinArrays();
+        Comp1.PinArrays();
+        Joint = GC.AllocateArray<ushort>(Joint.Length, pinned: true);
+    }
 }
 
 /// <summary>
@@ -1062,5 +1257,25 @@ public sealed class Av1CdfContext
         int ctx = int.Parse(key.Substring(b2, e2 - b2));
         int v = int.Parse(key.Substring(b3, e3 - b3));
         arr[c * 3 + ctx][v] = value;
+    }
+
+    /// <summary>The CDF arrays in declaration order, recursing into the sub-contexts (no reflection: Native AOT).</summary>
+    internal void CollectArrays(List<ushort[]> into)
+    {
+        Coef.CollectArrays(into);
+        Mode.CollectArrays(into);
+        Mv.CollectArrays(into);
+        Dmv.CollectArrays(into);
+        into.AddRange(Kfym);
+    }
+
+    /// <summary>Replaces every CDF array with a pinned one of the same size (values not kept).</summary>
+    internal void PinArrays()
+    {
+        Coef.PinArrays();
+        Mode.PinArrays();
+        Mv.PinArrays();
+        Dmv.PinArrays();
+        for (int i = 0; i < Kfym.Length; i++) Kfym[i] = GC.AllocateArray<ushort>(Kfym[i].Length, pinned: true);
     }
 }

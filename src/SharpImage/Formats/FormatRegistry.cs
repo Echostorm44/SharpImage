@@ -420,7 +420,7 @@ public static class FormatRegistry
             ImageFileFormat.Dicom => DicomCoder.Encode(image),
             ImageFileFormat.Jpeg2000 => Jpeg2000Coder.Encode(image),
             ImageFileFormat.JpegXl => JxlCoder.Encode(image),
-            ImageFileFormat.Avif => HeifCoder.Encode(image, HeifContainerType.Avif),
+            ImageFileFormat.Avif => HeifCoder.EncodeAvif(image), // avifenc's defaults (quality 60, speed 6)
             ImageFileFormat.Heic => HeifCoder.Encode(image, HeifContainerType.Heic),
             ImageFileFormat.Exr => ExrCoder.Encode(image),
             ImageFileFormat.Sgi => SgiCoder.Encode(image),
