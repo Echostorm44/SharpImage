@@ -243,6 +243,28 @@ internal static partial class AomEncodeMb
             }
             return;
         }
+        if (cols >= 8 && (cols & 7) == 0 && !Avx2.IsSupported && Sse41.IsSupported && rows > 0 && diffOff >= 0 && srcOff >= 0 && predOff >= 0
+            && diffOff + (long)(rows - 1) * diffStride + cols <= diff.Length && srcOff + (long)(rows - 1) * srcStride + cols <= src.Length
+            && predOff + (long)(rows - 1) * predStride + cols <= pred.Length)
+        {
+            // no AVX2: 8 samples per subtract
+            ref byte s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), srcOff);
+            ref byte p0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(pred), predOff);
+            ref short d0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(diff), diffOff);
+            for (int r = 0; r < rows; r++)
+            {
+                for (int c = 0; c < cols; c += 8)
+                {
+                    var a = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref s0, c))).AsByte());
+                    var b = Sse41.ConvertToVector128Int16(Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref p0, c))).AsByte());
+                    (a - b).StoreUnsafe(ref d0, (nuint)c);
+                }
+                s0 = ref Unsafe.Add(ref s0, srcStride);
+                p0 = ref Unsafe.Add(ref p0, predStride);
+                d0 = ref Unsafe.Add(ref d0, diffStride);
+            }
+            return;
+        }
         if (cols == 4 && Sse41.IsSupported && rows > 0 && diffOff >= 0 && srcOff >= 0 && predOff >= 0
             && diffOff + (long)(rows - 1) * diffStride + 4 <= diff.Length && srcOff + (long)(rows - 1) * srcStride + 4 <= src.Length
             && predOff + (long)(rows - 1) * predStride + 4 <= pred.Length)
@@ -725,10 +747,22 @@ internal static partial class AomEncodeMb
         ref short s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), off);
         if (!Avx2.IsSupported)
         {
+            // madd pairs zero-extended into 64-bit sums, 8 (or 4) values at a time
             ulong ss = 0;
+            var acc128 = Vector128<long>.Zero;
+            var zero = Vector128<int>.Zero;
             for (int r = 0; r < height; r++)
-                for (int c = 0; c < width; c++) { int v = Unsafe.Add(ref s0, r * stride + c); ss += (ulong)(v * v); }
-            return ss;
+            {
+                ref short row = ref Unsafe.Add(ref s0, r * stride);
+                int c = 0;
+                for (; c + 8 <= width; c += 8)
+                {
+                    var m = Sse2.MultiplyAddAdjacent(Vector128.LoadUnsafe(ref row, (nuint)c), Vector128.LoadUnsafe(ref row, (nuint)c));
+                    acc128 = Sse2.Add(acc128, Sse2.Add(Sse2.UnpackLow(m, zero).AsInt64(), Sse2.UnpackHigh(m, zero).AsInt64()));
+                }
+                for (; c < width; c++) { int v = Unsafe.Add(ref row, c); ss += (ulong)(v * v); }
+            }
+            return ss + (ulong)(acc128.GetElement(0) + acc128.GetElement(1));
         }
         var acc = Vector256<ulong>.Zero;
         ulong tail = 0;
@@ -783,9 +817,26 @@ internal static partial class AomEncodeMb
         ref short s0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), off);
         if (!Avx2.IsSupported)
         {
+            // the squares as madd pairs zero-extended into 64-bit sums, the values' sum via madd with ones
+            var acc = Vector128<long>.Zero;
+            var sv = Vector128<int>.Zero;
+            var zero = Vector128<int>.Zero;
+            var ones = Vector128.Create((short)1);
             for (int r = 0; r < height; r++)
-                for (int c = 0; c < width; c++) { int v = Unsafe.Add(ref s0, r * stride + c); ss += v * v; sum += v; }
-            return (ulong)ss;
+            {
+                ref short row = ref Unsafe.Add(ref s0, r * stride);
+                int c = 0;
+                for (; c + 8 <= width; c += 8)
+                {
+                    var v = Vector128.LoadUnsafe(ref row, (nuint)c);
+                    var m = Sse2.MultiplyAddAdjacent(v, v);
+                    acc = Sse2.Add(acc, Sse2.Add(Sse2.UnpackLow(m, zero).AsInt64(), Sse2.UnpackHigh(m, zero).AsInt64()));
+                    sv = Sse2.Add(sv, Sse2.MultiplyAddAdjacent(v, ones));
+                }
+                for (; c < width; c++) { int v = Unsafe.Add(ref row, c); ss += v * v; sum += v; }
+            }
+            sum += sv.GetElement(0) + sv.GetElement(1) + sv.GetElement(2) + sv.GetElement(3);
+            return (ulong)(ss + acc.GetElement(0) + acc.GetElement(1));
         }
         var one = Vector256.Create((short)1);
         var sumV = Vector256<int>.Zero;
@@ -968,6 +1019,28 @@ internal static partial class AomEncodeMb
     /// the difference in 16-bit lanes, madd pairs zero-extended to 64 bits. Returns the error; ssz: the coefficients'.</summary>
     internal static long BlockErrorAvx2(ReadOnlySpan<int> coeff, ReadOnlySpan<int> dqcoeff, int blockSize, out long ssz)
     {
+        if (!Avx2.IsSupported && Sse2.IsSupported && (blockSize & 7) == 0)
+        {
+            // the kernel in 128-bit lanes: int16-saturated values, the 16-bit wrapping difference, madd pairs
+            // zero-extended into 64-bit sums
+            var se = Vector128<long>.Zero;
+            var sz2 = Vector128<long>.Zero;
+            var zero = Vector128<int>.Zero;
+            ref int cc0 = ref MemoryMarshal.GetReference(coeff);
+            ref int dd0 = ref MemoryMarshal.GetReference(dqcoeff);
+            for (int i = 0; i < blockSize; i += 8)
+            {
+                var c = Sse2.PackSignedSaturate(Vector128.LoadUnsafe(ref cc0, (nuint)i), Vector128.LoadUnsafe(ref cc0, (nuint)(i + 4)));
+                var d = Sse2.PackSignedSaturate(Vector128.LoadUnsafe(ref dd0, (nuint)i), Vector128.LoadUnsafe(ref dd0, (nuint)(i + 4)));
+                var diff = Sse2.Subtract(d, c);
+                var dm = Sse2.MultiplyAddAdjacent(diff, diff);
+                var cm = Sse2.MultiplyAddAdjacent(c, c);
+                se = Sse2.Add(se, Sse2.Add(Sse2.UnpackLow(dm, zero).AsInt64(), Sse2.UnpackHigh(dm, zero).AsInt64()));
+                sz2 = Sse2.Add(sz2, Sse2.Add(Sse2.UnpackLow(cm, zero).AsInt64(), Sse2.UnpackHigh(cm, zero).AsInt64()));
+            }
+            ssz = sz2.GetElement(0) + sz2.GetElement(1);
+            return se.GetElement(0) + se.GetElement(1);
+        }
         if (!Avx2.IsSupported)
         {
             // the kernel lane by lane: int16-saturated values, the difference wrapping in 16 bits (madd pair sums

@@ -50,12 +50,17 @@ internal static partial class AomMl
 
     // cnn_convolve_no_maxpool_padding_valid_5x5_avx2 (layer 0: 5x5, stride 4, one in-channel): three blocks per pair
     // of 8-lane registers, then single blocks, each with libaom's reduction order (no FMA: libaom's build has none)
-    private static void CnnConvolve5x5Avx2(float[] input, int inWidth, int inHeight, int inStride, int inChannels,
+    internal static void CnnConvolve5x5Avx2(float[] input, int inWidth, int inHeight, int inStride, int inChannels,
         int outChannels, float[] weights, float[] bias, float[] output, int outStride)
     {
         const int fw = 5, skip = 4;
         int cstep = inChannels * outChannels;
-        if (!Avx2.IsSupported) { CnnConvolve5x5Scalar(input, inWidth, inHeight, inStride, inChannels, outChannels, weights, bias, output, outStride); return; }
+        if (!Avx2.IsSupported)
+        {
+            if (Sse3.IsSupported) CnnConvolve5x5Sse(input, inWidth, inHeight, inStride, inChannels, outChannels, weights, bias, output, outStride);
+            else CnnConvolve5x5Scalar(input, inWidth, inHeight, inStride, inChannels, outChannels, weights, bias, output, outStride);
+            return;
+        }
         var block01 = Vector256.Create(0, 1, 2, 3, 4, 4, 5, 6);
         var block12 = Vector256.Create(0, 1, 1, 2, 3, 4, 5, 0);
         var wmask0 = Vector256.Create(0, 1, 2, 3, 4, 0, 1, 2);
@@ -147,11 +152,16 @@ internal static partial class AomMl
 
     // cnn_convolve_no_maxpool_padding_valid_layer1_avx2 (16x16 in) / layer2_avx2 (8x8 in): per output channel, the
     // bias then each in-channel's 2x2 blocks ((p00 w0 + p10 w2) + (p01 w1 + p11 w3) by hadd) added in order
-    private static void CnnConvolve2x2Avx2(float[] input, int inSize, int inChannels, int outChannels, float[] weights,
+    internal static void CnnConvolve2x2Avx2(float[] input, int inSize, int inChannels, int outChannels, float[] weights,
         float[] bias, float[] output, int outBase, int outStride)
     {
         int cstep = inChannels * outChannels, outSize = inSize / 2;
-        if (!Avx2.IsSupported || (inSize != 16 && inSize != 8)) { CnnConvolve2x2Scalar(input, inSize, inChannels, outChannels, weights, bias, output, outBase, outStride); return; }
+        if (!Avx2.IsSupported || (inSize != 16 && inSize != 8))
+        {
+            if (Sse3.IsSupported && (inSize == 16 || inSize == 8)) CnnConvolve2x2Sse(input, inSize, inChannels, outChannels, weights, bias, output, outBase, outStride);
+            else CnnConvolve2x2Scalar(input, inSize, inChannels, outChannels, weights, bias, output, outBase, outStride);
+            return;
+        }
         if (input.Length < inChannels * inSize * inSize || output.Length < outBase + outChannels * outStride * outStride)
             throw new ArgumentException("cnn buffers");
         var outMask = Vector256.Create(0, 1, 4, 5, 2, 3, 6, 7);

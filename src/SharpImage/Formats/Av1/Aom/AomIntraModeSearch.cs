@@ -208,6 +208,36 @@ internal static class AomIntraModeSearch
             sse = (uint)ss;
             return (uint)(ss - (ulong)(sum * sum / (w * h)));
         }
+        if (System.Runtime.Intrinsics.X86.Sse41.IsSupported && (w & 3) == 0 && w > 0 && h > 0 && off >= 0 && off + (long)(h - 1) * stride + w <= buf.Length)
+        {
+            // no AVX2: 8 (or 4) samples at a time, the sums and squares in int32 lanes (exact: see above)
+            ref byte b0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(buf);
+            var sv = System.Runtime.Intrinsics.Vector128<int>.Zero;
+            var qv = System.Runtime.Intrinsics.Vector128<int>.Zero;
+            var ones = System.Runtime.Intrinsics.Vector128.Create((short)1);
+            for (int r = 0; r < h; r++)
+            {
+                ref byte row = ref Unsafe.Add(ref b0, off + r * stride);
+                int c = 0;
+                for (; c + 8 <= w; c += 8)
+                {
+                    var v = System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int16(System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref row, c))).AsByte());
+                    sv += System.Runtime.Intrinsics.X86.Sse2.MultiplyAddAdjacent(v, ones);
+                    qv += System.Runtime.Intrinsics.X86.Sse2.MultiplyAddAdjacent(v, v);
+                }
+                if (c < w)
+                {
+                    // the last 4 samples (the upper lanes zero)
+                    var v = System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int16(System.Runtime.Intrinsics.Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref row, c))).AsByte());
+                    sv += System.Runtime.Intrinsics.X86.Sse2.MultiplyAddAdjacent(v, ones);
+                    qv += System.Runtime.Intrinsics.X86.Sse2.MultiplyAddAdjacent(v, v);
+                }
+            }
+            sum = System.Runtime.Intrinsics.Vector128.Sum(sv);
+            ss = (ulong)(uint)System.Runtime.Intrinsics.Vector128.Sum(qv);
+            sse = (uint)ss;
+            return (uint)(ss - (ulong)(sum * sum / (w * h)));
+        }
         for (int r = 0; r < h; r++)
             for (int c = 0; c < w; c++) { int v = buf[off + r * stride + c]; sum += v; ss += (ulong)(v * v); }
         sse = (uint)ss;

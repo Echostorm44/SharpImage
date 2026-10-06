@@ -130,6 +130,12 @@ internal static partial class AomMl
             ComputeGradientInfoSbAvx2(src, stride, sbW, visW, visH, absSum, bin, baseOff);
             return;
         }
+        if (System.Runtime.Intrinsics.X86.Sse41.IsSupported && visW > 2 && visH > 2 && src.Length >= (visH - 1) * stride + visW + 1
+            && baseOff >= 0 && baseOff + (visH - 1) * sbW + visW <= Math.Min(absSum.Length, bin.Length))
+        {
+            ComputeGradientInfoSbSse41(src, stride, sbW, visW, visH, absSum, bin, baseOff);
+            return;
+        }
         for (int r = 1; r < visH - 1; ++r)
         {
             int o = r * stride;
@@ -186,6 +192,77 @@ internal static partial class AomMl
                     System.Runtime.Intrinsics.Vector256.Equals(dx32, System.Runtime.Intrinsics.Vector256<int>.Zero),
                     System.Runtime.Intrinsics.Vector256.Create(-1), cnt);
                 var w = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(res.GetLower(), res.GetUpper());
+                Unsafe.WriteUnaligned(ref Unsafe.As<sbyte, byte>(ref Unsafe.Add(ref b0, i)),
+                    System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(w, w).AsUInt64().ToScalar());
+            }
+            for (; c < visW - 1; ++c)
+            {
+                int p = o + c;
+                int dx = (src[p + 1 - stride] + 2 * src[p + 1] + src[p + 1 + stride]) -
+                         (src[p - 1 - stride] + 2 * src[p - 1] + src[p - 1 + stride]);
+                int dy = (src[p + stride - 1] + 2 * src[p + stride] + src[p + stride + 1]) -
+                         (src[p - stride - 1] + 2 * src[p - stride] + src[p - stride + 1]);
+                int i = baseOff + r * sbW + c;
+                absSum[i] = (ushort)(AbsI(dx) + AbsI(dy));
+                bin[i] = (sbyte)(dx != 0 ? GetHistBinIdx(dx, dy) : -1);
+            }
+        }
+    }
+
+    // (dy << 16) / dx truncated, two lanes through a double division (see ComputeGradientInfoSbAvx2: exact)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static System.Runtime.Intrinsics.Vector128<int> Ratio4(System.Runtime.Intrinsics.Vector128<int> num, System.Runtime.Intrinsics.Vector128<int> den)
+    {
+        var lo = System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Int32WithTruncation(System.Runtime.Intrinsics.X86.Sse2.Divide(
+            System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Double(num), System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Double(den)));
+        var nh = System.Runtime.Intrinsics.X86.Sse2.ShiftRightLogical128BitLane(num, 8);
+        var dh = System.Runtime.Intrinsics.X86.Sse2.ShiftRightLogical128BitLane(den, 8);
+        var hi = System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Int32WithTruncation(System.Runtime.Intrinsics.X86.Sse2.Divide(
+            System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Double(nh), System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Double(dh)));
+        return System.Runtime.Intrinsics.X86.Sse2.UnpackLow(lo.AsInt64(), hi.AsInt64()).AsInt32();
+    }
+
+    /// <summary><see cref="ComputeGradientInfoSbAvx2"/> in SSE4.1 (no AVX2): the same values.</summary>
+    private static void ComputeGradientInfoSbSse41(ReadOnlySpan<byte> src, int stride, int sbW, int visW, int visH, ushort[] absSum, sbyte[] bin, int baseOff)
+    {
+        ref byte s0 = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src);
+        ref int thr = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(HistBinThresholds);
+        ref ushort a0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(absSum);
+        ref sbyte b0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(bin);
+        for (int r = 1; r < visH - 1; ++r)
+        {
+            int o = r * stride;
+            int c = 1;
+            for (; c + 8 <= visW - 1; c += 8)
+            {
+                int p = o + c;
+                var um = L8(ref s0, p - stride - 1); var u0 = L8(ref s0, p - stride); var up = L8(ref s0, p - stride + 1);
+                var mm = L8(ref s0, p - 1); var mp = L8(ref s0, p + 1);
+                var dm = L8(ref s0, p + stride - 1); var d0 = L8(ref s0, p + stride); var dp = L8(ref s0, p + stride + 1);
+                var dx = (up + mp + mp + dp) - (um + mm + mm + dm);
+                var dy = (dm + d0 + d0 + dp) - (um + u0 + u0 + up);
+                int i = baseOff + r * sbW + c;
+                (System.Runtime.Intrinsics.Vector128.Abs(dx) + System.Runtime.Intrinsics.Vector128.Abs(dy)).AsUInt16()
+                    .StoreUnsafe(ref a0, (nuint)i);
+                var dxL = System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int32(dx);
+                var dxH = System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int32(System.Runtime.Intrinsics.X86.Sse2.ShiftRightLogical128BitLane(dx, 8));
+                var dyL = System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int32(dy);
+                var dyH = System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int32(System.Runtime.Intrinsics.X86.Sse2.ShiftRightLogical128BitLane(dy, 8));
+                var ratioL = Ratio4(System.Runtime.Intrinsics.Vector128.ShiftLeft(dyL, 16), dxL);
+                var ratioH = Ratio4(System.Runtime.Intrinsics.Vector128.ShiftLeft(dyH, 16), dxH);
+                var cntL = System.Runtime.Intrinsics.Vector128<int>.Zero;
+                var cntH = System.Runtime.Intrinsics.Vector128<int>.Zero;
+                for (int k = 0; k < HogBins; k++)
+                {
+                    var t = System.Runtime.Intrinsics.Vector128.Create(Unsafe.Add(ref thr, k));
+                    cntL -= System.Runtime.Intrinsics.Vector128.LessThan(t, ratioL);
+                    cntH -= System.Runtime.Intrinsics.Vector128.LessThan(t, ratioH);
+                }
+                var resL = System.Runtime.Intrinsics.Vector128.ConditionalSelect(System.Runtime.Intrinsics.Vector128.Equals(dxL, System.Runtime.Intrinsics.Vector128<int>.Zero),
+                    System.Runtime.Intrinsics.Vector128.Create(-1), cntL);
+                var resH = System.Runtime.Intrinsics.Vector128.ConditionalSelect(System.Runtime.Intrinsics.Vector128.Equals(dxH, System.Runtime.Intrinsics.Vector128<int>.Zero),
+                    System.Runtime.Intrinsics.Vector128.Create(-1), cntH);
+                var w = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(resL, resH);
                 Unsafe.WriteUnaligned(ref Unsafe.As<sbyte, byte>(ref Unsafe.Add(ref b0, i)),
                     System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(w, w).AsUInt64().ToScalar());
             }
