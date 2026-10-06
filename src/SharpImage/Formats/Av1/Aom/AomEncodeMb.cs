@@ -994,6 +994,51 @@ internal static partial class AomEncodeMb
             }
             return sse;
         }
+        if (!Avx2.IsSupported && Sse41.IsSupported && width > 0 && height > 0 && aOff >= 0 && bOff >= 0
+            && aOff + (long)(height - 1) * aStride + width <= a.Length && bOff + (long)(height - 1) * bStride + width <= b.Length)
+        {
+            // SSE4.1: the same exact integer sums, int32 lanes flushed every 8 rows
+            ref byte a0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(a), aOff);
+            ref byte b0 = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(b), bOff);
+            var acc = Vector128<int>.Zero;
+            for (int y = 0; y < height; y++)
+            {
+                ref byte ar = ref Unsafe.Add(ref a0, y * aStride);
+                ref byte br = ref Unsafe.Add(ref b0, y * bStride);
+                int x = 0;
+                for (; x + 16 <= width; x += 16)
+                {
+                    var va = Vector128.LoadUnsafe(ref ar, (nuint)x);
+                    var vb = Vector128.LoadUnsafe(ref br, (nuint)x);
+                    var dl = Sse2.Subtract(Sse2.UnpackLow(va, Vector128<byte>.Zero).AsInt16(), Sse2.UnpackLow(vb, Vector128<byte>.Zero).AsInt16());
+                    var dh = Sse2.Subtract(Sse2.UnpackHigh(va, Vector128<byte>.Zero).AsInt16(), Sse2.UnpackHigh(vb, Vector128<byte>.Zero).AsInt16());
+                    acc = Sse2.Add(acc, Sse2.Add(Sse2.MultiplyAddAdjacent(dl, dl), Sse2.MultiplyAddAdjacent(dh, dh)));
+                }
+                for (; x + 8 <= width; x += 8)
+                {
+                    var d = Sse2.Subtract(Sse41.ConvertToVector128Int16(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ar, x))).AsByte()),
+                        Sse41.ConvertToVector128Int16(Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref br, x))).AsByte()));
+                    acc = Sse2.Add(acc, Sse2.MultiplyAddAdjacent(d, d));
+                }
+                for (; x + 4 <= width; x += 4)
+                {
+                    var d = Sse2.Subtract(Sse41.ConvertToVector128Int16(Vector128.CreateScalar(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref ar, x))).AsByte()),
+                        Sse41.ConvertToVector128Int16(Vector128.CreateScalar(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref br, x))).AsByte()));
+                    acc = Sse2.Add(acc, Sse2.MultiplyAddAdjacent(d, d));
+                }
+                for (; x < width; x++)
+                {
+                    int d = Unsafe.Add(ref ar, x) - Unsafe.Add(ref br, x);
+                    sse += d * d;
+                }
+                if ((y & 7) == 7 || y == height - 1)
+                {
+                    sse += (uint)Vector128.Sum(acc.AsUInt32());
+                    acc = Vector128<int>.Zero;
+                }
+            }
+            return sse;
+        }
         for (int y = 0; y < height; y++)
             for (int x = 0; x < width; x++) { int d = a[aOff + y * aStride + x] - b[bOff + y * bStride + x]; sse += d * d; }
         return sse;

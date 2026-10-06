@@ -17,6 +17,7 @@ internal static partial class AomRestoration
         in AomTaps8 hf, in AomTaps8 vf, int w, int h, ushort[] temp)
     {
         if (Avx2.IsSupported && (w & 7) == 0) WienerConvolveAddSrcAvx2(src, s0, srcStride, dst, d0, dstStride, hf, vf, w, h);
+        else if (Sse41.IsSupported && (w & 7) == 0) WienerConvolveAddSrcSse(src, s0, srcStride, dst, d0, dstStride, hf, vf, w, h);
         else WienerConvolveAddSrcC(src, s0, srcStride, dst, d0, dstStride, hf, vf, w, h, temp);
     }
 
@@ -58,6 +59,99 @@ internal static partial class AomRestoration
         var res3 = Avx2.MultiplyAddAdjacent(s3, c3);
         return Avx2.Add(Avx2.Add(res0, res1), Avx2.Add(res2, res3));
     }
+
+    /// <summary><see cref="WienerConvolveAddSrcAvx2"/> without AVX2: each 128-bit lane of the AVX2 kernel (one row of the
+    /// horizontal pass, one output row of the vertical pass) as its own SSSE3 / SSE4.1 register, the same operations per
+    /// lane, so the output (and the intermediate block, including the zero-input row past an odd height) is the same.</summary>
+    [SkipLocalsInit]
+    public static unsafe void WienerConvolveAddSrcSse(byte[] src, int s0, int srcStride, byte[] dst, int d0, int dstStride,
+        in AomTaps8 filterX, in AomTaps8 filterY, int w, int h)
+    {
+        const int bd = 8, filterBits = 7, round0 = 3, round1 = 11, subpelTaps = 8, maxSbSize = 128;
+        short* imBlock = stackalloc short[(maxSbSize + subpelTaps) * 8 + 16];
+        int imH = h + subpelTaps - 2;
+        const int imStride = 8;
+        new Span<short>(imBlock + imH * imStride, maxSbSize / 2).Clear();
+        const int centerTap = (subpelTaps - 1) / 2;
+
+        var filt0 = Ld256(Filt1Global).GetLower();
+        var filt1 = Ld256(Filt2Global).GetLower();
+        var filt2 = Ld256(Filt3Global).GetLower();
+        var filt3 = Ld256(Filt4Global).GetLower();
+        var filtCenter = Ld256(FiltCenterGlobal).GetLower();
+
+        var filterCoeffsX = Vector128.Create(filterX[0], filterX[1], filterX[2], filterX[3], filterX[4], filterX[5], filterX[6], filterX[7]).AsByte();
+        var coeffsH0 = Ssse3.Shuffle(filterCoeffsX, Vector128.Create((ushort)0x0200).AsByte()).AsSByte();
+        var coeffsH1 = Ssse3.Shuffle(filterCoeffsX, Vector128.Create((ushort)0x0604).AsByte()).AsSByte();
+        var coeffsH2 = Ssse3.Shuffle(filterCoeffsX, Vector128.Create((ushort)0x0a08).AsByte()).AsSByte();
+        var coeffsH3 = Ssse3.Shuffle(filterCoeffsX, Vector128.Create((ushort)0x0e0c).AsByte()).AsSByte();
+
+        var roundConstH = Vector128.Create((short)(1 << (round0 - 1)));
+        var roundConstHorz = Vector128.Create((short)(1 << (bd + filterBits - round0 - 1)));
+        var clampLow = Vector128<short>.Zero;
+        var clampHigh = Vector128.Create((short)((1 << (bd + 1 + filterBits - round0)) - 1));
+
+        var filterCoeffsY = Vector128.Create(filterY[0], filterY[1], filterY[2], (short)(filterY[3] + (1 << filterBits)), filterY[4],
+            filterY[5], filterY[6], filterY[7]).AsInt32();
+        var coeffsV0 = Sse2.Shuffle(filterCoeffsY, 0x00).AsInt16();
+        var coeffsV1 = Sse2.Shuffle(filterCoeffsY, 0x55).AsInt16();
+        var coeffsV2 = Sse2.Shuffle(filterCoeffsY, 0xaa).AsInt16();
+        var coeffsV3 = Sse2.Shuffle(filterCoeffsY, 0xff).AsInt16();
+
+        var roundConstV = Vector128.Create((1 << (round1 - 1)) - (1 << (bd + round1 - 1)));
+        int imHEven = (imH + 1) & ~1;   // the AVX2 kernel writes row pairs: the odd last pair's second row from zero input
+
+        fixed (byte* srcBase = src)
+        fixed (byte* dstBase = dst)
+        {
+            byte* srcPtr = srcBase + s0 - centerTap * srcStride - centerTap;
+            byte* dstPtr = dstBase + d0;
+            for (int j = 0; j < w; j += 8)
+            {
+                for (int i = 0; i < imHEven; i++)
+                {
+                    var data = i < imH ? Sse2.LoadVector128(&srcPtr[i * srcStride + j]) : Vector128<byte>.Zero;
+                    var res01 = Ssse3.MultiplyAddAdjacent(Ssse3.Shuffle(data, filt0), coeffsH0);
+                    var res23 = Ssse3.MultiplyAddAdjacent(Ssse3.Shuffle(data, filt1), coeffsH1);
+                    var res45 = Ssse3.MultiplyAddAdjacent(Ssse3.Shuffle(data, filt2), coeffsH2);
+                    var res67 = Ssse3.MultiplyAddAdjacent(Ssse3.Shuffle(data, filt3), coeffsH3);
+                    var res = Sse2.Add(Sse2.Add(res01, res45), Sse2.Add(res23, res67));
+                    res = Sse2.ShiftRightArithmetic(Sse2.Add(res, roundConstH), round0);
+                    var data0 = Sse2.ShiftLeftLogical(Ssse3.Shuffle(data, filtCenter).AsInt16(), filterBits - round0);
+                    res = Sse2.Add(Sse2.Add(res, data0), roundConstHorz);
+                    Sse2.Store(imBlock + i * imStride, Sse2.Min(Sse2.Max(res, clampLow), clampHigh));
+                }
+
+                for (int i = 0; i < h; i++)
+                {
+                    short* data = &imBlock[i * imStride];
+                    var r0 = Sse2.LoadVector128(data);
+                    var r1 = Sse2.LoadVector128(data + imStride);
+                    var r2 = Sse2.LoadVector128(data + 2 * imStride);
+                    var r3 = Sse2.LoadVector128(data + 3 * imStride);
+                    var r4 = Sse2.LoadVector128(data + 4 * imStride);
+                    var r5 = Sse2.LoadVector128(data + 5 * imStride);
+                    var r6 = Sse2.LoadVector128(data + 6 * imStride);
+                    var r7 = Sse2.LoadVector128(data + 7 * imStride);
+                    var resA = ConvolveSse(Sse2.UnpackLow(r0, r1), Sse2.UnpackLow(r2, r3), Sse2.UnpackLow(r4, r5), Sse2.UnpackLow(r6, r7),
+                        coeffsV0, coeffsV1, coeffsV2, coeffsV3);
+                    var resB = ConvolveSse(Sse2.UnpackHigh(r0, r1), Sse2.UnpackHigh(r2, r3), Sse2.UnpackHigh(r4, r5), Sse2.UnpackHigh(r6, r7),
+                        coeffsV0, coeffsV1, coeffsV2, coeffsV3);
+                    var ra = Sse2.ShiftRightArithmetic(Sse2.Add(resA, roundConstV), round1);
+                    var rb = Sse2.ShiftRightArithmetic(Sse2.Add(resB, roundConstV), round1);
+                    // the pair loop packs signed; the odd last row (h - i == 1 after the pairs) packs unsigned 32 -> 16
+                    var res16 = (h & 1) != 0 && i == h - 1 ? Sse41.PackUnsignedSaturate(ra, rb).AsInt16() : Sse2.PackSignedSaturate(ra, rb);
+                    *(ulong*)&dstPtr[i * dstStride + j] = Sse2.PackUnsignedSaturate(res16, res16).AsUInt64().ToScalar();
+                }
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<int> ConvolveSse(Vector128<short> s0, Vector128<short> s1, Vector128<short> s2, Vector128<short> s3,
+        Vector128<short> c0, Vector128<short> c1, Vector128<short> c2, Vector128<short> c3)
+        => Sse2.Add(Sse2.Add(Sse2.MultiplyAddAdjacent(s0, c0), Sse2.MultiplyAddAdjacent(s1, c1)),
+            Sse2.Add(Sse2.MultiplyAddAdjacent(s2, c2), Sse2.MultiplyAddAdjacent(s3, c3)));
 
     /// <summary>av1_wiener_convolve_add_src_avx2 (8-bit, round_0 = 3, round_1 = 11).</summary>
     [SkipLocalsInit]

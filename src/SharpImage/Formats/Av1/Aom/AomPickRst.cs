@@ -224,6 +224,9 @@ internal sealed partial class AomPickRst
         if (Avx2.IsSupported && inBounds)
             return LowbdPixelProjErrorAvx2(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride,
                 flt1, f1, flt1Stride, xq0, xq1, ep);
+        if (Sse41.IsSupported && inBounds)
+            return LowbdPixelProjErrorSse41(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride,
+                flt1, f1, flt1Stride, xq0, xq1, ep);
         return LowbdPixelProjErrorC(src8, s0, width, height, srcStride, dat8, d0, datStride, flt0, f0, flt0Stride, flt1,
             f1, flt1Stride, xq0, xq1, ep);
     }
@@ -352,6 +355,131 @@ internal sealed partial class AomPickRst
             }
         }
         err += sum64.GetElement(0) + sum64.GetElement(1) + sum64.GetElement(2) + sum64.GetElement(3);
+        return err;
+    }
+
+    /// <summary><see cref="LowbdPixelProjErrorAvx2"/> in SSE4.1 (no AVX2): each 16-pixel step as two 8-pixel halves whose
+    /// int32 accumulators are the AVX2 register's low and high lanes, so every lane sum (and wrap) is the same.</summary>
+    private static unsafe long LowbdPixelProjErrorSse41(byte[] src8, int s0, int width, int height, int srcStride,
+        byte[] dat8, int d0, int datStride, int[] flt0Arr, int f0, int flt0Stride, int[] flt1Arr, int f1, int flt1Stride,
+        int xq0, int xq1, int ep)
+    {
+        const int shift = SgrprojRstBits + SgrprojPrjBits;
+        var rounding = Vector128.Create(1 << (shift - 1));
+        var sum64 = Vector128<long>.Zero;
+        long err = 0;
+        int i, j, k;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector128<short> PairSet(int a, int b) => Vector128.Create((int)((uint)(ushort)a | ((uint)(ushort)b << 16))).AsInt16();
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector128<short> Flt8(int* f) => Sse2.PackSignedSaturate(Sse2.LoadVector128(f), Sse2.LoadVector128(f + 4));
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector128<short> Px8(byte* p) => Sse41.ConvertToVector128Int16(p);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector128<long> Widen(Vector128<long> acc, Vector128<int> v) =>
+            Sse2.Add(Sse2.Add(acc, Sse41.ConvertToVector128Int64(v)), Sse41.ConvertToVector128Int64(Sse2.ShiftRightLogical128BitLane(v, 8)));
+        fixed (byte* srcBase = src8)
+        fixed (byte* datBase = dat8)
+        fixed (int* flt0Base = flt0Arr)
+        fixed (int* flt1Base = flt1Arr)
+        {
+            byte* src = srcBase + s0;
+            byte* dat = datBase + d0;
+            int* flt0 = flt0Base + f0;
+            int* flt1 = flt1Base + f1;
+            bool r0 = SgrR0[ep] > 0, r1 = SgrR1[ep] > 0;
+            if (r0 && r1)
+            {
+                var xqCoeff = PairSet(xq0, xq1);
+                for (i = 0; i < height; ++i)
+                {
+                    var lo = Vector128<int>.Zero; var hi = Vector128<int>.Zero;
+                    for (j = 0; j <= width - 16; j += 16)
+                        for (int h = 0; h < 16; h += 8)
+                        {
+                            var dd0 = Px8(dat + j + h);
+                            var ss0 = Px8(src + j + h);
+                            var u0 = Sse2.ShiftLeftLogical(dd0, SgrprojRstBits);
+                            var a = Sse2.Subtract(Flt8(flt0 + j + h), u0);
+                            var b = Sse2.Subtract(Flt8(flt1 + j + h), u0);
+                            var vr0 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(xqCoeff, Sse2.UnpackLow(a, b)), rounding), shift);
+                            var vr1 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(xqCoeff, Sse2.UnpackHigh(a, b)), rounding), shift);
+                            var e0 = Sse2.Subtract(Sse2.Add(Sse2.PackSignedSaturate(vr0, vr1), dd0), ss0);
+                            if (h == 0) lo = Sse2.Add(lo, Sse2.MultiplyAddAdjacent(e0, e0));
+                            else hi = Sse2.Add(hi, Sse2.MultiplyAddAdjacent(e0, e0));
+                        }
+                    for (k = j; k < width; ++k)
+                    {
+                        int u = dat[k] << SgrprojRstBits;
+                        int v = xq0 * (flt0[k] - u) + xq1 * (flt1[k] - u);
+                        int e = ((v + (1 << (shift - 1))) >> shift) + dat[k] - src[k];
+                        err += (long)e * e;
+                    }
+                    dat += datStride;
+                    src += srcStride;
+                    flt0 += flt0Stride;
+                    flt1 += flt1Stride;
+                    sum64 = Widen(Widen(sum64, lo), hi);
+                }
+            }
+            else if (r0 || r1)
+            {
+                int xqActive = r0 ? xq0 : xq1;
+                var xqCoeff = PairSet(xqActive, -xqActive * (1 << SgrprojRstBits));
+                int* flt = r0 ? flt0 : flt1;
+                int fltStride = r0 ? flt0Stride : flt1Stride;
+                for (i = 0; i < height; ++i)
+                {
+                    var lo = Vector128<int>.Zero; var hi = Vector128<int>.Zero;
+                    for (j = 0; j <= width - 16; j += 16)
+                        for (int h = 0; h < 16; h += 8)
+                        {
+                            var dd0 = Px8(dat + j + h);
+                            var ss0 = Px8(src + j + h);
+                            var f16 = Flt8(flt + j + h);
+                            var vr0 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(xqCoeff, Sse2.UnpackLow(f16, dd0)), rounding), shift);
+                            var vr1 = Sse2.ShiftRightArithmetic(Sse2.Add(Sse2.MultiplyAddAdjacent(xqCoeff, Sse2.UnpackHigh(f16, dd0)), rounding), shift);
+                            var e0 = Sse2.Subtract(Sse2.Add(Sse2.PackSignedSaturate(vr0, vr1), dd0), ss0);
+                            if (h == 0) lo = Sse2.Add(lo, Sse2.MultiplyAddAdjacent(e0, e0));
+                            else hi = Sse2.Add(hi, Sse2.MultiplyAddAdjacent(e0, e0));
+                        }
+                    for (k = j; k < width; ++k)
+                    {
+                        int u = dat[k] << SgrprojRstBits;
+                        int v = xqActive * (flt[k] - u);
+                        int e = ((v + (1 << (shift - 1))) >> shift) + dat[k] - src[k];
+                        err += (long)e * e;
+                    }
+                    dat += datStride;
+                    src += srcStride;
+                    flt += fltStride;
+                    sum64 = Widen(Widen(sum64, lo), hi);
+                }
+            }
+            else
+            {
+                var lo = Vector128<int>.Zero; var hi = Vector128<int>.Zero;
+                for (i = 0; i < height; ++i)
+                {
+                    for (j = 0; j <= width - 16; j += 16)
+                    {
+                        var d0v = Sse2.Subtract(Px8(dat + j), Px8(src + j));
+                        var d1v = Sse2.Subtract(Px8(dat + j + 8), Px8(src + j + 8));
+                        lo = Sse2.Add(lo, Sse2.MultiplyAddAdjacent(d0v, d0v));
+                        hi = Sse2.Add(hi, Sse2.MultiplyAddAdjacent(d1v, d1v));
+                    }
+                    for (k = j; k < width; ++k)
+                    {
+                        int e = dat[k] - src[k];
+                        err += (long)e * e;
+                    }
+                    dat += datStride;
+                    src += srcStride;
+                }
+                sum64 = Widen(Widen(sum64, lo), hi);
+            }
+        }
+        err += sum64.GetElement(0) + sum64.GetElement(1);
         return err;
     }
 
@@ -830,7 +958,7 @@ internal sealed partial class AomPickRst
         byte avg = FindAverage(dgd.Buf, dgd, hStart, hEnd, vStart, vEnd);
         Array.Clear(M, 0, wienerWin2);
         Array.Clear(H, 0, wienerWin2 * wienerWin2);
-        if (Avx2.IsSupported && hEnd - hStart <= 1024)
+        if (Sse2.IsSupported && hEnd - hStart <= 1024)
         {
             ComputeStatsAvx2(wienerWin, dgd, src, hStart, hEnd, vStart, vEnd, M, H, useDownsampledWienerStats, avg);
             for (int k = 0; k < wienerWin2; ++k)
@@ -927,7 +1055,7 @@ internal sealed partial class AomPickRst
             {
                 int c = 0;
                 for (; c + 16 <= n; c += 16)
-                    (Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref db[o + c])) - avgV).StoreUnsafe(ref dArr[row + c]);
+                    SubAvg16(ref db[o + c], ref dArr[row + c], avgV);
                 for (; c < n; c++) dArr[row + c] = (short)(db[o + c] - avg);
                 Array.Clear(dArr, row + n, dStride - n);
             }
@@ -937,12 +1065,12 @@ internal sealed partial class AomPickRst
         {
             int o = src.At(hStart, vStart + r), row = r * sStride, c = 0;
             for (; c + 16 <= width; c += 16)
-                (Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(ref sb[o + c])) - avgV).StoreUnsafe(ref sArr[row + c]);
+                SubAvg16(ref sb[o + c], ref sArr[row + c], avgV);
             for (; c < width; c++) sArr[row + c] = (short)(sb[o + c] - avg);
             Array.Clear(sArr, row + width, sStride - width);
         }
         int wdMul16 = width & ~15, beyond = width - wdMul16;
-        var mask = Avx2.CompareGreaterThan(Vector256.Create((short)beyond),
+        var mask = Vector256.GreaterThan(Vector256.Create((short)beyond),
             Vector256.Create((short)0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
         bool ds = useDownsampledWienerStats != 0;
         Span<Vector256<int>> accH = stackalloc Vector256<int>[7];
@@ -985,6 +1113,17 @@ internal sealed partial class AomPickRst
 
     [ThreadStatic] private static short[]? _statsD, _statsS;
 
+    /// <summary>16 samples minus the average as int16 (sub_avg_block_avx2's step).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void SubAvg16(ref byte src, ref short dst, Vector256<short> avgV)
+    {
+        var v = Vector128.LoadUnsafe(ref src);
+        if (Avx2.IsSupported) { (Avx2.ConvertToVector256Int16(v) - avgV).StoreUnsafe(ref dst); return; }
+        var a = avgV.GetLower();
+        Sse2.Subtract(Sse2.UnpackLow(v, Vector128<byte>.Zero).AsInt16(), a).StoreUnsafe(ref dst);
+        Sse2.Subtract(Sse2.UnpackHigh(v, Vector128<byte>.Zero).AsInt16(), a).StoreUnsafe(ref dst, 8);
+    }
+
     /// <summary>hadd_four_32_to_64_avx2's value for one accumulator: the two 4-lane int32 sums (wrapping), added in int64.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static long SumHadd4(Vector256<int> v)
@@ -1000,7 +1139,12 @@ internal sealed partial class AomPickRst
     /// <summary>convert_and_add + add_64bit_lvl: the int64 sum of the 8 lanes.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static long SumExact(Vector256<int> v)
-        => Vector256.Sum(Avx2.ConvertToVector256Int64(v.GetLower()) + Avx2.ConvertToVector256Int64(v.GetUpper()));
+    {
+        if (Avx2.IsSupported) return Vector256.Sum(Avx2.ConvertToVector256Int64(v.GetLower()) + Avx2.ConvertToVector256Int64(v.GetUpper()));
+        long t = 0;
+        for (int i = 0; i < 8; i++) t += v.GetElement(i);
+        return t;
+    }
 
     /// <summary>One INIT_H_VALUES / INIT_MH_VALUES sweep over the unit: accH[g] += madd(cur * df, window row g) for the
     /// win window rows at w (and, with s, accM[g] += madd(src * df, window row g)).</summary>
@@ -1008,6 +1152,21 @@ internal sealed partial class AomPickRst
         int beyond, Vector256<short> mask, int vStart, int vEnd, bool ds, Span<Vector256<int>> accH,
         Span<Vector256<int>> accM)
     {
+        if (!Avx2.IsSupported)
+        {
+            // SSE2: the low and high 8 columns of every 16 in separate sweeps, their accumulators being the AVX2
+            // register's lanes 0-3 and 4-7 (every lane sum, wraps included, the same)
+            Span<Vector128<int>> lo = stackalloc Vector128<int>[14];
+            Span<Vector128<int>> hi = stackalloc Vector128<int>[14];
+            StatsPassSse(win, cur, w, s, dStride, sStride, wdMul16, beyond, mask.GetLower(), vStart, vEnd, ds, lo);
+            StatsPassSse(win, cur + 8, w + 8, s == null ? null : s + 8, dStride, sStride, wdMul16, beyond, mask.GetUpper(), vStart, vEnd, ds, hi);
+            for (int g = 0; g < win; g++)
+            {
+                accH[g] = Vector256.Create(lo[g], hi[g]);
+                if (s != null) accM[g] = Vector256.Create(lo[7 + g], hi[7 + g]);
+            }
+            return;
+        }
         if (win == 7)
         {
             if (s == null) StatsPassH7(cur, w, dStride, wdMul16, beyond, mask, vStart, vEnd, ds, accH);
@@ -1155,6 +1314,71 @@ internal sealed partial class AomPickRst
         } while (procHt < vEnd);
         accH[0] = h0; accH[1] = h1; accH[2] = h2; accH[3] = h3; accH[4] = h4; accH[5] = h5; accH[6] = h6;
         accM[0] = m0; accM[1] = m1; accM[2] = m2; accM[3] = m3; accM[4] = m4; accM[5] = m5; accM[6] = m6;
+    }
+
+    /// <summary>One 8-column half of a <see cref="StatsPass"/> sweep in SSE2: acc[g] (window row g) += madd(cur * df, row g)
+    /// and, with s, acc[7 + g] += madd(src * df, row g), over every 16-column chunk of the unit (the last masked).</summary>
+    private static unsafe void StatsPassSse(int win, short* cur, short* w, short* s, int dStride, int sStride,
+        int wdMul16, int beyond, Vector128<short> mask, int vStart, int vEnd, bool ds, Span<Vector128<int>> acc)
+    {
+        Vector128<int> h0 = default, h1 = default, h2 = default, h3 = default, h4 = default, h5 = default, h6 = default;
+        Vector128<int> m0 = default, m1 = default, m2 = default, m3 = default, m4 = default, m5 = default, m6 = default;
+        nint o1 = dStride, o2 = 2 * (nint)dStride, o3 = 3 * (nint)dStride, o4 = 4 * (nint)dStride, o5 = 5 * (nint)dStride, o6 = 6 * (nint)dStride;
+        bool w7 = win == 7, withM = s != null;
+        int procHt = vStart, df = ds ? 4 : 1;
+        int xEnd = wdMul16 + (beyond != 0 ? 16 : 0);
+        do
+        {
+            if (ds && vEnd - procHt < 4) df = vEnd - procHt;
+            var dfv = Vector128.Create((short)df);
+            for (int x = 0; x < xEnd; x += 16)
+            {
+                var cv = Sse2.LoadVector128(cur + x);
+                if (x >= wdMul16) cv = Sse2.And(cv, mask);
+                var c = Sse2.MultiplyLow(cv, dfv);
+                short* p = w + x;
+                var w0 = Sse2.LoadVector128(p);
+                var w1 = Sse2.LoadVector128(p + o1);
+                var w2 = Sse2.LoadVector128(p + o2);
+                var w3 = Sse2.LoadVector128(p + o3);
+                var w4 = Sse2.LoadVector128(p + o4);
+                h0 = Sse2.Add(h0, Sse2.MultiplyAddAdjacent(c, w0));
+                h1 = Sse2.Add(h1, Sse2.MultiplyAddAdjacent(c, w1));
+                h2 = Sse2.Add(h2, Sse2.MultiplyAddAdjacent(c, w2));
+                h3 = Sse2.Add(h3, Sse2.MultiplyAddAdjacent(c, w3));
+                h4 = Sse2.Add(h4, Sse2.MultiplyAddAdjacent(c, w4));
+                Vector128<short> w5 = default, w6 = default;
+                if (w7)
+                {
+                    w5 = Sse2.LoadVector128(p + o5);
+                    w6 = Sse2.LoadVector128(p + o6);
+                    h5 = Sse2.Add(h5, Sse2.MultiplyAddAdjacent(c, w5));
+                    h6 = Sse2.Add(h6, Sse2.MultiplyAddAdjacent(c, w6));
+                }
+                if (withM)
+                {
+                    var sv = Sse2.LoadVector128(s + x);
+                    if (x >= wdMul16) sv = Sse2.And(sv, mask);
+                    var sm = Sse2.MultiplyLow(sv, dfv);
+                    m0 = Sse2.Add(m0, Sse2.MultiplyAddAdjacent(sm, w0));
+                    m1 = Sse2.Add(m1, Sse2.MultiplyAddAdjacent(sm, w1));
+                    m2 = Sse2.Add(m2, Sse2.MultiplyAddAdjacent(sm, w2));
+                    m3 = Sse2.Add(m3, Sse2.MultiplyAddAdjacent(sm, w3));
+                    m4 = Sse2.Add(m4, Sse2.MultiplyAddAdjacent(sm, w4));
+                    if (w7)
+                    {
+                        m5 = Sse2.Add(m5, Sse2.MultiplyAddAdjacent(sm, w5));
+                        m6 = Sse2.Add(m6, Sse2.MultiplyAddAdjacent(sm, w6));
+                    }
+                }
+            }
+            procHt += df;
+            cur += df * dStride;
+            w += df * dStride;
+            if (withM) s += df * sStride;
+        } while (procHt < vEnd);
+        acc[0] = h0; acc[1] = h1; acc[2] = h2; acc[3] = h3; acc[4] = h4; acc[5] = h5; acc[6] = h6;
+        acc[7] = m0; acc[8] = m1; acc[9] = m2; acc[10] = m3; acc[11] = m4; acc[12] = m5; acc[13] = m6;
     }
 
     private static int WrapIndex(int i, int wienerWin)
