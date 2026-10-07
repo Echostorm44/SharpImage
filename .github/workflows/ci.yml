@@ -35,8 +35,9 @@ jobs:
       - name: Build
         run: dotnet build -c ${{ env.CONFIGURATION }} --no-restore
 
-      # libaom twin libraries for the differential tests (AomInvTxfmTwinTests, AomSearchPerfTwinTests). libaom is
+      # libaom twin libraries for the differential tests (tests/SharpImage.Tests/Formats/Aom*TwinTests). libaom is
       # pinned in build.sh, so its static build is cached on that script; the small twin libraries are always rebuilt.
+      # SHARPIMAGE_AOMTWIN_REQUIRED=1 turns a missing twin into a failure instead of a skip.
       - name: Cache libaom (twin tests)
         id: aom-cache
         uses: actions/cache@v4
@@ -51,8 +52,8 @@ jobs:
       - name: Build libaom twins
         run: |
           sh tests/native/aomtwin/build.sh "$RUNNER_TEMP/aomtwin"
-          echo "SHARPIMAGE_AOMTWIN_INV=$RUNNER_TEMP/aomtwin/aomtwin_inv.so" >> "$GITHUB_ENV"
-          echo "SHARPIMAGE_AOMTWIN_SP=$RUNNER_TEMP/aomtwin/aomtwin_sp.so" >> "$GITHUB_ENV"
+          cat "$RUNNER_TEMP/aomtwin/twins.env" >> "$GITHUB_ENV"
+          echo "SHARPIMAGE_AOMTWIN_REQUIRED=1" >> "$GITHUB_ENV"
 
       - name: Run TUnit tests
         run: dotnet run --project tests/SharpImage.Tests -c ${{ env.CONFIGURATION }} --no-build

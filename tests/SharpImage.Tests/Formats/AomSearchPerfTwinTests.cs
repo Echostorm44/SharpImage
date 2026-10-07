@@ -7,21 +7,24 @@ namespace SharpImage.Tests.Formats;
 
 // Twins of the search kernels ported for speed (forward transform, quantizers, distortion sums) against libaom 3.14.1's
 // RTCD-dispatched kernels through aomtwin_sp (tests/native/aomtwin: twin_sp.c, build.sh; CI builds it). Point
-// SHARPIMAGE_AOMTWIN_SP at aomtwin_sp.dll / .so; without it the tests fail. SHARPIMAGE_AOMTWIN_SP_BENCH=1 also prints ns per
+// SHARPIMAGE_AOMTWIN_SP at aomtwin_sp.dll / .so; without it the tests report Skipped. SHARPIMAGE_AOMTWIN_SP_BENCH=1 also prints ns per
 // call of both sides on the same inputs.
 [NotInParallel]
 public sealed class AomSearchPerfTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_SP");
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN_SP";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
     private static readonly bool Bench = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_SP_BENCH") == "1";
     private static bool loaded;
 
     private static void Load()
     {
-        if (loaded) return;
-        if (DllPath == null) throw new InvalidOperationException("SHARPIMAGE_AOMTWIN_SP is not set (path of aomtwin_sp.dll / .so from tests/native/aomtwin/build.sh)");
-        if (!File.Exists(DllPath)) throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_SP is set but the DLL does not exist", DllPath);
-        AomTwinNative.Register("aomtwin_sp", DllPath);
+        AomTwinNative.SkipUnless(DllPath != null, EnvVar);
+        if (loaded)
+        {
+            return;
+        }
+        AomTwinNative.Register("aomtwin_sp", DllPath!);
         Native.twin_init();
         loaded = true;
     }
@@ -227,7 +230,10 @@ public sealed class AomSearchPerfTwinTests
     [Test]
     public async Task CnnPartition_Bench()
     {
-        if (!Bench) return;
+        if (!Bench)
+        {
+            Skip.Test("timing only: set SHARPIMAGE_AOMTWIN_SP_BENCH=1");
+        }
         var rng = new Random(9);
         var src = new byte[80 * 70];
         for (int i = 0; i < src.Length; i++) src[i] = (byte)(128 + rng.Next(-40, 41));
@@ -255,7 +261,10 @@ public sealed class AomSearchPerfTwinTests
     [Test]
     public async Task QmQuantizers_Vector_MatchScalar()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            Skip.Test("compares the AVX2 kernels with the scalar ones: this CPU has no AVX2");
+        }
         var rng = new Random(31);
         var quants = new AomQuants(8, 0, 0, 0, 0, 0, 0);
         int cases = 0, bad = 0;
@@ -301,7 +310,10 @@ public sealed class AomSearchPerfTwinTests
     [Test]
     public async Task HbdQuantizers_Vector_MatchScalar()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            Skip.Test("compares the AVX2 kernels with the scalar ones: this CPU has no AVX2");
+        }
         var rng = new Random(37);
         int cases = 0, bad = 0;
         foreach (int bd in new[] { 10, 12 })
@@ -342,7 +354,10 @@ public sealed class AomSearchPerfTwinTests
     [Test]
     public async Task HbdComputeStats_Vector_MatchScalar()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            Skip.Test("compares the AVX2 kernels with the scalar ones: this CPU has no AVX2");
+        }
         var rng = new Random(41);
         int cases = 0, bad = 0;
         foreach (int bd in new[] { 10, 12 })
@@ -409,7 +424,10 @@ public sealed class AomSearchPerfTwinTests
     [Test]
     public async Task HbdQmQuantizers_Vector_MatchScalar()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // the AVX2 kernels themselves: nothing to compare
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            Skip.Test("compares the AVX2 kernels with the scalar ones: this CPU has no AVX2");
+        }
         var rng = new Random(47);
         int cases = 0, bad = 0;
         foreach (int bd in new[] { 10, 12 })

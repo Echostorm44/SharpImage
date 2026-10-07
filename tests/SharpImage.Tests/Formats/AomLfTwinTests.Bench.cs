@@ -29,7 +29,11 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task Bench_Kernels()
     {
-        if (!Available || !Bench) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
+        if (!Bench)
+        {
+            Skip.Test("timing only: set SHARPIMAGE_AOMTWIN_BENCH=1");
+        }
         var rng = new Random(1);
         const int w = 64, h = 64;
         var dgd = new AomYv12Plane(w, h, w, h, 16);

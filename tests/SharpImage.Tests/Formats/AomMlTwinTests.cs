@@ -5,16 +5,22 @@ namespace SharpImage.Tests.Formats;
 
 // Twins of the libaom ML port (src/SharpImage/Formats/Av1/Aom/AomMl*.cs, AomMlModels.cs) against libaom 3.14.1's own
 // functions through aomtwin_ml.dll (built against libaom.a, run-time dispatch initialised, so the AVX2 / SSE3 kernels
-// the encoder uses are the ones compared; see scratchpad aomtwin_ml/). Every float is compared bit for bit.
-// Opt-in: point SHARPIMAGE_AOMTWIN_ML at aomtwin_ml.dll; without it the tests pass without checking.
+// the encoder uses are the ones compared; tests/native/aomtwin). Every float is compared bit for bit.
+// Opt-in: point SHARPIMAGE_AOMTWIN_ML at aomtwin_ml.dll; without it the tests report Skipped.
 // SHARPIMAGE_AOMTWIN_ML_EXHAUSTIVE=1 also runs expf over every float in [-10, 0], log1pf over every non-negative float
 // and the breakout threshold score over every float in (0, 1).
 [NotInParallel]
 public sealed class AomMlTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_ML");
-    private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
-        ? Load() : throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_ML is set but the DLL does not exist", DllPath));
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN_ML";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
+    private static readonly bool Available = DllPath != null && Load();
+
+    // libaom's reference here is its mingw-w64 build (avifenc.exe), whose expf is msvcrt's (float)exp((double)x) and whose
+    // log1pf is mingw's x87 code under control word 0x37F. A twin built anywhere else links that platform's libm (glibc's
+    // expf / log1pf / logf round differently), so these comparisons are only meaningful against a Windows mingw-w64 twin.
+    private const string MingwLibm = "needs the mingw-w64 (Windows) libaom twin: the expected values come from msvcrt exp and mingw x87 log1pf, "
+        + "which a twin built on another OS replaces with its own libm";
 
     private static bool Load()
     {
@@ -139,7 +145,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task Models_MatchLibaomBitExactly()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         int n = Native.twin_num_cfgs();
         await Assert.That(AomMlModels.All.Length).IsEqualTo(n);
         string? bad = null;
@@ -170,7 +176,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task NnPredict_AllModels_RandomFeatures()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(11);
         string? bad = null;
         for (int id = 0; id < AomMlModels.All.Length && bad == null; id++)
@@ -193,7 +199,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task NnPredict_EveryLayerShape()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(12);
         string? bad = null;
         for (int it = 0; it < 20000 && bad == null; it++)
@@ -228,7 +234,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task NnOutputPrecReduce_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(13);
         var v = new float[1000];
         for (int i = 0; i < v.Length; i++)
@@ -244,7 +250,8 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task NnSoftmax_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
+        AomTwinNative.SkipUnlessWindows(MingwLibm);
         var rng = new Random(14);
         string? bad = null;
         for (int it = 0; it < 100000 && bad == null; it++)
@@ -264,7 +271,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task NnFastSoftmax16_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(15);
         string? bad = null;
         for (int it = 0; it < 100000 && bad == null; it++)
@@ -286,7 +293,8 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task Expf_SoftmaxDomain()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
+        AomTwinNative.SkipUnlessWindows(MingwLibm);
         bool all = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_ML_EXHAUSTIVE") == "1";
         uint lo = 0x80000000u, hi = BitConverter.SingleToUInt32Bits(-10f);
         const int chunk = 1 << 20;
@@ -322,7 +330,8 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task Log1pf_IntegersAndRandom()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
+        AomTwinNative.SkipUnlessWindows(MingwLibm);
         const int chunk = 1 << 20;
         var input = new float[chunk];
         var theirs = new float[chunk];
@@ -377,7 +386,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task HorverCorrelation_AllSizes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(17);
         string? bad = null;
         var hv = new float[2];
@@ -396,7 +405,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task EnergyDistributionFiner_AndMeanDev_AllTxSizes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(18);
         string? bad = null;
         for (int it = 0; it < 30000 && bad == null; it++)
@@ -438,7 +447,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task PredictTxSplit_AllTxSizes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(19);
         string? bad = null;
         for (int it = 0; it < 20000 && bad == null; it++)
@@ -458,7 +467,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task PredictIntraTxDepthPrune_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(20);
         string? bad = null;
         int[] counts = new int[4];
@@ -488,7 +497,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task PruneTx2D_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(21);
         string? bad = null;
         int[] setTypes = [AomTables.EXT_TX_SET_ALL16, AomTables.EXT_TX_SET_DTT9_IDTX_1DDCT, AomTables.EXT_TX_SET_DTT4_IDTX_1DDCT];
@@ -540,7 +549,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task PerPixelVariance_AllBlockSizes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(22);
         string? bad = null;
         for (int it = 0; it < 6000 && bad == null; it++)
@@ -597,7 +606,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task Prune4Partition_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(23);
         string? bad = null;
         int changed = 0;
@@ -640,7 +649,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task PruneAbPartition_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(24);
         string? bad = null;
         for (int it = 0; it < 30000 && bad == null; it++)
@@ -662,7 +671,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task PruneRectPartition_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(25);
         string? bad = null;
         int pruned = 0;
@@ -700,7 +709,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task EarlyTermAfterSplit_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(26);
         string? bad = null;
         int terminated = 0;
@@ -765,7 +774,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task IntraHog_CollectAndPrune_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(27);
         string? bad = null;
         int pruned = 0;
@@ -819,7 +828,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task IntraHog_GradientCachePath_MatchesDirect()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(28);
         string? bad = null;
         for (int it = 0; it < 6000 && bad == null; it++)
@@ -863,7 +872,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task CnnPartitionPredict_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(29);
         string? bad = null;
         for (int it = 0; it < 400 && bad == null; it++)
@@ -957,7 +966,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task CnnPartition_RealImageSuperblocks()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var (luma, w, h) = PhotoLuma("landscape.jpg");
         var rng = new Random(30);
         cnnChanged = 0;
@@ -978,7 +987,8 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task CnnPartition_HighBitdepthRandom()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
+        AomTwinNative.SkipUnlessWindows(MingwLibm);
         var rng = new Random(31);
         string? bad = null;
         for (int it = 0; it < 40 && bad == null; it++)
@@ -1002,7 +1012,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task MlPredictBreakout_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(32);
         string? bad = null;
         int broke = 0;
@@ -1033,7 +1043,7 @@ public sealed class AomMlTwinTests
     [Test]
     public async Task BreakoutThreshScore_Log()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         bool all = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_ML_EXHAUSTIVE") == "1";
         const int chunk = 1 << 20;
         var theirs = new float[chunk];

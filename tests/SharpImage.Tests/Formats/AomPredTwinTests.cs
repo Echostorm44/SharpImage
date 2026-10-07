@@ -5,15 +5,15 @@ using static SharpImage.Formats.Av1.AomTables;
 namespace SharpImage.Tests.Formats;
 
 // Twins of the libaom intra prediction port (AomIntraPred / AomReconIntra / AomCfl) against libaom 3.14.1 through
-// aomtwin_pred.dll (scratchpad aomtwin_pred/: twin_pred.c exports the RTCD-dispatched SIMD kernels, twin_recon.c
+// aomtwin_pred.dll (tests/native/aomtwin: twin_pred.c exports the RTCD-dispatched SIMD kernels, twin_recon.c
 // compiles a copy of reconintra.c for its statics and drives av1_predict_intra_block_facade on a synthetic MACROBLOCKD).
-// Opt-in: point SHARPIMAGE_AOMTWIN_PRED at aomtwin_pred.dll; without it the tests pass without checking.
+// Opt-in: point SHARPIMAGE_AOMTWIN_PRED at aomtwin_pred.dll; without it the tests report Skipped.
 [NotInParallel]
 public sealed class AomPredTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_PRED");
-    private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
-        ? Load() : throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_PRED is set but the DLL does not exist", DllPath));
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN_PRED";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
+    private static readonly bool Available = DllPath != null && Load();
 
     private static bool Load()
     {
@@ -86,7 +86,7 @@ public sealed class AomPredTwinTests
     [Test]
     public async Task Predictors_AllKindsAllSizes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(11);
         const int stride = 80;
         byte[] aboveBuf = new byte[256], leftBuf = new byte[256];
@@ -135,7 +135,7 @@ public sealed class AomPredTwinTests
     [Test]
     public async Task Directional_Z1Z2Z3_AllAnglesSizesUpsample()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(12);
         const int stride = 80;
         byte[] aboveBuf = new byte[256], leftBuf = new byte[256];
@@ -199,7 +199,7 @@ public sealed class AomPredTwinTests
     [Test]
     public async Task FilterIntra_AllModesSizes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(13);
         const int stride = 48;
         byte[] aboveBuf = new byte[256], leftBuf = new byte[256];
@@ -232,7 +232,7 @@ public sealed class AomPredTwinTests
     [Test]
     public async Task IntraEdge_FilterUpsampleCornerStrength()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(14);
         byte[] a = new byte[200], b = new byte[200];
         for (int sz = 1; sz <= 129; sz++)
@@ -301,7 +301,7 @@ public sealed class AomPredTwinTests
     [Test]
     public async Task HasTopRight_HasBottomLeft_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(15);
         int checkedN = 0;
         for (int it = 0; it < 400000; it++)
@@ -343,7 +343,7 @@ public sealed class AomPredTwinTests
     [Test]
     public async Task Cfl_SubsampleSubtractAveragePredict()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(16);
         const int inStride = 72;
         byte[] input = new byte[inStride * 64];
@@ -460,7 +460,7 @@ public sealed class AomPredTwinTests
     [Test]
     public async Task PredictIntraBlockFacade_RandomFramesAndBlocks()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         try { await FacadeBody(); }
         catch (Exception e) { await Assert.That(e.ToString()).IsEqualTo("no exception"); }
     }

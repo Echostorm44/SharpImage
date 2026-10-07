@@ -428,7 +428,7 @@ public sealed partial class AomLfTwinTests
     private static async Task RunCaptures(string image, bool[] subsamplings, int[] speeds, int[] quantizers, int maxW = 0, int maxH = 0,
         int tileColsLog2 = 0, int tileRowsLog2 = 0, int sharpness = 0)
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var errs = new List<string>();
         int runs = 0;
         foreach (bool s444 in subsamplings)

@@ -9,23 +9,26 @@ namespace SharpImage.Tests.Formats;
 // aomtwin_pal.dll exports libaom.a's own palette.c / pred_common.c / entropymode.c / tokenize.c / intra_mode_search.c
 // functions, the RTCD-dispatched (AVX2) k-means kernels and msvcrt's qsort; aomtwin_palsearch.dll (next to it) compiles
 // a copy of palette.c and tokenize.c for their statics and runs the palette search on a synthetic MACROBLOCK with a
-// mock tx search (scratchpad aomtwin_pal/). Opt-in: point SHARPIMAGE_AOMTWIN_PAL at aomtwin_pal.dll; without it the
-// tests pass without checking.
+// mock tx search (tests/native/aomtwin). Opt-in: point SHARPIMAGE_AOMTWIN_PAL at aomtwin_pal.dll; without it the
+// tests report Skipped.
 [NotInParallel]
 public sealed partial class AomPaletteTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_PAL");
-    private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
-        ? Load() : throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_PAL is set but the DLL does not exist", DllPath));
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN_PAL";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
+    private static readonly bool Available = DllPath != null && Load();
 
     private static nint s_lib, s_search;
 
     private static unsafe bool Load()
     {
-        string searchPath = Path.Combine(Path.GetDirectoryName(DllPath)!, "aomtwin_palsearch.dll");
-        if (!File.Exists(searchPath)) throw new FileNotFoundException("aomtwin_palsearch.dll must sit next to aomtwin_pal.dll", searchPath);
-        s_lib = NativeLibrary.Load(DllPath!);
-        s_search = NativeLibrary.Load(searchPath);
+        string searchPath = Path.Combine(Path.GetDirectoryName(DllPath)!, "aomtwin_palsearch" + Path.GetExtension(DllPath));
+        if (!File.Exists(searchPath))
+        {
+            throw new FileNotFoundException("aomtwin_palsearch must sit next to aomtwin_pal", searchPath);
+        }
+        s_lib = AomTwinNative.Register("aomtwin_pal", DllPath!);
+        s_search = AomTwinNative.Register("aomtwin_palsearch", searchPath);
         ((delegate* unmanaged<void>)NativeLibrary.GetExport(s_lib, "twin_init"))();
         ((delegate* unmanaged<void>)NativeLibrary.GetExport(s_search, "twin_init"))();
         return true;
@@ -91,7 +94,9 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task MsvcrtQsort_ShortsortCallForCall()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
+        AomTwinNative.SkipUnlessWindows("compares with msvcrt's qsort call for call; a twin built on another OS links that libc's qsort "
+            + "(glibc's is a merge sort). AomMsvcrtQsortTwinTests.MsvcrtQsort_MatchesMsvcrtDigest checks the port on every OS");
         var rng = new Random(1);
         var f = new List<string>();
         int cases = 0;
@@ -136,7 +141,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task CalcIndices_Avx2_Dim1Dim2_TailsAndWrap()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         int isAvx2;
         unsafe { isAvx2 = ((delegate* unmanaged<int>)L("twin_calc_indices_is_avx2"))(); }
         await Assert.That(isAvx2).IsEqualTo(1);
@@ -185,7 +190,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task KMeans_Dim1Dim2_AgainstLibaom()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(3);
         var f = new List<string>();
         int cases = 0;
@@ -263,7 +268,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task ColorCosts_IndexCacheDeltaBitsCostYUv()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(4);
         var f = new List<string>();
         int cases = 0;
@@ -313,7 +318,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task PaletteCache_AboveLeftMerge()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(5);
         var f = new List<string>();
         int cases = 0;
@@ -353,7 +358,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task ColorIndexContext_DecoderAndFastEncoder()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(6);
         var f = new List<string>();
         int cases = 0;
@@ -399,7 +404,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task CostColorMap_AllBsizesPlanesCrops()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(7);
         var f = new List<string>();
         int cases = 0;
@@ -441,7 +446,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task CountColors_AndWithThreshold()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(8);
         var f = new List<string>();
         int cases = 0;
@@ -475,7 +480,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task RestoreUvColorMap_AllBsizesSubsamplingsCrops()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(9);
         var f = new List<string>();
         int cases = 0;
@@ -527,7 +532,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task Statics_RemoveDuplicatesDeltaEncodeOptimizeStage2()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(10);
         var f = new List<string>();
         int cases = 0;
@@ -576,7 +581,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task Statics_ExtendMapFillDataFindTopColors()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(11);
         var f = new List<string>();
         int cases = 0;

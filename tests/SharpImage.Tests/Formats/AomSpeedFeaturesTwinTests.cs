@@ -8,14 +8,14 @@ namespace SharpImage.Tests.Formats;
 // Twin of the speed-feature port (src/SharpImage/Formats/Av1/Aom/AomSpeedFeatures.cs) against libaom 3.14.1's own
 // av1_set_speed_features_framesize_independent / _dependent / _qindex_dependent, through aomtwin_sf.dll (a harness
 // built against libaom.a that runs them on a calloc'd AV1_COMP and dumps every SPEED_FEATURES field, WinnerModeParams
-// and the sequence tool flags as path=value lines; see scratchpad aomtwin_sf/). Opt-in: point SHARPIMAGE_AOMTWIN_SF at
-// aomtwin_sf.dll; without it the tests pass without checking.
+// and the sequence tool flags as path=value lines; tests/native/aomtwin). Opt-in: point SHARPIMAGE_AOMTWIN_SF at
+// aomtwin_sf.dll; without it the tests report Skipped.
 [NotInParallel]
 public sealed class AomSpeedFeaturesTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_SF");
-    private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
-        ? Load() : throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_SF is set but the DLL does not exist", DllPath));
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN_SF";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
+    private static readonly bool Available = DllPath != null && Load();
 
     private static bool Load()
     {
@@ -165,7 +165,7 @@ public sealed class AomSpeedFeaturesTwinTests
     [Test]
     public async Task AllIntra_FrameSequence_Matrix()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         IEnumerable<Config> Configs()
         {
             for (int speed = 0; speed <= 9; speed++)
@@ -183,7 +183,7 @@ public sealed class AomSpeedFeaturesTwinTests
     [Test]
     public async Task AllIntra_Stages_And_Repeats()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         int[][] opsList = [[1], [1, 2], [1, 2, 2, 3], [1, 2, 3, 4, 200, 3], [1, 2, 3, 4, 20, 3], [1, 2, 3, 1, 2, 3]];
         IEnumerable<Config> Configs()
         {
@@ -203,7 +203,7 @@ public sealed class AomSpeedFeaturesTwinTests
     [Test]
     public async Task AllIntra_OtherInputs()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var variants = new List<(string Name, Action<AomSpeedFeatureInputs> Set, bool SeqLocked)>
         {
             ("allowSctOnly", i => { i.AllowScreenContentTools = true; }, false),

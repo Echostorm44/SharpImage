@@ -371,7 +371,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task SearchY_AgainstLibaomPaletteC_MockTxSearch()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         string? r = RunSearchTwins(true, 21, 400, out int cases, out int calls, out int palettes);
         Console.WriteLine($"sby: {cases} searches, {calls} mock tx searches, {palettes} improved best_rd with a luma palette");
         await Assert.That(r).IsNull();
@@ -382,7 +382,7 @@ public sealed partial class AomPaletteTwinTests
     [Test]
     public async Task SearchUv_AgainstLibaomPaletteC_MockTxSearch()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         string? r = RunSearchTwins(false, 22, 400, out int cases, out int calls, out int palettes);
         Console.WriteLine($"sbuv: {cases} searches, {calls} mock tx searches, {palettes} improved best_rd with a chroma palette");
         await Assert.That(r).IsNull();

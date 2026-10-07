@@ -5,16 +5,16 @@ using static SharpImage.Formats.Av1.AomTables;
 namespace SharpImage.Tests.Formats;
 
 // Twins of the libaom deblocking / loop-restoration port (AomLpf, AomLoopFilter, AomPickLpf, AomRestoration, AomPickRst)
-// against libaom 3.14.1 through aomtwin_lf.dll (scratchpad aomtwin_lf/: twin_kern.c exports the RTCD-dispatched SIMD
+// against libaom 3.14.1 through aomtwin_lf.dll (tests/native/aomtwin: twin_kern.c exports the RTCD-dispatched SIMD
 // kernels and drives av1_loop_filter_frame_mt on synthetic frames; twin_pickrst.c is a renamed copy of pickrst.c for its
 // statics; twin_capture.c encodes through libaom's API and dumps libaom's own post-filter inputs and decisions).
-// Opt-in: point SHARPIMAGE_AOMTWIN_LF at aomtwin_lf.dll; without it the tests pass without checking.
+// Opt-in: point SHARPIMAGE_AOMTWIN_LF at aomtwin_lf.dll; without it the tests report Skipped.
 [NotInParallel]
 public sealed partial class AomLfTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_LF");
-    private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
-        ? Load() : throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_LF is set but the DLL does not exist", DllPath));
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN_LF";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
+    private static readonly bool Available = DllPath != null && Load();
 
     private static bool Load()
     {
@@ -100,7 +100,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task Lpf_AllKernels_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(11);
         int mismatches = 0, runs = 0, simdMismatches = 0, simdRuns = 0;
         foreach (int kind in new[] { 4, 6, 8, 14 })
@@ -167,7 +167,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task SseAndVar_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(3);
         for (int iter = 0; iter < 300; iter++)
         {
@@ -198,7 +198,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task ComputeStats_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(5);
         long area = 0;
         for (int iter = 0; iter < 60; iter++)
@@ -303,7 +303,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task Linsolve_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(9);
         for (int iter = 0; iter < 5000; iter++)
         {
@@ -335,7 +335,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task Selfguided_And_Projection_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(7);
         var sc = new AomRestoration.SgrScratch();
         for (int iter = 0; iter < 400; iter++)
@@ -422,7 +422,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task ApplySelfguided_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(8);
         var sc = new AomRestoration.SgrScratch();
         var f0 = new int[AomRestoration.RestorationUnitPelsMax];
@@ -455,7 +455,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task WienerConvolve_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(4);
         var temp = new ushort[135 * 128];
         for (int iter = 0; iter < 1500; iter++)
@@ -510,7 +510,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task BitCounts_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(2);
         for (int iter = 0; iter < 20000; iter++)
         {
@@ -565,7 +565,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task SearchSelfguided_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(12);
         var sc = new AomRestoration.SgrScratch();
         var f0 = new int[AomRestoration.RestorationUnitPelsMax];
