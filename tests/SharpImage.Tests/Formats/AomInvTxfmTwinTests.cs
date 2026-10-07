@@ -5,8 +5,8 @@ using static SharpImage.Formats.Av1.AomTables;
 namespace SharpImage.Tests.Formats;
 
 // Twin of the lowbd inverse transform port (AomInvTxfmLbd: av1_lowbd_inv_txfm2d_add_avx2 and its SSSE3 paths) against
-// libaom 3.14.1's RTCD-dispatched av1_inv_txfm_add through aomtwin_inv.dll (scratchpad aomtwin_inv/: twin_inv.c,
-// build.sh). Point SHARPIMAGE_AOMTWIN_INV at aomtwin_inv.dll; without it the test fails.
+// libaom 3.14.1's RTCD-dispatched av1_inv_txfm_add through aomtwin_inv (tests/native/aomtwin: twin_inv.c, build.sh;
+// CI builds it). Point SHARPIMAGE_AOMTWIN_INV at aomtwin_inv.dll / .so; without it the test fails.
 [NotInParallel]
 public sealed class AomInvTxfmTwinTests
 {
@@ -17,10 +17,9 @@ public sealed class AomInvTxfmTwinTests
     private static void Load()
     {
         if (loaded) return;
-        if (DllPath == null) throw new InvalidOperationException("SHARPIMAGE_AOMTWIN_INV is not set (path of aomtwin_inv.dll)");
+        if (DllPath == null) throw new InvalidOperationException("SHARPIMAGE_AOMTWIN_INV is not set (path of aomtwin_inv.dll / .so from tests/native/aomtwin/build.sh)");
         if (!File.Exists(DllPath)) throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_INV is set but the DLL does not exist", DllPath);
-        NativeLibrary.SetDllImportResolver(typeof(AomInvTxfmTwinTests).Assembly, (name, _, _) =>
-            name == "aomtwin_inv" ? NativeLibrary.Load(DllPath) : IntPtr.Zero);
+        AomTwinNative.Register("aomtwin_inv", DllPath);
         Native.twin_init();
         loaded = true;
     }

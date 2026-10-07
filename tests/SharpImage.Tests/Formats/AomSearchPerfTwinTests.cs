@@ -6,8 +6,8 @@ using static SharpImage.Formats.Av1.AomTables;
 namespace SharpImage.Tests.Formats;
 
 // Twins of the search kernels ported for speed (forward transform, quantizers, distortion sums) against libaom 3.14.1's
-// RTCD-dispatched kernels through aomtwin_sp.dll (scratchpad aomtwin_sp/: twin_sp.c, build.sh). Point
-// SHARPIMAGE_AOMTWIN_SP at aomtwin_sp.dll; without it the tests fail. SHARPIMAGE_AOMTWIN_SP_BENCH=1 also prints ns per
+// RTCD-dispatched kernels through aomtwin_sp (tests/native/aomtwin: twin_sp.c, build.sh; CI builds it). Point
+// SHARPIMAGE_AOMTWIN_SP at aomtwin_sp.dll / .so; without it the tests fail. SHARPIMAGE_AOMTWIN_SP_BENCH=1 also prints ns per
 // call of both sides on the same inputs.
 [NotInParallel]
 public sealed class AomSearchPerfTwinTests
@@ -19,10 +19,9 @@ public sealed class AomSearchPerfTwinTests
     private static void Load()
     {
         if (loaded) return;
-        if (DllPath == null) throw new InvalidOperationException("SHARPIMAGE_AOMTWIN_SP is not set (path of aomtwin_sp.dll)");
+        if (DllPath == null) throw new InvalidOperationException("SHARPIMAGE_AOMTWIN_SP is not set (path of aomtwin_sp.dll / .so from tests/native/aomtwin/build.sh)");
         if (!File.Exists(DllPath)) throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_SP is set but the DLL does not exist", DllPath);
-        NativeLibrary.SetDllImportResolver(typeof(AomSearchPerfTwinTests).Assembly, (name, _, _) =>
-            name == "aomtwin_sp" ? NativeLibrary.Load(DllPath) : IntPtr.Zero);
+        AomTwinNative.Register("aomtwin_sp", DllPath);
         Native.twin_init();
         loaded = true;
     }
@@ -129,18 +128,69 @@ public sealed class AomSearchPerfTwinTests
         return l.ToArray();
     }
 
-    /// <summary>The trellis (av1_optimize_txb) over captured search blocks (SHARPIMAGE_AOMTWIN_SP_TXB: records of tx, type,
-    /// plane, skip ctx, dc ctx, eob, dq0, dq1, rdmult, sharpness, n, coeff, qcoeff, dqcoeff as int32), with the default
-    /// coefficient costs of qindex 120: same eobs / rates as libaom, and both sides timed.</summary>
+    /// <summary>Trellis input records (the SHARPIMAGE_AOMTWIN_SP_TXB layout) built the way the encoder builds them: a
+    /// random residual through the forward transform and av1_quantize_fp at a random qindex, for every tx size and type,
+    /// both plane types and all skip / dc-sign contexts.</summary>
+    private static int[] SyntheticTxbRecords(int blocks)
+    {
+        var rng = new Random(2026);
+        var quants = new AomQuants(8, 0, 0, 0, 0, 0, 0);
+        var list = new List<int>();
+        var coeff = new int[64 * 64];
+        for (int blk = 0; blk < blocks; blk++)
+        {
+            int txSize = blk % 19;
+            int[] types = TypesFor(txSize);
+            int txType = types[rng.Next(types.Length)];
+            int w = TxSizeWide[txSize], h = TxSizeHigh[txSize];
+            int n = AomEncodeMb.MaxEob(txSize);
+            AomEncodeMb.TxTypeKinds(txType, out int hKind, out int vKind, out bool flipUd, out bool flipLr);
+            var diff = Residual(rng, w, h, rng.Next(5));
+            Av1FwdTxfmAom.ForwardRaw(diff, w, w, h, txSize, hKind, vKind, flipUd, flipLr, coeff);
+            int plane = rng.Next(3) == 0 ? 1 : 0;
+            int q = rng.Next(1, 256);
+            short dq0 = quants.Dequant[plane, q, 0], dq1 = quants.Dequant[plane, q, 1];
+            var qcoeff = new int[n];
+            var dqcoeff = new int[n];
+            int eob = AomQuantize.QuantizeFpAvx2(coeff.AsSpan(0, n), n, AomEncodeMb.IScanOf(txSize, txType), quants.RoundFp[plane, q, 0],
+                quants.RoundFp[plane, q, 1], quants.QuantFp[plane, q, 0], quants.QuantFp[plane, q, 1], dq0, dq1, AomQuantize.TxScale(txSize),
+                qcoeff, dqcoeff);
+            if (eob == 0)
+            {
+                continue;   // av1_optimize_b returns before the trellis on an all-zero block (the trellis reads scan[eob - 1])
+            }
+            list.AddRange([txSize, txType, plane, rng.Next(13), rng.Next(3), eob, dq0, dq1, rng.Next(100, 60000), rng.Next(4) == 0 ? rng.Next(1, 8) : 0, n]);
+            list.AddRange(coeff.AsSpan(0, n).ToArray());
+            list.AddRange(qcoeff);
+            list.AddRange(dqcoeff);
+        }
+        return list.ToArray();
+    }
+
+    /// <summary>The trellis (av1_optimize_txb) over search blocks, with the default coefficient costs of qindex 120: same
+    /// eobs / rates as libaom, and both sides timed. The blocks are SyntheticTxbRecords, or a capture from a real encode
+    /// (SHARPIMAGE_AOMTWIN_SP_TXB: records of tx, type, plane, skip ctx, dc ctx, eob, dq0, dq1, rdmult, sharpness, n,
+    /// coeff, qcoeff, dqcoeff as int32).</summary>
     [Test]
     public async Task OptimizeTxb_Captured_MatchLibaom()
     {
         Load();
         string? path = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_SP_TXB");
-        if (path == null || !File.Exists(path)) return;
-        var raw = File.ReadAllBytes(path);
-        var rec = new int[raw.Length / 4];
-        Buffer.BlockCopy(raw, 0, rec, 0, rec.Length * 4);
+        int[] rec;
+        if (path == null)
+        {
+            rec = SyntheticTxbRecords(19 * 400);
+        }
+        else
+        {
+            if (!File.Exists(path))
+            {
+                throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_SP_TXB is set but the capture does not exist", path);
+            }
+            var raw = File.ReadAllBytes(path);
+            rec = new int[raw.Length / 4];
+            Buffer.BlockCopy(raw, 0, rec, 0, rec.Length * 4);
+        }
         int nrec = 0;
         for (int o = 0; o < rec.Length; o += 11 + 3 * rec[o + 10]) nrec++;
         var fc = new Av1CdfCoefContext();

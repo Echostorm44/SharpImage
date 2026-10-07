@@ -18,8 +18,7 @@ public sealed partial class AomLfTwinTests
 
     private static bool Load()
     {
-        NativeLibrary.SetDllImportResolver(typeof(AomLfTwinTests).Assembly, (name, _, _) =>
-            name == "aomtwin_lf" ? NativeLibrary.Load(DllPath!) : IntPtr.Zero);
+        AomTwinNative.Register("aomtwin_lf", DllPath!);
         Native.twin_init();
         return true;
     }

@@ -19,8 +19,7 @@ public sealed class AomSpeedFeaturesTwinTests
 
     private static bool Load()
     {
-        NativeLibrary.SetDllImportResolver(typeof(AomSpeedFeaturesTwinTests).Assembly, (name, _, _) =>
-            name == "aomtwin_sf" ? NativeLibrary.Load(DllPath!) : IntPtr.Zero);
+        AomTwinNative.Register("aomtwin_sf", DllPath!);
         return true;
     }
 

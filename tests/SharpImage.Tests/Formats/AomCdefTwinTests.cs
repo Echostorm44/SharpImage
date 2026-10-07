@@ -16,8 +16,7 @@ public sealed class AomCdefTwinTests
 
     private static bool Load()
     {
-        NativeLibrary.SetDllImportResolver(typeof(AomCdefTwinTests).Assembly, (name, asm, path) =>
-            name == "aomtwin_cdef" ? NativeLibrary.Load(DllPath!) : IntPtr.Zero);
+        AomTwinNative.Register("aomtwin_cdef", DllPath!);
         Native.twin_init();
         return true;
     }

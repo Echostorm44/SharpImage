@@ -17,8 +17,7 @@ public sealed class AomPredTwinTests
 
     private static bool Load()
     {
-        NativeLibrary.SetDllImportResolver(typeof(AomPredTwinTests).Assembly, (name, _, _) =>
-            name == "aomtwin_pred" ? NativeLibrary.Load(DllPath!) : IntPtr.Zero);
+        AomTwinNative.Register("aomtwin_pred", DllPath!);
         Native.twin_init();
         return true;
     }

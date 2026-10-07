@@ -35,5 +35,24 @@ jobs:
       - name: Build
         run: dotnet build -c ${{ env.CONFIGURATION }} --no-restore
 
+      # libaom twin libraries for the differential tests (AomInvTxfmTwinTests, AomSearchPerfTwinTests). libaom is
+      # pinned in build.sh, so its static build is cached on that script; the small twin libraries are always rebuilt.
+      - name: Cache libaom (twin tests)
+        id: aom-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/aomtwin
+          key: aomtwin-${{ runner.os }}-${{ hashFiles('tests/native/aomtwin/build.sh') }}
+
+      - name: Install nasm
+        if: steps.aom-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get update -q && sudo apt-get install -y -q nasm
+
+      - name: Build libaom twins
+        run: |
+          sh tests/native/aomtwin/build.sh "$RUNNER_TEMP/aomtwin"
+          echo "SHARPIMAGE_AOMTWIN_INV=$RUNNER_TEMP/aomtwin/aomtwin_inv.so" >> "$GITHUB_ENV"
+          echo "SHARPIMAGE_AOMTWIN_SP=$RUNNER_TEMP/aomtwin/aomtwin_sp.so" >> "$GITHUB_ENV"
+
       - name: Run TUnit tests
         run: dotnet run --project tests/SharpImage.Tests -c ${{ env.CONFIGURATION }} --no-build
