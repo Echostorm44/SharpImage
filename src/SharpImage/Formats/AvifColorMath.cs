@@ -1,6 +1,8 @@
 // libavif's colour math (colr.c / colrconvert.c), ported operation-for-operation in float/double so gain map tone
 // mapping matches libavif: CICP colour primaries, the H.273 transfer functions as libavif implements them (PQ and HLG
 // scaled so SDR white = 1.0, "extended SDR"), and linear RGB -> RGB conversion through XYZ D50 (Bradford adaptation).
+using SharpImage.Core;
+
 namespace SharpImage.Formats;
 
 internal static class AvifColorMath
@@ -50,17 +52,17 @@ internal static class AvifColorMath
     public static Func<float, float> ToLinear(int tc) => tc switch
     {
         1 or 6 or 14 or 15 => ToLinear709,
-        4 => g => MathF.Pow(Clamp(g, 0.0f, 1.0f), 2.2f),
-        5 => g => MathF.Pow(Clamp(g, 0.0f, 1.0f), 2.8f),
+        4 => g => PortableMath.Pow(Clamp(g, 0.0f, 1.0f), 2.2f),
+        5 => g => PortableMath.Pow(Clamp(g, 0.0f, 1.0f), 2.8f),
         7 => ToLinearSmpte240,
         8 => GammaLinear,
-        9 => g => g <= 0.0f ? 0.01f / 2.0f : MathF.Pow(10.0f, 2.0f * (MathF.Min(g, 1.0f) - 1.0f)),
-        10 => g => g <= 0.0f ? 0.00316227766f / 2.0f : MathF.Pow(10.0f, 2.5f * (MathF.Min(g, 1.0f) - 1.0f)),
+        9 => g => g <= 0.0f ? 0.01f / 2.0f : PortableMath.Pow(10.0f, 2.0f * (MathF.Min(g, 1.0f) - 1.0f)),
+        10 => g => g <= 0.0f ? 0.00316227766f / 2.0f : PortableMath.Pow(10.0f, 2.5f * (MathF.Min(g, 1.0f) - 1.0f)),
         11 => ToLinearIec61966,
         12 => ToLinearBt1361,
         13 => ToLinearSrgb,
         16 => ToLinearPq,
-        17 => g => MathF.Pow(MathF.Max(g, 0.0f), 2.6f) / 0.91655527974030934f,
+        17 => g => PortableMath.Pow(MathF.Max(g, 0.0f), 2.6f) / 0.91655527974030934f,
         18 => ToLinearHlg,
         _ => ToLinear709,
     };
@@ -68,17 +70,17 @@ internal static class AvifColorMath
     public static Func<float, float> ToGamma(int tc) => tc switch
     {
         1 or 6 or 14 or 15 => ToGamma709,
-        4 => l => MathF.Pow(Clamp(l, 0.0f, 1.0f), 1.0f / 2.2f),
-        5 => l => MathF.Pow(Clamp(l, 0.0f, 1.0f), 1.0f / 2.8f),
+        4 => l => PortableMath.Pow(Clamp(l, 0.0f, 1.0f), 1.0f / 2.2f),
+        5 => l => PortableMath.Pow(Clamp(l, 0.0f, 1.0f), 1.0f / 2.8f),
         7 => ToGammaSmpte240,
         8 => GammaLinear,
-        9 => l => l <= 0.01f ? 0.0f : 1.0f + MathF.Log10(MathF.Min(l, 1.0f)) / 2.0f,
-        10 => l => l <= 0.00316227766f ? 0.0f : 1.0f + MathF.Log10(MathF.Min(l, 1.0f)) / 2.5f,
+        9 => l => l <= 0.01f ? 0.0f : 1.0f + PortableMath.Log10(MathF.Min(l, 1.0f)) / 2.0f,
+        10 => l => l <= 0.00316227766f ? 0.0f : 1.0f + PortableMath.Log10(MathF.Min(l, 1.0f)) / 2.5f,
         11 => ToGammaIec61966,
         12 => ToGammaBt1361,
         13 => ToGammaSrgb,
         16 => ToGammaPq,
-        17 => l => MathF.Pow(0.91655527974030934f * MathF.Max(l, 0.0f), 1.0f / 2.6f),
+        17 => l => PortableMath.Pow(0.91655527974030934f * MathF.Max(l, 0.0f), 1.0f / 2.6f),
         18 => ToGammaHlg,
         _ => ToGamma709,
     };
@@ -89,7 +91,7 @@ internal static class AvifColorMath
     {
         if (g < 0.0f) return 0.0f;
         if (g < 4.5f * 0.018053968510807f) return g / 4.5f;
-        if (g < 1.0f) return MathF.Pow((g + 0.09929682680944f) / 1.09929682680944f, 1.0f / 0.45f);
+        if (g < 1.0f) return PortableMath.Pow((g + 0.09929682680944f) / 1.09929682680944f, 1.0f / 0.45f);
         return 1.0f;
     }
 
@@ -97,7 +99,7 @@ internal static class AvifColorMath
     {
         if (l < 0.0f) return 0.0f;
         if (l < 0.018053968510807f) return l * 4.5f;
-        if (l < 1.0f) return 1.09929682680944f * MathF.Pow(l, 0.45f) - 0.09929682680944f;
+        if (l < 1.0f) return 1.09929682680944f * PortableMath.Pow(l, 0.45f) - 0.09929682680944f;
         return 1.0f;
     }
 
@@ -105,7 +107,7 @@ internal static class AvifColorMath
     {
         if (g < 0.0f) return 0.0f;
         if (g < 4.0f * 0.022821585529445f) return g / 4.0f;
-        if (g < 1.0f) return MathF.Pow((g + 0.111572195921731f) / 1.111572195921731f, 1.0f / 0.45f);
+        if (g < 1.0f) return PortableMath.Pow((g + 0.111572195921731f) / 1.111572195921731f, 1.0f / 0.45f);
         return 1.0f;
     }
 
@@ -113,39 +115,39 @@ internal static class AvifColorMath
     {
         if (l < 0.0f) return 0.0f;
         if (l < 0.022821585529445f) return l * 4.0f;
-        if (l < 1.0f) return 1.111572195921731f * MathF.Pow(l, 0.45f) - 0.111572195921731f;
+        if (l < 1.0f) return 1.111572195921731f * PortableMath.Pow(l, 0.45f) - 0.111572195921731f;
         return 1.0f;
     }
 
     private static float ToLinearIec61966(float g)
     {
-        if (g < -4.5f * 0.018053968510807f) return -MathF.Pow((g - 0.09929682680944f) / -1.09929682680944f, 1.0f / 0.45f);
+        if (g < -4.5f * 0.018053968510807f) return -PortableMath.Pow((g - 0.09929682680944f) / -1.09929682680944f, 1.0f / 0.45f);
         if (g < 4.5f * 0.018053968510807f) return g / 4.5f;
-        return MathF.Pow((g + 0.09929682680944f) / 1.09929682680944f, 1.0f / 0.45f);
+        return PortableMath.Pow((g + 0.09929682680944f) / 1.09929682680944f, 1.0f / 0.45f);
     }
 
     private static float ToGammaIec61966(float l)
     {
-        if (l < -0.018053968510807f) return -1.09929682680944f * MathF.Pow(-l, 0.45f) + 0.09929682680944f;
+        if (l < -0.018053968510807f) return -1.09929682680944f * PortableMath.Pow(-l, 0.45f) + 0.09929682680944f;
         if (l < 0.018053968510807f) return l * 4.5f;
-        return 1.09929682680944f * MathF.Pow(l, 0.45f) - 0.09929682680944f;
+        return 1.09929682680944f * PortableMath.Pow(l, 0.45f) - 0.09929682680944f;
     }
 
     private static float ToLinearBt1361(float g)
     {
         if (g < -0.25f) return -0.25f;
-        if (g < 0.0f) return MathF.Pow((g - 0.02482420670236f) / -0.27482420670236f, 1.0f / 0.45f) / -4.0f;
+        if (g < 0.0f) return PortableMath.Pow((g - 0.02482420670236f) / -0.27482420670236f, 1.0f / 0.45f) / -4.0f;
         if (g < 4.5f * 0.018053968510807f) return g / 4.5f;
-        if (g < 1.0f) return MathF.Pow((g + 0.09929682680944f) / 1.09929682680944f, 1.0f / 0.45f);
+        if (g < 1.0f) return PortableMath.Pow((g + 0.09929682680944f) / 1.09929682680944f, 1.0f / 0.45f);
         return 1.0f;
     }
 
     private static float ToGammaBt1361(float l)
     {
         if (l < -0.25f) return -0.25f;
-        if (l < 0.0f) return -0.27482420670236f * MathF.Pow(-4.0f * l, 0.45f) + 0.02482420670236f;
+        if (l < 0.0f) return -0.27482420670236f * PortableMath.Pow(-4.0f * l, 0.45f) + 0.02482420670236f;
         if (l < 0.018053968510807f) return l * 4.5f;
-        if (l < 1.0f) return 1.09929682680944f * MathF.Pow(l, 0.45f) - 0.09929682680944f;
+        if (l < 1.0f) return 1.09929682680944f * PortableMath.Pow(l, 0.45f) - 0.09929682680944f;
         return 1.0f;
     }
 
@@ -153,7 +155,7 @@ internal static class AvifColorMath
     {
         if (g < 0.0f) return 0.0f;
         if (g < 12.92f * 0.0030412825601275209f) return g / 12.92f;
-        if (g < 1.0f) return MathF.Pow((g + 0.0550107189475866f) / 1.0550107189475866f, 2.4f);
+        if (g < 1.0f) return PortableMath.Pow((g + 0.0550107189475866f) / 1.0550107189475866f, 2.4f);
         return 1.0f;
     }
 
@@ -161,17 +163,17 @@ internal static class AvifColorMath
     {
         if (l < 0.0f) return 0.0f;
         if (l < 0.0030412825601275209f) return l * 12.92f;
-        if (l < 1.0f) return 1.0550107189475866f * MathF.Pow(l, 1.0f / 2.4f) - 0.0550107189475866f;
+        if (l < 1.0f) return 1.0550107189475866f * PortableMath.Pow(l, 1.0f / 2.4f) - 0.0550107189475866f;
         return 1.0f;
     }
 
     private static float ToLinearPq(float g)
     {
         if (!(g > 0.0f)) return 0.0f;
-        float powGamma = MathF.Pow(g, 1.0f / 78.84375f);
+        float powGamma = PortableMath.Pow(g, 1.0f / 78.84375f);
         float num = MathF.Max(powGamma - 0.8359375f, 0.0f);
         float den = MathF.Max(18.8515625f - 18.6875f * powGamma, FltMin);
-        float linear = MathF.Pow(num / den, 1.0f / 0.1593017578125f);
+        float linear = PortableMath.Pow(num / den, 1.0f / 0.1593017578125f);
         return linear * PqMaxNits / SdrWhiteNits;
     }
 
@@ -179,28 +181,28 @@ internal static class AvifColorMath
     {
         if (!(l > 0.0f)) return 0.0f;
         l = Clamp(l * SdrWhiteNits / PqMaxNits, 0.0f, 1.0f);
-        float powLinear = MathF.Pow(l, 0.1593017578125f);
+        float powLinear = PortableMath.Pow(l, 0.1593017578125f);
         float num = 0.1640625f * powLinear - 0.1640625f;
         float den = 1.0f + 18.6875f * powLinear;
-        return MathF.Pow(1.0f + num / den, 78.84375f);
+        return PortableMath.Pow(1.0f + num / den, 78.84375f);
     }
 
     private static float ToLinearHlg(float g)
     {
         if (g < 0.0f) return 0.0f;
         float linear = g <= 0.5f
-            ? MathF.Pow((g * g) * (1.0f / 3.0f), 1.2f)
-            : MathF.Pow((MathF.Exp((g - 0.55991073f) / 0.17883277f) + 0.28466892f) / 12.0f, 1.2f);
+            ? PortableMath.Pow((g * g) * (1.0f / 3.0f), 1.2f)
+            : PortableMath.Pow((PortableMath.Exp((g - 0.55991073f) / 0.17883277f) + 0.28466892f) / 12.0f, 1.2f);
         return linear * HlgPeakNits / SdrWhiteNits;
     }
 
     private static float ToGammaHlg(float l)
     {
         l = Clamp(l * SdrWhiteNits / HlgPeakNits, 0.0f, 1.0f);
-        l = MathF.Pow(l, 1.0f / 1.2f);
+        l = PortableMath.Pow(l, 1.0f / 1.2f);
         if (l < 0.0f) return 0.0f;
         if (l <= 1.0f / 12.0f) return MathF.Sqrt(3.0f * l);
-        return 0.17883277f * MathF.Log(12.0f * l - 0.28466892f) + 0.55991073f;
+        return 0.17883277f * PortableMath.Log(12.0f * l - 0.28466892f) + 0.55991073f;
     }
 
     // ---- RGB -> RGB through XYZ D50 (avifColorPrimariesComputeRGBToRGBMatrix) --------------------------------------
