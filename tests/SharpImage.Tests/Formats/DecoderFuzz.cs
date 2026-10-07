@@ -94,7 +94,8 @@ public sealed class DecoderFuzz
         {
             if (Volatile.Read(ref hung) != 0) return;
             var (s, si, i) = job;
-            var input = Mutate(s.Data, new Random(HashCode.Combine(seed, si, i)));
+            // Not HashCode.Combine: its seed is random per process, which made the "fixed" budget a new one every run.
+            var input = Mutate(s.Data, new Random(unchecked((seed * 1_000_003 + si) * 1_000_003 + i)));
             string id = $"{s.Name}#{i}";
             string? saved = null;
             if (outDir != null) File.WriteAllBytes(saved = Path.Combine(outDir, $"inflight_{Environment.CurrentManagedThreadId}.bin"), input);
