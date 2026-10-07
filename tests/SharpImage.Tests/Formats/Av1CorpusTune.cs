@@ -9,6 +9,8 @@ namespace SharpImage.Tests.Formats;
 // Dev-only lambda-tuning harness. Reads one encoder config from env vars, encodes every 256x256 yuv420p in the
 // corpus dir across a qp sweep, and writes the resulting .avif files + a byte manifest for an external
 // BD-rate comparison. No-ops when the corpus dir is absent. Drive the sweep from bash (one config per run).
+// Developer harness (needs local data / a trigger): [Explicit] keeps it out of the normal and CI runs; select it by name.
+[Explicit]
 public sealed class Av1CorpusTune
 {
     const string Corpus = @"C:\Users\adamm\AppData\Local\Temp\claude\F--Code-QuickFixMyPics2\6657081e-026c-4ec2-a3b0-5a927b1d6dfe\scratchpad\corpus";

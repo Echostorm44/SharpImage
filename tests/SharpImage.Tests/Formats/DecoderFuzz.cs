@@ -131,7 +131,7 @@ public sealed class DecoderFuzz
     }
 
     // Replays one saved input (SHARPIMAGE_FUZZ_ONE="<Avif|Obu|Jpeg> <file>"), writing the full exception next to it.
-    [Test]
+    [Test, Explicit]
     public void ReplayOne()
     {
         if (Environment.GetEnvironmentVariable("SHARPIMAGE_FUZZ_ONE") is not { } cfg) return;
@@ -143,7 +143,7 @@ public sealed class DecoderFuzz
         File.WriteAllText(file + ".txt", result);
     }
 
-    [Test]
+    [Test, Explicit]
     public async Task Campaign()
     {
         if (Environment.GetEnvironmentVariable("SHARPIMAGE_FUZZ") is not { } cfg) return;   // opt-in

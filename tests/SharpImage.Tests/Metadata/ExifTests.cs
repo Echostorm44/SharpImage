@@ -327,10 +327,6 @@ public class ExifTests
     {
         string path = Path.Combine(
             AppContext.BaseDirectory, "TestAssets", "landscape.jpg");
-        if (!File.Exists(path))
-        {
-            return;
-        }
 
         var image = FormatRegistry.Read(path);
         // landscape.jpg has EXIF metadata

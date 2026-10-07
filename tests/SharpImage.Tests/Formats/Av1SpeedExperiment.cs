@@ -11,6 +11,8 @@ namespace SharpImage.Tests.Formats;
 // line "name Knob=value,Knob=value" sets Av1StillImageEncoder's internal static knobs (reset to their defaults
 // before every config), encodes each 8-bit 4:2:0 source listed in the configs file's "img <path> <w> <h>" lines at
 // base_q_idx 40/100/160/220, decodes with our decoder and writes "config image qidx bytes psnrY psnrU psnrV seconds".
+// Developer harness (needs local data / a trigger): [Explicit] keeps it out of the normal and CI runs; select it by name.
+[Explicit]
 public sealed class Av1SpeedExperiment
 {
     [Test, NotInParallel]

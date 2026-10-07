@@ -1493,7 +1493,6 @@ public class ExtendedFormatTests
     public async Task DdsBc7_RoseImage_RoundTrip()
     {
         string rosePath = Path.Combine(AppContext.BaseDirectory, "TestAssets", "photo_small.png");
-        if (!File.Exists(rosePath)) return;
 
         byte[] pngData = await File.ReadAllBytesAsync(rosePath);
         var original = FormatRegistry.Read(pngData);

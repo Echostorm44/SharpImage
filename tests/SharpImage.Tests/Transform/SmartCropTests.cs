@@ -151,7 +151,6 @@ public class SmartCropTests
     public async Task SmartCrop_WizardImage_ProducesValidOutput()
     {
         string wizardPath = Path.Combine(TestAssets, "peppers_rgba.png");
-        if (!File.Exists(wizardPath)) return;
 
         using var wizard = FormatRegistry.Read(wizardPath);
         using var cropped = SmartCrop.Apply(wizard, 400, 400);

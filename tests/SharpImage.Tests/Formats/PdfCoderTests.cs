@@ -447,7 +447,6 @@ public class PdfCoderTests
     public async Task Write_RealPng_ToPdf()
     {
         string pngPath = Path.Combine(TestImagesDir, "photo_small.png");
-        if (!File.Exists(pngPath)) return;
 
         string pdfPath = TempPath("rose_from_png.pdf");
         try
@@ -470,7 +469,6 @@ public class PdfCoderTests
     public async Task Write_RealJpeg_ToPdfJpeg()
     {
         string jpgPath = Path.Combine(TestImagesDir, "photo_small.jpg");
-        if (!File.Exists(jpgPath)) return;
 
         string pdfPath = TempPath("rose_jpeg_in_pdf.pdf");
         try

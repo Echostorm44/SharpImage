@@ -176,7 +176,6 @@ public class ModernDitherTests
     public async Task AllDitherMethods_WorkOnRealImage()
     {
         string rosePath = Path.Combine(TestAssets, "photo_small.png");
-        if (!File.Exists(rosePath)) return;
 
         // Test each method doesn't throw on a real image
         string[] methods = ["BlueNoise", "Stucki", "Atkinson", "Sierra"];

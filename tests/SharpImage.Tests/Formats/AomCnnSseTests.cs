@@ -9,7 +9,10 @@ public sealed class AomCnnSseTests
     [Test]
     public async Task SseLayers_MatchAvx2Layers_BitExact()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // nothing to compare against
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            Skip.Test("compares against the AVX2 kernels: this CPU has no AVX2");
+        }
         var rng = new Random(29);
         int bad = 0, cases = 0;
         for (int trial = 0; trial < 20; trial++)

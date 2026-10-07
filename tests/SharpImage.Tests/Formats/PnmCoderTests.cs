@@ -22,10 +22,6 @@ public class PnmCoderTests
     public async Task ReadPnm_RosePnm_LoadsCorrectly()
     {
         string rosePath = Path.Combine(TestAssetsDir, "photo_small.pnm");
-        if (!File.Exists(rosePath))
-        {
-            return;
-        }
 
         var frame = PnmCoder.Read(rosePath);
         long columns = frame.Columns;

@@ -10,6 +10,8 @@ namespace SharpImage.Tests.Formats;
 // Scratch rate-distortion benchmark for the AV1 intra encoder vs libaom. Not a correctness gate —
 // run explicitly with the treenode filter. Encodes bench_src.png at a sweep of qp values, decodes
 // back, and reports bytes + RGB-PSNR to a file the harness can diff against ffmpeg/libaom output.
+// Developer harness (needs local data / a trigger): [Explicit] keeps it out of the normal and CI runs; select it by name.
+[Explicit]
 public sealed class Av1EncodeBench
 {
     const string Dir = @"C:\Users\adamm\AppData\Local\Temp\claude\F--Code-QuickFixMyPics2\6657081e-026c-4ec2-a3b0-5a927b1d6dfe\scratchpad";

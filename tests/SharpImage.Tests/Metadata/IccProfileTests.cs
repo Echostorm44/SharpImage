@@ -212,10 +212,6 @@ public class IccProfileTests
     {
         string path = Path.Combine(
             AppContext.BaseDirectory, "TestAssets", "landscape.jpg");
-        if (!File.Exists(path))
-        {
-            return;
-        }
 
         var image = FormatRegistry.Read(path);
         await Assert.That(image.Metadata.IccProfile).IsNotNull();

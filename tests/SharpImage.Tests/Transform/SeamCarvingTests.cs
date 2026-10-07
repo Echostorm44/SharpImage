@@ -160,7 +160,6 @@ public class SeamCarvingTests
     public async Task SeamCarve_RealImage_ProducesValidOutput()
     {
         string wizardPath = Path.Combine(TestAssets, "peppers_rgba.png");
-        if (!File.Exists(wizardPath)) return;
 
         using var source = FormatRegistry.Read(wizardPath);
         int targetWidth = (int)(source.Columns * 3 / 4);

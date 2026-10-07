@@ -152,7 +152,6 @@ public class HistogramMatchingTests
     {
         string wizardPath = Path.Combine(TestAssets, "peppers_rgba.png");
         string rosePath = Path.Combine(TestAssets, "photo_small.png");
-        if (!File.Exists(wizardPath) || !File.Exists(rosePath)) return;
 
         using var wizard = FormatRegistry.Read(wizardPath);
         using var rose = FormatRegistry.Read(rosePath);
