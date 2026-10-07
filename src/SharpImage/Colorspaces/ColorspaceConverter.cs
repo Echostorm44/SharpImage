@@ -559,9 +559,9 @@ public static class ColorspaceConverter
     private static void XyzToLab(double X, double Y, double Z,
         out double l, out double a, out double b)
     {
-        double fx = X / D65X > CIEEpsilon ? Math.Cbrt(X / D65X) : (CIEK * X / D65X + 16.0) / 116.0;
-        double fy = Y / D65Y > CIEEpsilon ? Math.Cbrt(Y / D65Y) : (CIEK * Y / D65Y + 16.0) / 116.0;
-        double fz = Z / D65Z > CIEEpsilon ? Math.Cbrt(Z / D65Z) : (CIEK * Z / D65Z + 16.0) / 116.0;
+        double fx = X / D65X > CIEEpsilon ? PortableMathD.Cbrt(X / D65X) : (CIEK * X / D65X + 16.0) / 116.0;
+        double fy = Y / D65Y > CIEEpsilon ? PortableMathD.Cbrt(Y / D65Y) : (CIEK * Y / D65Y + 16.0) / 116.0;
+        double fz = Z / D65Z > CIEEpsilon ? PortableMathD.Cbrt(Z / D65Z) : (CIEK * Z / D65Z + 16.0) / 116.0;
 
         l = (116.0 * fy - 16.0) / 100.0;
         a = 500.0 * (fx - fy) / 255.0 + 0.5;
@@ -633,7 +633,7 @@ public static class ColorspaceConverter
         out double l, out double u, out double v)
     {
         double yr = Y / D65Y;
-        l = yr > CIEEpsilon ? 116.0 * Math.Cbrt(yr) - 16.0 : CIEK * yr;
+        l = yr > CIEEpsilon ? 116.0 * PortableMathD.Cbrt(yr) - 16.0 : CIEK * yr;
 
         double denom = X + 15.0 * Y + 3.0 * Z;
         double alpha = denom > Epsilon ? 1.0 / denom : 0.0;
@@ -653,7 +653,7 @@ public static class ColorspaceConverter
     private static void LuvToXyz(double L, double u, double v,
         out double X, out double Y, out double Z)
     {
-        Y = L > CIEK * CIEEpsilon ? Math.Pow((L + 16.0) / 116.0, 3.0) : L / CIEK;
+        Y = L > CIEK * CIEEpsilon ? PortableMathD.Pow((L + 16.0) / 116.0, 3.0) : L / CIEK;
 
         double refDenom = D65X + 15.0 * D65Y + 3.0 * D65Z;
         double u0 = 4.0 * D65X / refDenom;
@@ -890,9 +890,9 @@ public static class ColorspaceConverter
         double sRaw = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * bl;
 
         // Cube root
-        double lCbrt = Math.Cbrt(lRaw);
-        double mCbrt = Math.Cbrt(mRaw);
-        double sCbrt = Math.Cbrt(sRaw);
+        double lCbrt = PortableMathD.Cbrt(lRaw);
+        double mCbrt = PortableMathD.Cbrt(mRaw);
+        double sCbrt = PortableMathD.Cbrt(sRaw);
 
         // M2: cube-root LMS → Oklab
         lightness = 0.2104542553 * lCbrt + 0.7936177850 * mCbrt - 0.0040720468 * sCbrt;
@@ -990,19 +990,19 @@ public static class ColorspaceConverter
     private static double PqForward(double x)
     {
         if (x <= 0.0) return 0.0;
-        double xn = Math.Pow(x / 10000.0, PqN);
-        return Math.Pow((PqC1 + PqC2 * xn) / (1.0 + PqC3 * xn), PqP);
+        double xn = PortableMathD.Pow(x / 10000.0, PqN);
+        return PortableMathD.Pow((PqC1 + PqC2 * xn) / (1.0 + PqC3 * xn), PqP);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static double PqInverse(double x)
     {
         if (x <= 0.0) return 0.0;
-        double xp = Math.Pow(x, 1.0 / PqP);
+        double xp = PortableMathD.Pow(x, 1.0 / PqP);
         double num = PqC1 - xp;
         double den = PqC3 * xp - PqC2;
         if (den >= 0.0) return 0.0;
-        return 10000.0 * Math.Pow(num / den, 1.0 / PqN);
+        return 10000.0 * PortableMathD.Pow(num / den, 1.0 / PqN);
     }
 
     public static void RgbToJzazbz(double red, double green, double blue,
@@ -1177,7 +1177,7 @@ public static class ColorspaceConverter
     {
         if (linear < 0.0) return 0.0;
         return linear >= ProPhotoEt
-            ? Math.Pow(linear, 1.0 / 1.8)
+            ? PortableMathD.Pow(linear, 1.0 / 1.8)
             : 16.0 * linear;
     }
 
@@ -1186,7 +1186,7 @@ public static class ColorspaceConverter
     {
         if (encoded < 0.0) return 0.0;
         return encoded >= 16.0 * ProPhotoEt
-            ? Math.Pow(encoded, 1.8)
+            ? PortableMathD.Pow(encoded, 1.8)
             : encoded / 16.0;
     }
 

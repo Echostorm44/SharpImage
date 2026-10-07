@@ -336,7 +336,7 @@ public static class ThresholdOps
                 if (histogram[i] > 0)
                 {
                     double p = (double)histogram[i] / w0;
-                    h0 -= p * Math.Log(p);
+                    h0 -= p * PortableMathD.Log(p);
                 }
             }
 
@@ -346,7 +346,7 @@ public static class ThresholdOps
                 if (histogram[i] > 0)
                 {
                     double p = (double)histogram[i] / w1;
-                    h1 -= p * Math.Log(p);
+                    h1 -= p * PortableMathD.Log(p);
                 }
             }
 

@@ -285,12 +285,12 @@ public static class AccessibilityOps
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static double SrgbToLinear(double v)
     {
-        return v <= 0.04045 ? v / 12.92 : Math.Pow((v + 0.055) / 1.055, 2.4);
+        return v <= 0.04045 ? v / 12.92 : PortableMathD.Pow((v + 0.055) / 1.055, 2.4);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static double LinearToSrgb(double v)
     {
-        return v <= 0.0031308 ? v * 12.92 : 1.055 * Math.Pow(v, 1.0 / 2.4) - 0.055;
+        return v <= 0.0031308 ? v * 12.92 : 1.055 * PortableMathD.Pow(v, 1.0 / 2.4) - 0.055;
     }
 }

@@ -3,6 +3,8 @@
 // upsampled result reproduces the source — much crisper colour edges. Ported operation for operation (fixed-point
 // tables for sRGB, the float transfer functions of sharpyuv_gamma.c for other H.273 curves) so the planes equal
 // libsharpyuv's; its SSE2 kernels are bit-exact with the C ones ported here.
+using SharpImage.Core;
+
 namespace SharpImage.Formats;
 
 internal static class SharpYuv
@@ -30,7 +32,7 @@ internal static class SharpYuv
         for (int v = 0; v <= GammaToLinearTabSize; v++)
         {
             double g = norm * v;
-            double value = g <= thresh * 4.5 ? g / 4.5 : Math.Pow(aRec * (g + a), kGammaF);
+            double value = g <= thresh * 4.5 ? g / 4.5 : PortableMathD.Pow(aRec * (g + a), kGammaF);
             GammaToLinearTab[v] = (uint)(value * finalScale + 0.5);
         }
         GammaToLinearTab[GammaToLinearTabSize + 1] = GammaToLinearTab[GammaToLinearTabSize];
@@ -38,7 +40,7 @@ internal static class SharpYuv
         for (int v = 0; v <= LinearToGammaTabSize; v++)
         {
             double g = scale * v;
-            double value = g <= thresh ? 4.5 * g : (1.0 + a) * Math.Pow(g, 1.0 / kGammaF) - a;
+            double value = g <= thresh ? 4.5 * g : (1.0 + a) * PortableMathD.Pow(g, 1.0 / kGammaF) - a;
             LinearToGammaTab[v] = (uint)(finalScale * value + 0.5);
         }
         LinearToGammaTab[LinearToGammaTabSize + 1] = LinearToGammaTab[LinearToGammaTabSize];
@@ -59,8 +61,8 @@ internal static class SharpYuv
 
     private static float Clamp01(float x) => x < 0f ? 0f : (1f < x ? 1f : x);
     private static float Roundf(float x) => x < 0 ? (float)Math.Ceiling((double)(x - 0.5f)) : (float)Math.Floor((double)(x + 0.5f));
-    private static float Powf(float b, float e) => (float)Math.Pow(b, e);
-    private static float Log10f(float x) => (float)Math.Log10(x);
+    private static float Powf(float b, float e) => (float)PortableMathD.Pow(b, e);
+    private static float Log10f(float x) => (float)PortableMathD.Log10(x);
 
     private static float ToLinear(float g, int tc) => tc switch
     {
@@ -79,7 +81,7 @@ internal static class SharpYuv
         16 => ToLinearPq(g),
         17 => Powf(MathF.Max(g, 0f), 2.6f) / 0.91655527974030934f,
         18 => g < 0f ? 0f : g <= 0.5f ? Powf((g * g) * (1f / 3f), 1.2f)
-            : Powf((MathF.Exp((g - 0.55991073f) / 0.17883277f) + 0.28466892f) / 12.0f, 1.2f),
+            : Powf((PortableMath.Exp((g - 0.55991073f) / 0.17883277f) + 0.28466892f) / 12.0f, 1.2f),
         _ => 0f,
     };
 
@@ -126,7 +128,7 @@ internal static class SharpYuv
         l = Powf(l, 1f / 1.2f);
         if (l < 0f) return 0f;
         if (l <= 1f / 12f) return MathF.Sqrt(3f * l);
-        return 0.17883277f * MathF.Log(12f * l - 0.28466892f) + 0.55991073f;
+        return 0.17883277f * PortableMath.Log(12f * l - 0.28466892f) + 0.55991073f;
     }
 
     // SharpYuvGammaToLinear / SharpYuvLinearToGamma (13 = sRGB tables; 8 = linear returns the sample as is).

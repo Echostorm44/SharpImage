@@ -403,7 +403,7 @@ public static class ConvolutionFilters
         for (int i = 0;i < size;i++)
         {
             double x = i - radius;
-            kernel[i] = (float)Math.Exp(-(x * x) / twoSigmaSquared);
+            kernel[i] = (float)PortableMathD.Exp(-(x * x) / twoSigmaSquared);
             sum += kernel[i];
         }
 

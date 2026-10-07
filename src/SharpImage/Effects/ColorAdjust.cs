@@ -1,4 +1,4 @@
-﻿using SharpImage.Core;
+using SharpImage.Core;
 using SharpImage.Image;
 using System.Buffers;
 using System.Runtime.CompilerServices;
@@ -39,7 +39,7 @@ public static class ColorAdjust
         }
 
         double invGamma = 1.0 / gamma;
-        return ApplyPerPixel(source, val => Math.Pow(val, invGamma));
+        return ApplyPerPixel(source, val => PortableMathD.Pow(val, invGamma));
     }
 
     /// <summary>
@@ -185,7 +185,7 @@ public static class ColorAdjust
         return ApplyPerPixel(source, val =>
         {
             double normalized = Math.Clamp((val - inBlack) / range, 0.0, 1.0);
-            double gammaCorrected = Math.Pow(normalized, invGamma);
+            double gammaCorrected = PortableMathD.Pow(normalized, invGamma);
             return outBlack + gammaCorrected * (outWhite - outBlack);
         });
     }
@@ -251,6 +251,10 @@ public static class ColorAdjust
 
     // ─── Internal Helper ─────────────────────────────────────────
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ushort Apply(Func<double, double> transform, double val) =>
+        (ushort)Math.Clamp(transform(val) * Quantum.MaxValue + 0.5, 0, Quantum.MaxValue);
+
     /// <summary>
     /// Applies a per-channel color function (value in 0.0-1.0 range). Only processes RGB channels, preserves alpha.
     /// Parallelized across scanlines.
@@ -264,6 +268,11 @@ public static class ColorAdjust
         var result = new ImageFrame();
         result.Initialize(width, height, source.Colorspace, source.HasAlpha);
 
+        // The transform sees the sample alone, so large images evaluate it once per quantum value.
+        ushort[]? lut = (long)width * height * Math.Min(channels, 3) >= QuantumLut.MinSamples
+            ? QuantumLut.Build(i => Apply(transform, i * Quantum.Scale))
+            : null;
+
         Parallel.For(0, height, y =>
         {
             var srcRow = source.GetPixelRow(y);
@@ -276,9 +285,7 @@ public static class ColorAdjust
 
                 for (int c = 0;c < colorChannels;c++)
                 {
-                    double val = srcRow[off + c] * Quantum.Scale;
-                    double adjusted = transform(val);
-                    dstRow[off + c] = (ushort)Math.Clamp(adjusted * Quantum.MaxValue + 0.5, 0, Quantum.MaxValue);
+                    dstRow[off + c] = lut != null ? lut[srcRow[off + c]] : Apply(transform, srcRow[off + c] * Quantum.Scale);
                 }
 
                 if (channels > 3)
@@ -433,7 +440,7 @@ public static class ColorAdjust
     /// </summary>
     public static ImageFrame Exposure(ImageFrame source, double evStops)
     {
-        double multiplier = Math.Pow(2.0, evStops);
+        double multiplier = PortableMathD.Pow(2.0, evStops);
         return ApplyPerPixel(source, val => val * multiplier);
     }
 
@@ -710,7 +717,7 @@ public static class ColorAdjust
 
                 // Tonal targeting: Gaussian around the target range
                 double distance = lum - range;
-                double weight = Math.Exp(-(distance * distance) / (2.0 * 0.15 * 0.15));
+                double weight = PortableMathD.Exp(-(distance * distance) / (2.0 * 0.15 * 0.15));
                 double adjustedExposure = exposure * weight;
 
                 for (int c = 0; c < colorChannels; c++)

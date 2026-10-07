@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -34,8 +35,8 @@ internal sealed partial class AomGqEncoder
     {
         double avWeight = totalStats.Weight / totalStats.Count;
         double avErr = (totalStats.CodedError * avWeight) / totalStats.Count;
-        double modifiedError = avErr * Math.Pow(thisStats.CodedError * thisStats.Weight / DoubleDivideCheck(avErr), vbrbias / 100.0);
-        modifiedError *= Math.Pow(CalculateActiveArea(thisStats), 0.5);
+        double modifiedError = avErr * PortableMathD.Pow(thisStats.CodedError * thisStats.Weight / DoubleDivideCheck(avErr), vbrbias / 100.0);
+        modifiedError *= PortableMathD.Pow(CalculateActiveArea(thisStats), 0.5);
         return Fclamp(modifiedError, modifiedErrorMin, modifiedErrorMax);
     }
 
@@ -1643,8 +1644,8 @@ internal sealed partial class AomGqEncoder
 
     private void SetTwopassParamsBasedOnFpStats(in AomFpStats f)
     {
-        _twopass.MbAvEnergy = Math.Log(1 + f.IntraError);
-        if (!(_twopass.TotalStats.FrameAvgWaveletEnergy < 0)) _twopass.FrameAvgHaarEnergy = Math.Log(1 + f.FrameAvgWaveletEnergy);
+        _twopass.MbAvEnergy = PortableMathD.Log(1 + f.IntraError);
+        if (!(_twopass.TotalStats.FrameAvgWaveletEnergy < 0)) _twopass.FrameAvgHaarEnergy = PortableMathD.Log(1 + f.FrameAvgWaveletEnergy);
         _twopass.FrContentType = f.IntraSkipPct >= 0.15 ? 1 : 0;
     }
 

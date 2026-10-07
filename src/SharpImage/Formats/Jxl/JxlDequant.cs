@@ -2,6 +2,7 @@
 // jxl-vardct dequant.rs (DequantMatrixParams / into_matrix) and libjxl.
 using System;
 using System.Collections.Generic;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Jxl;
 
@@ -246,7 +247,7 @@ internal sealed class DequantMatrixParams
         float frac = scaledPos - scaledIndex;
         float a = bands[scaledIndex];
         float b = bands[scaledIndex + 1];
-        return a * MathF.Pow(b / a, frac);
+        return a * PortableMath.Pow(b / a, frac);
     }
 
     private static float[] DctQuantWeights(float[] p, int width, int height)

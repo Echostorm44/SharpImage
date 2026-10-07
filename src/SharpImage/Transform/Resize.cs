@@ -533,7 +533,7 @@ public static class Resize
     {
         x = Math.Abs(x);
         if (x >= 2.0) return 0.0;
-        return Math.Exp(-2.0 * x * x);
+        return PortableMathD.Exp(-2.0 * x * x);
     }
 
     // B-Spline (B=1, C=0, support = 2.0) — very smooth, no ringing, blurry

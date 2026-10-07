@@ -273,7 +273,7 @@ public static class SelectionOps
                     if (span[m] < span[minIdx]) minIdx = m;
                 (span[j], span[minIdx]) = (span[minIdx], span[j]);
 
-                double w = Math.Exp(-span[j] / (2.0 * sigmaSq + 1e-12));
+                double w = PortableMathD.Exp(-span[j] / (2.0 * sigmaSq + 1e-12));
                 weightedDist += w * span[j];
                 weightSum += w;
             }
@@ -747,7 +747,7 @@ public static class SelectionOps
         for (int i = 0; i < size; i++)
         {
             int d = i - radius;
-            double val = Math.Exp(-(d * d) / twoSigmaSq);
+            double val = PortableMathD.Exp(-(d * d) / twoSigmaSq);
             kernel[i] = (float)val;
             sum += val;
         }
@@ -792,9 +792,9 @@ public static class SelectionOps
                 double varG = Math.Max(comp.Variance[1], 1e-6);
                 double varB = Math.Max(comp.Variance[2], 1e-6);
 
-                double logDet = Math.Log(varR) + Math.Log(varG) + Math.Log(varB);
+                double logDet = PortableMathD.Log(varR) + PortableMathD.Log(varG) + PortableMathD.Log(varB);
                 double mahal = dr * dr / varR + dg * dg / varG + db * db / varB;
-                double logProb = Math.Log(comp.Weight) - 0.5 * (3.0 * Math.Log(2 * Math.PI) + logDet + mahal);
+                double logProb = PortableMathD.Log(comp.Weight) - 0.5 * (3.0 * PortableMathD.Log(2 * Math.PI) + logDet + mahal);
                 if (logProb > maxLog) maxLog = logProb;
             }
             return maxLog;
@@ -1017,7 +1017,7 @@ public static class SelectionOps
 
                     int ni = (ny * width + nx) * 3;
                     double dr = r - pixels[ni], dg = g - pixels[ni + 1], db = b - pixels[ni + 2];
-                    double nWeight = smoothnessLambda * Math.Exp(-beta * (dr * dr + dg * dg + db * db));
+                    double nWeight = smoothnessLambda * PortableMathD.Exp(-beta * (dr * dr + dg * dg + db * db));
 
                     var nLabel = labels[ny * width + nx];
                     bool nIsFg = nLabel == GrabCutLabel.Foreground || nLabel == GrabCutLabel.ProbableForeground;

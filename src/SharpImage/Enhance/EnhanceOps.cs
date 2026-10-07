@@ -224,25 +224,23 @@ public static class EnhanceOps
         {
             double mean = channelSum[c] / totalPixels;
             if (mean > 1e-10 && mean < 1.0 - 1e-10)
-                gammaValues[c] = Math.Log(0.5) / Math.Log(mean);
+                gammaValues[c] = PortableMathD.Log(0.5) / PortableMathD.Log(mean);
             else
                 gammaValues[c] = 1.0; // no correction needed
         }
 
         // Precompute gamma LUTs to avoid Math.Pow per pixel
-        int lutSize = Quantum.MaxValue + 1;
         var gammaLuts = new ushort[colorChannels][];
         double invMax = 1.0 / Quantum.MaxValue;
         for (int c = 0; c < colorChannels; c++)
         {
-            gammaLuts[c] = new ushort[lutSize];
             double gamma = gammaValues[c];
-            for (int i = 0; i < lutSize; i++)
+            gammaLuts[c] = QuantumLut.Build(i =>
             {
                 double val = i * invMax;
-                double corrected = Math.Pow(val, gamma);
-                gammaLuts[c][i] = (ushort)Math.Clamp(corrected * Quantum.MaxValue + 0.5, 0, Quantum.MaxValue);
-            }
+                double corrected = PortableMathD.Pow(val, gamma);
+                return (ushort)Math.Clamp(corrected * Quantum.MaxValue + 0.5, 0, Quantum.MaxValue);
+            });
         }
 
         var result = new ImageFrame();
@@ -293,21 +291,21 @@ public static class EnhanceOps
             if (sharpen)
             {
                 // Increase contrast: sigmoid stretch
-                double sigIn = 1.0 / (1.0 + Math.Exp(contrast * (midpoint - val)));
-                double sigMid = 1.0 / (1.0 + Math.Exp(contrast * (midpoint - 0.0)));
-                double sigMax = 1.0 / (1.0 + Math.Exp(contrast * (midpoint - 1.0)));
+                double sigIn = 1.0 / (1.0 + PortableMathD.Exp(contrast * (midpoint - val)));
+                double sigMid = 1.0 / (1.0 + PortableMathD.Exp(contrast * (midpoint - 0.0)));
+                double sigMax = 1.0 / (1.0 + PortableMathD.Exp(contrast * (midpoint - 1.0)));
                 result = (sigIn - sigMid) / (sigMax - sigMid);
             }
             else
             {
                 // Decrease contrast: inverse sigmoid
-                double sigMid = 1.0 / (1.0 + Math.Exp(contrast * (midpoint - 0.0)));
-                double sigMax = 1.0 / (1.0 + Math.Exp(contrast * (midpoint - 1.0)));
+                double sigMid = 1.0 / (1.0 + PortableMathD.Exp(contrast * (midpoint - 0.0)));
+                double sigMax = 1.0 / (1.0 + PortableMathD.Exp(contrast * (midpoint - 1.0)));
                 double scaledVal = val * (sigMax - sigMid) + sigMid;
                 if (scaledVal <= 0 || scaledVal >= 1.0)
                     result = val;
                 else
-                    result = midpoint - Math.Log(1.0 / scaledVal - 1.0) / contrast;
+                    result = midpoint - PortableMathD.Log(1.0 / scaledVal - 1.0) / contrast;
             }
 
             lut[i] = (ushort)Math.Clamp(result * Quantum.MaxValue + 0.5, 0, Quantum.MaxValue);
@@ -1175,15 +1173,14 @@ public static class EnhanceOps
         double invGamma = gamma != 0 ? 1.0 / gamma : 1.0;
 
         // Build LUT
-        ushort[] lut = new ushort[Quantum.MaxValue + 1];
         double range = whitePoint - blackPoint;
-        for (int i = 0; i <= Quantum.MaxValue; i++)
+        ushort[] lut = QuantumLut.Build(i =>
         {
             double normalized = (double)i / Quantum.MaxValue;
-            double gammaCorrected = Math.Pow(normalized, invGamma);
+            double gammaCorrected = PortableMathD.Pow(normalized, invGamma);
             double output = gammaCorrected * range + blackPoint;
-            lut[i] = (ushort)Math.Clamp(output, 0, Quantum.MaxValue);
-        }
+            return (ushort)Math.Clamp(output, 0, Quantum.MaxValue);
+        });
 
         var result = new ImageFrame();
         result.Initialize((uint)width, (uint)height, source.Colorspace, hasAlpha);

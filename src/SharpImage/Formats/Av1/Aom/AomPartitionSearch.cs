@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -283,8 +284,8 @@ internal static partial class AomEncodeFrame
             }
             minVar4x4 = Math.Min(minVar4x4, (int)vmin);
             maxVar4x4 = Math.Max(maxVar4x4, (int)vmax);
-            varMin = Math.Log(1 + minVar4x4 / 16.0);
-            varMax = Math.Log(1 + maxVar4x4 / 16.0);
+            varMin = PortableMathD.Log(1 + minVar4x4 / 16.0);
+            varMax = PortableMathD.Log(1 + maxVar4x4 / 16.0);
             return;
         }
         for (int i = 0; i < bh; i += 4)
@@ -295,8 +296,8 @@ internal static partial class AomEncodeFrame
                 minVar4x4 = Math.Min(minVar4x4, var);
                 maxVar4x4 = Math.Max(maxVar4x4, var);
             }
-        varMin = Math.Log(1 + minVar4x4 / 16.0);
-        varMax = Math.Log(1 + maxVar4x4 / 16.0);
+        varMin = PortableMathD.Log(1 + minVar4x4 / 16.0);
+        varMax = PortableMathD.Log(1 + maxVar4x4 / 16.0);
     }
 
     /// <summary>av1_prune_partitions_before_search (intra frames).</summary>

@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -338,8 +339,8 @@ internal sealed partial class AomGqEncoder
         fps.LtCodedError /= n;
         fps.IntraError /= n;
         fps.FrameAvgWaveletEnergy /= n;
-        fps.LogCodedError = Math.Log(1 + fps.CodedError);
-        fps.LogIntraError = Math.Log(1 + fps.IntraError);
+        fps.LogCodedError = PortableMathD.Log(1 + fps.CodedError);
+        fps.LogIntraError = PortableMathD.Log(1 + fps.IntraError);
         fps.MVr /= height;
         fps.MvrAbs /= height;
         fps.MVc /= width;
@@ -513,7 +514,7 @@ internal sealed partial class AomGqEncoder
     }
 
     /// <summary>log1p.</summary>
-    private static double LogOnePlus(int v) => Math.Log(1.0 + v);
+    private static double LogOnePlus(int v) => PortableMathD.Log(1.0 + v);
 
     /// <summary>aom_get_mb_ss: the sum of squares of the first 256 residuals.</summary>
     private static int GetMbSs(short[] a)

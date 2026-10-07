@@ -5,6 +5,7 @@
 // order follows the C so the estimated parameters match libaom's (aomenc --denoise-noise-level).
 
 using System;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -358,7 +359,7 @@ internal static class Av1NoiseModel
                     bool isFlat = trace < kTraceThreshold && ratio < kRatioThreshold && norm < kNormThreshold && var > kVarThreshold;
                     double sumWeights = -6682 * var + -0.2056 * ratio + 13087 * trace + -12434 * norm + 2.5694;
                     sumWeights = FClamp(sumWeights, -25.0, 100.0);
-                    float score = (float)(1.0 / (1 + Math.Exp(-sumWeights)));
+                    float score = (float)(1.0 / (1 + PortableMathD.Exp(-sumWeights)));
                     flatBlocks[by * numBlocksW + bx] = isFlat ? (byte)255 : (byte)0;
                     scores[by * numBlocksW + bx] = var > kVarThreshold ? score : 0;
                     index[by * numBlocksW + bx] = by * numBlocksW + bx;
@@ -538,7 +539,7 @@ internal static class Av1NoiseModel
                     double noiseVar = NoiseVar(data, denoised, stride, w >> subX, h >> subY, xo, yo, blockSize >> subX, blockSize >> subY);
                     double lumaStrength = c > 0 ? lumaGain * lumaSolver.Value(blockMean) : 0;
                     double corr = c > 0 ? coeffs[numCoords] : 0;
-                    double uncorrStd = Math.Sqrt(AMax(noiseVar / 16, noiseVar - Math.Pow(corr * lumaStrength, 2)));
+                    double uncorrStd = Math.Sqrt(AMax(noiseVar / 16, noiseVar - PortableMathD.Pow(corr * lumaStrength, 2)));
                     double adjustedStrength = uncorrStd / noiseGain;
                     solver.AddMeasurement(blockMean, adjustedStrength);
                 }
@@ -641,7 +642,7 @@ internal static class Av1NoiseModel
                 p[1] = AMin(255, p[1] / strengthDivisor);
                 maxScalingValue = AMax(p[1], maxScalingValue);
             }
-        int maxScalingValueLog2 = Math.Clamp((int)Math.Floor(Math.Log2(maxScalingValue) + 1), 2, 5);
+        int maxScalingValueLog2 = Math.Clamp((int)Math.Floor(PortableMathD.Log2(maxScalingValue) + 1), 2, 5);
         g.ScalingShift = 5 + (8 - maxScalingValueLog2);
         double scaleFactor = 1 << (8 - maxScalingValueLog2);
         (int, int)[] Convert(double[][] pts)
@@ -687,7 +688,7 @@ internal static class Av1NoiseModel
                 minCoeff = AMin(minCoeff, yCorr[c - 1]);
             }
         }
-        g.ArCoeffShift = Math.Clamp(7 - (int)AMax(1 + Math.Floor(Math.Log2(maxCoeff)), Math.Ceiling(Math.Log2(-minCoeff))), 6, 9);
+        g.ArCoeffShift = Math.Clamp(7 - (int)AMax(1 + Math.Floor(PortableMathD.Log2(maxCoeff)), Math.Ceiling(PortableMathD.Log2(-minCoeff))), 6, 9);
         double scaleAr = 1 << g.ArCoeffShift;
         int[][] ar = [g.ArCoeffsY, g.ArCoeffsCb, g.ArCoeffsCr];
         for (int c = 0; c < 3; ++c)

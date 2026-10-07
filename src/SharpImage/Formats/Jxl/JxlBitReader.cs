@@ -121,7 +121,7 @@ internal sealed class JxlBitReader
         float val;
         if (exp == 0)
         {
-            val = man / 1024f * MathF.Pow(2, -14);
+            val = man / 1024f * MathF.ScaleB(1f, -14);
         }
         else if (exp == 31)
         {
@@ -129,7 +129,7 @@ internal sealed class JxlBitReader
         }
         else
         {
-            val = (1 + man / 1024f) * MathF.Pow(2, exp - 15);
+            val = (1 + man / 1024f) * MathF.ScaleB(1f, exp - 15);
         }
 
         return sign != 0 ? -val : val;

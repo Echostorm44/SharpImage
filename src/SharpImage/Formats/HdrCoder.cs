@@ -202,7 +202,7 @@ public static class HdrCoder
         }
 
         // gamma = 2^(e - 128 - 8) = ldexp(1.0, e - 136)
-        float gamma = MathF.Pow(2f, e - 136f);
+        float gamma = MathF.ScaleB(1f, e - 136);   // exact power of two (also below the normal range)
         rf = r * gamma;
         gf = g * gamma;
         bf = b * gamma;

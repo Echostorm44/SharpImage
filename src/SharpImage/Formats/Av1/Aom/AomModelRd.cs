@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -109,7 +110,7 @@ internal static partial class AomModelRd
         if (sse == 0) { rate = 0; dist = 0; return; }
         double sseNorm = (double)sse / numSamples;
         double qstepsqr = (double)qstep * qstep;
-        double xqr = Math.Log2(sseNorm / qstepsqr);
+        double xqr = PortableMathD.Log2(sseNorm / qstepsqr);
         Curvfit(planeBsize, sseNorm, xqr, out double rateF, out double distBySseNormF);
         double distF = distBySseNormF * sseNorm;
         int rateI = (int)(Math.Max(0.0, rateF * numSamples) + 0.5);

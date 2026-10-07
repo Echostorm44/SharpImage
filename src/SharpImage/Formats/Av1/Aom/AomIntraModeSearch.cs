@@ -4,6 +4,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -336,7 +337,7 @@ internal static class AomIntraModeSearch
 
     // libaom's log1p is mingw-w64's x87 fyl2xp1 / fyl2x at 64-bit precision; log(1 + x) with 1 + x exact (x = k / 16)
     // matches it on all but ~0.02% of the inputs (1 ulp), below the resolution of the (int64) rd truncation it feeds
-    private static double Log1p(double x) => Math.Log(1 + x);
+    private static double Log1p(double x) => PortableMathD.Log(1 + x);
 
     /// <summary>INTRA_RD_VAR_THRESH.</summary>
     private static double IntraRdVarThresh(int speed) => 1.0 - 0.25 * speed;

@@ -516,7 +516,7 @@ public static class VisualEffectsOps
             double dx = px - points[k].X;
             double dy = py - points[k].Y;
             double distSq = dx * dx + dy * dy;
-            double weight = Math.Pow(distSq, power * 0.5);
+            double weight = PortableMathD.Pow(distSq, power * 0.5);
             weight = weight < 1.0 ? 1.0 : 1.0 / weight;
 
             sumR += points[k].R * weight;
@@ -651,7 +651,7 @@ public static class VisualEffectsOps
         double kernelSum = 0;
         for (int i = -kernelRadius; i <= kernelRadius; i++)
         {
-            kernel[i + kernelRadius] = Math.Exp(-(i * i) / (2.0 * sigma * sigma));
+            kernel[i + kernelRadius] = PortableMathD.Exp(-(i * i) / (2.0 * sigma * sigma));
             kernelSum += kernel[i + kernelRadius];
         }
         for (int i = 0; i < kernel.Length; i++)
@@ -1150,6 +1150,14 @@ public static class CdlOps
         var result = new ImageFrame();
         result.Initialize(width, height, source.Colorspace, source.HasAlpha);
 
+        // The SOP transform of a channel depends on that sample alone: large images evaluate it once per quantum value.
+        static double Sop(int q, double slope, double offset, double power) =>
+            PortableMathD.Pow(Math.Clamp(q / (double)Quantum.MaxValue * slope + offset, 0, 1), power);
+        bool useLut = (long)width * height * colorChannels >= QuantumLut.MinSamples;
+        double[]? lutR = useLut ? QuantumLut.BuildDouble(q => Sop(q, slopeR, offsetR, powerR)) : null;
+        double[]? lutG = useLut ? QuantumLut.BuildDouble(q => Sop(q, slopeG, offsetG, powerG)) : null;
+        double[]? lutB = useLut ? QuantumLut.BuildDouble(q => Sop(q, slopeB, offsetB, powerB)) : null;
+
         Parallel.For(0, height, y =>
         {
             var srcRow = source.GetPixelRow(y);
@@ -1160,13 +1168,12 @@ public static class CdlOps
                 int off = x * channels;
 
                 // SOP transform per channel (normalized 0..1)
-                double r = srcRow[off] / (double)Quantum.MaxValue;
-                double g = colorChannels >= 2 ? srcRow[off + 1] / (double)Quantum.MaxValue : r;
-                double b = colorChannels >= 3 ? srcRow[off + 2] / (double)Quantum.MaxValue : r;
-
-                r = Math.Pow(Math.Clamp(r * slopeR + offsetR, 0, 1), powerR);
-                g = Math.Pow(Math.Clamp(g * slopeG + offsetG, 0, 1), powerG);
-                b = Math.Pow(Math.Clamp(b * slopeB + offsetB, 0, 1), powerB);
+                int qr = srcRow[off];
+                int qg = colorChannels >= 2 ? srcRow[off + 1] : qr;
+                int qb = colorChannels >= 3 ? srcRow[off + 2] : qr;
+                double r = lutR != null ? lutR[qr] : Sop(qr, slopeR, offsetR, powerR);
+                double g = lutG != null ? lutG[qg] : Sop(qg, slopeG, offsetG, powerG);
+                double b = lutB != null ? lutB[qb] : Sop(qb, slopeB, offsetB, powerB);
 
                 // Apply saturation
                 if (Math.Abs(saturation - 1.0) > 0.001)

@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -250,7 +251,7 @@ internal sealed partial class AomGqEncoder
             }
             accuCoeff1 *= Math.Max(_twopass.Buf[stats + filterFrameLookaheadIdx + i].CorCoeff, 0.001);
         }
-        if (maxAfter >= 1) accuCoeff1 = Math.Pow(accuCoeff1, 1.0 / maxAfter);
+        if (maxAfter >= 1) accuCoeff1 = PortableMathD.Pow(accuCoeff1, 1.0 / maxAfter);
         for (int i = 1; i <= maxBefore; i++)
         {
             if (stats + filterFrameLookaheadIdx - i + 1 <= _twopass.InStart)
@@ -260,7 +261,7 @@ internal sealed partial class AomGqEncoder
             }
             accuCoeff0 *= Math.Max(_twopass.Buf[stats + filterFrameLookaheadIdx - i + 1].CorCoeff, 0.001);
         }
-        if (maxBefore >= 1) accuCoeff0 = Math.Pow(accuCoeff0, 1.0 / maxBefore);
+        if (maxBefore >= 1) accuCoeff0 = PortableMathD.Pow(accuCoeff0, 1.0 / maxBefore);
 
         int adjustNum = 6;
         var sf = TfCompressor().Sf;
@@ -595,17 +596,17 @@ internal sealed partial class AomGqEncoder
         int minFrameSize = Math.Min(frameToFilter.CropHeights[0], frameToFilter.CropWidths[0]);
         double invFactor = 1.0 / ((TF_WINDOW_BLOCK_BALANCE_WEIGHT + 1) * TF_SEARCH_ERROR_NORM_WEIGHT);
         double weightFactor = TF_WINDOW_BLOCK_BALANCE_WEIGHT * invFactor;
-        double qDecay = Math.Pow((double)qFactor / TF_Q_DECAY_THRESHOLD, 2);
+        double qDecay = PortableMathD.Pow((double)qFactor / TF_Q_DECAY_THRESHOLD, 2);
         qDecay = Math.Clamp(qDecay, 1e-5, 1);
-        if (qFactor >= TF_QINDEX_CUTOFF) qDecay = 0.5 * Math.Pow((double)qFactor / 64, 2);
-        double sDecay = Math.Pow((double)filterStrength / TF_STRENGTH_THRESHOLD, 2);
+        if (qFactor >= TF_QINDEX_CUTOFF) qDecay = 0.5 * PortableMathD.Pow((double)qFactor / 64, 2);
+        double sDecay = PortableMathD.Pow((double)filterStrength / TF_STRENGTH_THRESHOLD, 2);
         sDecay = Math.Clamp(sDecay, 1e-5, 1);
         var dFactor = new double[NUM_16X16];
         double distanceThreshold = Math.Max(minFrameSize * TF_SEARCH_DISTANCE_THRESHOLD, 1);
         for (int i = 0; i < NUM_16X16; i++)
         {
             var mv = subblockMvs[i];
-            double distance = Math.Sqrt(Math.Pow(mv.Row, 2) + Math.Pow(mv.Col, 2));
+            double distance = Math.Sqrt(PortableMathD.Pow(mv.Row, 2) + PortableMathD.Pow(mv.Col, 2));
             dFactor[i] = Math.Max(distance / distanceThreshold, 1);
         }
         var squareDiff = new uint[TF_BLOCK * TF_BLOCK];
@@ -619,7 +620,7 @@ internal sealed partial class AomGqEncoder
             int frameOffset = frameToFilter.Offsets[plane] + mbRow * h * frameStride + mbCol * w;
             int numRefPixels = 25 + (plane != 0 ? 1 << (ssx + ssy) : 0);
             double invNumRefPixels = 1.0 / numRefPixels;
-            double nDecay = 0.5 + Math.Log(2 * noiseLevels[plane] + 5.0);
+            double nDecay = 0.5 + PortableMathD.Log(2 * noiseLevels[plane] + 5.0);
             double decayFactor = 1 / (nDecay * qDecay * sDecay);
             // the luma sse sum for the chroma planes (computed at U from the luma square differences)
             if (plane == 1)
@@ -676,7 +677,7 @@ internal sealed partial class AomGqEncoder
                     }
                     scaledError = Math.Min(scaledError, 7);
                     int weight;
-                    if (tfWgtCalcLvl == 0) weight = (int)(Math.Exp(-scaledError) * TF_WEIGHT_SCALE);
+                    if (tfWgtCalcLvl == 0) weight = (int)(PortableMathD.Exp(-scaledError) * TF_WEIGHT_SCALE);
                     else
                     {
                         float fw = ApproxExp((float)-scaledError) * TF_WEIGHT_SCALE;
@@ -733,7 +734,7 @@ internal sealed partial class AomGqEncoder
                         varMin = Math.Min(varMin, v);
                         varMax = Math.Max(varMax, v);
                     }
-                double vmin = Math.Log(1 + varMin / 16.0), vmax = Math.Log(1 + varMax / 16.0);
+                double vmin = PortableMathD.Log(1 + varMin / 16.0), vmax = PortableMathD.Log(1 + varMax / 16.0);
                 if (vmax - vmin <= 4.0) allowMeForSubBlks = false;
             }
             for (int frame = 0; frame < numFrames; frame++)

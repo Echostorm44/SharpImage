@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -29,7 +30,7 @@ internal sealed class AomRdOpt
             10 => AomComp.DcQuantQtx(qindex, 0, 10) / 16.0,
             _ => AomComp.DcQuantQtx(qindex, 0, 12) / 64.0,
         };
-        return Math.Max((int)(Math.Pow(q, 1.25) * 5.12), 8);   // RD_THRESH_POW
+        return Math.Max((int)(PortableMathD.Pow(q, 1.25) * 5.12), 8);   // RD_THRESH_POW
     }
 
     /// <summary>set_block_thresholds (the RD pick mode: every mode; no segmentation, so each segment's qindex is the

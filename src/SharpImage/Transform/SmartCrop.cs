@@ -54,7 +54,7 @@ public static class SmartCrop
             try
             {
                 for (int i = 0; i < srcW * srcH; i++)
-                    interestMap[i] = saliencyMap[i] * 2f + entropyMap[i] + MathF.Log(1f + edgeMag[i]) * 0.1f;
+                    interestMap[i] = saliencyMap[i] * 2f + entropyMap[i] + PortableMath.LogFast(1f + edgeMag[i]) * 0.1f;
 
                 integralInterest = BuildIntegralImage(interestMap, srcW, srcH);
 
@@ -178,7 +178,7 @@ public static class SmartCrop
             try
             {
                 for (int i = 0; i < srcW * srcH; i++)
-                    interestMap[i] = saliencyMap[i] * 2f + entropyMap[i] + MathF.Log(1f + edgeMag[i]) * 0.1f;
+                    interestMap[i] = saliencyMap[i] * 2f + entropyMap[i] + PortableMath.LogFast(1f + edgeMag[i]) * 0.1f;
 
                 integralInterest = BuildIntegralImage(interestMap, srcW, srcH);
 
@@ -376,7 +376,7 @@ public static class SmartCrop
         // Center bias — subjects tend to be near the center
         double dx = (x - centerX) / sigmaX;
         double dy = (y - centerY) / sigmaY;
-        double centerBias = Math.Exp(-0.5 * (dx * dx + dy * dy));
+        double centerBias = PortableMathD.Exp(-0.5 * (dx * dx + dy * dy));
         return content * (0.6 + 0.4 * centerBias);
     }
 
@@ -599,7 +599,7 @@ public static class SmartCrop
         for (int i = 0; i < rarity.Length; i++)
         {
             if (histogram[i] > 0 && histogram[i] < commonThreshold)
-                rarity[i] = MathF.Log(1f + (float)totalPixels / histogram[i]);
+                rarity[i] = PortableMath.LogFast(1f + (float)totalPixels / histogram[i]);
             // Common bins and empty bins score 0
         }
 
@@ -639,7 +639,7 @@ public static class SmartCrop
             for (int x = 1; x <= width; x++)
             {
                 // Log-compress to reduce impact of extreme edge values
-                rowSum += Math.Log(1.0 + values[(y - 1) * width + (x - 1)]);
+                rowSum += PortableMathD.LogFast(1.0 + values[(y - 1) * width + (x - 1)]);
                 integral[y * stride + x] = rowSum + integral[(y - 1) * stride + x];
             }
         }
@@ -694,6 +694,16 @@ public static class SmartCrop
         var entropyMap = ArrayPool<float>.Shared.Rent(width * height);
         int halfBlock = blockSize / 2;
 
+        // p log2 p for every bin count of a full (interior) window, the same expression the loop evaluates
+        int fullCount = (2 * halfBlock + 1) * (2 * halfBlock + 1);
+        float invFull = 1f / fullCount;
+        var fullTerms = new float[fullCount + 1];
+        for (int k = 1; k <= fullCount; k++)
+        {
+            float p = k * invFull;
+            fullTerms[k] = p * PortableMath.Log2Fast(p);
+        }
+
         Parallel.For(0, height, y =>
         {
             Span<int> hist = stackalloc int[256];
@@ -718,12 +728,20 @@ public static class SmartCrop
 
                 float entropy = 0f;
                 float invCount = 1f / count;
+                bool full = count == fullCount;
                 for (int i = 0; i < 256; i++)
                 {
                     if (hist[i] > 0)
                     {
-                        float p = hist[i] * invCount;
-                        entropy -= p * MathF.Log2(p);
+                        if (full)
+                        {
+                            entropy -= fullTerms[hist[i]];
+                        }
+                        else
+                        {
+                            float p = hist[i] * invCount;
+                            entropy -= p * PortableMath.Log2Fast(p);
+                        }
                     }
                 }
 

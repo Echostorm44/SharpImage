@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -372,7 +373,7 @@ internal static partial class AomEncodeFrame
                 geomMeanOfScale *= cpi.SsimRdmultScalingFactors![row * numCols + col];
                 numOfMi += 1.0;
             }
-        geomMeanOfScale = Math.Pow(geomMeanOfScale, 1.0 / numOfMi);
+        geomMeanOfScale = PortableMathD.Pow(geomMeanOfScale, 1.0 / numOfMi);
         int rdIn = x.Rdmult;
         x.Rdmult = (int)((double)x.Rdmult * geomMeanOfScale + 0.5);
         AomTrace.Out?.Write($"ssim {miRow} {miCol} bs {bsize} {rdIn} -> {x.Rdmult} mi {cm.MiRows} {cm.MiCols}" + (char)10);

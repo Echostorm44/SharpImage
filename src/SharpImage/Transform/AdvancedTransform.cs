@@ -61,7 +61,7 @@ public static class AdvancedTransform
                 if (distSq >= radiusSq) continue;
 
                 // Gaussian falloff weight
-                double weight = Math.Exp(-distSq / (2.0 * (radius / 3.0) * (radius / 3.0))) * strength;
+                double weight = PortableMathD.ExpFast(-distSq / (2.0 * (radius / 3.0) * (radius / 3.0))) * strength;
 
                 // Source pixel (inverse warp: subtract displacement)
                 double srcX = x - dx * weight;

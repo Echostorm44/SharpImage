@@ -7,6 +7,7 @@
 using System;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Jxl;
 
@@ -628,7 +629,7 @@ internal static class JxlTreeLearner
         var t = new double[1 << 16];
         for (int i = 1; i < t.Length; i++)
         {
-            t[i] = Math.Log2(i);
+            t[i] = PortableMathD.Log2(i);
         }
 
         return t;
@@ -646,7 +647,7 @@ internal static class JxlTreeLearner
             return 0;
         }
 
-        double log2Total = Math.Log2(total);
+        double log2Total = PortableMathD.Log2Fast(total);
         double bits = 0;
         long floorBits = 0;
         for (int i = 0; i < len; i++)
@@ -663,7 +664,7 @@ internal static class JxlTreeLearner
             }
             else
             {
-                bits += c * (log2Total - (c < (1 << 16) ? Log2Small[c] : Math.Log2(c)));
+                bits += c * (log2Total - (c < (1 << 16) ? Log2Small[c] : PortableMathD.Log2Fast(c)));
             }
         }
 

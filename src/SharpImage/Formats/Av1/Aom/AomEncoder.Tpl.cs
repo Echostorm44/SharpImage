@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -52,9 +53,9 @@ internal static partial class AomEncoder
                 double cbcmp = s.SrcrfDist;
                 long mcDepDelta = AomRd.RdCost(tf.BaseRdmult, s.McDepRate, s.McDepDist);
                 double distScaled = s.RecrfDist << 7;
-                intraCost += Math.Log(distScaled) * cbcmp;
-                mcDepCost += Math.Log(distScaled + mcDepDelta) * cbcmp;
-                mcDepReg += Math.Log(3 * distScaled + mcDepDelta) * cbcmp;
+                intraCost += PortableMathD.Log(distScaled) * cbcmp;
+                mcDepCost += PortableMathD.Log(distScaled + mcDepDelta) * cbcmp;
+                mcDepReg += PortableMathD.Log(3 * distScaled + mcDepDelta) * cbcmp;
                 srcrfDist += s.SrcrfDist << 7;
                 srcrfSse += s.SrcrfSse << 7;
                 srcrfRate += s.SrcrfRate << AomTplData.TPL_DEP_COST_SCALE_LOG2;
@@ -63,8 +64,8 @@ internal static partial class AomEncoder
         double beta, rk;
         if (mcDepCost > 0 && intraCost > 0)
         {
-            rk = Math.Exp((intraCost - mcDepCost) / cbcmpBase);
-            x.Rb = Math.Exp((intraCost - mcDepReg) / cbcmpBase);
+            rk = PortableMathD.Exp((intraCost - mcDepCost) / cbcmpBase);
+            x.Rb = PortableMathD.Exp((intraCost - mcDepReg) / cbcmpBase);
             beta = cpi.R0 / rk;
         }
         else return baseQindex;
@@ -78,7 +79,7 @@ internal static partial class AomEncoder
         int sbsQstep = AomComp.DcQuantQtx(baseQindex, offset, cm.BitDepth);
         if (wantDelta)
         {
-            double sbsDist = srcrfDist * Math.Pow((double)sbsQstep / frmQstep, 2.0);
+            double sbsDist = srcrfDist * PortableMathD.Pow((double)sbsQstep / frmQstep, 2.0);
             double sbsRate = srcrfRate * ((double)frmQstep / sbsQstep);
             sbsDist = Math.Min(sbsDist, srcrfSse);
             deltaDist = (long)((sbsDist - srcrfDist) / rk);
@@ -150,12 +151,12 @@ internal static partial class AomEncoder
                 double cbcmp = s.SrcrfDist;
                 long mcDepDelta = AomRd.RdCost(tf.BaseRdmult, s.McDepRate, s.McDepDist);
                 double distScaled = s.RecrfDist << 7;
-                intraCostBase += Math.Log(distScaled) * cbcmp;
-                mcDepCostBase += Math.Log(3 * distScaled + mcDepDelta) * cbcmp;
+                intraCostBase += PortableMathD.Log(distScaled) * cbcmp;
+                mcDepCostBase += PortableMathD.Log(3 * distScaled + mcDepDelta) * cbcmp;
                 cbcmpBase += cbcmp;
             }
         if (cbcmpBase == 0) return deltaqRdmult;
-        double rk = Math.Exp((intraCostBase - mcDepCostBase) / cbcmpBase);
+        double rk = PortableMathD.Exp((intraCostBase - mcDepCostBase) / cbcmpBase);
         deltaqRdmult = (int)(deltaqRdmult * (rk / x.Rb));
         return Math.Max(deltaqRdmult, 1);
     }
