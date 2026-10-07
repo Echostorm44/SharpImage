@@ -1,7 +1,9 @@
 using SharpImage.Formats.Av1;
 namespace SharpImage.Tests.Formats;
-// LOCAL oracle-diff harness for the good-quality / real-time libaom port (not committed). Mirrors aomoracle_gq:
+// LOCAL oracle-diff harness for the good-quality / real-time libaom port. Mirrors aomoracle_gq:
 // GQ_YUV GQ_W GQ_H GQ_FRAMES GQ_SPEED GQ_Q="q0,q1" GQ_LAYERS GQ_SCALE="s0,s1" GQ_TUNE GQ_BD GQ_FMT GQ_THREADS GQ_OUT=<prefix>
+// It encodes a developer-supplied YUV file and writes trace files for an external diff against libaom, so on its own it
+// checks nothing: [Explicit] keeps it out of the normal (CI) run; select it by name with the GQ_* variables set.
 public sealed class AomGqSmoke
 {
     private static int ListAt(string? s, int i, int def)
@@ -11,11 +13,14 @@ public sealed class AomGqSmoke
         return int.Parse(parts[Math.Min(i, parts.Length - 1)]);
     }
 
-    [Test]
+    private static string Required(string name) => Environment.GetEnvironmentVariable(name) is { Length: > 0 } v
+        ? v : throw new InvalidOperationException($"{name} is not set (see the GQ_* list above)");
+
+    [Test, Explicit]
     public async Task EncodesSequence()
     {
-        string yuvPath = Environment.GetEnvironmentVariable("GQ_YUV")!;
-        int w = int.Parse(Environment.GetEnvironmentVariable("GQ_W")!), h = int.Parse(Environment.GetEnvironmentVariable("GQ_H")!);
+        string yuvPath = Required("GQ_YUV");
+        int w = int.Parse(Required("GQ_W")), h = int.Parse(Required("GQ_H"));
         int frames = int.Parse(Environment.GetEnvironmentVariable("GQ_FRAMES") ?? "1");
         int speed = int.Parse(Environment.GetEnvironmentVariable("GQ_SPEED") ?? "6");
         string? qs = Environment.GetEnvironmentVariable("GQ_Q"), scs = Environment.GetEnvironmentVariable("GQ_SCALE");
@@ -45,7 +50,7 @@ public sealed class AomGqSmoke
         string? tracePath = Environment.GetEnvironmentVariable("AOM_TRACE");
         using var traceWriter = tracePath != null ? new StreamWriter(tracePath) : null;
         AomTrace.Out = traceWriter;
-        string outp = Environment.GetEnvironmentVariable("GQ_OUT")!;
+        string outp = Required("GQ_OUT");
         using var dump = new StreamWriter(outp + ".txt");
         int frameNo = 0;
         enc.OnFrameEncoded = (cpi, fh) => Dump(dump, frameNo++, cpi, fh, enc.RcTraceLine);
