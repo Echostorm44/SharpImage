@@ -75,10 +75,10 @@ public static class FourierTransform
         // Log-scale magnitude for visualization
         if (maxMag > 0)
         {
-            double logMax = Math.Log(1 + maxMag);
+            double logMax = PortableMathD.Log(1 + maxMag);
             for (int i = 0;i < magnitude.Length;i++)
             {
-                magnitude[i] = Math.Log(1 + magnitude[i]) / logMax;
+                magnitude[i] = PortableMathD.Log(1 + magnitude[i]) / logMax;
             }
         }
 
@@ -109,7 +109,7 @@ public static class FourierTransform
         double logMax = maxMag > 0 ? 1.0 : 0; // normalized, invert the log
         for (int i = 0;i < magnitude.Length;i++)
         {
-            double mag = Math.Exp(magnitude[i] * Math.Log(1 + 1000)) - 1; // approximate un-log
+            double mag = PortableMathD.Exp(magnitude[i] * PortableMathD.Log(1 + 1000)) - 1; // approximate un-log
             realPart[i] = mag * Math.Cos(phase[i]);
             imagPart[i] = mag * Math.Sin(phase[i]);
         }
@@ -222,7 +222,7 @@ public static class FourierTransform
         }
 
         // Bit-reversal permutation
-        int bits = (int)Math.Log2(n);
+        int bits = (int)PortableMathD.Log2(n);
         for (int i = 0;i < n;i++)
         {
             int j = BitReverse(i, bits);

@@ -1474,8 +1474,10 @@ public static partial class HeifCoder
     private const long Mp4EpochOffset = 2082844800;   // 1904-01-01 -> 1970-01-01
     private static ulong ToMp4Time(DateTimeOffset? t) =>
         t is { } v ? (ulong)Math.Max(0, v.ToUnixTimeSeconds() + Mp4EpochOffset) : 0;
+    // Times past DateTimeOffset.MaxValue (year 9999; a 64-bit field can hold far more) are unrepresentable: unset.
+    private static readonly ulong MaxMp4Time = (ulong)(DateTimeOffset.MaxValue.ToUnixTimeSeconds() + Mp4EpochOffset);
     private static DateTimeOffset? FromMp4Time(ulong t) =>
-        t == 0 || t > long.MaxValue / 2 ? null : DateTimeOffset.FromUnixTimeSeconds((long)t - Mp4EpochOffset);
+        t == 0 || t > MaxMp4Time ? null : DateTimeOffset.FromUnixTimeSeconds((long)t - Mp4EpochOffset);
 
     private static byte[] EncodeAvifSequenceEntry(ImageSequence sequence, AvifEncodeOptions options)
     {

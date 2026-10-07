@@ -15,6 +15,8 @@ namespace SharpImage.Tests.Formats;
 // for every stream: the .avif, our decoder's native YUV planes (.ours.yuv, little-endian u16 for >8-bit), our
 // HeifCoder 16-bit RGB decode (.ours.rgb48) and the 16-bit source (.src.rgb48). An external script then checks
 // our-decoder == ffmpeg/dav1d (exact) and our RGB vs libavif (tolerance), plus rate/quality per depth.
+// Developer harness (needs local data / a trigger): [Explicit] keeps it out of the normal and CI runs; select it by name.
+[Explicit]
 public sealed class Av1HbdVerify
 {
     const string Scratch = @"C:\Users\adamm\AppData\Local\Temp\claude\F--Code-QuickFixMyPics2\6657081e-026c-4ec2-a3b0-5a927b1d6dfe\scratchpad";

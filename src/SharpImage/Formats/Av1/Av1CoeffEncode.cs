@@ -12,6 +12,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -422,13 +423,13 @@ internal static class Av1CoeffEncode
     private static int[] MakeBitCost512()
     {
         var t = new int[32769];
-        for (int p = 0; p <= 32768; p++) t[p] = (int)Math.Round((Log2_32768 - Math.Log2(Math.Max(p, 1))) * (1 << CostShift));
+        for (int p = 0; p <= 32768; p++) t[p] = (int)Math.Round((Log2_32768 - PortableMathD.Log2(Math.Max(p, 1))) * (1 << CostShift));
         return t;
     }
     private static double[] MakeBitCost()
     {
         var t = new double[32769];
-        for (int p = 0; p <= 32768; p++) t[p] = (double)Math.Round((Log2_32768 - Math.Log2(Math.Max(p, 1))) * (1 << CostShift)) / (1 << CostShift);
+        for (int p = 0; p <= 32768; p++) t[p] = (double)Math.Round((Log2_32768 - PortableMathD.Log2(Math.Max(p, 1))) * (1 << CostShift)) / (1 << CostShift);
         return t;
     }
     /// <summary>Bit cost of coding symbol <paramref name="s"/> from an inverse-CDF's current probabilities.</summary>

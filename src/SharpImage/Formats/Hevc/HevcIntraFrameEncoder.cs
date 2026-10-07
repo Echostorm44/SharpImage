@@ -5,6 +5,7 @@
 // luma TUs) with per-TU intra prediction. Mirrors HevcDecoder's coding_unit / transform_tree /
 // transform_unit syntax; residual via HevcResidualEncoder, availability via HevcZScan.
 using System;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Hevc;
 
@@ -117,7 +118,7 @@ internal sealed class HevcIntraFrameEncoder
 
         // Plan the transform quadtree (per-TU prediction + reconstruction, RD-decided split),
         // then encode it. Chroma is carried at every leaf (luma TU >= 8 so chroma TU >= 4).
-        double lambda = 0.85 * Math.Pow(2.0, (qp - 12) / 3.0);
+        double lambda = 0.85 * PortableMathD.Pow(2.0, (qp - 12) / 3.0);
         TuNode root = PlanTu(x0, y0, CtbLog2, 0, lumaMode, lambda);
         EncodeTuTree(cabac, root, 0, true, true, lumaMode);
     }

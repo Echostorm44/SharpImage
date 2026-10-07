@@ -426,7 +426,7 @@ public static class Jpeg2000Coder
         int w = (int)image.Columns;
         int h = (int)image.Rows;
         int imgChannels = image.NumberOfChannels;
-        int decompositionLevels = Math.Min(5, (int)Math.Log2(Math.Min(w, h)));
+        int decompositionLevels = Math.Min(5, (int)PortableMathD.Log2(Math.Min(w, h)));
         if (decompositionLevels < 1)
         {
             decompositionLevels = 1;
@@ -479,7 +479,7 @@ public static class Jpeg2000Coder
                 if (mag > maxMag) maxMag = mag;
             }
             // Number of bits needed to represent the max magnitude
-            bitsPerComponent[c] = maxMag > 0 ? (int)Math.Ceiling(Math.Log2(maxMag + 1)) : 1;
+            bitsPerComponent[c] = maxMag > 0 ? (int)Math.Ceiling(PortableMathD.Log2(maxMag + 1)) : 1;
             if (bitsPerComponent[c] < 16) bitsPerComponent[c] = 16; // minimum 16 for source precision
         }
 

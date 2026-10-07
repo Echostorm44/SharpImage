@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -21,8 +22,8 @@ internal struct AomFpStats
         Frame += f.Frame;
         Weight += f.Weight;
         IntraError += f.IntraError;
-        LogIntraError += Math.Log(1 + f.IntraError);   // log1p
-        LogCodedError += Math.Log(1 + f.CodedError);
+        LogIntraError += PortableMathD.Log(1 + f.IntraError);   // log1p
+        LogCodedError += PortableMathD.Log(1 + f.CodedError);
         FrameAvgWaveletEnergy += f.FrameAvgWaveletEnergy;
         CodedError += f.CodedError;
         SrCodedError += f.SrCodedError;

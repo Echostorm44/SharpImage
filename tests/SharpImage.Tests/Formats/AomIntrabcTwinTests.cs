@@ -7,12 +7,14 @@ namespace SharpImage.Tests.Formats;
 // Twins of the intrabc pieces of the libaom encoder port (AomHashMotion, AomMvCost, AomMvRef.IsDvValid, AomSad,
 // AomMcomp.FullPixelSearch, the tx partition / inter tx type mode costs) against libaom 3.14.1's own functions through
 // aomtwin_ibc.dll (built against libaom.a with the run-time dispatch initialised: the kernels compared are the SIMD
-// ones libaom's encoder runs; see scratchpad aomtwin_ibc/). Opt-in: point SHARPIMAGE_AOMTWIN_IBC at the DLL.
+// ones libaom's encoder runs; tests/native/aomtwin/aomtwin_ibc.c). Point SHARPIMAGE_AOMTWIN_IBC at the library; without it
+// the tests report Skipped.
 [NotInParallel]
 public sealed class AomIntrabcTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_IBC");
-    private static readonly IntPtr Lib = DllPath != null ? NativeLibrary.Load(DllPath) : IntPtr.Zero;
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN_IBC";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
+    private static readonly IntPtr Lib = DllPath != null ? AomTwinNative.Register("aomtwin_ibc", DllPath) : IntPtr.Zero;
     private static bool Available => Lib != IntPtr.Zero && Init();
     private static bool s_init;
 
@@ -27,7 +29,7 @@ public sealed class AomIntrabcTwinTests
     [Test]
     public async Task Crc32c_RandomBuffers()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         await Assert.That(Crc32c_RandomBuffersImpl()).IsNull();
     }
 
@@ -88,7 +90,7 @@ public sealed class AomIntrabcTwinTests
     [Test]
     public async Task BlockHash_AllSizes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         await Assert.That(BlockHash_AllSizesImpl()).IsNull();
     }
 
@@ -114,7 +116,7 @@ public sealed class AomIntrabcTwinTests
     [Test]
     public async Task HashTable_FrameBuild()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         await Assert.That(HashTable_FrameBuildImpl()).IsNull();
     }
 
@@ -155,7 +157,7 @@ public sealed class AomIntrabcTwinTests
     [Test]
     public async Task DvCosts_AndMvBitCost()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         await Assert.That(DvCosts_AndMvBitCostImpl()).IsNull();
     }
 
@@ -188,7 +190,7 @@ public sealed class AomIntrabcTwinTests
     [Test]
     public async Task IsDvValid_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         await Assert.That(IsDvValid_RandomImpl()).IsNull();
     }
 
@@ -218,7 +220,7 @@ public sealed class AomIntrabcTwinTests
     [Test]
     public async Task SadVariance_AllBlockSizes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         await Assert.That(SadVariance_AllBlockSizesImpl()).IsNull();
     }
 
@@ -261,7 +263,7 @@ public sealed class AomIntrabcTwinTests
     [Test]
     public async Task FullPixelSearch_RandomFrames()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         await Assert.That(FullPixelSearch_RandomFramesImpl()).IsNull();
     }
 
@@ -332,7 +334,7 @@ public sealed class AomIntrabcTwinTests
     [Test]
     public async Task InterModeCosts_Defaults()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         await Assert.That(InterModeCosts_DefaultsImpl()).IsNull();
     }
 
@@ -356,7 +358,7 @@ public sealed class AomIntrabcTwinTests
     [Test]
     public async Task NegativeControl_PerturbedCostTableDisagrees()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         await Assert.That(NegativeControl_PerturbedCostTableDisagreesImpl()).IsNull();
     }
 

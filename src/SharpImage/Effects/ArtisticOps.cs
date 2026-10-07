@@ -524,7 +524,7 @@ public static class ArtisticOps
                     if (distance > 0.0)
                     {
                         double normalizedDist = distance * invRadius;
-                        factor = Math.Pow(
+                        factor = PortableMathD.Pow(
                             Math.Sin(Math.PI * 0.5 * normalizedDist),
                             -amount);
                     }

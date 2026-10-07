@@ -7,6 +7,8 @@ using TUnit.Core;
 // Dev-only: per-phase bit accounting. Decodes a set of .avif files (ours + libaom's) with Av1Msac.AcctOn and
 // reports how many BYTES each stream spends on partition / mode / skip / tx / filter / luma-coef / chroma-coef.
 // Works on any valid AV1 stream, so it profiles libaom's bit split too. Trigger file bitprof.txt; consumed.
+// Developer harness (needs local data / a trigger): [Explicit] keeps it out of the normal and CI runs; select it by name.
+[Explicit]
 public sealed class Av1BitProfile
 {
     const string Corpus = @"C:\Users\adamm\AppData\Local\Temp\claude\F--Code-QuickFixMyPics2\6657081e-026c-4ec2-a3b0-5a927b1d6dfe\scratchpad\corpus";

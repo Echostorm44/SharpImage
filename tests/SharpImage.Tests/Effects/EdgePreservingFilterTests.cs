@@ -492,7 +492,6 @@ public class EdgePreservingFilterTests
     public async Task MedianFilter_RealImage_ProducesValidOutput()
     {
         string path = Path.Combine(TestImagesDir, "photo_small.png");
-        if (!File.Exists(path)) return;
 
         var image = FormatRegistry.Read(path);
         var result = BlurNoiseOps.MedianFilter(image, 1);
@@ -505,7 +504,6 @@ public class EdgePreservingFilterTests
     public async Task BilateralBlur_RealImage_ProducesValidOutput()
     {
         string path = Path.Combine(TestImagesDir, "photo_small.png");
-        if (!File.Exists(path)) return;
 
         var image = FormatRegistry.Read(path);
         var result = BlurNoiseOps.BilateralBlur(image, 3, 2.0, 30.0);
@@ -518,7 +516,6 @@ public class EdgePreservingFilterTests
     public async Task KuwaharaFilter_RealImage_ProducesValidOutput()
     {
         string path = Path.Combine(TestImagesDir, "photo_small.png");
-        if (!File.Exists(path)) return;
 
         var image = FormatRegistry.Read(path);
         var result = BlurNoiseOps.KuwaharaFilter(image, 3);
@@ -531,7 +528,6 @@ public class EdgePreservingFilterTests
     public async Task LocalContrast_RealImage_ProducesValidOutput()
     {
         string path = Path.Combine(TestImagesDir, "photo_small.png");
-        if (!File.Exists(path)) return;
 
         var image = FormatRegistry.Read(path);
         var result = EnhanceOps.LocalContrast(image, 10, 50.0);

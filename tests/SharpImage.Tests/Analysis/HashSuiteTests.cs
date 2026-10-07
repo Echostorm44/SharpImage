@@ -148,7 +148,6 @@ public class HashSuiteTests
     public async Task HashSuite_RealImage_ProducesConsistentHashes()
     {
         string wizardPath = Path.Combine(TestAssets, "peppers_rgba.png");
-        if (!File.Exists(wizardPath)) return;
 
         using var img = FormatRegistry.Read(wizardPath);
         var h1 = PerceptualHash.ComputeAll(img);

@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.Intrinsics;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -1272,7 +1273,7 @@ internal static class Av1PartitionCnn
             else if (l == 3) Array.Copy(cur, o.B1, o.B1.Length);
             else if (l == 4) Array.Copy(cur, o.B0, o.B0.Length);
         }
-        float lq = MathF.Log(1 + (float)(dcQ * dcQ) / 256.0f);
+        float lq = PortableMath.Log(1 + (float)(dcQ * dcQ) / 256.0f);
         o.LogQ = (lq - Mean[0]) / Std[0];
         return o;
     }

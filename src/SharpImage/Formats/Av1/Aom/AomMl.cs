@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics.X86;
 using System.Runtime.Intrinsics;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -49,8 +50,9 @@ internal static partial class AomMl
 
     // ---- libm as libaom links it (mingw-w64 msvcrt runtime) ----
 
-    /// <summary>expf: mingw-w64's msvcrt expf is (float)exp((double)x).</summary>
-    internal static float Expf(float x) => (float)Math.Exp(x);
+    /// <summary>expf: mingw-w64's msvcrt expf is (float)exp((double)x). The double exp is PortableMathD's, so the result is
+    /// the same on every OS (and equals (float)Math.Exp on Windows and Linux for every float in [-10, 0]).</summary>
+    internal static float Expf(float x) => (float)PortableMathD.Exp(x);
 
     /// <summary>log1pf: mingw-w64's log1pf is x87 code (fldln2; fyl2xp1 below |x| 0.29, else fyl2x of 1 + x). A
     /// mingw-w64 executable (avifenc.exe) runs with the x87 control word 0x37F (64-bit extended precision), so its
@@ -65,7 +67,7 @@ internal static partial class AomMl
         double d = x;
         double y = Math.Abs(d) < 1e-4
             ? d - d * d * (1.0 / 2) + d * d * d * (1.0 / 3) - d * d * d * d * (1.0 / 4) + d * d * d * d * d * (1.0 / 5)
-            : Math.Log(1.0 + d);
+            : PortableMathD.Log(1.0 + d);
         float f = (float)y;
         if ((double)f == y) return f;
         float nb = y > f ? MathF.BitIncrement(f) : MathF.BitDecrement(f);

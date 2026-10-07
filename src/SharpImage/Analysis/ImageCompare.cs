@@ -57,7 +57,7 @@ public static class ImageCompare
             return double.PositiveInfinity;
         }
 
-        return 10.0 * Math.Log10(1.0 / mse);
+        return 10.0 * PortableMathD.Log10(1.0 / mse);
     }
 
     /// <summary>

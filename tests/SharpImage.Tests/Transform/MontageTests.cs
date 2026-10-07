@@ -288,10 +288,6 @@ public class MontageTests
     public async Task Coalesce_RealGif_ProducesFullFrames()
     {
         string gifPath = Path.Combine(TestAssetsDir, "bounce_anim.gif");
-        if (!File.Exists(gifPath))
-        {
-            return;
-        }
 
         using var seq = GifCoder.ReadSequence(gifPath);
         if (seq.Count < 2)

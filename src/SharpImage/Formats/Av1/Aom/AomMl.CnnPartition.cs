@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -637,7 +638,7 @@ internal static partial class AomMl
         Span<float> score = stackalloc float[1];
         score[0] = 0f;
         NnPredict(features, cfg, true, score);
-        float threshScore = (float)Math.Log(thresh / (1 - thresh));
+        float threshScore = (float)PortableMathD.Log(thresh / (1 - thresh));
         if (score[0] >= threshScore)
         {
             doSquareSplit = 0;

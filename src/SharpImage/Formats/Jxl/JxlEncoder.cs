@@ -939,13 +939,13 @@ internal static partial class JxlEncoder
             for (int c = 0; c < 3; c++)
             {
                 double cb = 0;
-                double invLog2 = 1.0 / Math.Log(2);
+                double invLog2 = 1.0 / PortableMathD.Log(2);
                 foreach (int v in seen[c])
                 {
                     int k = hist[c][v + off];
                     if (total > 0)
                     {
-                        cb -= k * Math.Log((double)k / total) * invLog2;
+                        cb -= k * PortableMathD.LogFast((double)k / total) * invLog2;
                     }
 
                     hist[c][v + off] = 0;
@@ -1041,11 +1041,11 @@ internal static partial class JxlEncoder
             return 0;
         }
 
-        double bits = 0, invLog2 = 1.0 / Math.Log(2);
+        double bits = 0, invLog2 = 1.0 / PortableMathD.Log(2);
         foreach (int v in seen)
         {
             int c = hist[v + off];
-            bits -= c * Math.Log((double)c / total) * invLog2;
+            bits -= c * PortableMathD.LogFast((double)c / total) * invLog2;
         }
 
         return bits;
@@ -1161,10 +1161,10 @@ internal static partial class JxlEncoder
         }
 
         double bits = 0;
-        double invLog2 = 1.0 / Math.Log(2);
+        double invLog2 = 1.0 / PortableMathD.Log(2);
         foreach (int c in hist.Values)
         {
-            bits -= c * Math.Log((double)c / total) * invLog2;
+            bits -= c * PortableMathD.LogFast((double)c / total) * invLog2;
         }
 
         return bits;
@@ -1422,12 +1422,12 @@ internal static partial class JxlEncoder
         }
 
         double bits = 0;
-        double invLog2 = 1.0 / Math.Log(2);
+        double invLog2 = 1.0 / PortableMathD.Log(2);
         foreach (int c in counts)
         {
             if (c > 0)
             {
-                bits -= c * Math.Log((double)c / total) * invLog2;
+                bits -= c * PortableMathD.LogFast((double)c / total) * invLog2;
             }
         }
 
@@ -2228,13 +2228,13 @@ internal static partial class JxlEncoder
         var t = new double[LogLutSize];
         for (int i = 1; i < LogLutSize; i++)
         {
-            t[i] = Math.Log(i);
+            t[i] = PortableMathD.Log(i);
         }
 
         return t;
     }
 
-    internal static double LogOf(long v) => v < LogLutSize ? LogLut[v] : Math.Log(v);
+    internal static double LogOf(long v) => v < LogLutSize ? LogLut[v] : PortableMathD.Log(v);
 
     // dst[i] += src[i] over the whole array, vectorised (256/128-bit). Hot in the clustering K-search where
     // cluster histograms are accumulated from member contexts. Exact integer add — no effect on output.
@@ -2309,7 +2309,7 @@ internal static partial class JxlEncoder
 
         double bits = 0;
         double lg = LogOf(total);
-        double log2 = Math.Log(2);
+        double log2 = PortableMathD.Log(2);
         foreach (long v in h)
         {
             if (v > 0)

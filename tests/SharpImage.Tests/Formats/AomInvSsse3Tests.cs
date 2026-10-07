@@ -10,7 +10,10 @@ public sealed class AomInvSsse3Tests
     [Test]
     public async Task Ssse3Inverse_MatchesGenericInverse_AllSizes()
     {
-        if (!System.Runtime.Intrinsics.X86.Ssse3.IsSupported) return;
+        if (!System.Runtime.Intrinsics.X86.Ssse3.IsSupported)
+        {
+            Skip.Test("compares against the SSSE3 kernels: this CPU has no SSSE3");
+        }
         var rng = new Random(23);
         int cases = 0, bad = 0;
         for (int txSize = 0; txSize < AomTables.TxSizeWide.Length; txSize++)

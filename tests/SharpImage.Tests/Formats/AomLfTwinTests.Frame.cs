@@ -93,7 +93,7 @@ public sealed partial class AomLfTwinTests
     [Test]
     public async Task LoopFilterFrame_SyntheticGrids()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(21);
         int frames = 0;
         for (int iter = 0; iter < 120; iter++)

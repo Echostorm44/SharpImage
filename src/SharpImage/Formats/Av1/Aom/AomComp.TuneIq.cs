@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -68,11 +69,11 @@ internal sealed partial class AomComp
                         numOfVar += 1.0;
                     }
                 var = var / numOfVar;
-                var = 67.035434 * (1 - Math.Exp(-0.0021489 * var)) + 17.492222;
+                var = 67.035434 * (1 - PortableMathD.Exp(-0.0021489 * var)) + 17.492222;
                 f[index] = var;
-                logSum += Math.Log(var);
+                logSum += PortableMathD.Log(var);
             }
-        logSum = Math.Exp(logSum / (double)(numRows * numCols));
+        logSum = PortableMathD.Exp(logSum / (double)(numRows * numCols));
         for (int i = 0; i < numRows * numCols; i++) f[i] /= logSum;
     }
 }

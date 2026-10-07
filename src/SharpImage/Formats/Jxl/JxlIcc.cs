@@ -8,6 +8,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Jxl;
 
@@ -863,7 +864,7 @@ internal static class JxlIcc
         {
             if (c > 0)
             {
-                bits += c * -Math.Log2((double)c / bytes.Length);
+                bits += c * -PortableMathD.Log2Fast((double)c / bytes.Length);
             }
         }
 

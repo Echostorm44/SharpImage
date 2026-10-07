@@ -5,6 +5,7 @@
 
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -676,7 +677,7 @@ public ref struct Av1Msac
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Normalize(ulong d, uint r)
     {
-        if (AcctOn && r > 0 && rng > 0) PhaseBits[Phase] += -System.Math.Log2((double)r / rng);
+        if (AcctOn && r > 0 && rng > 0) PhaseBits[Phase] += -PortableMathD.Log2((double)r / rng);
         int shift = 15 ^ (31 ^ BitOperations.LeadingZeroCount(r));
         int c = cnt;
         

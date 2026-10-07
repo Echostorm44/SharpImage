@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -59,8 +60,8 @@ internal sealed partial class AomGqEncoder
                 double cbcmp = s.SrcrfDist;
                 long mcDepDelta = AomRd.RdCost(t.BaseRdmult, s.McDepRate, s.McDepDist);
                 double distScaled = s.RecrfDist << 7;
-                intraCostBase += Math.Log(distScaled) * cbcmp;
-                mcDepCostBase += Math.Log(distScaled + mcDepDelta) * cbcmp;
+                intraCostBase += PortableMathD.Log(distScaled) * cbcmp;
+                mcDepCostBase += PortableMathD.Log(distScaled + mcDepDelta) * cbcmp;
                 cbcmpBase += cbcmp;
             }
         if (mcDepCostBase == 0)
@@ -68,7 +69,7 @@ internal sealed partial class AomGqEncoder
             t.IsValid = false;
             return;
         }
-        _r0 = Math.Exp((intraCostBase - mcDepCostBase) / cbcmpBase);
+        _r0 = PortableMathD.Exp((intraCostBase - mcDepCostBase) / cbcmpBase);
         if (!IsFrameTplEligible(gf, _gfFrameIndex)) return;
         if (_lapEnabled)
         {
@@ -432,11 +433,11 @@ internal sealed partial class AomGqEncoder
                 long mcDepDelta = AomRd.RdCost(t.BaseRdmult, s.McDepRate, s.McDepDist);
                 double distScaled = s.RecrfDist << 7;   // RDDIV_BITS
                 distScaled = Math.Max(distScaled, 1);
-                intraCostBase += Math.Log(distScaled) * cbcmp;
-                mcDepCostBase += Math.Log(distScaled + mcDepDelta) * cbcmp;
+                intraCostBase += PortableMathD.Log(distScaled) * cbcmp;
+                mcDepCostBase += PortableMathD.Log(distScaled + mcDepDelta) * cbcmp;
                 cbcmpBase += cbcmp;
             }
-        return Math.Exp((mcDepCostBase - intraCostBase) / cbcmpBase);
+        return PortableMathD.Exp((mcDepCostBase - intraCostBase) / cbcmpBase);
     }
 
     /// <summary>init_mc_flow_dispenser.</summary>
@@ -1110,16 +1111,16 @@ internal sealed partial class AomGqEncoder
         long rateCost = deltaRate;
         if (srcrfDist <= 128) return rateCost;
         double dr = (double)(deltaRate >> (AomTplData.TPL_DEP_COST_SCALE_LOG2 + 9)) / pixNum;
-        double logDen = Math.Log(beta) / Math.Log(2.0) + 2.0 * dr;
-        if (logDen > Math.Log(10.0) / Math.Log(2.0))
+        double logDen = PortableMathD.Log(beta) / PortableMathD.Log(2.0) + 2.0 * dr;
+        if (logDen > PortableMathD.Log(10.0) / PortableMathD.Log(2.0))
         {
-            rateCost = (long)((Math.Log(1.0 / beta) * pixNum) / Math.Log(2.0) / 2.0);
+            rateCost = (long)((PortableMathD.Log(1.0 / beta) * pixNum) / PortableMathD.Log(2.0) / 2.0);
             rateCost <<= AomTplData.TPL_DEP_COST_SCALE_LOG2 + 9;
             return rateCost;
         }
-        double num = Math.Pow(2.0, logDen);
+        double num = PortableMathD.Pow(2.0, logDen);
         double den = num * beta + (1 - beta) * beta;
-        rateCost = (long)((pixNum * Math.Log(num / den)) / Math.Log(2.0) / 2.0);
+        rateCost = (long)((pixNum * PortableMathD.Log(num / den)) / PortableMathD.Log(2.0) / 2.0);
         rateCost <<= AomTplData.TPL_DEP_COST_SCALE_LOG2 + 9;
         return rateCost;
     }

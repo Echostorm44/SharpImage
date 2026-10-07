@@ -10,7 +10,10 @@ public sealed class AomNoAvx2EmulationTests
     [Test]
     public async Task QuantizerEmulationsAndSse41_MatchAvx2Kernels()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // nothing to compare against
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            Skip.Test("compares against the AVX2 kernels: this CPU has no AVX2");
+        }
         var rng = new Random(5);
         int cases = 0, bad = 0;
         for (int txSize = 0; txSize < 19; txSize++)

@@ -7,6 +7,7 @@
 // dequant matrices are the same as the decoder's, so libjxl's constants apply directly.
 
 using System;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Jxl;
 
@@ -94,7 +95,7 @@ internal static class JxlEncoderPerceptual
                 float bse = 0.25f * (Y[(y2 * stride) + x] + Y[(y1 * stride) + x] + Y[(y * stride) + x1] + Y[(y * stride) + x2]);
                 float gammac = RatioOfDerivatives(c + matchGammaOffset, false);
                 float diff = MathF.Abs(gammac * (c - bse));
-                diff = MathF.Log(1.0f + diff);
+                diff = PortableMath.Log(1.0f + diff);
                 mask1x1[(y * w) + x] = 1.0f / (diff + 0.01f);
             }
         }
@@ -181,7 +182,7 @@ internal static class JxlEncoderPerceptual
         return (quantField, mask1x1);
     }
 
-    private static float FastPow2(float x) => MathF.Pow(2.0f, x);
+    private static float FastPow2(float x) => PortableMath.Pow(2.0f, x);
 
     private static float[] FuzzyErosion(float[] from, int fw, int fh, int bw, int bh, float butteraugliTarget)
     {
@@ -398,7 +399,7 @@ internal static class JxlEncoderPerceptual
         return (sum * kMul) + outVal;
     }
 
-    private static float Log2(float v) => v <= 0 ? -128f : MathF.Log2(v);
+    private static float Log2(float v) => v <= 0 ? -128f : PortableMath.Log2(v);
 
     // Symmetric 5x5 convolution (libjxl's Symmetric5). Weight layout: c=centre, r=orthogonal dist 1,
     // R=orthogonal dist 2, d=diagonal (1,1), D=diagonal (2,2), L=(2,1)/(1,2). Edge pixels clamped.
@@ -516,13 +517,13 @@ internal static class JxlEncoderPerceptual
         {
             Xyb = xyb, Stride = stride, W = w, H = h, QuantField = quantField, Bw = bw,
             Mask1x1 = mask1x1, Cmap = cmap, Dm = dm,
-            InfoLossMul = 1.2f * MathF.Pow(ratio, 0.33677806662454718f),
-            ZerosMul = 9.3089059022677905f * MathF.Pow(ratio, 0.50990926717963703f),
-            CostDelta = 10.833273317067883f * MathF.Pow(ratio, 0.36702940662370243f),
+            InfoLossMul = 1.2f * PortableMath.Pow(ratio, 0.33677806662454718f),
+            ZerosMul = 9.3089059022677905f * PortableMath.Pow(ratio, 0.50990926717963703f),
+            CostDelta = 10.833273317067883f * PortableMath.Pow(ratio, 0.36702940662370243f),
         };
     }
 
-    private static readonly double[] KChannelMul = { Math.Pow(8.2, 8.0), Math.Pow(1.0, 8.0), Math.Pow(1.03, 8.0) };
+    private static readonly double[] KChannelMul = { PortableMathD.Pow(8.2, 8.0), PortableMathD.Pow(1.0, 8.0), PortableMathD.Pow(1.03, 8.0) };
     private static readonly float[] MaskuLut = { 12.0f, 0.0f, 4.0f };
 
     // EstimateEntropy: rate (cost_delta*Σsqrt|q| + zeros_mul*nonzero-bits) + info-loss (masking-weighted L8
@@ -578,7 +579,7 @@ internal static class JxlEncoderPerceptual
             }
 
             acc /= numBlocks;
-            quantNorm = MathF.Pow(acc, 1.0f / 16.0f);
+            quantNorm = PortableMath.Pow(acc, 1.0f / 16.0f);
         }
 
         double loss = 0;
@@ -651,7 +652,7 @@ internal static class JxlEncoderPerceptual
             }
         }
 
-        float lossScalar = (float)(Math.Pow(loss / size, 1.0 / 8.0) * size / quantNorm);
+        float lossScalar = (float)(PortableMathD.Pow(loss / size, 1.0 / 8.0) * size / quantNorm);
         entropy *= entropyMul;
         entropy += c.InfoLossMul * lossScalar;
         return entropy;

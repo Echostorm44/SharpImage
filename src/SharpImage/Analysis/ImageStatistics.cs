@@ -133,8 +133,8 @@ public static class ImageStatistics
         double mu03 = m03 - 3 * yc * m02 + 2 * yc * yc * m01;
 
         // Normalized central moments eta_pq = mu_pq / m00^((p+q)/2 + 1)
-        double inv2 = 1.0 / Math.Pow(m00, 2.0);   // (p+q=2) -> m00^2
-        double inv2_5 = 1.0 / Math.Pow(m00, 2.5); // (p+q=3) -> m00^2.5
+        double inv2 = 1.0 / PortableMathD.Pow(m00, 2.0);   // (p+q=2) -> m00^2
+        double inv2_5 = 1.0 / PortableMathD.Pow(m00, 2.5); // (p+q=3) -> m00^2.5
 
         double n20 = mu20 * inv2;
         double n11 = mu11 * inv2;
@@ -231,7 +231,7 @@ public static class ImageStatistics
         stats.Mean = m1;
         stats.Variance = n > 1 ? m2 / (n - 1) : 0;
         stats.StandardDeviation = Math.Sqrt(stats.Variance);
-        stats.Skewness = m2 > 0 ? Math.Sqrt((double)n) * m3 / Math.Pow(m2, 1.5) : 0;
+        stats.Skewness = m2 > 0 ? Math.Sqrt((double)n) * m3 / PortableMathD.Pow(m2, 1.5) : 0;
         stats.Kurtosis = m2 > 0 ? (double)n * m4 / (m2 * m2) - 3.0 : 0;
 
         // Histogram for entropy and median
@@ -252,7 +252,7 @@ public static class ImageStatistics
             if (histogram[i] > 0)
             {
                 double p = (double)histogram[i] / pixelCount;
-                entropy -= p * Math.Log2(p);
+                entropy -= p * PortableMathD.Log2(p);
             }
         }
         stats.Entropy = entropy;

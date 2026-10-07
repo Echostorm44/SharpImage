@@ -3,6 +3,7 @@
 
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using SharpImage.Core;
 
 namespace SharpImage.Fx;
 
@@ -235,7 +236,7 @@ internal sealed class BinaryNode : FxNode
             TokenKind.Star => l * r,
             TokenKind.Slash => r == 0 ? 0.0 : l / r,
             TokenKind.Percent => r == 0 ? 0.0 : l % r,
-            TokenKind.Caret => Math.Pow(l, r),
+            TokenKind.Caret => PortableMathD.Pow(l, r),
             TokenKind.Equal => l == r ? 1.0 : 0.0,
             TokenKind.NotEqual => l != r ? 1.0 : 0.0,
             TokenKind.Less => l < r ? 1.0 : 0.0,
@@ -356,10 +357,10 @@ internal sealed class FunctionCallNode : FxNode
             FxBuiltinFunc.Round => Math.Round(Args[0].Evaluate(ref ctx)),
             FxBuiltinFunc.Trunc => Math.Truncate(Args[0].Evaluate(ref ctx)),
             FxBuiltinFunc.Sqrt => Math.Sqrt(Args[0].Evaluate(ref ctx)),
-            FxBuiltinFunc.Exp => Math.Exp(Args[0].Evaluate(ref ctx)),
-            FxBuiltinFunc.Ln => Math.Log(Args[0].Evaluate(ref ctx)),
-            FxBuiltinFunc.Log => Math.Log10(Args[0].Evaluate(ref ctx)),
-            FxBuiltinFunc.Log2 => Math.Log2(Args[0].Evaluate(ref ctx)),
+            FxBuiltinFunc.Exp => PortableMathD.Exp(Args[0].Evaluate(ref ctx)),
+            FxBuiltinFunc.Ln => PortableMathD.Log(Args[0].Evaluate(ref ctx)),
+            FxBuiltinFunc.Log => PortableMathD.Log10(Args[0].Evaluate(ref ctx)),
+            FxBuiltinFunc.Log2 => PortableMathD.Log2(Args[0].Evaluate(ref ctx)),
             FxBuiltinFunc.Sign => Math.Sign(Args[0].Evaluate(ref ctx)),
             FxBuiltinFunc.Not => Args[0].Evaluate(ref ctx) == 0 ? 1.0 : 0.0,
             FxBuiltinFunc.Sinc => EvalSinc(Args[0].Evaluate(ref ctx)),
@@ -368,7 +369,7 @@ internal sealed class FunctionCallNode : FxNode
             FxBuiltinFunc.IsNaN => double.IsNaN(Args[0].Evaluate(ref ctx)) ? 1.0 : 0.0,
             // 2-arg
             FxBuiltinFunc.Atan2 => Math.Atan2(Args[0].Evaluate(ref ctx), Args[1].Evaluate(ref ctx)),
-            FxBuiltinFunc.Pow => Math.Pow(Args[0].Evaluate(ref ctx), Args[1].Evaluate(ref ctx)),
+            FxBuiltinFunc.Pow => PortableMathD.Pow(Args[0].Evaluate(ref ctx), Args[1].Evaluate(ref ctx)),
             FxBuiltinFunc.Min => Math.Min(Args[0].Evaluate(ref ctx), Args[1].Evaluate(ref ctx)),
             FxBuiltinFunc.Max => Math.Max(Args[0].Evaluate(ref ctx), Args[1].Evaluate(ref ctx)),
             FxBuiltinFunc.Mod => EvalMod(Args[0].Evaluate(ref ctx), Args[1].Evaluate(ref ctx)),
@@ -396,7 +397,7 @@ internal sealed class FunctionCallNode : FxNode
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double EvalGauss(double x) => Math.Exp(-x * x / 2.0);
+    private static double EvalGauss(double x) => PortableMathD.Exp(-x * x / 2.0);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static double EvalMod(double a, double b) => b == 0 ? 0.0 : a % b;

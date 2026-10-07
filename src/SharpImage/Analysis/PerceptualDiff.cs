@@ -301,17 +301,19 @@ public static class PerceptualDiff
         double scale = 1.0 / Quantum.MaxValue;
 
         var lab = new double[height, width * 3];
+        // sRGB -> linear depends on the sample alone: one table entry per quantum value for large images.
+        double[]? lin = (long)width * height * 3 >= QuantumLut.MinSamples ? QuantumLut.BuildDouble(q => Linearize(q * scale)) : null;
         for (int y = 0; y < height; y++)
         {
             var row = image.GetPixelRow(y);
             for (int x = 0; x < width; x++)
             {
                 int offset = x * channels;
-                double r = row[offset] * scale;
-                double g = row[offset + 1] * scale;
-                double b = row[offset + 2] * scale;
+                double r = lin != null ? lin[row[offset]] : Linearize(row[offset] * scale);
+                double g = lin != null ? lin[row[offset + 1]] : Linearize(row[offset + 1] * scale);
+                double b = lin != null ? lin[row[offset + 2]] : Linearize(row[offset + 2] * scale);
 
-                SrgbToLab(r, g, b, out double l, out double a, out double bLab);
+                LinearToLab(r, g, b, out double l, out double a, out double bLab);
                 lab[y, x * 3] = l;
                 lab[y, x * 3 + 1] = a;
                 lab[y, x * 3 + 2] = bLab;
@@ -320,14 +322,14 @@ public static class PerceptualDiff
         return lab;
     }
 
+    /// <summary>sRGB → linear.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void SrgbToLab(double r, double g, double b, out double l, out double a, out double bLab)
-    {
-        // sRGB → linear
-        r = r > 0.04045 ? Math.Pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
-        g = g > 0.04045 ? Math.Pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
-        b = b > 0.04045 ? Math.Pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
+    private static double Linearize(double c) => c > 0.04045 ? PortableMathD.Pow((c + 0.055) / 1.055, 2.4) : c / 12.92;
 
+    /// <summary>Linear sRGB → L*a*b* (D65).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LinearToLab(double r, double g, double b, out double l, out double a, out double bLab)
+    {
         // Linear RGB → XYZ (D65)
         double x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375;
         double y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750;
@@ -338,9 +340,9 @@ public static class PerceptualDiff
         z /= 1.08883;
 
         // XYZ → L*a*b*
-        x = x > 0.008856 ? Math.Cbrt(x) : 7.787 * x + 16.0 / 116.0;
-        y = y > 0.008856 ? Math.Cbrt(y) : 7.787 * y + 16.0 / 116.0;
-        z = z > 0.008856 ? Math.Cbrt(z) : 7.787 * z + 16.0 / 116.0;
+        x = x > 0.008856 ? PortableMathD.Cbrt(x) : 7.787 * x + 16.0 / 116.0;
+        y = y > 0.008856 ? PortableMathD.Cbrt(y) : 7.787 * y + 16.0 / 116.0;
+        z = z > 0.008856 ? PortableMathD.Cbrt(z) : 7.787 * z + 16.0 / 116.0;
 
         l = 116 * y - 16;
         a = 500 * (x - y);
@@ -355,7 +357,7 @@ public static class PerceptualDiff
         double c2 = Math.Sqrt(a2 * a2 + b2 * b2);
         double cMean = (c1 + c2) / 2.0;
 
-        double cMean7 = Math.Pow(cMean, 7);
+        double cMean7 = PortableMathD.Pow(cMean, 7);
         double g = 0.5 * (1 - Math.Sqrt(cMean7 / (cMean7 + 6103515625.0))); // 25^7
 
         double a1P = a1 * (1 + g);
@@ -411,9 +413,9 @@ public static class PerceptualDiff
         double sc = 1 + 0.045 * cPMean;
         double sh = 1 + 0.015 * cPMean * t;
 
-        double cPMean7 = Math.Pow(cPMean, 7);
+        double cPMean7 = PortableMathD.Pow(cPMean, 7);
         double rt = -2 * Math.Sqrt(cPMean7 / (cPMean7 + 6103515625.0))
-            * Math.Sin(60 * Math.Exp(-((hPMean - 275) / 25) * ((hPMean - 275) / 25)) * Math.PI / 180);
+            * Math.Sin(60 * PortableMathD.Exp(-((hPMean - 275) / 25) * ((hPMean - 275) / 25)) * Math.PI / 180);
 
         double dL = dLP / sl;
         double dC = dCP / sc;

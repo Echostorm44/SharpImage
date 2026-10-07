@@ -489,9 +489,9 @@ public static class BayerDemosaic
         out double labL, out double labA, out double labB)
     {
         // Linearize sRGB
-        r = r > 0.04045 ? Math.Pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
-        g = g > 0.04045 ? Math.Pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
-        b = b > 0.04045 ? Math.Pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
+        r = r > 0.04045 ? PortableMathD.Pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
+        g = g > 0.04045 ? PortableMathD.Pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
+        b = b > 0.04045 ? PortableMathD.Pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
 
         // sRGB to XYZ (D65)
         double x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375;
@@ -502,9 +502,9 @@ public static class BayerDemosaic
         x /= 0.95047;
         z /= 1.08883;
 
-        x = x > 0.008856 ? Math.Cbrt(x) : 7.787 * x + 16.0 / 116.0;
-        y = y > 0.008856 ? Math.Cbrt(y) : 7.787 * y + 16.0 / 116.0;
-        z = z > 0.008856 ? Math.Cbrt(z) : 7.787 * z + 16.0 / 116.0;
+        x = x > 0.008856 ? PortableMathD.Cbrt(x) : 7.787 * x + 16.0 / 116.0;
+        y = y > 0.008856 ? PortableMathD.Cbrt(y) : 7.787 * y + 16.0 / 116.0;
+        z = z > 0.008856 ? PortableMathD.Cbrt(z) : 7.787 * z + 16.0 / 116.0;
 
         labL = 116.0 * y - 16.0;
         labA = 500.0 * (x - y);

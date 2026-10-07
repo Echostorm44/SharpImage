@@ -47,7 +47,7 @@ public static class HdrOps
         {
             for (int imgIdx = 0; imgIdx < images.Length; imgIdx++)
             {
-                double exposure = Math.Pow(2, exposureValues[imgIdx]);
+                double exposure = PortableMathD.Pow(2, exposureValues[imgIdx]);
 
                 for (int y = 0; y < height; y++)
                 {
@@ -147,23 +147,31 @@ public static class HdrOps
         int channels = source.NumberOfChannels;
 
         // Compute log-average luminance
-        double logLumSum = 0;
         double delta = 1e-6;
         int pixelCount = width * height;
 
-        for (int y = 0; y < height; y++)
+        // Per-row sums in parallel, added in row order: the same total on every run and machine.
+        var rowLogSums = new double[height];
+        Parallel.For(0, height, y =>
         {
             var row = source.GetPixelRow(y);
+            double s = 0;
             for (int x = 0; x < width; x++)
             {
                 int off = x * channels;
                 double lum = channels >= 3
                     ? (row[off] * 0.2126 + row[off + 1] * 0.7152 + row[off + 2] * 0.0722) * Quantum.Scale
                     : row[off] * Quantum.Scale;
-                logLumSum += Math.Log(lum + delta);
+                s += PortableMathD.Log(lum + delta);
             }
+            rowLogSums[y] = s;
+        });
+        double logLumSum = 0;
+        for (int y = 0; y < height; y++)
+        {
+            logLumSum += rowLogSums[y];
         }
-        double logAvgLum = Math.Exp(logLumSum / pixelCount);
+        double logAvgLum = PortableMathD.Exp(logLumSum / pixelCount);
 
         var result = new ImageFrame();
         result.Initialize(width, height, source.Colorspace, source.HasAlpha);
@@ -196,8 +204,8 @@ public static class HdrOps
                     {
                         double val = srcRow[off + c] * Quantum.Scale;
                         // Saturation-preserving: lerp between luminance-only and full color
-                        double mapped = Math.Pow(val * ratio, saturation) *
-                            Math.Pow(mappedLum, 1.0 - saturation);
+                        double mapped = PortableMathD.Pow(val * ratio, saturation) *
+                            PortableMathD.Pow(mappedLum, 1.0 - saturation);
                         dstRow[off + c] = Quantum.Clamp((int)(mapped * Quantum.MaxValue));
                     }
                 }
@@ -243,8 +251,8 @@ public static class HdrOps
             }
         }
 
-        double logMaxLum = Math.Log10(1 + maxLum);
-        double biasP = Math.Log(bias) / Math.Log(0.5);
+        double logMaxLum = PortableMathD.Log10(1 + maxLum);
+        double biasP = PortableMathD.Log(bias) / PortableMathD.Log(0.5);
         double invMaxLumDelta = 1.0 / (maxLum + delta);
         bool hasAlpha = source.HasAlpha;
 
@@ -265,8 +273,9 @@ public static class HdrOps
                     : srcRow[off] * Quantum.Scale;
 
                 // Drago operator with adaptive bias
-                double mapped = Math.Log10(1 + lum) /
-                    (logMaxLum * (Math.Log10(2 + 8 * Math.Pow(lum * invMaxLumDelta, biasP))));
+                // per-pixel tone curve: the fast (few-ulp, still platform-independent) kernels
+                double mapped = PortableMathD.Log10Fast(1 + lum) /
+                    (logMaxLum * (PortableMathD.Log10Fast(2 + 8 * PortableMathD.PowFast(lum * invMaxLumDelta, biasP))));
 
                 mapped = Math.Clamp(mapped, 0, 1);
 
@@ -399,17 +408,17 @@ public static class HdrOps
                 double b = channels >= 3 ? row[off + 2] * Quantum.Scale : r;
 
                 // Well-exposedness: Gaussian centered at 0.5
-                double expR = Math.Exp(-12.5 * (r - 0.5) * (r - 0.5));
-                double expG = Math.Exp(-12.5 * (g - 0.5) * (g - 0.5));
-                double expB = Math.Exp(-12.5 * (b - 0.5) * (b - 0.5));
-                double exposedness = Math.Pow(expR * expG * expB, exposednessW);
+                double expR = PortableMathD.Exp(-12.5 * (r - 0.5) * (r - 0.5));
+                double expG = PortableMathD.Exp(-12.5 * (g - 0.5) * (g - 0.5));
+                double expB = PortableMathD.Exp(-12.5 * (b - 0.5) * (b - 0.5));
+                double exposedness = PortableMathD.Pow(expR * expG * expB, exposednessW);
 
                 // Saturation: std dev of channels
                 double mean = (r + g + b) / 3.0;
                 double sat = channels >= 3
                     ? Math.Sqrt(((r - mean) * (r - mean) + (g - mean) * (g - mean) + (b - mean) * (b - mean)) / 3.0)
                     : 0;
-                double satPow = Math.Pow(sat + 1e-10, saturationW);
+                double satPow = PortableMathD.Pow(sat + 1e-10, saturationW);
 
                 // Contrast: Laplacian magnitude (computed below for interior pixels)
                 double contrast = 0;
@@ -434,7 +443,7 @@ public static class HdrOps
 
                     contrast = Math.Abs(4 * lum - lumUp - lumDn - lumL - lumR);
                 }
-                double contPow = Math.Pow(contrast + 1e-10, contrastW);
+                double contPow = PortableMathD.Pow(contrast + 1e-10, contrastW);
 
                 weights[y * width + x] = contPow * satPow * exposedness + 1e-12;
             }

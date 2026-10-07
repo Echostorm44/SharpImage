@@ -38,4 +38,29 @@ public sealed class AvifSequenceTimeTests
         using var back2 = HeifCoder.DecodeSequence(plain);
         await Assert.That(back2.CreationTime).IsNull();
     }
+
+    // A 64-bit time past DateTimeOffset.MaxValue (year 9999) is unrepresentable, not an error: it reads as unset. It used
+    // to throw ArgumentOutOfRangeException from DateTimeOffset.FromUnixTimeSeconds (found by DecoderFuzz).
+    [Test]
+    public async Task TimeBeyondYear9999_ReadsAsUnset()
+    {
+        using var seq = TwoFrames();
+        var created = new DateTimeOffset(2024, 5, 17, 12, 30, 0, TimeSpan.Zero);
+        var modified = new DateTimeOffset(2025, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        byte[] avif = HeifCoder.EncodeAvifSequence(seq, new AvifEncodeOptions { Quality = 60, CreationTime = created, ModificationTime = modified });
+        var want = new byte[8];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt64BigEndian(want, (ulong)(created.ToUnixTimeSeconds() + 2082844800));
+        var huge = new byte[8];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt64BigEndian(huge, 1UL << 44);   // ~557,000 years after 1904
+        int patched = 0;
+        for (int i = avif.AsSpan().IndexOf(want); i >= 0; i = avif.AsSpan().IndexOf(want))
+        {
+            huge.CopyTo(avif, i);
+            patched++;
+        }
+        await Assert.That(patched).IsGreaterThan(0);
+        using var back = HeifCoder.DecodeSequence(avif);
+        await Assert.That(back.CreationTime).IsNull();
+        await Assert.That(back.ModificationTime).IsEqualTo(modified);
+    }
 }

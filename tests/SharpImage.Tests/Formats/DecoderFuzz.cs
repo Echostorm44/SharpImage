@@ -94,7 +94,8 @@ public sealed class DecoderFuzz
         {
             if (Volatile.Read(ref hung) != 0) return;
             var (s, si, i) = job;
-            var input = Mutate(s.Data, new Random(HashCode.Combine(seed, si, i)));
+            // Not HashCode.Combine: its seed is random per process, which made the "fixed" budget a new one every run.
+            var input = Mutate(s.Data, new Random(unchecked((seed * 1_000_003 + si) * 1_000_003 + i)));
             string id = $"{s.Name}#{i}";
             string? saved = null;
             if (outDir != null) File.WriteAllBytes(saved = Path.Combine(outDir, $"inflight_{Environment.CurrentManagedThreadId}.bin"), input);
@@ -130,7 +131,7 @@ public sealed class DecoderFuzz
     }
 
     // Replays one saved input (SHARPIMAGE_FUZZ_ONE="<Avif|Obu|Jpeg> <file>"), writing the full exception next to it.
-    [Test]
+    [Test, Explicit]
     public void ReplayOne()
     {
         if (Environment.GetEnvironmentVariable("SHARPIMAGE_FUZZ_ONE") is not { } cfg) return;
@@ -142,7 +143,7 @@ public sealed class DecoderFuzz
         File.WriteAllText(file + ".txt", result);
     }
 
-    [Test]
+    [Test, Explicit]
     public async Task Campaign()
     {
         if (Environment.GetEnvironmentVariable("SHARPIMAGE_FUZZ") is not { } cfg) return;   // opt-in

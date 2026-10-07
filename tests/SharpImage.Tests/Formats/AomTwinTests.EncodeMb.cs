@@ -41,7 +41,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task ForwardTransform_AllSizesTypes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(7);
         const int stride = 64;
         var diff = new short[64 * stride];
@@ -78,7 +78,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task Scans_AllSizesTypes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         for (int tx = 0; tx < 19; tx++)
             for (int txType = 0; txType < 16; txType++)
             {
@@ -93,7 +93,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task DistortionKernels_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(11);
         var c = new int[4096];
         var d = new int[4096];
@@ -135,7 +135,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task InverseTransform_AllSizesTypes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(13);
         const int stride = 64;
         var diff = new short[64 * stride];
@@ -188,7 +188,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task Hadamard_AllSizes()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(17);
         const int stride = 64;
         var diff = new short[64 * stride];

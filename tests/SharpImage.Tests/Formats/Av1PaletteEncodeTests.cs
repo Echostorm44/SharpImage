@@ -2,17 +2,17 @@ using System;
 using System.IO;
 using SharpImage.Formats;
 using SharpImage.Formats.Av1;
+using SharpImage.Image;
 using TUnit.Core;
 
 namespace SharpImage.Tests.Formats;
 
 // End-to-end palette-mode encode. Builds a few-colour 128x128 I420 image (the case palette targets), encodes it
 // with palette enabled, and decodes the result with our own Av1Decoder — asserting it decodes without error and,
-// where palette was used (lossless prediction + skip), reproduces the source luma exactly. Also writes the .avif
-// + our decoded YUV to the scratchpad so an external step can confirm ffmpeg/libdav1d decodes it identically.
+// where palette was used (lossless prediction + skip), reproduces the source luma exactly. Self-contained: the
+// decoder's YUV dump goes to a temp file that is read back and deleted.
 public sealed class Av1PaletteEncodeTests
 {
-    const string Dir = @"C:\Users\adamm\AppData\Local\Temp\claude\F--Code-QuickFixMyPics2\6657081e-026c-4ec2-a3b0-5a927b1d6dfe\scratchpad";
     const int W = 128, H = 128;
 
     private static (byte[] y, byte[] u, byte[] v) FewColorImage()
@@ -45,17 +45,33 @@ public sealed class Av1PaletteEncodeTests
             byte[] avif = Av1StillImageEncoder.EncodeAvifColorMultiSb(y, u, v, W, H, baseQIdx: 128);
             await Assert.That(HeifCoder.IsAvif(avif)).IsTrue();
 
-            // Decode via the public path (unwraps the ISOBMFF container to YUV) and dump it, plus the source, so an
-            // external ffmpeg/libdav1d cross-check can confirm both the stream validity and lossless palette recon.
-            if (Directory.Exists(Dir))
+            // Decode via the public path (unwraps the ISOBMFF container to YUV) with the decoder's 8-bit plane dump
+            // pointed at a temp file, so the reconstruction itself can be compared with the source.
+            string dump = Path.Combine(Path.GetTempPath(), $"sharpimage_pal_{Environment.ProcessId}.yuv");
+            Environment.SetEnvironmentVariable("AV1_DUMPYUV", dump);
+            ImageFrame decoded;
+            byte[] recon;
+            try
             {
-                File.WriteAllBytes(Path.Combine(Dir, "pal_enc.avif"), avif);
-                using var fs = new FileStream(Path.Combine(Dir, "pal_src.yuv"), FileMode.Create);
-                fs.Write(y, 0, y.Length); fs.Write(u, 0, u.Length); fs.Write(v, 0, v.Length);
+                decoded = HeifCoder.Decode(avif);
+                recon = File.ReadAllBytes(dump);
             }
-            Environment.SetEnvironmentVariable("AV1_DUMPYUV", Path.Combine(Dir, "pal_our.yuv"));
-            using var img = HeifCoder.Decode(avif);
-            Environment.SetEnvironmentVariable("AV1_DUMPYUV", null);
+            finally
+            {
+                Environment.SetEnvironmentVariable("AV1_DUMPYUV", null);
+                File.Delete(dump);
+            }
+            using var img = decoded;
+            int diffs = 0;
+            for (int i = 0; i < W * H; i++)
+            {
+                if (recon[i] != y[i])
+                {
+                    diffs++;
+                }
+            }
+            await Assert.That(recon.Length).IsEqualTo(W * H * 3 / 2);
+            await Assert.That(diffs).IsEqualTo(0);
             await Assert.That((int)img.Columns).IsEqualTo(W);
             await Assert.That((int)img.Rows).IsEqualTo(H);
         }

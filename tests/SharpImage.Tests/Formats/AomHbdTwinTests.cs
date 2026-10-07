@@ -5,19 +5,18 @@ using static SharpImage.Formats.Av1.AomTables;
 namespace SharpImage.Tests.Formats;
 
 // Twins of the libaom port's high bit depth kernels (AomHbd*.cs, AomQuant.Hbd.cs, AomEncodeMb.Hbd.cs, ...) against
-// libaom 3.14.1's RTCD-dispatched ones through aomtwin_hbd.dll (scratchpad aomtwin_hbd/twin_hbd.c). Opt-in: point
-// SHARPIMAGE_AOMTWIN_HBD at aomtwin_hbd.dll; without it the tests pass without checking.
+// libaom 3.14.1's RTCD-dispatched ones through aomtwin_hbd.dll (tests/native/aomtwin/twin_hbd.c). Opt-in: point
+// SHARPIMAGE_AOMTWIN_HBD at aomtwin_hbd.dll; without it the tests report Skipped.
 [NotInParallel]
 public sealed partial class AomHbdTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_HBD");
-    private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
-        ? Load() : throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_HBD is set but the DLL does not exist", DllPath));
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN_HBD";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
+    private static readonly bool Available = DllPath != null && Load();
 
     private static bool Load()
     {
-        NativeLibrary.SetDllImportResolver(typeof(AomHbdTwinTests).Assembly, (name, _, _) =>
-            name == "aomtwin_hbd" ? NativeLibrary.Load(DllPath!) : IntPtr.Zero);
+        AomTwinNative.Register("aomtwin_hbd", DllPath!);
         Native.twin_init();
         return true;
     }
@@ -71,7 +70,7 @@ public sealed partial class AomHbdTwinTests
     [Test]
     public async Task FwdTxfm_AllSizes_MatchLibaom()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(11);
         int bad = 0;
         string first = "";
@@ -96,7 +95,7 @@ public sealed partial class AomHbdTwinTests
     [Test]
     public async Task InvTxfm_AllSizes_MatchLibaom()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(12);
         string first = "";
         int cases = 0;
@@ -157,7 +156,7 @@ public sealed partial class AomHbdTwinTests
     [Test]
     public async Task Quantizers_MatchLibaom()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(13);
         string first = "";
         foreach (int bd in new[] { 10, 12 })
@@ -203,7 +202,7 @@ public sealed partial class AomHbdTwinTests
     [Test]
     public async Task Distortion_MatchLibaom()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(14);
         string first = "";
         foreach (int bd in new[] { 10, 12 })
@@ -261,7 +260,7 @@ public sealed partial class AomHbdTwinTests
     [Test]
     public unsafe Task IntraPred_MatchLibaom()
     {
-        if (!Available) return Task.CompletedTask;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(15);
         foreach (int bd in new[] { 10, 12 })
             for (int it = 0; it < 3000; it++)
@@ -315,7 +314,7 @@ public sealed partial class AomHbdTwinTests
     [Test]
     public unsafe Task NonrdLbdTxfmOnHbdResiduals_MatchLibaom()
     {
-        if (!Available) return Task.CompletedTask;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(16);
         foreach (int bd in new[] { 10, 12 })
             for (int it = 0; it < 3000; it++)

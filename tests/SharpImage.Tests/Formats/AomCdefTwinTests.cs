@@ -5,19 +5,18 @@ namespace SharpImage.Tests.Formats;
 
 // Twins of the CDEF kernels (AomCdef: cdef_find_dir / cdef_find_dir_dual, cdef_filter_8_*, cdef_copy_rect8_8bit_to_16bit,
 // aom_sse, av1_cdef_filter_fb) against libaom 3.14.1's RTCD-dispatched (AVX2) kernels through aomtwin_cdef.dll
-// (scratchpad aomtwin_cdef/: twin_cdef.c, build.sh). Without the DLL the tests still cross-check the AVX2 ports against
-// the C-reference ports. Opt-in: SHARPIMAGE_AOMTWIN_CDEF=<path to aomtwin_cdef.dll>.
+// (tests/native/aomtwin: twin_cdef.c, build.sh). Without the library the tests still cross-check the AVX2 ports against
+// the C-reference ports, then report Skipped. Point SHARPIMAGE_AOMTWIN_CDEF at the library.
 [NotInParallel]
 public sealed class AomCdefTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN_CDEF");
-    private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
-        ? Load() : throw new FileNotFoundException("SHARPIMAGE_AOMTWIN_CDEF is set but the DLL does not exist", DllPath));
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN_CDEF";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
+    private static readonly bool Available = DllPath != null && Load();
 
     private static bool Load()
     {
-        NativeLibrary.SetDllImportResolver(typeof(AomCdefTwinTests).Assembly, (name, asm, path) =>
-            name == "aomtwin_cdef" ? NativeLibrary.Load(DllPath!) : IntPtr.Zero);
+        AomTwinNative.Register("aomtwin_cdef", DllPath!);
         Native.twin_init();
         return true;
     }
@@ -75,11 +74,18 @@ public sealed class AomCdefTwinTests
     private static unsafe T* Aligned<T>(int count) where T : unmanaged => (T*)NativeMemory.AlignedAlloc((nuint)(count * sizeof(T)), 64);
 
     [Test]
-    public async Task FindDir_MatchesLibaomDispatched() => await Assert.That(FindDir_MatchesLibaomDispatchedImpl()).IsEqualTo(0);
+    public async Task FindDir_MatchesLibaomDispatched()
+    {
+        await Assert.That(FindDir_MatchesLibaomDispatchedImpl()).IsEqualTo(0);
+        AomTwinNative.SkipUnless(Available, EnvVar);   // the cross-check above ran; the libaom comparison needs the twin
+    }
 
     private static unsafe int FindDir_MatchesLibaomDispatchedImpl()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return 0;
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            Skip.Test("compares the AVX2 kernels: this CPU has no AVX2");
+        }
         var rng = new Random(5);
         ushort* nat = Aligned<ushort>(Size);
         int mismatches = 0;
@@ -114,7 +120,11 @@ public sealed class AomCdefTwinTests
     }
 
     [Test]
-    public async Task Filter8_AllVariants_MatchLibaomDispatched() => await Assert.That(Filter8_AllVariants_MatchLibaomDispatchedImpl()).IsEqualTo(0);
+    public async Task Filter8_AllVariants_MatchLibaomDispatched()
+    {
+        await Assert.That(Filter8_AllVariants_MatchLibaomDispatchedImpl()).IsEqualTo(0);
+        AomTwinNative.SkipUnless(Available, EnvVar);   // the cross-check above ran; the libaom comparison needs the twin
+    }
 
     private static unsafe int Filter8_AllVariants_MatchLibaomDispatchedImpl()
     {
@@ -172,7 +182,11 @@ public sealed class AomCdefTwinTests
     }
 
     [Test]
-    public async Task CopyRect8To16_MatchesLibaomDispatched() => await Assert.That(CopyRect8To16_MatchesLibaomDispatchedImpl()).IsEqualTo(0);
+    public async Task CopyRect8To16_MatchesLibaomDispatched()
+    {
+        await Assert.That(CopyRect8To16_MatchesLibaomDispatchedImpl()).IsEqualTo(0);
+        AomTwinNative.SkipUnless(Available, EnvVar);   // the cross-check above ran; the libaom comparison needs the twin
+    }
 
     private static unsafe int CopyRect8To16_MatchesLibaomDispatchedImpl()
     {
@@ -204,7 +218,7 @@ public sealed class AomCdefTwinTests
 
     private static unsafe int Sse_MatchesLibaomDispatchedImpl()
     {
-        if (!Available) return 0;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(17);
         int mismatches = 0;
         var a = new byte[160 * 140];
@@ -223,7 +237,11 @@ public sealed class AomCdefTwinTests
     }
 
     [Test]
-    public async Task FilterFb_MatchesLibaomDispatched() => await Assert.That(FilterFb_MatchesLibaomDispatchedImpl()).IsEqualTo(0);
+    public async Task FilterFb_MatchesLibaomDispatched()
+    {
+        AomTwinNative.SkipUnless(Available, EnvVar);
+        await Assert.That(FilterFb_MatchesLibaomDispatchedImpl()).IsEqualTo(0);
+    }
 
     private static unsafe int FilterFb_MatchesLibaomDispatchedImpl()
     {

@@ -287,7 +287,7 @@ public class JpegDctTests
 
     // Byte-exact round-trip of REAL third-party JPEGs (libjpeg/ffmpeg) from VARDCT_JBRD_DIR, which exercise
     // real Huffman tables, APPn/COM segments and restart markers.
-    [Test]
+    [Test, Explicit]   // developer probe: needs local files / output dirs from env vars
     public async Task Jpeg_ByteExact_RealFiles()
     {
         string dir = Environment.GetEnvironmentVariable("VARDCT_JBRD_DIR");

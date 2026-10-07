@@ -112,7 +112,7 @@ public class JxlVarDctEncoderTests
         return frame;
     }
 
-    [Test]
+    [Test, Explicit]   // developer probe: needs local files / output dirs from env vars
     public async Task DecodeRealReferenceFile()
     {
         string path = Environment.GetEnvironmentVariable("VARDCT_REF");
@@ -227,7 +227,7 @@ public class JxlVarDctEncoderTests
         await Assert.That(Math.Abs(psnr - modelPsnr)).IsLessThan(1.0); // decode matches the validated forward model
     }
 
-    [Test]
+    [Test, Explicit]   // developer probe: needs local files / output dirs from env vars
     public async Task VarDct_RatioProbe_AgainstLibjxl()
     {
         string outDir = Environment.GetEnvironmentVariable("VARDCT_RATIO_DIR");
@@ -564,7 +564,7 @@ public class JxlVarDctEncoderTests
     // encodes at a few distances, round-trips through our own decoder for a sanity PSNR, and dumps the
     // .jxl so the harness can decode it in jxl-oxide AND libjxl (the real garbling test). Gated on
     // VARDCT_LARGE_DIR (out) + VARDCT_LARGE_SRC (a binary PPM).
-    [Test]
+    [Test, Explicit]   // developer probe: needs local files / output dirs from env vars
     public async Task VarDct_LargeImage_MultiGroup()
     {
         string outDir = Environment.GetEnvironmentVariable("VARDCT_LARGE_DIR");
@@ -1713,7 +1713,7 @@ public class JxlVarDctEncoderTests
     // P6 + separate alpha via VARDCT_DEEP_ALPHA PGM), encodes lossless + lossy at several qualities, round-
     // trips through our own decoder (lossless MUST be exact), and dumps each .jxl to VARDCT_DEEP_DIR for the
     // external-decoder cross-check. Gated; driven over the whole corpus by scripts/deeptest.
-    [Test]
+    [Test, Explicit]   // developer probe: needs local files / output dirs from env vars
     public async Task VarDct_DeepTest()
     {
         string src = Environment.GetEnvironmentVariable("VARDCT_DEEP_SRC");

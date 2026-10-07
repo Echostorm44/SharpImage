@@ -4,6 +4,7 @@ using System.Text;
 using System.Xml;
 using SharpImage.Image;
 using SharpImage.Metadata;
+using SharpImage.Core;
 
 namespace SharpImage.Formats;
 
@@ -274,7 +275,7 @@ public static partial class JpegCoder
             {
                 var headroomLinear = new[] { 1.0 };
                 if (!GainMapDoubles(desc, "HDRGainMapHeadroom", headroomLinear, XmpNsAppleGainMap) || headroomLinear[0] <= 0) return false;
-                double headroom = Math.Log2(headroomLinear[0]);
+                double headroom = PortableMathD.Log2(headroomLinear[0]);
                 var h = HeifCoder.ToSFraction(headroom);
                 for (int c = 0; c < 3; c++)
                 {

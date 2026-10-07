@@ -361,7 +361,7 @@ public static class BlurNoiseOps
                 // Box-Muller transform
                 alpha = Math.Max(rng.NextDouble(), 1e-10);
                 beta = rng.NextDouble();
-                double gaussian = Math.Sqrt(-2.0 * Math.Log(alpha)) * Math.Cos(2.0 * Math.PI * beta);
+                double gaussian = Math.Sqrt(-2.0 * PortableMathD.LogFast(alpha)) * Math.Cos(2.0 * Math.PI * beta);
                 return pixel + Quantum.MaxValue * attenuate * 0.025 * gaussian;
 
             case NoiseType.Impulse:
@@ -376,14 +376,14 @@ public static class BlurNoiseOps
             case NoiseType.Laplacian:
                 alpha = Math.Max(rng.NextDouble(), 1e-10);
                 if (alpha <= 0.5)
-                    return pixel - Quantum.MaxValue * attenuate * 0.04 * Math.Log(2.0 * alpha);
+                    return pixel - Quantum.MaxValue * attenuate * 0.04 * PortableMathD.Log(2.0 * alpha);
                 else
-                    return pixel + Quantum.MaxValue * attenuate * 0.04 * Math.Log(2.0 * (1.0 - alpha));
+                    return pixel + Quantum.MaxValue * attenuate * 0.04 * PortableMathD.Log(2.0 * (1.0 - alpha));
 
             case NoiseType.MultiplicativeGaussian:
                 alpha = Math.Max(rng.NextDouble(), 1e-10);
                 beta = rng.NextDouble();
-                double mulNoise = Math.Sqrt(-2.0 * Math.Log(alpha)) * Math.Cos(2.0 * Math.PI * beta);
+                double mulNoise = Math.Sqrt(-2.0 * PortableMathD.LogFast(alpha)) * Math.Cos(2.0 * Math.PI * beta);
                 return pixel * (1.0 + attenuate * 0.04 * mulNoise);
 
             case NoiseType.Poisson:
@@ -391,7 +391,7 @@ public static class BlurNoiseOps
                 if (lambda < 30)
                 {
                     // Direct method for small lambda
-                    double expLambda = Math.Exp(-lambda);
+                    double expLambda = PortableMathD.ExpFast(-lambda);
                     double p = 1.0;
                     int k = 0;
                     do
@@ -406,7 +406,7 @@ public static class BlurNoiseOps
                     // Normal approximation for large lambda
                     alpha = Math.Max(rng.NextDouble(), 1e-10);
                     beta = rng.NextDouble();
-                    double approx = lambda + Math.Sqrt(lambda) * Math.Sqrt(-2.0 * Math.Log(alpha)) * Math.Cos(2.0 * Math.PI * beta);
+                    double approx = lambda + Math.Sqrt(lambda) * Math.Sqrt(-2.0 * PortableMathD.LogFast(alpha)) * Math.Cos(2.0 * Math.PI * beta);
                     return Math.Max(0, approx) / (Quantum.Scale * attenuate);
                 }
 
@@ -729,7 +729,7 @@ public static class BlurNoiseOps
         for (int i = 0; i < size; i++)
         {
             double x = i - radius;
-            kernel[i] = (float)Math.Exp(-(x * x) / twoSigmaSq);
+            kernel[i] = (float)PortableMathD.Exp(-(x * x) / twoSigmaSq);
             sum += kernel[i];
         }
 
@@ -756,7 +756,7 @@ public static class BlurNoiseOps
             {
                 double dx = x - radius;
                 double dy = y - radius;
-                kernel[y, x] = (float)Math.Exp(-(dx * dx + dy * dy) / twoSigmaSq);
+                kernel[y, x] = (float)PortableMathD.Exp(-(dx * dx + dy * dy) / twoSigmaSq);
                 sum += kernel[y, x];
             }
         }
@@ -900,7 +900,7 @@ public static class BlurNoiseOps
             for (int kx = 0; kx < kernelSize; kx++)
             {
                 int dx = kx - radius;
-                spatialWeights[ky * kernelSize + kx] = Math.Exp((dx * dx + dy * dy) / spatialDenom);
+                spatialWeights[ky * kernelSize + kx] = PortableMathD.Exp((dx * dx + dy * dy) / spatialDenom);
             }
         }
 
@@ -913,7 +913,7 @@ public static class BlurNoiseOps
         for (int i = 0; i < rangeLutSize; i++)
         {
             double diff = i / rangeScale;
-            rangeLut[i] = Math.Exp((diff * diff) / rangeDenom);
+            rangeLut[i] = PortableMathD.Exp((diff * diff) / rangeDenom);
         }
 
         var result = new ImageFrame();

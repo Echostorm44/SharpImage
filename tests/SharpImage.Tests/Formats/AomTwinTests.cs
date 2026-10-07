@@ -4,19 +4,18 @@ using SharpImage.Formats.Av1;
 namespace SharpImage.Tests.Formats;
 
 // Twins of the libaom encoder port (src/SharpImage/Formats/Av1/Aom): each ported function against libaom 3.14.1's own,
-// through aomtwin.dll (a thin export layer built against libaom.a; see scratchpad aomtwin/aomtwin.c). Opt-in: point
-// SHARPIMAGE_AOMTWIN at aomtwin.dll; without it the tests pass without checking.
+// through aomtwin.dll (a thin export layer built against libaom.a; tests/native/aomtwin/aomtwin.c). Opt-in: point
+// SHARPIMAGE_AOMTWIN at aomtwin.dll; without it the tests report Skipped.
 [NotInParallel]
 public sealed partial class AomTwinTests
 {
-    private static readonly string? DllPath = Environment.GetEnvironmentVariable("SHARPIMAGE_AOMTWIN");
-    private static readonly bool Available = DllPath != null && (File.Exists(DllPath)
-        ? Load() : throw new FileNotFoundException("SHARPIMAGE_AOMTWIN is set but the DLL does not exist", DllPath));
+    private const string EnvVar = "SHARPIMAGE_AOMTWIN";
+    private static readonly string? DllPath = AomTwinNative.PathFromEnv(EnvVar);
+    private static readonly bool Available = DllPath != null && Load();
 
     private static bool Load()
     {
-        NativeLibrary.SetDllImportResolver(typeof(AomTwinTests).Assembly, (name, _, _) =>
-            name == "aomtwin" ? NativeLibrary.Load(DllPath!) : IntPtr.Zero);
+        AomTwinNative.Register("aomtwin", DllPath!);
         Native.twin_init();
         return true;
     }
@@ -101,7 +100,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task CostSymbol_AllProbabilities()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         for (int p = 0; p <= 32768; p++)
             if (AomCost.CostSymbol(p) != Native.twin_cost_symbol(p))
                 await Assert.That(AomCost.CostSymbol(p)).IsEqualTo(Native.twin_cost_symbol(p));
@@ -110,7 +109,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task CostTokensFromCdf_RandomCdfs()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(1);
         for (int iter = 0; iter < 20000; iter++)
         {
@@ -134,7 +133,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task RdMultKeyFrame_AllQ()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         foreach (int bd in new[] { 8, 10, 12 })
             for (int q = 0; q < 256; q++)
                 await Assert.That(AomRd.RdMultKeyFrame(q, bd)).IsEqualTo(Native.twin_rdmult_kf(q, bd));
@@ -143,7 +142,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task BuildQuantizer_AllConfigs()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         foreach (int bd in new[] { 8, 10, 12 })
             foreach (int sharp in new[] { 0, 3, 7 })
                 foreach (var (ydc, udc, uac, vdc, vac) in new[] { (0, 0, 0, 0, 0), (-5, 3, -2, 4, 7) })
@@ -166,7 +165,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task Quantizers_RandomCoefficients()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(2);
         var q = new AomQuants(8, 0, 0, 0, 0, 0, 0);
         for (int iter = 0; iter < 40000; iter++)
@@ -208,7 +207,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task DefaultCoeffCosts_AllQContexts()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         foreach (int q in new[] { 0, 20, 21, 60, 61, 120, 121, 255 })
         {
             var ours = Flatten(OurDefaultCosts(q));
@@ -236,7 +235,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task CostCoeffsTxb_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(3);
         var costsByQ = new[] { 10, 40, 100, 200 }.Select(OurDefaultCosts).ToArray();
         var flat = costsByQ.Select(Flatten).ToArray();
@@ -263,7 +262,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task OptimizeTxb_Random()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         var rng = new Random(4);
         var quants = new AomQuants(8, 0, 0, 0, 0, 0, 0);
         var costsByQ = new[] { 10, 40, 100, 200 }.Select(OurDefaultCosts).ToArray();
@@ -323,7 +322,7 @@ public sealed partial class AomTwinTests
     [Test]
     public async Task DefaultModeCosts()
     {
-        if (!Available) return;
+        AomTwinNative.SkipUnless(Available, EnvVar);
         foreach (bool fi in new[] { true, false })
         {
             var buf = new int[20000]; var offs = new int[17];

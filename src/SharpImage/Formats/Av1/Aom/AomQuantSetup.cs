@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -199,7 +200,7 @@ internal static class AomQuantSetup
         double strength = (cpi.DeltaqStrength / 100.0) * 3.0;
         strength = Math.Clamp(strength, 0.0, 6.0);   // fclamp
         if (variance == 0) variance = 1;
-        double qstepRatio = 0.15 * strength * (-Math.Log2((double)variance) + 10.0) + 1.0;
+        double qstepRatio = 0.15 * strength * (-PortableMathD.Log2((double)variance) + 10.0) + 1.0;
         qstepRatio = Math.Clamp(qstepRatio, 1.0, VarBoostMaxBoost);
         double baseQ = QindexToQ(baseQindex, bd);   // av1_convert_qindex_to_q
         double targetQ = baseQ / qstepRatio;

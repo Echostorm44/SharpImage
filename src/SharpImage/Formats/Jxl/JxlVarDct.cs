@@ -5,6 +5,7 @@
 // (jxl-vardct, jxl-render vardct) and libjxl. Loop filters (Gaborish/EPF) are applied when present.
 using System;
 using System.Collections.Generic;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Jxl;
 
@@ -528,7 +529,7 @@ internal static class JxlVarDct
     // dequant HF: multiply decoded coefficients by dequant matrix + bias.
     private static void DequantHf(VarDctFrameParams fp, HfBlockContext hfCtx, DequantMatrixSet dm, Quantizer quant, LfGroupData lg, float[][] coeff, int coeffStride)
     {
-        float[] qmScale = { MathF.Pow(0.8f, fp.XQmScale - 2), 1.0f, MathF.Pow(0.8f, fp.BQmScale - 2) };
+        float[] qmScale = { PortableMath.Pow(0.8f, fp.XQmScale - 2), 1.0f, PortableMath.Pow(0.8f, fp.BQmScale - 2) };
         for (int channel = 0; channel < 3; channel++)
         {
             float quantBias = fp.QuantBias[channel];
@@ -826,7 +827,7 @@ internal static class JxlVarDct
     {
         float itscale = 255.0f / fp.IntensityTarget;
         float[] ob = fp.OpsinBias;
-        float[] cbrtOb = { MathF.Cbrt(ob[0]), MathF.Cbrt(ob[1]), MathF.Cbrt(ob[2]) };
+        float[] cbrtOb = { PortableMath.Cbrt(ob[0]), PortableMath.Cbrt(ob[1]), PortableMath.Cbrt(ob[2]) };
         float[] m = fp.OpsinInv;
         for (int i = 0; i < len; i++)
         {
@@ -871,7 +872,7 @@ internal static class JxlVarDct
             return 1f;
         }
 
-        return v <= 0.0031308f ? v * 12.92f : (1.055f * MathF.Pow(v, 1f / 2.4f)) - 0.055f;
+        return v <= 0.0031308f ? v * 12.92f : (1.055f * PortableMath.Pow(v, 1f / 2.4f)) - 0.055f;
     }
 
     /// <summary>Decodes a VarDCT frame body. Sections are laid out per the TOC; returns 3 sRGB float channels [0,1].</summary>

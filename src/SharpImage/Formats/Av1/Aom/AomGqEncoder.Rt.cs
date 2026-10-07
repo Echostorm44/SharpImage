@@ -1,4 +1,5 @@
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -394,8 +395,8 @@ internal sealed partial class AomGqEncoder
         _rt.Rc1Frame = correctionFactor > 1.1 ? -1 : correctionFactor < 0.9 ? 1 : 0;
         double adjustmentLimit;
         if (correctionFactor > 0.0)
-            adjustmentLimit = _isScreenContentType ? 0.25 + 0.5 * Math.Min(0.5, Math.Abs(Math.Log10(correctionFactor)))
-                : 0.25 + 0.75 * Math.Min(0.5, Math.Abs(Math.Log10(correctionFactor)));
+            adjustmentLimit = _isScreenContentType ? 0.25 + 0.5 * Math.Min(0.5, Math.Abs(PortableMathD.Log10(correctionFactor)))
+                : 0.25 + 0.75 * Math.Min(0.5, Math.Abs(PortableMathD.Log10(correctionFactor)));
         else adjustmentLimit = 0.75;
         if (correctionFactor > 1.01)
         {

@@ -405,8 +405,8 @@ public static partial class HeifCoder
                 if (inM != null) AvifColorMath.Convert(px, inM);
                 for (int k = 0; k < 3; k++)
                 {
-                    float gainMapLog2 = Lerp(gMin[k], gMax[k], MathF.Pow(gpx[k], gammaInv[k]));
-                    float toneMappedLinear = (px[k] + bOff[k]) * MathF.Pow(2.0f, gainMapLog2 * weight) - aOff[k];
+                    float gainMapLog2 = Lerp(gMin[k], gMax[k], PortableMath.Pow(gpx[k], gammaInv[k]));
+                    float toneMappedLinear = (px[k] + bOff[k]) * PortableMath.Pow(2.0f, gainMapLog2 * weight) - aOff[k];
                     if (toneMappedLinear > rgbMaxLinear) rgbMaxLinear = toneMappedLinear;
                     if (toneMappedLinear > pixelRgbMaxLinear) pixelRgbMaxLinear = toneMappedLinear;
                     tm[k] = toneMappedLinear;
@@ -538,13 +538,13 @@ public static partial class HeifCoder
                     if (b > baseMaxV) baseMaxV = b;
                     if (a > altMaxV) altMaxV = a;
                     float ratio = (a + altOffset[c]) / (b + baseOffset[c]);
-                    gmf[c][j * width + i] = MathF.Log2(MathF.Max(ratio, kEpsilon));
+                    gmf[c][j * width + i] = PortableMath.Log2(MathF.Max(ratio, kEpsilon));
                 }
             }
         }
 
-        double baseHeadroom = MathF.Log2(MathF.Max(baseMaxV, kEpsilon));
-        double altHeadroom = MathF.Log2(MathF.Max(altMaxV, kEpsilon));
+        double baseHeadroom = PortableMath.Log2(MathF.Max(baseMaxV, kEpsilon));
+        double altHeadroom = PortableMath.Log2(MathF.Max(altMaxV, kEpsilon));
         gm.BaseHdrHeadroom = ToUFraction(baseHeadroom);
         gm.AlternateHdrHeadroom = ToUFraction(altHeadroom);
         // Store the log-ratio of the HDR representation to the SDR one.
@@ -573,7 +573,7 @@ public static partial class HeifCoder
             {
                 float v = plane[k];
                 v = v < minLog2[c] ? minLog2[c] : (maxLog2[c] < v ? maxLog2[c] : v);
-                v = MathF.Pow((v - minLog2[c]) / range, gamma);
+                v = PortableMath.Pow((v - minLog2[c]) / range, gamma);
                 plane[k] = NanSafeClamp(v);
             }
         }

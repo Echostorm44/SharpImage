@@ -7,6 +7,7 @@
 // the 1-norm weighted maps distributed to the 8x8 blocks each scale-pixel covers.
 
 using System;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Jxl;
 
@@ -150,7 +151,7 @@ internal static class JxlEncoderSsimulacra
 
         ssim *= 0.9562382616834844;
         ssim = (2.326765642916932 * ssim) - (0.020884521182843837 * ssim * ssim) + (6.248496625763138e-05 * ssim * ssim * ssim);
-        return ssim > 0 ? 100.0 - (10.0 * Math.Pow(ssim, 0.6276336467831387)) : 100.0;
+        return ssim > 0 ? 100.0 - (10.0 * PortableMathD.Pow(ssim, 0.6276336467831387)) : 100.0;
     }
 
     private static double P4(double x)
@@ -223,7 +224,7 @@ internal static class JxlEncoderSsimulacra
         float sum = 0;
         for (int i = -radius; i <= radius; i++)
         {
-            float v = MathF.Exp(-(i * i) / (2 * sigma * sigma));
+            float v = PortableMath.Exp(-(i * i) / (2 * sigma * sigma));
             k[i + radius] = v;
             sum += v;
         }

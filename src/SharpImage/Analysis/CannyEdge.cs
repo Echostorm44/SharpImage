@@ -102,7 +102,7 @@ public static class CannyEdge
         for (int i = 0; i < ksize; i++)
         {
             int d = i - radius;
-            kernel[i] = MathF.Exp(-(d * d) / s2);
+            kernel[i] = PortableMath.Exp(-(d * d) / s2);
             sum += kernel[i];
         }
         for (int i = 0; i < ksize; i++) kernel[i] /= sum;

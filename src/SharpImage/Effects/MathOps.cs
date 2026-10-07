@@ -26,6 +26,13 @@ public static class MathOps
         var result = new ImageFrame();
         result.Initialize(width, height, source.Colorspace, source.HasAlpha);
 
+        // The transcendental operators depend on the sample alone: large images evaluate them once per quantum value.
+        bool costly = op is EvaluateOperator.Log or EvaluateOperator.Pow or EvaluateOperator.Exponential or EvaluateOperator.InverseLog
+            or EvaluateOperator.Sine or EvaluateOperator.Cosine;
+        ushort[]? lut = costly && (long)width * height * channels >= QuantumLut.MinSamples
+            ? QuantumLut.Build(i => (ushort)Math.Clamp(ApplyEvaluateOp((ushort)i, op, value), 0, Quantum.MaxValue))
+            : null;
+
         Parallel.For(0, height, y =>
         {
             var srcRow = source.GetPixelRow(y);
@@ -33,7 +40,7 @@ public static class MathOps
 
             for (int i = 0; i < width * channels; i++)
             {
-                dstRow[i] = (ushort)Math.Clamp(ApplyEvaluateOp(srcRow[i], op, value), 0, Quantum.MaxValue);
+                dstRow[i] = lut != null ? lut[srcRow[i]] : (ushort)Math.Clamp(ApplyEvaluateOp(srcRow[i], op, value), 0, Quantum.MaxValue);
             }
         });
 
@@ -212,7 +219,7 @@ public static class MathOps
                     double weight = terms[t * 2];
                     double exponent = terms[t * 2 + 1];
                     double normalized = imageArray[t].GetPixelRow(y)[i] / (double)Quantum.MaxValue;
-                    sum += weight * Math.Pow(normalized, exponent);
+                    sum += weight * PortableMathD.Pow(normalized, exponent);
                 }
 
                 dstRow[i] = (ushort)Math.Clamp(sum * Quantum.MaxValue, 0, Quantum.MaxValue);
@@ -243,16 +250,16 @@ public static class MathOps
             EvaluateOperator.Xor => (ushort)((ushort)p ^ (ushort)value),
             EvaluateOperator.LeftShift => (ushort)((ushort)p << (int)value),
             EvaluateOperator.RightShift => (ushort)((ushort)p >> (int)value),
-            EvaluateOperator.Log => value > 0 ? Math.Log(p + 1) / Math.Log(value) * Quantum.MaxValue / Math.Log(Quantum.MaxValue + 1) * Math.Log(value) : p,
-            EvaluateOperator.Pow => Math.Pow(p / Quantum.MaxValue, value) * Quantum.MaxValue,
+            EvaluateOperator.Log => value > 0 ? PortableMathD.Log(p + 1) / PortableMathD.Log(value) * Quantum.MaxValue / PortableMathD.Log(Quantum.MaxValue + 1) * PortableMathD.Log(value) : p,
+            EvaluateOperator.Pow => PortableMathD.Pow(p / Quantum.MaxValue, value) * Quantum.MaxValue,
             EvaluateOperator.Cosine => (Math.Cos(Math.PI * 2.0 * p / Quantum.MaxValue * value) + 1.0) * Quantum.MaxValue / 2.0,
             EvaluateOperator.Sine => (Math.Sin(Math.PI * 2.0 * p / Quantum.MaxValue * value) + 1.0) * Quantum.MaxValue / 2.0,
-            EvaluateOperator.Exponential => Math.Pow(value, p / Quantum.MaxValue) * Quantum.MaxValue,
+            EvaluateOperator.Exponential => PortableMathD.Pow(value, p / Quantum.MaxValue) * Quantum.MaxValue,
             EvaluateOperator.ThresholdBlack => p < value ? 0 : p,
             EvaluateOperator.ThresholdWhite => p > value ? Quantum.MaxValue : p,
             EvaluateOperator.Threshold => p > value ? Quantum.MaxValue : 0,
             EvaluateOperator.AddModulus => (p + value) % (Quantum.MaxValue + 1),
-            EvaluateOperator.InverseLog => value > 1 ? (Math.Pow(value, p / Quantum.MaxValue) - 1) / (value - 1) * Quantum.MaxValue : p,
+            EvaluateOperator.InverseLog => value > 1 ? (PortableMathD.Pow(value, p / Quantum.MaxValue) - 1) / (value - 1) * Quantum.MaxValue : p,
             _ => p,
         };
     }

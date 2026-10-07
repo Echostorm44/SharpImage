@@ -1,5 +1,6 @@
 using System;
 using static SharpImage.Formats.Av1.AomTables;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Av1;
 
@@ -167,7 +168,7 @@ internal static partial class AomEncoder
     {
         if (sse > 0.0)
         {
-            double psnr = 10.0 * Math.Log10(samples * peak * peak / sse);
+            double psnr = 10.0 * PortableMathD.Log10(samples * peak * peak / sse);
             return psnr > 100.0 ? 100.0 : psnr;
         }
         return 100.0;

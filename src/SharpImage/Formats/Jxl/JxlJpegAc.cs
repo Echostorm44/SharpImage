@@ -7,6 +7,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using E = SharpImage.Formats.Jxl.JxlBitReader.U32Enc;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Jxl;
 
@@ -360,7 +361,7 @@ internal static partial class JxlEncoder
             int cat = Cat(c);
             foreach (long v in hist[c].Values)
             {
-                symBits[cat] += -v * Math.Log((double)v / tot, 2);
+                symBits[cat] += -v * PortableMathD.Log2Fast((double)v / tot);
             }
         }
 
@@ -579,7 +580,7 @@ internal static partial class JxlEncoder
                 var tc = new double[nc.Length];
                 for (int t = 0; t < nc.Length; t++)
                 {
-                    tc[t] = nc[t] > 0 ? -Math.Log2(nc[t] / tableSum) : 16.0;
+                    tc[t] = nc[t] > 0 ? -PortableMathD.Log2Fast(nc[t] / tableSum) : 16.0;
                 }
 
                 tokCost[c] = tc;

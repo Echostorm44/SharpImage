@@ -853,7 +853,7 @@ public static class CameraRawProcessor
             if (linear < 0.018)
                 encoded = 4.5 * linear;
             else
-                encoded = 1.099 * Math.Pow(linear, 0.45) - 0.099;
+                encoded = 1.099 * PortableMathD.Pow(linear, 0.45) - 0.099;
 
             lut[i] = (ushort)(Math.Clamp(encoded, 0.0, 1.0) * 65535.0 + 0.5);
         }

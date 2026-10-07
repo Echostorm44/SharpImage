@@ -251,10 +251,10 @@ internal static partial class JxlEncoder
             double logMean = 0;
             for (int i = 0; i < blockDist.Length; i++)
             {
-                logMean += Math.Log(blockDist[i] + 1e-9);
+                logMean += PortableMathD.Log(blockDist[i] + 1e-9);
             }
 
-            double geoMean = Math.Exp(logMean / blockDist.Length);
+            double geoMean = PortableMathD.Exp(logMean / blockDist.Length);
 
             // Equalise gently (small power damps the oscillation that a large step causes), then renormalise
             // the field's geometric mean back to where it was so the total rate is held (pure reallocation).
@@ -262,14 +262,14 @@ internal static partial class JxlEncoder
             double preLog = 0, postLog = 0;
             for (int i = 0; i < quantField.Length; i++)
             {
-                preLog += Math.Log(quantField[i] + 1e-9);
+                preLog += PortableMathD.Log(quantField[i] + 1e-9);
                 double ratio = (blockDist[i] + 1e-9) / geoMean;
-                quantField[i] *= (float)Math.Pow(ratio, power);
+                quantField[i] *= (float)PortableMathD.Pow(ratio, power);
                 quantField[i] = Math.Clamp(quantField[i], 0.02f, 32f);
-                postLog += Math.Log(quantField[i] + 1e-9);
+                postLog += PortableMathD.Log(quantField[i] + 1e-9);
             }
 
-            float renorm = (float)Math.Exp((preLog - postLog) / quantField.Length);
+            float renorm = (float)PortableMathD.Exp((preLog - postLog) / quantField.Length);
             for (int i = 0; i < quantField.Length; i++)
             {
                 quantField[i] *= renorm;
@@ -467,7 +467,7 @@ internal static partial class JxlEncoder
         // relatively coarser as distance grows (the ^0.83 term), because at coarse quant the old flat 90/d
         // DC was ~a quarter of the file while barely moving SSIMULACRA2. Calibrated so d=1 keeps ~90 (where
         // the fine-quant heuristic wants it) and it drops toward ~35 at d=3.
-        float targetDc = MathF.Max(0.5f * d, MathF.Min(d, 0.3f * MathF.Pow(d / 0.3f, 0.83f)));
+        float targetDc = MathF.Max(0.5f * d, MathF.Min(d, 0.3f * PortableMath.Pow(d / 0.3f, 0.83f)));
         uint qlf = (uint)Math.Clamp((int)MathF.Round(73.4f / targetDc), 1, 512);
         return (gs, qlf, hfm);
     }
@@ -483,7 +483,7 @@ internal static partial class JxlEncoder
 
         return q >= 30
             ? 0.1f + ((100 - q) * 0.09f)
-            : 6.4f + (MathF.Pow(2.5f, (30 - q) / 5f) * 0.09f);
+            : 6.4f + (PortableMath.Pow(2.5f, (30 - q) / 5f) * 0.09f);
     }
 
     // Extract sRGB [0,1] float channels (grayscale expanded to RGB), matching EncodeLossless's sampling.
@@ -1519,12 +1519,12 @@ internal static partial class JxlEncoder
             tableSum += v;
         }
 
-        double cost = 0, invLog2 = 1.0 / Math.Log(2);
+        double cost = 0, invLog2 = 1.0 / PortableMathD.Log(2);
         for (int i = 0; i < hist.Length; i++)
         {
             if (hist[i] > 0)
             {
-                cost -= hist[i] * Math.Log((double)norm[i] / tableSum) * invLog2;
+                cost -= hist[i] * PortableMathD.LogFast((double)norm[i] / tableSum) * invLog2;
             }
         }
 
@@ -1970,7 +1970,7 @@ internal static partial class JxlEncoder
         int cap = (int)baseHfMul * 4;
         for (int i = 0; i < nb; i++)
         {
-            mul[i] = Math.Clamp((int)Math.Round(baseHfMul * Math.Exp(kMul * (act[i] - meanAct))), 1, cap);
+            mul[i] = Math.Clamp((int)Math.Round(baseHfMul * PortableMathD.Exp(kMul * (act[i] - meanAct))), 1, cap);
         }
 
         return mul;
@@ -2188,7 +2188,7 @@ internal static partial class JxlEncoder
         }
 
         acc /= num;
-        return MathF.Pow(acc, 1.0f / 16.0f);
+        return PortableMath.Pow(acc, 1.0f / 16.0f);
     }
 
     // The finest (largest) adaptive hf_mul over the dwBlocks x dhBlocks 8x8 cells a block covers.

@@ -9,7 +9,10 @@ public sealed class AomRestorationSseTests
     [Test]
     public async Task WienerSse_MatchesAvx2_AnyTaps()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;   // nothing to compare against
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            Skip.Test("compares against the AVX2 kernels: this CPU has no AVX2");
+        }
         var rng = new Random(41);
         int bad = 0;
         for (int iter = 0; iter < 300; iter++)
@@ -40,7 +43,10 @@ public sealed class AomRestorationSseTests
     [Test]
     public async Task SelfguidedSse_MatchesAvx2_FltAndApply()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            Skip.Test("compares against the AVX2 kernels: this CPU has no AVX2");
+        }
         var rng = new Random(43);
         var sc = new AomRestoration.SgrScratch();
         int bad = 0;

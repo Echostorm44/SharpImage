@@ -19,10 +19,32 @@ public static class SrgbConverter
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double Decode(double srgbQuantum)
     {
+        // Callers mostly pass whole quantum values: those come from a table of this same expression.
+        if (srgbQuantum >= 0.0 && srgbQuantum <= Quantum.MaxValue && srgbQuantum == (int)srgbQuantum)
+        {
+            return DecodeTable[(int)srgbQuantum];
+        }
+        return DecodeCore(srgbQuantum);
+    }
+
+    private static readonly double[] DecodeTable = BuildDecodeTable();
+
+    private static double[] BuildDecodeTable()
+    {
+        var table = new double[Quantum.MaxValue + 1];
+        for (int i = 0; i <= Quantum.MaxValue; i++)
+        {
+            table[i] = DecodeCore(i);
+        }
+        return table;
+    }
+
+    private static double DecodeCore(double srgbQuantum)
+    {
         double c = srgbQuantum * Quantum.Scale;
         double linear = c <= LinearThreshold
             ? c / 12.92
-            : Math.Pow((c + 0.055) / 1.055, 2.4);
+            : PortableMathD.Pow((c + 0.055) / 1.055, 2.4);
         return linear * Quantum.MaxValue;
     }
 
@@ -36,7 +58,7 @@ public static class SrgbConverter
         double c = linearQuantum * Quantum.Scale;
         double srgb = c <= LinearCutoff
             ? c * 12.92
-            : 1.055 * Math.Pow(c, 1.0 / 2.4) - 0.055;
+            : 1.055 * PortableMathD.Pow(c, 1.0 / 2.4) - 0.055;
         return srgb * Quantum.MaxValue;
     }
 
@@ -48,7 +70,7 @@ public static class SrgbConverter
     {
         return srgb <= LinearThreshold
             ? srgb / 12.92
-            : Math.Pow((srgb + 0.055) / 1.055, 2.4);
+            : PortableMathD.Pow((srgb + 0.055) / 1.055, 2.4);
     }
 
     /// <summary>
@@ -59,6 +81,6 @@ public static class SrgbConverter
     {
         return linear <= LinearCutoff
             ? linear * 12.92
-            : 1.055 * Math.Pow(linear, 1.0 / 2.4) - 0.055;
+            : 1.055 * PortableMathD.Pow(linear, 1.0 / 2.4) - 0.055;
     }
 }

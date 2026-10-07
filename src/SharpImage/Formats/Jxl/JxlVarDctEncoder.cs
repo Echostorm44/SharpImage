@@ -5,6 +5,7 @@
 // on top of it. WIP — only the 8x8 DCT path is implemented so far, verified by round-tripping through the
 // decoder's own inverse operations (JxlVarDctEncoder.ReconstructPsnr).
 using System;
+using SharpImage.Core;
 
 namespace SharpImage.Formats.Jxl;
 
@@ -15,7 +16,7 @@ internal static class JxlVarDctEncoder
     {
         float itscale = 255.0f / fp.IntensityTarget;
         float[] ob = fp.OpsinBias;
-        float[] cbrtOb = { MathF.Cbrt(ob[0]), MathF.Cbrt(ob[1]), MathF.Cbrt(ob[2]) };
+        float[] cbrtOb = { PortableMath.Cbrt(ob[0]), PortableMath.Cbrt(ob[1]), PortableMath.Cbrt(ob[2]) };
         float[] minv = Invert3x3(fp.OpsinInv); // forward opsin absorbance matrix
 
         var xyb = new float[3][];
@@ -43,9 +44,9 @@ internal static class JxlVarDctEncoder
             float lms1 = (minv[3] * rl) + (minv[4] * gl) + (minv[5] * bl);
             float lms2 = (minv[6] * rl) + (minv[7] * gl) + (minv[8] * bl);
 
-            float g0 = MathF.Cbrt((lms0 / itscale) - ob[0]);
-            float g1 = MathF.Cbrt((lms1 / itscale) - ob[1]);
-            float g2 = MathF.Cbrt((lms2 / itscale) - ob[2]);
+            float g0 = PortableMath.Cbrt((lms0 / itscale) - ob[0]);
+            float g1 = PortableMath.Cbrt((lms1 / itscale) - ob[1]);
+            float g2 = PortableMath.Cbrt((lms2 / itscale) - ob[2]);
 
             float yPlusX = g0 + cbrtOb[0];
             float yMinusX = g1 + cbrtOb[1];
@@ -63,7 +64,7 @@ internal static class JxlVarDctEncoder
     {
         float itscale = 255.0f / fp.IntensityTarget;
         float[] ob = fp.OpsinBias;
-        float[] cbrtOb = { MathF.Cbrt(ob[0]), MathF.Cbrt(ob[1]), MathF.Cbrt(ob[2]) };
+        float[] cbrtOb = { PortableMath.Cbrt(ob[0]), PortableMath.Cbrt(ob[1]), PortableMath.Cbrt(ob[2]) };
         float[] minv = Invert3x3(fp.OpsinInv);
         var xyb = new float[3][];
         for (int c = 0; c < 3; c++)
@@ -77,9 +78,9 @@ internal static class JxlVarDctEncoder
             float lms0 = (minv[0] * rl) + (minv[1] * gl) + (minv[2] * bl);
             float lms1 = (minv[3] * rl) + (minv[4] * gl) + (minv[5] * bl);
             float lms2 = (minv[6] * rl) + (minv[7] * gl) + (minv[8] * bl);
-            float g0 = MathF.Cbrt((lms0 / itscale) - ob[0]);
-            float g1 = MathF.Cbrt((lms1 / itscale) - ob[1]);
-            float g2 = MathF.Cbrt((lms2 / itscale) - ob[2]);
+            float g0 = PortableMath.Cbrt((lms0 / itscale) - ob[0]);
+            float g1 = PortableMath.Cbrt((lms1 / itscale) - ob[1]);
+            float g2 = PortableMath.Cbrt((lms2 / itscale) - ob[2]);
             float yPlusX = g0 + cbrtOb[0];
             float yMinusX = g1 + cbrtOb[1];
             xyb[0][i] = (yPlusX - yMinusX) * 0.5f;
@@ -104,7 +105,7 @@ internal static class JxlVarDctEncoder
             return 1f;
         }
 
-        return s <= 0.04045f ? s / 12.92f : MathF.Pow((s + 0.055f) / 1.055f, 2.4f);
+        return s <= 0.04045f ? s / 12.92f : PortableMath.Pow((s + 0.055f) / 1.055f, 2.4f);
     }
 
     // Inverse of a row-major 3x3 matrix (Cramer's rule).
@@ -250,6 +251,6 @@ internal static class JxlVarDctEncoder
         }
 
         mse /= count;
-        return mse <= 1e-9 ? 99.0 : 10.0 * Math.Log10((255.0 * 255.0) / mse);
+        return mse <= 1e-9 ? 99.0 : 10.0 * PortableMathD.Log10((255.0 * 255.0) / mse);
     }
 }
