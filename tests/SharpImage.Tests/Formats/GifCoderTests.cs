@@ -276,4 +276,57 @@ public class GifCoderTests
         }
         return image;
     }
+
+    // ─── Pooled index buffers ────────────────────────────────────
+
+    [Test]
+    public async Task Write_IgnoresLeftoversInPooledIndexBuffer()
+    {
+        // 5x5 = 25 indices: the shared pool hands out a 32-byte buffer, so 7 bytes past the image are left over
+        byte[] dirty = WriteAfterPoolFill(0xAB, s => GifCoder.Write(SolidFrame(5, 5), s));
+        byte[] clean = WriteAfterPoolFill(0x00, s => GifCoder.Write(SolidFrame(5, 5), s));
+        await Assert.That(dirty.AsSpan().SequenceEqual(clean)).IsTrue();
+    }
+
+    [Test]
+    public async Task WriteSequence_IgnoresLeftoversInPooledIndexBuffer()
+    {
+        static void Write(Stream s)
+        {
+            var sequence = new ImageSequence { CanvasWidth = 5, CanvasHeight = 5 };
+            sequence.AddFrame(SolidFrame(5, 5));
+            sequence.AddFrame(SolidFrame(5, 5));
+            GifCoder.WriteSequence(sequence, s);
+        }
+
+        byte[] dirty = WriteAfterPoolFill(0xAB, Write);
+        byte[] clean = WriteAfterPoolFill(0x00, Write);
+        await Assert.That(dirty.AsSpan().SequenceEqual(clean)).IsTrue();
+    }
+
+    private static byte[] WriteAfterPoolFill(byte fill, Action<Stream> write)
+    {
+        byte[] pooled = System.Buffers.ArrayPool<byte>.Shared.Rent(25);
+        pooled.AsSpan().Fill(fill);
+        System.Buffers.ArrayPool<byte>.Shared.Return(pooled);
+        using var ms = new MemoryStream();
+        write(ms);
+        return ms.ToArray();
+    }
+
+    private static ImageFrame SolidFrame(int width, int height)
+    {
+        var frame = new ImageFrame();
+        frame.Initialize(width, height, ColorspaceType.SRGB, false);
+        for (int y = 0; y < height; y++)
+        {
+            var row = frame.GetPixelRowForWrite(y);
+            for (int x = 0; x < width; x++)
+            {
+                row[x * 3] = Quantum.MaxValue;
+            }
+        }
+
+        return frame;
+    }
 }

@@ -293,7 +293,8 @@ public static class GifCoder
         stream.WriteByte((byte)minCodeSize);
 
         // LZW compressed data
-        Lzw.Compress(stream, indices, minCodeSize);
+        // the rented buffer can be longer than the image: compress only its pixels
+        Lzw.Compress(stream, indices.AsSpan(0, width * height), minCodeSize);
 
         // Trailer
         stream.WriteByte(Trailer);
@@ -699,7 +700,8 @@ public static class GifCoder
             // LZW data
             int minCodeSize = i == 0 ? Math.Max(2, bitsPerPixel) : Math.Max(2, frameBpp);
             stream.WriteByte((byte)minCodeSize);
-            Lzw.Compress(stream, frameIndices, minCodeSize);
+            // frame 0 uses the rented buffer, which can be longer than the frame
+            Lzw.Compress(stream, frameIndices.AsSpan(0, frameWidth * frameHeight), minCodeSize);
         }
 
         // Trailer
